@@ -37,7 +37,7 @@ def load_bundle(root,data,texts):
    source=row["file"]; p=check_file(root,source); path=source["path"]
    if any(p==(root/outputs[key]["path"]).resolve() for key in outputs): raise ValueError("inline file duplicates output path: "+path)
    text=p.read_text(errors="replace")
-  order=row.get("section_order"); reps[rid]=(set(roles),text,path,order)
+  order=row.get("section_order"); reps[rid]=(set(roles),text,path,order,fmt)
  if claimed!=set(outputs): raise ValueError("every output must be claimed exactly once")
  pid=b.get("primary_representation_id")
  if pid not in reps: raise ValueError("unknown primary representation: "+str(pid))
@@ -50,6 +50,31 @@ def load_bundle(root,data,texts):
   if not isinstance(order,list) or not order or len(set(order))!=len(order) or any(not isinstance(section,str) or not section for section in order): raise ValueError("invalid equivalence group section order")
   ids.add(gid); groups.append((set(members),order))
  return title,pid,reps,groups
+def _media_link_present(root, document_path, media_path, declared_link, text, document_format):
+ # Keep the v1 spelling accepted by existing reports. A new document-relative
+ # spelling must be an actual link to this declared file, not a text fragment.
+ if declared_link in text: return True
+ if document_format=="html":
+  parser=_HTMLLinks(); parser.feed(text); parser.close()
+  if any(tag=="base" for tag,_,_ in parser.dom_links): return False
+  values=[value for tag,_,value in parser.dom_links if tag!="base"]
+ else:
+  values=[value for _,value in _markdown_links(text)]
+ document=(root/document_path).resolve()
+ for value in values:
+  raw=value.strip().strip("<>")
+  try: split=urlsplit(raw)
+  except ValueError: continue
+  if split.scheme or split.netloc or split.query or split.fragment: continue
+  path=split.path
+  if not path or path.startswith("/") or "\\" in path or "%" in path: continue
+  target=(document.parent/path).resolve(strict=False)
+  try: target.relative_to(root)
+  except ValueError: continue
+  if target==media_path: return True
+ return False
+
+
 def _verify_v1(path):
  path=Path(path).resolve(); root=path.parent; data=_read_manifest(path)
  if data.get("schema_version")!=1: raise ValueError("schema_version must be 1")
@@ -72,12 +97,12 @@ def _verify_v1(path):
  groups={}
  for row in data.get("media",[]):
   if row.get("kind") not in KINDS: raise ValueError("invalid media kind")
-  check_file(root,row); groups.setdefault(row.get("sample_id"),set()).add(row["kind"])
+  media_path=check_file(root,row); groups.setdefault(row.get("sample_id"),set()).add(row["kind"])
   link=row["path"]
   if has_bundle:
    for rid in play_ids:
-    if link not in reps[rid][1]: raise ValueError("media link not bound in interactive representation "+rid+": "+link)
-  elif link not in md_text or link not in html_text: raise ValueError("media link not bound in both outputs: "+link)
+    if not _media_link_present(root,reps[rid][2],media_path,link,reps[rid][1],reps[rid][4]): raise ValueError("media link not bound in interactive representation "+rid+": "+link)
+  elif not _media_link_present(root,data["outputs"]["markdown"]["path"],media_path,link,md_text,"markdown") or not _media_link_present(root,data["outputs"]["html"]["path"],media_path,link,html_text,"html"): raise ValueError("media link not bound in both outputs: "+link)
  if not groups or any(kinds!=set(KINDS) for kinds in groups.values()): raise ValueError("each sample requires 1:1 audio/waveform/spectrogram/playback")
  if not data.get("visual_evidence"): raise ValueError("visual evidence required")
  for row in data["visual_evidence"]: check_file(root,row)

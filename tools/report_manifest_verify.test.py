@@ -78,6 +78,32 @@ class TestReport(unittest.TestCase):
  def test_valid_and_hash(self):
   with tempfile.TemporaryDirectory() as td:
    p,d=self.fixture(Path(td)); self.assertEqual(V.verify(p)["media"],4); Path(td,"audio.wav").write_text("changed"); self.assertRaises(ValueError,V.verify,p)
+ def test_nested_html_media_links_resolve_from_html_folder(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); report=root/"html_report"; assets=report/"assets"; assets.mkdir(parents=True)
+   names=("audio.wav","waveform.png","spectrogram.png","playback.html")
+   for name in names: (assets/name).write_text(name)
+   (assets/"other.wav").write_text("wrong existing media")
+   title="Audio eval 18000"
+   md=title+" score 7 html_report/index.html "+" ".join("html_report/assets/"+name for name in names)
+   html_text='<html><body>'+title+' score 7 <audio src="assets/audio.wav"></audio><img src="assets/waveform.png"><img src="assets/spectrogram.png"><a href="assets/playback.html">playback</a></body></html>'
+   (root/"REPORT.md").write_text(md); (report/"index.html").write_text(html_text)
+   def row(path,kind=None):
+    return {"path":path,"sha256":hashlib.sha256((root/path).read_bytes()).hexdigest(),**({"sample_id":"s1","kind":kind} if kind else {})}
+   data={"schema_version":1,"outputs":{"markdown":row("REPORT.md"),"html":row("html_report/index.html")},"summary_stats":{"score":7},"house_parameters":{"sample_rate_hz":48000,"frequency_band_hz":[0,24000]},"media":[row("html_report/assets/"+name,kind) for name,kind in zip(names,V.KINDS)],"visual_evidence":[row("html_report/assets/waveform.png")]}
+   manifest=root/"report_manifest.json"
+   manifest.write_text(json.dumps(data)); self.assertEqual(V.verify(manifest)["media"],4)
+   data["bundle"]={"title":title,"primary_representation_id":"playback","representations":[{"id":"playback","format":"html","roles":["canonical","interactive"],"output":"html"},{"id":"summary","format":"markdown","roles":["summary","navigation"],"output":"markdown"}]}
+   manifest.write_text(json.dumps(data)); self.assertEqual(V.verify(manifest)["media"],4)
+   for bad in ('assets/other.wav','../../outside.wav','assets/audio.wav?copy=1','assets/audio.wav#sample'):
+    changed=html_text.replace('assets/audio.wav',bad)
+    (report/"index.html").write_text(changed); data["outputs"]["html"]["sha256"]=row("html_report/index.html")["sha256"]
+    manifest.write_text(json.dumps(data)); self.assertRaisesRegex(ValueError,"media link not bound",V.verify,manifest)
+   (report/"index.html").write_text(html_text.replace('<html>','<html><base href="../">'))
+   data["outputs"]["html"]["sha256"]=row("html_report/index.html")["sha256"]
+   manifest.write_text(json.dumps(data)); self.assertRaisesRegex(ValueError,"media link not bound",V.verify,manifest)
+   (report/"index.html").write_text(html_text); data["outputs"]["html"]["sha256"]=row("html_report/index.html")["sha256"]
+   (assets/"audio.wav").unlink(); manifest.write_text(json.dumps(data)); self.assertRaisesRegex(ValueError,"missing report file",V.verify,manifest)
  def test_one_to_one(self):
   with tempfile.TemporaryDirectory() as td:
    p,d=self.fixture(Path(td)); d["media"].pop(); p.write_text(json.dumps(d)); self.assertRaises(ValueError,V.verify,p)
