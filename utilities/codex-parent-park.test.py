@@ -19,9 +19,10 @@ class ParentParkRetirementTest(unittest.TestCase):
     def test_hook_manifest_has_no_wildcard_parent_park(self):
         config = json.loads(HOOKS.read_text(encoding="utf-8"))
         entries = config["hooks"].get("PreToolUse", [])
-        self.assertEqual(entries, [])
+        self.assertFalse([entry for entry in entries if entry.get("matcher") == "*"])
         rendered = json.dumps(entries)
         self.assertNotIn("AGENT_PARENT_PARK_ONLY", rendered)
+        self.assertNotIn("parent-park", rendered)
 
 
 if __name__ == "__main__":
