@@ -589,7 +589,7 @@ class PaneHeaderIdentityTest(unittest.TestCase):
         `--title` alone clears `--display-agent` (measured on a live pane)."""
         import inspect
         from tools.fleet import herdr_projection
-        body = inspect.getsource(herdr_projection.project)
+        body = inspect.getsource(herdr_projection._report)
         metadata = body.split("metadata = [", 1)[1].split("\n\n", 1)[0]
         self.assertIn("--display-agent", metadata)
         self.assertIn("--title", metadata)

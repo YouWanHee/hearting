@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _TOOLS = str(Path(__file__).resolve().parents[1])
@@ -330,16 +332,101 @@ def _formatter_overrides(harness: str, session_id: str, title: str) -> tuple:
         return None, None
 
 
+_PROOF_WAIT_S = 90
+_THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _defer_until_proven(session_id: str, report_session: bool) -> None:
+    """Report a Codex session its own hook could not prove, once its TUI is proven.
+
+    A Codex TUI started without the managed app-server attaches to the user's shared
+    background Codex service, which runs the hooks in that service's environment: no
+    HERDR_PANE_ID, and the hook's ancestor is the service rather than the pane's TUI. The
+    TUI also has no provable thread until its first turn starts. Either way the pane
+    stayed anonymous, so a detached helper waits for the board's resolver to prove a live
+    TUI on this session and reports to the pane herdr gave that TUI.
+    """
+    if not _THREAD_ID.fullmatch(session_id or ""):
+        return
+    command = [sys.executable, str(Path(__file__).resolve()), "--harness", "codex",
+               "--session-id", session_id, "--await-codex-tui"]
+    if not report_session:
+        command.append("--no-report-session")
+    try:
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def _codex_tui_pane(session_id: str):
+    """The herdr pane of the live Codex TUI proven to be on ``session_id``, or None."""
+    from fleet.collectors import codex as codex_collector
+    from fleet.collectors import procscan
+    live = []
+
+    def live_codex():
+        if not live:
+            live.append(procscan.scan(harness_filter={"codex"}))
+        return live[0]
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or _comm(int(entry)) != "codex":
+            continue
+        pane = procscan.read_environ(int(entry)).get("HERDR_PANE_ID")
+        try:
+            if pane and codex_collector.session_id_of_process(
+                    int(entry), live_codex) == session_id:
+                return pane
+        except Exception:
+            continue
+    return None
+
+
+def _await_tui_and_project(session_id: str, report_session: bool) -> None:
+    import fcntl
+    import tempfile
+    # One waiter per session: every later prompt's helper exits while one is waiting.
+    lock = open(os.path.join(tempfile.gettempdir(),
+                             "hearting-herdr-await-%s.lock" % session_id), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    deadline = time.monotonic() + _PROOF_WAIT_S
+    while time.monotonic() < deadline:
+        pane = _codex_tui_pane(session_id)
+        if pane:
+            _report("codex", session_id, pane, report_session)
+            return
+        time.sleep(2)
+
+
 def project(harness: str, session_id: str, *, pane_id=None, worker=None,
             report_session=True) -> bool:
     """Report this session's pane metadata to herdr. Always returns True (fail-soft)."""
     harness = str(harness or "").lower()
     pane = pane_id or os.environ.get("HERDR_PANE_ID", "")
-    herdr = shutil.which("herdr")
-    if not pane or not herdr:
+    if not shutil.which("herdr"):
+        return True
+    codex_main = harness == "codex" and not (
+        worker if worker is not None else is_worker())
+    if not pane:
+        if codex_main:
+            _defer_until_proven(session_id, report_session)
         return True
     if not may_report(harness, session_id, worker=worker):
+        if codex_main and runtime_identity() == ("codex", None):
+            _defer_until_proven(session_id, report_session)
         return True
+    _report(harness, session_id, pane, report_session)
+    return True
+
+
+def _report(harness: str, session_id: str, pane: str, report_session: bool) -> None:
+    herdr = shutil.which("herdr")
+    if not herdr:
+        return
     title = session_title(harness, session_id)
     label, custom_title = _formatter_overrides(harness, session_id, title)
     agent, shown_title = compose(harness, session_id, title=custom_title or title,
@@ -363,7 +450,6 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
                            timeout=_HERDR_TIMEOUT, check=False)
         except Exception:
             pass
-    return True
 
 
 def main(argv=None) -> int:
@@ -376,9 +462,14 @@ def main(argv=None) -> int:
                         help="skip report-agent-session (the runtime's own hook owns it)")
     parser.add_argument("--print", action="store_true",
                         help="print the composed metadata instead of reporting it")
+    parser.add_argument("--await-codex-tui", action="store_true",
+                        help="wait until a live Codex TUI is proven on --session-id, then report")
     parser.add_argument("--may-report", action="store_true",
                         help="exit 0 when this process may report the session, else 1")
     args = parser.parse_args(argv)
+    if args.await_codex_tui:
+        _await_tui_and_project(args.session_id, not args.no_report_session)
+        return 0
     if args.may_report:
         return 0 if may_report(args.harness, args.session_id) else 1
     if args.print:
