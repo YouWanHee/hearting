@@ -467,6 +467,52 @@ class ReplacementTest(unittest.TestCase):
         _, _, _, target = self._legacy_claimed_pair()
         self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(target))
 
+    def test_automatic_retry_row_consumes_budget_and_delivers_failure_attention(self):
+        route, path = self._legacy_real_route('automatic-root')
+        R._route.return_value = (path, route)
+        original = self._legacy_row('att-auto-original', route, path)
+        successor = {**self._legacy_row('att-auto-successor', route, path),
+                     'automatic_retry_of': original['attempt_id'],
+                     'note': 'dead-exit-1', 'failure_class': 'runtime'}
+        self.write(original); self.write(successor, append=True)
+        rows = self.jobs.read_text().splitlines()
+        self.assertTrue(R.legacy_budget_exhausted(self.jobs, rows, original, route=route))
+        effective, lineage, attention = R.advance_batch(
+            self.jobs, {original['attempt_id']}, authority_check=lambda *_: True)
+        self.assertEqual(effective, {original['attempt_id']})
+        self.assertEqual(lineage, [])
+        self.assertEqual([item['reason'] for item in attention],
+                         ['automatic-replacement-exhausted'])
+        self.assertEqual(R.validate_attention(self.jobs, attention,
+                         allowed_attempts={original['attempt_id']}), attention)
+        before = self.jobs.read_bytes()
+        self.assertEqual(R.advance_batch(self.jobs, {original['attempt_id']},
+                         authority_check=lambda *_: True), (effective, lineage, attention))
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
+
+        continuation, continuation_path = self._legacy_real_route('automatic-continuation', route)
+        current = self._legacy_row('att-auto-continuation', continuation, continuation_path)
+        self.write(current, append=True)
+        self.assertTrue(R.legacy_budget_exhausted(
+            self.jobs, self.jobs.read_text().splitlines(), current, route=continuation))
+
+    def test_automatic_retry_backlink_mismatch_fails_without_writes(self):
+        route, path = self._legacy_real_route('automatic-negative')
+        original = self._legacy_row('att-auto-original', route, path)
+        successor = {**self._legacy_row('att-auto-successor', route, path),
+                     'automatic_retry_of': original['attempt_id']}
+        for change in ({'parent_sid': 'foreign'}, {'route_node': 'other-frame'},
+                       {'route_hash': 'sha256:foreign'}):
+            with self.subTest(change=change):
+                self.write(original); self.write({**successor, **change}, append=True)
+                before = self.jobs.read_bytes()
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.legacy_budget_exhausted(self.jobs, before.decode().splitlines(),
+                                              original, route=route)
+                self.assertEqual(caught.exception.reason, 'replacement-legacy-budget-link-unproven')
+                self.assertEqual(self.jobs.read_bytes(), before)
+
     def test_sd106_malformed_exact_backlink_fails_closed(self):
         route, _, original, target = self._legacy_claimed_pair()
         mutations = ({'retry_ordinal': '0'}, {'recovery_id': 'wrong-recovery'},

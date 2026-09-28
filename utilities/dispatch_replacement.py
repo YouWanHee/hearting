@@ -308,7 +308,7 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
                      if source.get('worker_type') == 'owner'
                      else meta.get('worker_type') != 'owner'
                      and meta.get('route_node') == source.get('route_node'))
-        if not same_node and other not in reference_ids:
+        if not same_node and other not in reference_ids and meta.get('automatic_retry_of') != aid:
             continue
         # The original row can be unchanged after an index-first crash.
         # Delay unrelated index errors until the row's lineage is established.
@@ -327,7 +327,8 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         legacy = (meta.get('retry_ordinal') == '1'
                   or meta.get('recovery_exhausted') == '1'
                   or (meta.get('start_permitted') == '0' and meta.get('recovery_id'))
-                  or attention is not None)
+                  or attention is not None or bool(meta.get('automatic_retry_of')
+                                                    and not meta.get('replacement_family_id')))
         family_hint = (reservation or {}).get('family_id')
         # SD157's own reservation is a replay, not a second consumption.
         # Its own SD106 exhaustion, however, is always a veto.
@@ -385,7 +386,13 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         prior_id = prior.get('owner_route_id') or prior.get('route_id')
         prior_hash = prior.get('owner_route_hash') or prior.get('route_hash')
         previous = lineage.get(prior_id)
-        direct = previous is not None or other in reference_ids or other == aid
+        direct = (previous is not None or other in reference_ids or other == aid
+                  or prior.get('automatic_retry_of') == aid)
+        if prior.get('automatic_retry_of') == aid and any(
+                prior.get(key) != source.get(key) for key in
+                ('route_id', 'route_hash', 'route_node', 'parent_attempt_id',
+                 'parent_sid', 'worker_type', 'dispatch_depth')):
+            raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
         try:
             if previous is not None:
                 if previous['route_hash'] != prior_hash:
