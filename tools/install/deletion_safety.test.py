@@ -384,6 +384,34 @@ class ReleaseScanSelectsRouteRecordsTest(unittest.TestCase):
             self.assertEqual(reason, "", "one sidecar must not poison the scan")
             self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
 
+    def test_paired_canonical_outcome_is_not_read_as_a_second_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            record = routes / f"{self.ROUTE_ID}.json"
+            outcome = routes / f"{self.ROUTE_ID}.outcome.json"
+            self._record(record, str(base / "release"))
+            outcome.write_text("{}", encoding="utf-8")
+            read_text = Path.read_text
+
+            def read_without_outcome(path, *args, **kwargs):
+                if path == outcome:
+                    raise AssertionError("paired outcome sidecar was opened")
+                return read_text(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", read_without_outcome):
+                results, reason = self._scan(base)
+            self.assertEqual((results, reason), ([], ""))
+
+    def test_unpaired_outcome_shaped_route_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            self._record(routes / f"{self.ROUTE_ID}.outcome.json", str(base / "release"))
+            results, reason = self._scan(base)
+            self.assertEqual(results, [])
+            self.assertTrue(reason.startswith("route-record-unrecognised-name:"), reason)
+
     def test_every_sidecar_shape_beside_a_route_record_is_ignored(self):
         # Not a denylist of the shapes we happen to know: anything that is not
         # `<route_id>.json` is not a route record.

@@ -2697,7 +2697,7 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
     roots, explicit_route_files, bindings_unreliable = _open_route_artifact_roots(environ)
     if bindings_unreliable:
         return [], bindings_unreliable
-    candidates: dict[str, Path] = {}
+    candidates: dict[str, tuple[Path, bool | None]] = {}
     # Bounded set covers both discovery paths together (review 🟡4): an
     # unbounded explicit-route tail from `owner_route_file=`/bindings would
     # otherwise let the scan cap be walked around entirely by growing that
@@ -2708,10 +2708,25 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         if not routes_dir.is_dir():
             continue
         try:
-            entries = list(routes_dir.glob("*.json"))
+            with os.scandir(routes_dir) as stream:
+                entries = [
+                    (Path(entry.path), entry.is_file())
+                    for entry in stream if entry.name.endswith(".json")
+                ]
         except OSError:
             return [], f"route-discovery-unreliable:{routes_dir}"
-        for entry in entries:
+        names = {entry.name for entry, _is_file in entries}
+        for entry, is_file in entries:
+            # A canonical route's paired outcome is a sidecar, not a second
+            # route record. On NAS, opening thousands of these only to reject
+            # their noncanonical names dominates release cleanup. Unknown
+            # sidecars and unpaired outcome-shaped files still get the full
+            # content check below, so a real route under an unexpected name
+            # cannot silently lose its release pin.
+            if entry.name.endswith(".outcome.json"):
+                base_name = entry.name[: -len(".outcome.json")] + ".json"
+                if base_name in names and _CANONICAL_ROUTE_NAME_RE.fullmatch(base_name):
+                    continue
             if not _CANONICAL_ROUTE_NAME_RE.fullmatch(entry.name):
                 # Select route records by the name `canonical_route_path()`
                 # actually writes, rather than skipping the sidecar shapes we
@@ -2739,19 +2754,22 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
             scanned += 1
             if scanned > _ROUTE_SCAN_MAX_FILES:
                 return [], "route-discovery-unreliable:scan-cap"
-            candidates[str(entry.resolve(strict=False))] = entry
+            # Directory enumeration already supplies an absolute path. Avoid
+            # resolving every route through NFS; an alias may be read twice,
+            # but duplicates cannot remove a release-retention reference.
+            candidates[os.path.abspath(entry)] = (entry, is_file)
     for route_file in explicit_route_files:
         scanned += 1
         if scanned > _ROUTE_SCAN_MAX_FILES:
             return [], "route-discovery-unreliable:scan-cap"
         path = Path(route_file)
-        candidates[str(path.resolve(strict=False))] = path
+        candidates.setdefault(os.path.abspath(path), (path, None))
 
     results: list[tuple[str, str]] = []
     registry_cache: dict = {}
     environ = environ or {}
-    for path in candidates.values():
-        if not path.is_file():
+    for path, scanned_file in candidates.values():
+        if scanned_file is False or (scanned_file is None and not path.is_file()):
             continue
         launch_home = _route_record_launch_home(path, registry_cache, environ)
         if launch_home is None:
