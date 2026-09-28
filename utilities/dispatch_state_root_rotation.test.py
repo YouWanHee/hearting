@@ -1898,16 +1898,16 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
 
         # Deterministic injection (plan-review requirement): a chmod-based
         # unreadable directory is not guaranteed to reproduce under every
-        # execution UID (e.g. root), so patch `Path.glob` itself to raise for
+        # execution UID (e.g. root), so patch `os.scandir` itself to raise for
         # exactly this directory instead.
-        real_glob = Path.glob
+        real_scandir = os.scandir
 
-        def _boom(self_path, pattern):
-            if self_path == routes_dir and pattern == "*.json":
-                raise OSError("simulated unreadable directory")
-            return real_glob(self_path, pattern)
+        def _boom(path):
+            if Path(path) == routes_dir:
+                raise PermissionError("simulated unreadable directory")
+            return real_scandir(path)
 
-        with mock.patch.object(Path, "glob", _boom):
+        with mock.patch.object(os, "scandir", _boom):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 DISTRIBUTION._cleanup_releases(keep=set())
