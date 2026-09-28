@@ -659,6 +659,23 @@ def inspect_terminal_attempt(
                 "contract-violation",
                 reason="artifact-outside-root",
             )
+        if not os.path.lexists(candidate):
+            # A checkpoint may place a cycle's loose output into its declared
+            # bucket after the worker wrote its final handoff. Follow only the
+            # producer's recorded same-cycle move, then recheck the root. This
+            # keeps the exact handoff useful without accepting an arbitrary
+            # replacement file at the old or new path.
+            from artifact_producer import resolve_placed_output
+            try:
+                artifact_path = resolve_placed_output(candidate).resolve(strict=False)
+                artifact_path.relative_to(root)
+            except (OSError, ValueError):
+                return _result(
+                    3, "invalid", str(parsed["source"]), "-", "outside-root",
+                    "contract-violation", reason="artifact-outside-root",
+                )
+            if artifact_path != candidate.resolve(strict=False):
+                parsed["artifact_origin_path_b64"] = _encode_path(candidate)
         # A worker's artifact is legitimately either one file or one directory of
         # them: a cycle's document bucket, a plans directory, an evidence tree. The
         # contract says "an in-root artifact", never "a regular file", and the

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -44,6 +45,8 @@ from dispatch_contract import (
     terminal_claim_observation,
     agent_home_equivalent,
     attempt_process_quiescence,
+    process_namespace_identity,
+    terminal_conflict_pending,
     completion_marker_is_current,
     completion_attempt_readiness,
     completion_conflict_attempt,
@@ -6530,6 +6533,105 @@ def _publish_continuation_owner_closure(route, node, evidence, jobs, attempt_id,
                     "source_attempt_id": attempt_id, "source_rows_changed": 0,
                     "blocking_attempts": [r["attempt_id"] for r in proof["reviews"]]}
 
+
+def _placed_artifact_false_negative(route, node, fields, metadata, evidence, lines):
+    """Prove one legacy artifact-missing close was a recorded bucket move.
+
+    This is deliberately narrower than terminal-conflict review: a FAIL or
+    BLOCKED handoff, another failure class, a changed source path, or a missing
+    current manifest cannot turn a committed terminal row into a PASS.
+    """
+    if (fields[1] != "done" or metadata.get("note") != "dead-invalid-envelope"
+            or metadata.get("route_id") != route.get("route_id")
+            or metadata.get("route_hash") != route.get("route_hash")
+            or metadata.get("route_node") != node.get("id")
+            or metadata.get("failure_class") != "invalid-envelope"
+            or metadata.get("classifier_source") != "completion-join-invalid-envelope-v1"
+            or metadata.get("reconcile_reason") != "terminal-invalid:artifact-missing"
+            or metadata.get("worker_type") != "stage"
+            or metadata.get("dispatch_depth") != "2"
+            or metadata.get("launch_lifecycle") != "foreground-scoped"
+            or metadata.get("pid_scope") != "namespace-local"
+            or metadata.get("group_reap_proof") != "pgid-empty-v1"
+            or metadata.get("attempt_descendant_proof") != "attempt-tagged-empty-v1"
+            or metadata.get("pid_ns") != process_namespace_identity()
+            or metadata.get("pid_observer_ns") != metadata.get("pid_ns")
+            or terminal_conflict_pending(metadata)
+            or metadata.get("terminal_correction_b64")
+            or Path(fields[3]).resolve() != Path(route["cwd"]).resolve()):
+        return None
+    attempt_id = metadata.get("attempt_id", "")
+    current_rows = [(index, parts, parse_registry_metadata(parts[5]))
+                    for index, row in enumerate(lines)
+                    if len(parts := row.split("\t")) == 6]
+    exact = [index for index, _, candidate in current_rows
+             if candidate.get("attempt_id") == attempt_id]
+    if (not attempt_id or len(exact) != 1
+            or not metadata.get("log_file", "").endswith(f".{attempt_id}.codex.jsonl")
+            or attempt_process_quiescence(metadata, terminal_receipt=True).state != "quiescent"):
+        return None
+    if any(index > exact[0] and candidate.get("route_id") == route["route_id"]
+           and candidate.get("route_node") == node["id"] and status[1] in {"open", "running", "done"}
+           for index, status, candidate in current_rows):
+        return None
+    marker_path = completion_dir(route["route_id"]) / f"{node['id']}.json"
+    if marker_path.is_file():
+        try:
+            if json.loads(marker_path.read_text(encoding="utf-8")).get("attempt_id") != attempt_id:
+                return None
+        except (OSError, ValueError):
+            return None
+    terminal = inspect_terminal_attempt(
+        metadata["log_file"], worktree=fields[3],
+        artifact_root_metadata=metadata.get("artifact_root"),
+    )
+    if (terminal.get("state") != "valid" or terminal.get("source") != "exact-turn-completed"
+            or terminal.get("terminal_event") != "turn.completed"
+            or terminal.get("verdict") != "PASS"
+            or terminal.get("failure_class") != "pass"
+            or terminal.get("artifact_state") != "readable"
+            or terminal.get("artifact_shape") != "file"
+            or not terminal.get("artifact_origin_path_b64")):
+        return None
+    try:
+        origin = Path(base64.urlsafe_b64decode(
+            terminal["artifact_origin_path_b64"] + "=" * (-len(terminal["artifact_origin_path_b64"]) % 4)
+        ).decode("utf-8"))
+        observed = Path(base64.urlsafe_b64decode(
+            terminal["artifact_path_b64"] + "=" * (-len(terminal["artifact_path_b64"]) % 4)
+        ).decode("utf-8"))
+        from artifact_producer import placed_output_proof
+        proof = placed_output_proof(
+            origin, route_id=route["route_id"], route_hash=route["route_hash"])
+        if (proof is None or observed != Path(proof["destination"])
+                or Path(evidence).resolve(strict=True) != observed):
+            return None
+        raw_log = Path(metadata["log_file"]).read_bytes()
+    except (OSError, ValueError, KeyError, UnicodeDecodeError):
+        return None
+    terminal_time = ""
+    for line in reversed(raw_log.splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "turn.completed":
+            terminal_time = str(event.get("timestamp") or "")
+            break
+    observed_at = datetime.now(timezone.utc).isoformat()
+    proof.update(
+        terminal_log_sha256=hashlib.sha256(raw_log).hexdigest(),
+        terminal_time=terminal_time,
+        prior_failure_observed_at=observed_at,
+        prior_note=metadata["note"],
+        prior_classifier_source=metadata["classifier_source"],
+        prior_failure_class=metadata["failure_class"],
+        prior_reconcile_reason=metadata["reconcile_reason"],
+        corrected_at=observed_at,
+        attempt_id=attempt_id, route_node=node["id"],
+    )
+    return proof
+
 def _complete_node_locked(
     route,
     node,
@@ -6648,6 +6750,11 @@ def _complete_node_locked(
                     or deferred_completion(row_metadata)=="pending"
                 )
             )
+            correction = None
+            if already_closed and not marker_eligible and row_note == "dead-invalid-envelope":
+                correction = _placed_artifact_false_negative(
+                    route, node, row_fields, row_metadata, evidence, lines)
+                marker_eligible = correction is not None
             # OPERATIONS §5.10 owner-closure extension: a review row that ended
             # `completed-review-blocking` is marker-eligible only through the
             # evidence-bound owner-closure gate; it raises its own typed refusal.
@@ -6668,8 +6775,22 @@ def _complete_node_locked(
                 raise ValueError(
                     f"attempt-row-terminal-without-completion:{row_note or 'unknown'}"
                 )
+            correction_pipe = None
+            if correction is not None:
+                correction_pipe = _updated_attempt_metadata(row_fields[5], {
+                    "prior_terminal_note": row_note,
+                    "prior_classifier_source": row_metadata["classifier_source"],
+                    "prior_failure_class": row_metadata["failure_class"],
+                    "prior_reconcile_reason": row_metadata["reconcile_reason"],
+                    "terminal_correction_b64": base64.urlsafe_b64encode(
+                        json.dumps(correction, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    ).decode("ascii").rstrip("="),
+                    "classifier_source": "recorded-bucket-move-correction-v1",
+                    "failure_class": "pass",
+                    "reconcile_reason": "recorded-bucket-move-corrected",
+                }, terminal=True)
             attempt_metadata={
-                key:value for key,value in row_metadata.items()
+                key:value for key,value in parse_registry_metadata(correction_pipe or row_fields[5]).items()
                 if not key.startswith("_")
             }
             marker=_publish_completion_locked(
@@ -6696,6 +6817,8 @@ def _complete_node_locked(
             # `complete` then reads note=completed-marker (last value wins) and returns the
             # idempotent already-closed path instead of appending twice.
             row_fields[1]="done"
+            if correction_pipe is not None:
+                row_fields[5] = correction_pipe
             if sealed_pipe is not None:
                 # The gate closed on the owner's ruling, not on a passing review:
                 # the closure facts were sealed above and the verdict axis stays

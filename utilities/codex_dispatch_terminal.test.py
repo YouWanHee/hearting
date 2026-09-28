@@ -90,6 +90,33 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             include_failure_detail=detail,
         )
 
+    def test_recorded_bucket_move_keeps_exact_handoff_readable(self):
+        original = self.root / "campaigns/cycle/artifacts/plan.md"
+        moved = self.root / "campaigns/cycle/artifacts/plans/plan.md"
+        moved.parent.mkdir(parents=True)
+        moved.write_text("finished plan\n")
+        log = self.write_log(verdict="PASS", blocker="none", artifact=str(original), sandbox=False)
+        self.assertEqual(self.inspect(log)["reason"], "artifact-missing")
+        with mock.patch("artifact_producer.resolve_placed_output", return_value=moved):
+            result = self.inspect(log)
+        self.assertEqual(result["state"], "valid")
+        self.assertEqual(result["artifact_state"], "readable")
+        self.assertEqual(
+            Path(base64.urlsafe_b64decode(result["artifact_path_b64"] + "=" *
+                                       (-len(result["artifact_path_b64"]) % 4)).decode()), moved)
+        self.assertEqual(
+            Path(base64.urlsafe_b64decode(result["artifact_origin_path_b64"] + "=" *
+                                       (-len(result["artifact_origin_path_b64"]) % 4)).decode()), original)
+
+    def test_bucket_move_cannot_escape_artifact_root(self):
+        original = self.root / "campaigns/cycle/artifacts/plan.md"
+        outside = self.base / "other.md"
+        outside.write_text("unrelated\n")
+        log = self.write_log(verdict="PASS", blocker="none", artifact=str(original), sandbox=False)
+        with mock.patch("artifact_producer.resolve_placed_output", return_value=outside):
+            result = self.inspect(log)
+        self.assertEqual(result["reason"], "artifact-outside-root")
+
     def test_a_review_artifact_that_declares_fail_contradicts_a_pass_envelope(self):
         # P-4: the round that shipped as a pass. Envelope PASS, artifact body
         # opening with `## 평결: FAIL`. The envelope keeps its authority (the

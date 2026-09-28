@@ -2170,6 +2170,95 @@ def resolve_placed_output(path: Path) -> Path:
     return path
 
 
+def placed_output_proof(path: Path, *, route_id: str, route_hash: str) -> Optional[Dict[str, str]]:
+    """Read a route-bound move and current manifest digest for terminal repair.
+
+    The manifest digest describes the file *now*. Neither it nor the placement
+    ledger claims to know the file's bytes at the worker's earlier handoff.
+    """
+    origin = Path(path)
+    if not origin.is_absolute() or os.path.lexists(origin):
+        return None
+    for output in origin.parents:
+        if output.name != "artifacts":
+            continue
+        directory = output.parent
+        binding = _read_json(directory / ".cycle.json") or {}
+        cid = binding.get("cycle_id", "")
+        if not artifact_identity.is_well_formed(cid, "cycle"):
+            continue
+        for root in list(directory.parents)[:4]:
+            record = read_cycle_record(root, cid)
+            if (record is None or record.get("route_id") != route_id
+                    or record.get("route_hash") != route_hash
+                    or record.get("campaign_id") != binding.get("campaign_id")
+                    or cycle_dir(root, record["campaign_id"], cid, record) != directory):
+                continue
+            placement_path = producer_dir(root) / "bucket-placements" / f"{cid}.json"
+            manifest_path = producer_dir(root) / "open-manifests" / f"{cid}.json"
+            try:
+                placement_bytes = placement_path.read_bytes()
+                manifest_bytes = manifest_path.read_bytes()
+                manifest = json.loads(manifest_bytes)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            checkpoint = _read_json(checkpoint_state_path(root, cid)) or {}
+            if (checkpoint.get("manifest_id") != manifest.get("manifest_id")
+                    or checkpoint.get("manifest_revision_id") != manifest.get("manifest_revision_id")
+                    or checkpoint.get("route_id") != route_id):
+                continue
+            relative = origin.relative_to(directory).as_posix()
+            moves = _output_placements(root, record)
+            applicable = [row for row in moves if relative == row["from"]
+                          or relative.startswith(row["from"] + "/")]
+            if len(applicable) != 1:
+                continue
+            placed = _placed_locator(relative, moves)
+            if placed == relative or not placed:
+                continue
+            target = directory / placed
+            try:
+                canonical_output = output.resolve()
+                canonical_target = target.resolve(strict=True)
+                canonical_target.relative_to(canonical_output)
+                if canonical_target != target or not target.is_file() or not os.access(target, os.R_OK):
+                    continue
+                content = target.read_bytes()
+            except (OSError, ValueError):
+                continue
+            digest = "sha256:" + hashlib.sha256(content).hexdigest()
+            revisions = [row for row in (manifest.get("artifact_revisions") or [])
+                         if isinstance(row, dict)
+                         and isinstance(row.get("locator"), dict)
+                         and row["locator"].get("path") == placed
+                         and row.get("content_digest") == digest
+                         and row.get("byte_size") == len(content)
+                         and isinstance(row.get("provenance"), dict)
+                         and row["provenance"].get("producer_route_id") == route_id]
+            routes = [row for row in (manifest.get("routes") or [])
+                      if isinstance(row, dict) and row.get("route_id") == route_id
+                      and row.get("route_hash") == route_hash]
+            cycle = manifest.get("cycle")
+            if (not isinstance(cycle, dict)
+                    or cycle.get("cycle_id") != cid
+                    or cycle.get("campaign_id") != record["campaign_id"]
+                    or manifest.get("manifest_id") is None
+                    or not manifest.get("manifest_revision_id")
+                    or len(revisions) != 1 or len(routes) != 1):
+                continue
+            return {
+                "origin": str(origin), "destination": str(target),
+                "cycle_id": cid, "manifest_revision_id": manifest["manifest_revision_id"],
+                "artifact_revision_id": revisions[0]["artifact_revision_id"],
+                "current_content_digest": digest,
+                "placement_sha256": hashlib.sha256(placement_bytes).hexdigest(),
+                "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            }
+    return None
+
+
 def _placed_locator(locator: Optional[str], moved: Sequence[Mapping[str, str]]) -> Optional[str]:
     if not locator:
         return locator

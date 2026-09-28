@@ -2,6 +2,7 @@
 """Open-cycle checkpoint: the interim manifest, its ID continuity into
 `finalize`, its gates, and the automatic trigger launcher."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -155,6 +156,38 @@ class InterimManifestTest(CheckpointTestBase):
         mapped.write_bytes(b"changed after completion")
         with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
             self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
+
+    def test_placed_output_proof_binds_ledger_manifest_and_current_bytes(self):
+        original = self.write_output(self.result, "plan.md", b"exact plan\n")
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        expected = dict(route_id=self.route_obj["route_id"], route_hash=self.route_obj["route_hash"])
+        proof = P.placed_output_proof(original, **expected)
+        self.assertIsNotNone(proof)
+        target = Path(proof["destination"])
+        self.assertEqual(target.read_bytes(), b"exact plan\n")
+        self.assertEqual(proof["current_content_digest"], "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest())
+        self.assertIsNone(P.placed_output_proof(original, route_id=expected["route_id"], route_hash="sha256:" + "0" * 64))
+        target.write_bytes(b"changed after manifest")
+        self.assertIsNone(P.placed_output_proof(original, **expected))
+        target.write_bytes(b"exact plan\n")
+        manifest = P.open_manifest_path(self.root, self.cycle_id)
+        original_manifest = manifest.read_bytes()
+        changed = json.loads(original_manifest)
+        changed["artifact_revisions"][0]["content_digest"] = "sha256:" + "0" * 64
+        manifest.write_text(json.dumps(changed), encoding="utf-8")
+        self.assertIsNone(P.placed_output_proof(original, **expected))
+        manifest.write_bytes(original_manifest)
+        ledger = P.producer_dir(self.root) / "bucket-placements" / f"{self.cycle_id}.json"
+        original_ledger = ledger.read_bytes()
+        ledger.write_text('{"moves":[]}', encoding="utf-8")
+        self.assertIsNone(P.placed_output_proof(original, **expected))
+        duplicate = json.loads(original_ledger)
+        duplicate["moves"].append(dict(duplicate["moves"][0]))
+        ledger.write_text(json.dumps(duplicate), encoding="utf-8")
+        self.assertIsNone(P.placed_output_proof(original, **expected))
+        ledger.write_bytes(original_ledger)
+        original.write_bytes(b"different file at old path")
+        self.assertIsNone(P.placed_output_proof(original, **expected))
 
     def test_internal_migration_snapshot_keeps_its_recorded_paths(self):
         self.write_output(self.result, "shared-input/_internal/migration-shared-bases.json", b"{}")

@@ -373,6 +373,8 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "prior_terminal_note",
     "prior_classifier_source",
     "prior_failure_class",
+    "prior_reconcile_reason",
+    "terminal_correction_b64",
     "conflicting_classifier_source",
     "conflicting_failure_class",
     "conflicting_terminal_note",

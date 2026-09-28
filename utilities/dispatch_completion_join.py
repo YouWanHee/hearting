@@ -3850,7 +3850,8 @@ def apply_exact_route_free_review_classification(
 
 
 def close_finished_child(
-    row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None
+    row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None,
+    correct_recorded_move: bool = False,
 ) -> str:
     """Reconcile cleanup or commit a still-open child's exact terminal evidence.
 
@@ -3859,7 +3860,10 @@ def close_finished_child(
     """
 
     metadata = getattr(row, "metadata", {}) or {}
-    if row.status not in OPEN_STATES and deferred_completion(metadata) != "pending":
+    if (row.status not in OPEN_STATES and deferred_completion(metadata) != "pending"
+            and not (correct_recorded_move and row.status == "done"
+                     and metadata.get("note") == "dead-invalid-envelope"
+                     and metadata.get("reconcile_reason") == "terminal-invalid:artifact-missing")):
         # A done row closed typed-deferred (budget exhausted, no marker yet)
         # is not finished -- it still owes the completion command below, so
         # only every OTHER terminal row (including a marker-bound deferred
@@ -3892,6 +3896,12 @@ def close_finished_child(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
     )
+    if correct_recorded_move and (
+        terminal.get("state") != "valid"
+        or terminal.get("verdict") != "PASS"
+        or not terminal.get("artifact_origin_path_b64")
+    ):
+        return "recorded-move-correction-evidence-unavailable"
     if terminal.get("state") != "valid":
         # Carry the inspector's own enum: a bare `terminal-invalid` sends the
         # next reader back through the parser to learn whether the envelope was

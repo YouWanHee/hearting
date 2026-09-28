@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, hashlib, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -3377,6 +3377,100 @@ class TestContinuation(unittest.TestCase):
     if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
 
+ def test_recorded_move_corrects_only_exact_artifact_missing_terminal(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   previous_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
+   jobs=Path(tmp)/"state"/"jobs.log";jobs.parent.mkdir(parents=True)
+   os.environ["AGENT_DISPATCH_JOBS"]=str(jobs)
+   try:
+    source=self._source(Path(tmp)/"artifacts")
+    node=next(row for row in source["nodes"] if row["id"]=="execute")
+    attempt="att-recorded-move-correction"
+    evidence=Path(tmp)/"evidence"/"execute.md";evidence.parent.mkdir()
+    evidence.write_text("exact current file\n",encoding="utf-8")
+    origin=Path(tmp)/"artifacts"/"execute.md"
+    log=Path(tmp)/f"worker.{attempt}.codex.jsonl"
+    log.write_text('{"type":"turn.completed","timestamp":"2026-09-28T07:29:16Z"}\n')
+    namespace="pid:[fixture]"
+    meta={
+     "attempt_id":attempt,"attempt_schema_version":"2",
+     "dispatch_depth":str(node["dispatch_depth"]),"transport":"headless",
+     "execution_surface":"registered-headless","registered_worker":"1",
+     "fallback_hop":"same-harness-headless","route_id":source["route_id"],
+     "route_hash":source["route_hash"],"route_node":node["id"],
+     "worker_type":"stage","launch_lifecycle":"foreground-scoped",
+     "pid_scope":"namespace-local","pid_ns":namespace,"pid_observer_ns":namespace,
+     "group_reap_proof":"pgid-empty-v1","attempt_descendant_proof":"attempt-tagged-empty-v1",
+     "log_file":str(log),"artifact_root":str(source["artifact_root"]),
+     "note":"dead-invalid-envelope","failure_class":"invalid-envelope",
+     "classifier_source":"completion-join-invalid-envelope-v1",
+     "reconcile_reason":"terminal-invalid:artifact-missing",
+    }
+    def row(metadata):
+     pipe=",".join(f"{k}={v}" for k,v in metadata.items())
+     jobs.write_text("\t".join(["2026-09-28T07:23:36Z","done",source["cwd"],source["cwd"],"stage",pipe])+"\n")
+    row(meta)
+    encoded=lambda p:base64.urlsafe_b64encode(str(p).encode()).decode().rstrip("=")
+    terminal={"state":"valid","source":"exact-turn-completed","terminal_event":"turn.completed",
+              "verdict":"PASS","failure_class":"pass","artifact_state":"readable",
+              "artifact_shape":"file","artifact_origin_path_b64":encoded(origin),
+              "artifact_path_b64":encoded(evidence)}
+    proof={"destination":str(evidence),"origin":str(origin),"cycle_id":"cyc-fixture",
+           "manifest_revision_id":"mrev-fixture","artifact_revision_id":"arev-fixture",
+           "current_content_digest":"sha256:"+hashlib.sha256(evidence.read_bytes()).hexdigest(),
+           "placement_sha256":"a"*64,"manifest_sha256":"b"*64}
+    with mock.patch.object(R,"inspect_terminal_attempt",return_value=terminal), \
+         mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
+         mock.patch.object(R,"process_namespace_identity",return_value=namespace), \
+         mock.patch("artifact_producer.placed_output_proof",return_value=proof):
+     with mock.patch.object(R,"_atomic_registry_replace",side_effect=OSError("interrupted")):
+      with self.assertRaises(OSError):
+       R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+     self.assertEqual(R.parse_registry_metadata(jobs.read_text().split("\t",5)[5])["note"],"dead-invalid-envelope")
+     marker,result=R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+     self.assertEqual(result["status"],"marker-appended")
+     corrected=jobs.read_bytes()
+     metadata=R.parse_registry_metadata(corrected.decode().split("\t",5)[5])
+     self.assertEqual(metadata["note"],"completed-marker")
+     self.assertEqual(metadata["failure_class"],"pass")
+     self.assertEqual(metadata["prior_terminal_note"],"dead-invalid-envelope")
+     self.assertEqual(metadata["prior_failure_class"],"invalid-envelope")
+     audit=json.loads(base64.urlsafe_b64decode(metadata["terminal_correction_b64"]+"="*(-len(metadata["terminal_correction_b64"])%4)))
+     self.assertEqual(audit["terminal_time"],"2026-09-28T07:29:16Z")
+     self.assertEqual(audit["terminal_log_sha256"],hashlib.sha256(log.read_bytes()).hexdigest())
+     again,_=R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+     self.assertEqual(again["sequence"],marker["sequence"])
+     self.assertEqual(jobs.read_bytes(),corrected)
+    # Other terminal verdicts, a changed route, and a missing move ledger
+    # cannot use the same narrow correction, even with a readable file.
+    for change in ({"failure_class":"fail"},{"route_hash":"sha256:"+"0"*64},{}):
+     row({**meta,**change})
+     with mock.patch.object(R,"inspect_terminal_attempt",return_value=terminal), \
+          mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
+          mock.patch.object(R,"process_namespace_identity",return_value=namespace), \
+          mock.patch("artifact_producer.placed_output_proof",return_value=None if not change else proof):
+      with self.assertRaises(ValueError):
+       R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+    for verdict in ("FAIL","BLOCKED"):
+     row(meta)
+     with mock.patch.object(R,"inspect_terminal_attempt",return_value={**terminal,"verdict":verdict}), \
+          mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
+          mock.patch.object(R,"process_namespace_identity",return_value=namespace), \
+          mock.patch("artifact_producer.placed_output_proof",return_value=proof):
+      with self.assertRaises(ValueError):
+       R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+    row(meta)
+    jobs.write_text(jobs.read_text()+jobs.read_text().replace(attempt,"att-newer-attempt"))
+    with mock.patch.object(R,"inspect_terminal_attempt",return_value=terminal), \
+         mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
+         mock.patch.object(R,"process_namespace_identity",return_value=namespace), \
+         mock.patch("artifact_producer.placed_output_proof",return_value=proof):
+     with self.assertRaises(ValueError):
+      R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+   finally:
+    if previous_jobs is None:os.environ.pop("AGENT_DISPATCH_JOBS",None)
+    else:os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
+
  def test_c_pin_and_grounding_must_name_one_commit(self):
   # S5: the pin (`git rev-parse HEAD`) and the grounding (`source_revision`) are
   # read by different functions at different moments -- exactly defect C's shape.
@@ -4685,6 +4779,9 @@ class SourceCensusTest(unittest.TestCase):
   # Inline finish's exact-cycle binding validates the already-admitted route
   # tuple; it does not choose which cycle the route owns.
   "finalize_exact_cycle",
+  # Read-only proof of an already-bound checkpoint move checks the route ID in
+  # the cycle record, checkpoint and manifest; it never selects cycle ownership.
+  "placed_output_proof",
   # The producer's inline binding check calls cycle_route_admission above,
   # then compares the pending finish intent's route ID with that admitted
   # binding. This is finish-tuple integrity, not another cycle selection.

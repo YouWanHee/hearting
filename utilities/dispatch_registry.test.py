@@ -1526,6 +1526,134 @@ class RegistryTest(unittest.TestCase):
      "authenticated-namespace-portable" if portable else "exact-teardown")
 
 
+class SameHostForegroundStageReceiptTest(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
+  self.repo=self.base/"repo";self.repo.mkdir()
+  self.root=self.repo/".agent_reports";self.root.mkdir()
+  self.artifact=self.root/"plan.md";self.artifact.write_text("finished plan\n")
+  self.jobs=self.base/"jobs.log"
+  self.attempt="att-same-host-stage"
+  self.log=self.base/f"plan.{self.attempt}.codex.jsonl"
+  self.namespace=os.readlink("/proc/self/ns/pid")
+  self.pid=99999996;self.pid_start="1"
+  self.live=None
+  self.write_log()
+  self.write_row()
+
+ def tearDown(self):
+  if self.live is not None:
+   self.live.terminate();self.live.wait(timeout=5)
+  self.tmp.cleanup()
+
+ def write_log(self,*,artifact=None,verdict="PASS",turn=True):
+  path=artifact or self.artifact
+  rows=[{"type":"item.completed","item":{"type":"agent_message",
+         "text":f"artifact: {path}\nverdict: {verdict}\nblocker: none"}}]
+  if turn: rows.append({"type":"turn.completed"})
+  self.log.write_text("\n".join(json.dumps(row) for row in rows)+"\n")
+
+ def write_row(self,*,extra="",namespace=None,pid=None,pid_start=None):
+  pid=self.pid if pid is None else pid
+  start=self.pid_start if pid_start is None else pid_start
+  ns=namespace or self.namespace
+  self.jobs.write_text(
+   f"2026-09-28T07:23:36Z\topen\t{self.repo}\t{self.repo}\tplan\t"
+   f"{CURRENT_ATTEMPT_CONTRACT},worker_type=stage,route_id=rt-stage,"
+   f"route_node=plan,attempt_id={self.attempt},pid={pid},pid_start={start},"
+   f"pgid={pid},pid_scope=namespace-local,pid_ns={ns},pid_observer_ns={ns},"
+   f"launch_lifecycle=foreground-scoped,artifact_root={self.root},"
+   f"log_file={self.log}{extra}\n")
+
+ def invoke(self,*args):
+  return subprocess.run([sys.executable,str(SCRIPT),"reconcile","--jobs",str(self.jobs),
+                         "--attempt",self.attempt,*args],capture_output=True,text=True)
+
+ def decision(self,*args):
+  result=self.invoke(*args)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  return json.loads(result.stdout)["decisions"][0]
+
+ def assert_receipt_refused(self):
+  self.assertFalse(self.decision()["category"].startswith("terminal-receipt-"))
+  self.assertNotIn("group_reap_proof",self.jobs.read_text())
+
+ def test_dry_run_then_apply_seals_only_process_receipt(self):
+  before=self.jobs.read_bytes()
+  self.assertEqual(self.decision()["category"],"terminal-receipt-ready")
+  self.assertEqual(self.jobs.read_bytes(),before)
+  result=self.invoke("--apply")
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  record=json.loads(result.stdout)
+  self.assertEqual(record["pending_delivery"],{"skipped":"exact-attempt-only"})
+  applied=record["decisions"][0]
+  self.assertEqual(applied["category"],"terminal-receipt-sealed")
+  self.assertTrue(applied["revalidated"])
+  line=self.jobs.read_text()
+  self.assertIn("\topen\t",line)
+  self.assertNotIn("failure_class=pass",line)
+  self.assertNotIn("completion-marker",line)
+  metadata=parse_registry_metadata(line.strip().split("\t",5)[5])
+  self.assertEqual(post_exit_receipt_reason(metadata),"governed-process-group-reaped")
+  self.assertEqual(attempt_process_quiescence(metadata,terminal_receipt=True).state,"quiescent")
+  self.assertEqual(self.decision()["category"],"terminal-receipt-ready")
+  before_retry=self.jobs.read_bytes()
+  retry=self.invoke("--apply")
+  self.assertEqual(retry.returncode,0,retry.stdout+retry.stderr)
+  self.assertEqual(json.loads(retry.stdout)["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(json.loads(retry.stdout)["decisions"][0]["category"],"terminal-receipt-sealed")
+  self.assertEqual(self.jobs.read_bytes(),before_retry)
+
+ def test_ambiguous_or_reused_identity_stays_pending(self):
+  self.write_row(extra=(f",pid_host=99999997,pid_host_start=1,pid_host_ns={self.namespace},"
+                        "pid_host_proof=nspid-procfs-root-v1"))
+  self.assert_receipt_refused()
+  self.live=subprocess.Popen(["sleep","60"],start_new_session=True)
+  actual=Path(f"/proc/{self.live.pid}/stat").read_text().rsplit(") ",1)[1].split()[19]
+  self.write_row(pid=self.live.pid,pid_start=str(int(actual)+1))
+  self.assert_receipt_refused()
+
+ def test_live_or_foreign_process_stays_pending(self):
+  self.live=subprocess.Popen(["sleep","60"],start_new_session=True)
+  actual=Path(f"/proc/{self.live.pid}/stat").read_text().rsplit(") ",1)[1].split()[19]
+  self.write_row(pid=self.live.pid,pid_start=actual)
+  self.assert_receipt_refused()
+  self.write_row(namespace="pid:[987654321]")
+  self.assert_receipt_refused()
+
+ def test_damaged_handoff_or_missing_artifact_stays_pending(self):
+  self.write_log(turn=False)
+  self.assert_receipt_refused()
+  self.write_log(verdict="FAIL")
+  self.assert_receipt_refused()
+  self.write_log(artifact=self.root/"missing.md")
+  self.assert_receipt_refused()
+
+ def test_failed_exact_correction_never_marks_success_or_delivers_broad_pending(self):
+  self.write_row(extra=",note=dead-invalid-envelope,failure_class=invalid-envelope,"
+                       "classifier_source=completion-join-invalid-envelope-v1,"
+                       "reconcile_reason=terminal-invalid:artifact-missing")
+  self.jobs.write_text(self.jobs.read_text().replace("\topen\t","\tdone\t"))
+  spec=importlib.util.spec_from_file_location("registry_exact_correction_fixture",SCRIPT)
+  module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  args=types.SimpleNamespace(jobs=self.jobs,attempt=self.attempt,session=None,route=None,
+                             node=None,job=None,all=False,apply=True,agent_home=self.base,
+                             only_exact_dead=False,audit=None)
+  original=self.jobs.read_bytes()
+  with mock.patch.object(module,"_recorded_move_correction_proof",return_value={"exact":True}), \
+       mock.patch.object(module,"close_finished_child",return_value="completion-rejected"), \
+       mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("broad delivery")):
+   for _ in range(2):
+    stream=io.StringIO()
+    with contextlib.redirect_stdout(stream):
+     module.reconcile(module.read_rows(self.jobs),args)
+    result=json.loads(stream.getvalue())
+    self.assertEqual(result["pending_delivery"],{"skipped":"exact-attempt-only"})
+    self.assertEqual(result["closed"],0)
+    self.assertEqual(result["decisions"][0]["category"],"terminal-correction-rejected")
+    self.assertEqual(self.jobs.read_bytes(),original)
+
+
 class ArtifactProofReceiptSealTest(unittest.TestCase):
  """A PASS worker whose post-exit receipt can never be issued must be recoverable.
 

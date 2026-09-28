@@ -21,12 +21,15 @@ sys.path[:0] = [str(ROOT), str(ROOT / "utilities")]
 from tools.fleet.model import ATTEMPT_CLASSIFIER_SOURCE, classify_attempt_evidence  # noqa: E402
 from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                AUTOMATIC_RECEIPTLESS_CLASSIFIER,
+                               ATTEMPT_DESCENDANT_PROOF,
                                DispatchContractError,
+                               GROUP_REAP_PROOF,
                                PARENT_EXTINCTION_TERMINAL_STATUSES,
                                agent_home_equivalent,
                                annotate_attempt_row_if,
                                attempt_governed_process_quiescence,
                                attempt_process_quiescence,
+                               attempt_scan_namespace_authority,
                                attempt_tagged_descendants,
                                authoritative_process_identities,
                                close_attempt_row,
@@ -41,6 +44,7 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                prove_attempt_quiescence,
                                observed_attempt_liveness,
                                post_exit_receipt_reason,
+                               process_namespace_identity,
                                recovery_id,
                                dispatch_state_roots,
                                claim_recovery_retry,
@@ -70,8 +74,11 @@ from codex_dispatch_terminal import (  # noqa: E402
 )
 from dispatch_completion_join import (  # noqa: E402
     ChildRow,
+    JoinContractError,
     classify_exact_route_free_review_outcome,
+    close_finished_child,
     current_attempt_row,
+    exact_attempt_row,
     materialize_after_terminal_close,
     reconcile_pending_delivery,
     review_terminal_evidence,
@@ -608,6 +615,101 @@ def _foreground_binding(meta):
         return None
 
 
+def _same_host_foreground_stage_receipt(row):
+    """Recover only a finished stage whose exact local process and output are proved.
+
+    A foreground wrapper normally publishes this receipt after waiting on its
+    child. If that wrapper disappears first, a same-namespace observer can
+    reconstruct the group-empty proof without treating a PASS string or a
+    missing PID alone as completion. Foreign namespaces remain receipt-gated.
+    """
+    meta = row["meta"]
+    if (row["status"] not in OPEN or row.get("attempt_contract_status") != "current"
+            or meta.get("registered_worker") != "1"
+            or meta.get("worker_type") != "stage"
+            or meta.get("dispatch_depth") != "2"
+            or meta.get("launch_lifecycle") != "foreground-scoped"
+            or meta.get("pid_scope") != "namespace-local"
+            or not meta.get("route_id") or not meta.get("route_node")
+            or post_exit_receipt_reason(meta)):
+        return None
+    attempt = meta.get("attempt_id", "")
+    pid = meta.get("pid", "")
+    namespace = process_namespace_identity()
+    if (not attempt or not pid.isdigit() or not meta.get("pid_start")
+            or meta.get("pgid") != pid or not namespace
+            or meta.get("pid_ns") != namespace
+            or meta.get("pid_observer_ns") != namespace
+            or not attempt_scan_namespace_authority(meta)):
+        return None
+    identities = authoritative_process_identities(meta)
+    if (len(identities) != 1 or identities[0].source != "local"
+            or identities[0].pid != int(pid)
+            or identities[0].expected_start != meta["pid_start"]):
+        return None
+    log_file = meta.get("log_file", "")
+    if not log_file or not Path(log_file).name.endswith(f".{attempt}.codex.jsonl"):
+        return None
+    terminal = inspect_terminal_attempt(
+        log_file, worktree=row.get("worktree"),
+        artifact_root_metadata=meta.get("artifact_root"),
+    )
+    if not (terminal.get("state") == "valid"
+            and terminal.get("source") == "exact-turn-completed"
+            and terminal.get("terminal_event") == "turn.completed"
+            and terminal.get("verdict") == "PASS"
+            and terminal.get("failure_class") == "pass"
+            and terminal.get("artifact_state") == "readable"
+            and terminal.get("artifact_shape") == "file"):
+        return None
+    governed = attempt_governed_process_quiescence(meta)
+    if governed.state != "quiescent" or governed.reason != "local-pid-gone":
+        return None
+    proof = prove_attempt_quiescence(meta, max_wait_seconds=0)
+    if (not proof.proven or proof.source != "exact-teardown"
+            or proof.process_group_state != "empty"
+            or proof.descendant_state != "empty" or not proof.namespace_authority):
+        return None
+    return {
+        "launch_outcome": "governed-process-reaped",
+        "group_reap_proof": GROUP_REAP_PROOF,
+        "group_reap_pgid": pid,
+        "attempt_descendant_proof": ATTEMPT_DESCENDANT_PROOF,
+        "attempt_descendant_observer_ns": namespace,
+    }
+
+
+def _recorded_move_correction_proof(row, rows, args):
+    """Preview only this exact attempt's already-committed artifact false negative."""
+    meta = row["meta"]
+    if (not args.attempt or args.attempt != meta.get("attempt_id")
+            or row["status"] != "done"
+            or meta.get("note") != "dead-invalid-envelope"
+            or meta.get("reconcile_reason") != "terminal-invalid:artifact-missing"):
+        return None
+    route_file = Path(meta.get("route_file") or "")
+    if not route_file.is_file():
+        return None
+    try:
+        route = json.loads(route_file.read_text(encoding="utf-8"))
+        node = next(node for node in route["nodes"] if node["id"] == meta.get("route_node"))
+        terminal = inspect_terminal_attempt(
+            meta.get("log_file"), worktree=row["worktree"],
+            artifact_root_metadata=meta.get("artifact_root"))
+        encoded = str(terminal.get("artifact_path_b64") or "")
+        evidence = Path(base64.urlsafe_b64decode(
+            encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+        spec = importlib.util.spec_from_file_location(
+            "capability_route_reconcile", ROOT / "utilities" / "capability-route.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module._placed_artifact_false_negative(
+            route, node, row["raw"].split("\t"), meta, evidence,
+            [item["raw"] for item in rows])
+    except (OSError, ValueError, KeyError, StopIteration, UnicodeDecodeError, TypeError):
+        return None
+
+
 def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
     if row["status"] not in OPEN:
         return "terminal", "cleanup-check-required", None
@@ -666,6 +768,19 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
                 worktree=row.get("worktree"),
                 artifact_root_metadata=meta.get("artifact_root"),
             )
+            if (meta.get("worker_type") == "stage"
+                    and meta.get("dispatch_depth") == "2"
+                    and meta.get("launch_lifecycle") == "foreground-scoped"
+                    and post_exit_receipt_reason(meta)
+                    and attempt_view.get("state") == "valid"
+                    and attempt_view.get("source") == "exact-turn-completed"
+                    and attempt_view.get("verdict") == "PASS"
+                    and attempt_view.get("artifact_state") == "readable"):
+                # The group receipt is process evidence, not a completion
+                # marker. A parked owner's existing terminal writer must still
+                # commit the marker; another reconcile must not turn its
+                # pending PASS into a synthetic dead-missing-marker failure.
+                return "terminal-pending", "terminal-commit-required", None
             note = (
                 "dead-missing-marker"
                 if attempt_view.get("artifact_state") == "readable"
@@ -904,6 +1019,7 @@ def repair_stale_row(rows, args):
 def reconcile(rows, args):
     only_exact_dead = getattr(args, "only_exact_dead", False)
     selected = [row for row in rows if matches(row, args)]
+    exact_repair_only = False
     newest = {}
     for row in rows:
         key = fold_key(row["meta"])
@@ -918,6 +1034,103 @@ def reconcile(rows, args):
         category, reason, note = classify(
             row, args, newest, rows, expected_binding=selected_binding
         )
+        correction = (
+            _recorded_move_correction_proof(row, rows, args)
+            if len(selected) == 1 and row.get("attempt_contract_status") == "current"
+            else None
+        )
+        if correction is not None:
+            exact_repair_only = True
+            completion = "not-attempted"
+            completed = False
+            if args.apply:
+                try:
+                    fresh = exact_attempt_row(args.jobs, row["meta"]["attempt_id"])
+                    completion = close_finished_child(
+                        fresh, jobs=args.jobs, correct_recorded_move=True
+                    ) or "writer-returned-success"
+                    latest = next((item for item in read_rows(args.jobs)
+                                   if item["meta"].get("attempt_id") == row["meta"]["attempt_id"]), None)
+                    completed = bool(latest and latest["status"] == "done"
+                                     and latest["meta"].get("note") == "completed-marker"
+                                     and _marker_backed_repair(latest, args.agent_home, args.jobs))
+                except (DispatchContractError, JoinContractError, OSError, ValueError) as exc:
+                    completion = getattr(exc, "reason", type(exc).__name__)
+            decisions.append({
+                "attempt_id": row["meta"]["attempt_id"], "slug": row["slug"],
+                "category": "terminal-correction-completed" if completed else
+                            "terminal-correction-rejected" if args.apply else "terminal-correction-ready",
+                "reason": "recorded-bucket-move-artifact-missing-false-negative",
+                "closed": completed, "completion": completion,
+                "proposed_note": None, "revalidated": completed if args.apply else None,
+                "cascade": [], "cleanup": None,
+                "summary_owner": {"state": "not-applied", "reason": "exact-correction-only"},
+            })
+            continue
+        # A same-host foreground stage can outlive the wrapper that normally
+        # publishes its post-exit receipt. Reconstruct only that receipt from
+        # the exact terminal envelope and complete local teardown proof, then
+        # use the existing exact completion writer for its marker and result.
+        receipt = (
+            _same_host_foreground_stage_receipt(row)
+            if category == "terminal-draining" else None
+        )
+        meta = row["meta"]
+        receipt_reentry = bool(
+            category == "terminal-pending" and row["status"] in OPEN
+            and row.get("attempt_contract_status") == "current"
+            and meta.get("worker_type") == "stage"
+            and meta.get("dispatch_depth") == "2"
+            and meta.get("launch_lifecycle") == "foreground-scoped"
+            and meta.get("route_id") and meta.get("route_node")
+            and meta.get("log_file", "").endswith(
+                f".{meta.get('attempt_id', '')}.codex.jsonl")
+            and post_exit_receipt_reason(meta) == "governed-process-group-reaped"
+            and meta.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
+            and meta.get("attempt_descendant_observer_ns") == process_namespace_identity()
+            and attempt_process_quiescence(meta, terminal_receipt=True).state == "quiescent"
+        )
+        if receipt is not None or receipt_reentry:
+            exact_repair_only = True
+            sealed = receipt_reentry
+            completion = "not-attempted"
+            completed = False
+            if args.apply and receipt is not None:
+                sealed = annotate_attempt_row_if(
+                    args.jobs, row["meta"]["attempt_id"], receipt,
+                    lambda fields: (
+                        fields == row["raw"].split("\t")
+                        and _same_host_foreground_stage_receipt(row) == receipt
+                    ),
+                )
+            if args.apply and sealed:
+                try:
+                    # v2.159.1 parked owners predate bucket-placement lookup.
+                    # Drive their existing exact completion writer here with
+                    # the current inspector's recorded moved path, then let
+                    # the old owner consume a normal done+marker receipt.
+                    fresh = exact_attempt_row(args.jobs, row["meta"]["attempt_id"])
+                    completion = close_finished_child(fresh, jobs=args.jobs) or "writer-returned-success"
+                    latest = next((item for item in read_rows(args.jobs)
+                                   if item["meta"].get("attempt_id") == row["meta"]["attempt_id"]), None)
+                    completed = bool(latest and latest["status"] == "done"
+                                     and latest["meta"].get("note") == "completed-marker"
+                                     and _marker_backed_repair(latest, args.agent_home, args.jobs))
+                except (DispatchContractError, JoinContractError, OSError, ValueError) as exc:
+                    completion = getattr(exc, "reason", type(exc).__name__)
+            decisions.append({
+                "attempt_id": row["meta"]["attempt_id"], "slug": row["slug"],
+                "category": "terminal-receipt-completed" if completed else "terminal-receipt-sealed"
+                            if sealed and args.apply else "terminal-receipt-ready"
+                            if not args.apply else "terminal-receipt-revalidation-veto",
+                "reason": "same-host-foreground-stage-post-exit-proof",
+                "proposed_note": None,
+                "revalidated": sealed if args.apply and receipt is not None else None,
+                "closed": completed, "completion": completion, "cascade": [],
+                "summary_owner": {"state": "not-applied", "reason": "receipt-only"},
+                "cleanup": None,
+            })
+            continue
         terminal_cleanup = None
         if not only_exact_dead and row["status"] not in OPEN and row.get("attempt_contract_status") == "current":
             terminal_cleanup = resolve_attempt_cleanup(
@@ -990,6 +1203,10 @@ def reconcile(rows, args):
               "decisions": decisions[:256]}
     if only_exact_dead:
         pass  # Exact join recovery never repairs unrelated delivery/owner state.
+    elif args.apply and exact_repair_only and len(selected) == 1:
+        # This operator repair is bound to one exact attempt. Do not make its
+        # transaction a carrier for unrelated pending deliveries.
+        record["pending_delivery"] = {"skipped": "exact-attempt-only"}
     elif args.apply:
         # SD-111 P2 §2-b-2/§2-c: this `reconcile` call is the existing
         # bounded-cadence "dispatch reconcile path" -- the materialize
