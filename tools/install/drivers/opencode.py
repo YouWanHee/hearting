@@ -387,6 +387,7 @@ def checks(scope="global"):
                 "tools/memory/git_exchange_v2.py",
                 "tools/memory/sync_v2.py",
                 "tools/memory/migration_v2.py",
+                "tools/memory/store_resolve.py",
             ],
             cwd=agent_home,
         )
