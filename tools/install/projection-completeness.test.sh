@@ -98,6 +98,11 @@ PY
   test "$resolved_codex" = "$VENDOR_BIN/codex" \
     || fail "$mode native Codex command changed: ${resolved_codex:-missing}"
   test ! -e "$CODEX_HOME/.harness/bin/codex" || fail "$mode recreated retired launcher"
+  CODEX_RUNTIME_PROJECTION_SKIP_CLI_DISCOVERY=1 AGENT_HOME="$ROOT" \
+    "$ROOT/adapters/codex/bin/check-runtime-projection.sh" > "$TMP/$mode-native-projection.log" \
+    || { cat "$TMP/$mode-native-projection.log" >&2; fail "$mode native projection failed"; }
+  grep -q 'check=managed-launcher:retired required=0' "$TMP/$mode-native-projection.log" \
+    || fail "$mode still requires a managed launcher"
 
   test "$(count_dirs "$HOME/.codex/skills")" = "$EXPECTED_CAPABILITIES" || fail "$mode Codex skill count"
   test "$(count_dirs "$HOME/.claude/skills")" = "$EXPECTED_CAPABILITIES" || fail "$mode Claude skill count"

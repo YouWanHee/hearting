@@ -111,7 +111,9 @@ class PreflightDispatchOwnerTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, output)
                 self.assertIn(f"adapter={adapter}", output)
                 self.assertNotIn("managed-entry-required", output)
-                self.assertIn("parent_completion_delivery=codex-native-queue", output)
+                self.assertIn("parent_session_id=01a0dc8c-18ad-7853-8a0f-69222f4d7888", output)
+                self.assertIn("status=dry-run", output)
+                self.assertIn("child_spawned=0", output)
                 self.assertEqual(jobs.read_text(encoding="utf-8"), "")
 
     def test_low_level_dispatch_arm_still_reaches_codex_wrapper_directly(self):
