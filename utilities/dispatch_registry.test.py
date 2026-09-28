@@ -1653,6 +1653,26 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
     self.assertEqual(result["decisions"][0]["category"],"terminal-correction-rejected")
     self.assertEqual(self.jobs.read_bytes(),original)
 
+ def test_completed_exact_correction_reentry_skips_broad_pending(self):
+  self.write_row(extra=",note=completed-marker,failure_class=pass,"
+                       "classifier_source=recorded-bucket-move-correction-v1,"
+                       "terminal_correction_b64=eyJleGFjdCI6dHJ1ZX0")
+  self.jobs.write_text(self.jobs.read_text().replace("\topen\t","\tdone\t"))
+  spec=importlib.util.spec_from_file_location("registry_correction_reentry_fixture",SCRIPT)
+  module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  args=types.SimpleNamespace(jobs=self.jobs,attempt=self.attempt,session=None,route=None,
+                             node=None,job=None,all=False,apply=True,agent_home=self.base,
+                             only_exact_dead=False,audit=None)
+  original=self.jobs.read_bytes()
+  with mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("broad delivery")), \
+       mock.patch.object(module,"close_finished_child",side_effect=AssertionError("duplicate completion")):
+   stream=io.StringIO()
+   with contextlib.redirect_stdout(stream):
+    module.reconcile(module.read_rows(self.jobs),args)
+  result=json.loads(stream.getvalue())
+  self.assertEqual(result["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(self.jobs.read_bytes(),original)
+
 
 class ArtifactProofReceiptSealTest(unittest.TestCase):
  """A PASS worker whose post-exit receipt can never be issued must be recoverable.

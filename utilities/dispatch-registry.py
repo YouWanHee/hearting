@@ -1026,6 +1026,25 @@ def reconcile(rows, args):
         if all(key[:2]): newest[key] = row["order"]
     decisions = []
     for row in selected:
+        # An exact recorded-move correction remains an exact-only repair on
+        # re-entry. Otherwise the now-completed row bypasses the correction
+        # branch and this call could deliver unrelated pending attempts.
+        if (len(selected) == 1 and row["status"] == "done"
+                and row["meta"].get("note") == "completed-marker"
+                and row["meta"].get("terminal_correction_b64")
+                and row["meta"].get("classifier_source") == "recorded-bucket-move-correction-v1"):
+            exact_repair_only = True
+            verified = _marker_backed_repair(row, args.agent_home, args.jobs)
+            decisions.append({
+                "attempt_id": row["meta"]["attempt_id"], "slug": row["slug"],
+                "category": "terminal-correction-already-completed" if verified
+                            else "terminal-correction-marker-unverified",
+                "reason": "recorded-bucket-move-artifact-missing-false-negative",
+                "closed": False, "completion": "already-completed" if verified else "marker-unverified",
+                "proposed_note": None, "revalidated": verified, "cascade": [], "cleanup": None,
+                "summary_owner": {"state": "not-applied", "reason": "exact-correction-only"},
+            })
+            continue
         selected_binding = (
             _foreground_binding(row["meta"])
             if _foreground_review_candidate(row["meta"])
