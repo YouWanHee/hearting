@@ -490,8 +490,8 @@ starts no subprocess or SessionEnd work, and emits no continuation. This
 supersedes older `native-Stop` and ordinary interactive park wording in this
 section; those shapes are migration history only.
 
-SD-92 completion binds to the calling `CODEX_THREAD_ID`, never a thread observed
-by a gateway. The interactive launcher and gateway are retired. Native queue
+SD-92 completion binds to the calling `CODEX_THREAD_ID`.
+The interactive launcher and gateway are retired. Native queue
 submission is at-least-once; pending/history checks suppress known duplicates.
 Interrupted-parent restart requires one exact pending Hearting item. Transport
 refusal preserves the delivery obligation independently of child completion.
