@@ -70,6 +70,16 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(CT._reject_code("My Fixture Slug", ctx, set()), "slug-like")
         self.assertEqual(CT._reject_code("My Fixture", ctx, set()), "slug-like")
 
+    def test_record_title_rejects_literal_folder_label_but_keeps_human_title(self):
+        record = {"locator": "2026-09-17_num-kws-tf-first-code", "slug": "num-kws-tf-first-code",
+                  "title": "NUM_KWS TF-first 구현 및 CPU 검증"}
+        ctx = self._ctx(record=record)
+        self.assertIsNone(CT._reject_code(record["title"], ctx, set(), source="record-title"))
+        for label in (record["slug"], record["locator"]):
+            self.assertEqual(CT._reject_code(label, ctx, set(), source="record-title"), "slug-like")
+        self.assertEqual(CT.derive_display_title(ctx, existing_title=None, reserved=set()).title,
+                         record["title"])
+
     def test_reject_campaign_title_key_slug_and_v2(self):
         ctx = self._ctx(campaign={"title": "Campaign Title", "key": "campaign-key", "slug": "campaign-slug"},
                         v2_title="V2 Display Title")
@@ -189,7 +199,8 @@ class RuleTest(unittest.TestCase):
         # W7-migrated cycle) must not mask the primary-heading outcome as
         # "no-source" -- the terminal reason is the primary step's own outcome, and
         # the rejected chain keeps every attempted source.
-        record = {"locator": "2026-09-17_my-fixture-slug", "title": "My Fixture Slug"}
+        record = {"locator": "2026-09-17_my-fixture-slug", "slug": "my-fixture-slug",
+                  "title": "my-fixture-slug"}
         manifest = {
             "artifacts": [{"artifact_id": "art_x", "role": "primary"}],
             "artifact_revisions": [{"artifact_id": "art_x", "media_type": "application/json",

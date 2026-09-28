@@ -253,20 +253,29 @@ def _primary_heading_candidate(ctx: CycleContext) -> Tuple[Optional[str], Option
     return heading, None
 
 
-def _reject_code(candidate: str, ctx: CycleContext, reserved: Set[str]) -> Optional[str]:
+def _reject_code(candidate: str, ctx: CycleContext, reserved: Set[str], *, source: str = "") -> Optional[str]:
     if not candidate:
         return "empty"
     if _CONTROL_RE.search(candidate):
         return "control-char"
     if len(candidate) > MAX_TITLE_CHARS:
         return "too-long"
-    try:
-        slug, _truncated = artifact_locator.slugify(candidate)
-    except artifact_locator.LocatorError:
-        slug = ""
-    locator_slug = artifact_locator.strip_leading_date(str(ctx.record.get("locator") or ""))
-    if slug and (slug == locator_slug or locator_slug.startswith(slug)):
-        return "slug-like"
+    locator = str(ctx.record.get("locator") or "")
+    if source == "record-title":
+        # The producer often derives a shorter locator from a real title. Only
+        # a literal folder label is residue; slugifying the title loses words.
+        folder_labels = {str(ctx.record.get("slug") or ""), locator,
+                         artifact_locator.strip_leading_date(locator)}
+        if candidate.casefold() in {label.casefold() for label in folder_labels if label}:
+            return "slug-like"
+    else:
+        try:
+            slug, _truncated = artifact_locator.slugify(candidate)
+        except artifact_locator.LocatorError:
+            slug = ""
+        locator_slug = artifact_locator.strip_leading_date(locator)
+        if slug and (slug == locator_slug or locator_slug.startswith(slug)):
+            return "slug-like"
     campaign_values = {
         str(ctx.campaign.get("title") or ""),
         str(ctx.campaign.get("key") or ""),
@@ -301,7 +310,7 @@ def derive_display_title(ctx: CycleContext, *, existing_title: Optional[str], re
         if not isinstance(raw, str) or not raw.strip():
             continue
         candidate = normalize_candidate(raw)
-        code = _reject_code(candidate, ctx, reserved)
+        code = _reject_code(candidate, ctx, reserved, source=source)
         if code is None:
             return Decision(candidate, source, None, tuple(rejected))
         rejected.append((source, code))
