@@ -32,6 +32,9 @@ class TestRunner(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # Runs after (LIFO) nothing else and before the directory removal: a
+        # started run still writing its log made that removal fail in CI.
+        self.addCleanup(self._stop_started_runs)
         self.base = Path(self.temp.name)
         self.repo = self.base / "repo"
         self.repo.mkdir()
@@ -76,6 +79,28 @@ class TestRunner(unittest.TestCase):
             sys.executable, str(SMOKE), "attest", "--input", str(self.repo / "config"),
             "--cwd", str(self.repo), "--output", str(self.attestation), "--", sys.executable, "-c", "pass",
         ], check=True, stdout=subprocess.DEVNULL)
+
+    def _stop_started_runs(self):
+        try:
+            runs = json.loads(self.registry.read_text()).get("runs", {})
+        except (AttributeError, OSError, ValueError):
+            return
+        own = os.getpgrp()
+        groups = {run.get("process_group") for run in runs.values() if isinstance(run, dict)}
+        for group in groups:
+            try:
+                group = int(group)
+                if group <= 1 or group == own:
+                    continue  # fixtures record this test's own group on purpose
+                os.killpg(group, signal.SIGKILL)
+            except (OSError, TypeError, ValueError):
+                continue
+            for _ in range(50):
+                try:
+                    os.killpg(group, 0)
+                except OSError:
+                    break
+                time.sleep(0.02)
 
     def cli(self, *args, cwd=None):
         return subprocess.run([
