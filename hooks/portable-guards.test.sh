@@ -410,7 +410,7 @@ if "$CODEX" prompt-signal "$TMP/flowproj" testsid >"$TMP/codex_prompt_signal_tra
   && grep -q '^capability_entrypoints=codex-native-skills$' "$TMP/codex_prompt_signal_tracked.out" \
   && grep -q '^hook_event=UserPromptSubmit$' "$TMP/codex_prompt_signal_tracked.out" \
   && grep -q '^hook_scope=runtime-hook$' "$TMP/codex_prompt_signal_tracked.out" \
-  && grep -q '^hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback$' "$TMP/codex_prompt_signal_tracked.out"; then
+  && grep -q '^hook_boundary=spec-read-and-design-observations$' "$TMP/codex_prompt_signal_tracked.out"; then
   ok "codex prompt signal carries the autopilot routing contract"
 else
   bad "codex prompt signal should carry the autopilot routing contract"
@@ -430,10 +430,10 @@ if "$CODEX" permissions >"$TMP/codex_permissions.out" 2>"$TMP/codex_permissions.
   && grep -q '^runtime_surface=codex-native-approval-sandbox$' "$TMP/codex_permissions.out" \
   && grep -q '^permission_model=approval-policy+sandbox$' "$TMP/codex_permissions.out" \
   && grep -q '^claude_allowed_tools=unsupported$' "$TMP/codex_permissions.out" \
-  && grep -q '^guard_contract=preflight-write-hooks-and-explicit-tool-contracts$' "$TMP/codex_permissions.out" \
-  && grep -q '^structured_write_hooks=Write,Edit,MultiEdit,apply_patch,functions.apply_patch$' "$TMP/codex_permissions.out" \
+  && grep -q '^guard_contract=runtime-permissions-and-tool-contracts$' "$TMP/codex_permissions.out" \
+  && grep -q '^structured_write_hooks=none$' "$TMP/codex_permissions.out" \
   && grep -q '^targeted_shell_hooks=Bash,Shell,functions.exec_command$' "$TMP/codex_permissions.out" \
-  && grep -q '^shell_read_write_hooks=targeted-detection$' "$TMP/codex_permissions.out"; then
+  && grep -q '^shell_read_write_hooks=posttool-observations-only$' "$TMP/codex_permissions.out"; then
   ok "codex permissions wrapper reports native approval/sandbox contract"
 else
   bad "codex permissions wrapper should report native approval/sandbox contract"
@@ -1933,22 +1933,6 @@ if printf '{"tool_name":"functions.exec_command","tool_input":{"cmd":"sed -n 1,1
 else
   bad "codex native read hook should mark canonical shared spec revision reads"
 fi
-mkdir -p "$TMP/repo/core"
-printf 'core\n' > "$TMP/repo/core/MEMORY.md"
-if printf '{"tool_name":"Read","tool_input":{"file_path":"%s"},"session_id":"corereadsid","cwd":"%s"}\n' "$TMP/repo/core/MEMORY.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_core_read_hook.out" 2>"$TMP/codex_core_read_hook.err" \
-  && find "$TMP/codex_marker_home/.core-grounding" -type f -name 'corereadsid__*' -print -quit | grep -q .; then
-  ok "codex native hook projection records core read markers"
-else
-  bad "codex native hook projection should record core read markers"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"cat core/MEMORY.md"},"session_id":"shellcorereadsid","cwd":"%s"}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_shell_core_read_hook.out" 2>"$TMP/codex_shell_core_read_hook.err" \
-  && find "$TMP/codex_marker_home/.core-grounding" -type f -name 'shellcorereadsid__*' -print -quit | grep -q .; then
-  ok "codex native read hook marks obvious shell core reads"
-else
-  bad "codex native read hook should mark obvious shell core reads"
-fi
 if printf '{"tool":{"name":"Read","input":{"path":"%s"}},"session_id":"nestedreadsid","cwd":"%s"}\n' "$TMP/repo/.agent_reports/spec/prd.md" "$TMP/repo" \
   | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook_nested.out" 2>"$TMP/codex_read_hook_nested.err" \
   && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'nestedreadsid__*' -print -quit | grep -q .; then
@@ -2565,7 +2549,7 @@ if "$OPENCODE" permissions >"$TMP/opencode_permissions.out" 2>"$TMP/opencode_per
   && grep -q '^runtime_surface=opencode-native-permission-config$' "$TMP/opencode_permissions.out" \
   && grep -q '^permission_model=permission-allow-ask-deny$' "$TMP/opencode_permissions.out" \
   && grep -q '^claude_allowed_tools=unsupported$' "$TMP/opencode_permissions.out" \
-  && grep -q '^guard_contract=preflight-write-plugin-and-explicit-tool-contracts$' "$TMP/opencode_permissions.out"; then
+  && grep -q '^guard_contract=runtime-permissions-and-tool-contracts$' "$TMP/opencode_permissions.out"; then
   ok "opencode permissions wrapper reports native permission contract"
 else
   bad "opencode permissions wrapper should report native permission contract"
@@ -3056,27 +3040,17 @@ if command -v opencode >/dev/null 2>&1; then
 else
   ok "opencode native plugin runtime discovery skipped (opencode not installed)"
 fi
-if node --input-type=module >"$TMP/opencode_plugin_hook.out" 2>"$TMP/opencode_plugin_hook.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
-EOF
-then
-  ok "opencode native plugin write hook bridges to preflight"
-else
-  bad "opencode native plugin write hook should bridge to preflight"
-fi
 mkdir -p "$TMP/fake_agent_home/adapters/opencode/bin"
 cat > "$TMP/fake_agent_home/adapters/opencode/bin/preflight.sh" <<'EOF'
 #!/usr/bin/env sh
 exit 77
 EOF
 chmod +x "$TMP/fake_agent_home/adapters/opencode/bin/preflight.sh"
-if node --input-type=module >"$TMP/opencode_plugin_invalid_home.out" 2>"$TMP/opencode_plugin_invalid_home.err" <<EOF
+if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_invalid_home.out" 2>"$TMP/opencode_plugin_invalid_home.err" <<EOF
 process.env.AGENT_HOME = "$TMP/fake_agent_home"
 const mod = await import("$ROOT/opencode_setting/opencode-plugins/hearting-guards.js")
 const plugin = await mod.AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
+await plugin["tool.execute.after"]({ tool: "write", sessionID: "testsid", args: { filePath: "$TMP/repo/spec/design/preview.html" } }, {})
 EOF
 then
   ok "opencode native plugin ignores invalid AGENT_HOME"
@@ -3085,11 +3059,11 @@ else
 fi
 mkdir -p "$TMP/opencode_copied_plugin"
 cp "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js" "$TMP/opencode_copied_plugin/hearting-guards.js"
-if node --input-type=module >"$TMP/opencode_plugin_copy.out" 2>"$TMP/opencode_plugin_copy.err" <<EOF
+if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_copy.out" 2>"$TMP/opencode_plugin_copy.err" <<EOF
 process.env.AGENT_HOME = "$ROOT"
 const mod = await import("$TMP/opencode_copied_plugin/hearting-guards.js")
 const plugin = await mod.AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
+await plugin["tool.execute.after"]({ tool: "write", sessionID: "testsid", args: { filePath: "$TMP/repo/spec/design/preview.html" } }, {})
 EOF
 then
   ok "opencode native plugin copy resolves harness through AGENT_HOME"
@@ -3131,20 +3105,15 @@ const output = { system: [] }
 await plugin["experimental.chat.system.transform"]({ sessionID: "op-worker", model: {} }, output)
 if (output.system.length !== 0) process.exit(1)
 await plugin.event({ event: { type: "session.idle", properties: { sessionID: "op-worker" } } })
-try {
-  await plugin["tool.execute.before"]({ tool: "write", sessionID: "op-worker" }, { args: { filePath: "$TMP/flowproj/f" } })
-  process.exit(1)
-} catch {}
 EOF
 then
-  if grep -q '^write ' "$OPENCODE_WORKER_ROOT/calls" \
-    && ! grep -Eq '^(memory|briefing|prompt-signal|start|session-end) ' "$OPENCODE_WORKER_ROOT/calls"; then
-    ok "opencode worker plugin skips main lifecycle while retaining write guards"
+  if [ ! -e "$OPENCODE_WORKER_ROOT/calls" ]; then
+    ok "opencode worker plugin skips main lifecycle"
   else
-    bad "opencode worker plugin must separate lifecycle from safety guards"
+    bad "opencode worker plugin must skip main lifecycle"
   fi
 else
-  bad "opencode worker plugin must separate lifecycle from safety guards"
+  bad "opencode worker plugin must skip main lifecycle"
 fi
 if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_design_hook.out" 2>"$TMP/opencode_plugin_design_hook.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
@@ -3157,91 +3126,6 @@ else
   bad "opencode native plugin design after hook should bridge to preflight"
 fi
 
-# A1/A2/A3 plugin bridge: transitive material-write denial, bash git-commit
-# denial, bash worktree-add denial/pass, neutral/non-add pass, raw command
-# preserved verbatim, and shell.env's OPENCODE_SESSION_ID assignment.
-opencode_plugin_source="$TMP/repo/opencode_plugin_source.py"
-printf 'print(1)\n' > "$opencode_plugin_source"
-git -C "$TMP/repo" add "$opencode_plugin_source"
-if node --input-type=module >"$TMP/opencode_plugin_write_route.out" 2>"$TMP/opencode_plugin_write_route.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-try {
-  await plugin["tool.execute.before"]({ tool: "write", sessionID: "opencode-plugin-no-route" }, { args: { filePath: "$opencode_plugin_source" } })
-  process.exit(1)
-} catch (error) {
-  if (!String(error.message || error).toLowerCase().includes("route")) process.exit(1)
-}
-EOF
-then
-  ok "opencode plugin tool.execute.before denies a route-less material write end-to-end"
-else
-  bad "opencode plugin tool.execute.before should deny a route-less material write end-to-end"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_commit.out" 2>"$TMP/opencode_plugin_bash_commit.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-try {
-  await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-commit" }, { args: { command: "git commit -am 'opencode_plugin_source'" } })
-  process.exit(1)
-} catch {}
-EOF
-then
-  ok "opencode plugin bash git commit of material content is denied"
-else
-  bad "opencode plugin bash git commit of material content should be denied"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_wt_deny.out" 2>"$TMP/opencode_plugin_bash_wt_deny.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-try {
-  await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-wt" }, { args: { command: "git worktree add .claude/worktrees/foo -b foo" } })
-  process.exit(1)
-} catch {}
-EOF
-then
-  ok "opencode plugin bash git worktree add outside -wt/ is denied"
-else
-  bad "opencode plugin bash git worktree add outside -wt/ should be denied"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_wt_pass.out" 2>"$TMP/opencode_plugin_bash_wt_pass.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-wt-pass" }, { args: { command: "git worktree add /home/x/repo-wt/slug -b slug main" } })
-EOF
-then
-  ok "opencode plugin passes canonical <repo>-wt/ worktree add"
-else
-  bad "opencode plugin should pass canonical <repo>-wt/ worktree add"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_neutral.out" 2>"$TMP/opencode_plugin_bash_neutral.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-neutral" }, { args: { command: "git worktree remove /home/x/repo-wt/slug" } })
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-neutral" }, { args: { command: "ls -la && git status" } })
-EOF
-then
-  ok "opencode plugin leaves non-add worktree subcommands and neutral commands alone"
-else
-  bad "opencode plugin should leave non-add worktree subcommands and neutral commands alone"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_verbatim.out" 2>"$TMP/opencode_plugin_bash_verbatim.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-// Irregular internal spacing would break a token-rejoining classifier but not
-// a verbatim single-argv passthrough; both the neutral command and the
-// worktree add must still resolve exactly as their single-space equivalents.
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-verbatim" }, { args: { command: "git status  &&  echo 'a   b'" } })
-try {
-  await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-verbatim" }, { args: { command: "git  worktree  add   .claude/worktrees/foo  -b  foo" } })
-  process.exit(1)
-} catch {}
-EOF
-then
-  ok "opencode plugin passes the raw bash command through verbatim as one argv element"
-else
-  bad "opencode plugin should pass the raw bash command through verbatim as one argv element"
-fi
 if node --input-type=module >"$TMP/opencode_plugin_shell_env.out" 2>"$TMP/opencode_plugin_shell_env.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })

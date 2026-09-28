@@ -12,11 +12,8 @@ so all content must be copied in, not symlinked).
 Mirrors `adapters/codex/bin/sync-native-plugin.py` (const block /
 `plugin_json`+`marketplace_json` literals / `write_json` / `sync()` /
 `check()`+`check_file()` / `main()`), extended: Codex's generator carries
-skills only; this one carries skills + agents + hooks(5: 2 self-contained +
-3 spec-pipeline DATA-rebased) + hooks.json + the utility bundle required by
-those hooks (agent-home.sh, artifact-root.sh, artifact-snapshot.py)
-(INST-OPEN-1, `_internal/hooks_inventory.md` adopt set — cycle 3 adopts the
-spec-pipeline trio via hooks.json AGENT_HOME env-prefix rebasing).
+skills only; this one carries skills + agents + two self-contained hooks
+and hooks.json.
 """
 
 from __future__ import annotations

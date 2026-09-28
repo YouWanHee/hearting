@@ -1,7 +1,7 @@
 #!/bin/sh
 # PostToolUse(Read): write a session marker after prd.md is actually read.
 # Portable CLI: spec-read-marker.sh --file <prd.md> [--session <id>] [--agent-home <dir>]
-# spec-skill-gate.sh uses the marker as evidence of a real read, not a quotation.
+# Records actual reads for observation by runtime consumers.
 # The marker stores prd.md mtime at read time for later drift comparison. POSIX sh, no jq.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
