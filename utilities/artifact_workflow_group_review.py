@@ -120,9 +120,13 @@ RULES (the same criteria used for the 2026-09-29 full backfill):
    evidence paths chosen ONLY from the listed candidate paths of its two cycles.
 4. Stay inside this campaign. Do not force unrelated cycles together. For every
    target you leave ungrouped, give the real reason.
-5. For each TARGET choose exactly one: join (an existing group_id, only when the
-   target shares that group's subgoal), new (a new group of >= 2 members; members
-   may include listed UNGROUPED cycles of this campaign), or none.
+5. For each TARGET choose exactly one: join (an existing group_id whose subgoal the
+   target shares or continues), new (a new group of >= 2 members; members may
+   include listed UNGROUPED cycles of this campaign), or none. Keep the granularity
+   of the existing groups: a target that carries an existing group's subgoal
+   forward (its next step, handoff, deployment, or fix) joins that group even when
+   several targets could also form a smaller group of their own; start a new group
+   only for a subgoal no existing group covers.
 6. Write titles, stage labels, reasons, and rationales in the language already
    used by this campaign's existing group titles, or otherwise by its documents.
    Title <= 120 chars, stage label <= 40, reason / rationale <= 280, one line each.
