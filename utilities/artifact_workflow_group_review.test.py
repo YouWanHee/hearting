@@ -580,7 +580,8 @@ class ModelCallTest(unittest.TestCase):
         governor.acquire.return_value = "token"
         with tempfile.TemporaryDirectory() as state, \
                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": state, "AGENT_DISPATCH_ATTEMPT_ID": "att-x",
-                                             "AGENT_ROUTE_ID": "rt-x", "FLEET_TITLE_PROVIDER": "codex"}), \
+                                             "AGENT_ROUTE_ID": "rt-x", "FLEET_TITLE_PROVIDER": "codex",
+                                             "AGENT_ARTIFACT_WORKFLOW_GROUP_ID": "wg-x"}), \
                 mock.patch.object(rt, "selected_providers", return_value=("claude", "opencode")) as select, \
                 mock.patch.object(rt, "provider_model", return_value="model-x") as model, \
                 mock.patch.object(rt, "_executable_available", return_value=True), \
@@ -604,6 +605,7 @@ class ModelCallTest(unittest.TestCase):
         self.assertEqual(env["AGENT_SESSION_ROLE"], "worker")
         self.assertNotIn("AGENT_DISPATCH_ATTEMPT_ID", env)
         self.assertNotIn("AGENT_ROUTE_ID", env)
+        self.assertNotIn("AGENT_ARTIFACT_WORKFLOW_GROUP_ID", env)
         governor.acquire.assert_called_once()
         self.assertEqual(governor.acquire.call_args.args[1], "title")
         governor.release.assert_called_once()
