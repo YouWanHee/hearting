@@ -175,7 +175,7 @@ class PinParserTest(unittest.TestCase):
     def test_unreadable_values_are_refused(self):
         for bad in ("nope", "boss=claude", "owner=gemini", "owner=claude:", "owner=claude:@high",
                     "owner=claude:m@", "owner=claude:has space", "owner=claude:a|b", "owner=claude:m@High",
-                    "owner=claude:a,b"):
+                    "owner=claude:a,b", "worker=claude:--foo@high", "owner=claude:-x", "owner=claude:.hidden"):
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "compose-pin-invalid"):
                 self.parse([bad])
         with self.assertRaisesRegex(ValueError, "compose-pin-invalid:owner given twice"):
@@ -340,6 +340,7 @@ class SelectionPinVerifyTest(unittest.TestCase):
             ({"contract_version": 1, "owner": {"harness": "codex"}}, "shape"),
             ({"contract_version": 1, "owner": {"harness": "gemini", "model": None, "effort": None}}, "harness"),
             ({"contract_version": 1, "owner": {"harness": "codex", "model": "a b", "effort": None}}, "model"),
+            ({"contract_version": 1, "owner": {"harness": "codex", "model": "--foo", "effort": None}}, "model"),
             ({"contract_version": 1, "owner": {"harness": "codex", "model": "m", "effort": "High"}}, "effort"),
             ("owner=codex", "contract"),
         ):
@@ -486,6 +487,27 @@ class WrapperPinTest(IsolatedCase):
                     self.args(adapter, route, worker_type="frame", depth=1))
                 self.assertEqual((frame["source"], frame["pin_status"]), ("pin", "applied"))
 
+    def test_a_capacity_retry_model_that_is_main_session_only_is_refused_for_a_worker(self):
+        for adapter in ("claude", "codex"):
+            wrapper = _wrapper(adapter)
+            with self.subTest(adapter=adapter):
+                top = "fable"
+                if adapter == "codex":
+                    top = wrapper.resolve_config("codex", source_root=ROOT)[0]["CFG_MAIN_SESSION_ONLY_MODELS"].split()[0]
+                ordinary = self.PIN_MODEL[adapter]
+                pins = {"worker": {"harness": adapter, "model": ordinary, "effort": None},
+                        "frame": {"harness": adapter, "model": ordinary, "effort": None}}
+                route = self.route(adapter, **pins)
+                args = self.args(adapter, route, retry=True)
+                args.model = top
+                with self.assertRaises(wrapper.ModelSelectionError) as ctx:
+                    wrapper.resolve_model_settings(args)
+                self.assertEqual(ctx.exception.reason, "headless-main-session-only-model")
+                frame_args = self.args(adapter, route, worker_type="frame", depth=1, retry=True)
+                frame_args.model = top
+                frame = wrapper.resolve_model_settings(frame_args)
+                self.assertEqual((frame["source"], frame["model"]), ("pin+capacity", top))
+
     def test_the_override_refusal_points_at_compose_pin(self):
         wrapper = _wrapper("claude")
         args = self.args("claude", self.route("claude"))
@@ -494,12 +516,6 @@ class WrapperPinTest(IsolatedCase):
             wrapper.resolve_model_settings(args)
         self.assertEqual(ctx.exception.reason, "model-profile-override-forbidden")
         self.assertIn("compose --pin", str(ctx.exception))
-
-    def test_dry_run_style_output_defaults_the_status_for_hand_built_settings(self):
-        # dispatch_dryrun_parity builds settings dicts without pin fields.
-        for adapter in ("claude", "codex", "opencode"):
-            settings = {"source": "profile"}
-            self.assertEqual(settings.get("pin_status", "none"), "none")
 
 
 class CliComposeTest(IsolatedCase):

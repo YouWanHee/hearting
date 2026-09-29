@@ -49,6 +49,23 @@ class RoutingConfigInstallTests(unittest.TestCase):
             self.assertEqual(second["status"], "preserved")
             self.assertTrue(path.read_text(encoding="utf-8").endswith("# user edit\n"))
 
+    def test_an_empty_target_list_leaves_no_file_behind(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False
+        ), mock.patch.object(routing_config.shutil, "which", return_value=None):
+            result = routing_config.ensure([])
+            self.assertEqual(result["status"], "skipped-no-runtime")
+            self.assertFalse(Path(result["path"]).exists())
+
+    def test_a_render_failure_never_leaves_an_empty_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False
+        ), mock.patch.object(routing_config.shutil, "which", return_value="/bin/runtime"), \
+                mock.patch.object(routing_config, "render", side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError):
+                routing_config.ensure(["claude"])
+            self.assertFalse(routing_config.config_path().exists())
+
     def test_validate_reports_drift_for_a_preserved_legacy_strategy(self):
         # DP-23: install never rewrites the user file, so a decision that only
         # reached the shipped template (balanced-first, 2026-08-13) stays

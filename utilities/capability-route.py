@@ -2602,7 +2602,7 @@ SELECTION_PIN_CONTRACT_VERSION = 1
 # The harness is split at the first ":" and the effort at the last "@", so a
 # model id may itself contain ":" (a provider tag) but never "@", whitespace,
 # "|" or ",".  Deliberately narrower than model_profile.SAFE_VALUE.
-SELECTION_PIN_MODEL = re.compile(r"^[A-Za-z0-9._/:-]+$")
+SELECTION_PIN_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*$")
 SELECTION_PIN_EFFORT = re.compile(r"^[a-z]+$")
 COMPOSE_SPEC_CANDIDATES = ("spec/prd.md",)
 
@@ -2982,7 +2982,7 @@ def _parse_selection_pins(values, owner=None):
                 effort = tail
             if not SELECTION_PIN_MODEL.fullmatch(model):
                 raise ValueError(
-                    f"compose-pin-invalid:{raw!r} model may contain only letters, digits and ._/:-")
+                    f"compose-pin-invalid:{raw!r} model must start with a letter or digit and contain only letters, digits and ._/:-")
             if effort is not None and not SELECTION_PIN_EFFORT.fullmatch(effort):
                 raise ValueError(f"compose-pin-invalid:{raw!r} effort must be lowercase letters")
         pins[target] = {"harness": harness, "model": model, "effort": effort}

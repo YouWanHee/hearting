@@ -736,13 +736,14 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         pin_model = pin.get("model")
         reasoning = args.reasoning or resolved["budget"]
         if pin["status"] == "applied":
-            if pin_target(args.worker_type) != "frame":
-                # Compose already dropped a main-session-only pin model; this
-                # guards a route edited after sealing.
-                _require_headless_model(pin_model, "pin")
             if not args.model:
                 model, reasoning = pin_model, pin["effort"] or resolved["budget"]
             source = "pin+capacity" if args.model else "pin"
+            if pin_target(args.worker_type) != "frame":
+                # Compose already dropped a main-session-only pin model; this
+                # guards a route edited after sealing and the model a capacity
+                # retry actually substitutes.
+                _require_headless_model(model, source)
         elif resolved["profile"] == TOP_PROFILE:
             # The one door to the main-session-only model from registered
             # dispatch: a route-sealed `top` profile (2026-09-09 사용자 결정).

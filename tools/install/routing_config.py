@@ -158,6 +158,10 @@ def ensure(targets, *, dry_run=False) -> dict:
         return {"status": "preserved", "path": str(path), "enabled": enabled}
     if dry_run:
         return {"status": "would-create", "path": str(path), "enabled": enabled}
+    if not enabled:
+        # Nothing to route to: leave the file absent instead of half-created.
+        return {"status": "skipped-no-runtime", "path": str(path), "enabled": enabled}
+    content = render(enabled)  # before the file exists, so a failure leaves nothing
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
@@ -165,7 +169,7 @@ def ensure(targets, *, dry_run=False) -> dict:
     except FileExistsError:
         return {"status": "preserved", "path": str(path), "enabled": enabled}
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(render(enabled))
+        handle.write(content)
     return {"status": "created", "path": str(path), "enabled": enabled}
 
 
