@@ -10,7 +10,7 @@ This is the portable capability contract for `autopilot-lab`. It defines runtime
 | Identifier | `autopilot-lab` |
 | Group | `entry` |
 | Supported modes | `setup, eval` |
-| Portable meaning | Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results. |
+| Portable meaning | Set up experiments, evaluate, and report results, including fixed results. |
 | Argument shape | `<task description> [--mode setup\|eval\|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial] [--report] [--from spec\|scaffold\|run\|eval\|summary]` |
 | Execution topology | `staged+resource`; registry `capabilities/topologies.json` |
 | Entry load phase | `post-approval`; owner contract `capabilities/autopilot-lab.md` |

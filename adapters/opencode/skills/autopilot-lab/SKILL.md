@@ -1,6 +1,6 @@
 ---
 name: autopilot-lab
-description: "Use when experiment setup, empirical evaluation, failure reproduction, or the experiment's own analysis and result report is needed, including fixed results without new measurements. Not for reusable evaluation-program implementation, independent paper/presentation drafting, or fixed-data document layout/caption edits."
+description: "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements. Not for reusable evaluation code, independent documents, or fixed-data document layout/caption edits."
 metadata:
   portable_source: capabilities/autopilot-lab.md
   adapter: opencode
@@ -35,7 +35,7 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation class: `entry-router`
 - Supported modes: `setup, eval`
 - Argument shape: `<task description> [--mode setup|eval|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--report] [--from spec|scaffold|run|eval|summary]`
-- Portable meaning: Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results.
+- Portable meaning: Set up experiments, evaluate, and report results, including fixed results.
 
 
 ## Workflow Evidence

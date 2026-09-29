@@ -1,6 +1,6 @@
 ---
 name: autopilot-draft
-description: "Use when a new paper, presentation, proposal, or report has an independent audience and document goal. Not for an experiment's own evaluation/result report (lab), existing-document correction, or source-code implementation."
+description: "Use when a new document has an independent audience and document goal. Not for experiment reports (lab), existing-document edits, or code."
 ---
 
 # autopilot-draft
@@ -31,7 +31,7 @@ contract. It is adapter-owned output, not a legacy compatibility Skill copy.
 - Invocation class: `entry-router`
 - Supported modes: `paper, presentation, doc`
 - Argument shape: `<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]`
-- Portable meaning: Document-drafting pipeline that produces an applicable artifact through strategy, drafting, verification, and editing.
+- Portable meaning: Draft independent documents through strategy, verification, and editing.
 
 
 

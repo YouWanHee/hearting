@@ -1,5 +1,5 @@
 ---
-description: "Run the portable autopilot-lab capability through the OpenCode adapter. Meaning: Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results."
+description: "Run the portable autopilot-lab capability through the OpenCode adapter. Meaning: Set up experiments, evaluate, and report results, including fixed results."
 ---
 
 Use the OpenCode adapter realization of portable capability `autopilot-lab`.

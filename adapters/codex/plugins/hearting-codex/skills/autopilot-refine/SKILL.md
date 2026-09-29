@@ -1,6 +1,6 @@
 ---
 name: autopilot-refine
-description: "Use when an existing document or research artifact needs factual, structural, stylistic, or review-driven correction with history preserved. Not for independent new-document drafting, new empirical work, or the experiment's own evaluation/result reporting (lab)."
+description: "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history. Not for new documents, empirical work, or evaluation/result reporting (lab)."
 ---
 
 # autopilot-refine
@@ -31,7 +31,7 @@ contract. It is adapter-owned output, not a legacy compatibility Skill copy.
 - Invocation class: `entry-router`
 - Supported modes: `none`
 - Argument shape: `"<prompt>" [--intensity direct|quick|standard|strong|thorough|adversarial] [--review-only | --memo <file>] [--confirm] [--no-fact-check] [--no-style-audit]`
-- Portable meaning: Correct and update existing document/research artifacts while preserving snapshots and change history.
+- Portable meaning: Correct existing documents with snapshots and change history.
 
 
 

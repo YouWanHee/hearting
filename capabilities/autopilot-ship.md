@@ -10,7 +10,7 @@ This is the portable capability contract for `autopilot-ship`. It defines runtim
 | Identifier | `autopilot-ship` |
 | Group | `entry` |
 | Supported modes | `default, package` |
-| Portable meaning | Prepare application deployment/release setup or package existing artifacts for delivery. |
+| Portable meaning | Prepare deployment/release setup or package existing artifacts. |
 | Argument shape | `<task description (optional)> [--mode default\|package] [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial]` |
 | Execution topology | `transactional-owner`; registry `capabilities/topologies.json` |
 | Entry load phase | `post-approval`; owner contract `capabilities/autopilot-ship.md` |

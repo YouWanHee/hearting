@@ -1,5 +1,5 @@
 ---
-description: "Run the portable autopilot-ship capability through the OpenCode adapter. Meaning: Prepare application deployment/release setup or package existing artifacts for delivery."
+description: "Run the portable autopilot-ship capability through the OpenCode adapter. Meaning: Prepare deployment/release setup or package existing artifacts."
 ---
 
 Use the OpenCode adapter realization of portable capability `autopilot-ship`.
