@@ -279,7 +279,7 @@ Harness-specific status signals need OpenCode-native realization:
 | role profiles | Read `roles/README.md`, then run `adapters/opencode/bin/preflight.sh role <portable-role>` to resolve OpenCode model/variant settings |
 | permission mapping | Run `adapters/opencode/bin/preflight.sh permissions` to inspect the OpenCode native permission contract and confirm Claude `allowedTools` is unsupported |
 | MCP mapping | Run `adapters/opencode/bin/preflight.sh mcp --check` to inspect OpenCode's native MCP CLI/config surface; do not copy Claude `settings.json` MCP registrations or project `tools/design-mcp` wholesale |
-| headless dispatch | Run `adapters/opencode/bin/preflight.sh headless --check <worktree>` before OpenCode `run` dispatch; it checks the worktree, command availability, and installed runtime projection without launching. The dispatch surface accepts `--model-profile deep|balanced-deep|light|mini` independently of optional behavioral `--model-role`. A route-bound profile resolves through `config/models.conf`; `_kernel/owner` rejects a stage `worker_mode` and may be profile-only, caller model/variant replacement is denied, and substantive registered `mini` is denied. Because OpenCode has no verified distinct effort variant, every profile separation is carried by the model: `balanced-deep` has its own configured tier, distinct from the deep tier, while `balanced` and `mini` collapse into `light`, so the row reports `profile_granularity=collapsed-mini` with `collapsed-balanced-to-light`, and `runtime-default` is represented by omitting `--variant`. Registry/Fleet keeps capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same projection check; liveness, harvest, merge, and cleanup boundaries remain unchanged |
+| headless dispatch | Run `adapters/opencode/bin/preflight.sh headless --check <worktree>` before OpenCode `run` dispatch; it checks the worktree, command availability, and installed runtime projection without launching. The dispatch surface accepts `--model-profile deep|balanced-deep|light|mini` independently of optional behavioral `--model-role`. A route-bound profile resolves through `config/models.conf`; `_kernel/owner` rejects a stage `worker_mode` and may be profile-only, caller model/variant replacement is denied, and substantive registered `mini` is denied. OpenCode's `variant` axis is verified (2026-09-30, headless `opencode run --variant`), so the shipped tiers separate by variant as well as model: `balanced-deep`, `light` and `mini` are declared tiers (`mini` is the light model one variant step lower), `balanced` collapses into `light` (`collapsed-balanced-to-light`), and `deep`/`top` collapse into `balanced-deep` because no deep tier is declared (`collapsed-deep-to-balanced-deep`, `collapsed-top-to-balanced-deep`). A route-sealed `compose --pin` model is applied by the wrapper (`model_source=pin`). `runtime-default` is represented by omitting `--variant`. Registry/Fleet keeps capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same projection check; liveness, harvest, merge, and cleanup boundaries remain unchanged |
 | QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps the shared QA assurance budget to OpenCode role checks and fallback reporting. `stage_graph_selector=explicit-graph-or-intensity-default` preserves the core split: an explicit graph takes precedence over the default recipe; QA only scales selected checks |
 | role modes | Read `roles/MODES.md`, then run `adapters/opencode/bin/preflight.sh mode-info <family/mode>`; treat adapter-coupled modes as unsupported unless wrappers exist, obey `fallback=reference-only`, and satisfy any named `tool_contract` / `tool_contract_check` before claiming tool-contract modes |
 | capabilities | Read `capabilities/README.md`, then run `adapters/opencode/bin/preflight.sh capability-info <capability>`; do not assume Claude Skill invocation |
@@ -308,12 +308,12 @@ OpenCode uses `provider/model-id` strings and an optional `variant`. The shipped
 default is `adapters/opencode/config/models.conf`; install seeds the user-owned
 `agent-config/models.conf` once. Runtime consumers select one complete file and
 fall back to the shipped file when the user file is invalid. Registered profiles
-resolve to `deep=deep-tier/runtime-default`,
-`balanced-deep=deep-tier/runtime-default` (reported as collapsed),
-`light=light-tier/runtime-default`, and
-`mini=mini-tier/runtime-default` (lifecycle/micro-only). The wrapper
-omits `--variant` for `runtime-default`; it never claims a distinct effort axis
-that the runtime has not verified. `external adversary` remains unavailable
+resolve to `deep=balanced-deep-tier` (reported as `collapsed-deep-to-balanced-deep`;
+OpenCode declares no deep tier and the shipped `dispatch-defaults.yaml` keeps it out
+of the deep band), `balanced-deep=balanced-deep-tier`,
+`light=light-tier`, and
+`mini=mini-tier` (lifecycle/micro-only), each with its declared variant. The wrapper
+omits `--variant` only for `runtime-default`. `external adversary` remains unavailable
 unless `AGENT_MODEL_EXTERNAL` or `AGENT_EXTERNAL_CMD` is configured.
 
 ## Current Projection Boundary

@@ -8096,7 +8096,7 @@ def main():
     cp.add_argument("--pin",action="append",default=[],metavar="TARGET=HARNESS[:MODEL[@EFFORT]]",
                     help="choose the tool (and optionally model and effort) once; the route seals it for the owner, "
                          "frame legs or depth-2 workers and every resume/replacement reuses it. TARGET is owner|frame|worker, "
-                         "e.g. --pin owner=opencode:opencode-go/muse-spark-1.3-contributor@xhigh --pin worker=opencode. "
+                         "e.g. --pin owner=opencode:<provider/model>@<effort> --pin worker=opencode. "
                          "Top models are accepted for frame only (owner/worker keep the tool and drop the model with a warning)")
     cp.add_argument("--campaign-key",help="the work stream this route joins or creates (required unless --parent-cycle or --unassigned); `artifact_producer.py campaign-list` shows active keys. Size it as a stream with a one-sentence closing condition — not a project name, not a one-cycle task (join the stream that task serves)")
     cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")

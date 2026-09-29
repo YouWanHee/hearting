@@ -54,8 +54,9 @@ EXTRA_AGENTS = KERNEL_AGENTS
 
 # Native subagent type catalog (CFG_NATIVE_AGENT_CATALOG in this adapter's
 # models.conf, name:portable-profile) — cross-harness parity with the Claude
-# catalog. Portable profiles resolve through utilities/model_profile.py; the
-# OpenCode variant axis stays runtime-default, so only the model is pinned.
+# catalog. Portable profiles resolve through utilities/model_profile.py; a native
+# agent file pins the model only, and the registered-launch wrapper attaches the
+# variant (--variant) for route-bound work.
 # Instructions are adapter-owned output, not a non-OpenCode Agent copy.
 CATALOG_AGENTS = {
     "balanced": {
