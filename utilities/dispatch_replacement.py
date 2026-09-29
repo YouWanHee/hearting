@@ -941,6 +941,15 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None):
         if source.get('worker_type') == 'owner' and not source.get('route_file'):
             env.update(AGENT_OWNER_ROUTE_FILE=record['route_file'],
                        AGENT_OWNER_ROUTE_ID=record['route_id'],AGENT_OWNER_ROUTE_HASH=record['route_hash'])
+        if source.get('worker_type') == 'owner':
+            # The launch seam publishes the owner's producer binding only from the
+            # route's own open cycle; the caller's environment is not that cycle.
+            try:
+                from artifact_producer import ProducerError, prepare_route_artifact_env
+                env.update(prepare_route_artifact_env(Path(record['route_file']), start=False,
+                                                      jobs=Path(jobs)))
+            except (ProducerError, OSError, ValueError):
+                pass
         completed = run(command,env=env,text=True,capture_output=True,check=False,timeout=120)
         current = _rows(Path(jobs).read_text().splitlines()).get(replacement)
         if current and current[1].get('launch_claimed') == '1':

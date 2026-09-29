@@ -3809,6 +3809,30 @@ class OwnerLaunchBindingTest(ProducerTestBase):
             self.assertEqual(binding_path.read_bytes(), first)
         self.assertEqual(len(P.list_cycle_records(self.root)), 1)
 
+    def test_replacement_owner_binds_from_the_routes_own_open_cycle(self):
+        route, route_file, launch_env, original, args = self._prepared_owner()
+        replacement = "att-launch-binding-replacement"
+        line = self.jobs.read_text(encoding="utf-8").rstrip("\n").split("\t")
+        meta = D.parse_registry_metadata(line[5])
+        meta.update(attempt_id=replacement, automatic_retry_of=original)
+        line[1], line[5] = "open", ",".join(f"{k}={v}" for k, v in meta.items())
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write("\t".join(line) + "\n")
+        args.attempt_id = replacement
+        caller = {"AGENT_ARTIFACT_CYCLE_ID": "cyc_stale", "AGENT_ARTIFACT_OUTPUT_DIR": "/stale/artifacts"}
+        binding = P.dispatch_terminal_commit.producer_binding_path(self.root, route["route_id"], replacement)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.bind_owner_launch(args, self.jobs, environ=caller)
+            self.assertEqual(caught.exception.code, "producer-binding-mismatch")
+            self.assertFalse(binding.exists())
+            route_env = P.prepare_route_artifact_env(route_file, start=False, jobs=self.jobs)
+            self.assertEqual(route_env["AGENT_ARTIFACT_CYCLE_ID"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+            result = P.bind_owner_launch(args, self.jobs, environ={**caller, **route_env})
+        self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+        self.assertTrue(binding.exists())
+        self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+
     def test_resume_only_refusals_never_write_binding_or_open_another_cycle(self):
         import artifact_lifecycle
         scenarios = ("route-closed", "campaign-inactive", "resplit", "no-open-cycle",

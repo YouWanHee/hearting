@@ -219,6 +219,35 @@ class ReplacementTest(unittest.TestCase):
                 or SimpleNamespace(returncode=0)))
         self.assertEqual(result['reason'],'replacement-launch-pending')
 
+    def _launch_env(self,worker_type,prepare):
+        self.write({**self.meta,'worker_type':worker_type,'route_file':str(self.path)} if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
+        seen={}
+        def run(command,**kw):
+            seen.update(kw['env']);return SimpleNamespace(returncode=0)
+        stale={'AGENT_ARTIFACT_CYCLE_ID':'cyc-stale','AGENT_ARTIFACT_OUTPUT_DIR':'/stale/out'}
+        with mock.patch.dict(os.environ,stale),mock.patch.object(R,'_authorized'),\
+                mock.patch('dispatch_replacement_batch.command',return_value=None),\
+                mock.patch('artifact_producer.prepare_route_artifact_env',side_effect=prepare) as prep:
+            R.advance(self.jobs,'att-source',run=run)
+        return seen,prep
+
+    def test_owner_replacement_launch_gets_the_routes_own_cycle_env(self):
+        route_env={'AGENT_ARTIFACT_ROOT':str(self.root),'AGENT_ARTIFACT_CYCLE_ID':'cyc-route','AGENT_ARTIFACT_OUTPUT_DIR':'/route/out'}
+        env,prep=self._launch_env('owner',lambda *a,**k:route_env)
+        prep.assert_called_once_with(self.path,start=False,jobs=self.jobs)
+        self.assertEqual((env['AGENT_ARTIFACT_CYCLE_ID'],env['AGENT_ARTIFACT_OUTPUT_DIR']),('cyc-route','/route/out'))
+
+    def test_owner_replacement_launch_survives_a_failed_cycle_lookup(self):
+        import artifact_producer
+        for error in (artifact_producer.ProducerError('route-artifact-root-missing'),OSError('gone'),ValueError('bad')):
+            env,_=self._launch_env('owner',mock.Mock(side_effect=error))
+            self.assertEqual(env['AGENT_ARTIFACT_CYCLE_ID'],'cyc-stale')
+
+    def test_stage_replacement_launch_env_is_not_touched_by_the_route_cycle(self):
+        env,prep=self._launch_env('frame',lambda *a,**k:{'AGENT_ARTIFACT_CYCLE_ID':'cyc-route'})
+        prep.assert_not_called()
+        self.assertEqual(env['AGENT_ARTIFACT_CYCLE_ID'],'cyc-stale')
+
     def test_exhausted_sd106_budget_cannot_start_new_family(self):
         for addition in [{'recovery_exhausted':'1'}, {'start_permitted':'0'},
                          {'recovery_id':'rid-dead'}]:

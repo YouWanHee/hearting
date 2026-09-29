@@ -402,7 +402,9 @@ stamp path in `core/HOOKS.md`.
   Only a person's release starts it; a registered headless owner's release does not.
   The continuation is the family's one automatic replacement, so
   `recovery_instructions` tells every replacement or continuation owner to keep
-  waiting on the bounded `await-release` at a later gate instead of parking. The
+  waiting on the bounded `await-release` at a later gate instead of parking. A
+  replacement owner's launch receives the route's own open cycle environment, so
+  its producer binding is published like the original owner's. The
   Claude wake and the shared completion follow-up describe a parked owner as
   paused at the gate, not failed. A revise or stop recorded while the owner is
   parked starts nothing automatically.
