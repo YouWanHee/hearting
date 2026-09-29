@@ -102,7 +102,6 @@ def main() -> int:
         except Exception:
             pass
     event_session_id = event_session_id or "codex-hook"
-    run_preflight("material-route", "clear", "--session", event_session_id, quiet=True)
     run_preflight("session-end", event_cwd, event_session_id)
     return 0
 
