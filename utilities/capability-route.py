@@ -4362,7 +4362,7 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
                 allow_unproven=True, jobs=None, expected_terminal_marker_digest=None,
                 terminal_commit_id=None, expected_owner_attempt_id=None,
                 expected_producer_binding_digest=None, inline_finish_id=None,
-                expected_summary_digest=None, inline_commit=None):
+                expected_summary_digest=None, inline_commit=None, autoclose=None):
     try:
         import inline_finish
         pending=inline_finish.pending_state(Path(route["artifact_root"]),route["route_id"])
@@ -4441,6 +4441,10 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
     if inline_finish_id is not None:
         outcome["inline_finish_id"] = inline_finish_id
         outcome["summary_digest"] = expected_summary_digest
+    # Closed by the runtime because nobody works on the route any more
+    # (utilities/route_autoclose.py), not by the session that composed it.
+    if autoclose is not None:
+        outcome["autoclose"] = dict(autoclose)
     # A-SD154-7: a route's closed outcome names every SD-154 revision recorded
     # under it, so a reader never has to walk completion-dir history by hand
     # to learn a gate's evidence was corrected mid-route.
@@ -7863,6 +7867,17 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         print(json.dumps(result,sort_keys=True))
     return output_path.resolve()
 
+def _route_autoclose(artifact_root, trigger):
+    """The runtime closes routes nobody works on any more (utilities/route_autoclose.py).
+    Bookkeeping only: it never fails or blocks the command that triggered it."""
+    try:
+        import route_autoclose
+        api=sys.modules.get(__name__)
+        if api is None: return
+        route_autoclose.report(route_autoclose.sweep(artifact_root,api=api,trigger=trigger))
+    except Exception as exc:  # noqa: BLE001
+        print(f"route_autoclose error={type(exc).__name__}",file=sys.stderr)
+
 def main():
     from dispatch_parent_completion import default_parent_harness
     p=argparse.ArgumentParser(allow_abbrev=False)
@@ -8084,6 +8099,7 @@ def main():
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
+        _route_autoclose(artifact_root,"compose")
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))

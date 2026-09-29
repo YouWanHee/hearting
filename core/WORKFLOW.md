@@ -534,12 +534,25 @@ and child cleanup. It records COMPLETE only after sealing, retries interrupted
 closure without a model turn and sends a recovery notice while closure remains
 pending. The owner and parent have no separate close/finalize procedure.
 
-An eligible `direct` inline route is finished by its current depth-0 session
-with one public command. Supply a readable, nonempty artifact from the route's
-exact open cycle and the final summary; the command records terminal proof,
-closes the route, seals that cycle and returns a receipt only after rechecking
-all three. A partial transaction remains `finish-pending` and is resumed with
-the same intent. Session exit alone does not finish the route.
+The runtime closes a route once nobody works on it; no session has to
+remember to. `compose` and `campaign-status` close an open route whose Claude
+session this host saw end and that then stayed quiet for an hour, or that saw
+no writes for a week; `campaign-close` also closes its campaign's member routes
+that belong to the closing session or stayed quiet for an hour. Routes of the
+calling session, routes a dispatch attempt, a pending owner settlement or an
+unended resource run still holds, routes waiting on a human gate and routes
+whose cycle a live process holds open stay open, as does everything when that
+evidence cannot be read. The closure claims no proof: it records what the
+completion markers show, seals the cycle completed only when that proof holds
+and abandoned otherwise, and names its reason in `autoclose`. A session that
+returns to such a route is not refused: `finish` reports it closed, and
+`start` returns the compose command that begins the work again.
+
+A session finishes its own `direct` inline route to record real evidence.
+Supply a readable, nonempty artifact from the route's exact open cycle and the
+final summary; the command records terminal proof, closes the route, seals
+that cycle and returns a receipt only after rechecking all three. A partial
+transaction remains `finish-pending` and is resumed with the same intent.
 
 ```text
 python3 utilities/capability-route.py finish --route <route.json> --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]

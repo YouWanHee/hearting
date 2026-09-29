@@ -97,6 +97,11 @@ OK, BLOCKED, USAGE = 0, 65, 64
 LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` first; if begin already ran, "
                      "export its --env-file output (AGENT_ARTIFACT_*) into this shell, then retry")
 
+# A cycle that is sealed, abandoned or closed automatically after it sat unused
+# (route_autoclose.py) takes no more writes; the way forward is a new route.
+CLOSED_CYCLE_HINT = ("this cycle takes no more writes (sealed, abandoned or closed automatically after it "
+                     "sat unused); compose the work again for an open cycle")
+
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
 
@@ -4090,9 +4095,12 @@ def finalize(
     force_abandon_ignoring_lease: bool = False,
     support_locators: Sequence[str] = (),
     expected_binding: Optional[Mapping[str, Any]] = None,
+    lock_timeout: Optional[float] = None,
     _admission_lock_fd: Optional[int] = None,
     _recovery_scope: str = "root",
 ) -> Dict[str, Any]:
+    """`lock_timeout` bounds both lock waits (default: the admission and
+    checkpoint defaults); a background sweep passes 0 so a held lock defers it."""
     root = Path(root).resolve()
     if _recovery_scope != "exact":
         dispatch_terminal_commit.require_current_cleanup("producer-finalize")
@@ -4114,7 +4122,8 @@ def finalize(
     lock_fd = _admission_lock_fd
     owns_lock = lock_fd is None
     if owns_lock:
-        lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
+        lock_fd = artifact_admission._acquire_lock(
+            root, artifact_admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout, now=now)
     interim_guard = contextlib.ExitStack()
     sweep_unresolved: List[Dict[str, Any]] = []
 
@@ -4184,7 +4193,8 @@ def finalize(
         # The open-cycle checkpoint assigns IDs under this lock; holding it until
         # the interim document is removed keeps a concurrent checkpoint from
         # republishing IDs the sealed manifest did not take.
-        interim_guard.enter_context(_checkpoint_lock(root, cycle_id, timeout=CHECKPOINT_FINALIZE_LOCK_SECONDS))
+        interim_guard.enter_context(_checkpoint_lock(
+            root, cycle_id, timeout=CHECKPOINT_FINALIZE_LOCK_SECONDS if lock_timeout is None else lock_timeout))
         # A live review lease protects the report's exact write window from
         # both terminal outcomes.  The check remains under the producer
         # admission lock and happens before any terminal mutation.
@@ -5806,9 +5816,11 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
         sealed_on_disk = manifest is not None
         if record is None:
             reason = "cycle-sealed" if sealed_on_disk else "cycle-unknown"
-            return {**base, "verdict": "deny", "reason": reason, "layout": "cycle", "cycle_id": cycle_id}
+            return {**base, "verdict": "deny", "reason": reason, "layout": "cycle", "cycle_id": cycle_id,
+                    "hint": CLOSED_CYCLE_HINT}
         if record.get("state") != "open" or record.get("campaign_id") != campaign_id or sealed_on_disk:
-            return {**base, "verdict": "deny", "reason": "cycle-not-open", "layout": "cycle", "cycle_id": cycle_id}
+            return {**base, "verdict": "deny", "reason": "cycle-not-open", "layout": "cycle", "cycle_id": cycle_id,
+                    "hint": CLOSED_CYCLE_HINT}
         bucket = parts[artifacts_index + 1] if len(parts) > artifacts_index + 2 else None
         return {**base, "verdict": "allow", "reason": "open-cycle-artifacts", "layout": "cycle",
                 "cycle_id": cycle_id, "campaign_id": campaign_id, "bucket": bucket,
@@ -5895,6 +5907,23 @@ def resolve_output_dir(root: Path, bucket: str, *, cycle_dir_hint: Optional[str]
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _route_autoclose(root: Path, trigger: str, campaign: Optional[str] = None) -> None:
+    """Close routes nobody works on before campaign bookkeeping reads them
+    (route_autoclose.py).  Bookkeeping only: it never fails the command.
+    `campaign` is the one `campaign-close` ends; its members close sooner."""
+    try:
+        import artifact_cutover
+        import route_autoclose
+        campaign_id = None
+        if campaign is not None:
+            record, _raw = artifact_campaign.read_json(root, artifact_campaign.campaign_path(root, campaign))
+            campaign_id = record.get("campaign_id")
+        route_autoclose.report(route_autoclose.sweep(
+            root, api=artifact_cutover._route_module(), trigger=trigger, campaign_id=campaign_id))
+    except Exception as exc:  # noqa: BLE001
+        print(f"route_autoclose error={type(exc).__name__}", file=sys.stderr)
 
 
 def _print(payload: Any) -> None:
@@ -6115,8 +6144,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print(result)
             return BLOCKED if str(result.get("status", "")).startswith("refused") else OK
         elif args.command == "campaign-status":
+            _route_autoclose(root, "campaign-status")
             result = artifact_campaign.status(root, args.campaign)
         elif args.command == "campaign-close":
+            _route_autoclose(root, "campaign-close", campaign=args.campaign)
             result = artifact_campaign.close(root, args.campaign, reason=args.reason)
         elif args.command == "campaign-reopen":
             result = artifact_campaign.reopen(root, args.campaign, reason=args.reason)

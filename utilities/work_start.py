@@ -481,6 +481,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         return {**result, "state":"needs-attention", "reason":"finish-pending",
                 "required_action":"resume-inline-finish", "finish_state":pending.get("state")}
     closed = closed_outcome(path, route)
+    if closed and closed.get("autoclose"):
+        # The runtime closed this route after it sat unused (route_autoclose.py).
+        # Nothing to repair: the same work starts again as a new route.
+        command = _compose_again(route)
+        return {**result, "state": "autoclosed", "reason": "route-closed-automatically",
+                "required_action": "compose-again", "outcome": closed, "resume_command": command,
+                "parent_next": "compose", "parent_next_command": command,
+                "next_step": "This route was closed automatically after it sat unused; run parent_next_command "
+                             "to compose the same work again."}
     if closed:
         if closed.get("finish_pending"):
             return {**result, "state": "needs-attention", "reason": "finish-pending",
@@ -685,6 +694,28 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             "next_step": "You are the parent session; the owner runs as a separate attempt. Do not kill, "
                 "replace, or redo its work inline. Follow parent_next: end-turn means yield; "
                 "bounded-wait means run parent_next_command once."}
+
+
+def _compose_again(route) -> str:
+    """The compose command that starts an automatically closed route's work again."""
+    task = Path(route["artifact_root"]) / ".runtime" / "route-autoclose" / f"{route['route_id']}.task.md"
+    if not task.is_file():
+        task.parent.mkdir(parents=True, exist_ok=True)
+        task.write_text(str((route.get("work_request") or {}).get("text") or ""), encoding="utf-8")
+    selection = route.get("selection") if isinstance(route.get("selection"), dict) else {}
+    shape = selection.get("shape") or ("direct" if route.get("effective_intensity") == "direct" else "staged")
+    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
+            "--slug", str(route.get("slug") or route["route_id"]), "--capability", route["capability"],
+            "--capability-mode", str(route.get("capability_mode") or "default"), "--shape", shape,
+            "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
+            "--prompt-file", str(task), "--start"]
+    if route.get("campaign_key"):
+        argv += ["--campaign-key", route["campaign_key"]]
+    elif route.get("parent_cycle_id"):
+        argv += ["--parent-cycle", route["parent_cycle_id"]]
+    else:
+        argv += ["--unassigned"]
+    return shlex.join(argv)
 
 
 def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
