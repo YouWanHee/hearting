@@ -1,23 +1,30 @@
 """Runtime closure of routes nobody works on any more.
 
 A compiled route is a lease the runtime holds for the session that composed
-it, not homework that session must remember.  `compose`, `campaign-status` and
-`campaign-close` run one bounded sweep that closes an open route only when
-time says nobody works on it:
+it, not homework that session must remember.  `compose` and `campaign-status`
+run one bounded background sweep that closes an open route only when time says
+nobody works on it:
 
 * session-ended -- this host holds positive evidence that the composing Claude
   session is gone (its own session record, whose process is dead) and nothing
   wrote to the route or its cycle for `QUIET_SECONDS`;
 * idle -- otherwise (no such evidence, or Codex/OpenCode, which expose none),
-  nothing wrote to the route, its cycle or its composer's route-chain ledger
-  for `IDLE_SECONDS`.  An activity scan that hits its size limit counts as
-  activity.
+  nothing wrote to the route, its cycle, its composer's route-chain ledger or
+  a bound resource run's log for `IDLE_SECONDS`.  An activity scan that hits
+  its size limit counts as activity.
 
-Never closed, whatever the time: a route of the session running the sweep, a
-route a dispatch attempt still holds (live, unverifiable or lease-held), one
-whose workflow ledger waits on a human gate, one a live resource run is bound
-to or logs into, one with a pending terminal commit or an unfinished `finish`,
-and one whose cycle directory a live process holds open.
+`campaign-close` is an explicit end: besides that sweep it closes the
+campaign's own open member routes that are the closing session's, or quiet
+for `QUIET_SECONDS` with no provably live session.
+
+Never closed, whatever the time or trigger: a route of the session running
+the sweep (outside `campaign-close`), a route a dispatch attempt still holds
+(live, unverifiable or lease-held), one whose owner's runtime settlement the
+runtime itself still classifies as pending, one whose workflow ledger waits on
+a human gate, one a resource run without an end record is bound to or logs
+into (on any host), one with an unfinished `finish`, and one whose cycle
+directory a live process holds open.  When any of that evidence cannot be
+read, the sweep closes nothing.
 
 The closure claims no proof.  Every route closes the same way,
 `close_route(allow_unproven=True)` with an `autoclose` record, so its terminal
@@ -25,7 +32,9 @@ proof is exactly what completion markers already show.  Its open cycle is then
 sealed with the existing states: completed when that proof holds, abandoned
 otherwise.  Both steps are idempotent, so the next sweep finishes whatever an
 interrupted one left: a cycle behind a runtime-written closure is sealed at
-once, any other closed-but-unsealed cycle after `QUIET_SECONDS`.
+once, any other closed-but-unsealed cycle after `QUIET_SECONDS`.  A session
+that comes back to an automatically closed route is not refused: `finish`
+reports it closed and succeeds, `start` hands back a compose command.
 
 The sweep writes under the artifact root only and reads the checkout with
 `git rev-parse` alone.  It takes no lock it would wait for and spends at most
@@ -44,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-IDLE_SECONDS = 24 * 3600
+IDLE_SECONDS = 7 * 24 * 3600
 QUIET_SECONDS = 3600
 BUDGET_SECONDS = 20.0
 WALK_LIMIT = 2000
@@ -52,6 +61,11 @@ WALK_LIMIT = 2000
 # older than this are not re-probed on every sweep.
 _RECENT_TERMINAL_SECONDS = 3600
 _TERMINAL = {"done", "killed", "cancelled"}
+_RESOURCE_OPEN = {"open", "running", "pending", "working"}   # artifact-quiescence RESOURCE_OPEN
+
+
+class Unreadable(Exception):
+    """Evidence a protection needs could not be read: the sweep closes nothing."""
 
 
 def _iso(now: float) -> str:
@@ -82,21 +96,31 @@ def _under(path: str, home: Path | None) -> bool:
 
 
 def _open_paths(root: Path) -> set[str]:
-    """Paths under `root` a live process holds open or runs in."""
+    """Paths under `root` a live process holds open or runs in.  Non-dumpable
+    daemons of this user (sd-pam, key agents) refuse inspection to everyone and
+    are skipped; a scan that can read none of this user's other processes is
+    blind, and a blind scan is unreadable evidence."""
     prefix = str(root) + os.sep
     found: set[str] = set()
     try:
-        pids = [pid for pid in os.listdir("/proc") if pid.isdigit()]
-    except OSError:
-        return found
+        pids = [pid for pid in os.listdir("/proc") if pid.isdigit() and int(pid) != os.getpid()]
+    except OSError as exc:
+        raise Unreadable("process-table") from exc
+    read = denied = 0
     for pid in pids:
-        links = []
         try:
-            links.append(os.readlink(f"/proc/{pid}/cwd"))
+            mine = os.stat(f"/proc/{pid}").st_uid == os.getuid()
+            links = [os.readlink(f"/proc/{pid}/cwd")]
             links += [os.readlink(f"/proc/{pid}/fd/{fd}") for fd in os.listdir(f"/proc/{pid}/fd")]
+        except PermissionError:
+            denied += mine
+            continue
         except OSError:
-            pass
+            continue   # the process or one descriptor went away meanwhile
+        read += mine
         found.update(link for link in links if link.startswith(prefix))
+    if denied and not read:
+        raise Unreadable("process-descriptors")
     return found
 
 
@@ -153,20 +177,26 @@ def _registries(api) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
-def _held_by_attempts(registries: list[Path]) -> set[str]:
-    """Route ids a registered attempt still holds: live, unverifiable or lease-held."""
+def _attempts(registries: list[Path]) -> tuple[set[str], dict]:
+    """(route ids a registered attempt still holds -- live, unverifiable or
+    lease-held --, route id -> its settled owner rows for the runtime's own
+    settlement check)."""
     if not any(path.is_file() for path in registries):
-        return set()
+        return set(), {}
     import artifact_cutover
     import codex_dispatch_terminal as terminal
     import dispatch_contract as dispatch
     held: set[str] = set()
+    owners: dict[str, list] = {}
     now = time.time()
     for attempt_id, row in artifact_cutover._registry_attempts(registries).items():
         metadata, status = row["metadata"], row["status"]
         ids = {metadata.get(key, "") for key in ("route_id", "owner_route_id", "batch_route_id")} - {""}
         if not ids:
             continue
+        if status == "done" and metadata.get("workflow_completion") == "runtime-v1":
+            for route_id in ids:
+                owners.setdefault(route_id, []).append(row)
         if status in _TERMINAL:
             try:
                 stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp()
@@ -187,21 +217,29 @@ def _held_by_attempts(registries: list[Path]) -> set[str]:
             except Exception:
                 current = None
             held |= ids | ({current} if current else set())
-    return held
+    return held, owners
+
+
+def _settlement_pending(route_id: str, owners: dict) -> bool:
+    """The runtime's own classifier: a PASS owner whose settlement is pending
+    or unknown still owns the route's closure."""
+    from dispatch_terminal_commit import owner_completion_pending
+    for row in owners.get(route_id, ()):
+        try:
+            if owner_completion_pending(Path(row["jobs"]), row["status"], row["metadata"]):
+                return True
+        except Exception:
+            return True
+    return False
 
 
 def _gate_ledger_roots(registries: list[Path]) -> list[Path]:
     import workflow_state
-    roots = []
-    for jobs in registries:
-        try:
-            roots.append(workflow_state.ledger_root_for(jobs=jobs)[0])
-        except Exception:
-            continue
     try:
+        roots = [workflow_state.ledger_root_for(jobs=jobs)[0] for jobs in registries]
         roots.append(workflow_state.ledger_root_for()[0])
-    except Exception:
-        pass
+    except Exception as exc:
+        raise Unreadable("workflow-ledger-root") from exc
     return list(dict.fromkeys(roots))
 
 
@@ -212,7 +250,7 @@ def _waits_on_human(route_id: str, roots: list[Path]) -> bool:
         try:
             entries = workflow_state.WorkflowLedger(route_id, root=root).journal()
         except Exception:
-            continue
+            return True   # unreadable: treat as waiting
         gates = {(entry.get("evidence") or {}).get("gate") for entry in entries
                  if isinstance(entry, dict) and entry.get("workflow_state") == "BLOCKED_HUMAN_GATE"
                  and isinstance(entry.get("evidence"), dict)} - {None}
@@ -221,24 +259,39 @@ def _waits_on_human(route_id: str, roots: list[Path]) -> bool:
     return False
 
 
-def _live_resource_runs() -> tuple[set[str], list[str]]:
-    """Route ids a live resource run is bound to, and the paths live runs log into."""
+def _resource_runs() -> tuple[set[str], list[str], dict]:
+    """(route ids a resource run without an end record is bound to, the paths
+    such runs log into, route id -> newest bound log write).  A run counts as
+    live until its registry row or exit sentinel records an end: a run started
+    on another host has no process here to ask."""
     try:
         import resource_run_registry
-        rows, _diagnostics = resource_run_registry.scan()
-    except Exception:
-        return set(), []
-    routes, paths = set(), []
+        rows, diagnostics = resource_run_registry.scan()
+    except Exception as exc:
+        raise Unreadable("resource-run-index") from exc
+    if any(str(row.get("kind", "")).startswith("malformed") for row in diagnostics):
+        raise Unreadable("resource-run-index")
+    routes, paths, activity = set(), [], {}
     for row in rows:
-        reason = (row.get("state_evidence") or {}).get("reason")
-        if row.get("liveness") != "working" and reason != "process-identity-unreadable":
-            continue
+        bound = set()
         for value in (row.get("route_id"), row.get("route_file"), row.get("route")):
             if isinstance(value, str) and value:
-                routes.add(Path(value).stem if value.endswith(".json") else value)
-        if isinstance(row.get("log_path"), str):
-            paths.append(os.path.realpath(row["log_path"]))
-    return routes, paths
+                bound.add(Path(value).stem if value.endswith(".json") else value)
+        log = row.get("log_path") if isinstance(row.get("log_path"), str) else ""
+        written = _mtime(Path(log)) if log else 0.0
+        for route_id in bound:
+            activity[route_id] = max(activity.get(route_id, 0.0), written)
+        status = str(row.get("registry_status") or "").lower()
+        sentinel = row.get("sentinel")
+        ended = (row.get("ended_at") is not None or row.get("exit_code") is not None
+                 or (status and status not in _RESOURCE_OPEN)
+                 or (isinstance(sentinel, str) and sentinel and os.path.exists(sentinel)))
+        if ended:
+            continue
+        routes |= bound
+        if log:
+            paths.append(os.path.realpath(log))
+    return routes, paths, activity
 
 
 def _claude_state(sid: str) -> str:
@@ -333,11 +386,12 @@ def _cycle_home(root: Path, record) -> Path | None:
 
 
 def _last_activity(root: Path, path: Path, raw: Mapping[str, Any], holder, api, record, now: float, *,
-                   deep: bool = False) -> float:
+                   deep: bool = False, resource_activity: Mapping[str, float] | None = None) -> float:
     """Newest write to the route, its ledger line and its cycle.  The cheap form
     stats the top of the cycle; `deep` walks it and the completion markers, and
     a tree past `WALK_LIMIT` counts as written now."""
-    newest = max(_mtime(path), float(holder.get("ts") or 0) if holder else 0.0)
+    newest = max(_mtime(path), float(holder.get("ts") or 0) if holder else 0.0,
+                 (resource_activity or {}).get(str(raw.get("route_id")), 0.0))
     homes = [root / ".runtime" / "inline-finish" / "v1" / str(raw.get("route_id"))]
     if deep:
         try:
@@ -358,25 +412,13 @@ def _last_activity(root: Path, path: Path, raw: Mapping[str, Any], holder, api, 
     return newest
 
 
-def _terminal_commit_pending(runtime: Path, route_id: str) -> bool:
-    """An owner's terminal commit started and has not sealed.  The slot directory
-    alone is only the producer binding written at owner launch."""
-    for state_file in (runtime / "terminal-commits" / "v1" / route_id).glob("*/terminal-commit.json"):
-        try:
-            if json.loads(state_file.read_text(encoding="utf-8")).get("state") != "owner-envelope-sealed":
-                return True
-        except (OSError, ValueError, AttributeError):
-            return True
-    return False
-
-
 def _kept(route_id: str, raw, *, root, runtime, facts, home) -> str | None:
     """Why this route must stay open whatever the time, else None."""
     import inline_finish
     if route_id in facts["held"]:
         return "owner-live"
-    if _terminal_commit_pending(runtime, route_id):
-        return "terminal-commit-pending"
+    if _settlement_pending(route_id, facts["owners"]):
+        return "owner-settlement-pending"
     try:
         pending = inline_finish.pending_state(root, route_id)
     except Exception:
@@ -392,9 +434,18 @@ def _kept(route_id: str, raw, *, root, runtime, facts, home) -> str | None:
     return None
 
 
-def _decide(holder, *, activity, current, idle_since, now) -> tuple[str | None, str | None]:
-    """(reason to close | None, reason kept)."""
+def _decide(holder, *, activity, current, idle_since, now, member=False) -> tuple[str | None, str | None]:
+    """(reason to close | None, reason kept).  `member`: a member route of the
+    campaign `campaign-close` is closing."""
     identity = (holder["harness"], holder["session_id"]) if holder else None
+    if member:
+        if current and identity == current:
+            return "campaign-close", None
+        if _session_state(holder) == "alive":
+            return None, "session-alive"
+        if now - idle_since >= QUIET_SECONDS:
+            return "campaign-close", None
+        return None, "recent-activity"
     if current and identity == current:
         return None, "current-session"
     state = _session_state(holder)
@@ -487,22 +538,38 @@ def _seal_unsealed_cycles(root: Path, api, cycles: dict, facts, *, deadline, now
     return sealed
 
 
-def sweep(artifact_root, *, api, trigger: str, now: float | None = None,
-          budget: float = BUDGET_SECONDS) -> dict:
-    """Close what nobody works on under one artifact root.  Never raises."""
+def sweep(artifact_root, *, api, trigger: str, campaign_id: str | None = None,
+          now: float | None = None, budget: float = BUDGET_SECONDS) -> dict:
+    """Close what nobody works on under one artifact root.  Never raises.
+    `campaign_id` names the campaign `campaign-close` is closing."""
     summary: dict[str, Any] = {"closed": [], "cycles": [], "kept": {}, "errors": [], "deferred": 0}
     # Reading old routes prints lineage/registry advisories meant for their
     # owners; this bookkeeping pass reports one line of its own instead.
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             _sweep(summary, Path(artifact_root).resolve(), api=api, trigger=trigger,
-                   now=time.time() if now is None else now, budget=budget)
+                   campaign_id=campaign_id, now=time.time() if now is None else now, budget=budget)
+        except Unreadable as exc:
+            summary["kept"]["evidence-unreadable:" + str(exc)] = 1
         except Exception as exc:
             summary["errors"].append({"error": f"{type(exc).__name__}: {str(exc)[:160]}"})
     return summary
 
 
-def _sweep(summary, root: Path, *, api, trigger, now, budget) -> None:
+def _campaign_members(root: Path, cycles: dict, campaign_id: str | None) -> set[str]:
+    """Route ids that seal the named campaign's open cycles."""
+    import artifact_producer
+    members = set()
+    for record in {id(r): r for r in cycles.values()}.values():
+        if campaign_id and record.get("campaign_id") == campaign_id:
+            try:
+                members.add(artifact_producer._finalize_route(root, record)["route_id"])
+            except Exception:
+                continue
+    return members
+
+
+def _sweep(summary, root: Path, *, api, trigger, campaign_id, now, budget) -> None:
     runtime = root / ".runtime"
     if not (runtime / "routes").is_dir():
         return
@@ -514,13 +581,15 @@ def _sweep(summary, root: Path, *, api, trigger, now, budget) -> None:
             summary["busy"] = True
             return
         registries = _registries(api)
-        resource_routes, resource_paths = _live_resource_runs()
-        facts = {"held": _held_by_attempts(registries), "gate_roots": _gate_ledger_roots(registries),
+        resource_routes, resource_paths, resource_activity = _resource_runs()
+        held, owners = _attempts(registries)
+        facts = {"held": held, "owners": owners, "gate_roots": _gate_ledger_roots(registries),
                  "resource_routes": resource_routes, "resource_paths": resource_paths,
                  "open_paths": _open_paths(root)}
         holders, activity = _composers(api)
         current = _current_identity()
         cycles = _open_cycles_by_route(root)
+        members = _campaign_members(root, cycles, campaign_id)
         files = sorted(_open_route_files(root, api), key=_mtime)
         for index, path in enumerate(files):
             if time.monotonic() >= deadline:
@@ -534,14 +603,15 @@ def _sweep(summary, root: Path, *, api, trigger, now, budget) -> None:
             home = _cycle_home(root, record)
             kept = _kept(route_id, raw, root=root, runtime=runtime, facts=facts, home=home)
             reason = None
+            rules = dict(activity=activity, current=current, now=now, member=route_id in members)
             if kept is None:
-                reason, kept = _decide(holder, activity=activity, current=current, now=now,
-                                       idle_since=_last_activity(root, path, raw, holder, api, record, now))
+                reason, kept = _decide(holder, idle_since=_last_activity(
+                    root, path, raw, holder, api, record, now, resource_activity=resource_activity), **rules)
             if reason is not None:
                 # Confirm against the whole cycle tree before acting.
-                reason, kept = _decide(holder, activity=activity, current=current, now=now,
-                                       idle_since=_last_activity(root, path, raw, holder, api, record, now,
-                                                                 deep=True))
+                reason, kept = _decide(holder, idle_since=_last_activity(
+                    root, path, raw, holder, api, record, now, deep=True,
+                    resource_activity=resource_activity), **rules)
             if reason is None:
                 summary["kept"][kept] = summary["kept"].get(kept, 0) + 1
                 continue

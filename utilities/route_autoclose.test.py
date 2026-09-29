@@ -4,8 +4,8 @@
 Every case drives the public CLI (`compose`, `start`, `status`,
 `campaign-status`, `campaign-close`) in an isolated artifact root, route-chain
 ledger, dispatch registry, workflow ledger, resource-run index and Claude
-session registry.  The R-cases are the PR #53 review reproductions, kept as
-regressions.
+session registry.  The R- and N-cases are the PR #53 review reproductions
+(rounds 1 and 2), kept as regressions.
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID"
                 "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE", "HEARTING_INLINE_FINISH_CRASH_AT",
                 "AGENT_WORKFLOW_ROOT", "AGENT_RESOURCE_RUN_INDEX")
 SESSION_ENV = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID", "opencode": "OPENCODE_SESSION_ID"}
-TWO_HOURS, TWO_DAYS = 2 * 3600, 2 * 24 * 3600
+TWO_HOURS, TWO_DAYS, EIGHT_DAYS = 2 * 3600, 2 * 24 * 3600, 8 * 24 * 3600
 
 
 def _proc_start(pid: int) -> str:
@@ -146,7 +146,7 @@ class RouteAutocloseTest(unittest.TestCase):
         path = route_file.with_name(route_file.stem + ".outcome.json")
         return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
-    def age(self, route_file, harness, sid, seconds=TWO_DAYS):
+    def age(self, route_file, harness, sid, seconds=EIGHT_DAYS):
         """`seconds` of nothing: route, cycles and the composer's own ledger."""
         old = time.time() - seconds
         ledger = self.ledgers / harness / f"{sid}.jsonl"
@@ -198,8 +198,9 @@ class RouteAutocloseTest(unittest.TestCase):
     def test_idle_direct_closes_without_claiming_proof_and_abandons_its_cycle(self):
         route_file, route = self.compose("quiet", "opencode", "ses-oc")
         record = self.write_artifact(route)
+        self.age(route_file, "opencode", "ses-oc", TWO_DAYS)
         self.sweep()
-        self.assertIsNone(self.outcome(route_file))   # a day of quiet first
+        self.assertIsNone(self.outcome(route_file))   # a week of quiet first
         self.age(route_file, "opencode", "ses-oc")
         self.assertIn("route_autoclose closed=1", self.sweep())
         outcome = self.outcome(route_file)
@@ -356,18 +357,19 @@ class RouteAutocloseTest(unittest.TestCase):
         self.sweep()
         self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
 
-    def test_a_started_terminal_commit_is_left_to_its_controller(self):
-        route_file, route = self.compose("committing", "codex", "session-9", intensity="quick", start=False)
+    def test_n6_pass_owner_with_pending_settlement_is_left_to_the_runtime(self):
+        route_file, route = self.compose("owned", "codex", "session-9", intensity="quick", start=False)
         slot = self.root / ".runtime/terminal-commits/v1" / route["route_id"] / "att-owner"
         slot.mkdir(parents=True)
-        (slot / "producer-binding.json").write_text("{}")   # written at owner launch: not a commit
+        (slot / "producer-binding.json").write_text("{}")   # written at owner launch
+        metadata = (f"attempt_id=att-owner,worker_type=owner,dispatch_depth=1,owner_route_id={route['route_id']},"
+                    f"owner_route_file={route_file},owner_route_hash={route['route_hash']},"
+                    "workflow_completion=runtime-v1,failure_class=pass")
+        self.jobs.write_text(f"2026-01-01T00:00:00Z\tdone\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
         self.age(route_file, "codex", "session-9")
-        (slot / "terminal-commit.json").write_text(json.dumps({"state": "claimed"}))
+        # dispatch_terminal_commit.owner_completion_pending: pending or unknown both keep the route.
         self.sweep()
         self.assertIsNone(self.outcome(route_file))
-        (slot / "terminal-commit.json").unlink()
-        self.sweep()
-        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
 
     def test_live_resource_run_bound_to_the_route_is_never_closed(self):
         route_file, route = self.compose("training", "codex", "session-9")
@@ -384,8 +386,59 @@ class RouteAutocloseTest(unittest.TestCase):
         self.sweep()
         self.assertIsNone(self.outcome(route_file))
         runner.kill(); runner.wait()
+        self.sweep()   # gone here, but a run on another host is gone here too: no end record, still live
+        self.assertIsNone(self.outcome(route_file))
+        data = json.loads(registry.read_text())
+        data["runs"]["train"].update(status="failed", exit_code=-9)   # the runner records the end
+        registry.write_text(json.dumps(data))
         self.sweep()
         self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+
+    def remote_run(self, route_file, **extra):
+        """A run registered from another host: its pid means nothing here."""
+        log = self.repo / "runs" / "train.log"
+        log.parent.mkdir(exist_ok=True)
+        log.write_text("epoch 1\n")
+        registry = self.base / "runs.json"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"r1": {
+            "run_id": "r1", "pid": 4000000, "starttime": "123", "command_hash": "ab" * 32,
+            "cwd": str(self.repo), "log": str(log), "sentinel": str(log) + ".exit",
+            "route": str(route_file), "node": "full-run", "status": "running", **extra}}}))
+        self.resource_index.write_text(json.dumps({"schema_version": 1, "registries": {
+            "k": {"path": str(registry)}}}))
+        return log
+
+    def test_n2_run_on_another_host_counts_as_live_until_it_records_an_end(self):
+        route_file, route = self.compose("remote-training", "codex", "session-b")
+        log = self.remote_run(route_file)
+        self.age(route_file, "codex", "session-b")
+        old = time.time() - EIGHT_DAYS
+        os.utime(log, (old, old))
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+        Path(str(log) + ".exit").write_text("0")   # the wrapper's exit sentinel
+        self.sweep()
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+
+    def test_n2_a_bound_runs_fresh_log_counts_as_activity(self):
+        route_file, route = self.compose("remote-log", "codex", "session-b")
+        self.remote_run(route_file, status="succeeded")   # ended, but it just wrote
+        self.age(route_file, "codex", "session-b")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_n7_unreadable_resource_index_closes_nothing(self):
+        route_file, route = self.compose("training-local", "codex", "session-b")
+        self.resource_index.write_text('{"schema_version": 1, "registries": ')
+        self.age(route_file, "codex", "session-b")
+        self.assertNotIn("route_autoclose closed", self.sweep())
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_n1_week_rule_covers_a_gate_this_host_cannot_see(self):
+        route_file, route = self.compose("gated-elsewhere", "codex", "session-b", intensity="quick", start=False)
+        self.age(route_file, "codex", "session-b", TWO_DAYS)
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
 
     def test_cycle_a_live_process_writes_into_is_never_closed(self):
         route_file, route = self.compose("logging", "codex", "session-9")
@@ -414,6 +467,46 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertIsNone(self.outcome(live_file))
         self.assertIsNone(self.outcome(resumed_file))
 
+    def autoclosed(self):
+        route_file, route = self.compose("overnight", "codex", "session-b")
+        record = self.write_artifact(route)
+        self.age(route_file, "codex", "session-b")
+        self.sweep()
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+        return route_file, route, record
+
+    def test_n3_finish_on_an_automatically_closed_route_succeeds(self):
+        route_file, route, record = self.autoclosed()
+        summary = self.base / "summary.md"
+        summary.write_text("done\n")
+        done = self.run_as("codex", "session-b", "finish", "--route", route_file, "--evidence",
+                           self.cycle_dir(record) / "artifacts/documents/report.md", "--summary-file", summary)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["state"], "already-closed-automatically")
+        self.assertIn("already closed automatically", done.stderr)
+
+    def test_n3_start_on_an_automatically_closed_route_hands_back_a_compose(self):
+        route_file, route, _record = self.autoclosed()
+        done = self.run_as("codex", "session-b", "start", "--route", route_file, "--jobs", self.jobs)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        receipt = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual((receipt["state"], receipt["parent_next"]), ("autoclosed", "compose"))
+        again = subprocess.run(receipt["parent_next_command"], shell=True, cwd=self.repo, capture_output=True,
+                               text=True, env={**self.env, "CODEX_THREAD_ID": "session-b"})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotEqual(json.loads(again.stdout.strip().splitlines()[-1])["route_id"], route["route_id"])
+
+    def test_non_automatic_closure_keeps_its_existing_finish_refusal(self):
+        route_file, route = self.compose("hand-closed", "codex", "session-1")
+        record = self.write_artifact(route)
+        self.run_as("codex", "session-1", "close", "--route", route_file, "--allow-unproven")
+        summary = self.base / "summary.md"
+        summary.write_text("done\n")
+        done = self.run_as("codex", "session-1", "finish", "--route", route_file, "--evidence",
+                           self.cycle_dir(record) / "artifacts/documents/report.md", "--summary-file", summary)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("finish-route-already-closed", done.stderr + done.stdout)
+
     def test_the_sweeping_session_keeps_its_own_routes(self):
         route_file, _route = self.compose("mine", "codex", "session-1")
         self.age(route_file, "codex", "session-1")
@@ -438,19 +531,27 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertIsNone(self.outcome(route_file))
 
     # ---- campaign close -------------------------------------------------------
-    def test_e_campaign_close_is_not_refused_by_an_idle_direct_but_is_by_fresh_work(self):
-        route_file, route = self.compose("member", "opencode", "ses-oc", campaign="k3")
+    def test_e_campaign_close_by_its_worker_is_not_refused_by_its_open_direct(self):
+        route_file, route = self.compose("member", "codex", "session-1", campaign="k2")
         campaign = self.write_artifact(route)["campaign_id"]
         status = json.loads(self.campaign("campaign-status", campaign).stdout)
         self.assertEqual(status["close_refusal"]["reason"], "campaign-cycle-not-sealed")
+        closed = self.run_as("codex", "session-1", "campaign-close", "--artifact-root", self.root,
+                             "--campaign", campaign, "--reason", "report shipped", program=PRODUCER)
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "campaign-close")
+        self.assertEqual(json.loads(self.campaign("campaign-status", campaign).stdout)["state"], "satisfied")
+
+    def test_e_campaign_close_takes_an_hour_quiet_member_but_not_fresh_work(self):
+        route_file, route = self.compose("member", "opencode", "ses-oc", campaign="k3")
+        campaign = self.write_artifact(route)["campaign_id"]
         fresh = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertNotEqual(fresh.returncode, 0)
         self.assertIsNone(self.outcome(route_file))
-        self.age(route_file, "opencode", "ses-oc")
+        self.age(route_file, "opencode", "ses-oc", TWO_HOURS)
         closed = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
-        self.assertEqual(self.outcome(route_file)["autoclose"]["trigger"], "campaign-close")
-        self.assertEqual(json.loads(self.campaign("campaign-status", campaign).stdout)["state"], "satisfied")
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "campaign-close")
 
     # ---- the checkout and everything outside the artifact root ----------------
     def test_r5_checkout_bytes_and_index_are_untouched_and_git_is_only_read(self):
