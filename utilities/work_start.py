@@ -676,7 +676,8 @@ def _compose_again(route) -> str:
     argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
             "--slug", str(route.get("slug") or route["route_id"]), "--capability", route["capability"],
             "--capability-mode", str(route.get("capability_mode") or "default"), "--shape", shape,
-            "--cwd", route["cwd"], "--prompt-file", str(task), "--start"]
+            "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
+            "--prompt-file", str(task), "--start"]
     if route.get("campaign_key"):
         argv += ["--campaign-key", route["campaign_key"]]
     elif route.get("parent_cycle_id"):

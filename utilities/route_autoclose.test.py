@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -33,6 +34,16 @@ SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID"
                 "AGENT_WORKFLOW_ROOT", "AGENT_RESOURCE_RUN_INDEX")
 SESSION_ENV = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID", "opencode": "OPENCODE_SESSION_ID"}
 TWO_HOURS, TWO_DAYS, EIGHT_DAYS = 2 * 3600, 2 * 24 * 3600, 8 * 24 * 3600
+
+
+# Only these reach the commands under test; everything else is set explicitly,
+# so a caller running inside a dispatch worker (AGENT_ARTIFACT_*, AGENT_WORKFLOW_ROOT,
+# session ids, XDG state) cannot steer a test write into a real artifact root.
+INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR", "USER", "LOGNAME", "SHELL")
+
+
+def isolated_env(**explicit) -> dict:
+    return {**{key: os.environ[key] for key in INHERITED if key in os.environ}, **explicit}
 
 
 def _proc_start(pid: int) -> str:
@@ -57,12 +68,10 @@ class RouteAutocloseTest(unittest.TestCase):
         self.sessions.mkdir(parents=True)
         self.ledgers = base / "route-chains"
         self.resource_index = base / "resource-runs.index.json"
-        self.env = {key: value for key, value in os.environ.items() if key not in SESSION_VARS}
-        self.env.update({"AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(self.jobs),
-                         "AGENT_DISPATCH_DEPTH": "0", "XDG_STATE_HOME": str(base / "xdg"),
-                         "FLEET_ROUTE_CHAIN_DIR": str(self.ledgers),
-                         "CLAUDE_CONFIG_DIR": str(base / "claude"),
-                         "AGENT_RESOURCE_RUN_INDEX": str(self.resource_index)})
+        self.env = isolated_env(
+            AGENT_HOME=str(ROOT), AGENT_DISPATCH_JOBS=str(self.jobs), AGENT_DISPATCH_DEPTH="0",
+            XDG_STATE_HOME=str(base / "xdg"), FLEET_ROUTE_CHAIN_DIR=str(self.ledgers),
+            CLAUDE_CONFIG_DIR=str(base / "claude"), AGENT_RESOURCE_RUN_INDEX=str(self.resource_index))
         artifact_producer.activate(self.root, repository_id="repo_" + "a" * 32,
                                    artifact_root_id="root_" + "b" * 32,
                                    w7={"campaign_id": "camp_" + "c" * 32})
@@ -495,6 +504,51 @@ class RouteAutocloseTest(unittest.TestCase):
                                text=True, env={**self.env, "CODEX_THREAD_ID": "session-b"})
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertNotEqual(json.loads(again.stdout.strip().splitlines()[-1])["route_id"], route["route_id"])
+
+    def test_review3_worker_environment_cannot_move_a_test_into_a_real_root(self):
+        decoy = self.base / "decoy-artifact-root"
+        decoy.mkdir()
+        worker = {"AGENT_ARTIFACT_ROOT": str(decoy), "AGENT_ARTIFACT_OUTPUT_DIR": str(decoy / "out"),
+                  "AGENT_ARTIFACT_CYCLE_ID": "cyc_" + "d" * 32, "AGENT_ARTIFACT_CAMPAIGN_KEY": "k1",
+                  "AGENT_WORKFLOW_ROOT": str(decoy / "workflow")}
+        with mock.patch.dict(os.environ, worker):
+            self.assertFalse(set(worker) & set(isolated_env()))
+            route_file, route, _record = self.autoclosed()
+            done = self.run_as("codex", "session-b", "start", "--route", route_file, "--jobs", self.jobs)
+        command = json.loads(done.stdout.strip().splitlines()[-1])["parent_next_command"]
+        # The leak's mechanism: the compose command a returning session runs, under a worker env.
+        again = subprocess.run(command, shell=True, cwd=self.repo, capture_output=True, text=True,
+                               env={**self.env, **worker, "CODEX_THREAD_ID": "session-b"})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        receipt = json.loads(again.stdout.strip().splitlines()[-1])
+        self.assertTrue(receipt["route_file"].startswith(str(self.root)), receipt["route_file"])
+        self.assertEqual(sorted(decoy.rglob("*")), [])
+
+    def test_review3_write_into_an_automatically_closed_cycle_names_the_way_forward(self):
+        route_file, route, record = self.autoclosed()
+        target = self.cycle_dir(record) / "artifacts" / "documents" / "late.md"
+        done = self.run_as("codex", "session-b", "check-write", "--artifact-root", self.root,
+                           "--file", target, program=PRODUCER)
+        verdict = json.loads(done.stdout)
+        self.assertEqual(verdict["verdict"], "deny")
+        self.assertIn("compose the work again", verdict["hint"])
+
+    def test_review3_a_cycle_that_cannot_seal_is_not_retried_until_its_evidence_changes(self):
+        route_file, route = self.compose("stuck", "codex", "session-1")
+        record = self.write_artifact(route)
+        self.run_as("codex", "session-1", "close", "--route", route_file, "--allow-unproven")
+        old = time.time() - TWO_HOURS
+        os.utime(route_file.with_name(route_file.stem + ".outcome.json"), (old, old))
+        cycle_file = self.root / ".runtime/artifact-producer/v1/cycles" / (record["cycle_id"] + ".json")
+        stuck = json.loads(cycle_file.read_text())
+        stuck["parent_cycle_id"] = "cyc_" + "e" * 32   # a parent that never seals
+        cycle_file.write_text(json.dumps(stuck))
+        self.assertIn("cycles_left_open=1", self.sweep())
+        memory = json.loads((self.root / ".runtime/route-autoclose/state.json").read_text())
+        self.assertIn(record["cycle_id"], memory["unsealable"])
+        self.assertNotIn("cycles_left_open", self.sweep())   # remembered: no second attempt
+        os.utime(cycle_file, None)                          # new evidence
+        self.assertIn("cycles_left_open=1", self.sweep())
 
     def test_non_automatic_closure_keeps_its_existing_finish_refusal(self):
         route_file, route = self.compose("hand-closed", "codex", "session-1")

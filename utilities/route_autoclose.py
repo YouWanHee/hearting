@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import io
 import json
 import os
@@ -294,6 +295,7 @@ def _resource_runs() -> tuple[set[str], list[str], dict]:
     return routes, paths, activity
 
 
+@functools.lru_cache(maxsize=256)
 def _claude_state(sid: str) -> str:
     """alive | gone | unknown.  `gone` only on positive evidence on this host:
     the session's own registry record, whose process is dead."""
@@ -356,25 +358,6 @@ def _read_route(path: Path):
     return raw if isinstance(raw, dict) and raw.get("route_id") == path.stem else None
 
 
-def _open_cycles_by_route(root: Path) -> dict:
-    """route_id -> its open cycle record, read once per sweep."""
-    import artifact_producer
-    table = {}
-    try:
-        records = artifact_producer.list_cycle_records(root)
-    except Exception:
-        return table
-    for record in records:
-        if record.get("state") != "open":
-            continue
-        table.setdefault(record.get("route_id"), record)
-        for binding in record.get("route_bindings") or []:
-            route_id = binding.get("route_id") if isinstance(binding, dict) else binding
-            if isinstance(route_id, str):
-                table.setdefault(route_id, record)
-    return table
-
-
 def _cycle_home(root: Path, record) -> Path | None:
     import artifact_producer
     if not record:
@@ -412,28 +395,6 @@ def _last_activity(root: Path, path: Path, raw: Mapping[str, Any], holder, api, 
     return newest
 
 
-def _kept(route_id: str, raw, *, root, runtime, facts, home) -> str | None:
-    """Why this route must stay open whatever the time, else None."""
-    import inline_finish
-    if route_id in facts["held"]:
-        return "owner-live"
-    if _settlement_pending(route_id, facts["owners"]):
-        return "owner-settlement-pending"
-    try:
-        pending = inline_finish.pending_state(root, route_id)
-    except Exception:
-        return "finish-pending"
-    if pending and pending.get("state") != "finished":
-        return "finish-pending"
-    if _waits_on_human(route_id, facts["gate_roots"]):
-        return "human-gate"
-    if route_id in facts["resource_routes"] or any(_under(item, home) for item in facts["resource_paths"]):
-        return "resource-run"
-    if any(_under(item, home) for item in facts["open_paths"]):
-        return "cycle-in-use"
-    return None
-
-
 def _decide(holder, *, activity, current, idle_since, now, member=False) -> tuple[str | None, str | None]:
     """(reason to close | None, reason kept).  `member`: a member route of the
     campaign `campaign-close` is closing."""
@@ -459,13 +420,25 @@ def _decide(holder, *, activity, current, idle_since, now, member=False) -> tupl
     return None, "recent-activity"
 
 
+_TRANSIENT = ("busy", "lock", "finish-in-progress", "in-progress")
+
+
+def _left_open(result: str) -> bool:
+    return result.startswith(("cycle-left-open", "cycle-unresolved"))
+
+
+def _transient(result: str) -> bool:
+    """A failure the next sweep may clear by itself (a held lock, a finish in flight)."""
+    return any(word in result for word in _TRANSIENT)
+
+
 def _seal_cycle(root: Path, route: Mapping[str, Any], proven) -> str:
     """Seal the route's open cycle with an existing state; never waits on a lock."""
     import artifact_producer
     try:
         record = artifact_producer.route_cycle_for(root, route)
-    except Exception:
-        record = None
+    except Exception as exc:
+        return "cycle-unresolved:" + str(exc)[:80]
     if not record:
         return "no-open-cycle"
     try:
@@ -508,34 +481,133 @@ def close_one(root: Path, path: Path, raw: Mapping[str, Any], reason: str, api, 
             "closed": "proven" if proven else "unproven", "cycle": _seal_cycle(root, route, proven)}
 
 
-def _seal_unsealed_cycles(root: Path, api, cycles: dict, facts, *, deadline, now) -> list[dict]:
-    """Open cycles behind an already closed route: the runtime's own closure at
-    once (an interrupted sweep), anyone else's after `QUIET_SECONDS`."""
+def _signature(path: Path) -> list | None:
+    try:
+        meta = path.stat()
+    except OSError:
+        return None
+    return [meta.st_mtime_ns, meta.st_size]
+
+
+class _Memory:
+    """What earlier sweeps learned, kept under the artifact root: cycle records
+    already past `open` (not re-read while unchanged) and cycles or routes that
+    failed to close, each with the signature of the evidence it failed on --
+    retried only once that evidence changes."""
+
+    def __init__(self, runtime: Path):
+        self.path = runtime / "route-autoclose" / "state.json"
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("schema") != 1:
+                raise ValueError
+        except (OSError, ValueError):
+            data = {"schema": 1}
+        self.settled = data.get("settled_cycles") if isinstance(data.get("settled_cycles"), dict) else {}
+        self.unsealable = data.get("unsealable") if isinstance(data.get("unsealable"), dict) else {}
+        self.failed_routes = data.get("failed_routes") if isinstance(data.get("failed_routes"), dict) else {}
+        self.changed = False
+
+    def save(self) -> None:
+        if not self.changed:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".state.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({"schema": 1, "settled_cycles": self.settled,
+                                         "unsealable": self.unsealable,
+                                         "failed_routes": self.failed_routes}, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.path)
+
+
+def _open_cycles(root: Path, memory: _Memory) -> list[dict]:
+    """Open cycle records, re-reading only records whose file changed."""
     import artifact_producer
-    sealed, seen = [], set()
+    directory = root / ".runtime" / "artifact-producer" / "v1" / "cycles"
+    records = []
+    try:
+        entries = [entry for entry in os.scandir(directory) if entry.name.endswith(".json")]
+    except OSError:
+        return records
+    for entry in entries:
+        signature = _signature(Path(entry.path))
+        if signature is None or memory.settled.get(entry.name) == signature:
+            continue
+        try:
+            record = artifact_producer.read_cycle_record(root, entry.name[:-len(".json")])
+        except Exception:
+            continue
+        if not record:
+            continue
+        if record.get("state") != "open":
+            memory.settled[entry.name] = signature
+            memory.changed = True
+            continue
+        parent = record.get("parent_cycle_id")
+        if isinstance(parent, str) and parent:
+            # A parent sealed later is new evidence for a child that could not seal.
+            signature = signature + (_signature(directory / f"{parent}.json") or [])
+        record = dict(record, _signature=signature)
+        records.append(record)
+    return records
+
+
+def _cycles_by_route(records: list[dict]) -> dict:
+    table = {}
+    for record in records:
+        table.setdefault(record.get("route_id"), record)
+        for binding in record.get("route_bindings") or []:
+            route_id = binding.get("route_id") if isinstance(binding, dict) else binding
+            if isinstance(route_id, str):
+                table.setdefault(route_id, record)
+    return table
+
+
+def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory: _Memory, *,
+                          deadline, now) -> list[dict]:
+    """Open cycles behind an already closed route: the runtime's own closure at
+    once (an interrupted sweep), anyone else's after `QUIET_SECONDS`.  A cycle
+    that fails to seal is remembered with its evidence and skipped until that
+    evidence changes."""
+    import artifact_producer
+    results = []
     runtime = root / ".runtime"
-    for record in list(cycles.values()):
+    for record in records:
         if time.monotonic() >= deadline:
             break
-        if record["cycle_id"] in seen:
-            continue
-        seen.add(record["cycle_id"])
-        if not api.outcome_path(api.canonical_route_path(root, record["route_id"])).is_file():
+        begin_outcome = api.outcome_path(api.canonical_route_path(root, record["route_id"]))
+        outcome_signature = _signature(begin_outcome)
+        if outcome_signature is None:
             continue   # the begin route is open: the route pass owns it
+        cycle_id = record["cycle_id"]
+        remembered = memory.unsealable.get(cycle_id)
+        if (remembered and remembered.get("signature") == record["_signature"]
+                and remembered.get("outcome_signature") == outcome_signature):
+            continue
+        try:
+            quick = json.loads(begin_outcome.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not quick.get("autoclose") and now - _mtime(begin_outcome) < QUIET_SECONDS:
+            continue
         try:
             leaf = artifact_producer._finalize_route(root, record)
             outcome_file = api.outcome_path(api.canonical_route_path(root, leaf["route_id"]))
             outcome = json.loads(outcome_file.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not outcome.get("autoclose") and now - _mtime(outcome_file) < QUIET_SECONDS:
-            continue
-        if _kept(leaf["route_id"], leaf, root=root, runtime=runtime, facts=facts,
-                 home=_cycle_home(root, record)):
-            continue
-        sealed.append({"cycle_id": record["cycle_id"], "route_id": leaf["route_id"],
-                       "cycle": _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"))})
-    return sealed
+        except Exception as exc:
+            result = "cycle-left-open:" + str(exc)[:80]
+        else:
+            if not outcome.get("autoclose") and now - _mtime(outcome_file) < QUIET_SECONDS:
+                continue
+            if evidence.kept(leaf["route_id"], lambda: _cycle_home(root, record)):
+                continue
+            result = _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"))
+        results.append({"cycle_id": cycle_id, "route_id": record["route_id"], "cycle": result})
+        if _left_open(result) and not _transient(result):
+            memory.unsealable[cycle_id] = {"signature": record["_signature"],
+                                           "outcome_signature": outcome_signature,
+                                           "reason": result, "at": _iso(now)}
+            memory.changed = True
+    return results
 
 
 def sweep(artifact_root, *, api, trigger: str, campaign_id: str | None = None,
@@ -556,17 +628,54 @@ def sweep(artifact_root, *, api, trigger: str, campaign_id: str | None = None,
     return summary
 
 
-def _campaign_members(root: Path, cycles: dict, campaign_id: str | None) -> set[str]:
+def _campaign_members(root: Path, records: list[dict], campaign_id: str | None) -> set[str]:
     """Route ids that seal the named campaign's open cycles."""
     import artifact_producer
     members = set()
-    for record in {id(r): r for r in cycles.values()}.values():
+    for record in records:
         if campaign_id and record.get("campaign_id") == campaign_id:
             try:
                 members.add(artifact_producer._finalize_route(root, record)["route_id"])
             except Exception:
                 continue
     return members
+
+
+class _Evidence:
+    """The never-close evidence, gathered once and only when a route is due."""
+
+    def __init__(self, root: Path, api):
+        registries = _registries(api)
+        self.root, self.runtime = root, root / ".runtime"
+        self.resource_routes, self.resource_paths, self.resource_activity = _resource_runs()
+        self.held, self.owners = _attempts(registries)
+        self.gate_roots = _gate_ledger_roots(registries)
+        self.open_paths = _open_paths(root)
+
+    def kept(self, route_id: str, home) -> str | None:
+        """Why this route stays open whatever the time; `home` yields its cycle
+        directory and is asked only when the cheaper evidence is silent."""
+        import inline_finish
+        if route_id in self.held:
+            return "owner-live"
+        if _settlement_pending(route_id, self.owners):
+            return "owner-settlement-pending"
+        try:
+            pending = inline_finish.pending_state(self.root, route_id)
+        except Exception:
+            return "finish-pending"
+        if pending and pending.get("state") != "finished":
+            return "finish-pending"
+        if _waits_on_human(route_id, self.gate_roots):
+            return "human-gate"
+        if route_id in self.resource_routes:
+            return "resource-run"
+        directory = home()
+        if any(_under(item, directory) for item in self.resource_paths):
+            return "resource-run"
+        if any(_under(item, directory) for item in self.open_paths):
+            return "cycle-in-use"
+        return None
 
 
 def _sweep(summary, root: Path, *, api, trigger, campaign_id, now, budget) -> None:
@@ -580,46 +689,75 @@ def _sweep(summary, root: Path, *, api, trigger, campaign_id, now, budget) -> No
         except OSError:
             summary["busy"] = True
             return
-        registries = _registries(api)
-        resource_routes, resource_paths, resource_activity = _resource_runs()
-        held, owners = _attempts(registries)
-        facts = {"held": held, "owners": owners, "gate_roots": _gate_ledger_roots(registries),
-                 "resource_routes": resource_routes, "resource_paths": resource_paths,
-                 "open_paths": _open_paths(root)}
-        holders, activity = _composers(api)
-        current = _current_identity()
-        cycles = _open_cycles_by_route(root)
-        members = _campaign_members(root, cycles, campaign_id)
-        files = sorted(_open_route_files(root, api), key=_mtime)
-        for index, path in enumerate(files):
-            if time.monotonic() >= deadline:
-                summary["deferred"] += len(files) - index
-                break
-            raw = _read_route(path)
-            if raw is None:
-                continue
-            route_id = raw["route_id"]
-            holder, record = holders.get(route_id), cycles.get(route_id)
-            home = _cycle_home(root, record)
-            kept = _kept(route_id, raw, root=root, runtime=runtime, facts=facts, home=home)
-            reason = None
-            rules = dict(activity=activity, current=current, now=now, member=route_id in members)
-            if kept is None:
-                reason, kept = _decide(holder, idle_since=_last_activity(
-                    root, path, raw, holder, api, record, now, resource_activity=resource_activity), **rules)
-            if reason is not None:
-                # Confirm against the whole cycle tree before acting.
-                reason, kept = _decide(holder, idle_since=_last_activity(
-                    root, path, raw, holder, api, record, now, deep=True,
-                    resource_activity=resource_activity), **rules)
-            if reason is None:
-                summary["kept"][kept] = summary["kept"].get(kept, 0) + 1
-                continue
-            try:
-                summary["closed"].append(close_one(root, path, raw, reason, api, trigger=trigger, now=now))
-            except Exception as exc:
-                summary["errors"].append({"route_id": route_id, "error": str(exc)[:160]})
-        summary["cycles"] = _seal_unsealed_cycles(root, api, _open_cycles_by_route(root), facts,
+        memory = _Memory(runtime)
+        try:
+            _pass(summary, root, api, memory, trigger=trigger, campaign_id=campaign_id, now=now,
+                  deadline=deadline)
+        finally:
+            memory.save()
+
+
+def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, now, deadline) -> None:
+    def kept(reason):
+        summary["kept"][reason] = summary["kept"].get(reason, 0) + 1
+
+    _claude_state.cache_clear()   # one answer per session per sweep
+    holders, activity = _composers(api)
+    current = _current_identity()
+    records = _open_cycles(root, memory)
+    cycles = _cycles_by_route(records)
+    members = _campaign_members(root, records, campaign_id)
+    files = sorted(_open_route_files(root, api), key=_mtime)
+    evidence = None
+    for index, path in enumerate(files):
+        if time.monotonic() >= deadline:
+            summary["deferred"] += len(files) - index
+            break
+        route_id = path.stem
+        remembered = memory.failed_routes.get(route_id)
+        if remembered and remembered.get("signature") == _signature(path):
+            kept("close-failed-before")
+            continue
+        holder = holders.get(route_id)
+        rules = dict(activity=activity, current=current, now=now, member=route_id in members)
+        # Time first, from what costs a stat: a route written recently is kept
+        # without reading any evidence.
+        reason, why = _decide(holder, idle_since=max(_mtime(path), float(holder.get("ts") or 0) if holder else 0.0),
+                              **rules)
+        if reason is None:
+            kept(why)
+            continue
+        raw = _read_route(path)
+        if raw is None:
+            continue
+        if evidence is None:
+            evidence = _Evidence(root, api)
+        record = cycles.get(route_id)
+        home = _cycle_home(root, record) if record else None
+        why = evidence.kept(route_id, lambda: home)
+        if why is None:
+            reason, why = _decide(holder, idle_since=_last_activity(
+                root, path, raw, holder, api, record, now, deep=True,
+                resource_activity=evidence.resource_activity), **rules)
+        if why is not None:
+            kept(why)
+            continue
+        try:
+            summary["closed"].append(close_one(root, path, raw, reason, api, trigger=trigger, now=now))
+        except Exception as exc:
+            summary["errors"].append({"route_id": route_id, "error": str(exc)[:160]})
+            if not _transient(str(exc)):
+                memory.failed_routes[route_id] = {"signature": _signature(path), "reason": str(exc)[:160],
+                                                  "at": _iso(now)}
+                memory.changed = True
+    if time.monotonic() < deadline and any(
+            _signature(api.outcome_path(api.canonical_route_path(root, record["route_id"])))
+            for record in records):
+        if evidence is None:
+            evidence = _Evidence(root, api)
+        if summary["closed"]:
+            records = _open_cycles(root, memory)
+        summary["cycles"] = _seal_unsealed_cycles(root, api, records, evidence, memory,
                                                   deadline=deadline, now=now)
 
 
@@ -632,6 +770,7 @@ def report(summary: Mapping[str, Any], stream=None) -> None:
     reasons: dict[str, int] = {}
     for row in closed:
         reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
-    print("route_autoclose closed=%d cycles_sealed=%d deferred=%d errors=%d reasons=%s" % (
-        len(closed), len(cycles), summary.get("deferred", 0), len(errors),
+    left_open = sum(_left_open(row["cycle"]) for row in cycles)
+    print("route_autoclose closed=%d cycles_sealed=%d cycles_left_open=%d deferred=%d errors=%d reasons=%s" % (
+        len(closed), len(cycles) - left_open, left_open, summary.get("deferred", 0), len(errors),
         ",".join(f"{k}:{v}" for k, v in sorted(reasons.items())) or "-"), file=stream)

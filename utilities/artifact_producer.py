@@ -97,6 +97,11 @@ OK, BLOCKED, USAGE = 0, 65, 64
 LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` first; if begin already ran, "
                      "export its --env-file output (AGENT_ARTIFACT_*) into this shell, then retry")
 
+# A cycle that is sealed, abandoned or closed automatically after it sat unused
+# (route_autoclose.py) takes no more writes; the way forward is a new route.
+CLOSED_CYCLE_HINT = ("this cycle takes no more writes (sealed, abandoned or closed automatically after it "
+                     "sat unused); compose the work again for an open cycle")
+
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
 
@@ -5806,9 +5811,11 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
         sealed_on_disk = manifest is not None
         if record is None:
             reason = "cycle-sealed" if sealed_on_disk else "cycle-unknown"
-            return {**base, "verdict": "deny", "reason": reason, "layout": "cycle", "cycle_id": cycle_id}
+            return {**base, "verdict": "deny", "reason": reason, "layout": "cycle", "cycle_id": cycle_id,
+                    "hint": CLOSED_CYCLE_HINT}
         if record.get("state") != "open" or record.get("campaign_id") != campaign_id or sealed_on_disk:
-            return {**base, "verdict": "deny", "reason": "cycle-not-open", "layout": "cycle", "cycle_id": cycle_id}
+            return {**base, "verdict": "deny", "reason": "cycle-not-open", "layout": "cycle", "cycle_id": cycle_id,
+                    "hint": CLOSED_CYCLE_HINT}
         bucket = parts[artifacts_index + 1] if len(parts) > artifacts_index + 2 else None
         return {**base, "verdict": "allow", "reason": "open-cycle-artifacts", "layout": "cycle",
                 "cycle_id": cycle_id, "campaign_id": campaign_id, "bucket": bucket,
