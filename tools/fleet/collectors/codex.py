@@ -56,6 +56,9 @@ _SUBAGENT_INDEX = {}                  # runtime home -> (read time, stamp, map, 
 _LIFECYCLE_CACHE_MAX = 512
 _LIFECYCLE_CACHE = OrderedDict()
 _LIFECYCLE_CACHE_EVICTIONS = 0
+_EXACT_LIFECYCLE_CACHE = OrderedDict()   # path -> (full stat stamp, exact-scan lifecycle)
+_ROLLOUT_CWD_CACHE_MAX = 8192
+_ROLLOUT_CWD_CACHE = {}                  # path -> (stat stamp, session_meta cwd)
 _LIFECYCLE_BOUNDARY_BYTES = 256
 _TURN_CONTEXT_CACHE_MAX = 512
 _TURN_CONTEXT_CACHE = OrderedDict()
@@ -207,6 +210,11 @@ def _advance_task_lifecycle(lifecycle, raw_line):
         row = json.loads(raw_line)
     except Exception:
         return lifecycle
+    return _advance_task_lifecycle_row(lifecycle, row)
+
+
+def _advance_task_lifecycle_row(lifecycle, row):
+    """Advance one already-decoded JSONL record."""
     if not isinstance(row, dict) or row.get("type") != "event_msg":
         return lifecycle
     payload = row.get("payload")
@@ -263,13 +271,14 @@ def _consume_lifecycle_bytes(lifecycle, carry, data, pending_calls=None):
     parts = (carry + data).split(b"\n")
     carry = parts.pop()
     for raw_line in parts:
+        # One decode serves both observers; a trailing CR is JSON whitespace.
+        try:
+            row = json.loads(raw_line)
+        except Exception:
+            row = None
         if pending_calls is not None:
-            try:
-                row = json.loads(raw_line)
-            except (ValueError, UnicodeError):
-                row = None
             _advance_pending_input(pending_calls, lifecycle, row)
-        lifecycle = _advance_task_lifecycle(lifecycle, raw_line.rstrip(b"\r"))
+        lifecycle = _advance_task_lifecycle_row(lifecycle, row)
     return lifecycle, carry
 
 
@@ -359,16 +368,11 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
     lifecycle for that observation; a later clean call may initialize afresh.
     Intermediate-byte rewrites are outside the contract and are not detected;
     detecting them would require rereading the whole file on every tick, which
-    conflicts with this feature's purpose. ``max_scan=None`` is the uncached exact
-    full scan used for native-subagent state.
+    conflicts with this feature's purpose. ``max_scan=None`` is the exact full scan
+    used for native-subagent state; see `_exact_task_lifecycle`.
     """
     if max_scan is None:
-        try:
-            return _parse_latest_task_lifecycle(
-                rollout_path, chunk=chunk, max_scan=None
-            )
-        except (OSError, ValueError):
-            return None
+        return _exact_task_lifecycle(rollout_path, chunk)
 
     global _LIFECYCLE_CACHE_EVICTIONS
     canonical_path = os.path.realpath(os.path.abspath(rollout_path))
@@ -446,6 +450,39 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
         _LIFECYCLE_CACHE.popitem(last=False)
         _LIFECYCLE_CACHE_EVICTIONS += 1
     return updated.lifecycle
+
+
+def _exact_task_lifecycle(rollout_path, chunk=65536):
+    """Full-history lifecycle, rescanned whenever the file's stat stamp changes.
+
+    Completed native children keep ``open`` spawn edges, so every child ever spawned
+    is observed on every tick. Only a byte-identical stat (identity, size, mtime,
+    ctime) reuses the previous full scan; any change, including an in-place rewrite,
+    replacement, or I/O failure, scans or fails exactly as an uncached read would.
+    The incremental session cursor is neither consulted nor mutated.
+    """
+    canonical_path = os.path.realpath(os.path.abspath(rollout_path))
+    try:
+        st = os.stat(canonical_path)
+    except OSError:
+        _EXACT_LIFECYCLE_CACHE.pop(canonical_path, None)
+        return None
+    stamp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    cached = _EXACT_LIFECYCLE_CACHE.get(canonical_path)
+    if cached is not None and cached[0] == stamp:
+        _EXACT_LIFECYCLE_CACHE.move_to_end(canonical_path)
+        return cached[1]
+    try:
+        lifecycle = _parse_latest_task_lifecycle(rollout_path, chunk=chunk, max_scan=None)
+    except (OSError, ValueError):
+        _EXACT_LIFECYCLE_CACHE.pop(canonical_path, None)
+        return None
+    # The stamp predates the scan, so a write racing the scan forces the next rescan.
+    _EXACT_LIFECYCLE_CACHE[canonical_path] = (stamp, lifecycle)
+    _EXACT_LIFECYCLE_CACHE.move_to_end(canonical_path)
+    while len(_EXACT_LIFECYCLE_CACHE) > _LIFECYCLE_CACHE_MAX:
+        _EXACT_LIFECYCLE_CACHE.popitem(last=False)
+    return lifecycle
 
 
 def _subagent_active(edge_status, rollout_path, updated_at=None, updated_at_ms=None,
@@ -751,7 +788,24 @@ def _rollout_model_effort(path, chunk=65536):
 
 
 def _rollout_cwd(path):
-    """cwd from session_meta (line 1) — cheap single-line read."""
+    """cwd from session_meta (line 1), reread only when the file's stat changes."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        _ROLLOUT_CWD_CACHE.pop(path, None)
+        return None
+    stamp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    cached = _ROLLOUT_CWD_CACHE.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    cwd = _read_rollout_cwd(path)
+    _ROLLOUT_CWD_CACHE[path] = (stamp, cwd)
+    if len(_ROLLOUT_CWD_CACHE) > _ROLLOUT_CWD_CACHE_MAX:
+        _ROLLOUT_CWD_CACHE.pop(next(iter(_ROLLOUT_CWD_CACHE)))
+    return cwd
+
+
+def _read_rollout_cwd(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             m = json.loads(f.readline())

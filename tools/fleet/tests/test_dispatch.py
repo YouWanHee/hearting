@@ -2808,5 +2808,36 @@ class IntegratedAlertRemovalTest(unittest.TestCase):
         self.assertIn("lone-case-20260709-33333", text)
 
 
+class TickReuseTest(unittest.TestCase):
+    """Unchanged files reuse their parse across ticks; any stat change rereads."""
+
+    def test_stat_memo_reuses_unchanged_log_and_rereads_on_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "attempt.log")
+            Path(path).write_text('{"type":"item.started"}\n', encoding="utf-8")
+            cache, calls = {}, []
+
+            def read(target):
+                calls.append(target)
+                return dispatch.terminal_envelope_observed(target)
+
+            self.assertFalse(dispatch._stat_memo(cache, path, read))
+            self.assertFalse(dispatch._stat_memo(cache, path, read))
+            self.assertEqual(len(calls), 1)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write('{"type":"turn.completed"}\n')
+            self.assertTrue(dispatch._stat_memo(cache, path, read))
+            self.assertEqual(len(calls), 2)
+            os.unlink(path)
+            self.assertFalse(dispatch._stat_memo(cache, path, read))
+            self.assertNotIn(path, cache)
+
+    def test_parse_pipe_meta_returns_independent_copies(self):
+        pipe = "capability=autopilot-code,mode=dev"
+        first = dispatch._parse_pipe_meta(pipe)
+        first["mode"] = "mutated"
+        self.assertEqual(dispatch._parse_pipe_meta(pipe)["mode"], "dev")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

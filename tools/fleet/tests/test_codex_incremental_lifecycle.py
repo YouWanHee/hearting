@@ -30,6 +30,7 @@ def _event(event_type, turn_id):
 class IncrementalLifecycleTest(unittest.TestCase):
     def setUp(self):
         codex._LIFECYCLE_CACHE.clear()
+        codex._EXACT_LIFECYCLE_CACHE.clear()
         codex._LIFECYCLE_CACHE_EVICTIONS = 0
 
     def _write(self, path, *records):
@@ -140,6 +141,29 @@ class IncrementalLifecycleTest(unittest.TestCase):
             self.assertIs(codex._LIFECYCLE_CACHE[canonical], cached)
             self.assertIsNone(codex._latest_task_lifecycle(path))
             self.assertNotIn(canonical, codex._LIFECYCLE_CACHE)
+
+    def test_max_scan_none_reuses_unchanged_file_and_rescans_on_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "child.jsonl")
+            self._write(path, _event("task_started", "t1"), _event("task_complete", "t1"))
+            with mock.patch.object(
+                codex, "_parse_latest_task_lifecycle",
+                wraps=codex._parse_latest_task_lifecycle,
+            ) as scan:
+                for _ in range(2):
+                    self.assertEqual(
+                        codex._latest_task_lifecycle(path, max_scan=None),
+                        ("task_complete", "t1"),
+                    )
+                self.assertEqual(scan.call_count, 1)
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(_event("task_started", "t2"))
+                self.assertEqual(
+                    codex._latest_task_lifecycle(path, max_scan=None),
+                    ("task_started", "t2"),
+                )
+                self.assertEqual(scan.call_count, 2)
+            self.assertNotIn(os.path.realpath(path), codex._LIFECYCLE_CACHE)
 
     def test_max_scan_none_io_failure_does_not_evict_session_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:

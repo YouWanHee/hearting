@@ -15,6 +15,7 @@ codex/opencode headless dispatch appears ONLY via jobs.log (their argv has no /a
 live_stage() derives the real pipeline stage from plans/*_<slug>/ artifacts (ported from
 statusline.sh:131-171) so the label reflects live progress, not the static argv.
 """
+import functools
 import json
 import glob
 import hashlib
@@ -145,6 +146,13 @@ def _attempt_attention(meta):
 
 
 def _parse_pipe_meta(pipe):
+    """Parse jobs.log pipe metadata; every registry row is re-read each tick."""
+    if isinstance(pipe, str):
+        return dict(_parse_pipe_meta_cached(pipe))
+    return _parse_pipe_meta_uncached(pipe)
+
+
+def _parse_pipe_meta_uncached(pipe):
     """Parse jobs.log pipe metadata.
 
     The registry stays six tab fields for backward compatibility; depth/parent/intensity
@@ -181,6 +189,9 @@ def _parse_pipe_meta(pipe):
     if not m:
         return {}
     return {"_name": _strip_autopilot_prefix(m.group(1)), "mode": m.group(2)}
+
+
+_parse_pipe_meta_cached = functools.lru_cache(maxsize=8192)(_parse_pipe_meta_uncached)
 
 
 def _parse_pipe(pipe):
@@ -462,7 +473,38 @@ def _codex_home():
     return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
 
+_STAT_MEMO_LIMIT = 8192
+_TRANSCRIPT_CWD_CACHE = {}       # path -> (stat stamp, cwd)
+_TERMINAL_ENVELOPE_CACHE = {}    # path -> (stat stamp, observed)
+
+
+def _stat_stamp(path):
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _stat_memo(cache, path, read):
+    """Reuse ``read(path)`` while the file's stat stamp is unchanged; any change rereads."""
+    try:
+        stamp = _stat_stamp(path)
+    except (OSError, TypeError, ValueError):
+        cache.pop(path, None)
+        return read(path)
+    cached = cache.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    value = read(path)
+    cache[path] = (stamp, value)
+    if len(cache) > _STAT_MEMO_LIMIT:
+        cache.pop(next(iter(cache)))
+    return value
+
+
 def _codex_transcript_cwd(path):
+    return _stat_memo(_TRANSCRIPT_CWD_CACHE, path, _read_codex_transcript_cwd)
+
+
+def _read_codex_transcript_cwd(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -834,8 +876,9 @@ def _dispatch_liveness(job, now, track=True, codex_index=None):
         and job.attempt_contract_status == "current"
         and job.registered_worker is True
     ):
-        terminal_seen = bool(terminal_observation) or terminal_envelope_observed(
-            getattr(job, "_log_file", None)
+        log_file = getattr(job, "_log_file", None)
+        terminal_seen = bool(terminal_observation) or bool(log_file) and _stat_memo(
+            _TERMINAL_ENVELOPE_CACHE, log_file, terminal_envelope_observed
         )
         registry_path = getattr(job, "_registry_path", None)
         phase = ""
@@ -1069,6 +1112,9 @@ _CLAUDE_DISPATCH_CONTEXT_WINDOW_DEFAULT = 1_000_000
 _CLAUDE_STREAM_CACHE = {}       # path -> (mtime_ns, size, parsed)
 _CODEX_ATTEMPT_CACHE = {}       # path -> (mtime_ns, size, parsed)
 _OPENCODE_ATTEMPT_CACHE = {}    # path -> (mtime_ns, size, parsed)
+# Every registry attempt is re-observed each tick, so the FIFO bound must exceed the
+# attempt count; a smaller bound evicts each entry before its next hit.
+_ATTEMPT_PARSE_CACHE_LIMIT = 4096
 
 
 def _owned_attempt_log_path(job):
@@ -1366,7 +1412,7 @@ def _parse_claude_stream_tail(path):
         "exec_tool": next(reversed(open_tools.values())) if open_tools else None,
     }
     _CLAUDE_STREAM_CACHE[path] = (cache_key[0], cache_key[1], parsed)
-    if len(_CLAUDE_STREAM_CACHE) > 128:
+    if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
     return parsed
 
@@ -1580,7 +1626,7 @@ def _parse_codex_attempt_tail(path):
               "activity": activity if len(thread_ids) == 1 else None,
               "exec_tool": next(reversed(open_commands.values())) if open_commands else None}
     _CODEX_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
-    if len(_CODEX_ATTEMPT_CACHE) > 128:
+    if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
     return parsed
 
@@ -1739,7 +1785,7 @@ def _parse_opencode_attempt_tail(path):
         "active_context_tokens": active,
     }
     _OPENCODE_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
-    if len(_OPENCODE_ATTEMPT_CACHE) > 128:
+    if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
     return parsed
 
@@ -3319,6 +3365,17 @@ def _label_route_id(job):
     return getattr(job, "route_id", None) or getattr(job, "owner_route_id", None)
 
 
+_CYCLE_RECORD_CACHE = {}         # path -> (stat stamp, parsed cycle record or None)
+
+
+def _read_cycle_record(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
 def _campaign_labels(jobs):
     """F-97c: bind an owner job's route to its producer cycle title, read-only and
     bounded. No IO at all when no job carries a route id."""
@@ -3347,10 +3404,8 @@ def _campaign_labels(jobs):
                     break
                 if not entry.name.endswith(".json"):
                     continue
-                try:
-                    with open(entry.path, encoding="utf-8") as fh:
-                        rec = json.load(fh)
-                except Exception:
+                rec = _stat_memo(_CYCLE_RECORD_CACHE, entry.path, _read_cycle_record)
+                if rec is None:
                     continue
                 rid = rec.get("route_id")
                 if rid in remaining:
