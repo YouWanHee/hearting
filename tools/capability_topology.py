@@ -62,6 +62,44 @@ def registry_digest(registry):
     return "sha256:" + hashlib.sha256(canonical_registry_bytes(registry)).hexdigest()
 
 
+def _string_values(node, out):
+    if isinstance(node, str):
+        out.add(node)
+    elif isinstance(node, dict):
+        for value in node.values():
+            _string_values(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            _string_values(value, out)
+
+
+def capability_registry_digest(registry, capability, extra_recipes=()):
+    """Digest of only the registry parts a route of `capability` derives from.
+
+    Kept: every top-level section except the two per-name tables, so a change
+    to any shared rule (intensities, profiles, workflow states, parallel
+    policy, ...) still changes it; the `recipes` rows of this capability (and
+    of the base capability a composed recipe names); and the
+    `completion_gate_contracts` rows those recipes reference. Recipes and gate
+    contracts of other capabilities are left out, so adding or editing an
+    unrelated capability does not make this capability's routes stale.
+    """
+    recipes = list(extra_recipes)
+    names = {capability}
+    for recipe in recipes:
+        base = (recipe.get("compose") or {}).get("base_capability") if isinstance(recipe, dict) else None
+        if isinstance(base, str):
+            names.add(base)
+    recipes = [r for r in registry.get("recipes", []) if r.get("capability") in names] + recipes
+    referenced = set()
+    _string_values(recipes, referenced)
+    contracts = registry.get("completion_gate_contracts") or {}
+    projection = {k: v for k, v in registry.items() if k not in ("recipes", "completion_gate_contracts")}
+    projection["recipes"] = recipes
+    projection["completion_gate_contracts"] = {k: v for k, v in contracts.items() if k in referenced}
+    return "sha256:" + hashlib.sha256(canonical_registry_bytes(projection)).hexdigest()
+
+
 def expected_recipe_keys(manifest=None):
     if manifest is None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
