@@ -99,7 +99,8 @@ def runtime_identity():
     - Codex: a process named ``codex``/``codex-*`` is the runtime only once
       `collectors.codex.session_id_of_process` proves its thread — the rollout it holds
       open, else (a direct TUI holding none) the board's own `process_rollouts`
-      start-time match over the live Codex processes, scanned at most once per walk. A
+      start-time match and then its same-cwd fallback over the live Codex processes,
+      scanned at most once per walk. A
       Codex process proven neither way (the `--remote` TUI, `codex-code-mode-host`, an
       ambiguous match) is passed over for the ancestor that is, and no proof anywhere
       means ``("codex", None)``;
@@ -381,7 +382,11 @@ def _defer_until_proven(session_id: str, report_session: bool) -> None:
 
 
 def _codex_tui_pane(session_id: str):
-    """The herdr pane of the live Codex TUI proven to be on ``session_id``, or None."""
+    """The herdr pane of the live Codex TUI proven to be on ``session_id``, or None.
+
+    Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
+    stay None: a badge on the wrong pane also misdirects peer messages.
+    """
     from fleet.collectors import codex as codex_collector
     from fleet.collectors import procscan
     live = []
@@ -391,6 +396,7 @@ def _codex_tui_pane(session_id: str):
             live.append(procscan.scan(harness_filter={"codex"}))
         return live[0]
 
+    panes = set()
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or _comm(int(entry)) != "codex":
             continue
@@ -398,10 +404,10 @@ def _codex_tui_pane(session_id: str):
         try:
             if pane and codex_collector.session_id_of_process(
                     int(entry), live_codex) == session_id:
-                return pane
+                panes.add(pane)
         except Exception:
             continue
-    return None
+    return panes.pop() if len(panes) == 1 else None
 
 
 def _await_tui_and_project(session_id: str, report_session: bool) -> None:

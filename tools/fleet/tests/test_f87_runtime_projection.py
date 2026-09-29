@@ -332,7 +332,7 @@ class RuntimeProjectionTest(unittest.TestCase):
                 else:
                     self.assertEqual(log.read_text(), "", case)
 
-    def direct_codex(self, root, bindir, sids):
+    def direct_codex(self, root, bindir, sids, created_offset=0):
         """A direct Codex TUI holding NO rollout fd (2026-08-10): a process named ``codex``
         whose prelude writes each root rollout, stamped with the current time, just after
         it starts — as Codex does at thread start — and closes it again. Only the board's
@@ -347,16 +347,17 @@ class RuntimeProjectionTest(unittest.TestCase):
                      json.dumps({"type": "session_meta", "payload": {
                          "id": sid, "cwd": os.path.realpath(root), "timestamp": "@NOW@"}}))
                     for sid in sids]
-        prelude = ("import datetime as _d;_now=_d.datetime.now(_d.timezone.utc).isoformat()\n"
+        prelude = ("import datetime as _d;_now=(_d.datetime.now(_d.timezone.utc)"
+                   "+_d.timedelta(seconds=%d)).isoformat()\n" % created_offset +
                    "for _p,_m in %r:\n    open(_p,'w').write(_m.replace('@NOW@',_now)+'\\n')\n"
                    % (rollouts,))
         return str(interpreter), prelude
 
-    def direct_codex_reports(self, root, sids, payload_sid, sibling=False):
+    def direct_codex_reports(self, root, sids, payload_sid, sibling=False, created_offset=0):
         """Run the Codex prompt hook under `direct_codex`; True when herdr was reached."""
         hook = ROOT / "adapters/codex/hooks/userprompt-lifecycle.py"
         bindir, log = self.stub(root)
-        interpreter, prelude = self.direct_codex(root, bindir, sids)
+        interpreter, prelude = self.direct_codex(root, bindir, sids, created_offset)
         env = self.env(root)
         env.update({"PATH": str(bindir) + os.pathsep + env["PATH"],
                     "HERDR_ENV": "1", "HERDR_PANE_ID": "wB:pN",
@@ -406,6 +407,21 @@ class RuntimeProjectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             self.assertFalse(self.direct_codex_reports(root, [sid], sid, sibling=True))
+
+    def test_a_thread_created_after_the_start_window_reports_by_the_board_fallback(self):
+        """Codex creates the thread 35 s to minutes after the TUI starts, past the start
+        match. The board then names the TUI by its same-cwd fallback, and so does the
+        gate, so the pane gets the badge Fleet shows; a foreign id still never reports."""
+        sid = "0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.assertTrue(self.direct_codex_reports(root, [sid], sid, created_offset=60))
+            self.assertFalse(self.direct_codex_reports(
+                root, [sid], "directpromptsid", created_offset=60))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.assertFalse(self.direct_codex_reports(
+                root, [sid], sid, sibling=True, created_offset=60))
 
     def test_the_gate_and_the_board_name_a_direct_tui_with_one_resolver(self):
         """The board's `prepare_tick` and the gate's `session_id_of_process` must give a

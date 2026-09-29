@@ -957,7 +957,10 @@ def session_id_of_process(pid, live_codex=None):
     so a process named exactly ``codex`` without that fd is then resolved by
     `process_rollouts` — the board's own resolver — over every live Codex process
     (`procscan.scan`, the board's process list), against the rollout home in that
-    process's OWN environment. An ambiguous start-time match stays None.
+    process's OWN environment. An ambiguous start-time match stays None. Last, the
+    board's same-cwd step (`enrich` -> `_fallback_rollout`): the one rollout no process
+    claims that was created since this process started, and that no other unresolved
+    same-cwd process could also take; zero, several, or a shared candidate stay None.
 
     The herdr report gate (`herdr_projection.may_report`) calls this, so no payload or
     environment value of the caller can stand in for it. ``live_codex`` is an optional
@@ -982,8 +985,30 @@ def session_id_of_process(pid, live_codex=None):
     if not home:
         return None
     sessions = live_codex() if live_codex else procscan.scan(harness_filter={"codex"})
-    path = process_rollouts(sessions, os.path.abspath(home))[0].get(pid)
+    home = os.path.abspath(home)
+    paths, claimed = process_rollouts(sessions, home)
+    path = paths.get(pid)
+    if not path:
+        path = _mutual_fallback_rollout(pid, sessions, home, paths, claimed)
     return _sid(path) if path else None
+
+
+def _mutual_fallback_rollout(pid, sessions, home, paths, claimed):
+    """The board's same-cwd fallback, accepted only when no rival process shares it."""
+    sess = next((s for s in sessions if getattr(s, "pid", None) == pid), None)
+    if sess is None or not getattr(sess, "cwd", None):
+        return None
+    now = time.time()
+    candidates = _fallback_candidates(sess, home, claimed, now)
+    if len(candidates) != 1:
+        return None
+    for rival in sessions:
+        if (rival is sess or getattr(rival, "harness", None) != "codex"
+                or getattr(rival, "cwd", None) != sess.cwd or rival.pid in paths):
+            continue
+        if candidates[0] in _fallback_candidates(rival, home, claimed, now):
+            return None
+    return candidates[0]
 
 
 def _session_created(meta):
@@ -1116,16 +1141,13 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
             }
 
 
-def _fallback_rollout(sess, home):
-    """Match an idle TUI only when exactly one unclaimed rollout fits its start time."""
-    now = time.time()
-    if now - _FALLBACK_CLAIMS["ts"] >= _INDEX_TTL:
-        _FALLBACK_CLAIMS.update(ts=now, sids=set())
+def _fallback_candidates(sess, home, claimed, now):
+    """Unclaimed same-cwd root rollouts created since this process started."""
     process_started = now - max(0, sess.elapsed_min) * 60
     candidates = []
     for path in _index(home).get(sess.cwd, []):
         sid = _sid(path)
-        if not sid or sid in _FALLBACK_CLAIMS["sids"]:
+        if not sid or sid in claimed:
             continue
         meta = _rollout_meta(path)
         if _is_subagent(meta):
@@ -1133,6 +1155,15 @@ def _fallback_rollout(sess, home):
         created = _session_created(meta)
         if created is not None and process_started - 300 <= created <= now + 300:
             candidates.append(path)
+    return candidates
+
+
+def _fallback_rollout(sess, home):
+    """Match an idle TUI only when exactly one unclaimed rollout fits its start time."""
+    now = time.time()
+    if now - _FALLBACK_CLAIMS["ts"] >= _INDEX_TTL:
+        _FALLBACK_CLAIMS.update(ts=now, sids=set())
+    candidates = _fallback_candidates(sess, home, _FALLBACK_CLAIMS["sids"], now)
     if len(candidates) != 1:
         return None
     path = candidates[0]
