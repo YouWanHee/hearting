@@ -13,9 +13,9 @@ python3 tools/stage-advance-census.py \
   --topologies capabilities/topologies.json --json
 ```
 
-정적 recipe 축(`capabilities/topologies.json`, schema 10): `standard_plus` node 53개 중
-continuation 선언 40, terminal 13, `runtime-eligible` 35 / `model-required` 18 /
-`unsealed` 0이며 13개 capability 중 12개가 staged graph를 가진다. 이 여섯 숫자는
+정적 recipe 축(`capabilities/topologies.json`, schema 10): recipe node 63개 중
+continuation 선언 49, terminal 14, `runtime-eligible` 44 / `model-required` 19 /
+`unsealed` 0이며 14개 capability 중 12개가 staged graph를 가진다. 이 숫자는
 `tools/stage_advance_census.test.py::test_repo_topology_pins_the_documented_recipe_axis`가
 고정한다.
 

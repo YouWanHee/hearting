@@ -126,15 +126,18 @@ class CensusFixture(unittest.TestCase):
         # depth-1 direction legs to each of the five standard+ recipes, and
         # autopilot-code already declared one `frame` node. Both legs carry a
         # continuation, and both are `runtime-eligible`, so those two counts
-        # move by the same nine. Terminal and model-required counts do not
-        # move: a frame leg is neither.
-        self.assertEqual(recipe["nodes_total"], 62)
+        # move by the same nine.
+        # +1 node / +1 terminal / +1 model-required / +1 capability: the
+        # autopilot-ship `package` mode added a second recipe whose single node is
+        # a terminal capability-owner carrying a completion gate. It is neither
+        # runtime-eligible nor a continuation, so those two counts do not move.
+        self.assertEqual(recipe["nodes_total"], 63)
         self.assertEqual(recipe["nodes_with_continuation"], 49)
-        self.assertEqual(recipe["terminal_nodes"], 13)
+        self.assertEqual(recipe["terminal_nodes"], 14)
         self.assertEqual(recipe["advance_class"]["runtime-eligible"], 44)
-        self.assertEqual(recipe["advance_class"]["model-required"], 18)
+        self.assertEqual(recipe["advance_class"]["model-required"], 19)
         self.assertEqual(recipe["capabilities_with_staged_nodes"], 12)
-        self.assertEqual(recipe["capabilities_total"], 13)
+        self.assertEqual(recipe["capabilities_total"], 14)
 
     # --- --topologies is really consumed ----------------------------------
 
