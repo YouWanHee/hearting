@@ -413,13 +413,14 @@ class RefreshRecoveryContract(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 class RouteChainWriterParityTest(unittest.TestCase):
-    """`WRITER_SUPPORT` is explicit per harness (U5: OpenCode is `not-implemented`,
-    never skipped); claude/codex share the same env writer and produce the same
-    assembled chain shape from the same fixture."""
+    """`WRITER_SUPPORT` is explicit per harness, never skipped. All three are `env`:
+    each exports its own native session id to the process, so a ledger line is anchored
+    directly and no harness is exempt. claude/codex/opencode produce the same assembled
+    chain shape from the same fixture."""
 
     def test_writer_support_matches_the_declared_map(self):
         self.assertEqual(route_chain.WRITER_SUPPORT,
-                          {"claude": "env", "codex": "env", "opencode": "not-implemented"})
+                          {"claude": "env", "codex": "env", "opencode": "env"})
         for h in HARNESSES:
             with self.subTest(harness=h):
                 self.assertIn(h, route_chain.WRITER_SUPPORT)
@@ -427,23 +428,42 @@ class RouteChainWriterParityTest(unittest.TestCase):
     def _session(self, harness, sid):
         return Session(harness=harness, pid=1, session_id=sid)
 
-    def test_opencode_session_never_gets_a_chain_even_with_a_ledger(self):
+    def test_opencode_session_gets_the_same_chain_shape_as_the_env_writers(self):
+        # OpenCode exports its own session id (OPENCODE_SESSION_ID) and the collector
+        # already carries it on the row, so a ledger line is anchored exactly as it is for
+        # claude/codex. Previously the harness was exempt in WRITER_SUPPORT, which dropped
+        # it in enrich() before its own lines were ever read. The same fixture must now
+        # assemble into the same chain for opencode as for a claude writer.
+        record = {"route_id": "rt-1", "route_hash": "h1", "capability": "autopilot-research",
+                  "capability_mode": "default", "effective_intensity": "standard"}
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"FLEET_ROUTE_CHAIN_DIR": tmp}):
-                # OpenCode has no writer (U5) -- there is no legal way to have produced
-                # this file, but even if state existed, enrich() must never read it.
-                oc_dir = os.path.join(tmp, "opencode")
-                os.makedirs(oc_dir, mode=0o700)
-                line = route_chain.build_line(
-                    {"route_id": "rt-1", "route_hash": "h1", "capability": "autopilot-research"},
-                    event="compose", harness="opencode", session_id="oc-1",
-                    route_file="/tmp/r.json",
-                )
-                with open(os.path.join(oc_dir, "oc-1.jsonl"), "w", encoding="utf-8") as fh:
-                    fh.write(json.dumps(line) + "\n")
-                session = self._session("opencode", "oc-1")
-                route_chain.enrich([session])
-                self.assertIsNone(session.route_chain)
+                chains = {}
+                for harness in ("claude", "opencode"):
+                    harness_dir = os.path.join(tmp, harness)
+                    os.makedirs(harness_dir, mode=0o700)
+                    line = route_chain.build_line(
+                        dict(record), event="compose", harness=harness, session_id="sid-1",
+                        route_file="/tmp/rt-1.json",
+                    )
+                    with open(os.path.join(harness_dir, "sid-1.jsonl"), "w", encoding="utf-8") as fh:
+                        fh.write(json.dumps(line) + "\n")
+                    session = self._session(harness, "sid-1")
+                    with mock.patch("fleet.route.load", return_value=record), \
+                         mock.patch("fleet.route.load_outcome",
+                                    return_value={"present": False}):
+                        route_chain.enrich([session])
+                    self.assertIsNotNone(session.route_chain,
+                                         f"{harness} session got no route_chain at all")
+                    chains[harness] = session.route_chain
+                self.assertEqual(chains["opencode"]["key"], chains["claude"]["key"])
+                self.assertEqual(chains["opencode"]["visible"], chains["claude"]["visible"])
+                self.assertEqual([n["label"] for n in chains["opencode"]["nodes"]],
+                                 [n["label"] for n in chains["claude"]["nodes"]])
+                self.assertEqual([n["route_id"] for n in chains["opencode"]["nodes"]],
+                                 [n["route_id"] for n in chains["claude"]["nodes"]])
+                self.assertEqual([n["state"] for n in chains["opencode"]["nodes"]],
+                                 [n["state"] for n in chains["claude"]["nodes"]])
 
     def test_claude_and_codex_produce_the_same_chain_shape_from_the_same_fixture(self):
         record = {"route_id": "rt-1", "route_hash": "h1", "capability": "autopilot-research",

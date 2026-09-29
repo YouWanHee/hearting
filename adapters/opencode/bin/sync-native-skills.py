@@ -51,6 +51,43 @@ def markdown_section(text: str, heading: str) -> str:
     return compact("\n".join(body))
 
 
+def markdown_section_raw(text: str, heading: str) -> str:
+    marker = f"## {heading}"
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == marker:
+            start = index
+            break
+    if start is None:
+        return ""
+    body: list[str] = []
+    for line in lines[start:]:
+        if body and line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def portable_sections(source: str) -> str:
+    sections: list[str] = []
+    for heading in (
+        "Artifact Ownership",
+        "Artifact Producer Lifecycle",
+        "Role Requirements",
+        "Guard Requirements",
+        "Portable Procedure",
+        "Routing Boundary",
+        "Mode-Specific Semantics",
+    ):
+        section = markdown_section_raw(source, heading)
+        if section:
+            sections.append(section)
+    if not sections:
+        return ""
+    return "\n\n## Projected Portable Details\n\n" + "\n\n".join(sections) + "\n"
+
+
 def render(identifier: str, spec: dict, capability_file: Path) -> tuple[str, str]:
     source = capability_file.read_text(encoding="utf-8")
     modes = ", ".join(spec["modes"]) or "none"
@@ -66,6 +103,7 @@ def render(identifier: str, spec: dict, capability_file: Path) -> tuple[str, str
 
 - Invocation semantics: {invocation_semantics}
 """
+    projected_details = "" if invocation_class == "entry-router" else portable_sections(source)
     description = compact(f"{invocation['use_when']} {invocation['not_for']}")
     if invocation_class == "entry-router":
         use_steps = f"""1. Before approval, route from this compact metadata and `core/WORKFLOW.md §0.2`; do not read the full portable source merely to propose the route.
@@ -79,6 +117,19 @@ def render(identifier: str, spec: dict, capability_file: Path) -> tuple[str, str
 2. Run `adapters/opencode/bin/preflight.sh capability-info {identifier}`.
 3. Obey the reported status:"""
         route_guard = ""
+
+    # OpenCode preflight has no `route <identifier>` grounding form
+    # ("route requires --capability option form"), so the grounding-only row is
+    # deliberately absent here — projecting it would name a command that does not
+    # exist. The workflow-state row is emitted for every capability, and the join
+    # keeps an empty route_guard from rendering a bare blank bullet.
+    workflow_evidence = "\n".join(
+        row for row in (
+            route_guard,
+            f"- For workflow state: `adapters/opencode/bin/preflight.sh status [cwd] [session-id]`"
+            f" and `adapters/opencode/bin/preflight.sh prompt-signal [cwd] [session-id]`",
+        ) if row
+    )
 
     body = f"""---
 name: {identifier}
@@ -115,10 +166,11 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Argument shape: `{argument_shape}`
 - Portable meaning: {meaning}
 {portable_contract}
+{projected_details}
 
 ## Workflow Evidence
 
-{route_guard}
+{workflow_evidence}
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

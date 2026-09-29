@@ -549,7 +549,7 @@ class CurrentCapabilityTest(unittest.TestCase):
 
 
 class EnrichTest(EnvTmpTestCase):
-    def test_enrich_skips_opencode_and_children_and_app_server(self):
+    def test_enrich_skips_children_and_app_server(self):
         sessions = [
             _sess(harness="opencode", session_id="oc-1"),
             _sess(harness="claude", session_id="c-1", is_child=True),
@@ -557,7 +557,8 @@ class EnrichTest(EnvTmpTestCase):
             _sess(harness="claude", session_id="c-3"),
         ]
         route_chain.enrich(sessions)
-        self.assertIsNone(sessions[0].route_chain)
+        # opencode is an env writer like the others: it is enriched, not skipped.
+        self.assertIsNotNone(sessions[0].route_chain)   # empty chain dict, not None
         self.assertIsNone(sessions[1].route_chain)
         self.assertIsNone(sessions[2].route_chain)
         self.assertIsNotNone(sessions[3].route_chain)   # empty chain dict, not None

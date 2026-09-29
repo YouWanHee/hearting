@@ -2,8 +2,14 @@
 
 State lives in ~/.local/share/opencode/opencode.db (WAL; opened mode=ro). The `session` table
 carries per-session model/cwd/cost/tokens live. argv has no session id, so pid↔session is
-matched by /proc/cwd == session.directory; among sessions in that directory we take the most
-recently updated top-level (parent_id IS NULL) session.
+matched by /proc/cwd == session.directory, narrowed to the session THIS process created: the
+earliest top-level (parent_id IS NULL) session in that directory whose time_created is at/after
+the process start (/proc/<pid>/stat field 22 against /proc/stat btime — the same derivation
+Codex already trusts). That narrowing matters because several opencode sessions can share one
+directory: without it every process in a shared directory collapsed onto whichever session was
+most recently updated, so the panes rendered as one. A process that attached to a pre-existing
+session has no such candidate and takes the older binding (most recently updated top-level in
+that directory) unchanged.
 
 Structurally missing (render '—', PRD §2/§4): rate-limit (no column). effort = model.variant.
 context% = last-request prompt size (input + cache.read + cache.write from the latest
@@ -22,6 +28,12 @@ from .. import titles
 
 _COLS = ("id, slug, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, "
          "time_updated, parent_id")
+
+# Variant tokens that name the runtime's own choice rather than a user-set dial. These are
+# the same words render drops in `_EMPTY_EFFORT` (render.py) — mirrored here, not imported:
+# collectors must not import render at module scope (see session_registry's import
+# contract), so the two lists are kept in step by name and test rather than by dependency.
+_DEFAULT_VARIANTS = frozenset({"default", "runtime-default", "inherit"})
 
 _REG = {"ts": 0.0, "map": None, "by_provider": None}   # → context window (from models.json)
 _REG_TTL = 300.0
@@ -126,7 +138,69 @@ def _db():
         "~/.local/share/opencode/opencode.db")
 
 
-def _query(cur, cwd):
+def _process_started_ms(sess):
+    """This process's start as epoch MILLIseconds, or None when unknown.
+
+    ``Session.proc_start`` is ``/proc/<pid>/stat`` field 22 — clock ticks since boot.
+    ``/proc/stat``'s ``btime`` is that same boot epoch in seconds, so the pair converts
+    exactly; the same derivation Codex already trusts for its own process-start match
+    (``collectors/codex.py`` ``_process_started_at``). Missing/non-Linux/unreadable
+    evidence stays None so the caller keeps the previous, weaker binding.
+    """
+    try:
+        ticks = int(sess.proc_start)
+        clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+        if ticks < 0 or clock_ticks <= 0:
+            return None
+        with open("/proc/stat", encoding="ascii", errors="replace") as handle:
+            boot = next(
+                int(line.split()[1]) for line in handle
+                if line.startswith("btime ")
+            )
+    except (AttributeError, OSError, StopIteration, TypeError, ValueError):
+        return None
+    return int((boot + ticks / clock_ticks) * 1000)
+
+
+def prepare_tick(sessions):
+    """`{pid: next same-directory opencode start (ms) | None}` for this tick.
+
+    A process owns the top-level sessions created between its own start and the next
+    same-directory opencode process's start; that window is what separates panes that
+    share a checkout without pinning a pane to the first session it ever opened.
+    """
+    starts = {}
+    for sess in sessions:
+        if getattr(sess, "harness", None) != "opencode" or not getattr(sess, "cwd", None):
+            continue
+        started = _process_started_ms(sess)
+        if started is not None:
+            starts.setdefault(sess.cwd, []).append((started, sess.pid))
+    until = {}
+    for rows in starts.values():
+        rows.sort()
+        for index, (_started, pid) in enumerate(rows):
+            until[pid] = rows[index + 1][0] if index + 1 < len(rows) else None
+    return until
+
+
+def _query(cur, cwd, proc_start_ms=None, until_ms=None):
+    # N opencode processes can share one directory, and one process can open several
+    # sessions over its life (/new). Bind to the most recently updated top-level session
+    # created inside this process's window [own start, next same-directory start): the
+    # window keeps panes apart, and "most recently updated" follows the session the pane
+    # is on now instead of the first one it ever created. A process that attached to a
+    # pre-existing session has no candidate here and keeps the older binding below.
+    if proc_start_ms is not None:
+        bound = "AND time_created<? " if until_ms is not None else ""
+        args = (cwd, proc_start_ms) + ((until_ms,) if until_ms is not None else ())
+        row = cur.execute(
+            "SELECT %s FROM session WHERE directory=? AND parent_id IS NULL "
+            "AND time_created>=? %sORDER BY time_updated DESC LIMIT 1" % (_COLS, bound),
+            args,
+        ).fetchone()
+        if row:
+            return row
     # prefer a top-level session; fall back to any session in the directory
     for extra in ("AND parent_id IS NULL ", ""):
         row = cur.execute(
@@ -198,7 +272,7 @@ def _child_sessions(con, sid):
     return out
 
 
-def enrich(sess):
+def enrich(sess, tick=None):
     # B-5: no hearting-managed writer exists yet for OpenCode (`writer_support ==
     # "not-implemented"`), so this always reads None today — the call is here so the
     # harness-parity contract (D) and a future writer both have one call site, matching
@@ -217,7 +291,8 @@ def enrich(sess):
     subagents = None
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
-        row = _query(con.cursor(), sess.cwd)
+        row = _query(con.cursor(), sess.cwd, _process_started_ms(sess),
+                     (tick or {}).get(sess.pid))
         if row and row[0]:
             table = _message_table(con)
             cursor = _observed_cursor(con, table, row[0])
@@ -275,7 +350,15 @@ def enrich(sess):
             provider = mj.get("providerID") or None
             # opencode reasoning effort = model JSON 'variant' (e.g. high/low) — user 2026-07-01
             if mj.get("variant"):
-                sess.effort = mj.get("variant")
+                # A real `default` is the runtime naming its own choice, not an unset
+                # dial, so it is kept OUT of `effort` (render's `_EMPTY_EFFORT` treats
+                # those words as carrying no information) and recorded separately —
+                # otherwise "the runtime defaulted" and "we observed nothing" render
+                # as the same blank.
+                if str(mj["variant"]).strip().lower() in _DEFAULT_VARIANTS:
+                    sess.effort_default = True
+                else:
+                    sess.effort = mj.get("variant")
         except Exception:
             sess.model = model_j
     if isinstance(cost, (int, float)):

@@ -411,7 +411,11 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     Exception on record: 2026-09-04 the opencode row's source-absence message was
     corrected ("plan quota is console-only" → "opencode-go key not found") after the
     Go usage API shipped upstream (#31084/PR #2879) — the four r7 goldens were
-    regenerated with the exact capture procedure above for that intentional change."""
+    regenerated with the exact capture procedure above for that intentional change.
+    Exception on record: 2026-09-29 the usage-header label for that same harness became
+    "opencode go" (user: 상단 opencode→opencode go, so the row names the GO account whose
+    quota it shows, matching 'claude code') — the four r7 goldens were regenerated with
+    the exact capture procedure above; the only diff was that one label line per width."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

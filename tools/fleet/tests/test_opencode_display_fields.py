@@ -241,5 +241,68 @@ class DispatchTelemetryTest(unittest.TestCase):
         self.assertIsNotNone(dispatch._owned_attempt_log_path(job))
 
 
+class SessionBindingTest(unittest.TestCase):
+    """pid↔session binding when several opencode processes share one directory, and when
+    one process opens more than one session (measured 2026-09-29: three panes on the
+    primary checkout; one BC_ResNet pane that opened four sessions, whose live
+    OPENCODE_SESSION_ID was the fourth)."""
+
+    _DIR = "/repo"
+
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.execute(
+            "CREATE TABLE session (id TEXT, slug TEXT, agent TEXT, model TEXT, cost REAL, "
+            "tokens_input INT, tokens_output INT, tokens_reasoning INT, time_updated INT, "
+            "parent_id TEXT, directory TEXT, time_created INT)")
+
+    def _add(self, sid, created, updated, parent=None, directory=_DIR):
+        self.con.execute(
+            "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, sid, None, None, None, None, None, None, updated, parent, directory, created))
+
+    def _bound(self, start, until=None):
+        row = opencode._query(self.con.cursor(), self._DIR, start, until)
+        return row[0] if row else None
+
+    def test_same_directory_processes_bind_their_own_sessions(self):
+        self._add("a", created=110, updated=900)
+        self._add("b", created=210, updated=950)
+        self._add("c", created=310, updated=990)
+        self.assertEqual(self._bound(100, 200), "a")
+        self.assertEqual(self._bound(200, 300), "b")
+        self.assertEqual(self._bound(300), "c")
+
+    def test_a_process_follows_the_session_it_opened_last(self):
+        for sid, created, updated in (("first", 110, 120), ("second", 130, 140),
+                                      ("current", 150, 999)):
+            self._add(sid, created, updated)
+        self.assertEqual(self._bound(100), "current")
+
+    def test_child_sessions_never_bind(self):
+        self._add("top", created=110, updated=500)
+        self._add("sub", created=120, updated=999, parent="top")
+        self.assertEqual(self._bound(100), "top")
+
+    def test_attached_process_keeps_the_directory_fallback(self):
+        self._add("old", created=10, updated=999)
+        self.assertEqual(self._bound(100), "old")
+
+    def test_prepare_tick_bounds_each_process_by_the_next_same_directory_start(self):
+        class _S:
+            def __init__(self, pid, cwd, harness="opencode"):
+                self.pid, self.cwd, self.harness = pid, cwd, harness
+        starts = {1: 300, 2: 100, 3: 200, 4: 50, 5: 60}
+        sessions = [_S(1, "/r"), _S(2, "/r"), _S(3, "/r"), _S(4, "/other"),
+                    _S(5, "/r", harness="codex")]
+        orig = opencode._process_started_ms
+        opencode._process_started_ms = lambda sess: starts[sess.pid]
+        try:
+            until = opencode.prepare_tick(sessions)
+        finally:
+            opencode._process_started_ms = orig
+        self.assertEqual(until, {2: 200, 3: 300, 1: None, 4: None})
+
+
 if __name__ == "__main__":
     unittest.main()

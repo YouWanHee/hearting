@@ -109,6 +109,38 @@ class OpenCodeSubagentTest(unittest.TestCase):
             self.assertEqual(len(sess.subagents), 1)
             self.assertEqual(sess.subagents[0].agent_type, "explore")
 
+    def test_variant_default_is_flagged_not_raised_as_effort(self):
+        """opencode emits variant 'default' for a model whose effort the runtime chose.
+        Promoting it to `effort` would put an uninformative word in the effort column, so
+        the collector keeps `effort` None and records `effort_default` instead — which is
+        what lets the row say 'the runtime defaulted' rather than showing the same blank a
+        session with no effort at all gets."""
+        def enrich_with(variant):
+            with tempfile.TemporaryDirectory() as tmp:
+                db = self._db(tmp, [
+                    {"id": "s1", "slug": "p", "agent": None, "directory": "/x",
+                     "model": json.dumps({"id": "gpt-5.6-luna", "variant": variant}),
+                     "time_updated": 1000, "parent_id": None},
+                ])
+                with mock.patch.dict(os.environ, {"OPENCODE_DB": db}):
+                    sess = Session(harness="opencode", pid=1, cwd="/x")
+                    opencode.enrich(sess)
+                return sess
+
+        for token in ("default", "runtime-default", "inherit", "Default"):
+            sess = enrich_with(token)
+            self.assertIsNone(sess.effort, token)
+            self.assertTrue(sess.effort_default, token)
+
+        sess = enrich_with("xhigh")
+        self.assertEqual(sess.effort, "xhigh")
+        self.assertFalse(sess.effort_default)
+
+        # no variant at all = genuinely unobserved, which is NOT "the runtime defaulted"
+        sess = enrich_with(None)
+        self.assertIsNone(sess.effort)
+        self.assertFalse(sess.effort_default)
+
 
 class CodexSubagentTest(unittest.TestCase):
     """Temp state DB/rollout fixtures — real Codex runtime state is never written."""
@@ -1263,6 +1295,52 @@ class SubagentStripBudgetTest(unittest.TestCase):
         # non-wire-id values pass through untouched for _clean_model to handle
         self.assertEqual(render._short_model_id("sonnet"), "sonnet")
         self.assertIsNone(render._short_model_id(None))
+
+    def test_tier_and_version_suffixes_drop_from_model_name(self):
+        """사용자 2026-09-29: 'muse-spark-1.3-contributor'→'muse-spark', 'space-bunny-free'→
+        'space-bunny' (Fleet model cell). Both ids previously only *looked* short because
+        `_model_cell` clipped them at a width derived from the effort word, so the same
+        model changed shape with the effort length."""
+        self.assertEqual(render._short_model_id("muse-spark-1.3-contributor"), "muse-spark")
+        self.assertEqual(render._short_model_id("space-bunny-free"), "space-bunny")
+        # the display name is what session cards show too, not just dispatch rows
+        self.assertEqual(render._clean_model("muse-spark-1.3-contributor"), "muse-spark")
+        self.assertEqual(render._clean_model("space-bunny-free"), "space-bunny")
+        # a single-token family keeps its version — 'glm-5.2' is the 2026-08-07 decision,
+        # and a suffix strip that reached it would have shown a bare 'glm'
+        self.assertEqual(render._short_model_id("glm-5.2"), "glm-5.2")
+        self.assertEqual(render._clean_model("opencode-go/glm-5.2"), "glm-5.2")
+        self.assertEqual(render._short_model_id("gpt-5.6"), "gpt-5.6")
+        # untouched: a version is not trailing, and neither is this a tier word
+        self.assertEqual(render._short_model_id("gpt-5.6-luna"), "gpt-5.6-luna")
+        self.assertIsNone(render._shorten_model_suffix(None))
+
+    def test_runtime_default_effort_is_marked_not_blank(self):
+        """opencode reports variant 'default' (a real token naming the runtime's own choice).
+        `_EMPTY_EFFORT` drops it, so the row and a session with no effort at all rendered
+        identically. `effort_default` tells the two apart without claiming a ramp level."""
+        w = render._HMW - render._TAG_W
+
+        def cell(effort, is_default):
+            return "".join(t for t, _ in render._harness_model_cell(
+                "opencode", "gpt-5.6-luna", effort, w, "h_opencode",
+                effort_default=is_default))
+
+        self.assertIn("default", cell(None, True))
+        self.assertNotIn("default", cell(None, False))
+        # a real level still wins and is unchanged; the flag never displaces one
+        self.assertIn("max", cell("max", True))
+        self.assertIn("xhigh", cell("xhigh", False))
+        # `_effort_text` itself is unchanged — the runtime default is not an effort level
+        self.assertEqual(render._effort_text("default"), "")
+
+    def test_usage_header_names_the_opencode_go_account(self):
+        """사용자 2026-09-29: 상단 'opencode'→'opencode go' (사용량 정확). Scoped to the usage
+        row only; the session card and dispatch rows still name the runtime itself."""
+        self.assertEqual(render._USAGE_BADGE_TEXT["opencode"], "opencode go")
+        self.assertEqual(render._BADGE_TEXT["opencode"], "opencode")
+        # the usage label still fits its fixed 14-cell column
+        self.assertLessEqual(len(render._USAGE_BADGE_TEXT["opencode"]), 14)
 
     def test_completed_elapsed_stops_at_ended_at_and_gains_idle_tail(self):
         """사용자 2026-07-29 '언제 끝났는지': 30m runtime that finished 45m ago must
