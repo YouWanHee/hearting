@@ -1752,7 +1752,7 @@ def build_parser():
     p_wait = sub.add_parser("wait")
     p_wait.add_argument("target")
     p_wait.add_argument("--until", action="append", default=[])
-    p_wait.add_argument("--timeout", type=int, default=None)
+    p_wait.add_argument("--timeout", type=int, default=None, help="milliseconds")
     p_wait.add_argument("--ref", action="append", default=[])
     p_wait.set_defaults(func=cmd_wait)
 
@@ -1768,7 +1768,7 @@ def build_parser():
     p_watch = sub.add_parser("watch")
     p_watch.add_argument("target")
     p_watch.add_argument("--until", action="append", default=[])
-    p_watch.add_argument("--timeout", type=int, default=None)
+    p_watch.add_argument("--timeout", type=int, default=None, help="milliseconds")
     p_watch.add_argument("--ref", action="append", default=[])
     p_watch.add_argument("--wake", choices=("auto", "hook", "none"), default="auto")
     p_watch.set_defaults(func=cmd_watch, rearmed_from=None, rearm_count=0)
@@ -1791,7 +1791,7 @@ def build_parser():
 
     p_join = sub.add_parser("join")
     p_join.add_argument("watch_id")
-    p_join.add_argument("--timeout", type=int, default=None)
+    p_join.add_argument("--timeout", type=int, default=None, help="milliseconds")
     p_join.set_defaults(func=cmd_join)
 
     p_status = sub.add_parser("status")
