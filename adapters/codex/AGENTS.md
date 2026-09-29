@@ -106,7 +106,7 @@ Ordinary execution uses `preflight.sh compose --campaign-key <stream> --start
 --prompt-file <task>` (the stream key is required; `--unassigned` is the only
 keyless form);
 follow its receipt and reuse its `resume_command`. Runtime owns preparation,
-frame launches, exact attempt reuse, waiting and terminal closure. The parent
+frame launches, exact attempt reuse, waiting and closure, at success or once idle. The parent
 compares completed frames and asks the native interview only at `needs-question`.
 
 The low-level dispatch-depth-1 owner surface is `preflight.sh dispatch-owner

@@ -5892,6 +5892,22 @@ def resolve_output_dir(root: Path, bucket: str, *, cycle_dir_hint: Optional[str]
 # ---------------------------------------------------------------------------
 
 
+def _route_autoclose(root: Path, trigger: str, campaign: Optional[str] = None) -> None:
+    """Close routes nobody works on before campaign bookkeeping reads them
+    (route_autoclose.py).  Bookkeeping only: it never fails the command."""
+    try:
+        import artifact_cutover
+        import route_autoclose
+        campaign_id = None
+        if campaign is not None:
+            record, _raw = artifact_campaign.read_json(root, artifact_campaign.campaign_path(root, campaign))
+            campaign_id = record.get("campaign_id")
+        route_autoclose.report(route_autoclose.sweep(
+            root, api=artifact_cutover._route_module(), trigger=trigger, campaign_id=campaign_id))
+    except Exception as exc:  # noqa: BLE001
+        print(f"route_autoclose error={type(exc).__name__}", file=sys.stderr)
+
+
 def _print(payload: Any) -> None:
     print(json.dumps(payload, sort_keys=True))
 
@@ -6110,8 +6126,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print(result)
             return BLOCKED if str(result.get("status", "")).startswith("refused") else OK
         elif args.command == "campaign-status":
+            _route_autoclose(root, "campaign-status")
             result = artifact_campaign.status(root, args.campaign)
         elif args.command == "campaign-close":
+            _route_autoclose(root, "campaign-close", campaign=args.campaign)
             result = artifact_campaign.close(root, args.campaign, reason=args.reason)
         elif args.command == "campaign-reopen":
             result = artifact_campaign.reopen(root, args.campaign, reason=args.reason)
