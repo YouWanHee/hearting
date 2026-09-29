@@ -1,5 +1,39 @@
 # autopilot-ship
 
+Select the purpose first: `--mode package` prepares an archive from existing
+artifacts using the package procedure below. Omitted mode or `--mode default`
+keeps the deployment/release procedure and its `spec/ship.md` record. Package
+does not require a hosting/app spec or run the deployment steps.
+
+## Package procedure
+
+Reuse the existing delivery template and the request's named model versions,
+input/sample list, expected outputs, and existing reports. Keep this exact
+scope: received field samples plus one or two simulations does not include
+raw59, A-weight96, IPC, or historical models merely because they exist. A later
+approval of a larger batch is specific to that batch, not a reusable default.
+
+Collect the existing files into the requested layout. Reuse finalized results;
+only missing requested sample inference goes to lab/eval, without a full
+training/evaluation loop or new report. If packaging requires reusable program
+development, route that implementation to code. Independent document creation
+belongs to draft; interpretation of experiment results stays lab/eval.
+
+Check that the named versions and requested files match, copied relative links
+resolve within the delivery, and the ZIP (or requested equivalent) contains the
+intended files. Use the existing `release-config/` artifact bucket, preserve
+source reports and experiment/route/manifest state, and return the actual
+archive path with any missing inputs or known limitations. A content/version
+note may reuse the template; do not require a new manifest or proof file.
+
+Select the package recipe at the requested intensity: direct inline, quick
+one-shot owner, or standard+ single `package` owner. Apply the existing
+plan/check and verification rigor within that work. Stop when the verified
+archive is ready; do not continue into the deployment procedure below, invoke
+security/release reviews, install, deploy, or expand the sample/model list.
+
+## Default deployment/release procedure
+
 Prepare application deployment and release setup. Accumulate the current shipping contract in `<artifact-root>/spec/ship.md` under the three-tier output convention (`<agent-home>/core/CONVENTIONS.md#5-skill-output-convention--t1t2t3`).
 
 ## Purpose

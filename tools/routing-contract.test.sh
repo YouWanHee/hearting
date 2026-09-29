@@ -89,6 +89,11 @@ cases = {
     'Write an independent paper or presentation': 'autopilot-draft',
     'Implement a reusable evaluation driver or fix the HTML generator': 'autopilot-code',
     'Fix only the typos and sentences in REPORT.md': 'autopilot-refine',
+    'Reuse the delivery template, named model and requested samples/outputs/reports': 'autopilot-ship --mode package',
+    'Infer on the received field samples and one or two simulations': 'autopilot-lab --mode eval',
+    'Fix the reusable archive builder': 'autopilot-code',
+    'Write an independent presentation for the recipient': 'autopilot-draft',
+    'Deploy the application to production': 'autopilot-ship',
 }
 rows = [line.split('|') for line in workflow.splitlines() if line.startswith('| "')]
 for request, primary in cases.items():
@@ -106,7 +111,10 @@ trees = (
     'adapters/codex/skills', 'adapters/codex/plugins/hearting-codex/skills',
     'adapters/opencode/skills',
 )
-for name in ('autopilot-lab', 'autopilot-draft', 'autopilot-refine'):
+assert manifest['autopilot-ship']['modes'] == ['default', 'package']
+assert 'delivery archive (package mode)' in manifest['autopilot-ship']['invocation']['use_when']
+assert 'package mode does not run the deployment/review loop' in manifest['autopilot-ship']['invocation']['not_for']
+for name in ('autopilot-lab', 'autopilot-draft', 'autopilot-refine', 'autopilot-ship'):
     for tree in trees:
         path = root / tree / name / 'SKILL.md'
         text = path.read_text()
@@ -128,7 +136,12 @@ for tree in trees[:3]:
     text = (root / tree / 'autopilot-lab/references/eval-procedure.md').read_text()
     assert 'Do not rerun inference' in text, tree
     assert 'report-only failure does not relabel a completed evaluation' in text, tree
-print('PASS evaluation report boundaries: 8 examples, 3 entries × 6 projections')
+for tree in trees[:3]:
+    text = ' '.join((root / tree / 'autopilot-ship/references/owner-execution.md').read_text().split())
+    for phrase in ('relative links', 'named model versions', 'ZIP',
+                   'do not continue into the deployment procedure', 'not a reusable default'):
+        assert phrase in text, (tree, phrase)
+print('PASS report/delivery boundaries: 13 examples, 4 entries × 6 projections')
 PY
 then ok 'evaluation-report semantic boundaries and generated metadata'; else bad 'evaluation-report semantic boundaries'; fi
 

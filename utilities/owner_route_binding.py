@@ -1153,7 +1153,8 @@ def _derive_depth1_node_binding(route_file: str | Path, *, worktree: str | Path,
 
 
 def _supported_owner_harnesses(route: dict) -> set[str]:
-    if route.get("effective_intensity") == "quick":
+    """Read owner readiness for quick/single-owner routes, parent tuples otherwise."""
+    if route.get("effective_intensity") == "quick" or route.get("registered_headless_candidates") is not None:
         rows, field = route.get("registered_headless_candidates") or [], "harness"
     else:
         rows = (route.get("dispatch_evidence") or {}).get("tuples") or []

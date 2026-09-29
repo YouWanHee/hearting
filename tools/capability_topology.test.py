@@ -71,6 +71,10 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "9082445b19699eee098dbbb307b8edf3339a3f3ea65ef84f8c1e688c1f16799c",
         "228bb08fccc6ebc2dd7ab6dc77e9714c52cb8d7f12b0a283e61cac3613532f5e",
     ),
+    ("autopilot-ship", ('package',)): (
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    ),
     ("autopilot-spec", ('api', 'app', 'cli', 'library', 'research', 'update')): (
         "75c2f90d642e06e0de837d66e96b250218937c14b4fdea590811ba6ab6dd4226",
         "e70da359341bbe7261db03b9d4c9bbeebb72f7ce46dd4ed7c8e05174eb76cf4d",
@@ -86,7 +90,7 @@ def full_field_digest(value):
 class TestTopology(unittest.TestCase):
     def setUp(self): self.r = T.load_registry()
     def test_exact_coverage_and_digest(self):
-        result = T.validate_registry(self.r); self.assertEqual((12, 27), (result["capabilities"], result["recipes"])); self.assertEqual(T.registry_digest(self.r), T.registry_digest(json.loads(json.dumps(self.r, sort_keys=True))))
+        result = T.validate_registry(self.r); self.assertEqual((12, 28), (result["capabilities"], result["recipes"])); self.assertEqual(T.registry_digest(self.r), T.registry_digest(json.loads(json.dumps(self.r, sort_keys=True))))
     def test_missing_coverage(self):
         r=copy.deepcopy(self.r); r["recipes"].pop(); self.assertRaises(T.TopologyError, T.validate_registry, r)
     def test_cycle(self):
@@ -470,6 +474,7 @@ class TestTopology(unittest.TestCase):
             ("autopilot-lab", ("setup",)): ["handoff"],
             ("autopilot-refine", ("default",)): ["transaction"],
             ("autopilot-ship", ("default",)): ["release-setup", "deploy"],
+            ("autopilot-ship", ("package",)): ["package"],
             ("autopilot-spec", ("api", "app", "cli", "library", "research", "update")): [
                 "prd-transaction"
             ],

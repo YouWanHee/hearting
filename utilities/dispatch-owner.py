@@ -215,11 +215,10 @@ def _sealed_owner_context(path, *, worker_type="owner"):
     intensity = route.get("effective_intensity")
     if intensity == "direct":
         raise OwnerError("route-evidence-direct-route-has-no-owner")
-    if intensity == "quick":
-        # A quick route seals no depth-2 tuples; its own registered-headless
-        # candidates name the harnesses that were probed. The wrapper already
-        # rejects a foreign harness there (`quick-headless-unavailable`), so
-        # this only moves the same verdict ahead of the launch.
+    if intensity == "quick" or route.get("registered_headless_candidates") is not None:
+        # Quick and single-owner recipes have no depth-2 tuples. Their
+        # registered-headless candidates name the probed owner harnesses;
+        # the launch binding rechecks this same selection.
         rows, field = route.get("registered_headless_candidates") or [], "harness"
     else:
         rows = (route.get("dispatch_evidence") or {}).get("tuples") or []

@@ -198,6 +198,26 @@ Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
 to `audit`. Both may inspect code; purpose, not file type, decides the owner.
 
+Collecting existing artifacts into a delivery archive uses
+`autopilot-ship --mode package`: reuse the delivery template, named model
+versions, requested input/output list, and existing reports; check the included
+files, relative links, versions, and archive. This is a delivery goal, without
+an automatic deployment, installation, security/release-review loop, new
+evaluation, or report rewrite. Keep the sample list within the request: nearby
+datasets, historical models, and a larger earlier delivery are not implicit
+inputs. A later approval of a larger batch applies only to that batch.
+Missing sample inference is lab/eval work for those samples, with packaging as
+the delivery step; implementing a reusable packager is code work. Ship without
+a mode retains its existing deployment/release behavior (`default`).
+
+| Delivery request | Primary | Boundary |
+|---|---|---|
+| "Reuse the delivery template, named model and requested samples/outputs/reports; make a ZIP" | `autopilot-ship --mode package` | Existing results first; only requested files and minimal link/version/archive checks |
+| "Infer on the received field samples and one or two simulations, then package them" | `autopilot-lab --mode eval` | Only missing requested inference; ship/package for delivery, no full-dataset expansion |
+| "Fix the reusable archive builder" | `autopilot-code` | Program implementation, not packaging an existing result |
+| "Write an independent presentation for the recipient" | `autopilot-draft` | New document goal, not file collection |
+| "Deploy the application to production" | `autopilot-ship` | Existing default deployment authorization and verification remain |
+
 Added after a 2026-07-14 incident where a checkpoint reevaluation with report
 regeneration was routed to `autopilot-refine` as primary from its surface
 artifact and the entire evaluation ran inline in the main session.
