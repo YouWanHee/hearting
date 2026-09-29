@@ -23,9 +23,15 @@ import time
 
 SCHEMA = 1
 HARNESSES = ("claude", "codex", "opencode")
-# F-<next> writer coverage per harness (regl. 10, U5) — opencode interactive sessions expose
-# no session id to this process, so there is nothing to anchor a ledger line to yet.
-WRITER_SUPPORT = {"claude": "env", "codex": "env", "opencode": "not-implemented"}
+# Writer coverage per harness. "env" means the harness exports its own native session id to
+# the process, so a ledger line can be anchored without any separate identity store. All three
+# do: `interactive_parent_identity()` (dispatch_parent_completion.py) reads CLAUDE_SESSION_ID,
+# CODEX_THREAD_ID/CODEX_SESSION_ID and OPENCODE_SESSION_ID, and the opencode collector already
+# sets `sess.session_id` from its own session row. Measured 2026-09-29 in a live opencode
+# session: that env id and the rendered row's `session_id` are the same string, so the write
+# anchor and the read anchor already agree. Herdr is deliberately NOT the anchor here — it
+# reports no session id for opencode — and none is required.
+WRITER_SUPPORT = {"claude": "env", "codex": "env", "opencode": "env"}
 TAIL_BYTES = 64 * 1024
 MAX_LINE_BYTES = 4096
 MAX_PLAN = 12
