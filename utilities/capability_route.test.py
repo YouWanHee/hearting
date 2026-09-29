@@ -2547,6 +2547,25 @@ class TestContinuation(unittest.TestCase):
    self.assertEqual(continuation["selection"]["shape"],"staged")
    R.verify_route(continuation,R.ROOT)
 
+ def test_selection_pins_ride_a_continuation_and_verify(self):
+  # `compose --pin` seals the tool/model choice once; a resume must carry the
+  # same pins or the choice silently disappears at the first continuation.
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact)
+   source["selection_pins"]={"contract_version":1,
+    "owner":{"harness":"opencode","model":"opencode-go/muse-spark-1.3-contributor","effort":"xhigh"},
+    "worker":{"harness":"opencode","model":None,"effort":None}}
+   source["route_hash"]=R.route_hash(source)
+   source["route_id"]="rt-"+source["route_hash"].split(":",1)[1][:16]
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   continuation=self._build(source)
+   self.assertEqual(continuation["selection_pins"],source["selection_pins"])
+   R.verify_route(continuation,R.ROOT)
+   continuation["selection_pins"]["owner"]["harness"]="gemini"
+   with self.assertRaisesRegex(ValueError,"invalid selection_pins.owner.harness"):
+    R.verify_route(continuation,R.ROOT)
+
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
    source=self._source(Path(tmp)/"artifacts-request")

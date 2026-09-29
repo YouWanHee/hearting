@@ -92,6 +92,22 @@ class AllocationReceiptTest(unittest.TestCase):
         self.assertIs(row["preferred_honored"], True)
         self.assertEqual(row["parallel_leg_count"], 2)
 
+    def test_receipt_carries_a_copy_of_harness_weights_or_none(self):
+        weighted = {**self._policy("balanced"), "harness_weights": {"opencode": 0.3}}
+        result = self.receipt.record_allocation_receipt(
+            route_id="rt-weights", route_node="plan-check", writer="dispatch-batch.py",
+            child_harness="codex", allocation=weighted, jobs=self.jobs,
+        )
+        row = json.loads(Path(result["path"]).read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["harness_weights"], {"opencode": 0.3})
+        self.assertEqual(row["inert_keys"], {})
+        plain = self.receipt.record_allocation_receipt(
+            route_id="rt-noweights", route_node="plan-check", writer="dispatch-batch.py",
+            child_harness="codex", allocation=self._policy("balanced"), jobs=self.jobs,
+        )
+        row = json.loads(Path(plain["path"]).read_text(encoding="utf-8").splitlines()[0])
+        self.assertIsNone(row["harness_weights"])
+
     def test_unknown_writer_or_harness_is_refused_without_raising(self):
         self.assertIsNone(self.receipt.record_allocation_receipt(
             route_id="rt-x", route_node="n", writer="someone-else.py",

@@ -763,8 +763,8 @@ MEMORY_STEPS = [
 
 # Tier · budget below is "as CLAUDE realizes it", not a portable number. The tier column
 # is adapter-dependent and cannot be made portable: Claude and OpenCode give balanced-deep
-# its own tier, Codex rides the deep tier at a lower effort, and OpenCode has no effort
-# axis at all (every budget there is `runtime-default`). Each adapter's own tiers live in
+# its own tier, Codex rides the deep tier at a lower effort, and OpenCode declares no
+# deep tier (deep collapses onto balanced-deep) with its own variant per tier. Each adapter's own tiers live in
 # its config/models.conf. Three rows were outright wrong until 2026-09-09 (mini rode
 # `medium` though every adapter ships `mini:low`, balanced-deep was on the deep tier, and
 # `balanced` was missing entirely). `generate.py --check` only proves docs/ matches this

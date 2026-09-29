@@ -611,6 +611,69 @@ class DispatchOwnerTests(unittest.TestCase):
         result = self.run_owner()
         self.assertNotIn("adapter=opencode", result.stdout)
 
+    def _v4_config(self, deep_last_resort="[]", *, enabled="claude, codex, opencode", weights="", version=4):
+        path = self.home / f"dispatch-defaults-v{version}.yaml"
+        path.write_text(
+            f"schema_version: {version}\n"
+            f"harnesses:\n  enabled: [{enabled}]\n"
+            "profiles:\n"
+            f"  deep:\n    primary: [claude, codex]\n    relief: []\n    last_resort: {deep_last_resort}\n    promote_relief_below: 0\n"
+            "  balanced-deep:\n    primary: [claude, codex]\n    relief: []\n    last_resort: []\n    promote_relief_below: 0\n"
+            "  light:\n    primary: [claude, codex, opencode]\n    relief: []\n    last_resort: []\n    promote_relief_below: 0\n"
+            "  mini:\n    primary: [claude, codex, opencode]\n    relief: []\n    last_resort: []\n    promote_relief_below: 0\n"
+            "allocation:\n  strategy: balanced\n  window: 30\n  usage_gate_used_percent: 85\n"
+            f"{weights}"
+            "capabilities:\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_schema_v4_live_config_selects_through_capacity_not_the_legacy_loop(self):
+        # 2026-09-30 behaviour change, pinned in one place. A live schema-4
+        # config (no sealed policy, e.g. a frame launched from an older route)
+        # used to fall into the legacy loop: first configured harness with a
+        # positive gauge, so exhausted claude/codex (5% headroom) still won and
+        # an ungauged opencode could never be chosen. It now takes the same
+        # capacity selection as schema 3: the usage gate demotes the
+        # near-exhausted primaries and the ungated opencode leads.
+        result = self.run_owner(
+            config=self._v4_config(), model_profile="light",
+            env_extra={"HARNESS_CAPACITY_SCORES": "claude:5,codex:5"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("adapter=opencode", result.stdout)
+        self.assertIn("selection_source=configured-balanced", result.stdout)
+        # With healthy gauges nothing changes for the ordinary case: the first
+        # configured peer still leads at equal headroom.
+        healthy = self.run_owner(config=self._v4_config(), model_profile="light")
+        self.assertIn("adapter=claude", healthy.stdout)
+
+    def test_harness_weights_reach_the_live_owner_selection(self):
+        # opencode is declared first so equal headroom would pick it; the
+        # configured low weight moves it behind the peers.
+        order = "opencode, claude, codex"
+        weighted = self.run_owner(
+            config=self._v4_config(enabled=order, weights="  harness_weights:\n    opencode: 0.3\n"),
+            model_profile="light")
+        self.assertIn("adapter=claude", weighted.stdout)
+        unweighted = self.run_owner(config=self._v4_config(enabled=order), model_profile="light")
+        self.assertIn("adapter=opencode", unweighted.stdout)
+
+    def test_explicit_adapter_outside_the_profile_bands_is_followed_when_enabled(self):
+        # deep does not list opencode: a recommendation for automatic selection,
+        # not a wall against a harness the user named (`--owner opencode`).
+        config = self._v4_config(version=3)
+        result = self.run_owner(config=config, extra=("--adapter", "opencode"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("adapter=opencode", result.stdout)
+        self.assertIn("selection_source=explicit", result.stdout)
+        self.assertIn("explicit_policy=outside-profile-bands", result.stdout)
+        # A disabled harness stays refused.
+        disabled = self.run_owner(
+            config=self._v4_config(enabled="claude, codex", version=3), extra=("--adapter", "opencode"))
+        self.assertNotEqual(disabled.returncode, 0)
+        self.assertIn("reason=explicit-adapter-disabled-by-user-policy", disabled.stdout)
+
     def test_limited_configured_candidate_demotes_with_auditable_reason(self):
         stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(f"{stamp}\tdone\trepo\t{ROOT}\tx\tnote=dead-session-limit,harness=claude\n", encoding="utf-8")
@@ -922,6 +985,39 @@ class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
         context = OWNER._sealed_owner_context(path, worker_type="frame")
         self.assertEqual(context["harnesses"], {"codex"})
         self.assertIsNone(context["policy"])
+
+    def _frame_route(self, node_policy="unset", **override):
+        frame = {"id": "frame", "unit": "plan/frame", "dispatch_depth": 1, "worker_type": "frame",
+                 "model_profile": "deep", "role": "deep maker"}
+        if node_policy != "unset":
+            frame["harness_policy"] = node_policy
+        payload = {"effective_intensity": "standard",
+                   "dispatch_evidence": {"tuples": [
+                       {"parent_harness": "claude", "child_harness": "claude", "status": "supported"},
+                       {"parent_harness": "claude", "child_harness": "opencode", "status": "supported"}]},
+                   "dispatch_allocation": {"strategy": "balanced", "window": 30,
+                                           "harness_order": ["claude", "codex", "opencode"]},
+                   "nodes": [frame]}
+        payload.update(override)
+        return self._route(payload)
+
+    def test_frame_reads_the_policy_sealed_on_its_own_node(self):
+        policy = {"primary": ["opencode"], "relief": [], "last_resort": [], "promote_relief_below": 0}
+        context = OWNER._sealed_owner_context(
+            self._frame_route(policy), worker_type="frame", route_node="frame")
+        self.assertEqual(context["policy"], policy)
+        self.assertEqual(context["harnesses"], {"claude", "opencode"})
+        # An older route seals none: the live policy keeps being read.
+        old = OWNER._sealed_owner_context(self._frame_route(), worker_type="frame", route_node="frame")
+        self.assertIsNone(old["policy"])
+        # An unknown node id is not another node's policy.
+        other = OWNER._sealed_owner_context(
+            self._frame_route(policy), worker_type="frame", route_node="frame-alternative")
+        self.assertIsNone(other["policy"])
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._sealed_owner_context(
+                self._frame_route({"primary": "opencode"}), worker_type="frame", route_node="frame")
+        self.assertEqual(str(caught.exception), "route-evidence-owner-policy-malformed")
 
     def test_standard_package_owner_uses_registered_headless_candidates(self):
         path = self._route({"effective_intensity": "standard", "dispatch_evidence": None,

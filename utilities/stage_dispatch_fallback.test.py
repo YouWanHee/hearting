@@ -582,7 +582,8 @@ class FallbackTest(unittest.TestCase):
   receipt=dict(line.split("=",1) for line in out.getvalue().splitlines() if "=" in line)
   self.assertEqual(receipt["allocation_rank"],"claude,codex")
   self.assertEqual(receipt["allocation_preferred"],"codex")
-  self.assertEqual(receipt["allocation_inert_keys"],"depth_affinity_weight,usage_gate_used_percent,usage_headroom_exponent")
+  # The shipped default now seals `harness_weights`; under capacity-aware it is inert too.
+  self.assertEqual(receipt["allocation_inert_keys"],"depth_affinity_weight,harness_weights,usage_gate_used_percent,usage_headroom_exponent")
   self.assertTrue(receipt["allocation_receipt"].startswith("al-"),receipt)
   ledger=Path(self.tmp.name)/"allocation"/f"{route['route_id']}.jsonl"
   self.assertEqual(receipt["allocation_ledger"],str(ledger)); self.assertTrue(ledger.is_file())
@@ -594,7 +595,7 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(ledger_row["action"],"dry-run"); self.assertEqual(ledger_row["writer"],"stage-dispatch-fallback.py")
   self.assertEqual(ledger_row["strategy"],"capacity-aware"); self.assertEqual(ledger_row["preferred"],"codex")
   self.assertIs(ledger_row["preferred_honored"],False)
-  self.assertEqual(sorted(ledger_row["inert_keys"]),["depth_affinity_weight","usage_gate_used_percent","usage_headroom_exponent"])
+  self.assertEqual(sorted(ledger_row["inert_keys"]),["depth_affinity_weight","harness_weights","usage_gate_used_percent","usage_headroom_exponent"])
   self.assertEqual(ledger_row["rank"],["claude","codex"]); self.assertEqual(ledger_row["fallback_hop"],"cross-harness-headless")
   self.assertEqual(ledger_row["capacity"]["codex"],74.0); self.assertEqual(ledger_row["counts"]["claude"],3)
   # A missing allocation context (no sealed policy) still leaves the child evidence.
@@ -1226,6 +1227,25 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(context["rank"][0],"claude")
   self.assertEqual(context["rank"][-1],"codex")
   self.assertEqual(set(context["rank"]),{"claude","codex","opencode"})
+ def test_harness_weights_reach_the_stage_fallback_ranking(self):
+  # OpenCode sits in the same band as the peers and the declared order would
+  # put it first at equal headroom; `allocation.harness_weights` moves it back.
+  node=self._depth_affinity_node(2)
+  node["harness_policy"]={"primary":["claude","codex","opencode"],"relief":[],
+                          "last_resort":[],"promote_relief_below":0}
+  def rank(weights):
+   route=self._depth_affinity_route(["opencode","claude","codex"],affinity=False)
+   if weights:
+    route["dispatch_allocation"]["harness_weights"]=weights
+   with mock.patch.object(F,"_usage_states",return_value={
+       "claude":"ok","codex":"ok","opencode":"ok"}), \
+       mock.patch.object(F.CAPACITY,"capacity_scores",return_value={
+        "claude":80,"codex":80,"opencode":80}):
+    _hops,context=F.ordered_fallback_hops(route,node,self.jobs)
+   return context["rank"]
+  self.assertEqual(rank(None)[0],"opencode")
+  self.assertEqual(rank({"opencode":0.3})[0],"claude")
+  self.assertEqual(rank({"opencode":0.3})[-1],"opencode")
  def test_balanced_stage_affinity_cannot_lift_a_gated_harness(self):
   node={
    "harness_affinity":"claude",

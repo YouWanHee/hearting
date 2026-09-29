@@ -235,6 +235,31 @@ class TopProfileOptionalityTest(unittest.TestCase):
             resolve_profile_values("claude", values, "top")
         self.assertEqual(refused.exception.reason, "profile-top-undeclared")
 
+    def test_an_opencode_copy_without_the_deep_granularity_key_stays_selected(self):
+        # 2026-09-30: the shipped OpenCode file started naming its deep collapse
+        # (`CFG_MODEL_PROFILE_GRANULARITY_DEEP`). That key is receipt metadata, so a
+        # complete copy seeded before it must keep being the user's selected file
+        # instead of being replaced whole by the shipped one.
+        shipped_text = (ROOT / "adapters" / "opencode" / "config" / "models.conf").read_text(encoding="utf-8")
+        self.assertIn("CFG_MODEL_PROFILE_GRANULARITY_DEEP=", shipped_text)
+        legacy = "\n".join(
+            line for line in shipped_text.splitlines()
+            if not line.startswith("CFG_MODEL_PROFILE_GRANULARITY_DEEP=")
+        ) + "\n"
+        root = self.make_root("opencode", shipped_text)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy, encoding="utf-8")
+        values, receipt = config.resolve_config("opencode", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        from model_profile import resolve_profile_values
+        self.assertEqual(resolve_profile_values("opencode", values, "deep")["granularity"], "full")
+        # Any other missing shipped key still means an incomplete copy.
+        user.write_text(legacy.replace("CFG_MODEL_PROFILE_MINI=", "#CFG_MODEL_PROFILE_MINI="), encoding="utf-8")
+        _values, receipt = config.resolve_config("opencode", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("shipped", "user-incomplete"))
+
     def test_a_codex_copy_without_the_main_only_key_stays_selected_whole_file(self):
         # top review B2: a policy key a release added must not turn an older
         # complete codex copy into `user-incomplete` (a silent whole-file

@@ -65,22 +65,22 @@ class OpencodeDispatchModelEligibilityTest(unittest.TestCase):
             encoding="utf-8")
         return str(path)
 
-    def test_top_collapses_onto_the_deep_tier_and_admits_no_override(self):
+    def test_top_collapses_onto_the_balanced_deep_tier_and_admits_no_override(self):
         policy = parse_config(SHIPPED_CONF)
         route = self.top_route()
         result = WRAPPER.resolve_model_settings(selection(profile="top", route_file=route))
         # the label survives on the receipt; the tier does not exist here
         self.assertEqual(
             (result["profile"], result["tier"], result["granularity"]),
-            ("top", "deep", "collapsed-top-to-deep"))
-        self.assertEqual(result["model"], policy["CFG_TIER_DEEP_MODEL"])
+            ("top", "balanced-deep", "collapsed-top-to-balanced-deep"))
+        self.assertEqual(result["model"], policy["CFG_TIER_BALANCED_DEEP_MODEL"])
         self.assertNotIn("CFG_TIER_TOP_MODEL", policy)
         # the collapse is exactly why the check reads args.model_profile: the
         # resolved profile is still "top" here, but a future adapter that
         # rewrote the label on collapse would slip past a resolved-value check
         with self.assertRaises(WRAPPER.ModelSelectionError) as override:
             WRAPPER.resolve_model_settings(selection(
-                profile="top", route_file=route, model="opencode-go/qwen3.8-max",
+                profile="top", route_file=route, model=result["model"],
                 variant="high", capacity_retry=1))
         self.assertEqual(override.exception.reason, "profile-top-override-forbidden")
 

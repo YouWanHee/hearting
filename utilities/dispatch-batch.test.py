@@ -1475,6 +1475,92 @@ class DispatchBatchTest(unittest.TestCase):
                     ctx.exception.degradation_reason, "sole-gate-non-peer-harness"
                 )
 
+    def test_policy_without_a_quality_peer_family_proceeds_as_degraded_sole_gate(self):
+        # Disjoint deep/balanced-deep primaries (a warned user policy) define no
+        # quality-peer family. That is a policy shape, not a harness shortage,
+        # so the peer group is placed and the degradation is recorded instead
+        # of refused with `peer-gate:no-quality-peer-family-hard-eligible`.
+        def policy(primary):
+            return {"primary": [primary], "relief": [], "last_resort": ["opencode"],
+                    "promote_relief_below": 0}
+        nodes = self._quality_peer_nodes(
+            peer_families=["opencode"], aux_families=["opencode"]
+        )
+        for node in nodes:
+            node["harness_policy"] = policy("codex" if node["model_profile"] == "deep" else "claude")
+        route = {
+            "route_id": "rt-fixture", "route_hash": "sha256:fixture",
+            "owner_harness_policy": policy("codex"),
+        }
+        with mock.patch.object(
+            BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
+        ):
+            rows, independence, diagnostics = BATCH.assign_harnesses(
+                route, nodes, allow_degraded=False
+            )
+        self.assertEqual({row[1] for row in rows}, {"opencode"})
+        self.assertEqual(diagnostics["sole_gate"], "degraded")
+        self.assertEqual(diagnostics["quality_peer_families"], [])
+
+    def test_a_defined_but_unavailable_quality_peer_set_still_refuses(self):
+        # The asymmetric half: the policy DOES define claude/codex as peers but
+        # neither is eligible, so this stays the SD-100 availability refusal.
+        nodes = self._quality_peer_nodes(
+            peer_families=["opencode"], aux_families=["opencode"]
+        )
+        route = {
+            "route_id": "rt-fixture", "route_hash": "sha256:fixture",
+            "owner_harness_policy": {
+                "primary": ["claude", "codex"], "relief": ["opencode"],
+                "last_resort": [], "promote_relief_below": 0,
+            },
+        }
+        with mock.patch.object(
+            BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
+        ), self.assertRaises(BATCH.BatchError) as ctx:
+            BATCH.assign_harnesses(route, nodes, allow_degraded=True)
+        self.assertEqual(ctx.exception.reason, "parallel-cross-harness-unavailable")
+
+    def test_a_node_policy_that_omits_a_harness_excludes_it_from_placement(self):
+        # `opencode-light-model`: OpenCode is left out of the deep band, so a
+        # deep node never lands on it even when it is the only eligible family
+        # left and even though `band_rank` used to merely sort it last.
+        nodes = self._quality_peer_nodes(
+            peer_families=["claude", "opencode"], aux_families=["opencode"]
+        )
+        for node in nodes:
+            node["harness_policy"] = {
+                "primary": ["claude", "codex"], "relief": [], "last_resort": [],
+                "promote_relief_below": 0,
+            }
+        route = {
+            "route_id": "rt-fixture", "route_hash": "sha256:fixture",
+            "owner_harness_policy": {
+                "primary": ["claude", "codex"], "relief": [], "last_resort": [],
+                "promote_relief_below": 0,
+            },
+        }
+        with mock.patch.object(
+            BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
+        ):
+            with self.assertRaises(BATCH.BatchError) as ctx:
+                BATCH.assign_harnesses(route, nodes, allow_degraded=False)
+        # The auxiliary leg only had opencode; with opencode outside its policy
+        # the group cannot be placed at all, and the reason says why.
+        self.assertEqual(ctx.exception.reason, "parallel-headless-unavailable")
+        self.assertIn("outside-profile-policy", ctx.exception.detail)
+        peers_only = nodes[:2]
+        with mock.patch.object(
+            BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
+        ):
+            rows, _independence, diagnostics = BATCH.assign_harnesses(
+                route, peers_only, allow_degraded=False
+            )
+        self.assertEqual({row[1] for row in rows}, {"claude"})
+        self.assertEqual(
+            diagnostics["family_exclusions"]["opencode"], ["outside-profile-policy"]
+        )
+
     def test_ac11_peer_gate_positive_assigns_quality_peer_and_aux_opencode(self):
         # AC 11 positive: peer legs are claude/codex-eligible and the auxiliary
         # leg is opencode-eligible; the group may mix opencode on the auxiliary

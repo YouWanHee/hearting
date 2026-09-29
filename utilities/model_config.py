@@ -71,9 +71,13 @@ TIER_REFERENCE_KEYS = ("CFG_TIER_DEEP_FAILOVER", "CFG_NATIVE_SUBAGENT", "CFG_LIF
 # in memory (below); `top` is never derived -- a copy without it simply has no
 # top exception profile, and its TOP tier keys become unreferenced like any
 # other tier a release added (SD-145). Nothing here writes to the user file.
+# `CFG_MODEL_PROFILE_GRANULARITY_DEEP` (2026-09-30) is receipt metadata only: the
+# resolver falls back to the global granularity when it is absent, so a copy seeded
+# before the shipped OpenCode file started naming its deep collapse stays selected.
 OPTIONAL_PROFILE_KEYS = frozenset({
     "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
     "CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP",
+    "CFG_MODEL_PROFILE_GRANULARITY_DEEP",
 })
 # Policy keys a release added after a user copy was seeded. A complete user
 # copy without one stays selected whole-file, and the consumer sees the key
