@@ -2861,24 +2861,38 @@ def _compose_readiness(cwd, jobs, parent_harness, children):
         raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
 
 
+SPEC_READ_SHARED_PREFIX = "compose-auto: shared spec present, read "
+
+
 def compose_spec_read(cwd, artifact_root, explicit):
     """`auto` is honest, not permissive: with no spec candidate it records the
-    absence; with one present it refuses and names the file the caller must
-    read and assert (`--spec-read <source>`). The spec-read gate is a real
-    invariant (WORKFLOW §7.0); compose only removes the boilerplate case."""
+    absence; with a `spec/prd.md` present it refuses and names the file the
+    caller must read and assert (`--spec-read <source>`). The spec-read gate is
+    a real invariant (WORKFLOW §7.0); compose only removes the boilerplate case.
+    A shared-spec `prd.md` never blocks compose: the record says which file is
+    there to read and `compose_card` passes that path on as one line."""
     if explicit not in (None, "", "auto"):
         return {"satisfied": explicit.lower() not in ("0", "false", "no"), "source": explicit}
-    present = []
+    present, shared = [], []
     for root in (Path(cwd), Path(artifact_root)):
         for rel in COMPOSE_SPEC_CANDIDATES:
             candidate = root / rel
             if candidate.is_file():
                 present.append(str(candidate))
-        present.extend(_compose_shared_spec_prds(root))
+        shared.extend(_compose_shared_spec_prds(root))
     if present:
         raise ValueError("compose-spec-read-required:" + ",".join(sorted(set(present))))
-    return {"satisfied": True,
-            "source": "compose-auto: no spec/prd.md or shared spec prd.md under cwd or artifact root"}
+    if shared:
+        return {"satisfied": True, "source": SPEC_READ_SHARED_PREFIX + ",".join(sorted(set(shared)))}
+    return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
+
+
+def _compose_spec_read_notice(route):
+    """One `[경로]` card line when compose found a shared spec it did not ask the caller to read."""
+    source = ((route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source")
+    if isinstance(source, str) and source.startswith(SPEC_READ_SHARED_PREFIX):
+        return "  공유 spec 있음 — 읽을 경로: " + source[len(SPEC_READ_SHARED_PREFIX):]
+    return None
 
 
 def _compose_shared_spec_prds(root):
@@ -3094,6 +3108,9 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    notice = _compose_spec_read_notice(route)
+    if notice:
+        card += "\n" + notice
     for advisory in OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_harness):
         card += "\n  " + advisory["message"]
     return card

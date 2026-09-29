@@ -274,9 +274,9 @@ remain binding contracts for the selected work.
 to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd, artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
-`compose-spec-read-required` when a `spec/prd.md` (or the latest `prd.md` of a
-`shared/spec/<ref>/` revision) exists under the cwd or the
-artifact root and the caller has not named what was read), and both
+`compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
+artifact root and the caller has not named what was read; the latest `prd.md` of
+a `shared/spec/<ref>/` revision only adds one `[경로]` card line with its path), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`
 records `compose` or `preset`, `selection.shape` records the shape, a staged
