@@ -532,21 +532,20 @@ closure without a model turn and sends a recovery notice while closure remains
 pending. The owner and parent have no separate close/finalize procedure.
 
 The runtime closes a route once nobody works on it; no session has to
-remember to. `compose`, `status`, `campaign-status` and `campaign-close` close
-open routes superseded by a newer compose from the same session, whose
-composing session has ended, or with no writes for a day — except one a live
-dispatch attempt still holds. A direct route with a cycle-local artifact goes
-through the finish transaction below (newest artifact as evidence, work
-request as summary, HEAD as commit); any other route closes with its honest
-terminal proof, and its cycle is sealed completed or abandoned to match. The
-closure's `autoclose` names why.
+remember to. `compose`, `campaign-status` and `campaign-close` close an open
+route whose Claude session this host saw end and that then stayed quiet for an
+hour, or that saw no writes for a day. Routes of the calling session, routes a
+dispatch attempt or resource run still holds, routes waiting on a human gate
+and routes whose cycle a live process holds open stay open. The closure claims
+no proof: it records what the completion markers show, seals the cycle
+completed only when that proof holds and abandoned otherwise, and names its
+reason in `autoclose`.
 
-A session may still finish its own `direct` inline route to name the evidence
-and summary itself. Supply a readable, nonempty artifact from the route's
-exact open cycle and the final summary; the command records terminal proof,
-closes the route, seals that cycle and returns a receipt only after rechecking
-all three. A partial transaction remains `finish-pending` and is resumed with
-the same intent.
+A session finishes its own `direct` inline route to record real evidence.
+Supply a readable, nonempty artifact from the route's exact open cycle and the
+final summary; the command records terminal proof, closes the route, seals
+that cycle and returns a receipt only after rechecking all three. A partial
+transaction remains `finish-pending` and is resumed with the same intent.
 
 ```text
 python3 utilities/capability-route.py finish --route <route.json> --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]

@@ -7813,14 +7813,14 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         print(json.dumps(result,sort_keys=True))
     return output_path.resolve()
 
-def _route_autoclose(artifact_root, trigger, **kw):
+def _route_autoclose(artifact_root, trigger):
     """The runtime closes routes nobody works on any more (utilities/route_autoclose.py).
     Bookkeeping only: it never fails or blocks the command that triggered it."""
     try:
         import route_autoclose
         api=sys.modules.get(__name__)
         if api is None: return
-        route_autoclose.report(route_autoclose.sweep(artifact_root,api=api,trigger=trigger,**kw))
+        route_autoclose.report(route_autoclose.sweep(artifact_root,api=api,trigger=trigger))
     except Exception as exc:  # noqa: BLE001
         print(f"route_autoclose error={type(exc).__name__}",file=sys.stderr)
 
@@ -8045,7 +8045,7 @@ def main():
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
-        _route_autoclose(artifact_root,"compose",new_route_id=route["route_id"])
+        _route_autoclose(artifact_root,"compose")
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
@@ -8223,7 +8223,6 @@ def main():
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
-        _route_autoclose(a.artifact_root,"status")
         rows=route_status(a.artifact_root)
         if a.open_only: rows=[row for row in rows if not row["closed"]]
         print(json.dumps(rows,sort_keys=True,indent=2))

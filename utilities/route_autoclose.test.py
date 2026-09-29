@@ -3,10 +3,13 @@
 
 Every case drives the public CLI (`compose`, `start`, `status`,
 `campaign-status`, `campaign-close`) in an isolated artifact root, route-chain
-ledger, dispatch registry and Claude session registry.
+ledger, dispatch registry, workflow ledger, resource-run index and Claude
+session registry.  The R-cases are the PR #53 review reproductions, kept as
+regressions.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -26,9 +29,10 @@ PRODUCER = ROOT / "utilities/artifact_producer.py"
 SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
                 "OPENCODE_SESSION_ID", "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
                 "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_PARENT_SESSION_ID", "AGENT_ROUTE_FILE",
-                "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE", "HEARTING_INLINE_FINISH_CRASH_AT")
+                "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE", "HEARTING_INLINE_FINISH_CRASH_AT",
+                "AGENT_WORKFLOW_ROOT", "AGENT_RESOURCE_RUN_INDEX")
 SESSION_ENV = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID", "opencode": "OPENCODE_SESSION_ID"}
-TWO_DAYS = 2 * 24 * 3600
+TWO_HOURS, TWO_DAYS = 2 * 3600, 2 * 24 * 3600
 
 
 def _proc_start(pid: int) -> str:
@@ -38,7 +42,7 @@ def _proc_start(pid: int) -> str:
 class RouteAutocloseTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-")
-        base = Path(self.temp.name)
+        self.base = base = Path(self.temp.name)
         self.repo, self.root = base / "repo", base / "artifacts"
         self.repo.mkdir(); self.root.mkdir()
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
@@ -46,16 +50,19 @@ class RouteAutocloseTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
                         "commit", "-qm", "base"], check=True)
-        self.jobs = base / "jobs.log"
+        self.jobs = base / "state" / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir(parents=True)
         self.jobs.write_text("", encoding="utf-8")
         self.sessions = base / "claude" / "sessions"
         self.sessions.mkdir(parents=True)
         self.ledgers = base / "route-chains"
+        self.resource_index = base / "resource-runs.index.json"
         self.env = {key: value for key, value in os.environ.items() if key not in SESSION_VARS}
         self.env.update({"AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(self.jobs),
-                         "AGENT_DISPATCH_DEPTH": "0", "XDG_STATE_HOME": str(base / "state"),
+                         "AGENT_DISPATCH_DEPTH": "0", "XDG_STATE_HOME": str(base / "xdg"),
                          "FLEET_ROUTE_CHAIN_DIR": str(self.ledgers),
-                         "CLAUDE_CONFIG_DIR": str(base / "claude")})
+                         "CLAUDE_CONFIG_DIR": str(base / "claude"),
+                         "AGENT_RESOURCE_RUN_INDEX": str(self.resource_index)})
         artifact_producer.activate(self.root, repository_id="repo_" + "a" * 32,
                                    artifact_root_id="root_" + "b" * 32,
                                    w7={"campaign_id": "camp_" + "c" * 32})
@@ -68,10 +75,11 @@ class RouteAutocloseTest(unittest.TestCase):
         self.headless = base / "headless.json"
         self.headless.write_text(json.dumps({"candidates": [{**probe, "harness": "codex"},
                                                             {**probe, "harness": "claude"}]}))
-        self.sleepers = []
+        self.processes = []
+        self.sweeps = 0
 
     def tearDown(self):
-        for proc in self.sleepers:
+        for proc in self.processes:
             proc.kill(); proc.wait()
         self.temp.cleanup()
 
@@ -103,10 +111,20 @@ class RouteAutocloseTest(unittest.TestCase):
         self.last_stderr = done.stderr
         return route_file, json.loads(route_file.read_text(encoding="utf-8"))
 
-    def status(self, harness="codex", sid="observer"):
-        done = self.run_as(harness, sid, "status", "--artifact-root", self.root, "--open-only")
+    def sweep(self):
+        """The next compose from some other session is what triggers a sweep."""
+        self.sweeps += 1
+        self.compose(f"observer-{self.sweeps}", "codex", "observer", start=False)
+        return self.last_stderr
+
+    def status(self):
+        done = self.run_as("codex", "observer", "status", "--artifact-root", self.root, "--open-only")
         self.assertEqual(done.returncode, 0, done.stderr)
         return {row["route_id"] for row in json.loads(done.stdout)}
+
+    def campaign(self, verb, campaign, *extra):
+        return self.run_as("codex", "observer", verb, "--artifact-root", self.root, "--campaign", campaign,
+                           *extra, program=PRODUCER)
 
     def cycle(self, route):
         return artifact_producer.route_cycle_for(self.root, route)
@@ -114,10 +132,12 @@ class RouteAutocloseTest(unittest.TestCase):
     def cycle_record(self, cycle_id):
         return artifact_producer.read_cycle_record(self.root, cycle_id)
 
+    def cycle_dir(self, record):
+        return artifact_producer.cycle_dir(self.root, record["campaign_id"], record["cycle_id"], record)
+
     def write_artifact(self, route, name="report.md", body="the report\n"):
         record = self.cycle(route)
-        target = artifact_producer.cycle_dir(self.root, record["campaign_id"], record["cycle_id"],
-                                             record) / "artifacts" / "documents" / name
+        target = self.cycle_dir(record) / "artifacts" / "documents" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
         return record
@@ -126,9 +146,9 @@ class RouteAutocloseTest(unittest.TestCase):
         path = route_file.with_name(route_file.stem + ".outcome.json")
         return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
-    def age(self, route_file, harness, sid):
-        """Two days of nothing: route, cycle, and the composer's own ledger."""
-        old = time.time() - TWO_DAYS
+    def age(self, route_file, harness, sid, seconds=TWO_DAYS):
+        """`seconds` of nothing: route, cycles and the composer's own ledger."""
+        old = time.time() - seconds
         ledger = self.ledgers / harness / f"{sid}.jsonl"
         if ledger.is_file():
             lines = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
@@ -138,182 +158,339 @@ class RouteAutocloseTest(unittest.TestCase):
                      *self.root.joinpath("campaigns").rglob("*")]:
             os.utime(path, (old, old))
 
-    def claude_alive(self, sid):
-        proc = subprocess.Popen(["sleep", "300"])
-        self.sleepers.append(proc)
-        (self.sessions / f"{proc.pid}.json").write_text(json.dumps(
-            {"pid": proc.pid, "sessionId": sid, "procStart": _proc_start(proc.pid)}))
+    def spawn(self, *argv):
+        proc = subprocess.Popen([sys.executable, "-c", "import sys, time; time.sleep(300)", *argv])
+        self.processes.append(proc)
+        for _ in range(100):   # until exec replaced the forked parent's argv
+            if b"time.sleep(300)" in Path(f"/proc/{proc.pid}/cmdline").read_bytes():
+                break
+            time.sleep(0.02)
         return proc
 
-    # ---- (a) superseded -------------------------------------------------
-    def test_a_same_session_compose_finishes_previous_direct_with_its_artifact(self):
-        first_file, first = self.compose("first")
-        record = self.write_artifact(first)
-        second_file, _ = self.compose("second")
-        self.assertIn("route_autoclose closed=1", self.last_stderr)
-        outcome = self.outcome(first_file)
-        self.assertEqual(outcome["autoclose"]["reason"], "superseded")
-        self.assertIs(outcome["terminal_gate_proven"], True)
-        self.assertTrue(outcome["inline_finish_id"])
-        self.assertEqual(outcome["summary"], "Tighten the report generator.")
-        sealed = self.cycle_record(record["cycle_id"])
-        self.assertEqual((sealed["state"], sealed["cycle_state"]), ("sealed", "completed"))
-        self.assertIsNone(self.outcome(second_file))
+    def claude_record(self, proc, sid):
+        (self.sessions / f"{proc.pid}.json").write_text(json.dumps(
+            {"pid": proc.pid, "sessionId": sid, "procStart": _proc_start(proc.pid)}))
 
-    def test_a_previous_direct_without_artifact_closes_unproven_and_drops_empty_cycle(self):
-        first_file, first = self.compose("first")
-        record = self.cycle(first)
-        self.compose("second")
-        outcome = self.outcome(first_file)
-        self.assertEqual((outcome["autoclose"]["reason"], outcome["autoclose"]["evidence"]),
-                         ("superseded", "none"))
+    def claude_alive(self, sid):
+        proc = self.spawn()
+        self.claude_record(proc, sid)
+        return proc
+
+    def claude_crashed(self, sid):
+        """A Claude session that died without removing its registry record."""
+        proc = self.spawn()
+        self.claude_record(proc, sid)
+        proc.kill(); proc.wait()
+
+    def raise_gate(self, route):
+        """Journal BLOCKED_HUMAN_GATE the way `workflow-supervisor.py gate --block` does."""
+        import workflow_state
+        gate = (route.get("human_gate_bindings") or [{}])[0].get("gate") or "plan-approval"
+        ledger = workflow_state.WorkflowLedger(route["route_id"], route["route_hash"], jobs=str(self.jobs))
+        with ledger.lock():
+            for state in ("READY", "RUNNING"):
+                ledger.set_workflow_state(state, actor="test")
+            ledger.set_workflow_state("BLOCKED_HUMAN_GATE", evidence={"gate": gate, "artifact": "/x/q.md"},
+                                      actor="test")
+        self.assertEqual(workflow_state.human_gate_resolution(ledger.journal(), gate)["status"], "blocked")
+
+    # ---- closes, claiming no proof -----------------------------------------
+    def test_idle_direct_closes_without_claiming_proof_and_abandons_its_cycle(self):
+        route_file, route = self.compose("quiet", "opencode", "ses-oc")
+        record = self.write_artifact(route)
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))   # a day of quiet first
+        self.age(route_file, "opencode", "ses-oc")
+        self.assertIn("route_autoclose closed=1", self.sweep())
+        outcome = self.outcome(route_file)
+        self.assertEqual((outcome["autoclose"]["reason"], outcome["autoclose"]["proof"]), ("idle", "not-claimed"))
         self.assertIs(outcome["terminal_gate_proven"], False)
+        self.assertNotIn("inline_finish_id", outcome)
+        sealed = self.cycle_record(record["cycle_id"])
+        self.assertEqual((sealed["state"], sealed["cycle_state"]), ("sealed", "abandoned"))
+
+    def test_idle_direct_without_output_drops_its_empty_cycle(self):
+        route_file, route = self.compose("empty", "codex", "session-9")
+        record = self.cycle(route)
+        self.age(route_file, "codex", "session-9")
+        self.sweep()
+        self.assertIs(self.outcome(route_file)["terminal_gate_proven"], False)
         self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "abandoned")
 
-    # ---- (b) session ended ------------------------------------------------
-    def test_b_ended_claude_session_direct_closes_on_next_status(self):
-        route_file, route = self.compose("orphan", "claude", "claude-gone")
-        self.write_artifact(route)
-        self.assertIn(route["route_id"], self.status())   # an hour of quiet first
-        self.age(route_file, "claude", "claude-gone")
-        self.assertNotIn(route["route_id"], self.status())
-        outcome = self.outcome(route_file)
-        self.assertEqual(outcome["autoclose"]["reason"], "session-ended")
-        self.assertEqual(outcome["autoclose"]["trigger"], "status")
-        self.assertIs(outcome["terminal_gate_proven"], True)
+    def test_crashed_claude_session_closes_after_an_hour_of_quiet(self):
+        self.claude_crashed("claude-crashed")
+        route_file, route = self.compose("orphan", "claude", "claude-crashed")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+        self.age(route_file, "claude", "claude-crashed", TWO_HOURS)
+        self.sweep()
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "session-ended")
 
-    def test_b_undecidable_session_closes_only_after_two_idle_days(self):
-        route_file, route = self.compose("quiet", "opencode", "ses-oc")
-        self.assertIn(route["route_id"], self.status())
-        self.age(route_file, "opencode", "ses-oc")
-        self.assertNotIn(route["route_id"], self.status())
-        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
-
-    # ---- (c) no owner --------------------------------------------------------
-    def test_c_quick_route_without_owner_closes_with_honest_proof(self):
-        route_file, route = self.compose("solo", "claude", "claude-gone", intensity="quick", start=False)
+    def test_quick_route_without_owner_closes_with_its_honest_proof(self):
+        self.claude_crashed("claude-crashed")
+        route_file, route = self.compose("solo", "claude", "claude-crashed", intensity="quick", start=False)
         self.assertEqual(route["effective_intensity"], "quick")
-        self.age(route_file, "claude", "claude-gone")
-        self.assertNotIn(route["route_id"], self.status())
+        self.age(route_file, "claude", "claude-crashed", TWO_HOURS)
+        self.sweep()
         outcome = self.outcome(route_file)
         self.assertEqual(outcome["autoclose"]["reason"], "session-ended")
         self.assertIs(outcome["terminal_gate_proven"], False)
         self.assertTrue(outcome["terminal_gates"])
 
-    # ---- (d) never close live work -----------------------------------------
-    def test_d_attempt_the_registry_still_holds_is_never_closed(self):
-        route_file, route = self.compose("owned", "claude", "claude-gone", intensity="quick", start=False)
-        metadata = f"attempt_id=att-live-owner,worker_type=owner,owner_route_id={route['route_id']}"
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self.jobs.write_text(f"{stamp}\trunning\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
-        self.age(route_file, "claude", "claude-gone")
-        self.assertIn(route["route_id"], self.status())
-        self.assertIsNone(self.outcome(route_file))
-        self.jobs.write_text(f"2026-01-01T00:00:00Z\tdone\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
-        self.assertNotIn(route["route_id"], self.status())
-
-    def test_d_live_claude_session_is_never_closed(self):
-        sleeper = self.claude_alive("claude-live")
-        route_file, route = self.compose("busy", "claude", "claude-live")
-        self.age(route_file, "claude", "claude-live")
-        self.assertIn(route["route_id"], self.status())
-        sleeper.kill(); sleeper.wait()
-        self.assertNotIn(route["route_id"], self.status())
-        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "session-ended")
-
-    def test_d_resumed_claude_session_keeps_its_old_routes(self):
-        route_file, route = self.compose("resumed", "claude", "claude-old")
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)",
-                                 "--resume", "claude-old"])
-        self.sleepers.append(proc)
-        (self.sessions / f"{proc.pid}.json").write_text(json.dumps(
-            {"pid": proc.pid, "sessionId": "claude-new", "procStart": _proc_start(proc.pid)}))
-        self.age(route_file, "claude", "claude-old")
-        self.assertIn(route["route_id"], self.status())
-
-    def test_d_cycle_a_live_process_writes_into_is_never_closed(self):
-        first_file, first = self.compose("training", "claude", "claude-gone")
-        record = self.write_artifact(first, "train.log", "epoch 1\n")
-        log = artifact_producer.cycle_dir(self.root, record["campaign_id"], record["cycle_id"],
-                                          record) / "artifacts" / "documents" / "train.log"
-        writer = subprocess.Popen([sys.executable, "-c", "import sys, time; f = open(sys.argv[1], 'a'); time.sleep(300)",
-                                   str(log)])
-        self.sleepers.append(writer)
-        time.sleep(0.5)
-        self.age(first_file, "claude", "claude-gone")
-        self.assertIn(first["route_id"], self.status())
-        second_file, _ = self.compose("next", "claude", "claude-gone")
-        self.assertIsNone(self.outcome(first_file))
-        writer.kill(); writer.wait()
-        self.age(first_file, "claude", "claude-gone")
-        self.assertNotIn(first["route_id"], self.status())
-
-    def test_d_status_from_the_composing_session_keeps_its_routes(self):
-        route_file, route = self.compose("mine", "codex", "session-1")
-        self.age(route_file, "codex", "session-1")
-        self.assertIn(route["route_id"], self.status("codex", "session-1"))
-
-    def test_d_supersede_leaves_a_non_direct_route_that_never_ran(self):
-        waiting_file, waiting = self.compose("waiting", intensity="quick", start=False)
-        self.compose("next")
-        self.assertIsNone(self.outcome(waiting_file))
-
-    def test_b_cycle_left_open_after_its_route_closed_is_sealed(self):
+    def test_cycle_left_open_after_its_route_closed_is_sealed(self):
         route_file, route = self.compose("closed-by-hand", "codex", "session-1")
         record = self.write_artifact(route)
         closed = self.run_as("codex", "session-1", "close", "--route", route_file, "--allow-unproven")
         self.assertEqual(closed.returncode, 0, closed.stderr)
-        self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "open")
-        self.status()
+        self.sweep()
         self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "open")   # closed just now
-        old = time.time() - 2 * 3600
+        old = time.time() - TWO_HOURS
         os.utime(route_file.with_name(route_file.stem + ".outcome.json"), (old, old))
-        self.status()
+        self.sweep()
         sealed = self.cycle_record(record["cycle_id"])
         self.assertEqual((sealed["state"], sealed["cycle_state"]), ("sealed", "abandoned"))
 
-    # ---- (e) campaign close -------------------------------------------------
-    def campaign(self, verb, campaign, sid="observer", *extra):
-        return self.run_as("codex", sid, verb, "--artifact-root", self.root, "--campaign", campaign,
-                           *extra, program=PRODUCER)
+    def test_r7_interrupted_autoclose_is_finished_by_the_next_sweep(self):
+        route_file, route = self.compose("interrupted", "codex", "session-1")
+        record = self.write_artifact(route)
+        # The sweep died between writing the closure and sealing the cycle.
+        script = ("import importlib.util, json, sys; from pathlib import Path; "
+                  "spec = importlib.util.spec_from_file_location('cr', sys.argv[1]); "
+                  "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); "
+                  "p = Path(sys.argv[2]); r = m.verify_route(json.loads(p.read_text()), None, "
+                  "allow_stale_registry=True); m.close_route(r, p, None, 'x', allow_unproven=True, "
+                  "autoclose={'reason': 'idle', 'trigger': 'compose', 'closed_by': 'runtime', "
+                  "'proof': 'not-claimed'})")
+        done = subprocess.run([sys.executable, "-c", script, str(CAP), str(route_file)], env=self.env,
+                              cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "open")
+        self.assertIn("cycles_sealed=1", self.sweep())   # at once: the closure is the runtime's own
+        sealed = self.cycle_record(record["cycle_id"])
+        self.assertEqual((sealed["state"], sealed["cycle_state"]), ("sealed", "abandoned"))
+        self.assertNotIn("errors=1", self.sweep())
+        self.assertFalse((self.root / ".runtime/inline-finish/v1" / route["route_id"]).exists())
+        closed = self.campaign("campaign-close", record["campaign_id"], "--reason", "done")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
 
-    def test_e_campaign_close_by_its_worker_is_not_refused_by_its_open_direct(self):
-        route_file, route = self.compose("member", campaign="k2")
+    def test_g_a_held_producer_lock_defers_sealing_to_a_later_sweep(self):
+        import artifact_admission
+        route_file, route = self.compose("locked", "codex", "session-9")
+        record = self.write_artifact(route)
+        self.age(route_file, "codex", "session-9")
+        fd = artifact_admission._acquire_lock(self.root, 1.0)
+        try:
+            started = time.monotonic()
+            self.sweep()
+            self.assertLess(time.monotonic() - started, 30)
+        finally:
+            artifact_admission._release_lock(self.root, fd)
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+        self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "open")
+        self.sweep()
+        self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "sealed")
+
+    def test_g_a_running_sweep_makes_the_next_one_skip(self):
+        route_file, _route = self.compose("busy-sweep", "codex", "session-9")
+        self.age(route_file, "codex", "session-9")
+        with (self.root / ".runtime/route-autoclose.lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            self.sweep()
+            self.assertIsNone(self.outcome(route_file))
+        self.sweep()
+        self.assertIsNotNone(self.outcome(route_file))
+
+    # ---- never closes live work ---------------------------------------------
+    def test_r1_second_campaign_of_a_live_session_leaves_the_first_alone(self):
+        self.claude_alive("S")
+        first_file, first = self.compose("first", "claude", "S", campaign="k1")
+        record = self.write_artifact(first, "draft.md", "half-written draft\n")
+        self.compose("second", "claude", "S", campaign="k2")
+        self.assertIsNone(self.outcome(first_file))
+        self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "open")
+
+    def test_r6_sub_agent_sharing_the_session_id_leaves_the_parent_route_alone(self):
+        self.claude_alive("parent")
+        parent_file, _parent = self.compose("parent-work", "claude", "parent")
+        self.compose("subagent-work", "claude", "parent")
+        self.assertIsNone(self.outcome(parent_file))
+
+    def test_r2_route_waiting_on_a_human_gate_is_never_closed(self):
+        self.claude_crashed("claude-crashed")
+        route_file, route = self.compose("gated", "claude", "claude-crashed", intensity="quick", start=False)
+        self.raise_gate(route)
+        self.age(route_file, "claude", "claude-crashed")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_r3_ended_owner_at_a_gate_is_not_closed_by_the_next_compose(self):
+        route_file, route = self.compose("gated2", "codex", "session-1", intensity="quick", start=False)
+        self.raise_gate(route)
+        metadata = f"attempt_id=att-owner-ended,worker_type=owner,owner_route_id={route['route_id']}"
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - TWO_HOURS))
+        self.jobs.write_text(f"{old}\tdone\t{self.repo}\t{self.repo}\towner\t{metadata}\n")
+        self.age(route_file, "codex", "session-1")
+        self.compose("side-question", "codex", "session-1")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_r4_claude_session_this_host_cannot_see_waits_for_the_day_rule(self):
+        self.claude_alive("S-live")
+        route_file, _route = self.compose("busy", "claude", "S-live")
+        self.age(route_file, "claude", "S-live", TWO_HOURS)
+        other = self.base / "other-profile"
+        (other / "sessions").mkdir(parents=True)
+        self.env["CLAUDE_CONFIG_DIR"] = str(other)   # another host / profile
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_attempt_the_registry_still_holds_is_never_closed(self):
+        route_file, route = self.compose("owned", "codex", "session-9", intensity="quick", start=False)
+        metadata = f"attempt_id=att-live-owner,worker_type=owner,owner_route_id={route['route_id']}"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.jobs.write_text(f"{stamp}\trunning\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
+        self.age(route_file, "codex", "session-9")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+        self.jobs.write_text(f"2026-01-01T00:00:00Z\tdone\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
+        self.sweep()
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+
+    def test_a_started_terminal_commit_is_left_to_its_controller(self):
+        route_file, route = self.compose("committing", "codex", "session-9", intensity="quick", start=False)
+        slot = self.root / ".runtime/terminal-commits/v1" / route["route_id"] / "att-owner"
+        slot.mkdir(parents=True)
+        (slot / "producer-binding.json").write_text("{}")   # written at owner launch: not a commit
+        self.age(route_file, "codex", "session-9")
+        (slot / "terminal-commit.json").write_text(json.dumps({"state": "claimed"}))
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+        (slot / "terminal-commit.json").unlink()
+        self.sweep()
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+
+    def test_live_resource_run_bound_to_the_route_is_never_closed(self):
+        route_file, route = self.compose("training", "codex", "session-9")
+        runner = self.spawn("train.py")
+        identity = {"pid": runner.pid, "starttime": _proc_start(runner.pid),
+                    "command_hash": hashlib.sha256(Path(f"/proc/{runner.pid}/cmdline").read_bytes()).hexdigest()}
+        registry = self.base / "resource-runs.json"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {
+            "train": {**identity, "route_file": str(route_file), "route_id": route["route_id"],
+                      "node": "inline", "status": "running"}}}))
+        self.resource_index.write_text(json.dumps({"schema_version": 1, "registries": {
+            "r": {"path": str(registry)}}}))
+        self.age(route_file, "codex", "session-9")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+        runner.kill(); runner.wait()
+        self.sweep()
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
+
+    def test_cycle_a_live_process_writes_into_is_never_closed(self):
+        route_file, route = self.compose("logging", "codex", "session-9")
+        record = self.write_artifact(route, "train.log", "epoch 1\n")
+        log = self.cycle_dir(record) / "artifacts" / "documents" / "train.log"
+        writer = subprocess.Popen([sys.executable, "-c", "import sys, time; f = open(sys.argv[1], 'a'); "
+                                   "time.sleep(300)", str(log)])
+        self.processes.append(writer)
+        time.sleep(0.5)
+        self.age(route_file, "codex", "session-9")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+        writer.kill(); writer.wait()
+        self.sweep()
+        self.assertIsNotNone(self.outcome(route_file))
+
+    def test_live_and_resumed_claude_sessions_are_never_closed(self):
+        self.claude_alive("claude-live")
+        live_file, _live = self.compose("busy", "claude", "claude-live")
+        resumed_file, _resumed = self.compose("resumed", "claude", "claude-old")
+        proc = self.spawn("--resume", "claude-old")
+        self.claude_record(proc, "claude-new")
+        self.age(live_file, "claude", "claude-live")
+        self.age(resumed_file, "claude", "claude-old")
+        self.sweep()
+        self.assertIsNone(self.outcome(live_file))
+        self.assertIsNone(self.outcome(resumed_file))
+
+    def test_the_sweeping_session_keeps_its_own_routes(self):
+        route_file, _route = self.compose("mine", "codex", "session-1")
+        self.age(route_file, "codex", "session-1")
+        self.compose("next", "codex", "session-1")
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_e_an_oversized_cycle_counts_as_active(self):
+        route_file, route = self.compose("big", "codex", "session-9")
+        record = self.write_artifact(route)
+        bulk = self.cycle_dir(record) / "artifacts" / "bulk"
+        bulk.mkdir()
+        for index in range(2100):
+            (bulk / f"{index}.txt").write_text("x")
+        self.age(route_file, "codex", "session-9")
+        self.sweep()
+        self.assertIsNone(self.outcome(route_file))
+
+    def test_f_status_stays_read_only(self):
+        route_file, route = self.compose("listed", "codex", "session-9")
+        self.age(route_file, "codex", "session-9")
+        self.assertIn(route["route_id"], self.status())
+        self.assertIsNone(self.outcome(route_file))
+
+    # ---- campaign close -------------------------------------------------------
+    def test_e_campaign_close_is_not_refused_by_an_idle_direct_but_is_by_fresh_work(self):
+        route_file, route = self.compose("member", "opencode", "ses-oc", campaign="k3")
         campaign = self.write_artifact(route)["campaign_id"]
         status = json.loads(self.campaign("campaign-status", campaign).stdout)
         self.assertEqual(status["close_refusal"]["reason"], "campaign-cycle-not-sealed")
-        closed = self.campaign("campaign-close", campaign, "session-1", "--reason", "report shipped")
-        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
-        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "campaign-close")
-        self.assertEqual(json.loads(self.campaign("campaign-status", campaign).stdout)["state"], "satisfied")
-
-    def test_e_campaign_close_takes_a_quiet_direct_but_not_fresh_work(self):
-        route_file, route = self.compose("member", "opencode", "ses-oc", campaign="k3")
-        campaign = self.write_artifact(route)["campaign_id"]
-        fresh = self.campaign("campaign-close", campaign, "observer", "--reason", "done")
+        fresh = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertNotEqual(fresh.returncode, 0)
         self.assertIsNone(self.outcome(route_file))
         self.age(route_file, "opencode", "ses-oc")
-        closed = self.campaign("campaign-close", campaign, "observer", "--reason", "done")
+        closed = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
-        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "campaign-close")
+        self.assertEqual(self.outcome(route_file)["autoclose"]["trigger"], "campaign-close")
+        self.assertEqual(json.loads(self.campaign("campaign-status", campaign).stdout)["state"], "satisfied")
 
-    # ---- (f) source tree ----------------------------------------------------
-    def _tree(self):
-        return {str(path.relative_to(self.repo)): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in sorted(self.repo.rglob("*")) if path.is_file() and ".git" not in path.parts}
-
-    def test_f_autoclose_leaves_the_checkout_untouched_and_records_tracked_dirt(self):
-        first_file, first = self.compose("first")
-        self.write_artifact(first)
+    # ---- the checkout and everything outside the artifact root ----------------
+    def test_r5_checkout_bytes_and_index_are_untouched_and_git_is_only_read(self):
+        shim_dir = self.base / "shim"
+        shim_dir.mkdir()
+        log = self.base / "git.log"
+        real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+        (shim_dir / "git").write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + str(log)
+                                      + "\nexec " + real_git + " \"$@\"\n")
+        (shim_dir / "git").chmod(0o755)
+        route_file, route = self.compose("edited", "codex", "session-9")
+        campaign = self.write_artifact(route)["campaign_id"]
         (self.repo / "README.md").write_text("user edit in progress\n", encoding="utf-8")
-        before = self._tree()
-        self.compose("second")
-        self.assertEqual(self._tree(), before)
-        outcome = self.outcome(first_file)
-        self.assertIs(outcome["terminal_gate_proven"], True)
-        self.assertEqual(outcome["autoclose"]["tracked_dirt"], ["README.md"])
-        self.assertEqual((self.repo / "README.md").read_text(), "user edit in progress\n")
+        os.utime(self.repo / "README.md", (time.time() + 5, time.time() + 5))   # stat-stale index
+        self.age(route_file, "codex", "session-9")
+        index = self.repo / ".git" / "index"
+        before = {path: path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}
+        index_before = (index.stat().st_mtime_ns, index.read_bytes())
+        self.env["PATH"] = str(shim_dir) + os.pathsep + self.env["PATH"]
+        closed = self.campaign("campaign-status", campaign)
+        self.assertIn("route_autoclose closed=1", closed.stderr)
+        self.assertEqual({path: path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}, before)
+        self.assertEqual((index.stat().st_mtime_ns, index.read_bytes()), index_before)
+        calls = log.read_text().splitlines() if log.is_file() else []
+        self.assertTrue(all("rev-parse" in call.split() for call in calls), calls)
+
+    def test_r8_a_sweep_writes_nothing_outside_the_artifact_root(self):
+        route_file, route = self.compose("outside", "codex", "session-9")
+        campaign = self.write_artifact(route)["campaign_id"]
+        self.age(route_file, "codex", "session-9")
+
+        def snapshot():
+            return {str(path): path.stat().st_mtime_ns for path in self.base.rglob("*")
+                    if path.is_file() and not path.is_relative_to(self.root) and not path.is_relative_to(self.repo)}
+
+        before = snapshot()
+        done = self.campaign("campaign-status", campaign)
+        self.assertIn("route_autoclose closed=1", done.stderr)
+        after = snapshot()
+        self.assertEqual(sorted(key for key in after if before.get(key) != after[key]), [])
 
 
 if __name__ == "__main__":

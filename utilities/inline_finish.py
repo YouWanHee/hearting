@@ -46,21 +46,6 @@ def _fault(point: str) -> None:
     if os.environ.get("HEARTING_INLINE_FINISH_CRASH_AT") == point:
         raise InlineFinishError("fault-injected-" + point)
 
-def _scoped_tracked_dirt(cwd: str, scope) -> list[str]:
-    """Tracked edits inside a direct node's declared write scope."""
-    # A status probe must not refresh the checkout's index as a side effect.
-    dirty = subprocess.run(["git", "-C", cwd, "status", "--porcelain", "--untracked-files=no"],
-                           capture_output=True, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
-    if dirty.returncode:
-        raise InlineFinishError("finish-git-status-unavailable")
-    found = []
-    for line in dirty.stdout.splitlines():
-        path = line[3:].strip().strip('"')
-        if any(item == "source-scoped" or fnmatch.fnmatchcase(path, item.removesuffix("/**") + "/*")
-               or path == item.removesuffix("/**") for item in scope):
-            found.append(path)
-    return found
-
 def _registry_lines(jobs: Path, inherited: bool) -> list[str]:
     try:
         return jobs.read_text().splitlines()
@@ -70,12 +55,7 @@ def _registry_lines(jobs: Path, inherited: bool) -> list[str]:
         return []
 
 
-def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
-           autoclose: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Finish one direct route.  `autoclose` is the runtime closing a route
-    nobody works on any more (route_autoclose.py): no current session is
-    required, the commit is the checkout's HEAD, and scoped tracked edits are
-    recorded on the closure instead of refusing it."""
+def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, Any]:
     root = Path(route["artifact_root"]).resolve(strict=True)
     route_file = Path(route_file)
     if route_file.is_symlink():
@@ -94,22 +74,18 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
     # The interactive caller can be hosted by any supported runtime.  Keep the
     # same ambiguity rule used by dispatch admission rather than guessing one
     # session variable when a shell happens to inherit several.
-    if autoclose is None:
-        from dispatch_parent_completion import interactive_parent_identity
-        from dispatch_contract import DispatchContractError
-        try:
-            _harness, sid = interactive_parent_identity(os.environ)
-        except DispatchContractError as exc:
-            if str(exc) == "caller-harness-ambiguous":
-                raise InlineFinishError("finish-caller-harness-ambiguous") from exc
-            raise InlineFinishError("finish-caller-harness-invalid") from exc
-        if not sid:
-            raise InlineFinishError("finish-current-session-missing")
-        if not sid or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
-            raise InlineFinishError("finish-registered-caller-ineligible")
-    else:
-        sid = "runtime-autoclose"
-        autoclose = dict(autoclose)
+    from dispatch_parent_completion import interactive_parent_identity
+    from dispatch_contract import DispatchContractError
+    try:
+        _harness, sid = interactive_parent_identity(os.environ)
+    except DispatchContractError as exc:
+        if str(exc) == "caller-harness-ambiguous":
+            raise InlineFinishError("finish-caller-harness-ambiguous") from exc
+        raise InlineFinishError("finish-caller-harness-invalid") from exc
+    if not sid:
+        raise InlineFinishError("finish-current-session-missing")
+    if not sid or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
+        raise InlineFinishError("finish-registered-caller-ineligible")
     if dispatch_terminal_commit.require_current_cleanup("inline-finish", target=route_file) is not None:
         raise InlineFinishError("finish-foreign-cleanup-scope")
     from dispatch_contract import resolve_global_registry
@@ -180,31 +156,24 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
     if not summary_text: raise InlineFinishError("finish-summary-invalid")
     source = str(route.get("source_commit") or "")
     commit = str(args.commit or api._head_commit(route["cwd"]) or "").lower()
-    if autoclose is not None and not api._COMMIT_SHA.fullmatch(commit):
-        commit = source.lower()
-        autoclose["commit_basis"] = "source-commit-head-unavailable"
     if not api._COMMIT_SHA.fullmatch(source) or not api._COMMIT_SHA.fullmatch(commit):
         raise InlineFinishError("finish-commit-invalid")
     ancestor = subprocess.run(["git", "-C", route["cwd"], "merge-base", "--is-ancestor", source, commit], capture_output=True)
     head = subprocess.run(["git", "-C", route["cwd"], "rev-parse", "HEAD"], capture_output=True, text=True)
     commit_reachable = subprocess.run(["git", "-C", route["cwd"], "merge-base", "--is-ancestor", commit, "HEAD"], capture_output=True)
     if ancestor.returncode or head.returncode or commit_reachable.returncode:
-        if autoclose is None:
-            raise InlineFinishError("finish-commit-not-source-descendant")
-        autoclose.setdefault("commit_basis", "head-not-source-descendant")
+        raise InlineFinishError("finish-commit-not-source-descendant")
     # Tracked edits inside this direct node's declared scope are not admissible.
     scope = (node.get("write_scope") or [])
-    try:
-        scoped_dirt = _scoped_tracked_dirt(route["cwd"], scope)
-    except InlineFinishError:
-        if autoclose is None:
-            raise
-        scoped_dirt = []
-        autoclose["tracked_dirt"] = "git-status-unavailable"
-    if scoped_dirt:
-        if autoclose is None:
+    dirty = subprocess.run(["git", "-C", route["cwd"], "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True)
+    if dirty.returncode:
+        raise InlineFinishError("finish-git-status-unavailable")
+    for line in dirty.stdout.splitlines():
+        path = line[3:].strip().strip('"')
+        if any(item == "source-scoped" or fnmatch.fnmatchcase(path, item.removesuffix("/**") + "/*")
+               or path == item.removesuffix("/**") for item in scope):
             raise InlineFinishError("finish-scoped-tracked-dirt")
-        autoclose["tracked_dirt"] = scoped_dirt[:50]
     identity = artifact_lifecycle.read_root_identity(root)
     if not identity: raise InlineFinishError("finish-artifact-root-identity-missing")
     evidence_rel = evidence.resolve().relative_to(output.resolve()).as_posix()
@@ -243,8 +212,16 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
                 raise
             except Exception as exc:
                 raise InlineFinishError("finish-registry-unreadable") from exc
-            if autoclose is None and _scoped_tracked_dirt(route["cwd"], scope):
-                raise InlineFinishError("finish-scoped-tracked-dirt")
+            locked_dirty = subprocess.run(
+                ["git", "-C", route["cwd"], "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True, text=True)
+            if locked_dirty.returncode:
+                raise InlineFinishError("finish-git-status-unavailable")
+            for line in locked_dirty.stdout.splitlines():
+                path = line[3:].strip().strip('"')
+                if any(item == "source-scoped" or fnmatch.fnmatchcase(path, item.removesuffix("/**") + "/*")
+                       or path == item.removesuffix("/**") for item in scope):
+                    raise InlineFinishError("finish-scoped-tracked-dirt")
             latest = artifact_producer.read_cycle_record(root, record["cycle_id"])
             if (not latest or latest.get("state") not in {"open", "sealed"}
                     or dispatch_terminal_commit.cycle_identity_digest(latest) != intent["cycle_record_digest"]):
@@ -255,9 +232,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
                     or api.route_hash(current_route) != intent["route_hash"]):
                 raise InlineFinishError("finish-route-drift")
             current_head = api._head_commit(route["cwd"])
-            if autoclose is None and (not current_head or subprocess.run(
+            if not current_head or subprocess.run(
                     ["git", "-C", route["cwd"], "merge-base", "--is-ancestor", intent["commit"], current_head],
-                    capture_output=True).returncode):
+                    capture_output=True).returncode:
                 raise InlineFinishError("finish-commit-drift")
             if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
                 raise InlineFinishError("finish-active-review-lease")
@@ -273,8 +250,6 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
                 _fault("before-claim")
                 state = {"schema":"inline_finish_v1", "inline_finish_id":intent_id, "intent":intent,
                          "claimant_session":sid, "state":"claimed"}
-                if autoclose is not None:
-                    state["autoclose"] = autoclose
                 _atomic(state_path, state)
                 _fault("after-claim")
             marker_file = api.completion_dir(route["route_id"]) / (node["id"] + ".json")
@@ -284,13 +259,6 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
                     cmd = [sys.executable, str(api.ROOT/"utilities/capability-route.py"), "complete",
                            "--route", str(route_file), "--node", node["id"], "--evidence", str(evidence)]
                     child_env=os.environ.copy(); child_env["AGENT_INLINE_FINISH_ID"]=intent_id
-                    if state.get("autoclose") is not None:
-                        # The runtime, not whichever worker happened to trigger
-                        # the sweep, records this inline completion.
-                        for key in ("AGENT_DISPATCH_ATTEMPT_ID", "AGENT_ROUTE_FILE",
-                                    "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE"):
-                            child_env.pop(key, None)
-                        child_env["AGENT_DISPATCH_DEPTH"] = "0"
                     subprocess.run(cmd, cwd=route["cwd"], env=child_env, check=True, capture_output=True, text=True)
                 marker_raw = marker_file.read_bytes()
                 marker = json.loads(marker_raw)
@@ -335,8 +303,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
                         allow_unproven=False, expected_terminal_marker_digest=marker_digest,
                         inline_finish_id=intent_id, inline_commit=commit,
                         expected_summary_digest=intent["summary_sha256"],
-                        expected_producer_binding_digest=_digest(json.dumps(binding,sort_keys=True,separators=(",", ":")).encode()),
-                        autoclose=state.get("autoclose"))
+                        expected_producer_binding_digest=_digest(json.dumps(binding,sort_keys=True,separators=(",", ":")).encode()))
                 else:
                     outcome = json.loads(outcome_path.read_text())
                     if (outcome.get("route_hash") != route["route_hash"]
@@ -376,8 +343,6 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *,
                            "route_hash":route["route_hash"], "cycle_id":record["cycle_id"],
                            "terminal_marker_digest":marker_digest, "manifest_digest":verified["manifest_digest"],
                            "commit":commit, "replay":replayed_at_entry}
-                if state.get("autoclose") is not None:
-                    receipt["autoclose"] = state["autoclose"]
                 state.update(state="finished", receipt=receipt); _atomic(state_path, state)
                 _fault("after-receipt")
             if state.get("state") != "finished": raise InlineFinishError("finish-pending")

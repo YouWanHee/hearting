@@ -1,37 +1,35 @@
 """Runtime closure of routes nobody works on any more.
 
-A compiled route is a lease the runtime holds for the session that composed it,
-not homework that session must remember.  When it is plain that no one works on
-a route any more, the runtime closes it and its open producer cycle:
+A compiled route is a lease the runtime holds for the session that composed
+it, not homework that session must remember.  `compose`, `campaign-status` and
+`campaign-close` run one bounded sweep that closes an open route only when
+time says nobody works on it:
 
-* superseded -- the same interactive session composes a new route; its earlier
-  open routes without a live owner are done with.  A non-direct route counts
-  only once an owner attempt ran and ended (a route waiting at a human gate has
-  no ended owner and is left alone).
-* session-ended -- the composing session is provably gone (Claude's own session
-  registry; the other runtimes expose no such proof yet) and nothing wrote to
-  the route or its cycle for `QUIET_SECONDS`.
-* idle -- nothing wrote to the route, its cycle, or its composing session's
-  route-chain ledger for `IDLE_SECONDS`.  Used only when the session's liveness
-  cannot be decided.
-* campaign-close -- closing a campaign closes its members' open routes: the
-  closing session's own, and others' once quiet for `QUIET_SECONDS` with no
-  provably live session.  Fresh work by someone else still refuses the close.
+* session-ended -- this host holds positive evidence that the composing Claude
+  session is gone (its own session record, whose process is dead) and nothing
+  wrote to the route or its cycle for `QUIET_SECONDS`;
+* idle -- otherwise (no such evidence, or Codex/OpenCode, which expose none),
+  nothing wrote to the route, its cycle or its composer's route-chain ledger
+  for `IDLE_SECONDS`.  An activity scan that hits its size limit counts as
+  activity.
 
-A route with a live, unverifiable or lease-held dispatch attempt, a pending
-terminal commit, a finish another caller claimed, or a cycle directory a live
-process still holds open (a training run logging into it) is never touched.
+Never closed, whatever the time: a route of the session running the sweep, a
+route a dispatch attempt still holds (live, unverifiable or lease-held), one
+whose workflow ledger waits on a human gate, one a live resource run is bound
+to or logs into, one with a pending terminal commit or an unfinished `finish`,
+and one whose cycle directory a live process holds open.
 
-How it closes: a direct route with a cycle-local artifact goes through the same
-`finish` transaction the session would have run (the newest artifact as
-evidence, the work request as summary, HEAD as commit, scoped tracked edits
-recorded rather than refused).  Everything else is closed with its honest
-terminal proof (`close_route(allow_unproven=True)`) and its open cycle is sealed
-completed when that proof holds, abandoned otherwise.  A cycle whose route was
-closed over `QUIET_SECONDS` ago but never sealed is sealed the same way.  Every
-closure carries an `autoclose` record naming why.  Only records under the
-artifact root are written; the source checkout is never touched.  One sweep
-spends at most `BUDGET_SECONDS`; what it did not reach waits for the next one.
+The closure claims no proof.  Every route closes the same way,
+`close_route(allow_unproven=True)` with an `autoclose` record, so its terminal
+proof is exactly what completion markers already show.  Its open cycle is then
+sealed with the existing states: completed when that proof holds, abandoned
+otherwise.  Both steps are idempotent, so the next sweep finishes whatever an
+interrupted one left: a cycle behind a runtime-written closure is sealed at
+once, any other closed-but-unsealed cycle after `QUIET_SECONDS`.
+
+The sweep writes under the artifact root only and reads the checkout with
+`git rev-parse` alone.  It takes no lock it would wait for and spends at most
+`BUDGET_SECONDS`; whatever it did not reach waits for the next one.
 """
 from __future__ import annotations
 
@@ -42,20 +40,18 @@ import json
 import os
 import sys
 import time
-import types
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 IDLE_SECONDS = 24 * 3600
-# An ended session's route still waits this long after its last write.
 QUIET_SECONDS = 3600
 BUDGET_SECONDS = 20.0
+WALK_LIMIT = 2000
 # A terminal registry row may still have its wrapper process publishing; rows
 # older than this are not re-probed on every sweep.
 _RECENT_TERMINAL_SECONDS = 3600
 _TERMINAL = {"done", "killed", "cancelled"}
-_OUTPUT_PREFERENCE = (".md", ".txt", ".json", ".html", ".csv", ".yaml", ".yml")
 
 
 def _iso(now: float) -> str:
@@ -69,15 +65,223 @@ def _mtime(path: Path) -> float:
         return 0.0
 
 
-def _newest_mtime(directory: Path, limit: int = 2000) -> float:
+def _newest_mtime(directory: Path, limit: int = WALK_LIMIT) -> float | None:
+    """Newest mtime in a tree, or None when the tree is larger than `limit`."""
     newest, seen = _mtime(directory), 0
     for base, dirs, files in os.walk(directory):
         for name in files + dirs:
             newest = max(newest, _mtime(Path(base) / name))
             seen += 1
-            if seen >= limit:
-                return newest
+            if seen > limit:
+                return None
     return newest
+
+
+def _under(path: str, home: Path | None) -> bool:
+    return home is not None and (path == str(home) or path.startswith(str(home) + os.sep))
+
+
+def _open_paths(root: Path) -> set[str]:
+    """Paths under `root` a live process holds open or runs in."""
+    prefix = str(root) + os.sep
+    found: set[str] = set()
+    try:
+        pids = [pid for pid in os.listdir("/proc") if pid.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        links = []
+        try:
+            links.append(os.readlink(f"/proc/{pid}/cwd"))
+            links += [os.readlink(f"/proc/{pid}/fd/{fd}") for fd in os.listdir(f"/proc/{pid}/fd")]
+        except OSError:
+            pass
+        found.update(link for link in links if link.startswith(prefix))
+    return found
+
+
+def _composers(api) -> tuple[dict, dict]:
+    """route_id -> latest route-chain ledger holder, and (harness, sid) -> ledger mtime."""
+    holders: dict[str, dict] = {}
+    activity: dict[tuple[str, str], float] = {}
+    try:
+        rc = api._route_chain_module()
+    except Exception:
+        rc = None
+    if rc is None:
+        return holders, activity
+    for harness in rc.HARNESSES:
+        directory = Path(rc.state_root()) / harness
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            sid = name[:-len(".jsonl")]
+            activity[(harness, sid)] = _mtime(directory / name)
+            for line in rc.read_tail(harness, sid, max_bytes=1024 * 1024):
+                ts = line.get("ts") or 0
+                previous = holders.get(line["route_id"])
+                if previous is None or ts >= previous["ts"]:
+                    holders[line["route_id"]] = {"harness": harness, "session_id": sid, "ts": ts}
+    return holders, activity
+
+
+def _current_identity():
+    """The interactive depth-0 session running this command, else None."""
+    if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") not in ("", "0"):
+        return None
+    try:
+        from dispatch_parent_completion import interactive_parent_identity
+        harness, sid = interactive_parent_identity(os.environ)
+    except Exception:
+        return None
+    return (harness, sid) if harness and sid else None
+
+
+def _registries(api) -> list[Path]:
+    import dispatch_contract as dispatch
+    paths = []
+    try:
+        paths.append(Path(dispatch.resolve_global_registry(api.ROOT, None, 0, "read").path))
+    except Exception:
+        pass
+    if os.environ.get("AGENT_DISPATCH_JOBS"):
+        paths.append(Path(os.environ["AGENT_DISPATCH_JOBS"]))
+    return list(dict.fromkeys(paths))
+
+
+def _held_by_attempts(registries: list[Path]) -> set[str]:
+    """Route ids a registered attempt still holds: live, unverifiable or lease-held."""
+    if not any(path.is_file() for path in registries):
+        return set()
+    import artifact_cutover
+    import codex_dispatch_terminal as terminal
+    import dispatch_contract as dispatch
+    held: set[str] = set()
+    now = time.time()
+    for attempt_id, row in artifact_cutover._registry_attempts(registries).items():
+        metadata, status = row["metadata"], row["status"]
+        ids = {metadata.get(key, "") for key in ("route_id", "owner_route_id", "batch_route_id")} - {""}
+        if not ids:
+            continue
+        if status in _TERMINAL:
+            try:
+                stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                stamp = now
+            if now - stamp >= _RECENT_TERMINAL_SECONDS:
+                continue
+        try:
+            observed = dispatch.observed_attempt_liveness(
+                status, metadata, terminal_envelope=terminal.terminal_envelope_observed(metadata.get("log_file")))
+            state = observed.state
+            lease = bool(metadata.get("supervisor_lease_file")) and dispatch.supervisor_lease_is_held(row["jobs"], metadata)
+        except Exception:
+            state, lease = "unverifiable", False
+        if state in {"alive", "unverifiable"} or lease:
+            try:
+                current, _conflict = artifact_cutover._current_owner_route_id(attempt_id, metadata, row["jobs"])
+            except Exception:
+                current = None
+            held |= ids | ({current} if current else set())
+    return held
+
+
+def _gate_ledger_roots(registries: list[Path]) -> list[Path]:
+    import workflow_state
+    roots = []
+    for jobs in registries:
+        try:
+            roots.append(workflow_state.ledger_root_for(jobs=jobs)[0])
+        except Exception:
+            continue
+    try:
+        roots.append(workflow_state.ledger_root_for()[0])
+    except Exception:
+        pass
+    return list(dict.fromkeys(roots))
+
+
+def _waits_on_human(route_id: str, roots: list[Path]) -> bool:
+    """A gate this route's workflow raised and nobody has resolved yet."""
+    import workflow_state
+    for root in roots:
+        try:
+            entries = workflow_state.WorkflowLedger(route_id, root=root).journal()
+        except Exception:
+            continue
+        gates = {(entry.get("evidence") or {}).get("gate") for entry in entries
+                 if isinstance(entry, dict) and entry.get("workflow_state") == "BLOCKED_HUMAN_GATE"
+                 and isinstance(entry.get("evidence"), dict)} - {None}
+        if any(workflow_state.human_gate_resolution(entries, gate)["status"] == "blocked" for gate in gates):
+            return True
+    return False
+
+
+def _live_resource_runs() -> tuple[set[str], list[str]]:
+    """Route ids a live resource run is bound to, and the paths live runs log into."""
+    try:
+        import resource_run_registry
+        rows, _diagnostics = resource_run_registry.scan()
+    except Exception:
+        return set(), []
+    routes, paths = set(), []
+    for row in rows:
+        reason = (row.get("state_evidence") or {}).get("reason")
+        if row.get("liveness") != "working" and reason != "process-identity-unreadable":
+            continue
+        for value in (row.get("route_id"), row.get("route_file"), row.get("route")):
+            if isinstance(value, str) and value:
+                routes.add(Path(value).stem if value.endswith(".json") else value)
+        if isinstance(row.get("log_path"), str):
+            paths.append(os.path.realpath(row["log_path"]))
+    return routes, paths
+
+
+def _claude_state(sid: str) -> str:
+    """alive | gone | unknown.  `gone` only on positive evidence on this host:
+    the session's own registry record, whose process is dead."""
+    tools = str(Path(__file__).resolve().parents[1] / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    try:
+        from fleet import session_handle, session_registry
+        from dispatch_contract import process_identity_disposition
+        directory = session_handle._claude_sessions_dir()
+        names = os.listdir(directory) if directory else []
+    except Exception:
+        return "unknown"
+    dead = unresolved = False
+    for name in names:
+        if not name.endswith(".json") or not name[:-5].isdigit():
+            continue
+        pid = int(name[:-5])
+        record = session_registry.read("claude", pid)
+        if not record:
+            continue
+        verdict = process_identity_disposition(pid, str(record.get("procStart") or ""))
+        if record.get("sessionId") == sid:
+            if verdict == "live":
+                return "alive"
+            dead |= verdict == "dead"
+            unresolved |= verdict != "dead"
+        elif verdict == "live":
+            # A resumed session runs under a new id with the old one on argv.
+            try:
+                if sid in Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace"):
+                    return "alive"
+            except OSError:
+                pass
+    return "gone" if dead and not unresolved else "unknown"
+
+
+def _session_state(holder: Mapping[str, Any] | None) -> str:
+    if holder and holder["harness"] == "claude":
+        return _claude_state(holder["session_id"])
+    return "unknown"
 
 
 def _open_route_files(root: Path, api) -> list[Path]:
@@ -118,276 +322,99 @@ def _open_cycles_by_route(root: Path) -> dict:
     return table
 
 
-def _open_paths(root: Path) -> set[str]:
-    """Paths under `root` a live process holds open or runs in."""
-    prefix = str(root) + os.sep
-    found: set[str] = set()
-    try:
-        pids = [pid for pid in os.listdir("/proc") if pid.isdigit()]
-    except OSError:
-        return found
-    for pid in pids:
-        links = []
-        try:
-            links.append(os.readlink(f"/proc/{pid}/cwd"))
-            links += [os.readlink(f"/proc/{pid}/fd/{fd}") for fd in os.listdir(f"/proc/{pid}/fd")]
-        except OSError:
-            pass
-        found.update(link for link in links if link.startswith(prefix))
-    return found
-
-
-def _route_chain(api):
-    try:
-        return api._route_chain_module()
-    except Exception:
-        return None
-
-
-def _composers(api) -> tuple[dict, dict]:
-    """route_id -> latest ledger holder, and (harness, sid) -> ledger mtime."""
-    rc = _route_chain(api)
-    holders: dict[str, dict] = {}
-    activity: dict[tuple[str, str], float] = {}
-    if rc is None:
-        return holders, activity
-    for harness in rc.HARNESSES:
-        directory = Path(rc.state_root()) / harness
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            continue
-        for name in names:
-            if not name.endswith(".jsonl"):
-                continue
-            sid = name[:-len(".jsonl")]
-            activity[(harness, sid)] = _mtime(directory / name)
-            for line in rc.read_tail(harness, sid, max_bytes=1024 * 1024):
-                ts = line.get("ts") or 0
-                previous = holders.get(line["route_id"])
-                if previous is None or ts >= previous["ts"]:
-                    holders[line["route_id"]] = {"harness": harness, "session_id": sid,
-                                                 "ts": ts, "event": line.get("event")}
-    return holders, activity
-
-
-def _current_identity():
-    """The interactive depth-0 session running this command, else None."""
-    if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") not in ("", "0"):
-        return None
-    try:
-        from dispatch_parent_completion import interactive_parent_identity
-        harness, sid = interactive_parent_identity(os.environ)
-    except Exception:
-        return None
-    return (harness, sid) if harness and sid else None
-
-
-def _attempts(api) -> tuple[set, set]:
-    """(route ids a dispatch attempt still holds, route ids whose owner ran and ended)."""
-    import dispatch_contract as dispatch
-    paths = []
-    try:
-        paths.append(dispatch.resolve_global_registry(api.ROOT, None, 0, "read").path)
-    except Exception:
-        pass
-    if os.environ.get("AGENT_DISPATCH_JOBS"):
-        paths.append(Path(os.environ["AGENT_DISPATCH_JOBS"]))
-    if not any(Path(path).is_file() for path in paths):
-        return set(), set()
-    import artifact_cutover
-    import codex_dispatch_terminal as terminal
-    held: set[str] = set()
-    ended: set[str] = set()
-    now = time.time()
-    for attempt_id, row in artifact_cutover._registry_attempts(paths).items():
-        metadata, status = row["metadata"], row["status"]
-        ids = {metadata.get(key, "") for key in ("route_id", "owner_route_id", "batch_route_id")} - {""}
-        if not ids:
-            continue
-        is_owner = metadata.get("worker_type") == "owner" or bool(metadata.get("owner_route_id"))
-        if status in _TERMINAL:
-            try:
-                recent = now - datetime.fromisoformat(
-                    row["timestamp"].replace("Z", "+00:00")).timestamp() < _RECENT_TERMINAL_SECONDS
-            except (TypeError, ValueError):
-                recent = True
-            if not recent:
-                if is_owner:
-                    ended |= ids
-                continue
-        try:
-            observed = dispatch.observed_attempt_liveness(
-                status, metadata, terminal_envelope=terminal.terminal_envelope_observed(metadata.get("log_file")))
-            state = observed.state
-            lease = bool(metadata.get("supervisor_lease_file")) and dispatch.supervisor_lease_is_held(row["jobs"], metadata)
-        except Exception:
-            state, lease = "unverifiable", False
-        if state in {"alive", "unverifiable"} or lease:
-            try:
-                current, _conflict = artifact_cutover._current_owner_route_id(attempt_id, metadata, row["jobs"])
-            except Exception:
-                current = None
-            held |= ids | ({current} if current else set())
-        elif is_owner:
-            ended |= ids
-    return held, ended
-
-
-def _claude_state(sid: str) -> str:
-    """alive | gone | unknown from Claude Code's own session registry."""
-    tools = str(Path(__file__).resolve().parents[1] / "tools")
-    if tools not in sys.path:
-        sys.path.insert(0, tools)
-    try:
-        from fleet import session_handle, session_registry
-        from dispatch_contract import process_identity_disposition
-    except Exception:
-        return "unknown"
-    directory = session_handle._claude_sessions_dir()
-    if not directory:
-        return "unknown"
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return "unknown"
-    unresolved = False
-    for name in names:
-        if not name.endswith(".json") or not name[:-5].isdigit():
-            continue
-        pid = int(name[:-5])
-        record = session_registry.read("claude", pid)
-        if not record:
-            continue
-        verdict = process_identity_disposition(pid, str(record.get("procStart") or ""))
-        if verdict == "dead":
-            continue
-        if record.get("sessionId") == sid:
-            if verdict == "live":
-                return "alive"
-            unresolved = True
-            continue
-        if verdict == "live":
-            # A resumed session runs under a new id with the old one on argv.
-            try:
-                if sid in Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace"):
-                    return "alive"
-            except OSError:
-                pass
-    return "unknown" if unresolved else "gone"
-
-
-def _session_state(holder: Mapping[str, Any] | None) -> str:
-    if not holder:
-        return "unknown"
-    if holder["harness"] == "claude":
-        return _claude_state(holder["session_id"])
-    return "unknown"
-
-
-def _open_cycle(root: Path, route: Mapping[str, Any]):
-    import artifact_producer
-    try:
-        return artifact_producer.route_cycle_for(root, route)
-    except Exception:
-        return None
-
-
 def _cycle_home(root: Path, record) -> Path | None:
     import artifact_producer
+    if not record:
+        return None
     try:
         return artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
     except Exception:
         return None
 
 
-def _last_activity(root: Path, path: Path, raw: Mapping[str, Any], holder, api, record, *,
+def _last_activity(root: Path, path: Path, raw: Mapping[str, Any], holder, api, record, now: float, *,
                    deep: bool = False) -> float:
-    """Newest write to the route, its ledger line and its cycle.  `deep` walks
-    the cycle tree and completion markers; the cheap form stats the top only."""
-    newest = _mtime(path)
-    if holder:
-        newest = max(newest, float(holder.get("ts") or 0))
-    finish_home = root / ".runtime" / "inline-finish" / "v1" / str(raw.get("route_id"))
-    newest = max(newest, _newest_mtime(finish_home, limit=20) if deep else _mtime(finish_home))
+    """Newest write to the route, its ledger line and its cycle.  The cheap form
+    stats the top of the cycle; `deep` walks it and the completion markers, and
+    a tree past `WALK_LIMIT` counts as written now."""
+    newest = max(_mtime(path), float(holder.get("ts") or 0) if holder else 0.0)
+    homes = [root / ".runtime" / "inline-finish" / "v1" / str(raw.get("route_id"))]
     if deep:
         try:
-            newest = max(newest, _newest_mtime(api.completion_dir(raw["route_id"]), limit=200))
+            homes.append(Path(api.completion_dir(raw["route_id"])))
         except Exception:
             pass
-    home = _cycle_home(root, record) if record else None
     if record:
         newest = max(newest, _mtime(root / ".runtime/artifact-producer/v1/cycles" / (record["cycle_id"] + ".json")))
-    if home is not None:
-        newest = max(newest, _newest_mtime(home) if deep else max(_mtime(home), _mtime(home / "artifacts")))
+        home = _cycle_home(root, record)
+        if home is not None:
+            homes.append(home)
+            newest = max(newest, _mtime(home / "artifacts"))
+    for home in homes:
+        seen = _newest_mtime(home) if deep else _mtime(home)
+        if seen is None:
+            return now
+        newest = max(newest, seen)
     return newest
 
 
-def _decide(route_id, raw, *, holder, session_activity, current, new_route_id, held, ended,
-            idle_since, now, idle, campaign_close, in_use=False):
+def _terminal_commit_pending(runtime: Path, route_id: str) -> bool:
+    """An owner's terminal commit started and has not sealed.  The slot directory
+    alone is only the producer binding written at owner launch."""
+    for state_file in (runtime / "terminal-commits" / "v1" / route_id).glob("*/terminal-commit.json"):
+        try:
+            if json.loads(state_file.read_text(encoding="utf-8")).get("state") != "owner-envelope-sealed":
+                return True
+        except (OSError, ValueError, AttributeError):
+            return True
+    return False
+
+
+def _kept(route_id: str, raw, *, root, runtime, facts, home) -> str | None:
+    """Why this route must stay open whatever the time, else None."""
+    import inline_finish
+    if route_id in facts["held"]:
+        return "owner-live"
+    if _terminal_commit_pending(runtime, route_id):
+        return "terminal-commit-pending"
+    try:
+        pending = inline_finish.pending_state(root, route_id)
+    except Exception:
+        return "finish-pending"
+    if pending and pending.get("state") != "finished":
+        return "finish-pending"
+    if _waits_on_human(route_id, facts["gate_roots"]):
+        return "human-gate"
+    if route_id in facts["resource_routes"] or any(_under(item, home) for item in facts["resource_paths"]):
+        return "resource-run"
+    if any(_under(item, home) for item in facts["open_paths"]):
+        return "cycle-in-use"
+    return None
+
+
+def _decide(holder, *, activity, current, idle_since, now) -> tuple[str | None, str | None]:
     """(reason to close | None, reason kept)."""
-    if route_id in held:
-        return None, "owner-live"
-    if in_use:
-        return None, "cycle-in-use"
     identity = (holder["harness"], holder["session_id"]) if holder else None
-    if campaign_close and route_id in campaign_close:
-        # The closer's own route ends with its campaign; anyone else's only
-        # once it is quiet and its session is not provably still there.
-        if current and identity == current:
-            return "campaign-close", None
-        if _session_state(holder) == "alive":
-            return None, "session-alive"
-        if now - idle_since >= QUIET_SECONDS:
-            return "campaign-close", None
-        return None, "recent-activity"
     if current and identity == current:
-        if new_route_id and route_id != new_route_id and (
-                raw.get("effective_intensity") == "direct" or route_id in ended):
-            return "superseded", None
         return None, "current-session"
     state = _session_state(holder)
     if state == "alive":
         return None, "session-alive"
-    if state == "gone":
-        if now - idle_since >= QUIET_SECONDS:
-            return "session-ended", None
-        return None, "recent-activity"
-    recent = max(idle_since, session_activity.get(identity, 0.0) if identity else 0.0)
-    if now - recent >= idle:
+    if state == "gone" and now - idle_since >= QUIET_SECONDS:
+        return "session-ended", None
+    recent = max(idle_since, activity.get(identity, 0.0) if identity else 0.0)
+    if now - recent >= IDLE_SECONDS:
         return "idle", None
     return None, "recent-activity"
 
 
-def _pick_evidence(root: Path, record) -> Path | None:
-    """The newest nonempty regular file among the cycle's outputs."""
+def _seal_cycle(root: Path, route: Mapping[str, Any], proven) -> str:
+    """Seal the route's open cycle with an existing state; never waits on a lock."""
     import artifact_producer
     try:
-        directory = artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
+        record = artifact_producer.route_cycle_for(root, route)
     except Exception:
-        return None
-    best = None
-    for base, dirs, files in os.walk(directory):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for name in files:
-            if name.startswith("."):
-                continue
-            candidate = Path(base) / name
-            try:
-                meta = candidate.lstat()
-            except OSError:
-                continue
-            if candidate.is_symlink() or not meta.st_size or not os.path.isfile(candidate):
-                continue
-            key = (name.lower().endswith(_OUTPUT_PREFERENCE), meta.st_mtime)
-            if best is None or key > best[0]:
-                best = (key, candidate)
-    return best[1] if best else None
-
-
-def _seal_cycle(root: Path, route: Mapping[str, Any], proven) -> str:
-    import artifact_producer
-    record = _open_cycle(root, route)
+        record = None
     if not record:
         return "no-open-cycle"
     try:
@@ -398,13 +425,13 @@ def _seal_cycle(root: Path, route: Mapping[str, Any], proven) -> str:
         return "cycle-held-by-continuation"
     if proven is True:
         try:
-            artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="completed")
+            artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="completed", lock_timeout=0)
             return "cycle-completed"
         except Exception:
             pass
     try:
         result = artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="abandoned",
-                                            abandon_reason="route-unrecoverable")
+                                            abandon_reason="route-unrecoverable", lock_timeout=0)
     except Exception as exc:
         return "cycle-left-open:" + str(exc)[:80]
     return "cycle-abandoned-empty" if result.get("status") == "no-lineage" else "cycle-abandoned"
@@ -418,183 +445,112 @@ def _summary_text(raw: Mapping[str, Any]) -> str:
 
 def close_one(root: Path, path: Path, raw: Mapping[str, Any], reason: str, api, *,
               trigger: str, now: float) -> dict:
-    """Close one route the runtime decided nobody works on.  Raises on failure."""
-    import inline_finish
-    record_of = {"reason": reason, "trigger": trigger, "closed_by": "runtime", "at": _iso(now)}
+    """Close one route nobody works on, claiming no proof.  Idempotent: a rerun
+    replays the existing closure and seals whatever is still open."""
     route = api.verify_route(dict(raw), None, allow_stale_registry=True)
-    route_id = route["route_id"]
-    pending = inline_finish.pending_state(root, route_id)
-    if pending and pending.get("state") != "finished" and not pending.get("autoclose"):
-        raise ValueError("finish-claimed-by-session")
-    if route.get("effective_intensity") == "direct":
-        import artifact_producer
-        record = _open_cycle(root, route)
-        if pending and pending.get("autoclose"):
-            # Resume our own interrupted finish with exactly its recorded intent.
-            intent = pending.get("intent") or {}
-            record = artifact_producer.read_cycle_record(root, intent.get("cycle_id", ""))
-            evidence = (artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
-                        / "artifacts" / intent.get("evidence_path", "")) if record else None
-            summary = Path(pending["autoclose"].get("summary_file", ""))
-        else:
-            evidence = _pick_evidence(root, record) if record else None
-            summary = root / ".runtime" / "inline-finish" / "v1" / route_id / "autoclose-summary.md"
-        strict_ok = True
-        try:
-            api.verify_route(dict(raw), raw.get("cwd"))
-        except Exception:
-            strict_ok = False
-        if evidence is not None and strict_ok and Path(route["cwd"]).is_dir():
-            if not summary.is_file():
-                summary.parent.mkdir(parents=True, exist_ok=True)
-                summary.write_text(_summary_text(raw) + "\n", encoding="utf-8")
-            args = types.SimpleNamespace(evidence=str(evidence), summary_file=str(summary), commit=None)
-            try:
-                inline_finish.finish(args, route, path, api,
-                                     autoclose={**record_of, "summary_file": str(summary),
-                                                "evidence": "auto-selected"})
-                return {"route_id": route_id, "reason": reason, "closed": "finished",
-                        "cycle": "cycle-completed", "evidence": str(evidence)}
-            except Exception:
-                state = inline_finish.pending_state(root, route_id)
-                if state and state.get("autoclose") and state.get("state") != "claimed":
-                    raise   # past the claim: the next sweep resumes the same intent
-                if state and state.get("autoclose"):
-                    # Our own claim with nothing recorded under it yet.
-                    (root / ".runtime" / "inline-finish" / "v1" / route_id / "finish.json").unlink(missing_ok=True)
-        record_of["evidence"] = "none"
-    outcome, _created = api.close_route(route, path, None, _summary_text(raw),
-                                        allow_unproven=True, autoclose=record_of)
+    outcome, _created = api.close_route(
+        route, path, None, _summary_text(raw), allow_unproven=True,
+        autoclose={"reason": reason, "trigger": trigger, "closed_by": "runtime",
+                   "proof": "not-claimed", "at": _iso(now)})
     proven = outcome.get("terminal_gate_proven")
-    return {"route_id": route_id, "reason": reason, "closed": "proven" if proven else "unproven",
-            "cycle": _seal_cycle(root, route, proven)}
+    return {"route_id": route["route_id"], "reason": reason,
+            "closed": "proven" if proven else "unproven", "cycle": _seal_cycle(root, route, proven)}
 
 
-def _seal_orphan_cycles(root: Path, api, held: set, cycles: dict, *, campaign_id, deadline, now,
-                        open_paths=()) -> list[dict]:
-    """Open cycles whose sealing route closed over `QUIET_SECONDS` ago and
-    whose finalize never ran."""
+def _seal_unsealed_cycles(root: Path, api, cycles: dict, facts, *, deadline, now) -> list[dict]:
+    """Open cycles behind an already closed route: the runtime's own closure at
+    once (an interrupted sweep), anyone else's after `QUIET_SECONDS`."""
     import artifact_producer
-    import inline_finish
     sealed, seen = [], set()
-    for record in cycles.values():
+    runtime = root / ".runtime"
+    for record in list(cycles.values()):
         if time.monotonic() >= deadline:
             break
-        if record["cycle_id"] in seen or (campaign_id and record.get("campaign_id") != campaign_id):
+        if record["cycle_id"] in seen:
             continue
         seen.add(record["cycle_id"])
         if not api.outcome_path(api.canonical_route_path(root, record["route_id"])).is_file():
             continue   # the begin route is open: the route pass owns it
         try:
             leaf = artifact_producer._finalize_route(root, record)
+            outcome_file = api.outcome_path(api.canonical_route_path(root, leaf["route_id"]))
+            outcome = json.loads(outcome_file.read_text(encoding="utf-8"))
         except Exception:
             continue
-        outcome_file = api.outcome_path(api.canonical_route_path(root, leaf["route_id"]))
-        if (leaf["route_id"] in held or not outcome_file.is_file()
-                or now - _mtime(outcome_file) < QUIET_SECONDS
-                or (root / ".runtime" / "terminal-commits" / "v1" / leaf["route_id"]).exists()):
+        if not outcome.get("autoclose") and now - _mtime(outcome_file) < QUIET_SECONDS:
             continue
-        try:
-            if inline_finish.pending_for_cycle(root, record["cycle_id"]):
-                continue
-        except Exception:
-            continue
-        home = _cycle_home(root, record)
-        if home is not None and any(item == str(home) or item.startswith(str(home) + os.sep) for item in open_paths):
-            continue
-        try:
-            proven = json.loads(outcome_file.read_text(encoding="utf-8")).get("terminal_gate_proven")
-        except (OSError, ValueError):
+        if _kept(leaf["route_id"], leaf, root=root, runtime=runtime, facts=facts,
+                 home=_cycle_home(root, record)):
             continue
         sealed.append({"cycle_id": record["cycle_id"], "route_id": leaf["route_id"],
-                       "cycle": _seal_cycle(root, leaf, proven)})
+                       "cycle": _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"))})
     return sealed
 
 
-def sweep(artifact_root, *, api, trigger: str, new_route_id: str | None = None,
-          campaign_id: str | None = None, now: float | None = None,
-          budget: float = BUDGET_SECONDS, idle: float = IDLE_SECONDS) -> dict:
+def sweep(artifact_root, *, api, trigger: str, now: float | None = None,
+          budget: float = BUDGET_SECONDS) -> dict:
     """Close what nobody works on under one artifact root.  Never raises."""
     summary: dict[str, Any] = {"closed": [], "cycles": [], "kept": {}, "errors": [], "deferred": 0}
     # Reading old routes prints lineage/registry advisories meant for their
     # owners; this bookkeeping pass reports one line of its own instead.
     with contextlib.redirect_stderr(io.StringIO()):
-        return _sweep(summary, artifact_root, api=api, trigger=trigger, new_route_id=new_route_id,
-                      campaign_id=campaign_id, now=now, budget=budget, idle=idle)
-
-
-def _sweep(summary, artifact_root, *, api, trigger, new_route_id, campaign_id, now, budget, idle):
-    try:
-        root = Path(artifact_root).resolve()
-        runtime = root / ".runtime"
-        if not (runtime / "routes").is_dir():
-            return summary
-        now = time.time() if now is None else now
-        deadline = time.monotonic() + budget
-        lock_path = runtime / "route-autoclose.lock"
-        with lock_path.open("a+b") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                summary["busy"] = True
-                return summary
-            holders, activity = _composers(api)
-            held, ended = _attempts(api)
-            current = _current_identity()
-            open_paths = _open_paths(root)
-            members = None
-            if campaign_id:
-                import artifact_producer
-                members = set()
-                for record in artifact_producer.list_cycle_records(root):
-                    if record.get("state") == "open" and record.get("campaign_id") == campaign_id:
-                        try:
-                            members.add(artifact_producer._finalize_route(root, record)["route_id"])
-                        except Exception:
-                            continue
-            cycles = _open_cycles_by_route(root)
-            mine = {route_id for route_id, holder in holders.items()
-                    if current and (holder["harness"], holder["session_id"]) == current}
-            files = sorted(_open_route_files(root, api),
-                           key=lambda item: (item.stem not in mine, _mtime(item)))
-            for index, path in enumerate(files):
-                if time.monotonic() >= deadline:
-                    summary["deferred"] += len(files) - index
-                    break
-                raw = _read_route(path)
-                if raw is None:
-                    continue
-                route_id = raw["route_id"]
-                if (runtime / "terminal-commits" / "v1" / route_id).exists():
-                    kept = "terminal-commit-pending"
-                    summary["kept"][kept] = summary["kept"].get(kept, 0) + 1
-                    continue
-                holder = holders.get(route_id)
-                record = cycles.get(route_id)
-                home = _cycle_home(root, record) if record else None
-                in_use = home is not None and any(
-                    item == str(home) or item.startswith(str(home) + os.sep) for item in open_paths)
-                facts = dict(holder=holder, session_activity=activity, current=current,
-                             new_route_id=new_route_id, held=held, ended=ended, now=now, idle=idle,
-                             campaign_close=members, in_use=in_use)
-                reason, kept = _decide(route_id, raw, idle_since=_last_activity(
-                    root, path, raw, holder, api, record), **facts)
-                if reason not in (None, "superseded"):
-                    # Confirm quiet against the whole cycle tree before acting.
-                    reason, kept = _decide(route_id, raw, idle_since=_last_activity(
-                        root, path, raw, holder, api, record, deep=True), **facts)
-                if reason is None:
-                    summary["kept"][kept] = summary["kept"].get(kept, 0) + 1
-                    continue
-                try:
-                    summary["closed"].append(close_one(root, path, raw, reason, api, trigger=trigger, now=now))
-                except Exception as exc:
-                    summary["errors"].append({"route_id": route_id, "error": str(exc)[:160]})
-            summary["cycles"] = _seal_orphan_cycles(root, api, held, cycles, campaign_id=campaign_id,
-                                                    deadline=deadline, now=now, open_paths=open_paths)
-    except Exception as exc:
-        summary["errors"].append({"error": f"{type(exc).__name__}: {str(exc)[:160]}"})
+        try:
+            _sweep(summary, Path(artifact_root).resolve(), api=api, trigger=trigger,
+                   now=time.time() if now is None else now, budget=budget)
+        except Exception as exc:
+            summary["errors"].append({"error": f"{type(exc).__name__}: {str(exc)[:160]}"})
     return summary
+
+
+def _sweep(summary, root: Path, *, api, trigger, now, budget) -> None:
+    runtime = root / ".runtime"
+    if not (runtime / "routes").is_dir():
+        return
+    deadline = time.monotonic() + budget
+    with (runtime / "route-autoclose.lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            summary["busy"] = True
+            return
+        registries = _registries(api)
+        resource_routes, resource_paths = _live_resource_runs()
+        facts = {"held": _held_by_attempts(registries), "gate_roots": _gate_ledger_roots(registries),
+                 "resource_routes": resource_routes, "resource_paths": resource_paths,
+                 "open_paths": _open_paths(root)}
+        holders, activity = _composers(api)
+        current = _current_identity()
+        cycles = _open_cycles_by_route(root)
+        files = sorted(_open_route_files(root, api), key=_mtime)
+        for index, path in enumerate(files):
+            if time.monotonic() >= deadline:
+                summary["deferred"] += len(files) - index
+                break
+            raw = _read_route(path)
+            if raw is None:
+                continue
+            route_id = raw["route_id"]
+            holder, record = holders.get(route_id), cycles.get(route_id)
+            home = _cycle_home(root, record)
+            kept = _kept(route_id, raw, root=root, runtime=runtime, facts=facts, home=home)
+            reason = None
+            if kept is None:
+                reason, kept = _decide(holder, activity=activity, current=current, now=now,
+                                       idle_since=_last_activity(root, path, raw, holder, api, record, now))
+            if reason is not None:
+                # Confirm against the whole cycle tree before acting.
+                reason, kept = _decide(holder, activity=activity, current=current, now=now,
+                                       idle_since=_last_activity(root, path, raw, holder, api, record, now,
+                                                                 deep=True))
+            if reason is None:
+                summary["kept"][kept] = summary["kept"].get(kept, 0) + 1
+                continue
+            try:
+                summary["closed"].append(close_one(root, path, raw, reason, api, trigger=trigger, now=now))
+            except Exception as exc:
+                summary["errors"].append({"route_id": route_id, "error": str(exc)[:160]})
+        summary["cycles"] = _seal_unsealed_cycles(root, api, _open_cycles_by_route(root), facts,
+                                                  deadline=deadline, now=now)
 
 
 def report(summary: Mapping[str, Any], stream=None) -> None:
