@@ -20,6 +20,13 @@ Every file in this repo must fall into one category.
 | Continuity state | Cross-project agent worklog/notes data that survives sessions but is not harness source. | `<agent-notes-root>/cards`, `_layer2`, `_triage`, `digests`, `oncall`, `study` | Never committed to this repo; may be versioned in a separate notes/data repo |
 | Local board app state | Worklog-board local app workspace, generated output, DB/cache, dispatch logs, and worktrees. | `<worklog-board-app>/.cache`, `.next`, `.dispatch`, `.env*`, `node_modules`, `<worklog-board-app>-wt/` | Never committed to this repo |
 
+Project files and adapter runtime state need not share a filesystem. If a
+child runtime requires user-owned state but the project filesystem maps
+runtime directories to a different UID, its adapter uses the existing canonical
+dispatch state root for that state, within the owner's normal writable scope.
+It preserves the project location and foreign directory, links existing auth/config read-only,
+and does not ask the caller to change ownership, permissions, or launch flags.
+
 ## 2. Adapter Rule
 
 An adapter must not claim support for a surface unless it provides one of:

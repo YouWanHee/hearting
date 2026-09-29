@@ -474,6 +474,106 @@ class AdapterV11Test(unittest.TestCase):
    self.assertEqual(
     sorted(p.name for p in source.iterdir()),["auth.json","config.toml"])
    self.assertEqual(sorted(p.name for p in fixture_home.iterdir()),[])
+ def test_nested_codex_home_foreign_worktree_uses_existing_state_scope(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); source=root/"source"; source.mkdir(); worktree=root/"nas"; worktree.mkdir()
+   (source/"auth.json").write_text("{}\n")
+   (source/"config.toml").write_text('model = "fixture"\n')
+   home=root/"user"; home.mkdir(); state=root/"dispatch"; state.mkdir(); jobs=state/"jobs.log"; jobs.write_text("")
+   preferred=worktree/".dispatch"/"nested-codex-home"; preferred.mkdir(parents=True); preferred.chmod(0o700)
+   sentinel=preferred/"preserve"; sentinel.write_text("foreign directory contents")
+   before=(sentinel.read_bytes(),preferred.stat().st_mode,sorted(p.name for p in preferred.iterdir()))
+   wrapper=self.load_wrapper("codex")
+   original_stat=Path.stat
+   def mapped_stat(path,*args,**kwargs):
+    info=original_stat(path,*args,**kwargs)
+    if path in (preferred,worktree):
+     fields=list(info); fields[4]=os.geteuid()+1; return os.stat_result(fields)
+    return info
+   env={"PATH":os.environ.get("PATH",""),"HOME":str(home),"AGENT_HOME":str(ROOT),
+        "CODEX_HOME":str(source),"AGENT_DISPATCH_JOBS":str(jobs),"PYTHONDONTWRITEBYTECODE":"1"}
+   with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(Path,"stat",mapped_stat):
+    predicted=wrapper.nested_codex_home_path(worktree,jobs)
+    chosen=wrapper.prepare_nested_codex_home(worktree,source,jobs=jobs)
+    self.assertEqual(chosen,predicted)
+    self.assertEqual(wrapper.prepare_nested_codex_home(worktree,source,jobs=jobs),chosen)
+    args=type("Args",(),{"nested_headless_network":True,"jobs_path":jobs})()
+    self.assertTrue(any(chosen.is_relative_to(p) for p in wrapper.nested_owner_writable_dirs(args)))
+   self.assertTrue(chosen.is_relative_to(state/"homes"/"codex"))
+   self.assertEqual(chosen.stat().st_uid,os.geteuid())
+   self.assertEqual((sentinel.read_bytes(),preferred.stat().st_mode,sorted(p.name for p in preferred.iterdir())),before)
+   self.assertEqual((chosen/"auth.json").resolve(),source/"auth.json")
+   self.assertEqual((chosen/"config.toml").resolve(),source/"config.toml")
+   self.assertEqual(sorted(p.name for p in source.iterdir()),["auth.json","config.toml"])
+   self.assertEqual(jobs.read_text(),"")
+
+ def test_nested_codex_home_missing_on_foreign_mount_selects_without_writes(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); worktree=root/"nas"; worktree.mkdir(); state=root/"dispatch"; state.mkdir()
+   wrapper=self.load_wrapper("codex"); original_stat=Path.stat
+   def mapped_stat(path,*args,**kwargs):
+    info=original_stat(path,*args,**kwargs)
+    if path==worktree:
+     fields=list(info); fields[4]=os.geteuid()+1; return os.stat_result(fields)
+    return info
+   with mock.patch.object(Path,"stat",mapped_stat):
+    chosen=wrapper.nested_codex_home_path(worktree,state/"jobs.log")
+   self.assertTrue(chosen.is_relative_to(state))
+   self.assertEqual(list(worktree.iterdir()),[])
+   self.assertEqual(list(state.iterdir()),[])
+
+ def test_nested_codex_home_foreign_fallback_and_symlink_escape_stay_untouched(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); worktree=root/"nas"; worktree.mkdir(); state=root/"dispatch"; state.mkdir(); outside=root/"outside"; outside.mkdir()
+   preferred=worktree/".dispatch"/"nested-codex-home"; preferred.parent.mkdir(); preferred.symlink_to(outside,target_is_directory=True)
+   (state/"homes").symlink_to(outside,target_is_directory=True)
+   wrapper=self.load_wrapper("codex")
+   with self.assertRaisesRegex(DC.DispatchContractError,"no user-owned runtime home"):
+    wrapper.nested_codex_home_path(worktree,state/"jobs.log")
+   self.assertTrue(preferred.is_symlink()); self.assertTrue((state/"homes").is_symlink())
+   self.assertEqual(list(outside.iterdir()),[])
+   (state/"homes").unlink()  # owned fixture cleanup only
+   original_stat=Path.stat
+   def mapped_stat(path,*args,**kwargs):
+    info=original_stat(path,*args,**kwargs)
+    if path==state:
+     fields=list(info); fields[4]=os.geteuid()+1; return os.stat_result(fields)
+    return info
+   with mock.patch.object(Path,"stat",mapped_stat), self.assertRaisesRegex(DC.DispatchContractError,"no user-owned runtime home"):
+    wrapper.nested_codex_home_path(worktree,state/"jobs.log")
+   self.assertEqual(list(state.iterdir()),[])
+ def test_foreign_nested_home_dryrun_receipt_and_both_launch_argv_share_state_scope(self):
+  for supervised in (True,False):
+   with self.subTest(supervised=supervised),tempfile.TemporaryDirectory() as td:
+    root=Path(td);repo,art=self.fixture(root);state=root/"state";state.mkdir();jobs=state/"jobs.log";logs=state/"logs"
+    wrapper=self.load_wrapper("codex"); original_stat=Path.stat
+    def mapped_stat(path,*args,**kwargs):
+     info=original_stat(path,*args,**kwargs)
+     if path==repo:
+      fields=list(info);fields[4]=os.geteuid()+1;return os.stat_result(fields)
+     return info
+    argv=["--dry-run","--worktree",str(repo),"--slug","nas-owner","--capability","autopilot-code",
+          "--capability-mode","dev","--intensity","standard","--dispatch-depth","1","--worker-type","owner",
+          "--unit","_kernel/owner","--assigned-contract","autopilot-code","--model","gpt-test",
+          "--reasoning","low","--log-dir",str(logs),"--jobs",str(jobs)]
+    env={"PATH":os.environ.get("PATH",""),"HOME":str(root/"user"),"AGENT_HOME":str(ROOT),
+         "AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CALLER_HARNESS":"codex"}
+    out=io.StringIO()
+    with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(Path,"stat",mapped_stat), \
+         mock.patch.object(wrapper,"codex_app_server_available",return_value=supervised),contextlib.redirect_stdout(out):
+     expected=wrapper.nested_codex_home_path(repo,jobs)
+     code=wrapper.main(argv)
+    self.assertEqual(code,0,out.getvalue())
+    fields=dict(line.split("=",1) for line in out.getvalue().splitlines() if "=" in line)
+    self.assertEqual(fields["nested_codex_home"],str(expected))
+    tokens=__import__('shlex').split(fields["command"])
+    flag="--writable-root" if supervised else "--add-dir"
+    grants=[Path(tokens[i+1]) for i,t in enumerate(tokens[:-1]) if t==flag]
+    self.assertTrue(any(expected.is_relative_to(p) for p in grants),grants)
+    self.assertIn(state,grants)
+    self.assertIn(str(repo),tokens)
+    self.assertFalse(expected.exists())
+    self.assertFalse((repo/".dispatch"/"nested-codex-home").exists())
  def test_detached_selection_is_promoted_before_launch_without_failure_exposure(self):
   for harness in ("codex","claude"):
    for repetition in range(4):
