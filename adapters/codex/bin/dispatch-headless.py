@@ -1779,18 +1779,43 @@ def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
     )
 
 
-def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None) -> Path:
+def nested_codex_home_path(worktree: Path, jobs: Path | None = None) -> Path:
+    """Select existing writable runtime scope without touching a foreign NAS home."""
+    def owned_directory_or_ancestor(path):
+        while not path.exists() and not path.is_symlink():
+            path = path.parent
+        return path.is_dir() and not path.is_symlink() and path.stat().st_uid == os.geteuid()
+
+    worktree = Path(worktree).resolve()
+    preferred = worktree / ".dispatch" / "nested-codex-home"
+    if (preferred.resolve().is_relative_to(worktree)
+            and owned_directory_or_ancestor(preferred)):
+        return preferred
+    canonical_jobs = Path(jobs or os.environ.get("AGENT_DISPATCH_JOBS", ""))
+    if canonical_jobs.is_absolute():
+        state_root = dispatch_state_root(canonical_jobs)
+        key = hashlib.sha256(str(worktree).encode()).hexdigest()[:32]
+        fallback = state_root / "homes" / "codex" / key
+        if (fallback.resolve().is_relative_to(state_root)
+                and owned_directory_or_ancestor(fallback)):
+            return fallback
+    raise DispatchContractError("nested-codex-home-projection-failed",
+                                "no user-owned runtime home in the canonical dispatch state root")
+
+
+def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None,
+                              *, jobs: Path | None = None) -> Path:
     """Create a writable Codex home inside the owner's sandbox.
 
     Recursive ``codex exec`` needs to write session/app-server state. Pointing
     it at the user's normal CODEX_HOME fails under workspace-write even when
-    network is enabled. The projection keeps mutable state inside the owner
-    worktree, links the existing credential/config read-only, and installs only
+    network is enabled. The projection keeps mutable state in existing owner
+    writable scope, links the existing credential/config read-only, and installs only
     harness-owned runtime links. Credentials are never copied or modified.
     """
 
     source = (source_home or Path(os.environ.get("CODEX_HOME", "~/.codex"))).expanduser().resolve()
-    destination = worktree / ".dispatch" / "nested-codex-home"
+    destination = nested_codex_home_path(worktree, jobs)
     destination.mkdir(parents=True, exist_ok=True)
     destination.chmod(0o700)
 
@@ -2636,15 +2661,15 @@ def main(argv: list[str]) -> int:
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     args.nested_codex_home = None
-    args.nested_codex_home_path = (
-        worktree / ".dispatch" / "nested-codex-home"
-        if args.nested_headless_network else None
-    )
-    if action == "start" and args.nested_headless_network:
-        try:
-            args.nested_codex_home = prepare_nested_codex_home(worktree)
-        except DispatchContractError as e:
-            return fail(e.reason, 73, detail=e.detail, child_spawned="0")
+    try:
+        args.nested_codex_home_path = (
+            nested_codex_home_path(worktree, args.jobs_path)
+            if args.nested_headless_network else None
+        )
+        if action == "start" and args.nested_headless_network:
+            args.nested_codex_home = prepare_nested_codex_home(worktree, jobs=args.jobs_path)
+    except DispatchContractError as e:
+        return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     prompt_name = (
         f"{args.slug}.{getattr(args, 'command_attempt_id', None)}.codex.prompt.txt"
         if getattr(args, "command_attempt_id", None)
