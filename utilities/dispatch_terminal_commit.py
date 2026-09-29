@@ -326,12 +326,23 @@ def _in_root_regular(path: Path, root: Path) -> bool:
         return False
 
 
+def _placed(candidate: Path) -> Path:
+    """Follow the producer's recorded placement: finalize may move a loose terminal
+    report (``artifacts/final_report.md`` -> ``artifacts/plans/final_report.md``) after
+    its completion marker named the old path."""
+    try:
+        from artifact_producer import resolve_placed_output
+        return resolve_placed_output(candidate)
+    except Exception:
+        return candidate
+
+
 def select_primary_artifact(route: Mapping[str, Any], gates: Mapping[str, Any],
                             binding: Optional[Mapping[str, Any]], *, artifact_root: Path) -> Optional[Path]:
     root = Path(artifact_root).resolve()
     explicit = (binding or {}).get("primary") or (binding or {}).get("primary_artifact")
     if isinstance(explicit, str):
-        candidate = Path(explicit)
+        candidate = _placed(Path(explicit))
         if candidate.is_absolute() and _in_root_regular(candidate, root) and candidate.stat().st_size:
             return candidate.resolve()
     contract = route.get("workflow_contract") or {}
@@ -343,7 +354,7 @@ def select_primary_artifact(route: Mapping[str, Any], gates: Mapping[str, Any],
         row = gates.get(node_id)
         evidence = row.get("evidence") if isinstance(row, Mapping) else None
         if isinstance(evidence, str):
-            candidate = Path(evidence)
+            candidate = _placed(Path(evidence))
             if candidate.is_absolute() and _in_root_regular(candidate, root) and candidate.stat().st_size:
                 candidates.append(candidate.resolve())
     return candidates[0] if len(candidates) == 1 else (candidates[0] if candidates else None)
