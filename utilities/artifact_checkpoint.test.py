@@ -157,6 +157,17 @@ class InterimManifestTest(CheckpointTestBase):
         with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
             self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
 
+    def test_reviewed_plan_evidence_follows_checkpoint_move(self):
+        # plan-check launch read the plan marker's original path and was refused with
+        # reviewed-evidence-producer-unproven once a checkpoint had placed the plan.
+        import review_input as RI
+        evidence = self.write_output(self.result, "plan.md", b"exact plan\n")
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertFalse(evidence.exists())
+        found = RI._file(str(evidence))
+        self.assertEqual(Path(found["path"]), P.resolve_placed_output(evidence).resolve())
+        self.assertEqual(found["sha256"], hashlib.sha256(b"exact plan\n").hexdigest())
+
     def test_owner_envelope_primary_follows_checkpoint_move(self):
         # The owner envelope used to look only at the marker's original evidence path,
         # so every closure whose report finalize had placed stayed closure-pending with
