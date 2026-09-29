@@ -1290,7 +1290,142 @@ def status(root: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
+# SD-163: read-only lookup of a prior cycle's same-named output. Every failure
+# below is "not found"; nothing here refuses, gates, or writes.
+INPUT_SOURCE_MAX_DEPTH = 6
+INPUT_SOURCE_MAX_ENTRIES = 4096
+INPUT_SOURCE_MAX_CANDIDATES = 16
+
+
+def _input_target(name: Any) -> Optional[Tuple[Tuple[str, ...], bool]]:
+    """Return (path components, is_dir) for a declared input, or None when it is not a plain path."""
+    if not isinstance(name, str):
+        return None
+    is_dir = name.endswith("/**")
+    parts = tuple((name[:-3] if is_dir else name).split("/"))
+    if any(part in ("", ".", "..") or any(char in part for char in "*?[<>") for part in parts):
+        return None
+    return parts, is_dir
+
+
+def _cycle_artifacts_dir(root: Path, cycle_id: str) -> Optional[Path]:
+    record = read_cycle_record(root, cycle_id)
+    if record is None:
+        return None
+    artifacts = cycle_dir(root, record["campaign_id"], cycle_id, record) / "artifacts"
+    if artifacts.is_symlink() or not artifacts.is_dir():
+        return None
+    resolved = artifacts.resolve(strict=True)
+    return resolved if resolved.is_relative_to(Path(root).resolve()) else None
+
+
+def _scan_cycle_artifacts(artifacts: Path) -> Optional[List[Tuple[str, bool]]]:
+    """List (relative posix path, is_dir) below artifacts/; symlinks are skipped, caps give None."""
+    found: List[Tuple[str, bool]] = []
+    stack = [(artifacts, 0)]
+    visited = 0
+    while stack:
+        directory, depth = stack.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                visited += 1
+                if visited > INPUT_SOURCE_MAX_ENTRIES:
+                    return None
+                if entry.is_symlink():
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                if not is_dir and not entry.is_file(follow_symlinks=False):
+                    continue
+                found.append((Path(entry.path).relative_to(artifacts).as_posix(), is_dir))
+                if is_dir and depth < INPUT_SOURCE_MAX_DEPTH:
+                    stack.append((Path(entry.path), depth + 1))
+    return found
+
+
+def _campaign_latest_cycle(root: Path, campaign_id: str, before: Optional[str] = None) -> Optional[str]:
+    """Latest cycle of a campaign (or the one started just before `before`); unassigned containers have none."""
+    campaign = read_campaign(root, campaign_id)
+    cycles = (campaign or {}).get("cycles")
+    if not campaign or campaign.get("degraded") is True or campaign.get("key") == UNASSIGNED_KEY \
+            or not isinstance(cycles, list) or not cycles:
+        return None
+    if before is None:
+        return cycles[-1]
+    return cycles[cycles.index(before) - 1] if before in cycles[1:] else None
+
+
+def input_source_cycle(root: Path, *, parent_cycle_id: Optional[str] = None,
+                       campaign_key: Optional[str] = None) -> Optional[str]:
+    """The one source cycle: the parent, else the joined campaign's most recent cycle."""
+    if parent_cycle_id:
+        return parent_cycle_id
+    if not campaign_key or campaign_key == UNASSIGNED_KEY:
+        return None
+    decision = classify_campaign_key(list_campaign_summaries(root, active_only=False), campaign_key)
+    if decision.get("mode") not in ("join", "reopen"):
+        return None
+    return _campaign_latest_cycle(root, decision["campaign_id"])
+
+
+def input_source_finder(root: Path, *, parent_cycle_id: Optional[str] = None,
+                        campaign_key: Optional[str] = None):
+    """Return find(name) -> {"cycle_id", "path"} | None, resolving the source lazily and once."""
+    root = Path(root)
+    memo: Dict[str, Optional[Dict[str, str]]] = {}
+    loaded: Dict[str, Any] = {}
+
+    def lookup(name: str) -> Optional[Dict[str, str]]:
+        if not loaded:
+            loaded["entries"] = None
+            cycle_id = input_source_cycle(root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key)
+            artifacts = _cycle_artifacts_dir(root, cycle_id) if cycle_id else None
+            if artifacts is not None:
+                loaded.update(cycle_id=cycle_id, artifacts=artifacts,
+                              entries=_scan_cycle_artifacts(artifacts))
+        target = _input_target(name)
+        if target is None or loaded["entries"] is None:
+            return None
+        parts, is_dir = target
+        rels = [rel for rel, entry_dir in loaded["entries"]
+                if entry_dir == is_dir and tuple(rel.split("/"))[-len(parts):] == parts]
+        if not rels or len(rels) > INPUT_SOURCE_MAX_CANDIDATES:
+            return None
+        # Shortest cycle-relative path by character length, then lexicographic; never by recency.
+        chosen = loaded["artifacts"] / min(rels, key=lambda rel: (len(rel), rel))
+        resolved = chosen.resolve(strict=True)
+        if not resolved.is_relative_to(loaded["artifacts"]):
+            return None
+        return {"cycle_id": loaded["cycle_id"], "path": resolved.relative_to(root.resolve()).as_posix()}
+
+    def find(name: str) -> Optional[Dict[str, str]]:
+        if name not in memo:
+            try:
+                memo[name] = lookup(name)
+            except Exception:  # SD-163: every lookup failure is "not found"
+                memo[name] = None
+        return dict(memo[name]) if memo[name] else None
+
+    return find
+
+
+def _parent_output_dir(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Absolute artifacts/ of the source cycle: parent, else sealed input_sources, else the campaign's previous cycle."""
+    try:
+        cycle_id = record.get("parent_cycle_id")
+        for node in (route or {}).get("nodes") or []:
+            if cycle_id:
+                break
+            sources = node.get("input_sources") if isinstance(node, Mapping) else None
+            for source in (sources.values() if isinstance(sources, Mapping) else ()):
+                cycle_id = cycle_id or (source.get("cycle_id") if isinstance(source, Mapping) else None)
+        cycle_id = cycle_id or _campaign_latest_cycle(root, record["campaign_id"], before=record["cycle_id"])
+        directory = _cycle_artifacts_dir(root, cycle_id) if cycle_id and cycle_id != record["cycle_id"] else None
+        return str(directory) if directory else None
+    except Exception:  # SD-163: every lookup failure is "not found"
+        return None
+
+
+def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
     directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
     env = {
         "AGENT_ARTIFACT_ROOT": str(root),
@@ -1307,6 +1442,9 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
     group_id = artifact_workflow_groups.group_for_cycle(root, record["campaign_id"], record["cycle_id"])
     if group_id:
         env["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"] = group_id
+    parent_output = _parent_output_dir(root, record, route)
+    if parent_output:
+        env["AGENT_ARTIFACT_PARENT_OUTPUT_DIR"] = parent_output
     return env
 
 
@@ -1375,7 +1513,7 @@ def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> 
         return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (
             "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
             "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR")}}
-    return _env_for(root, record)
+    return _env_for(root, record, route)
 
 
 def _route_naming(
@@ -1939,7 +2077,7 @@ def _begin_cycle_record(
                 "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
                 "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
                 "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
-                "env": _env_for(root, record),
+                "env": _env_for(root, record, route),
                 **({"rebound": True} if rebound else {}),
                 **({"title_updated": True} if title_updated else {}),
                 **_campaign_degradation(bound_campaign),
@@ -2075,7 +2213,7 @@ def _begin_cycle_record(
         return {
             "status": "begun", "layout": "cycle", "campaign_id": campaign["campaign_id"],
             "cycle_id": new_cycle_id, "producer_id": producer_id, "cycle_dir": str(target),
-            "campaign_created": campaign_created, "env": _env_for(root, record),
+            "campaign_created": campaign_created, "env": _env_for(root, record, route),
             **({"campaign_reopened": True, "campaign_reopen_event_id": campaign_reopen_event_id}
                if campaign_reopen_event_id else {}),
             **_campaign_degradation(campaign),

@@ -2631,7 +2631,7 @@ def parse_graph_spec(text):
     return rows
 
 
-def _compose_inputs(base_nodes, base_node, kept):
+def _compose_inputs(base_nodes, base_node, kept, find_input=None):
     """Keep the base node's declared inputs wherever they can still exist.
 
     An input stays when it is not produced by any recipe node (an external
@@ -2642,19 +2642,24 @@ def _compose_inputs(base_nodes, base_node, kept):
     prints `inputs` verbatim, so a dropped node's file must not be promised.
     Nothing is added: the chain edge lives in `depends_on`, and a full-graph
     compose must yield exactly the preset's inputs. (Canary review round 1
-    B1, round 2 M2.)
+    B1, round 2 M2.) SD-163: when `find_input(name)` finds a same-named prior
+    output, the input stays and its source is returned in the second value.
     """
     producers = {}
     for candidate in base_nodes.values():
         for output in candidate.get("outputs") or []:
             producers.setdefault(output, set()).add(candidate["id"])
-    inputs = []
+    inputs, sources = [], {}
     for item in base_node.get("inputs") or []:
         owners = producers.get(item)
         if owners is None or owners & kept or TOPO._is_semantic_output(item):
             if item not in inputs:
                 inputs.append(item)
-    return inputs or ["task"]
+        elif find_input is not None and (source := find_input(item)) is not None:
+            if item not in inputs:
+                inputs.append(item)
+            sources[item] = source
+    return inputs or ["task"], sources
 
 
 def _compose_graph_order_violation(base_nodes, ids):
@@ -2694,7 +2699,7 @@ def _compose_graph_order_violation(base_nodes, ids):
     return None
 
 
-def compose_subgraph_recipe(registry, base_recipe, graph_spec):
+def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
     The nodes keep their unit, kind, gate, write scope, profile and permissions;
@@ -2759,7 +2764,9 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
                         break
                     raisers.append(prior["id"])
                 node["depends_on"] = list(reversed(raisers))
-        node["inputs"] = _compose_inputs(base_nodes, base_nodes[node_id], set(ids))
+        node["inputs"], sources = _compose_inputs(base_nodes, base_nodes[node_id], set(ids), find_input)
+        if sources:
+            node["input_sources"] = sources
         node.pop("terminal", None)
         node.pop("terminal_gate", None)
         node.pop("continuation", None)
@@ -2869,8 +2876,13 @@ def _versioned_subgraph(registry, recipe):
         base = TOPO.resolve_recipe(registry, meta["base_capability"], recipe["modes"][0])
         overrides = meta.get("unit_overrides", {})
         graph = [(node_id, overrides.get(node_id)) for node_id in meta["graph"]]
-        return compose_subgraph_recipe(registry, base, graph) == recipe
-    except (ValueError, KeyError, TypeError, IndexError):
+        sealed = {}
+        for node in recipe["standard_plus"]["nodes"]:
+            if isinstance(node.get("input_sources"), dict):
+                for name, source in node["input_sources"].items():
+                    sealed.setdefault(name, source)
+        return compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None) == recipe
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return False
 
 
@@ -3158,7 +3170,15 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if shape == "direct" and signals:
         raise ValueError("compose-direct-signals-conflict")
     readiness = None
-    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
+    find_input = None
+    if shape == "staged" and graph and not unassigned:
+        try:
+            import artifact_producer
+            find_input = artifact_producer.input_source_finder(
+                artifact_root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key)
+        except ImportError:
+            find_input = None
+    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph), find_input)
                        if shape == "staged" and graph else base)
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
     if shape == "staged" and not owner_only and dispatch_evidence is None:
@@ -3288,6 +3308,14 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
         f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
         + _compose_campaign_line(compose_campaign_selection(route))
     )
+    sourced = {}
+    for node in route["nodes"]:
+        for name, source in (node.get("input_sources") or {}).items():
+            sourced.setdefault(name, source)
+    if sourced:  # SD-163: inputs filled from a prior cycle
+        source_dir = os.path.commonpath([str(Path(source["path"]).parent) for source in sourced.values()])
+        card += (f"\n  입력 {'·'.join(sourced)} ← {','.join(sorted({s['cycle_id'] for s in sourced.values()}))}"
+                 f" {Path(route['artifact_root']) / source_dir}")
     from artifact_producer import route_cycle_for, cycle_dir, default_bucket, ProducerError
     try:
         record = route_cycle_for(Path(route["artifact_root"]), route)
