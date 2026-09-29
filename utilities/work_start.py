@@ -481,6 +481,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         return {**result, "state":"needs-attention", "reason":"finish-pending",
                 "required_action":"resume-inline-finish", "finish_state":pending.get("state")}
     closed = closed_outcome(path, route)
+    if closed and closed.get("autoclose"):
+        # The runtime closed this route after it sat unused (route_autoclose.py).
+        # Nothing to repair: the same work starts again as a new route.
+        command = _compose_again(route)
+        return {**result, "state": "autoclosed", "reason": "route-closed-automatically",
+                "required_action": "compose-again", "outcome": closed, "resume_command": command,
+                "parent_next": "compose", "parent_next_command": command,
+                "next_step": "This route was closed automatically after it sat unused; run parent_next_command "
+                             "to compose the same work again."}
     if closed:
         if closed.get("finish_pending"):
             return {**result, "state": "needs-attention", "reason": "finish-pending",
@@ -618,6 +627,34 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         sys.executable, str(ROOT / "utilities/capability-route.py"), "correct",
         "--jobs", str(jobs), "--attempt-id", aid,
     ])
+    if status == "done":
+        import dispatch_replacement
+        parked = dispatch_replacement.owner_parked_gate(jobs, aid)
+        if parked:
+            result["parked_gate"] = parked
+            gate = parked["gate"]
+            release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
+                                  "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
+                                  "--decision", "proceed"])
+            if parked["status"] == "blocked":
+                return {**result, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
+                        "required_action": "answer-human-gate", "gate": gate,
+                        "gate_artifact": parked["artifact"], "release_command": release,
+                        "next_step": f"The owner paused at human gate {gate} and exited; this is not a failure. "
+                            "Show the person the gate artifact and ask for a decision. Record it with "
+                            "release_command (replace proceed with revise or stop when chosen). "
+                            "A proceed starts the continuation automatically."}
+            if parked["status"] == "stop":
+                return {**result, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
+                        "next_step": f"The person stopped this work at gate {gate}. Report that; "
+                            "nothing is running and no replacement starts."}
+            if parked["status"] == "revise":
+                return {**result, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
+                        "required_action": "report-gate-revision", "gate": gate,
+                        "next_step": f"The person asked for a revision at gate {gate} while no owner is running. "
+                            "Report the feedback and ask how to proceed; no automatic continuation starts "
+                            "for a revise."}
+            # proceed: fall through to the replacement path below.
     if status == "done" and verdict_pass(metadata):
         from dispatch_terminal_commit import owner_workflow_gaps
         missing = owner_workflow_gaps(jobs, metadata, route)
@@ -668,6 +705,28 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             "next_step": "You are the parent session; the owner runs as a separate attempt. Do not kill, "
                 "replace, or redo its work inline. Follow parent_next: end-turn means yield; "
                 "bounded-wait means run parent_next_command once."}
+
+
+def _compose_again(route) -> str:
+    """The compose command that starts an automatically closed route's work again."""
+    task = Path(route["artifact_root"]) / ".runtime" / "route-autoclose" / f"{route['route_id']}.task.md"
+    if not task.is_file():
+        task.parent.mkdir(parents=True, exist_ok=True)
+        task.write_text(str((route.get("work_request") or {}).get("text") or ""), encoding="utf-8")
+    selection = route.get("selection") if isinstance(route.get("selection"), dict) else {}
+    shape = selection.get("shape") or ("direct" if route.get("effective_intensity") == "direct" else "staged")
+    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
+            "--slug", str(route.get("slug") or route["route_id"]), "--capability", route["capability"],
+            "--capability-mode", str(route.get("capability_mode") or "default"), "--shape", shape,
+            "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
+            "--prompt-file", str(task), "--start"]
+    if route.get("campaign_key"):
+        argv += ["--campaign-key", route["campaign_key"]]
+    elif route.get("parent_cycle_id"):
+        argv += ["--parent-cycle", route["parent_cycle_id"]]
+    else:
+        argv += ["--unassigned"]
+    return shlex.join(argv)
 
 
 def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,

@@ -525,7 +525,8 @@ def render_context(
     text = (
         "AGENT_HARNESS_HUMAN_GATE_V1\n"
         + canonical(normalized).decode("utf-8")
-        + "\nA human decision is required; the owner is alive and waiting.\n"
+        + "\nA human decision is required; the owner is waiting at the gate or has paused there, "
+        + "and the release continues the work either way.\n"
         + f"Artifact: {normalized['artifact_path']}\n"
         + "Run only these checked forms after presenting the gate to the person:\n"
         + inspect

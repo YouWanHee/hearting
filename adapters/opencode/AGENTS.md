@@ -78,7 +78,7 @@ keyless form).
 Runtime prepares the cycle, starts declared frames and reuses exact attempts.
 Follow `parent_next`; reuse `resume_command` after wakes or corrections. At
 `needs-question`, compare the completed frames and ask the native interview.
-Actual release precedes owner execution; runtime closes route/cycle before success.
+Actual release precedes owner execution; runtime closes route/cycle at success or once idle.
 
 Route by `core/WORKFLOW.md §0.2`: precedence names the capability that owns
 the artifacts; §0.2.1 then picks the work **shape** before any preset.

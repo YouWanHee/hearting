@@ -673,8 +673,8 @@ def agent_home():
     return _harness_root(Path(__file__).resolve())
 
 
-def provider_model(adapter, home=None):
-    """The adapter's `mini` model, resolved through the portable profile resolver.
+def provider_model(adapter, home=None, profile="mini"):
+    """The adapter's `mini` (default) model, resolved through the portable profile resolver.
 
     Fleet must not name a concrete model: the complete user model config, with
     the shipped adapter file as fallback, is the runtime source of truth. The
@@ -691,7 +691,7 @@ def provider_model(adapter, home=None):
             sys.path.insert(0, utilities)
         import model_profile
         resolved, _receipt = model_profile.resolve_runtime_profile(
-            adapter, "mini", source_root=home
+            adapter, profile, source_root=home
         )
         return resolved.get("model")
     except Exception:
@@ -728,7 +728,8 @@ You are a no-tools title worker. Output only the two labeled lines you are asked
 """
 
 
-def _opencode_workdir(home):
+def _opencode_workdir(home, agent_name="fleet-titler", agent_body=_OPENCODE_AGENT,
+                      workdir=None):
     """Materialize the tool-free agent the opencode provider runs as.
 
     Mirrors `adapters/opencode/bin/distill-worker.sh`: opencode has no per-invocation
@@ -744,32 +745,41 @@ def _opencode_workdir(home):
     mini-profile provider and this path started running at all). `home` is still accepted
     so callers need no change, and is used only as the last-resort fallback when no state
     directory can be created.
+
+    Another lifecycle worker reuses the same materialization by passing its own
+    `agent_name`/`agent_body` and, optionally, its own state `workdir`; the defaults
+    keep the Fleet title agent and directory byte-identical.
     """
-    state = os.environ.get("FLEET_TITLE_STATE_DIR")
-    if not state:
-        xdg = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-        state = os.path.join(xdg, "hearting")
-    workdir = Path(state) / "fleet-title-workdir"
-    agent_file = workdir / ".opencode" / "agent" / "fleet-titler.md"
+    if workdir is not None:
+        workdir = Path(workdir)
+    else:
+        state = os.environ.get("FLEET_TITLE_STATE_DIR")
+        if not state:
+            xdg = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+            state = os.path.join(xdg, "hearting")
+        workdir = Path(state) / "fleet-title-workdir"
+    agent_file = workdir / ".opencode" / "agent" / (agent_name + ".md")
     try:
         if not agent_file.is_file():
             agent_file.parent.mkdir(parents=True, exist_ok=True)
-            agent_file.write_text(_OPENCODE_AGENT, encoding="utf-8")
+            agent_file.write_text(agent_body, encoding="utf-8")
         return workdir
     except OSError:
         pass
     workdir = Path(home) / ".agent-workspace" / "fleet-title-workdir"
-    agent_file = workdir / ".opencode" / "agent" / "fleet-titler.md"
+    agent_file = workdir / ".opencode" / "agent" / (agent_name + ".md")
     try:
         if not agent_file.is_file():
             agent_file.parent.mkdir(parents=True, exist_ok=True)
-            agent_file.write_text(_OPENCODE_AGENT, encoding="utf-8")
+            agent_file.write_text(agent_body, encoding="utf-8")
         return workdir
     except OSError:
         return None
 
 
-def provider_command(adapter, prompt, model=None, home=None):
+def provider_command(adapter, prompt, model=None, home=None, *, stdin_prompt=False,
+                     opencode_agent=None, out_tag="fleet-title", workdir=None,
+                     profile="mini"):
     """One provider invocation as (argv, stdin_text, output_file), or None.
 
     The three runtimes disagree on both ends of the call — claude takes the prompt in
@@ -777,32 +787,44 @@ def provider_command(adapter, prompt, model=None, home=None):
     opencode takes stdin and answers on stdout — so the caller cannot assume any one
     shape. Returning all three fields keeps that difference here instead of leaking it
     into `run_worker`.
+
+    The keyword-only options serve other lifecycle workers and default to the title
+    behavior: `stdin_prompt` feeds claude the prompt on stdin (a large prompt would
+    overflow argv), `opencode_agent=(name, body)` swaps the opencode agent, `out_tag`
+    names the codex output file, `workdir` roots the opencode agent directory, and
+    `profile` picks the portable profile the model resolves from.
     """
     home = Path(home or agent_home())
-    model = model or provider_model(adapter, home)
+    model = model or provider_model(adapter, home, profile=profile)
     if not model:
         return None
     if adapter == "claude":
-        return (["claude", "-p", prompt, "--model", model,
-                 "--disallowedTools", DISALLOWED_TOOLS], None, None)
+        argv = ["claude", "-p"] + ([] if stdin_prompt else [prompt]) + [
+            "--model", model, "--disallowedTools", DISALLOWED_TOOLS]
+        return (argv, prompt if stdin_prompt else None, None)
     if adapter == "codex":
-        out = Path(tempfile.gettempdir()) / ("fleet-title-%d.out" % os.getpid())
+        out = Path(tempfile.gettempdir()) / ("%s-%d.out" % (out_tag, os.getpid()))
         return (["codex", "exec", "--cd", str(home), "--sandbox", "read-only",
                  "--ephemeral", "--ignore-rules", "--skip-git-repo-check",
                  "--output-last-message", str(out), "-m", model, "-"], prompt, out)
     if adapter == "opencode":
-        workdir = _opencode_workdir(home)
+        agent_name, agent_body = opencode_agent or ("fleet-titler", _OPENCODE_AGENT)
+        workdir = _opencode_workdir(home, agent_name, agent_body, workdir=workdir)
         if workdir is None:
             return None
         return (["opencode", "run", "--pure", "--dir", str(workdir),
-                 "--agent", "fleet-titler", "--format", "default", "-m", model],
+                 "--agent", agent_name, "--format", "default", "-m", model],
                 prompt, None)
     return None
 
 
-def selected_providers():
-    """Explicit choice wins; otherwise use the shared mini-profile selector."""
-    chosen = (os.environ.get("FLEET_TITLE_PROVIDER") or "").strip().lower()
+def selected_providers(profile="mini", pin_env="FLEET_TITLE_PROVIDER"):
+    """Explicit choice wins; otherwise use the shared profile selector (default `mini`).
+
+    `pin_env=None` ignores the operator pin, so a non-title worker is not steered by
+    the Fleet title variables.
+    """
+    chosen = (os.environ.get(pin_env) or "").strip().lower() if pin_env else ""
     if chosen in PROVIDER_ORDER:
         return (chosen,)
     home = agent_home()
@@ -827,7 +849,7 @@ def selected_providers():
         config = defaults.load_and_validate(
             defaults.default_config_path(), defaults.default_topology_path()
         )
-        policy = defaults.query_profile_policy(config, "mini")
+        policy = defaults.query_profile_policy(config, profile)
         allocation = defaults.query_allocation(config)
         jobs = (Path(os.environ["AGENT_DISPATCH_JOBS"])
                 if os.environ.get("AGENT_DISPATCH_JOBS")
@@ -1171,6 +1193,63 @@ def _resolve_command(prompt, model=None):
     return commands[0] if commands else ([], None, None)
 
 
+def run_provider_cascade(commands, *, timeout, env, cwd=None):
+    """Run command triples in order; return (text, index of the answering command).
+
+    `timeout` remains one total bound. Divide the remaining wall-clock budget across
+    remaining candidates so a stuck leader cannot consume the fallback's entire turn.
+    Every failure degrades to ``("", None)``; the caller owns slots and governor tokens.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    for index, (argv, stdin_text, out_file) in enumerate(commands):
+        remaining = max(0.0, deadline - time.monotonic())
+        remaining_candidates = len(commands) - index
+        if remaining <= 0:
+            break
+        attempt_timeout = max(0.001, remaining / remaining_candidates)
+        if out_file is not None:
+            # A prior interrupted Codex call can leave this pid-scoped file behind.
+            # Never accept that stale answer as the next attempt's output.
+            try:
+                Path(out_file).unlink()
+            except OSError:
+                pass
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=attempt_timeout,
+                env=env,
+                cwd=cwd,
+                input=stdin_text,
+                stdin=None if stdin_text is not None else subprocess.DEVNULL,
+                shell=False,
+            )
+            if result.returncode != 0:
+                continue
+            if out_file is None:
+                text = result.stdout or ""
+            else:
+                try:
+                    text = Path(out_file).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+            if text.strip():
+                return text, index
+        except Exception:
+            # Provider failures are isolated. The next selected runtime gets the
+            # remaining bounded budget; a pinned/custom one simply exhausts the list.
+            continue
+        finally:
+            if out_file is not None:
+                try:
+                    Path(out_file).unlink()
+                except OSError:
+                    pass
+    return "", None
+
+
 def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, label=""):
     """Run the title-provider cascade with no shell; all failures degrade to ``''``."""
     if refresh_disabled():
@@ -1213,55 +1292,8 @@ def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, 
         governor_module = importlib.util.module_from_spec(spec); spec.loader.exec_module(governor_module)
         governor_root = governor_module.default_root()
         governor_token = governor_module.acquire(governor_root, "title", label=label)
-        # `timeout` remains one total bound. Divide the remaining wall-clock budget across
-        # remaining candidates so a stuck leader cannot consume the fallback's entire turn.
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        for index, (argv, stdin_text, out_file) in enumerate(commands):
-            remaining = max(0.0, deadline - time.monotonic())
-            remaining_candidates = len(commands) - index
-            if remaining <= 0:
-                break
-            attempt_timeout = max(0.001, remaining / remaining_candidates)
-            if out_file is not None:
-                # A prior interrupted Codex call can leave this pid-scoped file behind.
-                # Never accept that stale answer as the next attempt's output.
-                try:
-                    Path(out_file).unlink()
-                except OSError:
-                    pass
-            try:
-                result = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=attempt_timeout,
-                    env=env,
-                    input=stdin_text,
-                    stdin=None if stdin_text is not None else subprocess.DEVNULL,
-                    shell=False,
-                )
-                if result.returncode != 0:
-                    continue
-                if out_file is None:
-                    text = result.stdout or ""
-                else:
-                    try:
-                        text = Path(out_file).read_text(encoding="utf-8", errors="replace")
-                    except OSError:
-                        text = ""
-                if text.strip():
-                    return text
-            except Exception:
-                # Provider failures are isolated. The next selected runtime gets the
-                # remaining bounded budget; a pinned/custom one simply exhausts the list.
-                continue
-            finally:
-                if out_file is not None:
-                    try:
-                        Path(out_file).unlink()
-                    except OSError:
-                        pass
-        return ""
+        text, _index = run_provider_cascade(commands, timeout=timeout, env=env)
+        return text
     except Exception:
         return ""
     finally:

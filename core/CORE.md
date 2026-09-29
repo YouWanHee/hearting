@@ -310,7 +310,9 @@ member's current status and primary artifact from the current sealed or open
 manifest rather than treating a historical evidence revision as current
 success. `artifact_workflow_groups.py prepare|apply|verify` owns a checked
 single-file replacement, including corrections and withdrawal; no route
-parent/`depends_on` meaning or extra workflow gate is introduced. The exact v1
+parent/`depends_on` meaning or extra workflow gate is introduced.
+`artifact_workflow_group_review.py sweep` reviews newly sealed cycles in the
+background through the same prepare/apply/verify path. The exact v1
 schema and verification semantics are in [WORKFLOW_GROUPS.md](WORKFLOW_GROUPS.md).
 
 **Campaign metadata amendment.** `artifact_metadata_amendment.py

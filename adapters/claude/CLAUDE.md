@@ -42,7 +42,7 @@ work stream; `artifact_producer.py campaign-list` shows active keys, and
 frames and reuses exact attempts. Follow `parent_next`; reuse `resume_command`
 after wakes or corrections. At `needs-question`, compare completed frames and
 ask the native interview. Actual release precedes owner execution; runtime
-closes route/cycle before success. The commands below remain low-level interfaces.
+closes route/cycle at success or once idle. The commands below remain low-level interfaces.
 
 Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
 capability that owns the artifacts; §0.2.1 then picks the **shape** of the

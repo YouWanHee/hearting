@@ -109,6 +109,16 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
     state_path, lock_path = base / "finish.json", base / "finish.lock"
     prior_state = _read(state_path)
     if not prior_state and api.outcome_path(route_file).exists():
+        # The runtime closed this route after it sat unused (route_autoclose.py);
+        # a session returning to it is done, not refused.
+        try:
+            closure = json.loads(api.outcome_path(route_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            closure = {}
+        if closure.get("autoclose") and closure.get("route_hash") == route["route_hash"]:
+            print("capability-route: route already closed automatically; nothing left to finish", file=sys.stderr)
+            return {"schema": "finish_receipt_v1", "route_id": route["route_id"], "route_hash": route["route_hash"],
+                    "state": "already-closed-automatically", "autoclose": closure["autoclose"]}
         raise InlineFinishError("finish-route-already-closed")
     record = artifact_producer.route_cycle_for(root, route)
     if record is None and prior_state:
