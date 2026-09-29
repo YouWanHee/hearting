@@ -120,6 +120,14 @@ class RouteAutocloseTest(unittest.TestCase):
         self.last_stderr = done.stderr
         return route_file, json.loads(route_file.read_text(encoding="utf-8"))
 
+    def later(self):
+        """RECHECK_SECONDS pass: routes and cycles the evidence kept are judged again."""
+        state = self.root / ".runtime/route-autoclose/state.json"
+        if state.is_file():
+            data = json.loads(state.read_text())
+            data["kept"] = {}
+            state.write_text(json.dumps(data))
+
     def sweep(self):
         """The next compose from some other session is what triggers a sweep."""
         self.sweeps += 1
@@ -364,6 +372,9 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertIsNone(self.outcome(route_file))
         self.jobs.write_text(f"2026-01-01T00:00:00Z\tdone\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
         self.sweep()
+        self.assertIsNone(self.outcome(route_file))   # judged again only after RECHECK_SECONDS
+        self.later()
+        self.sweep()
         self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
 
     def test_n6_pass_owner_with_pending_settlement_is_left_to_the_runtime(self):
@@ -400,6 +411,7 @@ class RouteAutocloseTest(unittest.TestCase):
         data = json.loads(registry.read_text())
         data["runs"]["train"].update(status="failed", exit_code=-9)   # the runner records the end
         registry.write_text(json.dumps(data))
+        self.later()
         self.sweep()
         self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
 
@@ -426,6 +438,7 @@ class RouteAutocloseTest(unittest.TestCase):
         self.sweep()
         self.assertIsNone(self.outcome(route_file))
         Path(str(log) + ".exit").write_text("0")   # the wrapper's exit sentinel
+        self.later()
         self.sweep()
         self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "idle")
 
@@ -461,6 +474,7 @@ class RouteAutocloseTest(unittest.TestCase):
         self.sweep()
         self.assertIsNone(self.outcome(route_file))
         writer.kill(); writer.wait()
+        self.later()
         self.sweep()
         self.assertIsNotNone(self.outcome(route_file))
 
@@ -549,6 +563,19 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertNotIn("cycles_left_open", self.sweep())   # remembered: no second attempt
         os.utime(cycle_file, None)                          # new evidence
         self.assertIn("cycles_left_open=1", self.sweep())
+
+    def test_review3_a_kept_route_is_judged_again_only_after_the_recheck_interval(self):
+        import route_autoclose
+        route_file, route = self.compose("owned-later", "codex", "session-9", intensity="quick", start=False)
+        metadata = f"attempt_id=att-live-owner,worker_type=owner,owner_route_id={route['route_id']}"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.jobs.write_text(f"{stamp}\trunning\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
+        self.age(route_file, "codex", "session-9")
+        self.sweep()
+        state = json.loads((self.root / ".runtime/route-autoclose/state.json").read_text())
+        row = state["kept"]["route:" + route["route_id"]]
+        self.assertEqual(row["reason"], "owner-live")
+        self.assertAlmostEqual(row["until"] - time.time(), route_autoclose.RECHECK_SECONDS, delta=120)
 
     def test_non_automatic_closure_keeps_its_existing_finish_refusal(self):
         route_file, route = self.compose("hand-closed", "codex", "session-1")

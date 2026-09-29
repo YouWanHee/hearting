@@ -57,6 +57,10 @@ from typing import Any, Mapping
 IDLE_SECONDS = 7 * 24 * 3600
 QUIET_SECONDS = 3600
 BUDGET_SECONDS = 20.0
+# A route or cycle the evidence kept open is not re-judged sooner than this:
+# the answer rarely changes within minutes, and asking costs a registry and
+# process scan.  Closing later by at most this much is the safe direction.
+RECHECK_SECONDS = 600
 WALK_LIMIT = 2000
 # A terminal registry row may still have its wrapper process publishing; rows
 # older than this are not re-probed on every sweep.
@@ -506,7 +510,16 @@ class _Memory:
         self.settled = data.get("settled_cycles") if isinstance(data.get("settled_cycles"), dict) else {}
         self.unsealable = data.get("unsealable") if isinstance(data.get("unsealable"), dict) else {}
         self.failed_routes = data.get("failed_routes") if isinstance(data.get("failed_routes"), dict) else {}
+        self.kept = data.get("kept") if isinstance(data.get("kept"), dict) else {}
         self.changed = False
+
+    def recently_kept(self, key: str, now: float) -> str | None:
+        row = self.kept.get(key)
+        return row.get("reason") if isinstance(row, dict) and float(row.get("until") or 0) > now else None
+
+    def keep(self, key: str, reason: str, now: float) -> None:
+        self.kept[key] = {"reason": reason, "until": now + RECHECK_SECONDS}
+        self.changed = True
 
     def save(self) -> None:
         if not self.changed:
@@ -514,8 +527,8 @@ class _Memory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".state.{os.getpid()}.tmp")
         temporary.write_text(json.dumps({"schema": 1, "settled_cycles": self.settled,
-                                         "unsealable": self.unsealable,
-                                         "failed_routes": self.failed_routes}, sort_keys=True), encoding="utf-8")
+                                         "unsealable": self.unsealable, "failed_routes": self.failed_routes,
+                                         "kept": self.kept}, sort_keys=True), encoding="utf-8")
         os.replace(temporary, self.path)
 
 
@@ -567,7 +580,7 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
     """Open cycles behind an already closed route: the runtime's own closure at
     once (an interrupted sweep), anyone else's after `QUIET_SECONDS`.  A cycle
     that fails to seal is remembered with its evidence and skipped until that
-    evidence changes."""
+    evidence changes.  `evidence` gathers the never-close evidence on first use."""
     import artifact_producer
     results = []
     runtime = root / ".runtime"
@@ -579,6 +592,8 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
         if outcome_signature is None:
             continue   # the begin route is open: the route pass owns it
         cycle_id = record["cycle_id"]
+        if memory.recently_kept("cycle:" + cycle_id, now):
+            continue
         remembered = memory.unsealable.get(cycle_id)
         if (remembered and remembered.get("signature") == record["_signature"]
                 and remembered.get("outcome_signature") == outcome_signature):
@@ -598,7 +613,9 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
         else:
             if not outcome.get("autoclose") and now - _mtime(outcome_file) < QUIET_SECONDS:
                 continue
-            if evidence.kept(leaf["route_id"], lambda: _cycle_home(root, record)):
+            why = evidence().kept(leaf["route_id"], lambda: _cycle_home(root, record))
+            if why:
+                memory.keep("cycle:" + cycle_id, why, now)
                 continue
             result = _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"))
         results.append({"cycle_id": cycle_id, "route_id": record["route_id"], "cycle": result})
@@ -708,7 +725,14 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
     cycles = _cycles_by_route(records)
     members = _campaign_members(root, records, campaign_id)
     files = sorted(_open_route_files(root, api), key=_mtime)
-    evidence = None
+    evidence = []
+
+    def gather() -> _Evidence:
+        """The never-close evidence, read once, and only once something needs it."""
+        if not evidence:
+            evidence.append(_Evidence(root, api))
+        return evidence[0]
+
     for index, path in enumerate(files):
         if time.monotonic() >= deadline:
             summary["deferred"] += len(files) - index
@@ -727,19 +751,22 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
         if reason is None:
             kept(why)
             continue
+        remembered_why = memory.recently_kept("route:" + route_id, now)
+        if remembered_why:
+            kept(remembered_why)
+            continue
         raw = _read_route(path)
         if raw is None:
             continue
-        if evidence is None:
-            evidence = _Evidence(root, api)
         record = cycles.get(route_id)
         home = _cycle_home(root, record) if record else None
-        why = evidence.kept(route_id, lambda: home)
+        why = gather().kept(route_id, lambda: home)
         if why is None:
             reason, why = _decide(holder, idle_since=_last_activity(
                 root, path, raw, holder, api, record, now, deep=True,
-                resource_activity=evidence.resource_activity), **rules)
+                resource_activity=gather().resource_activity), **rules)
         if why is not None:
+            memory.keep("route:" + route_id, why, now)
             kept(why)
             continue
         try:
@@ -750,14 +777,10 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
                 memory.failed_routes[route_id] = {"signature": _signature(path), "reason": str(exc)[:160],
                                                   "at": _iso(now)}
                 memory.changed = True
-    if time.monotonic() < deadline and any(
-            _signature(api.outcome_path(api.canonical_route_path(root, record["route_id"])))
-            for record in records):
-        if evidence is None:
-            evidence = _Evidence(root, api)
+    if time.monotonic() < deadline:
         if summary["closed"]:
             records = _open_cycles(root, memory)
-        summary["cycles"] = _seal_unsealed_cycles(root, api, records, evidence, memory,
+        summary["cycles"] = _seal_unsealed_cycles(root, api, records, gather, memory,
                                                   deadline=deadline, now=now)
 
 
