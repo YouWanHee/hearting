@@ -1368,7 +1368,7 @@ def build_continuation_route(
         "effective_intensity","owner_model_profile","execution_topology",
         "owner_dispatch_depth","max_dispatch_depth","tracking",
         "tracked_gate_evidence","spec_touch","cwd","source_commit",
-        "registry_digest","dispatch_defaults_digest","dispatch_allocation",
+        "registry_digest","capability_registry_digest","dispatch_defaults_digest","dispatch_allocation",
         "owner_harness_policy","selection","human_gates","human_gate_bindings",
         "confirmation_mode","small_work_confirmation",
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
@@ -3318,6 +3318,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "tracking":tracking,"tracked_gate_evidence":evidence,"spec_touch":spec_touch,
       "cwd":str(cwd),"artifact_root":str(artifact),"source_commit":_git_commit(cwd),
       "registry_digest":TOPO.registry_digest(registry),
+      "capability_registry_digest":TOPO.capability_registry_digest(
+          registry, capability, [recipe] if composed else ()),
       "dispatch_defaults_digest":dispatch_defaults_digest,
       "dispatch_allocation":dispatch_allocation,
       "owner_harness_policy":owner_harness_policy,
@@ -3417,7 +3419,8 @@ def _check_validation_basis(route, *, allow_stale_registry):
     return basis
 
 def classify_validation_basis(route, *, registry_digest_now, units_digest_now,
-                              registry_root_now, unit_catalog_root_now):
+                              registry_root_now, unit_catalog_root_now,
+                              capability_digest_now=None):
     """Pure classifier for a route's registry/unit-catalog currentness
     (task-brief B-2 §1.4/§1.5). Never raises and never touches the filesystem.
 
@@ -3436,6 +3439,13 @@ def classify_validation_basis(route, *, registry_digest_now, units_digest_now,
     ):
         sealed_digest = route.get(digest_key)
         if sealed_digest is None or sealed_digest == own_digest:
+            axes[axis] = {"verdict": "current", "message": None}
+            continue
+        # The whole registry moved, but the parts this route derives from did
+        # not (an edit to another capability): the sealed graph is still valid.
+        sealed_capability = route.get("capability_registry_digest")
+        if (axis == "registry" and capability_digest_now is not None
+                and isinstance(sealed_capability, str) and sealed_capability == capability_digest_now):
             axes[axis] = {"verdict": "current", "message": None}
             continue
         if basis is None or agent_home_equivalent(basis[root_key], own_root):
@@ -3542,10 +3552,15 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         # closure records it honestly as unproven rather than stranding it.
         return dict(route, _registry_current=False)
     registry=TOPO.load_registry()
+    capability_digest_now=None
+    if isinstance(route.get("capability_registry_digest"), str) and isinstance(route.get("capability"), str):
+        extra=[route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"), dict) else ()
+        capability_digest_now=TOPO.capability_registry_digest(registry, route["capability"], extra)
     classification=classify_validation_basis(
         route, registry_digest_now=TOPO.registry_digest(registry),
         units_digest_now=unit_catalog_digest(),
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
+        capability_digest_now=capability_digest_now,
     )
     persona_version = route.get("persona_independence_contract_version")
     if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
