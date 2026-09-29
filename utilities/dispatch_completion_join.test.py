@@ -4183,6 +4183,21 @@ class WorkContinuationReceiptTest(unittest.TestCase):
         self.assertIn("requested work is complete",text)
         self.assertNotIn("advance the route",text)
 
+    def test_parked_owner_followup_says_paused_and_keeps_start_handle(self):
+        self.jobs.write_text(self.record("owner",kind="owner").replace(
+            "worker_type=owner","note=dead-worker-blocked,worker_type=owner"))
+        parked = {"gate":"full-run-authorization","status":"blocked"}
+        with mock.patch("dispatch_replacement.owner_parked_gate",return_value=parked):
+            text = self.render([("owner","inspect-done-failure")])
+        self.assertIn("paused at human gate full-run-authorization",text)
+        self.assertIn("this is not a failure",text)
+        self.assertEqual(text.count("capability-route.py start"),1,text)
+        self.assertNotIn("preflight.sh harvest",text)
+        with mock.patch("dispatch_replacement.owner_parked_gate",return_value=None):
+            text = self.render([("owner","inspect-done-failure")])
+        self.assertNotIn("paused at human gate",text)
+        self.assertEqual(text.count("capability-route.py start"),1,text)
+
     def test_depth_two_and_corrupt_context_keep_exact_inspection_fallback(self):
         self.jobs.write_text(self.record("stage",kind="stage",depth="2"))
         text = self.render([("stage","inspect-done-failure")])

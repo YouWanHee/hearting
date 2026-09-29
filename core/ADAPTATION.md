@@ -348,7 +348,7 @@ stamp path in `core/HOOKS.md`.
   open owner attempt it also watches, once per interval, for
   a pending gate record addressed to this session and raised by that attempt;
   when one appears the hook spends its single wake immediately (exit 2,
-  `owner=alive-waiting`), leaves the record `sent-ambiguous` (the wake is
+  `owner=waiting-or-parked`), leaves the record `sent-ambiguous` (the wake is
   speculative, so the next-prompt sweep can still re-deliver it once if the
   wake was lost; the release retires it either way), and tells the session to
   put the `[방향 확인]` card and interview questions to the user and record
@@ -390,6 +390,22 @@ stamp path in `core/HOOKS.md`.
   A depth-0 session waits on `workflow-supervisor.py await-release`
   (bounded, read-only), and every launch surface refuses to start a node whose
   entry gate is not released (`human-gate-unreleased`/`human-gate-not-raised`).
+  An owner that ends `BLOCKED` at a gate it raised after it started, while the
+  nodes that gate holds back have not begun, is parked, not failed
+  (`dispatch_replacement.owner_parked_gate`, a read-only judgement over its typed
+  handoff, the route journal, completion markers, and stage rows). `resume_command`
+  reports it as `waiting-human-gate` with the exact release command. A person's
+  `release --decision proceed` then reports `owner_continuation` after the ledger
+  write: `owner-live` when an owner is still running, the shared `start` receipt when
+  it started the continuation owner (bounded by `OWNER_CONTINUATION_TIMEOUT_SECONDS`,
+  100), or `not-started` with a `resume_command` that finishes the same start later.
+  Only a person's release starts it; a registered headless owner's release does not.
+  The continuation is the family's one automatic replacement, so
+  `recovery_instructions` tells every replacement or continuation owner to keep
+  waiting on the bounded `await-release` at a later gate instead of parking. The
+  Claude wake and the shared completion follow-up describe a parked owner as
+  paused at the gate, not failed. A revise or stop recorded while the owner is
+  parked starts nothing automatically.
   A Codex delivery uses a distinct strict `human-gate` receipt and `hg-dlv-*`
   gateway identity. It binds the route id/hash/file, gate raise epoch, exact
   live owner attempt and sealed batch, immutable registry, recipient thread and

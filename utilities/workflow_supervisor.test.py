@@ -2933,5 +2933,111 @@ class TestRegisteredEvidenceDeferredCompletion(unittest.TestCase):
         self.assertTrue(evidence["succeeded"])
 
 
+class TestReleaseOwnerContinuation(WorkflowFixture):
+    """A person's proceed starts one continuation owner only for an owner parked at that gate."""
+    GATE = "full-run-authorization"
+
+    def setUp(self):
+        super().setUp()
+        self.route, self.path = self.two_stage_route(
+            continuation={"kind": "human-gate", "gate": self.GATE}, human_gate=self.GATE)
+        self.jobs, _code = self.block_gate(self.path, self.GATE)
+
+    def park_owner(self):
+        text = self.jobs.read_text(encoding="utf-8")
+        self.jobs.write_text(text.replace("\topen\t", "\tdone\t").rstrip("\n")
+                             + ",note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
+
+    def parked(self, status="proceed", gate=None):
+        return {"gate": gate or self.GATE, "status": status, "epoch": 1, "artifact": "/tmp/gate.md",
+                "route_file": str(self.path), "route_id": self.route["route_id"],
+                "route_hash": self.route["route_hash"], "gated_nodes": ["verify"]}
+
+    def release(self, decision="proceed", **env):
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(buf):
+            code = SUP.main(["release", "--route", str(self.path), "--gate", self.GATE,
+                             "--decision", decision, "--actor", "fixture-user", "--jobs", str(self.jobs)])
+        return code, json.loads(buf.getvalue())
+
+    def test_release_reports_a_live_owner_without_starting_another(self):
+        with mock.patch.object(SUP, "start_owner_continuation", side_effect=AssertionError("owner is live")):
+            code, payload = self.release()
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["owner_continuation"], {"state": "owner-live", "attempt_id": "att-fixtureowner0001"})
+
+    def test_release_starts_the_parked_owner_continuation_once(self):
+        self.park_owner()
+        receipt = {"state": "running", "owner_attempt_id": "att-new", "parent_next": "end-turn"}
+        with mock.patch("dispatch_replacement.owner_parked_gate", return_value=self.parked()), \
+             mock.patch.object(SUP, "start_owner_continuation", return_value=(0, receipt)) as started:
+            code, payload = self.release()
+        self.assertEqual(code, 0)
+        started.assert_called_once_with(str(self.path), str(self.jobs))
+        continuation = payload["owner_continuation"]
+        self.assertEqual((continuation["state"], continuation["owner_attempt_id"], continuation["parent_next"]),
+                         ("running", "att-new", "end-turn"))
+        self.assertEqual(continuation["parked_attempt_id"], "att-fixtureowner0001")
+        self.assertIn("capability-route.py start", continuation["resume_command"])
+        ledger = SUP.ledger_for(self.route, self.jobs)
+        self.assertEqual(ledger.state()["workflow_state"], "RUNNING")
+        self.assertEqual(len(ledger.claims()), 1)
+
+    def assert_no_continuation(self, decision, status, **env):
+        self.park_owner()
+        with mock.patch("dispatch_replacement.owner_parked_gate", return_value=self.parked(status)), \
+             mock.patch.object(SUP, "start_owner_continuation", side_effect=AssertionError("no continuation")):
+            _, payload = self.release(decision, **env)
+        self.assertNotIn("owner_continuation", payload)
+
+    def test_release_revise_never_starts_a_continuation(self):
+        self.assert_no_continuation("revise", "revise")
+
+    def test_release_stop_never_starts_a_continuation(self):
+        self.assert_no_continuation("stop", "stop")
+
+    def test_headless_owner_release_never_starts_a_continuation(self):
+        self.park_owner()
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}), \
+             mock.patch("dispatch_replacement.owner_parked_gate", return_value=self.parked()), \
+             mock.patch.object(SUP, "start_owner_continuation", side_effect=AssertionError("no continuation")), \
+             contextlib.redirect_stdout(buf):
+            SUP.main(["release", "--route", str(self.path), "--gate", self.GATE,
+                      "--decision", "proceed", "--jobs", str(self.jobs)])
+        self.assertNotIn("owner_continuation", json.loads(buf.getvalue()))
+
+    def test_continuation_failure_keeps_the_release(self):
+        for label, outcome in (("timeout", subprocess.TimeoutExpired(["start"], 100)),
+                               ("exit-code", (2, {"state": "needs-attention", "reason": "x"})),
+                               ("no-receipt", (0, {}))):
+            with self.subTest(case=label):
+                self.setUp()
+                self.park_owner()
+                patch = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
+                with mock.patch("dispatch_replacement.owner_parked_gate", return_value=self.parked()), \
+                     mock.patch.object(SUP, "start_owner_continuation", **patch):
+                    code, payload = self.release()
+                self.assertEqual(code, 0)
+                self.assertEqual(payload["decision"], "proceed")
+                self.assertEqual(payload["owner_continuation"]["state"], "not-started")
+                self.assertIn("capability-route.py start", payload["owner_continuation"]["resume_command"])
+                self.assertEqual(SUP.ledger_for(self.route, self.jobs).state()["workflow_state"], "RUNNING")
+
+    def test_frame_gate_release_without_owner_is_unchanged(self):
+        self.jobs.write_text("", encoding="utf-8")
+        with mock.patch.object(SUP, "start_owner_continuation", side_effect=AssertionError("no owner")):
+            code, payload = self.release()
+        self.assertEqual(code, 0)
+        self.assertNotIn("owner_continuation", payload)
+
+    def test_parked_at_other_gate_is_not_continued(self):
+        self.park_owner()
+        with mock.patch("dispatch_replacement.owner_parked_gate", return_value=self.parked(gate="another-gate")), \
+             mock.patch.object(SUP, "start_owner_continuation", side_effect=AssertionError("other gate")):
+            _, payload = self.release()
+        self.assertNotIn("owner_continuation", payload)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

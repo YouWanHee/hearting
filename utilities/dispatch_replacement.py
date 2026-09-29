@@ -9,11 +9,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import dataclasses
+from datetime import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 from typing import Callable
@@ -28,6 +30,10 @@ DEATH_NOTES = frozenset({
     'dead-no-progress', 'dead-timeout',
 })
 SCHEMA = 'automatic-dead-replacement-v1'
+CONTINUATION_WAIT_NOTE = (
+    'This route has already used its one automatic continuation. If you raise a human gate later, '
+    'wait for the person: call the bounded workflow-supervisor.py await-release again after each timeout, '
+    'and do not end the turn at the gate; ending there leaves the work for a person to restart.\n')
 
 
 def _bytes(value):
@@ -173,25 +179,33 @@ def _terminal_absent(fields, meta):
     return result.get('state') == 'absent'
 
 
-def death_proof(fields, meta):
+def death_proof(fields, meta, *, jobs=None, lines=None):
     """No broad dead-* permission; a semantic result still owns settlement."""
     if fields[1] not in {'done', 'cancelled', 'killed'}:
         raise DC.DispatchContractError('replacement-terminal-unsettled')
     if DC.terminal_conflict_pending(meta):
         raise DC.DispatchContractError('replacement-terminal-conflict')
+    parked = None
+    if jobs is not None and meta.get('note') == 'dead-worker-blocked':
+        found = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
+        if found and found['status'] == 'proceed':
+            parked = found
     automatic_receiptless = (meta.get('note') == 'cancelled-receipt-unavailable'
         and meta.get('classifier_source') == DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER)
-    if not automatic_receiptless and (meta.get('note') not in DEATH_NOTES
+    if not parked and not automatic_receiptless and (meta.get('note') not in DEATH_NOTES
             or fields[1] in {'cancelled', 'killed'}):
         raise DC.DispatchContractError('replacement-not-silent-death')
     proof = DC.attempt_process_quiescence(meta, terminal_receipt=True)
     if proof.state != 'quiescent':
         raise DC.DispatchContractError('replacement-process-'+proof.state, proof.reason)
-    if not _terminal_absent(fields, meta):
+    if not parked and not _terminal_absent(fields, meta):
         raise DC.DispatchContractError('replacement-result-settlement-required')
-    return {'state': proof.state, 'reason': proof.reason,
-            'note': meta.get('note', ''), 'cleanup_receipt_digest': meta.get('cleanup_receipt_digest', ''),
-            'cancellation_receipt_digest': meta.get('cancellation_receipt_digest', '')}
+    result = {'state': proof.state, 'reason': proof.reason,
+              'note': meta.get('note', ''), 'cleanup_receipt_digest': meta.get('cleanup_receipt_digest', ''),
+              'cancellation_receipt_digest': meta.get('cancellation_receipt_digest', '')}
+    if parked:
+        result.update({'parked_gate': parked['gate'], 'gate_epoch': parked['epoch']})
+    return result
 
 
 def _children_quiescent(rows, owner):
@@ -226,6 +240,69 @@ def _route(jobs, aid, meta):
     if path.with_suffix('.outcome.json').exists():
         raise DC.DispatchContractError('replacement-route-closed')
     return path, route
+
+
+def _instant(value):
+    moment = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    if moment.tzinfo is None:
+        raise ValueError('instant-without-timezone')
+    return moment
+
+
+def owner_parked_gate(jobs, aid, *, lines=None):
+    """Read-only: the human gate a BLOCKED owner is resting at, or None.
+
+    A typed BLOCKED owner handoff is a pause, not a failure, when this owner raised
+    a human gate after it started and the nodes the gate holds back have not begun.
+    Never raises; every unproven condition answers None.
+    """
+    try:
+        rows = _rows(lines if lines is not None else Path(jobs).read_text().splitlines())
+        fields, meta = rows[aid]
+        if (fields[1] != 'done' or meta.get('worker_type') != 'owner'
+                or meta.get('note') != 'dead-worker-blocked' or DC.terminal_conflict_pending(meta)):
+            return None
+        path, route = _route(jobs, aid, meta)
+        import workflow_state as WS
+        ledger = WS.WorkflowLedger(route['route_id'], route['route_hash'], jobs=jobs)
+        entries = ledger.journal()
+        started = _instant(fields[0])
+        chosen = None
+        for gate in sorted({b['gate'] for b in route.get('human_gate_bindings', [])}):
+            raisers = [n for n in route['nodes'] if WS.node_raises_human_gate(n, gate)]
+            if not raisers or any(n.get('worker_type') == 'frame' for n in raisers):
+                continue
+            res = WS.human_gate_resolution(entries, gate)
+            if res['status'] == 'not-raised':
+                continue
+            try:
+                raised = _instant(res['raised_at'])
+            except (ValueError, TypeError):
+                continue
+            if raised <= started:
+                continue
+            if chosen is None or raised > chosen[0]:
+                chosen = (raised, gate, res, raisers)
+        if chosen is None:
+            return None
+        _, gate, res, raisers = chosen
+        gated = sorted({s for n in raisers for s in WS.route_successors(route, str(n['id']))})
+        inline = [str(n['id']) for n in raisers if gate in n.get('inline_human_gates', [])]
+        completion = DC.dispatch_state_root(jobs)/'completion'/route['route_id']
+        if any((completion/(node+'.json')).exists() for node in gated+inline):
+            return None
+        if any(node in ledger._rebuild(entries)['nodes'] for node in gated):
+            return None
+        for _, (_, other) in rows.items():
+            if (other.get('route_id') == route['route_id'] and other.get('route_node') in gated
+                    and other.get('worker_type') != 'owner'):
+                return None
+        return {'gate': gate, 'status': res['status'], 'epoch': res['epoch'],
+                'raised_at': res['raised_at'], 'artifact': res.get('artifact'),
+                'route_file': str(path), 'route_id': route['route_id'],
+                'route_hash': route['route_hash'], 'gated_nodes': gated}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def _logical_key(route, meta):
@@ -474,7 +551,7 @@ def claim(jobs: Path, aid: str) -> dict:
                 raise DC.DispatchContractError('automatic-replacement-exhausted', record['logical_node']['node'])
             _no_competing_successor(rows, aid, record['replacement_attempt_id'])
             return record
-        proof = death_proof(fields, meta)
+        proof = death_proof(fields, meta, jobs=jobs, lines=lines)
         path, route = _route(jobs, aid, meta)
         logical = _logical_key(route, meta)
         family = _digest(logical)
@@ -626,7 +703,7 @@ def validate_claim_source(jobs, lines, record):
     _no_competing_successor(rows, prior, record['replacement_attempt_id'])
     if _budget_exhausted(jobs, source, lines=lines):
         raise DC.DispatchContractError('automatic-replacement-exhausted', prior)
-    death_proof(fields, source)
+    death_proof(fields, source, jobs=jobs, lines=lines)
     _source_fences(jobs, source, record['route_id'], prior)
     if source.get('worker_type') == 'owner':
         _children_quiescent(rows, prior)
@@ -658,7 +735,11 @@ def admission(jobs, lines, metadata):
     if reservation and not source.get('replacement_claim_digest'):
         raise DC.DispatchContractError('replacement-claim-pending', prior)
     if not family:
-        if _budget_exhausted(jobs, source, lines=lines):
+        # The candidate's own row is not a consumed retry: it is present once spawn admits it.
+        own = metadata.get('attempt_id')
+        peers = [line for line in lines
+                 if not (own and len(line.split('\t')) == 6 and DC.row_has_attempt(line.split('\t')[5], own))]
+        if _budget_exhausted(jobs, source, lines=peers):
             raise DC.DispatchContractError('automatic-replacement-exhausted', prior)
         return None
     record = _check_record(_read(_record_path(jobs, family)), family, source)
@@ -823,7 +904,12 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None):
             and not DC.verdict_pass(source)):
         return exhausted_attention(jobs, aid, source)
     # Avoid side effects or errors on ordinary success/live observations.
-    if (source.get('note') not in DEATH_NOTES
+    parked = None
+    if source.get('note') == 'dead-worker-blocked':
+        parked = owner_parked_gate(jobs, aid)
+        if parked and parked['status'] != 'proceed':
+            return {'state': 'not-applicable', 'parked_gate': parked}
+    if (not parked and source.get('note') not in DEATH_NOTES
             and source.get('classifier_source') != DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return {'state':'not-applicable'}
     try:
@@ -1018,9 +1104,19 @@ def recovery_instructions(args):
     if record['replacement_attempt_id'] != args.attempt_id:
         raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
     completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
-    return ('\n\n## Verified recovery context\n'
+    text = ('\n\n## Verified recovery context\n'
             f'You replace exact-dead attempt {prior} once, on the existing route {record["route_id"]}.\n'
             f'Reuse the existing cycle {record["reuse"]["cycle_id"]} and completion evidence for: {completed}.\n'
             'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. '
             'Keep existing human answers and gate releases; do not ask the same scope again. '
             'Preserve the original failure and report any second failure as needs-attention.\n')
+    gate = (record.get('proof') or {}).get('parked_gate')
+    if gate:
+        read = shlex.join([sys.executable, str(ROOT/'utilities/workflow-supervisor.py'), 'await-release',
+                           '--route', record['route_file'], '--gate', gate, '--jobs', str(jobs),
+                           '--max', '0', '--answers-out']) + ' <file>'
+        text += (f'The original owner stopped at human gate {gate} (raise epoch {record["proof"].get("gate_epoch")}); '
+                 'a person released it with proceed. '
+                 f'Read the recorded answers with: {read} '
+                 f'Do not raise {gate} again. Continue from the node it gated through the remaining declared stages.\n')
+    return text + CONTINUATION_WAIT_NOTE
