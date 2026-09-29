@@ -38,9 +38,11 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Portable meaning: Correct existing documents with snapshots and change history.
 
 
+
 ## Workflow Evidence
 
 - Before durable capability output: `adapters/opencode/bin/preflight.sh route --capability autopilot-refine <complete compile arguments>`
+- For workflow state: `adapters/opencode/bin/preflight.sh status [cwd] [session-id]` and `adapters/opencode/bin/preflight.sh prompt-signal [cwd] [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

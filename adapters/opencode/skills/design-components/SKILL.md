@@ -40,9 +40,41 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation semantics: Component and visual-asset creation through the design role's maker mode. Produce shadcn/Tailwind components (`ui`), composed full-screen pages (`webapp`), slide visual guides (`slide`), SVG icons (`icon`), or Mermaid/direct-SVG/Excalidraw diagrams (`diagram`). Render and visually self-verify every output through a render→read→fix loop. With `--artifact standalone`, emit a self-contained single-file HTML preview. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
+
+## Projected Portable Details
+
+## Artifact Ownership
+
+Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.
+
+## Artifact Producer Lifecycle
+
+`design-components` is a `standard+` stage worker: it never issues its own campaign or
+cycle. It receives the owner's open cycle through
+`AGENT_ARTIFACT_CAMPAIGN_ID`/`AGENT_ARTIFACT_CYCLE_ID`/`AGENT_ARTIFACT_PRODUCER_ID`/
+`AGENT_ARTIFACT_CYCLE_DIR`/`AGENT_ARTIFACT_OUTPUT_DIR` (dispatch env
+pass-through), may call `utilities/artifact_producer.py begin --node <node id>`
+on the same route to resume that cycle, and writes only inside
+`<cycle_dir>/artifacts/<bucket>/...` within its node `write_scope`.
+`artifact_producer.py` owns the open cycle and its output paths; `finalize` and
+`admit-shared` belong to the owner, never to a stage worker. See
+`producer_lifecycle` in `capabilities/topologies.json`.
+
+## Role Requirements
+
+Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concrete model names, subagent frontmatter, and runtime-specific tool lists belong in adapter files.
+
+## Guard Requirements
+
+Adapters must preserve the portable invariants relevant to this capability:
+
+- resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
+- use DB memory paths, not runtime-native memory files.
+
+
 ## Workflow Evidence
 
-
+- For workflow state: `adapters/opencode/bin/preflight.sh status [cwd] [session-id]` and `adapters/opencode/bin/preflight.sh prompt-signal [cwd] [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.
