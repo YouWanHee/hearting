@@ -426,6 +426,97 @@ class InterimManifestTest(CheckpointTestBase):
 
 
 class CheckpointDisplayTitleTest(CheckpointTestBase):
+    def resume(self, **kwargs):
+        return P.begin(self.root, route_file=self.route_file, capability="autopilot-code",
+                       intensity="direct", **kwargs)
+
+    def test_owner_resume_title_updates_current_binding_without_payload_scan(self):
+        self.write_output(self.result, data="# 이전 한국어 제목\n".encode())
+        payload = self.write_output(self.result, "plans/cycle/delivery.zip", b"large payload fixture")
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        _, _, other = self.begin(mode="debug", title="다른 사이클의 기존 제목")
+        self.write_output(other, data=b"other")
+        P.checkpoint(self.root, cycle_id=other["cycle_id"])
+        other_entry = next(row for row in self.titles() if row["cycle_id"] == other["cycle_id"])
+        record_before = P.read_cycle_record(self.root, self.cycle_id)
+        protected = [P.open_manifest_path(self.root, self.cycle_id),
+                     P.checkpoint_state_path(self.root, self.cycle_id),
+                     P.reservation_path(self.root, self.cycle_id), self.route_file, payload]
+        before = {path: path.read_bytes() for path in protected}
+        title = "9/21 현장 요청 — 최종 결과 전달"
+        real_read = Path.read_bytes
+        def read(path):
+            if path == payload:
+                raise AssertionError("title resume must not read ZIP payload")
+            return real_read(path)
+        with mock.patch.object(P, "_checkpoint_scan", side_effect=AssertionError("no scan")), \
+             mock.patch.object(P, "checkpoint", side_effect=AssertionError("no checkpoint")), \
+             mock.patch.object(Path, "read_bytes", read):
+            resumed = self.resume(title=title)
+        self.assertEqual(resumed["status"], "resumed")
+        self.assertTrue(resumed["title_updated"])
+        self.assertEqual(resumed["cycle_id"], self.cycle_id)
+        self.assertEqual(P.read_cycle_record(self.root, self.cycle_id), {**record_before, "title": title})
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+        self.assertIn(other_entry, self.titles())
+        entry = next(row for row in self.titles() if row["cycle_id"] == self.cycle_id)
+        self.assertEqual(entry["display_title"], title)
+        self.assertEqual(entry["manifest_bindings"], [{
+            "manifest_revision_id": self.interim()["manifest_revision_id"],
+            "manifest_digest": CT.binding_digest(self.interim())}])
+
+    def test_omitted_same_title_and_worker_resume_do_not_write_title_metadata(self):
+        self.write_output(self.result, data="# 기존 제목 유지 확인\n".encode())
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.resume(title="사용자가 지정한 한국어 제목")
+        paths = [P.cycle_record_path(self.root, self.cycle_id), self.root / CT.CYCLE_TITLES_REL]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with mock.patch.object(P, "_write_cycle_record", side_effect=AssertionError("no record write")), \
+             mock.patch.object(CT, "emit_after_checkpoint", side_effect=AssertionError("no title emit")):
+            self.resume()
+            self.resume(title="사용자가 지정한 한국어 제목")
+            self.resume(node_id=self.route_obj["nodes"][0]["id"], title="작업자가 바꾸면 안 되는 제목")
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_resume_title_without_manifest_changes_record_only(self):
+        with mock.patch.object(P, "_checkpoint_scan", side_effect=AssertionError("no scan")):
+            self.resume(title="산출물 생성 전 한국어 제목")
+        self.assertEqual(P.read_cycle_record(self.root, self.cycle_id)["title"], "산출물 생성 전 한국어 제목")
+        self.assertFalse(P.open_manifest_path(self.root, self.cycle_id).exists())
+        self.assertEqual(self.titles(), [])
+
+    def test_resume_title_failure_uses_existing_checkpoint_retry(self):
+        self.write_output(self.result, data="# 원래 표시 제목\n".encode())
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        with mock.patch.object(CT, "_upsert_title_locked", side_effect=OSError("fixture")):
+            self.assertTrue(self.resume(title="재시도할 한국어 제목")["title_updated"])
+        self.assertEqual(P.read_cycle_record(self.root, self.cycle_id)["title"], "재시도할 한국어 제목")
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "unchanged")
+        self.assertEqual(self.titles()[0]["display_title"], "재시도할 한국어 제목")
+
+    def test_resume_title_closed_and_sealed_cycles_are_unchanged(self):
+        self.write_output(self.result, data="# 봉인 전 표시 제목\n".encode())
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.seal()
+        paths = [P.cycle_record_path(self.root, self.cycle_id), self.root / CT.CYCLE_TITLES_REL,
+                 Path(self.result["cycle_dir"]) / "manifest.json"]
+        before = {path: path.read_bytes() for path in paths}
+        with self.assertRaises(P.ProducerError) as error:
+            self.resume(title="봉인 이후 바꾸면 안 되는 제목")
+        self.assertEqual(error.exception.code, "route-already-closed")
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_resume_title_campaign_conflict_rejects_without_title_change(self):
+        self.write_output(self.result, data="# 캠페인 검사 기존 제목\n".encode())
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        _, _, other = self.begin(mode="debug", campaign_key="other-title-stream")
+        paths = [P.cycle_record_path(self.root, self.cycle_id), self.root / CT.CYCLE_TITLES_REL]
+        before = {path: path.read_bytes() for path in paths}
+        with self.assertRaises(P.ProducerError) as error:
+            self.resume(title="다른 캠페인에서 보낸 제목", campaign_id=other["campaign_id"])
+        self.assertEqual(error.exception.code, "cycle-campaign-selection-conflict")
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
     def titles(self):
         path = self.root / CT.CYCLE_TITLES_REL
         return json.loads(path.read_text())["entries"] if path.exists() else []

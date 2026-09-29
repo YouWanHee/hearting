@@ -270,7 +270,12 @@ open cycles alongside their interim manifest, using the same record, request,
 and primary Markdown-heading rules as sealing. Updated outputs refresh both
 the title and its manifest binding. No-output cycles and cycles without a usable
 title publish no new declaration. Title publication is best-effort and never
-blocks the checkpoint; a later checkpoint retries it automatically.
+blocks the checkpoint; a later checkpoint retries it automatically. An owner
+resuming the same open cycle with an explicit `begin --title` updates its title
+and republishes the declaration against the current interim manifest, without
+rescanning or moving outputs. A worker `begin --node`, an omitted title, or an
+unchanged title does not rewrite title metadata. Existing identities, locators,
+other cycles, and sealed records stay unchanged.
 
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-reopen|campaign-recover`
 reports, closes, reopens, and repairs a campaign. An agent that judges the

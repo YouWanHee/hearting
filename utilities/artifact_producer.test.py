@@ -4604,12 +4604,15 @@ class RouteLineageBindingTest(ProducerTestBase):
         begun = self._begin(a)
         b = self._continuation(a)
         resumed = P.begin(self.root, route_file=R.canonical_route_path(self.root, b["route_id"]),
-                          capability=b["capability"], intensity=b["effective_intensity"])
+                          capability=b["capability"], intensity=b["effective_intensity"],
+                          title="후속 작업의 한국어 제목")
         self.assertEqual((resumed["status"], resumed.get("rebound"), resumed["cycle_id"]),
                          ("resumed", True, begun["cycle_id"]))
         self.assertEqual(P.list_cycle_records(self.root).__len__(), 1)  # no new cycle
         self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"]])
         record_before = P.read_cycle_record(self.root, begun["cycle_id"])
+        self.assertEqual(record_before["title"], "후속 작업의 한국어 제목")
+        self.assertTrue(resumed["title_updated"])
         P.require_cycle_output(self.root, Path(begun["cycle_dir"]) / "artifacts" / "y.md", route_id=b["route_id"])
         self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"]), record_before)
 

@@ -1918,12 +1918,25 @@ def _begin_cycle_record(
                         owner_begin=owner_begin)
                 except dispatch_terminal_commit.TerminalCommitError as exc:
                     raise ProducerError(exc.code, exc.detail) from exc
+            title_updated = False
+            if owner_begin and title is not None:
+                # A repeated owner begin is the existing metadata edit surface.
+                # Reread after a continuation bind to retain its route audit.
+                current = read_cycle_record(root, record["cycle_id"])
+                directory = cycle_dir(root, current["campaign_id"], current["cycle_id"], current)
+                if current.get("state") == "open" and not (directory / "manifest.json").exists():
+                    display_title = _route_naming(route, bound_campaign, title=title, goal=goal, root=root)[1]
+                    if current.get("title") != display_title:
+                        record = {**current, "title": display_title}
+                        _write_cycle_record(root, record, exclusive=False)
+                        title_updated = True
             return {
                 "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
                 "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
                 "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
                 "env": _env_for(root, record),
                 **({"rebound": True} if rebound else {}),
+                **({"title_updated": True} if title_updated else {}),
                 **_campaign_degradation(bound_campaign),
             }
         if campaign is not None:
@@ -2068,6 +2081,11 @@ def _begin_cycle_record(
 
 def begin(root: Path, **kwargs: Any) -> Dict[str, Any]:
     result = _begin_cycle_record(root, **kwargs)
+    if result.get("title_updated"):
+        # The existing publisher rereads the current open manifest under the
+        # admission -> checkpoint lock order. No checkpoint scan or payload
+        # rehash is needed for a title-only change.
+        artifact_cycle_titles.emit_after_checkpoint(root, {"cycle_id": result["cycle_id"]})
     if (kwargs.get("node_id") is None and result.get("layout") == "cycle"
             and kwargs.get("capability") == "autopilot-spec"):
         # The admission lock has been released. Seed before a review worker can
