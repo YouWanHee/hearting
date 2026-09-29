@@ -908,8 +908,36 @@ def classified_receipt(
             )
         else:
             reason = "terminal-failure-or-unclosed"
+        parked = None
+        if state != "success" and required_action == "inspect-done-failure":
+            try:
+                import dispatch_replacement
+                parked = dispatch_replacement.owner_parked_gate(launch.jobs, launch.attempt_id)
+            except (ImportError, OSError, ValueError):  # the optional explanation never blocks a wake
+                parked = None
         if state == "success":
             instruction = "No harvest command is required; the registered owner completed."
+        elif parked and parked["status"] == "blocked":
+            gate = parked["gate"]
+            required_action = HUMAN_GATE_PREFIX + gate
+            reason = "owner-parked-at-human-gate"
+            release = shlex.join([
+                sys.executable, str(home / "utilities" / "workflow-supervisor.py"), "release",
+                "--route", parked["route_file"], "--jobs", str(launch.jobs), "--gate", gate,
+                "--decision", "proceed"])
+            instruction = (
+                f"The owner paused at human gate {gate} and exited; this is not a failure. "
+                f"Read {parked.get('artifact') or 'the gate artifact'}, ask the person, then record "
+                f"the answer with:\n{release}\n(replace proceed with revise or stop when chosen). "
+                "A proceed starts the continuation owner."
+            )
+        elif parked and parked["status"] == "proceed":
+            reason = "owner-parked-gate-released"
+            instruction = (
+                f"Human gate {parked['gate']} is already released. Continue the work with:\n"
+                + shlex.join([sys.executable, str(home / "utilities" / "capability-route.py"), "start",
+                              "--route", parked["route_file"], "--jobs", str(launch.jobs)])
+            )
         elif required_action in {"complete-open", "inspect-done-failure"}:
             instruction = (
                 "Exact completion bookkeeping command:\n"
@@ -1281,18 +1309,18 @@ def _gate_notices(
 
 
 def gate_wake_message(launch: Launch, notices: list[str]) -> str:
-    """The in-wait gate wake: bounded, typed, and explicit that the owner is
-    still alive and waiting -- so the session answers the gate instead of
-    harvesting the attempt."""
+    """The in-wait gate wake: bounded, typed, and explicit that the gate is
+    answered, not harvested; the owner may still be waiting or may have paused
+    at the gate."""
 
     if any("Hearting supervision needs attention." in notice for notice in notices):
         return " ".join(notices)
     return (
         "Hearting human gate awaiting your decision (SD-123/129). Runtime gate receipt "
         f"schema=2 state=attention attempt_id={launch.attempt_id} armed={launch.armed} "
-        "owner=alive-waiting required_action=human-gate. "
-        "The owner is waiting on `workflow-supervisor.py await-release`; it is answered, not "
-        "harvested. Read the artifact named below (an interview file or frame summary), put "
+        "owner=waiting-or-parked required_action=human-gate. "
+        "The owner is waiting on `workflow-supervisor.py await-release` or has paused at the "
+        "gate; either way it is answered, not harvested, and a release continues the work. Read the artifact named below (an interview file or frame summary), put "
         "the [방향 확인] card -- and every interview question, one topic at a time, in plain "
         "words -- to the user through AskUserQuestion, then record the answer with "
         "`workflow-supervisor.py release --route <route file> --gate <name> --decision "

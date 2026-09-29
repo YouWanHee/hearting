@@ -607,6 +607,34 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         sys.executable, str(ROOT / "utilities/capability-route.py"), "correct",
         "--jobs", str(jobs), "--attempt-id", aid,
     ])
+    if status == "done":
+        import dispatch_replacement
+        parked = dispatch_replacement.owner_parked_gate(jobs, aid)
+        if parked:
+            result["parked_gate"] = parked
+            gate = parked["gate"]
+            release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
+                                  "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
+                                  "--decision", "proceed"])
+            if parked["status"] == "blocked":
+                return {**result, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
+                        "required_action": "answer-human-gate", "gate": gate,
+                        "gate_artifact": parked["artifact"], "release_command": release,
+                        "next_step": f"The owner paused at human gate {gate} and exited; this is not a failure. "
+                            "Show the person the gate artifact and ask for a decision. Record it with "
+                            "release_command (replace proceed with revise or stop when chosen). "
+                            "A proceed starts the continuation automatically."}
+            if parked["status"] == "stop":
+                return {**result, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
+                        "next_step": f"The person stopped this work at gate {gate}. Report that; "
+                            "nothing is running and no replacement starts."}
+            if parked["status"] == "revise":
+                return {**result, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
+                        "required_action": "report-gate-revision", "gate": gate,
+                        "next_step": f"The person asked for a revision at gate {gate} while no owner is running. "
+                            "Report the feedback and ask how to proceed; no automatic continuation starts "
+                            "for a revise."}
+            # proceed: fall through to the replacement path below.
     if status == "done" and verdict_pass(metadata):
         from dispatch_terminal_commit import owner_workflow_gaps
         missing = owner_workflow_gaps(jobs, metadata, route)

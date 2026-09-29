@@ -659,6 +659,16 @@ keeps the exact question and gate available for a later real answer; independent
 authorized work can continue. Managed question surfaces disable automatic empty
 answers where the runtime supports this. Otherwise the owner leaves a plain-text
 question for a later reply instead of repeatedly opening expiring prompts.
+An owner that raises a gate calls the bounded `await-release` once; when the gate
+is still blocked it ends its turn with `verdict: BLOCKED`, naming the gate as its
+blocker. That parked stop is a pause, not a failure, and no model turn runs while
+the person decides. `resume_command` then reports `waiting-human-gate` with the
+exact release command, and a person's `release --decision proceed` starts one
+continuation owner when no owner is live. That continuation uses the route's one
+automatic replacement, so a replacement or continuation owner, which its prompt's
+recovery context identifies, keeps calling the bounded `await-release` at a later
+gate instead of parking. A revise or stop recorded while the owner is parked keeps
+its meaning and starts nothing automatically.
 
 A continuation route projects this contract onto its suffix. It drops a gate
 whose gated entry node was cut, never rebinds a retained raising continuation to

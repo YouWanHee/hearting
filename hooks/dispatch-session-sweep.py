@@ -105,7 +105,8 @@ def main() -> int:
             "recommended answer first -- then record the answer with `workflow-supervisor.py "
             "release --route <route file> --gate <name> --decision proceed|revise|stop "
             "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
-            "`await-release`. Do not start Monitor, dispatch-wait, or a polling loop.\n"
+            "`await-release` or has paused at the gate; the release continues the work either way. "
+            "Do not start Monitor, dispatch-wait, or a polling loop.\n"
             + "\n".join(f"- {line}" for line in gate_lines)
         )
     if lines:

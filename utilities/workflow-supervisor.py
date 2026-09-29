@@ -1434,6 +1434,46 @@ def _gate_predecessor_node(route, gate_name):
     return None
 
 
+OWNER_CONTINUATION_TIMEOUT_SECONDS = 100  # stays inside a 120s tool-call limit; a later start resumes a half-done launch
+
+
+def start_owner_continuation(route_path, jobs):
+    """Run the shared resume handle once. Tests replace this function."""
+    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+            "--route", str(Path(route_path).resolve()), "--jobs", str(jobs)]
+    completed = subprocess.run(argv, text=True, capture_output=True, check=False,
+                               timeout=OWNER_CONTINUATION_TIMEOUT_SECONDS)
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    return completed.returncode, (json.loads(lines[-1]) if lines else {})
+
+
+def owner_continuation(route, route_path, gate, jobs):
+    """After a person's proceed: report a live owner, or start the continuation
+    for an owner parked at this gate. None when there is nothing to continue."""
+    row = _owner_row(_registry_rows(jobs), route["route_id"])
+    if row is None:
+        return None
+    attempt = row["meta"].get("attempt_id", "")
+    if row["status"] in {"open", "running"}:
+        return {"state": "owner-live", "attempt_id": attempt}
+    import dispatch_replacement
+    parked = dispatch_replacement.owner_parked_gate(Path(jobs), attempt)
+    if not parked or parked["gate"] != gate or parked["status"] != "proceed":
+        return None
+    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+                         "--route", str(Path(route_path).resolve()), "--jobs", str(jobs)])
+    try:
+        code, receipt = start_owner_continuation(route_path, jobs)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return {"state": "not-started", "reason": type(exc).__name__,
+                "parked_attempt_id": attempt, "resume_command": resume}
+    kept = {key: receipt[key] for key in ("state", "reason", "owner_attempt_id", "parent_next",
+            "parent_next_command", "required_action", "next_step") if key in receipt}
+    if code or not kept.get("state"):
+        kept["state"] = "not-started"
+    return {**kept, "parked_attempt_id": attempt, "resume_command": resume}
+
+
 def cmd_release(args):
     """A50-8: `release --decision proceed|revise|stop`, semantically
     consistent with `gate --release|--block` but closing the gap `gate
@@ -1542,6 +1582,16 @@ def cmd_release(args):
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
                             released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
+    if args.decision == "proceed" and actor_kind == "user":
+        jobs = args.jobs or (None if payload.get("ledger_root_source") == "AGENT_WORKFLOW_ROOT"
+                             else default_jobs_path())
+        if jobs:
+            try:
+                continuation = owner_continuation(route, args.route, args.gate, jobs)
+            except (SupervisorError, OSError, ValueError) as exc:
+                continuation = {"state": "not-started", "reason": str(exc)[:240]}
+            if continuation is not None:
+                payload["owner_continuation"] = continuation
     print(json.dumps(payload, sort_keys=True))
     return 0
 
