@@ -150,7 +150,7 @@ NATIVE_EVIDENCE_FIELDS = {
 
 
 def _validate_registered_headless_evidence(evidence):
-    """Normalize quick eligibility; every invalid/empty case has one failure enum."""
+    """Normalize headless owner eligibility using the existing quick contract."""
 
     if not isinstance(evidence, dict):
         raise ValueError("quick-headless-unavailable")
@@ -1763,6 +1763,13 @@ def _evidence_parent_dispatch_depth(nodes, owner_dispatch_depth):
         )
     return parent_dispatch_depth
 
+
+def _single_owner_nodes(nodes):
+    """An owner-only recipe needs owner readiness, not unused child tuples."""
+    return (len(nodes) == 1 and nodes[0].get("kind") == "capability-owner"
+            and nodes[0].get("unit") == "_kernel/owner"
+            and nodes[0].get("dispatch_depth") == 1)
+
 def _validate_tuple_parent_identity(row, parent_dispatch_depth):
     """Reject a checked tuple sealed for a parent runtime the route cannot have.
 
@@ -2929,11 +2936,14 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if shape == "direct" and signals:
         raise ValueError("compose-direct-signals-conflict")
     readiness = None
-    if shape == "staged" and dispatch_evidence is None:
+    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
+                       if shape == "staged" and graph else base)
+    owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
+    if shape == "staged" and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
                                        children or COMPOSE_DEFAULT_CHILDREN)
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
-    if shape == "solo" and registered_headless_evidence is None:
+    if (shape == "solo" or owner_only) and registered_headless_evidence is None:
         readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
                                                     parent_harness, children or COMPOSE_DEFAULT_CHILDREN)
         registered_headless_evidence = {"candidates": readiness["candidates"]}
@@ -2947,7 +2957,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         profile_demands=profile_demands, explicit_profiles=explicit_profiles, profile=profile,
     )
     if shape == "staged" and graph:
-        recipe = compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
+        recipe = selected_recipe
         route = compile_composed_route(
             recipe, capability_mode, requested, cwd, artifact_root,
             predicates=predicates, inline_reason=None, **common)
@@ -3223,7 +3233,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         raise ValueError("structured inline_reason required")
     evidence=_validate_tracking_evidence(tracking, tracked_gate_evidence)
     checked_dispatch=None
-    if effective not in ("direct","quick"):
+    if effective not in ("direct","quick") and _single_owner_nodes(nodes):
+        registered_headless_candidates = _validate_registered_headless_evidence(registered_headless_evidence)
+    elif effective not in ("direct","quick"):
         parent_dispatch_depth=_evidence_parent_dispatch_depth(
             nodes, recipe["standard_plus"]["owner_dispatch_depth"])
         checked_dispatch=_validate_dispatch_evidence(
@@ -3917,7 +3929,17 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         raise ValueError("tracking cannot be an escalation basis")
     spec_touch=any(_scope_touches_spec(scope) for node in route.get("nodes",[]) for scope in node.get("write_scope",[]))
     if bool(route.get("spec_touch")) != spec_touch: raise ValueError("spec_touch declaration mismatch")
-    if route.get("effective_intensity") not in ("direct","quick"):
+    if effective not in ("direct","quick") and _single_owner_nodes(route.get("nodes",[])):
+        candidates = _validate_registered_headless_evidence({"candidates": route.get("registered_headless_candidates")})
+        if (candidates != route.get("registered_headless_candidates")
+                or route.get("registered_headless_policy") is not None
+                or route.get("dispatch_evidence") is not None
+                or route["nodes"][0].get("fallback_hops")
+                or route.get("selection",{}).get("transport") != "headless"):
+            raise ValueError("owner-only registered-headless evidence mismatch")
+    elif route.get("effective_intensity") not in ("direct","quick"):
+        if route.get("registered_headless_candidates") is not None:
+            raise ValueError("nested route cannot substitute owner-only readiness")
         if route.get("selection",{}).get("transport") != "headless":
             raise ValueError("standard+ routes require checked headless transport")
         contract_version=route.get("dispatch_contract_version") or route.get("broker_contract_version") or 1
@@ -7803,7 +7825,7 @@ def main():
     c.add_argument("--transport",default=None); c.add_argument("--transport-evidence",default="caller-selected")
     c.add_argument("--inline-reason"); c.add_argument("--tracking",choices=sorted(TRACKING),required=True)
     c.add_argument("--dispatch-evidence",help="JSON file with checked nested tuples/native evidence")
-    c.add_argument("--registered-headless-evidence",help="JSON file with checked quick candidates")
+    c.add_argument("--registered-headless-evidence",help="JSON file with checked quick or single-owner candidates")
     c.add_argument("--composed-recipe",help="JSON file with a compose-on-demand recipe (sealed composed: true)")
     c.add_argument("--spec-read",required=True); c.add_argument("--drift-verdict",required=True)
     c.add_argument("--workflow-mode",choices=sorted(TRACKING),required=True); c.add_argument("--artifact-guard",required=True)
@@ -7837,7 +7859,7 @@ def main():
     cp.add_argument("--parent-harness",default=None,choices=("claude","codex","opencode"),help="default: actual parent runtime")
     cp.add_argument("--jobs",default=None,help="registry for the readiness probe (default AGENT_DISPATCH_JOBS or the stable state root)")
     cp.add_argument("--dispatch-evidence",help="checked evidence JSON (skips the live probe)")
-    cp.add_argument("--registered-headless-evidence",help="checked quick candidates JSON (skips the live probe)")
+    cp.add_argument("--registered-headless-evidence",help="checked quick or single-owner candidates JSON (skips the live probe)")
     cp.add_argument("--transport-evidence",default="compose-default")
     cp.add_argument("--explain",action="store_true",help="print the [경로] card and the sealed graph without writing the route")
     cp.add_argument("--output")

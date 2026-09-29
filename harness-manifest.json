@@ -275,14 +275,17 @@
   "autopilot-ship": {
    "group": "entry",
    "family": "app",
-   "modes": [],
-   "summary": "Prepare application deployment/release setup and a ship checklist.",
+   "modes": [
+    "default",
+    "package"
+   ],
+   "summary": "Prepare application deployment/release setup or package existing artifacts for delivery.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when an application needs deployment or release configuration, readiness verification, and a ship checklist.",
-    "not_for": "Not for ordinary feature implementation or an unauthorized production deployment."
+    "use_when": "Use when an application needs deployment/release preparation, or existing artifacts must be collected and checked in a delivery archive (package mode).",
+    "not_for": "Not for feature implementation, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
    },
-   "argument_shape": "<task description (optional)> [--intensity direct|quick|standard|strong|thorough|adversarial]",
+   "argument_shape": "<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]",
    "requires": {
     "capabilities": [],
     "units": [

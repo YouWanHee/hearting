@@ -923,6 +923,13 @@ class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
         self.assertEqual(context["harnesses"], {"codex"})
         self.assertIsNone(context["policy"])
 
+    def test_standard_package_owner_uses_registered_headless_candidates(self):
+        path = self._route({"effective_intensity": "standard", "dispatch_evidence": None,
+                            "registered_headless_candidates": [
+                                {"harness": "codex", "status": "supported"},
+                                {"harness": "claude", "status": "unsupported"}]})
+        self.assertEqual(OWNER._sealed_owner_harnesses(path), {"codex"})
+
     def test_direct_route_has_no_owner_to_bind(self):
         path = self._route({"effective_intensity": "direct", "dispatch_evidence": None})
         with self.assertRaises(OWNER.OwnerError) as caught:

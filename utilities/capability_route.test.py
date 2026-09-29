@@ -316,7 +316,7 @@ class TestRoute(unittest.TestCase):
        recipe["capability"],mode,intensity,R.ROOT,R.ROOT,predicates=[],
        transport="headless",tracking="tracked",
        tracked_gate_evidence=self.args()["tracked_gate_evidence"],
-       dispatch_evidence=evidence)
+       dispatch_evidence=evidence,registered_headless_evidence=self.registered_headless())
       self.assertEqual(route["owner_model_profile"],"deep")
       owners=[
        node for node in route["nodes"]
@@ -350,7 +350,7 @@ class TestRoute(unittest.TestCase):
        ]
       self.assertEqual(stable(route["nodes"]),stable(expected))
       R.verify_route(route,R.ROOT); compiled+=1
-  self.assertEqual(compiled,162)  # 27 recipes x 6 intensities (W7C added the 3 pre/ops entries)
+  self.assertEqual(compiled,168)  # 28 capability/mode pairs x 6 intensities
  def test_verify_rejects_rehashed_executable_owner_profile_drift(self):
   quick=R.compile_route(**self.args(
    requested_intensity="quick",predicates=[],transport=None,inline_reason=None,
@@ -6348,6 +6348,118 @@ class ComposeRouteTest(TestRoute):
       for field in ("unit","completion_gate","write_scope","model_profile"):
        self.assertEqual(node.get(field),originals[name].get(field),(name,field))
      R.verify_route(route,R.ROOT)
+ def test_ship_package_compiles_minimal_delivery_at_each_shape(self):
+  request={"text":"Reuse model v3 and the delivery template; package field.wav, sim1.wav, sim2.wav with their existing outputs and report. No other samples or models.","owner_harness":"codex"}
+  for shape,intensity,ids in (("direct","direct",["inline"]),("solo","quick",["one-shot"]),("staged","standard",["package"]),("staged","strong",["package"]),("staged","adversarial",["package"])):
+   with self.subTest(shape=shape,intensity=intensity):
+    route=self.compose(capability="autopilot-ship",capability_mode="package",shape=shape,graph=None,intensity=intensity,registered_headless_evidence=self.registered_headless(),work_request=request)
+    self.assertEqual(route["capability_mode"],"package")
+    self.assertEqual(route["effective_intensity"],intensity)
+    self.assertEqual([n["id"] for n in route["nodes"]],ids)
+    self.assertEqual(route["human_gates"],[])
+    self.assertEqual(route.get("parallel_groups",[]),[])
+    self.assertEqual(route["work_request"]["text"],request["text"])
+    self.assertFalse(route["spec_touch"])
+    self.assertTrue(route["nodes"][-1]["terminal"])
+    if shape=="staged":
+     node=route["nodes"][0]
+     self.assertEqual(node["unit"],"_kernel/owner")
+     self.assertEqual(node["model_profile"],"deep")
+     self.assertEqual(node["completion_gate"],"ship-setup")
+     self.assertEqual(node["write_scope"],["release-config/**"])
+     self.assertIsNone(route["dispatch_evidence"])
+     import owner_route_binding as binding
+     with tempfile.TemporaryDirectory() as tmp:
+      path=Path(tmp)/"route.json"; path.write_text(json.dumps(route))
+      binding.validate_owner_route_binding(path,worktree=R.ROOT,capability="autopilot-ship",capability_mode="package",intensity=intensity,harness="codex")
+    R.verify_route(route,R.ROOT)
+ def test_ship_package_requires_checked_owner_readiness(self):
+  for evidence in ({"candidates":[]},self.registered_headless(status="unsupported")):
+   with self.assertRaisesRegex(ValueError,"headless-unavailable"):
+    self.compose(capability="autopilot-ship",capability_mode="package",graph=None,registered_headless_evidence=evidence)
+  route=self.compose(capability="autopilot-ship",capability_mode="package",graph=None,registered_headless_evidence=self.registered_headless())
+  route["dispatch_evidence"]=self.evidence()
+  route["route_hash"]=R.route_hash(route)
+  route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
+  with self.assertRaisesRegex(ValueError,"owner-only registered-headless"):
+   R.verify_route(route,R.ROOT)
+ def test_ship_package_compose_uses_owner_probe_without_child_tuples(self):
+  readiness={"candidates":self.registered_headless()["candidates"],"tuples":[]}
+  with mock.patch.object(R,"_compose_readiness",return_value=readiness) as probe:
+   route=self.compose(capability="autopilot-ship",capability_mode="package",graph=None,dispatch_evidence=None)
+  probe.assert_called_once()
+  self.assertIsNone(route["dispatch_evidence"])
+  self.assertIsNone(route["registered_headless_policy"])  # retains standard attempt semantics
+  R.verify_route(route,R.ROOT)
+ def test_ship_package_public_start_hands_off_one_node_less_owner(self):
+  import work_start as W
+  spec=importlib.util.spec_from_file_location("package_owner",P.with_name("dispatch-owner.py"))
+  owner=importlib.util.module_from_spec(spec); spec.loader.exec_module(owner)
+  route=self.compose(capability="autopilot-ship",capability_mode="package",graph=None,
+   registered_headless_evidence=self.registered_headless(),
+   work_request={"text":"Package only the requested existing artifacts.","owner_harness":"codex"})
+  with tempfile.TemporaryDirectory() as tmp:
+   path=Path(tmp)/"route.json"; path.write_text(json.dumps(route))
+   jobs=Path(tmp)/"jobs.log"; jobs.touch()
+   launches=[]
+   def admit(command,**kwargs):
+    launches.append(command)
+    self.assertNotIn("--route-node",command)
+    explicit,values,forwarded,evidence,derived=owner._parse(command[2:])
+    self.assertEqual(explicit,"codex")
+    self.assertEqual(values["--dispatch-depth"],"1")
+    self.assertEqual(values["--worker-type"],"owner")
+    from types import SimpleNamespace
+    from dispatch_mode_contract import normalize_dispatch_modes
+    axes=SimpleNamespace(**{k[2:].replace("-","_"):v for k,v in values.items()})
+    axes.dispatch_depth=int(axes.dispatch_depth)
+    normalize_dispatch_modes(axes)
+    self.assertEqual(axes.unit,"_kernel/owner")
+    self.assertFalse(axes.worker_mode)
+    self.assertEqual(values["--capability-mode"],"package")
+    self.assertEqual(values["--model-profile"],"deep")
+    binding=owner.validate_owner_route_binding(evidence,worktree=values["--worktree"],
+     capability=values["--capability"],capability_mode=values["--capability-mode"],
+     intensity=values["--intensity"],harness=explicit)
+    env=owner.export_owner_route_env({},binding)
+    self.assertEqual(env["AGENT_OWNER_ROUTE_ID"],route["route_id"])
+    self.assertNotIn("AGENT_ROUTE_NODE",env)
+    with self.assertRaisesRegex(owner.OwnerRouteBindingError,"owner-route-harness-mismatch"):
+     owner.validate_owner_route_binding(evidence,worktree=values["--worktree"],
+      capability=values["--capability"],capability_mode="package",intensity="standard",harness="opencode")
+    aid=command[command.index("--attempt-id")+1]
+    jobs.write_text("now\topen\trepo\tworktree\towner\t"+
+     f"attempt_id={aid},worker_type=owner,parent_sid=parent,launch_started=1,"+
+     f"owner_route_id={route['route_id']},owner_route_hash={route['route_hash']},"+
+     "parent_completion_delivery=codex-managed-gateway\n")
+    return subprocess.CompletedProcess(command,0,"registered=1 started=1 child_spawned=1\n","")
+   with mock.patch.object(W,"default_parent_session_id",return_value="parent"), \
+        mock.patch.object(W,"join_selected_attempts",return_value={"state":"timeout"}):
+    for _ in range(2):
+     result=W.start_work(route,path,jobs,run=admit)
+     self.assertEqual(result["state"],"running",result)
+   self.assertEqual(len(launches),1)
+ def test_depth_two_recipe_cannot_use_owner_candidates_instead_of_tuples(self):
+  with mock.patch.object(R,"_compose_readiness",return_value={"tuples":[],"candidates":self.registered_headless()["candidates"]}), \
+       self.assertRaisesRegex(ValueError,"nested eligibility tuples required"):
+   self.compose(dispatch_evidence=None,registered_headless_evidence=self.registered_headless())
+  route=self.compose()
+  route["registered_headless_candidates"]=self.registered_headless()["candidates"]
+  route["route_hash"]=R.route_hash(route)
+  route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
+  with self.assertRaisesRegex(ValueError,"nested route cannot substitute owner-only readiness"):
+   R.verify_route(route,R.ROOT)
+ def test_ship_unspecified_mode_keeps_default_deployment_recipe(self):
+  omitted=self.compose(capability="autopilot-ship",capability_mode=None,graph=None)
+  explicit=self.compose(capability="autopilot-ship",capability_mode="default",graph=None)
+  self.assertEqual(omitted["capability_mode"],"default")
+  self.assertEqual(omitted["nodes"],explicit["nodes"])
+  self.assertEqual([n["id"] for n in omitted["nodes"]],["release-setup","security-review","release-review","deploy","post-deploy-verify"])
+  self.assertEqual(omitted["human_gates"],["deploy-authorization"])
+  R.verify_route(omitted,R.ROOT)
+ def test_ship_package_cannot_select_deployment_nodes(self):
+  with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node:deploy"):
+   self.compose(capability="autopilot-ship",capability_mode="package",graph="package,deploy")
  def test_chosen_graph_does_not_require_presets_review_stage(self):
   for intensity in ("standard","strong"):
    route=self.compose(graph="plan,test,report",intensity=intensity)
@@ -6562,13 +6674,13 @@ class OwnerRegisteredCompletionTest(unittest.TestCase):
  setUp=InlineStageCompletionRecipeTest.setUp
  _restore=InlineStageCompletionRecipeTest._restore
 
- def fixture(self, **overrides):
+ def fixture(self, capability="autopilot-spec", capability_mode="update", node_id="prd-transaction", **overrides):
   t=TestRoute()
-  route=R.compile_route(**t.args(capability="autopilot-spec",capability_mode="update",
+  route=R.compile_route(**t.args(capability=capability,capability_mode=capability_mode,
    artifact_root=self.base/"artifacts",requested_intensity="standard",predicates=[],
    signals=["shared-contract"],transport="headless",inline_reason=None,
-   dispatch_evidence=t.dispatch(t.nested())))
-  node=next(n for n in route["nodes"] if n["id"]=="prd-transaction")
+   dispatch_evidence=t.dispatch(t.nested()),registered_headless_evidence=t.registered_headless()))
+  node=next(n for n in route["nodes"] if n["id"]==node_id)
   path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
   path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
   evidence=self.base/"artifacts"/"report.md"; evidence.write_text("검증 완료\n")
@@ -6596,7 +6708,7 @@ class OwnerRegisteredCompletionTest(unittest.TestCase):
    self.assertTrue(marker["registered_worker"])
    self.assertEqual(marker["attempt_id"],"att-terminal-owner")
    self.assertTrue(D.completion_marker_is_current(route,node,
-    R.completion_dir(route["route_id"])/"prd-transaction.json"))
+    R.completion_dir(route["route_id"])/(node["id"]+".json")))
    # Identity lookup and the real registry writer are exercised; OS liveness
    # is isolated so this fixture never claims anything about host processes.
    for process,state in ((D.ProcessQuiescence("quiescent","fixture"),"ready"),
@@ -6646,7 +6758,14 @@ class OwnerRegisteredCompletionTest(unittest.TestCase):
   with self.assertRaisesRegex(ValueError,"route identity"):
    R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,attempt_id="att-terminal-owner")
   self.assertEqual(self.jobs.read_bytes(),before)
-  self.assertFalse((R.completion_dir(route["route_id"])/"prd-transaction.json").exists())
+  self.assertFalse((R.completion_dir(route["route_id"])/(node["id"]+".json")).exists())
+
+
+class ShipPackageOwnerCompletionTest(OwnerRegisteredCompletionTest):
+ """The standard package owner uses existing registered completion and closure."""
+ def fixture(self, **overrides):
+  return super().fixture(capability="autopilot-ship",capability_mode="package",
+   node_id="package",**overrides)
 
 
 class ExactFenceFailureModeTest(unittest.TestCase):

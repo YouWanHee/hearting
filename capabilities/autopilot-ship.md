@@ -9,15 +9,20 @@ This is the portable capability contract for `autopilot-ship`. It defines runtim
 |---|---|
 | Identifier | `autopilot-ship` |
 | Group | `entry` |
-| Supported modes | `none` |
-| Portable meaning | Prepare application deployment/release setup and a ship checklist. |
-| Argument shape | `<task description (optional)> [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial]` |
+| Supported modes | `default, package` |
+| Portable meaning | Prepare application deployment/release setup or package existing artifacts for delivery. |
+| Argument shape | `<task description (optional)> [--mode default\|package] [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial]` |
 | Execution topology | `transactional-owner`; registry `capabilities/topologies.json` |
 | Entry load phase | `post-approval`; owner contract `capabilities/autopilot-ship.md` |
 
 ## Invocation Semantics
 
-Application deployment-setup entrypoint for projects with an existing `spec/`
+Two delivery purposes share this entrypoint. Omitted mode and `--mode default`
+retain the existing deployment/release path. `--mode package` collects existing
+artifacts into a delivery archive and uses its own minimal recipe below; it
+does not enter the deployment procedure.
+
+Default mode is an application deployment-setup entrypoint for projects with an existing `spec/`
 and substantially complete functionality. Guide the first ship setup,
 environment, domain, and migration deployment; select hosting (Vercel, Fly,
 Railway, Cloudflare, or EAS); create CI/CD files, `.env.example`, domain guidance,
@@ -25,6 +30,22 @@ and a deployment record. The user runs real deployment commands; this skill
 provides guidance only. Keep it distinct from autopilot-spec's initial
 spec/skeleton work. It may be rerun for environment changes, added domains, or
 production migration deployment.
+
+Package mode reuses the existing delivery template, explicitly named model
+versions, requested input/output list, and existing reports. Collect only that
+scope, check file presence, relative links, version consistency and archive
+contents, then provide the ZIP or requested equivalent. An application spec,
+hosting choice, CI/CD setup, deployment, installation, security/release review,
+training/evaluation, or report rewrite is not implied by packaging.
+
+Reuse sufficient results first. If sample outputs are missing, the necessary
+inference belongs to lab/eval and stays limited to the requested samples;
+do not silently expand to earlier datasets, alternative/old models, or full
+benchmark runs. A request for received field samples plus one or two simulations
+does not authorize raw59, A-weight96, IPC, or historical-model sweeps. A later
+approval to finish a 167-item batch is local to that batch, not a new default.
+Reusable packaging-program implementation belongs to code; new experiment
+analysis/reporting to lab; independent document drafting to draft.
 
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
@@ -69,7 +90,29 @@ Pipeline intensity follows `core/CONVENTIONS.md §1`: `direct` has no plan stage
 
 ## Stage Graph and Deploy Authorization
 
-The `standard+` graph is `release-setup → {security-review, release-review} →
+### Package
+
+Package uses the existing owner behavior and `ship-setup` completion contract:
+the verified delivery archive is its output. `direct` performs the bounded
+work inline; `quick` uses one one-shot owner; `standard+` uses one terminal
+`package` owner node. The owner performs the plan/check and file/link/version/
+archive verification appropriate to the selected intensity inside that work.
+Higher intensity preserves rigor and owner profile without adding deployment
+or unrelated review stages. No new approval, completion gate, manifest, or
+proof file is required. Existing route/producer completion remains unchanged.
+
+The package recipe has no `security-review`, `release-review`, `deploy`,
+`post-deploy-verify`, `eval-run`, or human-gate node. Select it by mode before
+recipe compilation; pruning the default deployment graph is not the package
+implementation. Outputs use the existing `release-config/` artifact bucket.
+Reuse the existing delivery layout and include a brief content/version note
+only when needed to make the archive usable. Verify the actual archive entries
+and that copied relative links resolve within the delivery; do not change or
+re-seal published source reports, experiment records, or previous archives.
+
+### Default deployment/release
+
+The default `standard+` graph is `release-setup → {security-review, release-review} →
 deploy → post-deploy-verify`. Both readiness reviews declare a `human-gate`
 continuation naming `deploy-authorization`, which binds to `deploy` as an entry
 gate: readiness passing never starts a deployment by itself. `deploy` records the

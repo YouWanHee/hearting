@@ -3,9 +3,9 @@
   "canonical_manifest": "harness-manifest.json",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:a5ac57240bcef5d93d1a7ca5c8a448aa6cdfe0ae46ad2bac3d99089c33a4926e",
+    "digest": "sha256:7fc152f5d99a5346207970c9ab5af660943220715a869110ac5c916557ea6853",
     "capabilities": 12,
-    "recipes": 27
+    "recipes": 28
   },
   "manifest_version": "2.0.0",
   "skills": [
@@ -168,12 +168,15 @@
       "name": "autopilot-ship",
       "group": "entry",
       "fam": "app",
-      "modes": [],
-      "blurb": "Prepare application deployment/release setup and a ship checklist.",
+      "modes": [
+        "default",
+        "package"
+      ],
+      "blurb": "Prepare application deployment/release setup or package existing artifacts for delivery.",
       "invocation_class": "entry-router",
-      "use_when": "Use when an application needs deployment or release configuration, readiness verification, and a ship checklist.",
-      "not_for": "Not for ordinary feature implementation or an unauthorized production deployment.",
-      "argument_hint": "<task description (optional)> [--intensity direct|quick|standard|strong|thorough|adversarial]"
+      "use_when": "Use when an application needs deployment/release preparation, or existing artifacts must be collected and checked in a delivery archive (package mode).",
+      "not_for": "Not for feature implementation, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop.",
+      "argument_hint": "<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]"
     },
     {
       "slug": "skill__autopilot-spec",

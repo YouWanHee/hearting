@@ -1,6 +1,6 @@
 ---
 name: autopilot-ship
-description: "Use when an application needs deployment or release configuration, readiness verification, and a ship checklist. Not for ordinary feature implementation or an unauthorized production deployment."
+description: "Use when an application needs deployment/release preparation, or existing artifacts must be collected and checked in a delivery archive (package mode). Not for feature implementation, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
 metadata:
   portable_source: capabilities/autopilot-ship.md
   adapter: opencode
@@ -33,9 +33,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 
 - Identifier: `autopilot-ship`
 - Invocation class: `entry-router`
-- Supported modes: `none`
-- Argument shape: `<task description (optional)> [--intensity direct|quick|standard|strong|thorough|adversarial]`
-- Portable meaning: Prepare application deployment/release setup and a ship checklist.
+- Supported modes: `default, package`
+- Argument shape: `<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]`
+- Portable meaning: Prepare application deployment/release setup or package existing artifacts for delivery.
 
 
 ## Workflow Evidence

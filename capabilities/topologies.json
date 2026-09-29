@@ -3261,6 +3261,91 @@
       }
     },
     {
+      "capability": "autopilot-ship",
+      "modes": [
+        "package"
+      ],
+      "topology_class": "transactional-owner",
+      "direct_predicates": [
+        "atomic-outcome",
+        "known-scope",
+        "no-shared-contract",
+        "no-resource-run",
+        "no-artifact-handoff",
+        "no-independent-verifier",
+        "focused-verification"
+      ],
+      "promotion_signals": [
+        "shared-contract",
+        "independent-verifier",
+        "stage-resume"
+      ],
+      "quick": {
+        "topology": "one-shot-owner",
+        "worker_kind": "capability-owner",
+        "write_scope": [
+          "release-config/**"
+        ],
+        "owner_dispatch_depth": 1,
+        "max_dispatch_depth": 1,
+        "model_profile": "balanced-deep"
+      },
+      "standard_plus": {
+        "topology": "transactional-owner",
+        "nodes": [
+          {
+            "id": "package",
+            "kind": "capability-owner",
+            "depends_on": [],
+            "role": "deep orchestrator",
+            "inputs": [
+              "task",
+              "existing-artifacts",
+              "delivery-template"
+            ],
+            "outputs": [
+              "release-config/**"
+            ],
+            "write_scope": [
+              "release-config/**"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "ship-setup",
+            "dispatch_depth": 1,
+            "fallback_hops": [
+              "same-harness-headless",
+              "cross-harness-headless",
+              "inline"
+            ],
+            "unit": "_kernel/owner",
+            "model_profile": "deep",
+            "advance_class": "model-required",
+            "model_required_reason": "terminal-report",
+            "commit_expected": false,
+            "terminal": true,
+            "terminal_gate": "ship-setup"
+          }
+        ],
+        "owner_dispatch_depth": 1,
+        "max_dispatch_depth": 1
+      },
+      "completion_gates": [
+        "ship-setup"
+      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
+      "resume_retry_boundaries": [
+        "package"
+      ],
+      "artifact_scope": {
+        "external_scopes": [
+          "release-config/**"
+        ],
+        "target_relative": true,
+        "review_anchor": "reviews"
+      }
+    },
+    {
       "capability": "autopilot-spec",
       "modes": [
         "api",
@@ -4168,7 +4253,7 @@
     },
     "ship-setup": {
       "kind": "custom",
-      "doc": "owner release configuration; conductor-owned"
+      "doc": "owner release configuration or verified delivery archive (package mode); conductor-owned"
     },
     "ship-security": {
       "kind": "unit-io",
