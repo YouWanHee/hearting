@@ -1,5 +1,5 @@
 ---
-description: "Run the portable autopilot-draft capability through the OpenCode adapter. Meaning: Document-drafting pipeline that produces an applicable artifact through strategy, drafting, verification, and editing."
+description: "Run the portable autopilot-draft capability through the OpenCode adapter. Meaning: Draft independent documents through strategy, verification, and editing."
 ---
 
 Use the OpenCode adapter realization of portable capability `autopilot-draft`.

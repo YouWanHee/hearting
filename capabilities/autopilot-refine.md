@@ -10,7 +10,7 @@ This is the portable capability contract for `autopilot-refine`. It defines runt
 | Identifier | `autopilot-refine` |
 | Group | `entry` |
 | Supported modes | `none` |
-| Portable meaning | Correct and update existing document/research artifacts while preserving snapshots and change history. |
+| Portable meaning | Correct existing documents with snapshots and change history. |
 | Argument shape | `"<prompt>" [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial] [--review-only \| --memo <file>] [--confirm] [--no-fact-check] [--no-style-audit]` |
 | Execution topology | `transactional-owner`; registry `capabilities/topologies.json` |
 | Entry load phase | `post-approval`; owner contract `capabilities/autopilot-refine.md` |

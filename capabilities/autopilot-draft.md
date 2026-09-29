@@ -10,7 +10,7 @@ This is the portable capability contract for `autopilot-draft`. It defines runti
 | Identifier | `autopilot-draft` |
 | Group | `entry` |
 | Supported modes | `paper, presentation, doc` |
-| Portable meaning | Document-drafting pipeline that produces an applicable artifact through strategy, drafting, verification, and editing. |
+| Portable meaning | Draft independent documents through strategy, verification, and editing. |
 | Argument shape | `<task description> [--mode paper\|presentation\|doc] [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial] [--user-refine] [--no-clarify] [--from analyze\|strategy\|strategy-refine\|draft\|draft-refine\|finalize]` |
 | Execution topology | `staged`; registry `capabilities/topologies.json` |
 | Entry load phase | `post-approval`; owner contract `capabilities/autopilot-draft.md` |

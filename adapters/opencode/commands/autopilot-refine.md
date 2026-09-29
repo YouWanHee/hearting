@@ -1,5 +1,5 @@
 ---
-description: "Run the portable autopilot-refine capability through the OpenCode adapter. Meaning: Correct and update existing document/research artifacts while preserving snapshots and change history."
+description: "Run the portable autopilot-refine capability through the OpenCode adapter. Meaning: Correct existing documents with snapshots and change history."
 ---
 
 Use the OpenCode adapter realization of portable capability `autopilot-refine`.

@@ -1,6 +1,6 @@
 ---
 name: autopilot-ship
-description: "Use when an application needs deployment/release preparation, or existing artifacts must be collected and checked in a delivery archive (package mode). Not for feature implementation, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
+description: "Use when preparing deployment/release or a delivery archive (package mode). Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
 ---
 
 # autopilot-ship
@@ -31,7 +31,7 @@ contract. It is adapter-owned output, not a legacy compatibility Skill copy.
 - Invocation class: `entry-router`
 - Supported modes: `default, package`
 - Argument shape: `<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]`
-- Portable meaning: Prepare application deployment/release setup or package existing artifacts for delivery.
+- Portable meaning: Prepare deployment/release setup or package existing artifacts.
 
 
 

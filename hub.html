@@ -559,10 +559,10 @@
         "presentation",
         "doc"
       ],
-      "blurb": "Document-drafting pipeline that produces an applicable artifact through strategy, drafting, verification, and editing.",
+      "blurb": "Draft independent documents through strategy, verification, and editing.",
       "invocation_class": "entry-router",
-      "use_when": "Use when a new paper, presentation, proposal, or report has an independent audience and document goal.",
-      "not_for": "Not for an experiment's own evaluation/result report (lab), existing-document correction, or source-code implementation.",
+      "use_when": "Use when a new document has an independent audience and document goal.",
+      "not_for": "Not for experiment reports (lab), existing-document edits, or code.",
       "argument_hint": "<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]"
     },
     {
@@ -574,10 +574,10 @@
         "setup",
         "eval"
       ],
-      "blurb": "Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results.",
+      "blurb": "Set up experiments, evaluate, and report results, including fixed results.",
       "invocation_class": "entry-router",
-      "use_when": "Use when experiment setup, empirical evaluation, failure reproduction, or the experiment's own analysis and result report is needed, including fixed results without new measurements.",
-      "not_for": "Not for reusable evaluation-program implementation, independent paper/presentation drafting, or fixed-data document layout/caption edits.",
+      "use_when": "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements.",
+      "not_for": "Not for reusable evaluation code, independent documents, or fixed-data document layout/caption edits.",
       "argument_hint": "<task description> [--mode setup|eval|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--report] [--from spec|scaffold|run|eval|summary]"
     },
     {
@@ -586,10 +586,10 @@
       "group": "entry",
       "fam": "doc",
       "modes": [],
-      "blurb": "Correct and update existing document/research artifacts while preserving snapshots and change history.",
+      "blurb": "Correct existing documents with snapshots and change history.",
       "invocation_class": "entry-router",
-      "use_when": "Use when an existing document or research artifact needs factual, structural, stylistic, or review-driven correction with history preserved.",
-      "not_for": "Not for independent new-document drafting, new empirical work, or the experiment's own evaluation/result reporting (lab).",
+      "use_when": "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history.",
+      "not_for": "Not for new documents, empirical work, or evaluation/result reporting (lab).",
       "argument_hint": "\"<prompt>\" [--intensity direct|quick|standard|strong|thorough|adversarial] [--review-only | --memo <file>] [--confirm] [--no-fact-check] [--no-style-audit]"
     },
     {
@@ -617,10 +617,10 @@
         "default",
         "package"
       ],
-      "blurb": "Prepare application deployment/release setup or package existing artifacts for delivery.",
+      "blurb": "Prepare deployment/release setup or package existing artifacts.",
       "invocation_class": "entry-router",
-      "use_when": "Use when an application needs deployment/release preparation, or existing artifacts must be collected and checked in a delivery archive (package mode).",
-      "not_for": "Not for feature implementation, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop.",
+      "use_when": "Use when preparing deployment/release or a delivery archive (package mode).",
+      "not_for": "Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop.",
       "argument_hint": "<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]"
     },
     {
