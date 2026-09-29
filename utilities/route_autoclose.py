@@ -576,7 +576,7 @@ def _cycles_by_route(records: list[dict]) -> dict:
 
 
 def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory: _Memory, *,
-                          deadline, now) -> list[dict]:
+                          deadline, now, campaign_id=None) -> list[dict]:
     """Open cycles behind an already closed route: the runtime's own closure at
     once (an interrupted sweep), anyone else's after `QUIET_SECONDS`.  A cycle
     that fails to seal is remembered with its evidence and skipped until that
@@ -592,7 +592,7 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
         if outcome_signature is None:
             continue   # the begin route is open: the route pass owns it
         cycle_id = record["cycle_id"]
-        if memory.recently_kept("cycle:" + cycle_id, now):
+        if record.get("campaign_id") != campaign_id and memory.recently_kept("cycle:" + cycle_id, now):
             continue
         remembered = memory.unsealable.get(cycle_id)
         if (remembered and remembered.get("signature") == record["_signature"]
@@ -751,7 +751,8 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
         if reason is None:
             kept(why)
             continue
-        remembered_why = memory.recently_kept("route:" + route_id, now)
+        # campaign-close is the user's explicit end: judge its members now.
+        remembered_why = None if route_id in members else memory.recently_kept("route:" + route_id, now)
         if remembered_why:
             kept(remembered_why)
             continue
@@ -781,7 +782,7 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
         if summary["closed"]:
             records = _open_cycles(root, memory)
         summary["cycles"] = _seal_unsealed_cycles(root, api, records, gather, memory,
-                                                  deadline=deadline, now=now)
+                                                  deadline=deadline, now=now, campaign_id=campaign_id)
 
 
 def report(summary: Mapping[str, Any], stream=None) -> None:

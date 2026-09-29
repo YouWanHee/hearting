@@ -634,6 +634,22 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
         self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "campaign-close")
 
+    def test_review4_campaign_close_judges_its_members_despite_the_recheck_interval(self):
+        route_file, route = self.compose("member-owned", "codex", "session-9", campaign="k4")
+        campaign = self.write_artifact(route)["campaign_id"]
+        metadata = f"attempt_id=att-owner,worker_type=owner,owner_route_id={route['route_id']}"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.jobs.write_text(f"{stamp}\trunning\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
+        self.age(route_file, "codex", "session-9", TWO_HOURS)
+        refused = self.campaign("campaign-close", campaign, "--reason", "done")
+        self.assertNotEqual(refused.returncode, 0)   # the owner still runs
+        self.assertIsNone(self.outcome(route_file))
+        # The owner just ended; the user closes the campaign within RECHECK_SECONDS.
+        self.jobs.write_text(f"2026-01-01T00:00:00Z\tdone\t{self.repo}\t{self.repo}\towned\t{metadata}\n")
+        closed = self.campaign("campaign-close", campaign, "--reason", "done")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        self.assertEqual(self.outcome(route_file)["autoclose"]["reason"], "campaign-close")
+
     # ---- the checkout and everything outside the artifact root ----------------
     def test_r5_checkout_bytes_and_index_are_untouched_and_git_is_only_read(self):
         shim_dir = self.base / "shim"
