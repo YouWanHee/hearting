@@ -27,6 +27,12 @@ artifact characteristics by default; an explicit user scope overrides it.
 Report only—never modify the artifact. This complements autopilot-refine:
 refine edits, while audit inspects.
 
+Use this capability for independent inspection of completed work, including
+code and experiment provenance. Code review within an implementation/debug
+cycle stays `autopilot-code --mode audit`. Measuring new data quality or
+reproducing an experimental failure is lab/eval; inspecting already completed
+evidence is audit. This boundary preserves both code-review capabilities.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Artifact Ownership

@@ -10,7 +10,7 @@ This is the portable capability contract for `autopilot-lab`. It defines runtime
 | Identifier | `autopilot-lab` |
 | Group | `entry` |
 | Supported modes | `setup, eval` |
-| Portable meaning | Rapid experiment prototyping around training setup and checkpoint evaluation/analysis. |
+| Portable meaning | Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results. |
 | Argument shape | `<task description> [--mode setup\|eval\|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct\|quick\|standard\|strong\|thorough\|adversarial] [--report] [--from spec\|scaffold\|run\|eval\|summary]` |
 | Execution topology | `staged+resource`; registry `capabilities/topologies.json` |
 | Entry load phase | `post-approval`; owner contract `capabilities/autopilot-lab.md` |
@@ -19,9 +19,11 @@ This is the portable capability contract for `autopilot-lab`. It defines runtime
 
 Rapid experiment prototype entrypoint. The user runs heavy training; the lab
 supports the work before and after it. `setup` prepares an experiment from spec
-to scaffold and run commands. `eval` analyzes a trained checkpoint through
-metrics, ablations, paper comparisons, plots, and optional formal reports
-(prose routes to autopilot-draft; audio/media uses playback HTML). Extension
+to scaffold and run commands. `eval` owns experiment evaluation, synthetic
+failure reproduction, model comparison, and the resulting analysis and report,
+including interpretation of already fixed metrics without new measurements.
+Prose and HTML reports remain lab outputs; audio/media uses playback HTML.
+Reuse sufficient existing results and select only the needed stages. Extension
 cases use `--parent <slug>` rather than new modes: fine-tuning creates a setup
 config branch, and reevaluation uses eval. Enforce per-experiment folders, a
 STORY narrative, and an append-only `_RUNLOG` timeline with pending/completed
@@ -109,7 +111,7 @@ advances `metrics`, and `sync` is the terminal node.
 
 ### Eval execution topology (`standard+`)
 
-The separable stages of a `standard+` eval are: (1) context and experiment
+The full recipe's separable stages of a `standard+` eval are: (1) context and experiment
 contract, (2) evaluation harness preparation, (3) checkpoint evaluation run,
 (4) metrics and per-array analysis, (5) figures, audio, and playback HTML,
 (6) canonical report-bundle assembly, (7) independent verification, (8)
@@ -125,6 +127,16 @@ opening one session per stage:
 | verification worker | read-only checks; verdict artifact only | 7 |
 | publication stage | `report-bundle publish` with explicit project/experiment/version, then destination verification; writes only the installed bundle root and `bundle-publication.json` | 8 |
 | closing stage | `autopilot-spec` update when applicable (a research-mode blueprint advances as a roadmap: close the step with its verdict and evidence, re-plan the tail), then offer only `bundle_id`, version, and `report/index.html` to the optional app-neutral sink; unavailable records `skipped/extension-unavailable` | 9 |
+
+This is a stage catalog, not a requirement to repeat completed computation.
+For reporting or media work on fixed results, use `WORKFLOW §0.2.1` to select
+the needed subgraph (for example `report,independent-verify,publish,sync` for a publishable
+report from existing inputs). Reuse metrics, checkpoints, and media; omit
+training, inference, and metric computation when the request does not need
+them. Keep the selected stages' intensity, verification, provenance, and
+completion contracts. The existing `report` stage uses `editorial/report`;
+its prose does not require a draft primary or a new cycle. Do not fabricate
+run state or rewrite a completed run merely to report its results.
 
 The main session or its dispatch-depth-1 conductor applies the `WORKFLOW §0.3`
 pre-execution gate before the checkpoint evaluation run, dispatches workers
@@ -287,13 +299,20 @@ companion, not an interchangeable equivalent format. A manifest without `bundle`
 readable and is classified `legacy/unspecified`. The legacy figure-semantic verifier
 remains a compatibility checker, not a second report manifest.
 
-`autopilot-lab` owns new empirical work: training setup, checkpoint
-reevaluation, metric/ablation computation, and experiment figure/media
-generation. Under `WORKFLOW §0.2`, a request containing such work keeps
-`autopilot-lab` as the primary capability even when phrased as a document
-update. `autopilot-refine` corrects existing document surfaces only;
-`autopilot-spec` records evaluation-policy or blueprint changes without
-executing them; formal prose assembly hands off to `autopilot-draft`. Every
+`autopilot-lab` owns experiment evaluation and its result report, with or
+without new empirical work. Under `WORKFLOW §0.2`, comparisons, interpretation,
+limitations, listening examples, and conclusions stay lab/eval even when the
+request names a report or HTML. New inference or synthetic failure reproduction
+also belongs here; fixed-data font, size, layout, caption, or table-order edits
+do not become empirical work merely because a figure is rendered again.
+`autopilot-refine`/`autopilot-apply` own document correction, including putting
+finalized metrics into an existing paper; `autopilot-draft` owns independent
+paper, presentation, proposal, or other document goals. Internal evaluation
+writing uses the existing lab report/editorial stage. `autopilot-spec` records
+evaluation-policy or blueprint changes without executing them. Reusable
+evaluation-driver or HTML-generator implementation/debugging belongs to
+`autopilot-code`; small support scripts can stay in the lab implementation
+stage without a separate code cycle. Every
 completed setup or eval durable terminal evaluates the route-sealed optional
 artifact-sink extension under `WORKFLOW §0.2`: after atomic bundle publication,
 an available sink receives receipt v2 identity (`bundle_id`, `version`, and

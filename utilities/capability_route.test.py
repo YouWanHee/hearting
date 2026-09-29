@@ -6324,6 +6324,30 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual([n["id"] for n in route["nodes"]],
    ["frame","frame-alternative","plan","plan-check","execute","impl-review","test","report"])
   R.verify_route(route,R.ROOT)
+ def test_lab_fixed_result_report_subgraph_does_not_require_a_new_eval_run(self):
+  """Reporting keeps lab ownership and selected gates without recomputation."""
+  for intensity in ("standard","strong"):
+   for graph in ("report,independent-verify,publish,sync","media,report,independent-verify,publish,sync"):
+    with self.subTest(intensity=intensity,graph=graph):
+     request={"text":"Report DSC fixed checkpoint results; reuse frozen aggregate metrics and existing media without new inference.","owner_harness":"codex"}
+     route=self.compose(capability="autopilot-lab",capability_mode="eval",graph=graph,intensity=intensity,work_request=request)
+     self.assertEqual(route["capability"],"autopilot-lab")
+     self.assertEqual(route["capability_mode"],"eval")
+     self.assertEqual(route["effective_intensity"],intensity)
+     expected=graph.split(",")
+     if intensity=="strong": expected.insert(expected.index("publish"),"independent-verify-alternative")
+     self.assertEqual([n["id"] for n in route["nodes"]],expected)
+     self.assertEqual(route["work_request"],request)
+     nodes={n["id"]:n for n in route["nodes"]}
+     self.assertEqual(nodes["report"]["unit"],"editorial/report")
+     self.assertTrue(nodes["sync"]["terminal"])
+     self.assertEqual(route["human_gates"],[])
+     preset=self.compose(capability="autopilot-lab",capability_mode="eval",graph=None,intensity=intensity)
+     originals={n["id"]:n for n in preset["nodes"]}
+     for name,node in nodes.items():
+      for field in ("unit","completion_gate","write_scope","model_profile"):
+       self.assertEqual(node.get(field),originals[name].get(field),(name,field))
+     R.verify_route(route,R.ROOT)
  def test_chosen_graph_does_not_require_presets_review_stage(self):
   for intensity in ("standard","strong"):
    route=self.compose(graph="plan,test,report",intensity=intensity)

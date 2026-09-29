@@ -1,6 +1,13 @@
 ## Eval mode: post-training evaluation and analysis
 
-Evaluate a completed checkpoint from the latest setup experiment or from `--parent <slug>` for reevaluation or new data.
+Evaluate a checkpoint, reproduce an experimental failure, or analyze and report
+the experiment's existing results. Use the latest setup experiment or
+`--parent <slug>` when applicable. For report/media-only work, reuse sufficient
+fixed metrics, checkpoint outputs, and media; select only needed stages under
+`WORKFLOW §0.2.1`, retaining intensity and verification. E1/E2 and run-state
+creation/finalization below apply when executing an evaluation, not merely
+reporting a completed one. Do not rerun inference or alter a completed run's
+status/timestamps to satisfy the eval label.
 
 > **Stage dispatch:** use the contract in `setup-procedure.md`. Apply the `WORKFLOW §0.3` pre-execution gate before E2. At standard+, group separable stages into workers by write ownership per the eval execution topology in `capabilities/autopilot-lab.md`, and dispatch them as dispatch-depth-2 headless sessions with file-only handoff. Each worker reads only artifact paths such as `metrics.jsonl`, `REPORT.md`, and research inputs, never earlier conversational context. Running a separable stage inline requires the recorded reason in `_RUNLOG` or the experiment `_internal/` (`OPERATIONS §5.10` inline exceptions).
 
@@ -11,7 +18,7 @@ Evaluate a completed checkpoint from the latest setup experiment or from `--pare
 | E2 execution (eval worker) | `qa/test` unit, functional | `eval.py` and checkpoint | Metric values in `run.json best` plus `metrics.jsonl` | Dispatched dispatch depth 2 |
 | E3-2 plot / E3-5 media (media worker) | `material/figure-gen` unit | `metrics.jsonl`, audio outputs | `figures/*.{png,pdf}`, playback `report/*.html` | Dispatched dispatch depth 2 |
 | E3-3 compare | `research/research-survey` unit | `REPORT.md`, `research/`, and `analysis_project/paper/` | Comparison section in `REPORT.md` | Dispatched dispatch depth 2 |
-| E3-4/E3-5 report assembly (report worker) | `editorial/report` unit or draft handoff | metrics, figures, STORY inputs | `REPORT.md`, `STORY.md`, `summary.md` | Dispatched dispatch depth 2 |
+| E3-4/E3-5 report assembly (report worker) | lab's `editorial/report` unit | metrics, figures, STORY inputs | `REPORT.md`, `STORY.md`, `summary.md` | Dispatched dispatch depth 2 |
 | Independent verification | `qa/test` unit, read-only | Final artifacts | Verdict record under `_internal/` | Dispatched dispatch depth 2, read-only |
 | Bundle publication | owner, deterministic CLI | Verified staged `report/` plus explicit project/experiment/version | `bundle-publication.json` | Run `tools/report-bundle.py publish`; version is never inferred |
 | Optional artifact sink | `autopilot-spec` update when applicable, then app-neutral artifact emission | `bundle-publication.json` | Sink receipt v2 or typed skip | After terminal sync: available sends only bundle_id/version/report/index.html; unavailable records `skipped/extension-unavailable` |
@@ -63,7 +70,7 @@ Embed every generated figure in `REPORT.md` with `![<caption>](figures/<plot>.pn
 
 **E3-5. Optional formal report** for `--report`, `보고서 써줘`, `공유용`, or high-stakes publication:
 
-- **General prose report:** hand off to `autopilot-draft --mode doc` with `summary.md`, `STORY.md`, `figures/`, and run metrics. Draft owns prose generation and produces `documents/{date}_{slug}/`; eval only requests the handoff.
+- **Experiment result report:** use lab's existing `report` / `editorial/report` stage with `summary.md`, `STORY.md`, `figures/`, and run metrics. Lab owns comparison, interpretation, limitations, and conclusions even when no new measurements are needed. Prose or sharing does not create a draft cycle. Only an independent paper, presentation, proposal, or other document brief routes to `autopilot-draft`.
 - **Playback HTML for audio/media experiments:** have the `material/figure-gen` unit generate separated audio, spectrogram segments, and embedded `<audio>`/`<img>` in `experiments/{date}_{slug}/report/report.html`. Markdown previews block `<audio>`, so an audio domain makes this HTML the primary `interactive` playback representation and `REPORT.md` its `summary`/`navigation` companion; they are not interchangeable equivalent formats. Declare both in the manifest `bundle` with one shared `title` and `primary_representation_id`. Split long audio into pages of bounded segments. When necessary, serve locally through `python -m http.server --bind 0.0.0.0 <port>` and provide the URL.
 
 Assemble publishable output in a staged `report/` with canonical
@@ -88,7 +95,7 @@ consumer serves verified playback with CSP
 - `REPORT.md` is the self-contained final report. Put Executive Summary first, followed by background, hypothesis, method, results, interpretation, conclusion, next steps, and reproduction. Embed figures. Define every condition, structure, acronym, and metric so a reader without the conversation understands it. Consolidate summary, STORY, metrics, and figures here.
 - `summary.md` is only a one-line index for RUNLOG and parent auto-loading, with a verdict and a pointer to `REPORT.md`; it is not the user deliverable.
 - `STORY.md` accumulates motivation, previous or parent context, this attempt, result, and next candidate.
-- Update the existing experiment row in `<artifact-root>/experiments/_RUNLOG.md` from pending to done with result and next step. Do not append a second row. Mark the attempt with `(← <parent_slug>)` when applicable. Append only when an eval-only entry has no existing row. Use failed status for interruption or failure.
-- Update the existing `run.json` to `status: "done"`, current `ended_at`, and `best: {name,value,step}` using the same metric as the report and RUNLOG. On failure, write `status: "failed"` and `ended_at` but omit `best`.
+- For an evaluation executed in this work, update the existing experiment row in `<artifact-root>/experiments/_RUNLOG.md` from pending to done with result and next step. Do not append a second row. Mark the attempt with `(← <parent_slug>)` when applicable. Append only when an eval-only entry has no existing row. Use failed status for interruption or failure. Reporting existing results preserves the completed run's state and lineage.
+- For that executed evaluation, update the existing `run.json` to `status: "done"`, current `ended_at`, and `best: {name,value,step}` using the same metric as the report and RUNLOG. On failure, write `status: "failed"` and `ended_at` but omit `best`. A report-only failure does not relabel a completed evaluation as failed.
 - Emit `run.json best` and parent delta for worklog consumption. Lab emits only; worklog receives and creates cards. Do not recompute the result or push proactively.
 - After `REPORT.md`, `STORY.md`, `_RUNLOG.md`, and `run.json` are durable, verify the staged bundle, publish it atomically with explicit project/experiment/version, and verify the destination. Record `bundle-publication.json` without an absolute root. After sync, evaluate the route-sealed optional artifact-sink extension for done and failed terminal states with durable artifacts. When available, send receipt v2 with only stable bundle identity, version, and `report/index.html`; on unavailable, record `skipped/extension-unavailable`. User suggestion does not override either branch.

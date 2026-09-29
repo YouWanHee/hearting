@@ -1,6 +1,6 @@
 ---
 name: autopilot-draft
-description: "Use when a new paper, presentation, report, proposal, or other user-facing document must be produced from evidence. Not for correcting only an existing document or for source-code implementation."
+description: "Use when a new paper, presentation, proposal, or report has an independent audience and document goal. Not for an experiment's own evaluation/result report (lab), existing-document correction, or source-code implementation."
 metadata:
   portable_source: capabilities/autopilot-draft.md
   adapter: opencode

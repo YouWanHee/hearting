@@ -1,5 +1,5 @@
 ---
-description: "Run the portable autopilot-lab capability through the OpenCode adapter. Meaning: Rapid experiment prototyping around training setup and checkpoint evaluation/analysis."
+description: "Run the portable autopilot-lab capability through the OpenCode adapter. Meaning: Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results."
 ---
 
 Use the OpenCode adapter realization of portable capability `autopilot-lab`.
@@ -20,7 +20,7 @@ This is adapter-owned output generated from `capabilities/autopilot-lab.md`, not
 
 Portable contract excerpt:
 
-- Invocation semantics: Rapid experiment prototype entrypoint. The user runs heavy training; the lab supports the work before and after it. `setup` prepares an experiment from spec to scaffold and run commands. `eval` analyzes a trained checkpoint through metrics, ablations, paper comparisons, plots, and optional formal reports (prose routes to autopilot-draft; audio/media uses playback HTML). Extension cases use `--parent <slug>` rather than new modes: fine-tuning creates a setup config branch, and reevaluation uses eval. Enforce per-experiment folders, a STORY narrative, and an append-only `_RUNLOG` timeline with pending/completed state and parent links to prevent overwrites and ad hoc loss. Automatically read `experiment_conventions.md` and `similar_models.md` from analyze-project, giving the user's existing layer, prefix, and config patterns priority. Graduate refinement or library work to autopilot-code. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
+- Invocation semantics: Rapid experiment prototype entrypoint. The user runs heavy training; the lab supports the work before and after it. `setup` prepares an experiment from spec to scaffold and run commands. `eval` owns experiment evaluation, synthetic failure reproduction, model comparison, and the resulting analysis and report, including interpretation of already fixed metrics without new measurements. Prose and HTML reports remain lab outputs; audio/media uses playback HTML. Reuse sufficient existing results and select only the needed stages. Extension cases use `--parent <slug>` rather than new modes: fine-tuning creates a setup config branch, and reevaluation uses eval. Enforce per-experiment folders, a STORY narrative, and an append-only `_RUNLOG` timeline with pending/completed state and parent links to prevent overwrites and ad hoc loss. Automatically read `experiment_conventions.md` and `similar_models.md` from analyze-project, giving the user's existing layer, prefix, and config patterns priority. Graduate refinement or library work to autopilot-code. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
 User arguments from OpenCode: `$ARGUMENTS`

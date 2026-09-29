@@ -117,24 +117,39 @@ This document plus the runtime adapter bootstrap is the routing source of truth.
 
 ### 0.2. Semantic Primary Routing
 
-Choose the primary capability from the core new work the request performs, not
+Choose the primary capability from the purpose of the work the request performs, not
 from the artifact the user names or the surface verb such as "update", "fix",
 or "정리". A request that ends in "update the report" still has its primary
-decided by what must newly happen before any report can change.
+decided by the evaluation, implementation, or independent document goal it serves.
 
 Precedence, highest first:
 
-1. New empirical work — training, checkpoint reevaluation or analysis,
-   metric or ablation computation, plot/figure generation, or audio/media
-   artifact generation — makes `autopilot-lab` the primary capability
-   (`eval` for checkpoint-centered work, `setup` for new training).
+1. Experiment evaluation and its result report belong to `autopilot-lab`
+   (`eval` for evaluation, analysis, and result reporting; `setup` for new
+   training). This includes new inference, synthetic failure reproduction,
+   metric/ablation computation, and figures or media that produce new empirical
+   comparisons. It also includes interpretation, limitations, listening
+   comparisons, and conclusions from already fixed results, without new
+   measurements. Prose, Markdown, or HTML does not change this ownership.
+   Reuse existing metrics, checkpoints, and media when sufficient; select only
+   needed stages, including the existing `report` / `editorial/report` stage,
+   under §0.2.1. Reporting alone requires neither a new training/inference run,
+   the full eval loop, nor a separate draft cycle. Preserve the selected
+   intensity, verification, and experiment lineage.
 2. With no new empirical work, correcting only the wording, structure, or
-   errors of an existing document makes `autopilot-refine` the primary.
+   errors of an existing document makes `autopilot-refine` the primary
+   (`autopilot-apply` for an approved patching guide). Re-rendering fixed data
+   with different size, fonts, layout, captions, or table order is document
+   correction or work within the existing artifact owner, not new empirical
+   evaluation. Updating a paper with finalized metrics stays refine/apply;
+   interpreting and reporting the experiment itself stays lab/eval.
 3. A change to requirements, evaluation policy, or any blueprint surface adds
    `autopilot-spec` update as a secondary spec-sync step; it never replaces
    the execution primary.
-4. Formal report prose assembly routes through `autopilot-draft` or the owning
-   capability's draft handoff as a secondary step.
+4. `autopilot-draft` owns a new independent document goal: a paper,
+   presentation, proposal, or report with its own audience and document brief.
+   Writing inside an experiment report uses lab's report/editorial support
+   without changing primary or creating a separate cycle for prose.
 5. Durable result routing may offer the canonical artifact to the optional
    `artifact-sink` extension, always secondary and last. The portable harness
    owns only the closed `artifact.completed` receipt and a local registration
@@ -163,9 +178,25 @@ Precedence, highest first:
 
 | Request shape | Primary | Secondary |
 |---|---|---|
-| "Reevaluate the model on a new test set and update the report" | `autopilot-lab --mode eval` | refine/draft document pass; `autopilot-spec` on policy change; optional artifact sink |
+| "Reevaluate the model on a new test set and update the report" | `autopilot-lab --mode eval` | existing lab report stage; `autopilot-spec` on policy change; optional artifact sink |
+| "DSC final evaluation: infer with two fixed checkpoints, reuse frozen aggregates, and report the comparison" | `autopilot-lab --mode eval` | existing media/report stages |
+| "Report the experiment's conclusions and limitations from fixed metrics; no new inference" | `autopilot-lab --mode eval` | existing report/editorial support only as needed |
+| "DSC analysis: synthesize cases to reproduce the field failure" | `autopilot-lab --mode eval` | analyze-project for existing code/graphs when useful |
+| "TF paper: reduce figure height and reorder table columns using the same data" | `autopilot-refine` | apply an approved guide, or keep the existing artifact owner |
+| "Put finalized experiment metrics into the existing paper" | `autopilot-refine` | `autopilot-apply` for an approved guide |
+| "Write an independent paper or presentation from the evaluation" | `autopilot-draft` | consume existing lab results |
+| "Implement a reusable evaluation driver or fix the HTML generator's path bug" | `autopilot-code` | lab only if a separate empirical evaluation is requested |
 | "Fix only the typos and sentences in REPORT.md" | `autopilot-refine` | — |
 | "Change the evaluation mixing policy to unscaled and reevaluate" | `autopilot-lab --mode eval` | `autopilot-spec` update; neither replaces the other |
+
+An "analysis" label does not select a capability: reading existing code or
+papers uses analyze-project/research as appropriate; new synthesis, failure
+reproduction, or model comparison uses lab/eval; implementing a reusable
+evaluation program uses code. Small experiment-support scripts remain within
+lab's existing implementation stages and do not automatically open a code cycle.
+Likewise, code review within an implementation/debug cycle belongs to
+`autopilot-code --mode audit`; independent inspection of completed work belongs
+to `audit`. Both may inspect code; purpose, not file type, decides the owner.
 
 Added after a 2026-07-14 incident where a checkpoint reevaluation with report
 regeneration was routed to `autopilot-refine` as primary from its surface
