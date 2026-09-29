@@ -96,6 +96,16 @@ class RuleTest(unittest.TestCase):
         ctx = self._ctx()
         self.assertEqual(CT._reject_code("a/b title", ctx, set()), "filename-like")
         self.assertEqual(CT._reject_code("plan report.md", ctx, set()), "filename-like")
+        for candidate in ("docs/9/21 report", "9/21/summary", "2026/09/21 report",
+                          "9/99 report", "9/21 report.md", "9/21 foo/bar"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(CT._reject_code(candidate, ctx, set()), "filename-like")
+
+    def test_accept_month_day_in_natural_title(self):
+        ctx = self._ctx(record={"title": "9/21 현장 요청 — 최종 분석 및 평가 보고서"})
+        decision = CT.derive_display_title(ctx, existing_title=None, reserved=set())
+        self.assertEqual(decision.title, "9/21 현장 요청 — 최종 분석 및 평가 보고서")
+        self.assertEqual(decision.source, "record-title")
 
     def test_reject_generic(self):
         # A single-word candidate like "Report" is caught earlier by R-TOKEN

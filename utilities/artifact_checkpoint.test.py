@@ -430,6 +430,19 @@ class CheckpointDisplayTitleTest(CheckpointTestBase):
         path = self.root / CT.CYCLE_TITLES_REL
         return json.loads(path.read_text())["entries"] if path.exists() else []
 
+    def test_month_day_record_title_is_declared_on_first_checkpoint(self):
+        title = "9/21 현장 요청 — 최종 분석 및 평가 보고서"
+        _, _, result = self.begin(mode="debug", title=title)
+        cycle_id = result["cycle_id"]
+        self.write_output(result, data="# M3_5 → M3_9 최종 분석 및 평가 보고서\n".encode())
+        self.assertEqual(P.checkpoint(self.root, cycle_id=cycle_id)["status"], "emitted")
+        entries = self.titles()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["cycle_id"], cycle_id)
+        self.assertEqual(entries[0]["display_title"], title)
+        self.assertEqual(entries[0]["manifest_bindings"][0]["manifest_revision_id"],
+                         json.loads(P.open_manifest_path(self.root, cycle_id).read_text())["manifest_revision_id"])
+
     def test_heading_refresh_rebinds_current_manifest_and_seal(self):
         self.write_output(self.result, data="# 열린 사이클의 첫 제목\n".encode())
         first = P.checkpoint(self.root, cycle_id=self.cycle_id)

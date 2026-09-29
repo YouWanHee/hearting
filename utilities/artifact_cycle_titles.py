@@ -67,6 +67,9 @@ _REJECT_ORDER = (
 )
 _TOKEN_RE = re.compile(r"^[\w.\-]+$")
 _FILENAME_EXT_RE = re.compile(r"\.(md|json|ya?ml|txt|py|sh)$", re.IGNORECASE)
+# A whitespace-delimited month/day in prose is a date, not a path separator.
+# Keep every other slash (including a second slash in a longer path) rejected.
+_MONTH_DAY_RE = re.compile(r"(?<!\S)(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?=\s)")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ROUTE_PREFIX_HASH_RE = re.compile(r"^#+\s*")
 _ROUTE_PREFIX_TASK_RE = re.compile(r"^Task:\s*", re.IGNORECASE)
@@ -287,7 +290,7 @@ def _reject_code(candidate: str, ctx: CycleContext, reserved: Set[str], *, sourc
         return "campaign-title"
     if " " not in candidate and _TOKEN_RE.fullmatch(candidate):
         return "token-only"
-    if "/" in candidate or _FILENAME_EXT_RE.search(candidate):
+    if "/" in _MONTH_DAY_RE.sub("", candidate) or _FILENAME_EXT_RE.search(candidate):
         return "filename-like"
     folded = candidate.casefold()
     if folded in GENERIC_TITLES_EXACT or any(forbidden in folded for forbidden in CTR.FORBIDDEN_GENERIC_TITLES):
