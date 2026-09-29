@@ -136,10 +136,17 @@ write guard into one route-bound `_internal/versions/v{N}/` directory; the
 model does not allocate or copy versions. The abstract `target-artifact` write
 scope resolves only to `documents/<artifact>/**` and `research/<artifact>/**`.
 It never owns new empirical work: under `WORKFLOW §0.2`, a request
-that also requires reevaluation, new metrics, or new figure/media generation
+that also requires reevaluation, new metrics, or figures/media from new empirical analysis
 routes that work to `autopilot-lab` (or the owning execution capability) as
 primary, with refine as a secondary document pass over the finalized results.
 Blueprint or evaluation-policy changes belong to `autopilot-spec` update.
+
+Re-rendering fixed data with changed figure height, fonts, layout, captions,
+or table order remains refine/apply or the existing artifact owner's work.
+Inserting finalized metrics into a paper is also document correction.
+The experiment's own interpretation, comparison, limitations, and result report
+remain lab/eval even without new measurements; the absence of a new run alone
+does not make refine primary.
 
 After the confirmed transaction, evaluate the route-sealed optional
 artifact-sink extension with the canonical revised artifact—not the snapshot or

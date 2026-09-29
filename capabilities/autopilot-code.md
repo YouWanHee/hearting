@@ -26,6 +26,12 @@ and option consistency; research checks reproducibility, configs, and metrics.
 Non-code decisions such as PRDs, stack selection, skeletons, and ship setup
 belong to autopilot-spec.
 
+Reusable evaluation drivers and HTML/report-generator bugs are code work.
+Experiment execution and result reporting belong to lab/eval, whose small
+support scripts do not automatically require a separate code cycle.
+Code review within implementation/debug work uses `--mode audit`; independent
+inspection of completed work uses `audit`. Both may inspect code.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Artifact Ownership

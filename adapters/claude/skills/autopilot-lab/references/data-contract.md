@@ -90,9 +90,16 @@ At evaluation completion, emit the `run.json best` result plus its delta from th
 
 ### `report/` — iframe-rendered report artifacts
 
-`experiments/<id>/report/` is the HTML directory rendered by the dashboard in a sandboxed iframe. One directory supports two producers:
+`experiments/<id>/report/` is the legacy HTML directory rendered by the dashboard
+in a sandboxed iframe. Ownership follows `WORKFLOW §0.2`, not the HTML format:
 
 - Lab continues to generate its existing audio/media playback page at `report/report.html`, including separated audio, spectrograms, `<audio>`, and `<img>` embeds.
-- `autopilot-draft` or design produces rich prose HTML. Lab does not generate prose HTML itself.
+- Lab's report/editorial stage also produces the experiment's prose result
+  report and canonical `report/index.html` bundle from existing or new results.
+- `autopilot-draft` or design owns an independent document or design goal,
+  not the experiment report merely because it contains prose HTML.
 
-The statement that draft/design owns `report/` applies only to prose reports; it does not prohibit lab's audio HTML. These may coexist with `REPORT.md`: lab Markdown, lab audio/media HTML, and draft/design prose HTML. Coexistence is not equivalence: each is a distinct representation with its own `roles` in the manifest `bundle`, and only an explicit `bundle.equivalence_groups` entry declares two of them equivalent.
+Prose and playback may coexist with `REPORT.md` under the same lab owner.
+Coexistence is not equivalence: each is a distinct representation with its own
+`roles` in the manifest `bundle`, and only an explicit
+`bundle.equivalence_groups` entry declares two of them equivalent.

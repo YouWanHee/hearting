@@ -108,6 +108,12 @@ Artifact absence alone is not a trigger. New empirical evaluation belongs to
 implementation to `autopilot-code`, and inspection of completed work to
 `audit`. Apply those semantic primaries before this initial-analysis default.
 
+An analysis request that includes new synthetic failure reproduction, inference,
+or model comparison is lab/eval work, even when existing code or graphs also
+need reading. Reporting the experiment's own fixed results likewise stays
+lab/eval. Implementing a reusable evaluation program is code work; a small
+experiment-support script need not become a separate code cycle.
+
 After persistent analysis becomes durable, evaluate the optional artifact-sink
 extension from `WORKFLOW §0.2`. When the sink is available, offer the canonical
 analysis artifact through the app-neutral receipt contract. When it is absent,

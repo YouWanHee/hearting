@@ -1,6 +1,6 @@
 ---
 name: autopilot-refine
-description: "Use when an existing document or research artifact needs factual, structural, stylistic, or review-driven correction with history preserved. Not for drafting a new artifact or performing new empirical work required before the document can change."
+description: "Use when an existing document or research artifact needs factual, structural, stylistic, or review-driven correction with history preserved. Not for independent new-document drafting, new empirical work, or the experiment's own evaluation/result reporting (lab)."
 metadata:
   portable_source: capabilities/autopilot-refine.md
   adapter: opencode

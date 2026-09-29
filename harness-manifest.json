@@ -183,8 +183,8 @@
    "summary": "Document-drafting pipeline that produces an applicable artifact through strategy, drafting, verification, and editing.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when a new paper, presentation, report, proposal, or other user-facing document must be produced from evidence.",
-    "not_for": "Not for correcting only an existing document or for source-code implementation."
+    "use_when": "Use when a new paper, presentation, proposal, or report has an independent audience and document goal.",
+    "not_for": "Not for an experiment's own evaluation/result report (lab), existing-document correction, or source-code implementation."
    },
    "argument_shape": "<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]",
    "requires": {
@@ -208,11 +208,11 @@
     "setup",
     "eval"
    ],
-   "summary": "Rapid experiment prototyping around training setup and checkpoint evaluation/analysis.",
+   "summary": "Experiment training setup, evaluation/analysis, and result reporting, including reports from fixed results.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when training setup, checkpoint evaluation, ablation, metric computation, or other new empirical output is required.",
-    "not_for": "Not for ordinary production-code changes that create no new experiment or evaluation result."
+    "use_when": "Use when experiment setup, empirical evaluation, failure reproduction, or the experiment's own analysis and result report is needed, including fixed results without new measurements.",
+    "not_for": "Not for reusable evaluation-program implementation, independent paper/presentation drafting, or fixed-data document layout/caption edits."
    },
    "argument_shape": "<task description> [--mode setup|eval|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--report] [--from spec|scaffold|run|eval|summary]",
    "requires": {
@@ -237,7 +237,7 @@
    "invocation": {
     "class": "entry-router",
     "use_when": "Use when an existing document or research artifact needs factual, structural, stylistic, or review-driven correction with history preserved.",
-    "not_for": "Not for drafting a new artifact or performing new empirical work required before the document can change."
+    "not_for": "Not for independent new-document drafting, new empirical work, or the experiment's own evaluation/result reporting (lab)."
    },
    "argument_shape": "\"<prompt>\" [--intensity direct|quick|standard|strong|thorough|adversarial] [--review-only | --memo <file>] [--confirm] [--no-fact-check] [--no-style-audit]",
    "requires": {

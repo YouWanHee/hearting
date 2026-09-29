@@ -1,7 +1,7 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
 name: autopilot-draft
-description: "Use when a new paper, presentation, report, proposal, or other user-facing document must be produced from evidence. Not for correcting only an existing document or for source-code implementation."
+description: "Use when a new paper, presentation, proposal, or report has an independent audience and document goal. Not for an experiment's own evaluation/result report (lab), existing-document correction, or source-code implementation."
 argument-hint: "<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]"
 metadata:
   group: entry
@@ -9,8 +9,8 @@ metadata:
   invocation_class: entry-router
   modes: ["paper", "presentation", "doc"]
   blurb: "Document-drafting pipeline that produces an applicable artifact through strategy, drafting, verification, and editing."
-  use_when: "Use when a new paper, presentation, report, proposal, or other user-facing document must be produced from evidence."
-  not_for: "Not for correcting only an existing document or for source-code implementation."
+  use_when: "Use when a new paper, presentation, proposal, or report has an independent audience and document goal."
+  not_for: "Not for an experiment's own evaluation/result report (lab), existing-document correction, or source-code implementation."
 ---
 
 # autopilot-draft

@@ -147,6 +147,15 @@ Adapters must preserve the portable invariants relevant to this capability:
 
 ## Routing Boundary
 
+Choose draft for an independent document goal with its own audience and brief,
+such as a new paper, presentation, proposal, or standalone report. The experiment's
+own evaluation, comparisons, interpretation, limitations, and conclusion report
+remain `autopilot-lab --mode eval`, even with fixed results and no new measurements.
+Prose, Markdown, HTML, or sharing the report does not by itself create a draft
+primary or a separate cycle. Use the owning capability's existing report/editorial
+stage for internal writing; consume lab results here only for the independent
+document goal. Corrections to an existing paper belong to refine/apply.
+
 After finalization makes the canonical `final-artifact` durable, evaluate the
 route-sealed optional artifact-sink extension. When available, offer the
 artifact through the app-neutral receipt contract. When unavailable, record

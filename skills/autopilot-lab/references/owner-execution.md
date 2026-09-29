@@ -79,7 +79,7 @@ One-shot data conversion, cleanup, or utility scripts are not lab experiments. R
 
 Infer `setup` for requests that define a new training, ablation, loss, model variation, or fine-tuning run. Infer `eval` for requests centered on an existing checkpoint, metrics, result analysis, test data, or paper comparison. Use `--parent` when the request clearly extends or reevaluates an existing experiment.
 
-Routing is semantic (WORKFLOW §0.2 (`<agent-home>/core/WORKFLOW.md#02-semantic-primary-routing`)): a request that includes checkpoint reevaluation, new metrics, or new figure/media work keeps this capability primary even when phrased as a report update; refine, spec, draft, and note attach as secondaries. Before long-running eval execution, apply the WORKFLOW §0.3 (`<agent-home>/core/WORKFLOW.md#03-pre-execution-gate-for-long-running-work`) pre-execution gate and, at `standard+`, the eval stage-worker topology.
+Routing is semantic (WORKFLOW §0.2 (`<agent-home>/core/WORKFLOW.md#02-semantic-primary-routing`)): checkpoint evaluation, synthetic failure reproduction, and the experiment's own analysis and result report stay lab/eval, including fixed results without new measurements. Use the existing report/editorial stage; prose or HTML alone never requires a draft primary or a separate cycle. Select only needed stages and reuse completed metrics/media without forcing training, inference, or the full eval loop. Independent papers/presentations belong to draft; fixed-data document formatting belongs to refine/apply or the existing artifact owner. Before long-running eval execution, apply the WORKFLOW §0.3 (`<agent-home>/core/WORKFLOW.md#03-pre-execution-gate-for-long-running-work`) pre-execution gate and, at `standard+`, the selected eval stage-worker topology.
 
 Defaults:
 
@@ -92,9 +92,10 @@ Defaults:
 Direct boundaries:
 
 - One-shot conversion or cleanup → `/autopilot-code --intensity quick`
-- Plot-only work → the `material/figure-gen` unit
+- New empirical plots → lab's `material/figure-gen` unit; fixed-data font/size/layout/caption changes → refine/apply or the existing artifact owner
 - Productionization, packaging, or broader spec work → `/autopilot-code` or `/autopilot-spec`
 - Document wording/structure-only fixes with no new empirical work → `/autopilot-refine`
+- Reusable evaluation-driver/HTML-generator implementation or bugs → `/autopilot-code`; small experiment-support scripts may stay in lab
 - An explicit `/autopilot-lab <args>` invocation supplies the routing choice directly
 
 ## Language Rule

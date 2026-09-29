@@ -72,6 +72,66 @@ for c in r_route_lab_eval_primary r_route_refine_doc_only r_route_spec_policy_la
   sh -n "$d/fixture.sh" 2>/dev/null && ok "drill $c fixture sh-clean" || bad "drill $c fixture 문법 오류"
 done
 
+# Semantic examples are documentation contracts, not a keyword router or a
+# claim about live model behavior. Check each example's own primary column.
+if python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+workflow = (root / 'core/WORKFLOW.md').read_text()
+cases = {
+    'DSC final evaluation: infer with two fixed checkpoints': 'autopilot-lab --mode eval',
+    "Report the experiment's conclusions and limitations from fixed metrics": 'autopilot-lab --mode eval',
+    'DSC analysis: synthesize cases': 'autopilot-lab --mode eval',
+    'TF paper: reduce figure height': 'autopilot-refine',
+    'Put finalized experiment metrics into the existing paper': 'autopilot-refine',
+    'Write an independent paper or presentation': 'autopilot-draft',
+    'Implement a reusable evaluation driver or fix the HTML generator': 'autopilot-code',
+    'Fix only the typos and sentences in REPORT.md': 'autopilot-refine',
+}
+rows = [line.split('|') for line in workflow.splitlines() if line.startswith('| "')]
+for request, primary in cases.items():
+    matches = [row for row in rows if request in row[1]]
+    assert len(matches) == 1 and matches[0][2].strip() == f'`{primary}`', request
+
+manifest = json.loads((root / 'harness-manifest.json').read_text())['capabilities']
+assert 'without new measurements' in manifest['autopilot-lab']['invocation']['use_when']
+assert 'independent audience and document goal' in manifest['autopilot-draft']['invocation']['use_when']
+assert 'fixed-data document layout/caption edits' in manifest['autopilot-lab']['invocation']['not_for']
+assert 'evaluation/result reporting (lab)' in manifest['autopilot-refine']['invocation']['not_for']
+trees = (
+    'skills', 'adapters/claude/skills',
+    'adapters/claude/plugin-marketplace/plugins/hearting-claude/skills',
+    'adapters/codex/skills', 'adapters/codex/plugins/hearting-codex/skills',
+    'adapters/opencode/skills',
+)
+for name in ('autopilot-lab', 'autopilot-draft', 'autopilot-refine'):
+    for tree in trees:
+        path = root / tree / name / 'SKILL.md'
+        text = path.read_text()
+        for field in ('use_when', 'not_for'):
+            assert manifest[name]['invocation'][field] in text, (path, field)
+
+for path in [root / 'core/WORKFLOW.md', root / 'capabilities/autopilot-lab.md'] + [
+    root / tree / 'autopilot-lab/references' / name for tree in trees[:3]
+    for name in ('eval-procedure.md', 'data-contract.md', 'owner-execution.md')
+]:
+    text = ' '.join(path.read_text().split())
+    for obsolete in ('prose routes to autopilot-draft',
+                     'formal prose assembly hands off to',
+                     'Formal report prose assembly routes through',
+                     'Draft owns prose generation',
+                     'Lab does not generate prose HTML itself'):
+        assert obsolete not in text, (path, obsolete)
+for tree in trees[:3]:
+    text = (root / tree / 'autopilot-lab/references/eval-procedure.md').read_text()
+    assert 'Do not rerun inference' in text, tree
+    assert 'report-only failure does not relabel a completed evaluation' in text, tree
+print('PASS evaluation report boundaries: 8 examples, 3 entries × 6 projections')
+PY
+then ok 'evaluation-report semantic boundaries and generated metadata'; else bad 'evaluation-report semantic boundaries'; fi
+
 if [ "$fails" -gt 0 ]; then
   printf 'routing-contract: %d failure(s)\n' "$fails"
   exit 1
