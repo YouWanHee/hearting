@@ -863,6 +863,7 @@ def selected_providers():
             preferred=None,
             affinity_weight=allocation.get("depth_affinity_weight", 0.5),
             headroom_exponent=allocation.get("usage_headroom_exponent", 1),
+            harness_weights=allocation.get("harness_weights"),
         )
         band_order = ("relief", "primary", "last_resort") if promoted else (
             "primary", "relief", "last_resort"

@@ -103,10 +103,6 @@ def render(enabled) -> str:
         raise ValueError("routing config requires at least one enabled runtime")
     peers = [name for name in enabled if name != "opencode"]
     opencode = ["opencode"] if "opencode" in enabled else []
-    if not peers:
-        raise ValueError(
-            "routing config requires at least one quality-peer runtime (claude or codex)"
-        )
 
     def inline(values):
         return "[" + ", ".join(values) + "]"
@@ -120,11 +116,19 @@ def render(enabled) -> str:
     ]
     for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
         light = profile in {"balanced", "light", "mini"}
+        if not peers:
+            # OpenCode-only: nothing to recommend against, every profile uses it.
+            primary, last_resort = opencode, []
+        else:
+            # Deep work never reaches OpenCode; balanced-deep keeps it only as a
+            # last resort; balanced/light/mini treat it as a peer.
+            primary = peers + opencode if light else peers
+            last_resort = opencode if profile == "balanced-deep" else []
         lines += [
             f"  {profile}:",
-            f"    primary: {inline(peers + opencode if light else peers)}",
+            f"    primary: {inline(primary)}",
             f"    relief: {inline([])}",
-            f"    last_resort: {inline([] if light else opencode)}",
+            f"    last_resort: {inline(last_resort)}",
             f"    promote_relief_below: 0",
         ]
     lines += [
@@ -136,6 +140,9 @@ def render(enabled) -> str:
         *[f"    {depth}: {harness}" for depth, harness in (("owner", "claude"), ("worker", "codex")) if harness in enabled],
         "  depth_affinity_weight: 0.65",
         "  usage_headroom_exponent: 2",
+        # A slow harness gets a smaller share of default placements. Block
+        # mapping only: the policy parser does not read inline {a: 1} maps.
+        *(["  harness_weights:", "    opencode: 0.3"] if peers and opencode else []),
         # Omitted cells inherit the shipped profiles/dispatch-defaults.yaml
         # capability baseline; a cell written here always wins over it.
         "capabilities:",
@@ -149,12 +156,6 @@ def ensure(targets, *, dry_run=False) -> dict:
     enabled = available_runtimes(targets)
     if path.exists():
         return {"status": "preserved", "path": str(path), "enabled": enabled}
-    if not any(name in enabled for name in ("claude", "codex")):
-        return {
-            "status": "skipped-no-quality-peer",
-            "path": str(path),
-            "enabled": enabled,
-        }
     if dry_run:
         return {"status": "would-create", "path": str(path), "enabled": enabled}
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1226,6 +1226,25 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(context["rank"][0],"claude")
   self.assertEqual(context["rank"][-1],"codex")
   self.assertEqual(set(context["rank"]),{"claude","codex","opencode"})
+ def test_harness_weights_reach_the_stage_fallback_ranking(self):
+  # OpenCode sits in the same band as the peers and the declared order would
+  # put it first at equal headroom; `allocation.harness_weights` moves it back.
+  node=self._depth_affinity_node(2)
+  node["harness_policy"]={"primary":["claude","codex","opencode"],"relief":[],
+                          "last_resort":[],"promote_relief_below":0}
+  def rank(weights):
+   route=self._depth_affinity_route(["opencode","claude","codex"],affinity=False)
+   if weights:
+    route["dispatch_allocation"]["harness_weights"]=weights
+   with mock.patch.object(F,"_usage_states",return_value={
+       "claude":"ok","codex":"ok","opencode":"ok"}), \
+       mock.patch.object(F.CAPACITY,"capacity_scores",return_value={
+        "claude":80,"codex":80,"opencode":80}):
+    _hops,context=F.ordered_fallback_hops(route,node,self.jobs)
+   return context["rank"]
+  self.assertEqual(rank(None)[0],"opencode")
+  self.assertEqual(rank({"opencode":0.3})[0],"claude")
+  self.assertEqual(rank({"opencode":0.3})[-1],"opencode")
  def test_balanced_stage_affinity_cannot_lift_a_gated_harness(self):
   node={
    "harness_affinity":"claude",
