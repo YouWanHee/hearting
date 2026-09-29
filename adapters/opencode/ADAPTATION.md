@@ -188,7 +188,7 @@ injections are auto-applied. The table records the current state.
 | `SessionStart`-equivalent memory inject | plugin `experimental.chat.system.transform` → `memory`, computed once per session and re-emitted on every model call | full — auto injected, persists for the whole session |
 | `UserPromptSubmit` capsule candidates / routing-contract signal / briefing | plugin `chat.message` → prompt/turn capture, then `experimental.chat.system.transform` → `candidates` / `prompt-signal` / `briefing`, computed once per user turn and re-emitted on every model call of that turn | full — candidate output is active current-project/global capsule-only, maximum six / 2,400 UTF-8 bytes; the prompt is held in plugin memory only (never written) and dropped at `session.deleted` |
 | `SessionEnd` memory sync | plugin `event` (`session.idle`) → detached `preflight session-end` → `mem sync --json` | full — auto applied (D-78: no automatic distiller) |
-| `PreToolUse[Bash]` worktree-path guard (deny) | plugin `tool.execute.before` on `bash` → `preflight worktree-path`, `preflight worktree-path` explicit fallback | portable `git worktree add` path check only — the built-in-worktree-tool deny is Claude-native and has **no** OpenCode counterpart (`core/HOOKS.md:45`) |
+| `PreToolUse[Bash]` worktree-path guard (deny) | retired with the write gates; `preflight worktree-path` remains a no-op alias that prints a retired notice | none — the portable `git worktree add` path check is no longer enforced (`core/HOOKS.md:45`) |
 
 Two items remain that cannot reach byte-for-byte Claude parity; they are
 OpenCode runtime surface limits, not adapter debt:

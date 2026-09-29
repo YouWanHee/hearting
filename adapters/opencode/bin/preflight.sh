@@ -103,8 +103,6 @@ usage() {
   cat <<'EOF'
 usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh read <file> [session-id]
-       preflight.sh material-route <bind|check|clear> [options]
-       preflight.sh worktree-path --tool <tool> [--command <cmd>] [--cwd <dir>] [--session <id>]
        preflight.sh capability <name> [cwd] [session-id]
        preflight.sh skill <name> [cwd] [session-id]
        preflight.sh memory [cwd]
@@ -277,8 +275,14 @@ case "$cmd" in
 
     ;;
   material-route|worktree-path)
-    # Compatibility aliases for callers predating hook-gate retirement.
-    :
+    # Retired with the write gates. `check` used to report route participation;
+    # answering exit 0 now would claim a check that never ran, so it fails and
+    # names the real command. The other subcommands stay harmless no-ops.
+    if [ "$cmd" = material-route ] && [ "${2:-}" = check ]; then
+      echo "opencode preflight: material-route check is retired and checks nothing; inspect a route with 'capability-route.py verify --route <file> --cwd <dir>' or 'capability-route.py status --artifact-root <root>'" >&2
+      exit 64
+    fi
+    echo "opencode preflight: $cmd is retired; nothing to do" >&2
     ;;
   read)
     [ "$#" -ge 2 ] || { echo "opencode preflight: read requires a file path" >&2; exit 64; }
@@ -797,8 +801,7 @@ EOF
     ;;
   compose|route)
     if [ "$1" = "compose" ]; then
-      # SD-135: preset-free work route (shape/subgraph); same compiler, same
-      # D1 bind rule below (exactly one --output plus --cwd and a session id).
+      # SD-135: preset-free work route (shape/subgraph); same compiler.
       subcommand=compose
       shift
     else
@@ -809,71 +812,7 @@ EOF
       subcommand=compile
       shift
     fi
-    # D1: bind only after a successful compile with exactly one --output (or,
-    # since SD-135, none -- then the sealed route on stdout names the
-    # canonical file), a --cwd (or the route's sealed cwd), and a nonempty
-    # OPENCODE_SESSION_ID (from the plugin's shell.env hook). Scan the
-    # already-tokenized argv only, never the command text. No sid, more than
-    # one --output, or a nonzero compile all pass through unbound and
-    # silently, preserving the compiler's own stdout/stderr/exit status.
-    output_count=0
-    output_val=""
-    cwd_val=""
-    prev=""
-    for a in "$@"; do
-      case "$a" in
-        --output=*) output_count=$((output_count + 1)); output_val=${a#--output=} ;;
-        --cwd=*) cwd_val=${a#--cwd=} ;;
-      esac
-      case "$prev" in
-        --output) output_count=$((output_count + 1)); output_val=$a ;;
-        --cwd) cwd_val=$a ;;
-      esac
-      prev=$a
-    done
-    # SD-135 parity (canary review round 1, B3): `compose` omits `--output`
-    # (and may omit `--cwd`/`--artifact-root`) by design, so the sealed
-    # route on stdout is the binding evidence -- the same rule the Claude/
-    # Codex PostToolUse hook applies. Capture stdout to a file, echo it back
-    # unchanged, and bind the canonical path when no --output was given.
-    stdout_capture=$(mktemp "${TMPDIR:-/tmp}/preflight-route.XXXXXX")
-    set +e
-    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/utilities/capability-route.py" "$subcommand" "$@" > "$stdout_capture"
-    compile_rc=$?
-    set -e
-    cat "$stdout_capture"
-    bind_rc=0
-    if [ "$compile_rc" -eq 0 ] && [ "$output_count" -eq 0 ] && [ -n "${OPENCODE_SESSION_ID:-}" ]; then
-      resolved=$(python3 - "$stdout_capture" <<'PYEOF'
-import json, sys
-from pathlib import Path
-lines = [l for l in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if l.strip()]
-try:
-    route = json.loads(lines[-1]) if lines else {}
-except ValueError:
-    route = {}
-rid, root, cwd = route.get("route_id"), route.get("artifact_root"), route.get("cwd")
-if isinstance(rid, str) and rid and isinstance(root, str) and root.startswith("/") and isinstance(cwd, str) and cwd:
-    print(f"{root}/.runtime/routes/{rid}.json\t{cwd}")
-PYEOF
-)
-      if [ -n "$resolved" ]; then
-        output_val=${resolved%%	*}
-        [ -n "$cwd_val" ] || cwd_val=${resolved#*	}
-        output_count=1
-      fi
-    fi
-    rm -f "$stdout_capture"
-    if [ "$compile_rc" -eq 0 ] && [ "$output_count" -eq 1 ] && [ -n "$cwd_val" ] && [ -n "${OPENCODE_SESSION_ID:-}" ]; then
-      set +e
-      "$0" material-route bind --route "$output_val" --cwd "$cwd_val" --session "$OPENCODE_SESSION_ID"
-      bind_rc=$?
-      set -e
-    fi
-    if [ "$bind_rc" -ne 0 ]; then
-      exit "$bind_rc"
-    fi
-    exit "$compile_rc"
+    exec env AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/utilities/capability-route.py" "$subcommand" "$@"
     ;;
   worker-route)
     shift

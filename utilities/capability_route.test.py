@@ -6570,7 +6570,9 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["nodes"][0]["id"],"inline"); self.assertEqual(route["tracking"],"untracked")
   self.assertEqual(route["selection"],dict(route["selection"],route_origin="compose",shape="direct"))
   self.assertEqual(sorted(route["selection"]["direct_predicates"]),sorted(ALL))
-  self.assertEqual(route["tracked_gate_evidence"]["spec_read"]["source"],"compose-auto: no spec/prd.md under cwd or artifact root")
+  self.assertEqual(route["tracked_gate_evidence"]["spec_read"]["source"],"compose-auto: no spec/prd.md or shared spec prd.md under cwd or artifact root")
+  # compose fills the predicates itself; the record must not call that caller input.
+  self.assertEqual({row["source"] for row in route["selection"]["selection_basis"]},{"compose-default"})
   R.verify_route(route,R.ROOT)
   card=R.compose_card(route); self.assertIn("direct(direct)",card); self.assertIn(route["route_id"],card); self.assertIn("사람 게이트 없음",card)
  def test_solo_shape_is_one_registered_owner(self):
@@ -6597,6 +6599,16 @@ class ComposeRouteTest(TestRoute):
    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
    self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
    self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_spec_read_auto_recognises_the_shared_spec_layout(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); ref=root/"shared"/"spec"/"ref_abc"
+   for rrev in ("rrev_01","rrev_02"):
+    (ref/"revisions"/rrev).mkdir(parents=True); (ref/"revisions"/rrev/"prd.md").write_text("# prd\n",encoding="utf-8")
+   (ref/"reference.json").write_text(json.dumps({"latest_revision_id":"rrev_02"}),encoding="utf-8")
+   with self.assertRaisesRegex(ValueError,"compose-spec-read-required:.*rrev_02/prd.md$"): R.compose_spec_read(root,root,"auto")
+   self.assertEqual(R.compose_spec_read(root,root,"read shared spec")["source"],"read shared spec")
+   (ref/"reference.json").write_text("{not json",encoding="utf-8")
+   self.assertTrue(R.compose_spec_read(root,root,"auto")["satisfied"])
  def test_preset_compile_records_preset_origin_and_derived_shape(self):
   route=R.compile_route(**self.args())
   self.assertEqual(route["selection"]["route_origin"],"preset"); self.assertEqual(route["selection"]["shape"],"direct")

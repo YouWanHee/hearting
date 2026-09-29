@@ -2874,9 +2874,28 @@ def compose_spec_read(cwd, artifact_root, explicit):
             candidate = root / rel
             if candidate.is_file():
                 present.append(str(candidate))
+        present.extend(_compose_shared_spec_prds(root))
     if present:
         raise ValueError("compose-spec-read-required:" + ",".join(sorted(set(present))))
-    return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
+    return {"satisfied": True,
+            "source": "compose-auto: no spec/prd.md or shared spec prd.md under cwd or artifact root"}
+
+
+def _compose_shared_spec_prds(root):
+    """Latest `prd.md` of each admitted shared spec (`shared/spec/<ref>/revisions/<rrev>/`,
+    CORE artifact layout); older revisions are history, not what the caller must read."""
+    found = []
+    for reference in sorted((root / "shared" / "spec").glob("*/reference.json")):
+        try:
+            latest = json.loads(reference.read_text(encoding="utf-8")).get("latest_revision_id")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(latest, str) or not re.fullmatch(r"rrev_[0-9a-f]+", latest):
+            continue
+        candidate = reference.parent / "revisions" / latest / "prd.md"
+        if candidate.is_file():
+            found.append(str(candidate))
+    return found
 
 
 def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artifact_root,
@@ -3145,7 +3164,10 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                 "completion_gate":"inline-complete",
                 "terminal":True,"terminal_gate":"inline-complete"}]
         gates=["inline-complete"]
-        selection_basis=[{"axis":"direct-predicate","signal":p,"source":"caller"} for p in predicates]
+        # compose fills every direct predicate itself (it has no --predicate
+        # flag); label them so the record never claims the caller asserted them.
+        predicate_source="compose-default" if route_origin=="compose" else "caller"
+        selection_basis=[{"axis":"direct-predicate","signal":p,"source":predicate_source} for p in predicates]
     elif effective=="quick":
         if transport not in (None, "headless"):
             raise ValueError(f"invalid quick transport: {transport!r}")

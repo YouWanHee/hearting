@@ -404,6 +404,15 @@ class WorkStartTest(unittest.TestCase):
                 self.assertNotIn("parent_next",result)
                 self.assertEqual(len(self.calls),3)
 
+    def test_running_owner_receipt_states_the_parent_role(self):
+        self.start(); self.ready = self.released = True; self.start()
+        with mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}):
+            result = self.start()
+        self.assertEqual(result["state"], "running", result)
+        self.assertIn("parent_next", result)
+        self.assertIn("You are the parent session", result["next_step"])
+        self.assertIn("Do not kill", result["next_step"])
+
     def test_owner_exits_during_join_before_the_public_receipt(self):
         self.start(); self.ready = self.released = True; self.start()
         def close_during_join(**kwargs):
