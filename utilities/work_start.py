@@ -518,6 +518,16 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         harnesses = list(dict.fromkeys(c[key] for c in candidates if c.get("status") == "supported" and c.get(key)))
         if not harnesses:
             return {**result, "state": "needs-attention", "reason": "frame-harness-unavailable"}
+        # A tool the caller pinned (`compose --pin frame=H`, else the owner pin,
+        # which `--owner H` also seals) is the user's explicit choice, so it is
+        # passed on; with no pin the frame keeps the automatic selection. A
+        # pinned tool the route's evidence does not support is not forced: the
+        # legs fall back to automatic selection and the result says so.
+        pins = route.get("selection_pins") or {}
+        frame_pin = ((pins.get("frame") or pins.get("owner") or {}).get("harness"))
+        if frame_pin and frame_pin not in harnesses:
+            result["frame_explicit_harness"] = f"unavailable:{frame_pin}"
+            frame_pin = None
         attempts = set()
         # Validate every reused identity before starting any missing sibling.
         slots = [_slot(route, node["id"], rows) for node in frames]
@@ -528,7 +538,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                 # choice into a user override and bypassed the capacity gate.
                 # The selector rechecks live usage inside the sealed pool for
                 # each frame, just as it does for an automatic owner.
-                rows, refusal = _launch_admitted(route, path, jobs, node["id"], None, run, result,
+                rows, refusal = _launch_admitted(route, path, jobs, node["id"], frame_pin, run, result,
                                                   wait=wait, sleep=sleep, clock=clock)
                 if aid not in rows:
                     result["frame_attempts"] = sorted(attempts)
@@ -595,7 +605,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     aid = _slot(route, "owner", rows)
     refusal = None
     if aid not in rows:
-        rows, refusal = _launch_admitted(route, path, jobs, "owner", request["owner_harness"], run, result,
+        owner_pin = ((route.get("selection_pins") or {}).get("owner") or {}).get("harness")
+        rows, refusal = _launch_admitted(route, path, jobs, "owner", owner_pin or request["owner_harness"], run, result,
                                           wait=wait, sleep=sleep, clock=clock)
     if aid not in rows:
         if refusal:

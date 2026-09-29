@@ -123,7 +123,8 @@ _HINTS = {
                                     "and AGENT_ARTIFACT_CYCLE_DIR in the same Bash call as the launch (OPERATIONS §5.10b)",
     "route-node-unknown": "--route-node must name an id present in the sealed route's nodes list",
     "route-node-worker-type-forbidden": "--route-node selects a frame node's own profile and role; only --worker-type frame may use it",
-    "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
+    "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag. "
+                      "To choose a tool or model, seal it once at compose time: capability-route.py compose --pin <owner|frame|worker>=<harness>[:<model>[@<effort>]]",
     "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
                                              "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
                                              "registry could never wake this session",
@@ -194,7 +195,7 @@ def _same_value(flag, given, sealed):
     return str(given) == str(sealed)
 
 
-def _sealed_owner_context(path, *, worker_type="owner"):
+def _sealed_owner_context(path, *, worker_type="owner", route_node=None):
     """Return route-sealed owner candidates, quality policy, and allocation.
 
     An owner is not a route node, so this selector stays route-blind for
@@ -239,7 +240,18 @@ def _sealed_owner_context(path, *, worker_type="owner"):
     harnesses &= _defaults.DISPATCHABLE_HARNESSES
     if not harnesses:
         raise OwnerError("route-evidence-no-supported-owner-harness")
-    policy = None if worker_type == "frame" else route.get("owner_harness_policy")
+    if worker_type == "frame":
+        # A frame leg reads the bands its own node was sealed with (a route
+        # sealed before nodes carried them has none and keeps reading the live
+        # policy, as before).
+        node = next(
+            (n for n in route.get("nodes", [])
+             if isinstance(n, dict) and n.get("id") == (route_node or "frame")),
+            None,
+        )
+        policy = node.get("harness_policy") if isinstance(node, dict) else None
+    else:
+        policy = route.get("owner_harness_policy")
     if policy is not None:
         if not isinstance(policy, dict) or any(
             not isinstance(policy.get(band), list)
@@ -715,7 +727,11 @@ def main(argv):
         explicit, values, forwarded, route_evidence, derived = _parse(argv)
         jobs = _authoritative_jobs(values, os.environ)
         profile = values["--model-profile"]
-        sealed_context = _sealed_owner_context(route_evidence, worker_type=values["--worker-type"]) if route_evidence else None
+        sealed_context = (
+            _sealed_owner_context(route_evidence, worker_type=values["--worker-type"],
+                                  route_node=values.get("--route-node"))
+            if route_evidence else None
+        )
         if sealed_context and isinstance(sealed_context.get("policy"), dict):
             policy = dict(sealed_context["policy"])
             config = None
@@ -731,12 +747,24 @@ def main(argv):
         # schema-v3 authorization comes from the enabled set and quality bands.
         if explicit is not None and explicit not in _defaults.DISPATCHABLE_HARNESSES:
             raise OwnerError("explicit-adapter-unauthorized")
+        explicit_policy = None
         if (
             explicit is not None
             and config_version == 3
             and explicit not in configured
         ):
-            raise OwnerError("explicit-adapter-disabled-by-user-policy")
+            # The profile's bands are a recommendation for automatic selection.
+            # A harness the user explicitly named is honoured while it is
+            # enabled at all (the allocation pool); only a disabled harness is
+            # refused.
+            pool = None
+            if sealed_context and isinstance(sealed_context.get("allocation"), dict):
+                pool = sealed_context["allocation"].get("harness_order")
+            if pool is None and config is not None:
+                pool = _defaults.query_allocation(config)["harness_order"]
+            if explicit not in (pool or ()):
+                raise OwnerError("explicit-adapter-disabled-by-user-policy")
+            explicit_policy = "outside-profile-bands"
         sealed = sealed_context["harnesses"] if sealed_context else None
         policy_harnesses = list(configured)
         if sealed is not None:
@@ -788,7 +816,7 @@ def main(argv):
         relief_promoted = False
         if explicit and _eligible(states[explicit]):
             selected, source, quality_band = explicit, "explicit", "explicit"
-        if selected is None and config_version == 3:
+        if selected is None and config_version in {3, 4}:
             selected, quality_band, _ranks, relief_promoted = _capacity.select(
                 policy, states, counts, allocation["harness_order"], capacity,
                 strategy=allocation["strategy"],
@@ -796,10 +824,11 @@ def main(argv):
                 preferred=_capacity.preferred_for_depth(allocation, 1),
                 affinity_weight=allocation.get("depth_affinity_weight", 0.5),
                 headroom_exponent=allocation.get("usage_headroom_exponent", 1),
+                harness_weights=allocation.get("harness_weights"),
             )
             if selected:
                 source = "configured-" + allocation["strategy"]
-        if selected is None and config_version != 3:
+        if selected is None and config_version not in {3, 4}:
             for harness in ranked(configured):
                 if automatically_available(harness):
                     selected = harness
@@ -886,6 +915,8 @@ def main(argv):
                                   reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted)), flush=True)
+        if explicit_policy and source == "explicit":
+            print(f"explicit_policy={explicit_policy}", flush=True)
         print(f"route_defaults={','.join(derived) or 'none'}", flush=True)
         child_env = {
             key: value for key, value in os.environ.items() if not _MODEL_ENV.fullmatch(key)

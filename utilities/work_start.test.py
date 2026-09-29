@@ -537,6 +537,44 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(self.start()["reason"], "work-attempt-identity-conflict")
         self.assertEqual(len(self.calls), 2)
 
+    def adapters(self):
+        return [c[c.index("--adapter") + 1] if "--adapter" in c else None for c in self.calls]
+
+    def test_a_pinned_tool_is_passed_to_both_frame_legs_and_then_the_owner(self):
+        pins = {"contract_version": 1,
+                "owner": {"harness": "opencode", "model": None, "effort": None}}
+        self.route["selection_pins"] = pins
+        self.start()
+        # Both legs run on the one tool the caller named (SD-160 allows a shared
+        # harness); with no pin they stay on automatic selection (no --adapter).
+        self.assertEqual(self.adapters(), ["opencode", "opencode"])
+        self.ready = True; self.released = True
+        self.start()
+        self.assertEqual(self.adapters(), ["opencode", "opencode", "opencode"])
+
+    def test_a_frame_pin_wins_over_the_owner_pin_for_the_frame_legs_only(self):
+        self.route["selection_pins"] = {"contract_version": 1,
+            "owner": {"harness": "codex", "model": None, "effort": None},
+            "frame": {"harness": "opencode", "model": "provider/model", "effort": "max"}}
+        self.start()
+        self.assertEqual(self.adapters(), ["opencode", "opencode"])
+        self.ready = True; self.released = True
+        self.start()
+        self.assertEqual(self.adapters()[2], "codex")
+
+    def test_a_pinned_tool_the_route_never_probed_is_not_forced(self):
+        self.route["selection_pins"] = {"contract_version": 1,
+            "frame": {"harness": "claude", "model": None, "effort": None}}
+        result = self.start()
+        self.assertEqual(self.adapters(), [None, None])
+        self.assertEqual(result["frame_explicit_harness"], "unavailable:claude")
+
+    def test_a_route_without_pins_keeps_automatic_frame_selection(self):
+        self.assertNotIn("selection_pins", self.route)
+        result = self.start()
+        self.assertEqual(self.adapters(), [None, None])
+        self.assertNotIn("frame_explicit_harness", result)
+
     def test_quick_uses_the_sealed_candidate_pool(self):
         self.route["effective_intensity"] = "quick"
         self.route["registered_headless_candidates"] = [{"harness":"opencode","status":"supported"}]

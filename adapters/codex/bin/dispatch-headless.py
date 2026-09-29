@@ -133,8 +133,10 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
+    pin_target,
     require_top_route,
     resolve_runtime_profile,
+    route_selection_pin,
     validate_registered_profile,
 )
 from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
@@ -702,7 +704,8 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         if (args.model or args.reasoning) and not args.capacity_retry:
             raise ModelSelectionError(
                 "model-profile-override-forbidden",
-                "a route-sealed model profile may use a concrete override only on a checked capacity retry",
+                "a route-sealed model profile may use a concrete override only on a checked capacity retry "
+                "(to choose a model, seal it at compose time: capability-route.py compose --pin <target>=<harness>:<model>[@<effort>])",
             )
         try:
             resolved, _receipt = resolve_runtime_profile(
@@ -718,7 +721,29 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "profile-top-override-forbidden",
                 "the top exception profile admits no concrete --model override, capacity retry included",
             )
-        if resolved["profile"] == TOP_PROFILE:
+        # A route-sealed selection pin (`compose --pin`) beats the profile's
+        # own model; a checked capacity retry still replaces it, and the receipt
+        # then says `pin+capacity` with the pinned model so nothing is
+        # overwritten silently.
+        try:
+            pin = route_selection_pin(
+                getattr(args, "route_file", None)
+                or getattr(getattr(args, "owner_route_binding", None), "route_file", None),
+                worker_type=args.worker_type, adapter="codex",
+            )
+        except ModelProfileError as exc:
+            raise ModelSelectionError(exc.reason, str(exc)) from exc
+        pin_model = pin.get("model")
+        reasoning = args.reasoning or resolved["budget"]
+        if pin["status"] == "applied":
+            if pin_target(args.worker_type) != "frame":
+                # Compose already dropped a main-session-only pin model; this
+                # guards a route edited after sealing.
+                _require_headless_model(pin_model, "pin")
+            if not args.model:
+                model, reasoning = pin_model, pin["effort"] or resolved["budget"]
+            source = "pin+capacity" if args.model else "pin"
+        elif resolved["profile"] == TOP_PROFILE:
             # The one door to the main-session-only model from registered
             # dispatch: a route-sealed `top` profile (2026-09-09 사용자 결정).
             # The waiver covers exactly the resolved model.
@@ -733,7 +758,9 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             "tier": resolved["tier"],
             "granularity": resolved["granularity"],
             "model": model,
-            "reasoning": args.reasoning or resolved["budget"],
+            "reasoning": reasoning,
+            "pin_status": pin["status"],
+            **({"pin_model": pin_model} if pin["status"] == "applied" else {}),
         }
     if args.model_role and args.model:
         raise ModelSelectionError(
@@ -1690,6 +1717,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
         f",profile_granularity={settings['granularity']}"
         f",model={settings['model']},reasoning={settings['reasoning']}"
+        f",model_pin_status={settings.get('pin_status', 'none')}"
+        + (f",model_pin={settings['pin_model']}" if settings.get("pin_model") else "")
     )
     if args.approval != "inherit":
         pipe += f",approval={args.approval}"
@@ -3343,6 +3372,9 @@ def main(argv: list[str]) -> int:
     print(f"route_validation={getattr(args, 'route_validation', None) or '-'}")
     settings = args.resolved_model_settings
     print(f"model_source={settings['source']}")
+    print(f"model_pin_status={settings.get('pin_status', 'none')}")
+    if settings.get("pin_model"):
+        print(f"model_pin={settings['pin_model']}")
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")

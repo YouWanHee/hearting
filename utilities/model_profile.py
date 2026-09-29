@@ -381,6 +381,48 @@ def require_top_route(route_file, *, profile: str, node: str | None = None) -> N
             "the route did not seal the top exception profile for its owner", "profile-top-route-mismatch")
 
 
+# Route-sealed selection pins (`capability-route.py compose --pin`).  The route
+# carries one pin per target; every wrapper reads it from the route file the
+# launch is bound to, so a resume, a capacity replacement or a stage fallback
+# lands on the same choice without any launch-time flag.
+PIN_TARGETS = ("owner", "frame", "worker")
+
+
+def pin_target(worker_type: str | None) -> str:
+    return "frame" if worker_type == "frame" else "owner" if worker_type == "owner" else "worker"
+
+
+def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) -> dict[str, object]:
+    """The sealed pin that applies to this launch.
+
+    Returns `{"status": "none"}` (no route or no pin for this target),
+    `{"status": "harness-mismatch", "pinned_harness"}` (the launch runs on a
+    different tool than the pin names, for example after a fallback hop),
+    `{"status": "harness-only"}` (a tool pin without a model) or
+    `{"status": "applied", "model", "effort"}` where `effort` may be None (the
+    profile's own budget then applies).  An unreadable route is an error, not
+    "no pin": silently ignoring a pin is exactly what pinning exists to prevent.
+    """
+
+    if not route_file:
+        return {"status": "none"}
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ModelProfileError(
+            f"selection pin route unreadable: {exc}", "selection-pin-route-unreadable") from exc
+    pins = route.get("selection_pins") if isinstance(route, dict) else None
+    pin = pins.get(pin_target(worker_type)) if isinstance(pins, dict) else None
+    if not isinstance(pin, dict):
+        return {"status": "none"}
+    if pin.get("harness") != adapter:
+        return {"status": "harness-mismatch", "pinned_harness": pin.get("harness")}
+    model = pin.get("model")
+    if not model:
+        return {"status": "harness-only"}
+    return {"status": "applied", "model": model, "effort": pin.get("effort") or None}
+
+
 # The frame bootstrap tier ladder -- ONE function, ONE home.
 #
 # The frame pair runs one tier ABOVE the owner it frames, because framing is
