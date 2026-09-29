@@ -23,6 +23,10 @@ class HeartingGatesTest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()) as output:
                 G.same_work_or_refuse('route-hash-mismatch', 'old\nnew')
             self.assertEqual(output.getvalue(), 'hearting: gate-off route-hash-mismatch old new\n')
+            with contextlib.redirect_stderr(io.StringIO()) as repeat:
+                G.same_work_or_refuse('route-hash-mismatch', 'old\nnew')
+                G.same_work_or_refuse('route-hash-mismatch', 'other')
+            self.assertEqual(repeat.getvalue(), 'hearting: gate-off route-hash-mismatch other\n')
         with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
             with self.assertRaises(DC.DispatchContractError) as error:
                 G.same_work_or_refuse('route-hash-mismatch', 'detail')

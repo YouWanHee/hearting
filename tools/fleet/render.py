@@ -7935,6 +7935,50 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             compute_host_pump.stop(join_timeout=1.0)
 
 
+def _stderr_log_path():
+    xdg = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(xdg, "agent-fleet", "fleet-stderr.log")
+
+
+class _StderrToLog:
+    """While the TUI owns the terminal, send fd 2 (Python writes and inherited child
+    stderr alike) to a log file: any diagnostic a collector or library prints would
+    otherwise land on top of the curses screen and break it. Restored on exit, so a
+    crash traceback still reaches the terminal."""
+
+    def __init__(self, path):
+        self.path = path
+        self.saved = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            if os.path.getsize(self.path) > 4 * 1024 * 1024:
+                os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+        try:
+            sys.stderr.flush()
+            log = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError:
+            return self
+        self.saved = os.dup(2)
+        os.dup2(log, 2)
+        os.close(log)
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            try:
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os.dup2(self.saved, 2)
+            os.close(self.saved)
+            self.saved = None
+        return False
+
+
 def run_live(collect_all, hfilter, section, interval):
     if curses is None:
         sys.stderr.write("fleet: the live TUI needs curses (unavailable here; on native "
@@ -7945,7 +7989,8 @@ def run_live(collect_all, hfilter, section, interval):
         sys.stderr.write("fleet: stdout is not a TTY — use --once (snapshot) or --json.\n")
         return 1
     try:
-        return curses.wrapper(_loop, collect_all, hfilter, section, interval)
+        with _StderrToLog(_stderr_log_path()):
+            return curses.wrapper(_loop, collect_all, hfilter, section, interval)
     except KeyboardInterrupt:
         return 0
     except Exception as e:  # pragma: no cover
