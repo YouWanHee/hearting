@@ -372,8 +372,14 @@ case "$cmd" in
     fi
     ;;
   material-route|worktree-path)
-    # Compatibility aliases for callers predating hook-gate retirement.
-    :
+    # Retired with the write gates. `check` used to report route participation;
+    # answering exit 0 now would claim a check that never ran, so it fails and
+    # names the real command. The other subcommands stay harmless no-ops.
+    if [ "$cmd" = material-route ] && [ "${2:-}" = check ]; then
+      echo "codex preflight: material-route check is retired and checks nothing; inspect a route with 'capability-route.py verify --route <file> --cwd <dir>' or 'capability-route.py status --artifact-root <root>'" >&2
+      exit 64
+    fi
+    echo "codex preflight: $cmd is retired; nothing to do" >&2
     ;;
   worker-route)
     shift

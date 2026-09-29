@@ -157,6 +157,23 @@ class InterimManifestTest(CheckpointTestBase):
         with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
             self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
 
+    def test_owner_envelope_primary_follows_checkpoint_move(self):
+        # The owner envelope used to look only at the marker's original evidence path,
+        # so every closure whose report finalize had placed stayed closure-pending with
+        # recovery-unavailable/material-primary-required.
+        import dispatch_terminal_commit as TC
+        evidence = self.write_output(self.result, "final_report.md", b"final report\n")
+        node = next(node for node in self.route_obj["nodes"] if node.get("terminal"))
+        F.R.write_completion_marker(self.route_obj, node, node["id"], evidence)
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertFalse(evidence.exists())
+        gates = {node["id"]: {"evidence": str(evidence)}}
+        route = dict(self.route_obj, workflow_contract={"terminal_nodes": [node["id"]]})
+        primary = TC.select_primary_artifact(route, gates, {}, artifact_root=self.root)
+        self.assertIsNotNone(primary)
+        self.assertEqual(primary.read_bytes(), b"final report\n")
+        self.assertEqual(primary, P.resolve_placed_output(evidence).resolve())
+
     def test_placed_output_proof_binds_ledger_manifest_and_current_bytes(self):
         original = self.write_output(self.result, "plan.md", b"exact plan\n")
         P.checkpoint(self.root, cycle_id=self.cycle_id)

@@ -28,14 +28,13 @@ adapter.
 ## Runtime Mapping
 
 - `AGENT_HOME` is the installed harness root. Resolve the canonical artifact root with `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
-- `preflight.sh` is a shorthand, not a PATH command: it resolves to `<AGENT_HOME>/adapters/opencode/bin/preflight.sh` and no shim is installed at the harness root. Run it by that absolute path — for example `AGENT_HOME="$AGENT_HOME" bash "$AGENT_HOME/adapters/opencode/bin/preflight.sh" material-route bind ...` — and read every `preflight.sh <command>` below as that path. Export `AGENT_HOME` to the installed root for release behavior, or to a checkout/worktree to use that tree as the active runtime.
+- `preflight.sh` is a shorthand, not a PATH command: it resolves to `<AGENT_HOME>/adapters/opencode/bin/preflight.sh` and no shim is installed at the harness root. Run it by that absolute path — for example `AGENT_HOME="$AGENT_HOME" bash "$AGENT_HOME/adapters/opencode/bin/preflight.sh" capability-info <capability>` — and read every `preflight.sh <command>` below as that path. Export `AGENT_HOME` to the installed root for release behavior, or to a checkout/worktree to use that tree as the active runtime.
 - Portable model roles stay vendor-neutral in shared artifacts; never use vendor model names as portable semantics.
 - Capabilities come from `capabilities/`. OpenCode-native generated Skills, commands, agents, and plugins live under `adapters/opencode/` and project through `opencode_setting/opencode-skills`, `opencode_setting/opencode-commands`, `opencode_setting/opencode-agents`, and `opencode_setting/opencode-plugins`.
 - Validate native discovery with `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`; Claude compatibility autoload must not mask missing OpenCode output.
 - Run `preflight.sh capability-info <capability>` and `preflight.sh mode-info <family/mode>`; obey named `tool_contract`, `tool_contract_check`, `runtime_surface`, and `fallback`.
 - Read the governing core contract before adapter changes. Spec reads may be
   recorded with `preflight.sh read <prd.md>` for workflow evidence.
-- Material source work needs route participation, not a card alone: before a source write or a commit containing source changes, hold a current cwd-bound route record (`preflight.sh material-route check`), at least `autopilot-code direct` for code. Hotfixes do not bypass it.
 - Use explicit guards when the OpenCode plugin is unavailable or untrusted. Never port Claude allowedTools, settings MCP, command, agent, or hook formats.
 
 Detailed lifecycle and edge-case contracts live in

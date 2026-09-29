@@ -1455,6 +1455,23 @@ class TestRoute(unittest.TestCase):
   tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
   with self.assertRaisesRegex(ValueError,"composed route nodes differ"):
    R.verify_route(tampered,R.ROOT)
+ def test_standard_and_composed_routes_survive_an_unrelated_capability_edit(self):
+  def other_capability(registry):
+   next(r for r in registry["recipes"] if r["capability"]=="autopilot-ship")["probe"]="edited"
+   registry["completion_gate_contracts"]["ship-setup"]["doc"]="edited doc"
+  def own_capability(registry):
+   next(r for r in registry["recipes"] if r["capability"]=="autopilot-code")["probe"]="edited"
+  preset=self.compile_v3(self.dispatch(self.nested()))
+  composed=self._composed()
+  for route in (preset,composed):
+   for mutate,current in ((other_capability,True),(own_capability,False)):
+    registry=json.loads(json.dumps(R.TOPO.load_registry())); mutate(registry)
+    with mock.patch.object(R.TOPO,"load_registry",return_value=registry):
+     if current:
+      self.assertNotIn("_registry_current",R.verify_route(route,R.ROOT))
+     else:
+      with self.assertRaisesRegex(ValueError,"stale registry digest"):
+       R.verify_route(route,R.ROOT)
  def test_composed_requires_standard_plus(self):
   with self.assertRaisesRegex(ValueError,"standard\\+ effective intensity"):
    R.compile_composed_route(
@@ -1492,6 +1509,7 @@ class TestRoute(unittest.TestCase):
   replica=next(node for node in route["nodes"] if node["id"]=="frame-alternative")
   replica["outputs"]=["shards/frame/direction-brief.alternative.md"]
   route["registry_digest"]="sha256:"+"0"*64
+  route["capability_registry_digest"]="sha256:"+"0"*64
   route["route_hash"]=R.route_hash(route)
   route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
   with self.assertRaisesRegex(ValueError,"stale registry digest"):
@@ -4159,16 +4177,74 @@ class TestValidationBasis(unittest.TestCase):
    self.assertTrue(created)
  def test_same_root_digest_change_still_reads_as_stale(self):
   route=R.compile_route(**self.args())
-  stale=self._reseal({**json.loads(json.dumps(route)),"registry_digest":"sha256:"+"0"*64})
+  stale=self._reseal({**json.loads(json.dumps(route)),"registry_digest":"sha256:"+"0"*64,"capability_registry_digest":"sha256:"+"0"*64})
   with self.assertRaisesRegex(ValueError,"stale registry digest"):
    R.verify_route(stale,R.ROOT)
   stale=self._reseal({**json.loads(json.dumps(route)),"unit_catalog_digest":"sha256:"+"0"*64})
   with self.assertRaisesRegex(ValueError,"stale unit catalog digest"):
    R.verify_route(stale,R.ROOT)
+ def _registry_variant(self,mutate):
+  registry=json.loads(json.dumps(R.TOPO.load_registry()))
+  mutate(registry)
+  return mock.patch.object(R.TOPO,"load_registry",return_value=registry)
+ def test_edit_to_another_capability_keeps_the_route_current(self):
+  route=R.compile_route(**self.args())
+  self.assertIn("capability_registry_digest",route)
+  def other_capability(registry):
+   next(r for r in registry["recipes"] if r["capability"]!="autopilot-code")["probe"]="edited"
+   registry["completion_gate_contracts"]["ship-setup"]["doc"]="edited doc"
+   registry["completion_gate_contracts"]["unrelated-new-gate"]={"kind":"custom","doc":"x"}
+   registry["recipes"].append({**json.loads(json.dumps(registry["recipes"][0])),"capability":"autopilot-brand-new"})
+  with self._registry_variant(other_capability):
+   self.assertNotEqual(route["registry_digest"],R.TOPO.registry_digest(R.TOPO.load_registry()))
+   sys.modules["hearting_gates"]._REPORTED.clear()
+   with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
+    verified=R.verify_route(route,R.ROOT)
+   self.assertNotIn("gate-off",err.getvalue())
+   self.assertNotIn("_registry_current",verified)
+   R.verify_route(route,R.ROOT)
+ def test_edit_to_the_same_capability_or_a_shared_section_makes_the_route_stale(self):
+  route=R.compile_route(**self.args())
+  def same_capability(registry):
+   next(r for r in registry["recipes"] if r["capability"]=="autopilot-code")["probe"]="edited"
+  def referenced_gate(registry):
+   registry["completion_gate_contracts"]["code-plan"]["probe"]="edited"
+  def shared_section(registry):
+   registry["parallel_group_max_width"]+=1
+  for mutate in (same_capability,referenced_gate,shared_section):
+   with self._registry_variant(mutate):
+    with self.assertRaisesRegex(ValueError,"stale registry digest"):
+     R.verify_route(route,R.ROOT)
+    sys.modules["hearting_gates"]._REPORTED.clear()
+    with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
+     verified=R.verify_route(route,R.ROOT)
+    self.assertIn("route-registry-stale",err.getvalue())
+    self.assertIs(verified["_registry_current"],False)
+ def test_route_without_capability_digest_keeps_whole_registry_comparison(self):
+  route=R.compile_route(**self.args())
+  legacy=json.loads(json.dumps(route)); legacy.pop("capability_registry_digest")
+  legacy=self._reseal(legacy)
+  R.verify_route(legacy,R.ROOT)
+  def other_capability(registry):
+   next(r for r in registry["recipes"] if r["capability"]!="autopilot-code")["probe"]="edited"
+  with self._registry_variant(other_capability):
+   with self.assertRaisesRegex(ValueError,"stale registry digest"):
+    R.verify_route(legacy,R.ROOT)
+ def test_capability_digest_ignores_other_capabilities_only(self):
+  registry=R.TOPO.load_registry()
+  base=R.TOPO.capability_registry_digest(registry,"autopilot-code")
+  edited=json.loads(json.dumps(registry))
+  next(r for r in edited["recipes"] if r["capability"]=="autopilot-ship")["probe"]="edited"
+  self.assertEqual(base,R.TOPO.capability_registry_digest(edited,"autopilot-code"))
+  self.assertNotEqual(base,R.TOPO.capability_registry_digest(edited,"autopilot-ship"))
+  # A hand-edited composed recipe with a malformed `compose` digests, never crashes.
+  for compose in ("x",["autopilot-ship"],None):
+   R.TOPO.capability_registry_digest(registry,"autopilot-code",[{"compose":compose}])
  def test_legacy_route_without_basis_keeps_stale_wording(self):
   route=R.compile_route(**self.args())
   legacy=json.loads(json.dumps(route)); legacy.pop("validation_basis")
   legacy["registry_digest"]="sha256:"+"0"*64
+  legacy["capability_registry_digest"]="sha256:"+"0"*64
   legacy=self._reseal(legacy)
   with self.assertRaisesRegex(ValueError,"stale registry digest"):
    R.verify_route(legacy,R.ROOT)
@@ -4180,6 +4256,7 @@ class TestValidationBasis(unittest.TestCase):
   skewed=json.loads(json.dumps(route))
   skewed["validation_basis"]["registry_root"]="/tmp/b2-fixture-other-registry-root"
   skewed["registry_digest"]="sha256:"+"1"*64
+  skewed["capability_registry_digest"]="sha256:"+"1"*64
   skewed=self._reseal(skewed)
   with self.assertRaisesRegex(ValueError,r"^registry-digest-skew\(compiled="):
    R.verify_route(skewed,R.ROOT)
@@ -4230,6 +4307,7 @@ class TestValidationBasis(unittest.TestCase):
   route=R.compile_route(**self.args())
   both=json.loads(json.dumps(route))
   both["registry_digest"]="sha256:"+"0"*64
+  both["capability_registry_digest"]="sha256:"+"0"*64
   both["validation_basis"]["unit_catalog_root"]="/tmp/b2-fixture-other-unit-root"
   both["unit_catalog_digest"]="sha256:"+"1"*64
   both=self._reseal(both)
@@ -4304,6 +4382,7 @@ class TestValidationBasis(unittest.TestCase):
   registry_skew=json.loads(json.dumps(route))
   registry_skew["validation_basis"]["registry_root"]="/tmp/b2-fixture-other-registry-root"
   registry_skew["registry_digest"]="sha256:"+"1"*64
+  registry_skew["capability_registry_digest"]="sha256:"+"1"*64
   registry_skew=self._reseal(registry_skew)
   unit_skew=json.loads(json.dumps(route))
   unit_skew["validation_basis"]["unit_catalog_root"]="/tmp/b2-fixture-other-unit-root"
@@ -4323,6 +4402,7 @@ class TestValidationBasis(unittest.TestCase):
   skewed=json.loads(json.dumps(route))
   skewed["validation_basis"]["registry_root"]="/tmp/b2-fixture-other-registry-root"
   skewed["registry_digest"]="sha256:"+"1"*64
+  skewed["capability_registry_digest"]="sha256:"+"1"*64
   skewed=self._reseal(skewed)
   verified=R.verify_route(skewed,R.ROOT,allow_stale_registry=True)
   self.assertIs(verified["_registry_current"],False)
@@ -6571,6 +6651,8 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["selection"],dict(route["selection"],route_origin="compose",shape="direct"))
   self.assertEqual(sorted(route["selection"]["direct_predicates"]),sorted(ALL))
   self.assertEqual(route["tracked_gate_evidence"]["spec_read"]["source"],"compose-auto: no spec/prd.md under cwd or artifact root")
+  # compose fills the predicates itself; the record must not call that caller input.
+  self.assertEqual({row["source"] for row in route["selection"]["selection_basis"]},{"compose-default"})
   R.verify_route(route,R.ROOT)
   card=R.compose_card(route); self.assertIn("direct(direct)",card); self.assertIn(route["route_id"],card); self.assertIn("사람 게이트 없음",card)
  def test_solo_shape_is_one_registered_owner(self):
@@ -6597,6 +6679,34 @@ class ComposeRouteTest(TestRoute):
    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
    self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
    self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_spec_read_auto_notes_the_shared_spec_layout_without_refusing(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); ref=root/"shared"/"spec"/"ref_abc"
+   for rrev in ("rrev_01","rrev_02"):
+    (ref/"revisions"/rrev).mkdir(parents=True); (ref/"revisions"/rrev/"prd.md").write_text("# prd\n",encoding="utf-8")
+   (ref/"reference.json").write_text(json.dumps({"latest_revision_id":"rrev_02"}),encoding="utf-8")
+   # a shared spec is a one-line notice, never a refusal; only the latest revision is named
+   got=R.compose_spec_read(root,root,"auto")
+   self.assertTrue(got["satisfied"])
+   self.assertTrue(got["source"].startswith(R.SPEC_READ_SHARED_PREFIX))
+   self.assertIn("rrev_02/prd.md",got["source"]); self.assertNotIn("rrev_01",got["source"])
+   route=self.compose(artifact_root=root)
+   self.assertEqual(route["tracked_gate_evidence"]["spec_read"],got)
+   R.verify_route(route,R.ROOT)
+   notice=[l for l in R.compose_card(route).splitlines() if "공유 spec" in l]
+   self.assertEqual(len(notice),1); self.assertIn("rrev_02/prd.md",notice[0]); self.assertNotIn("rrev_01",notice[0])
+   # an explicit --spec-read keeps the caller's provenance and needs no notice
+   self.assertEqual(R.compose_spec_read(root,root,"read shared spec")["source"],"read shared spec")
+   self.assertNotIn("공유 spec",R.compose_card(self.compose(artifact_root=root,spec_read="read shared spec")))
+   # a spec/prd.md next to a shared spec still refuses, on spec/prd.md alone
+   (root/"spec").mkdir(); (root/"spec"/"prd.md").write_text("# prd\n",encoding="utf-8")
+   with self.assertRaisesRegex(ValueError,"compose-spec-read-required:[^,]*spec/prd.md$") as ctx: R.compose_spec_read(root,root,"auto")
+   self.assertNotIn("shared",str(ctx.exception))
+   (root/"spec"/"prd.md").unlink()
+   # an unreadable reference.json is ignored: the plain no-spec record, no notice
+   (ref/"reference.json").write_text("{not json",encoding="utf-8")
+   self.assertEqual(R.compose_spec_read(root,root,"auto")["source"],"compose-auto: no spec/prd.md under cwd or artifact root")
+   self.assertNotIn("공유 spec",R.compose_card(self.compose(artifact_root=root)))
  def test_preset_compile_records_preset_origin_and_derived_shape(self):
   route=R.compile_route(**self.args())
   self.assertEqual(route["selection"]["route_origin"],"preset"); self.assertEqual(route["selection"]["shape"],"direct")

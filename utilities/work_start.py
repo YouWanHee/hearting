@@ -662,7 +662,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         return _wait_expired({**result, "observation": joined})
     directive, reason, _ = parent_next(metadata.get("parent_completion_delivery", ""), aid, agent_home=ROOT)
     return {**result, "state": "running", "parent_next": directive, "parent_next_reason": reason,
-            "parent_next_command": resume + " --wait" if directive == "bounded-wait" else ""}
+            "parent_next_command": resume + " --wait" if directive == "bounded-wait" else "",
+            "next_step": "You are the parent session; the owner runs as a separate attempt. Do not kill, "
+                "replace, or redo its work inline. Follow parent_next: end-turn means yield; "
+                "bounded-wait means run parent_next_command once."}
 
 
 def _compose_again(route) -> str:

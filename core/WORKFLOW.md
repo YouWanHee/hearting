@@ -275,7 +275,8 @@ to obtain a complete recipe. `compose` fills omitted flags from the checkout: cw
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
-artifact root and the caller has not named what was read), and both
+artifact root and the caller has not named what was read; the latest `prd.md` of
+a `shared/spec/<ref>/` revision only adds one `[경로]` card line with its path), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`
 records `compose` or `preset`, `selection.shape` records the shape, a staged
@@ -387,13 +388,15 @@ criterion, destructive risk, or touched external system.
 Material source work has an additional deterministic participation invariant:
 before a source Edit/Write-family mutation or a commit containing source
 changes, the acting session must hold a current, cwd-bound route record emitted
-by `utilities/capability-route.py compile`. For code, that route is
+by `utilities/capability-route.py compile` or `compose`. For code, that route is
 `autopilot-code` at no less than `direct`. A Skill invocation, the prose card,
 an earlier session's record, or a stale record from another cwd is not route
 participation. Hotfixes do not bypass this floor. This invariant was hardened
 after the 2026-07-24 Cairn incident in which a route card was shown but no
 route was entered and the feature was edited, committed, and deployed through
-silent no-route work.
+silent no-route work. The runtime write gates are retired, so no command
+enforces or answers this invariant; it is the session's own obligation, and
+`capability-route.py verify`/`status` only inspect a route that exists.
 
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At
@@ -843,7 +846,7 @@ In a spec-backed project, a later fix or feature—especially in a new session�
 These rules close three gaps: a broken trail caused by over-creating plans for quick work, spec drift that bypasses versioned spec update, and blind editing in a new session. Both `autopilot-spec` and `autopilot-code` are iterable; post-build change is another invocation of the same capability, not a new workflow family.
 # Capability route topology
 
-Every entry capability resolves through `capabilities/topologies.json`, the machine-readable execution-topology source. Intensity, topology class, worker kind, transport, DAG nodes, write scopes, promotion signals, and completion gates remain separate axes. `utilities/capability-route.py` compiles an immutable route bound to the registry digest, source commit, physical absolute working directory, artifact root, and transport evidence. Adapters may project compact summaries and pointers, but must not copy the graph into bootstrap or Skill metadata.
+Every entry capability resolves through `capabilities/topologies.json`, the machine-readable execution-topology source. Intensity, topology class, worker kind, transport, DAG nodes, write scopes, promotion signals, and completion gates remain separate axes. `utilities/capability-route.py` compiles an immutable route bound to the registry digest (plus a `capability_registry_digest` over only the parts that route derives from: shared sections, its own capability's recipes and the gate contracts they cite, so an edit to another capability does not make it stale), source commit, physical absolute working directory, artifact root, and transport evidence. Adapters may project compact summaries and pointers, but must not copy the graph into bootstrap or Skill metadata.
 
 The route compiler is **enforced** (promoted from report-only, 2026-07-22): every node
 references a unit in `roles/units/`, and routing happens at entry only — a
