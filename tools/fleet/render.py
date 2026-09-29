@@ -100,6 +100,12 @@ def _palette_fg(name, fallback):
 
 # harness = dim lowercase word in its identity color (no bracket chip, no reverse-video)
 _BADGE_TEXT = {"claude": "claude code", "codex": "codex", "opencode": "opencode"}
+# Usage-header labels only (user 2026-09-29: "상단 opencode→opencode go"). The quota in that
+# row is the opencode-GO account, not the bare opencode runtime, and 'claude code' already
+# does exactly this disambiguation one row up. Scoped to the usage header on purpose: the
+# session card and dispatch rows say `opencode` because those name the runtime itself, and
+# renaming them there would mislabel what they describe.
+_USAGE_BADGE_TEXT = {"opencode": "opencode go"}
 _BADGE_KEY = {"claude": "h_claude", "codex": "h_codex", "opencode": "h_opencode"}
 _LIVE_RANK = {"working": 0, "idle": 1, "blocked": 2, "done": 3, "stale": 4, "dead": 5, "unknown": 6}
 _JOB_LIVE_RANK = {"working": 0, "queued": 1, "stale": 2, "dead": 3, "unknown": 4}
@@ -652,7 +658,7 @@ def _clean_model(name):
     name = name.split(" (", 1)[0]
     if "/" in name:
         name = name.split("/", 1)[1]
-    return _ROLE_MODEL_NAME.get(name.lower(), name)
+    return _shorten_model_suffix(_ROLE_MODEL_NAME.get(name.lower(), name))
 
 
 # Variant/effort tokens that carry no information: the runtime picked its own default and
@@ -661,12 +667,34 @@ def _clean_model(name):
 # the same honest blank a missing effort already gets.
 _EMPTY_EFFORT = {"runtime-default", "inherit", "unknown", "default"}
 
+# What a session that reported the runtime's own default effort shows in place of a
+# level: an explicit, dimmed '(·default)'. Distinct from the blank an unobserved effort
+# gets, without claiming any ramp position — the ramp (`_eff_key`) is for real levels only.
+_DEFAULT_EFFORT_MARK = "default"
+
 
 def _effort_text(effort):
     return "" if not effort or str(effort).strip().lower() in _EMPTY_EFFORT else str(effort)
 
 
 _MODEL_ID_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?(?:-\d{8})?$")
+# Non-claude ids carry a tier qualifier and/or a version that the display name does not
+# need: 'muse-spark-1.3-contributor' → 'muse-spark', 'space-bunny-free' → 'space-bunny'
+# (user 2026-09-29). A version is dropped ONLY when a hyphen survives in front of it, so
+# the single-token families keep the version they were always shown with — 'glm-5.2'
+# stays 'glm-5.2' (the 2026-08-07 decision), and 'gpt-5.6' stays 'gpt-5.6'.
+_MODEL_TIER_RE = re.compile(r"-(?:contributor|free)$")
+_MODEL_VERSION_RE = re.compile(r"-\d+\.\d+$")
+
+
+def _shorten_model_suffix(name):
+    """Drop a trailing tier qualifier ('-contributor'/'-free'), then a version segment —
+    but the version only when a multi-token name would still be left standing."""
+    if not name:
+        return name
+    name = _MODEL_TIER_RE.sub("", name)
+    remainder = _MODEL_VERSION_RE.sub("", name)
+    return remainder if "-" in remainder else name
 
 
 def _short_model_id(name):
@@ -679,7 +707,7 @@ def _short_model_id(name):
         return name
     m = _MODEL_ID_RE.match(name)
     if not m:
-        return name
+        return _shorten_model_suffix(name)
     fam, major, minor = m.group(1).capitalize(), m.group(2), m.group(3)
     return "%s %s" % (fam, major + ("." + minor if minor else ""))
 
@@ -1041,7 +1069,8 @@ def _model_cell(model, effort, width, dim=False):
     return [(_pad(name[: width - 1], width), lkey)]
 
 
-def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown="?"):
+def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown="?",
+                       effort_default=False):
     """F-33 (v11, 사용자 확정 2026-07-16) — WIDE-layout harness field with model/effort folded
     in as a parenthetical: 'claude code (Fable 5·xhigh)'. The harness text keeps its
     existing hb_*/h_* badge color (`hkey`); the parenthetical reuses `_model_cell`'s
@@ -1051,7 +1080,12 @@ def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown=
     has no live telemetry to show. Always returns segments summing to exactly `width` cells
     (long names/ids clip the same way `_model_cell` already did, never overflow) — the last
     cell is always left as guaranteed padding so a maxed-out clip never runs the closing `)`
-    straight into the name column (the `_NAME_GAP` collision, same idiom, new spot)."""
+    straight into the name column (the `_NAME_GAP` collision, same idiom, new spot).
+
+    `effort_default` marks "the runtime reported an effort token, but it was its own
+    uninformative default". That is not an effort level, so it never claims a real one —
+    it renders a small dim '(default)' instead, distinguishing it from a session that
+    reported no effort at all (both would otherwise be the same blank)."""
     hn = _BADGE_TEXT.get(harness, unknown) if harness else unknown
     segs = [(hn, hkey)]
     used = len(hn)
@@ -1072,6 +1106,10 @@ def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown=
             segs += [(" (", "dim"), (name, _model_key(model, dim=dim)),
                      ("·", "dim"), (eff, _eff_key(eff_full, dim)), (")", "dim")]
             used += 2 + len(name) + 1 + len(eff) + 1
+        elif effort_default and room >= len(name) + 1 + len(_DEFAULT_EFFORT_MARK):
+            segs += [(" (", "dim"), (name, _model_key(model, dim=dim)),
+                     ("·", "dim"), (_DEFAULT_EFFORT_MARK, "dim"), (")", "dim")]
+            used += 2 + len(name) + 1 + len(_DEFAULT_EFFORT_MARK) + 1
         elif room > 0:
             nm = name[: max(1, room)]
             segs += [(" (", "dim"), (nm, _model_key(model, dim=dim)), (")", "dim")]
@@ -1919,7 +1957,9 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     segs += _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
     segs += _harness_model_cell(s.harness, None if dead_stale else s.model,
                                 None if dead_stale else s.effort, _HMW - _TAG_W, hkey,
-                                dim=dim_tel)
+                                dim=dim_tel,
+                                effort_default=(not dead_stale
+                                                and bool(getattr(s, "effort_default", False))))
 
     # F-22: reserve identity suffixes first, then let the title consume the
     # responsive name column. Calls without a terminal-derived width retain the
@@ -5761,7 +5801,7 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
     hs = [h for h in ("claude", "codex", "opencode") if h in rl or h in live]
     rows = []
     for idx, h in enumerate(hs):
-        hn = _BADGE_TEXT.get(h, h)
+        hn = _USAGE_BADGE_TEXT.get(h) or _BADGE_TEXT.get(h, h)
         row = [("  usage " if idx == 0 else "        ", "head"),
                (_pad(hn, 14), "hb_" + h if h in _BADGE_TEXT else "hb_other")]
         if h not in rl:
