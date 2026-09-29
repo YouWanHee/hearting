@@ -816,5 +816,133 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.step(interview=self.question_file)["state"], "needs-question")
 
 
+GF = load("work_start_group_fixture", W.ROOT / "utilities/artifact_workflow_groups.test.py")
+
+
+class GroupContextStartTest(GF.fixture.ProducerTestBase):
+    """Actual compose/admit/start/producer seams with no live roots or workers."""
+    _cycles = GF.WorkflowGroupsTest._cycles
+    _proposal = staticmethod(GF.WorkflowGroupsTest._proposal)
+
+    def setUp(self):
+        super().setUp()
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_ARTIFACT_")}
+        patch = mock.patch.dict(os.environ, clean, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.members = self._cycles(2)
+        self.campaign = self.members[0]["campaign"]
+        plan = GF.W.prepare(self.root, self.campaign, self._proposal(self.members))
+        GF.W.apply(self.root, plan)
+        self.group = plan["document"]["groups"][0]["group_id"]
+        self.context = {"campaign_id": self.campaign, "group_id": self.group}
+        self.env = {"AGENT_ARTIFACT_CAMPAIGN_ID": self.campaign,
+                    "AGENT_ARTIFACT_WORKFLOW_GROUP_ID": self.group}
+
+    def compose(self, slug="group-followup", **kwargs):
+        args = dict(capability="autopilot-code", capability_mode="dev", shape="direct", graph=None,
+                    slug=slug, cwd=W.ROOT, artifact_root=self.root, campaign_key="workflow-test",
+                    parent_cycle_id=self.members[0]["id"], parent_harness="codex", spec_read="fixture",
+                    drift_verdict="within-spec", work_request={"text": "Continue the named goal.",
+                                                               "owner_harness": "codex"})
+        args.update(kwargs)
+        route = GF.fixture.R.compose_route(**args)
+        bound = GF.fixture.L.admit_runtime_route(self.root, route)
+        return route, Path(bound.route_file)
+
+    def snapshot(self):
+        return {str(p.relative_to(self.root)): p.read_bytes()
+                for p in self.root.rglob("*") if p.is_file() and p.name != ".admission.lock"}
+
+    def test_fresh_start_and_resume_preserve_explicit_context(self):
+        with mock.patch.dict(os.environ, self.env):
+            route, path = self.compose()
+        # Read serialized route as a new caller does, after the source env is gone.
+        route = json.loads(path.read_text())
+        self.assertEqual(route["work_request"]["workflow_group_context"], self.context)
+        GF.fixture.R.verify_route(route, W.ROOT)
+        before_env = dict(os.environ)
+        first = W.start_work(route, path, self.jobs)
+        self.assertEqual(first["state"], "inline")
+        self.assertEqual(first["artifact_env"]["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"], self.group)
+        again = W.start_work(json.loads(path.read_text()), path, self.jobs)
+        self.assertEqual(again["artifact_env"], first["artifact_env"])
+        self.assertEqual(dict(os.environ), before_env)
+        document = GF.W.verify(self.root, self.campaign)
+        self.assertEqual(document["groups"], 1)
+        declaration = json.loads(GF.W.declaration_path(self.root, self.campaign).read_text())
+        self.assertEqual(len(declaration["groups"][0]["members"]), 3)
+
+    def test_fresh_cli_process_starts_and_resumes_without_group_environment(self):
+        with mock.patch.dict(os.environ, self.env):
+            route, path = self.compose()
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("AGENT_ARTIFACT_", "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_OWNER_ROUTE_"))}
+        env.update(AGENT_HOME=str(W.ROOT), AGENT_DISPATCH_JOBS=str(self.jobs),
+                   AGENT_DISPATCH_CALLER_HARNESS="codex")
+        command = [sys.executable, str(W.ROOT / "utilities/capability-route.py"),
+                   "start", "--route", str(path), "--jobs", str(self.jobs)]
+        results = []
+        for _ in range(2):
+            run = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            result = json.loads(run.stdout)
+            self.assertEqual(result["artifact_env"]["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"], self.group)
+            results.append(result["artifact_env"])
+        self.assertEqual(results[0], results[1])
+
+    def test_parent_only_old_request_stays_ungrouped(self):
+        route, path = self.compose()
+        self.assertNotIn("workflow_group_context", route["work_request"])
+        result = W.start_work(route, path, self.jobs)
+        self.assertNotIn("AGENT_ARTIFACT_WORKFLOW_GROUP_ID", result["artifact_env"])
+
+    def test_other_campaign_ambient_context_is_not_captured(self):
+        with mock.patch.dict(os.environ, self.env):
+            route, path = self.compose(campaign_key="independent-goal", parent_cycle_id=None)
+        self.assertNotIn("workflow_group_context", route["work_request"])
+        result = W.start_work(route, path, self.jobs)
+        self.assertNotIn("AGENT_ARTIFACT_WORKFLOW_GROUP_ID", result["artifact_env"])
+        self.assertNotEqual(result["artifact_env"]["AGENT_ARTIFACT_CAMPAIGN_ID"], self.campaign)
+
+    def test_saved_context_cannot_override_different_campaign(self):
+        route, path = self.compose(campaign_key="independent-goal", parent_cycle_id=None,
+            work_request={"text": "task", "owner_harness": "codex", "workflow_group_context": self.context})
+        before = self.snapshot()
+        with self.assertRaisesRegex(GF.P.ProducerError, "workflow-group-campaign-mismatch"):
+            W.start_work(route, path, self.jobs)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_current_explicit_conflict_is_rejected_without_writes(self):
+        with mock.patch.dict(os.environ, self.env):
+            route, path = self.compose()
+        before = self.snapshot()
+        with mock.patch.dict(os.environ, {**self.env, "AGENT_ARTIFACT_WORKFLOW_GROUP_ID": "wgrp_" + "f" * 32}):
+            with self.assertRaisesRegex(GF.P.ProducerError, "workflow-group-context-conflict"):
+                W.start_work(route, path, self.jobs)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_saved_context_is_hash_bound_and_closed_shape(self):
+        with mock.patch.dict(os.environ, self.env):
+            route, _ = self.compose()
+        route["work_request"]["workflow_group_context"]["group_id"] = "wgrp_" + "f" * 32
+        with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
+            with self.assertRaisesRegex(ValueError, "modified route hash"):
+                GF.fixture.R.verify_route(route, W.ROOT)
+        for context in (None, {}, {**self.context, "guess": True},
+                        {**self.context, "group_id": "title-derived"},
+                        {**self.context, "campaign_id": "../campaign"}):
+            with self.subTest(context=context), self.assertRaisesRegex(ValueError, "work-request-group-context-invalid"):
+                W.validate_request({"text": "task", "owner_harness": None, "workflow_group_context": context})
+
+    def test_registered_launch_preparation_uses_same_saved_context(self):
+        with mock.patch.dict(os.environ, self.env):
+            route, path = self.compose(shape="solo", registered_headless_evidence=GF.fixture.registered_headless())
+        # The selector invokes this same producer seam before adapter launch.
+        result = GF.P.prepare_route_artifact_env(path, start=True, jobs=self.jobs)
+        self.assertEqual(result["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"], self.group)
+        self.assertEqual(GF.P.prepare_route_artifact_env(path, start=False, jobs=self.jobs), result)
+
+
 if __name__ == "__main__":
     unittest.main()

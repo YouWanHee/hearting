@@ -88,7 +88,12 @@ metadata file. An identical replay verifies; a different concurrent successor
 is a conflict. `verify` checks current structure/identity and reports stale or
 unverified evidence separately. An explicitly carried same-campaign group
 context can add a new cycle as a member during the existing producer `begin`;
-the parent cycle alone cannot do so. No new workflow gate is required.
+the parent cycle alone cannot do so. `compose` preserves that explicit campaign
+and group identity in the existing sealed work request. A later `start`/resume
+restores it through the normal producer preparation, even in a fresh process;
+a different campaign or conflicting explicit group is rejected. Routes without
+this optional context retain their existing behavior. No new workflow gate or
+user input is required.
 The final recheck covers newly authored evidence immediately before apply;
 independent writers can still alter artifact bytes afterward, so the declaration
 does not claim an atomic snapshot of external artifact writes. Historical stale

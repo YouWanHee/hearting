@@ -2959,8 +2959,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if unassigned:
         route["campaign_unassigned"] = True
     if work_request is not None:
-        from work_start import validate_request
-        route["work_request"] = dict(validate_request(work_request))
+        from work_start import capture_request_context
+        route["work_request"] = capture_request_context(work_request, route)
     if unassigned or work_request is not None:
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])

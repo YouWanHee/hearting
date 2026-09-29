@@ -201,13 +201,53 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
 
 
 def validate_request(value):
-    if not isinstance(value, dict) or set(value) != {"text", "owner_harness"}:
+    if (not isinstance(value, dict) or not {"text", "owner_harness"} <= set(value)
+            or set(value) - {"text", "owner_harness", "workflow_group_context"}):
         raise ValueError("work-request-invalid")
     if not isinstance(value["text"], str) or not value["text"].strip():
         raise ValueError("work-request-empty")
     if value["owner_harness"] not in {None, "claude", "codex", "opencode"}:
         raise ValueError("work-request-owner-invalid")
+    if "workflow_group_context" in value:
+        import artifact_identity
+        from artifact_workflow_groups import GROUP_ID
+        context = value["workflow_group_context"]
+        if (not isinstance(context, dict) or set(context) != {"campaign_id", "group_id"}
+                or not artifact_identity.is_well_formed(context.get("campaign_id"), "campaign")
+                or not isinstance(context.get("group_id"), str)
+                or not GROUP_ID.fullmatch(context["group_id"])):
+            raise ValueError("work-request-group-context-invalid")
     return value
+
+
+def group_context_matches_campaign(route, context):
+    """Check an explicit context against selection; never infer one from a parent."""
+    import artifact_producer as producer
+    root = Path(route["artifact_root"])
+    campaign = producer.read_campaign(root, context["campaign_id"])
+    if campaign is None or route.get("campaign_unassigned"):
+        return False
+    key, parent_id = route.get("campaign_key"), route.get("parent_cycle_id")
+    if key is not None and key != campaign.get("key"):
+        return False
+    if parent_id:
+        parent = producer.read_cycle_record(root, parent_id)
+        if parent is None or parent.get("campaign_id") != context["campaign_id"]:
+            return False
+    return bool(key or parent_id)
+
+
+def capture_request_context(value, route):
+    """Seal only the already explicit same-campaign context for later start."""
+    request = dict(validate_request(value))
+    if "workflow_group_context" not in request:
+        campaign = os.environ.get("AGENT_ARTIFACT_CAMPAIGN_ID")
+        group = os.environ.get("AGENT_ARTIFACT_WORKFLOW_GROUP_ID")
+        if campaign and group:
+            context = {"campaign_id": campaign, "group_id": group}
+            if group_context_matches_campaign(route, context):
+                request["workflow_group_context"] = context
+    return validate_request(request)
 
 
 def attempt_id(route, node):

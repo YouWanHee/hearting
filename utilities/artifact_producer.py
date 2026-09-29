@@ -1355,8 +1355,16 @@ def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> 
     root = Path(raw["artifact_root"]).resolve()
     route = load_route(root, route_file)
     if start:
+        context = (route.get("work_request") or {}).get("workflow_group_context")
+        selection = {}
+        if context:
+            from work_start import group_context_matches_campaign
+            if not group_context_matches_campaign(route, context):
+                raise ProducerError("workflow-group-campaign-mismatch", context["campaign_id"])
+            selection = {"workflow_group_id": context["group_id"]}
         return begin(root, route_file=route_file, capability=route["capability"],
-                     intensity=route["effective_intensity"], require_cycle=True, jobs=jobs)["env"]
+                     intensity=route["effective_intensity"], require_cycle=True, jobs=jobs,
+                     **selection)["env"]
     record = route_cycle_for(root, route)
     if record is None:
         return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (
