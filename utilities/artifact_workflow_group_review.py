@@ -42,7 +42,9 @@ import artifact_workflow_groups as W  # noqa: E402
 from artifact_checkpoint_trigger import CUTOVER_REL, in_test_process  # noqa: E402
 
 PROFILE = "light"
-MODEL_TIMEOUT = 240
+# A full-size campaign input (~120k characters) took 393 s on the light profile
+# (2026-09-30); nobody waits on this background call, so allow it to finish.
+MODEL_TIMEOUT = 600
 MAX_PASSES = 3
 HARD_FAILURE_LIMIT = 3
 MAX_TARGETS_PER_CALL = 16
@@ -827,12 +829,14 @@ def _closed(value: Any, keys: frozenset, what: str) -> Mapping[str, Any]:
 
 
 def _parse(text: str) -> Mapping[str, Any]:
-    body = text.strip()
-    fenced = re.fullmatch(r"```json\s*(.*?)\s*```", body, re.DOTALL)
-    if fenced:
-        body = fenced.group(1)
+    # Read the first JSON object and ignore a fence or a note around it: models
+    # add one despite the prompt, and every structural check below still applies.
+    start = text.find("{")
     try:
-        return _closed(json.loads(body, object_pairs_hook=W._unique_pairs), _TOP_KEYS, "top-level-keys")
+        if start < 0:
+            raise ValueError("no JSON object")
+        value, _end = json.JSONDecoder(object_pairs_hook=W._unique_pairs).raw_decode(text, start)
+        return _closed(value, _TOP_KEYS, "top-level-keys")
     except W.WorkflowGroupError as exc:
         raise ReviewError("invalid-response", exc.code) from exc
     except (ValueError, RecursionError) as exc:

@@ -354,6 +354,15 @@ class ValidationTest(ReviewBase):
                 self.assertEqual(W.declaration_path(self.root, self.camp).read_bytes(), self.declared)
                 self.assertEqual(self.record()["cycles"][self.tid]["failure_class"], "invalid-response")
 
+    def test_fenced_reply_with_a_trailing_note_is_read(self):
+        reply = {"decisions": [{"cycle_id": self.tid, "verdict": "join", "group_id": self.gid,
+                                "stage_label": "Three", "reason": "Same subgoal."}],
+                 "new_groups": [], "relations": []}
+        text = "```json\n%s\n```\n\nNote: the join follows the shared plan." % json.dumps(reply)
+        report = self.report(self.run_reply(text))
+        self.assertEqual(report["status"], "applied")
+        self.assertEqual(self.record()["cycles"][self.tid]["verdict"], "joined")
+
     def test_long_stage_label_falls_back_and_newlines_are_normalized(self):
         reply = {"decisions": [{"cycle_id": self.tid, "verdict": "join", "group_id": self.gid,
                                 "stage_label": "s" * 60, "reason": "First line\nsecond   line"}],
