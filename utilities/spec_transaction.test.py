@@ -211,6 +211,96 @@ class SpecTransactionTest(unittest.TestCase):
    self.assertEqual((component/"_internal/versions/v1/prd.md").read_text(),"before\n")
    self.assertFalse((artifact/"spec/_internal/versions/v1").exists())
 
+ BEGIN="<!-- BLUEPRINT-SUMMARY:BEGIN -->"; END="<!-- BLUEPRINT-SUMMARY:END -->"
+ def prd_text(self, *body):
+  return "\n".join(["# Title","",self.BEGIN,"- one item",self.END,"","## 1. Common",*body])+"\n"
+
+ def write_code(self, text, *, exit_code=None):
+  code=f"import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text({text!r},encoding='utf-8')"
+  return code+(f"; import sys; sys.exit({exit_code})" if exit_code is not None else "")
+
+ def run_readability(self, before, code):
+  """Run one transaction; returns (result, receipt rows, spec dir, tmp) with the tmp dir kept alive by the caller's context."""
+  td=tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup)
+  root=Path(td.name); artifact,spec,route=self.fixture(root); events=root/"events.jsonl"
+  if before is not None: (spec/"prd.md").write_text(before,encoding="utf-8")
+  result=subprocess.run(self.command(root,artifact,route,code,events=events),text=True,capture_output=True,env=HERMETIC_ENV)
+  rows=[json.loads(l) for l in events.read_text().splitlines()]
+  return result,rows,spec
+
+ def test_i1_clean_new_prd_records_an_empty_readability_receipt(self):
+  result,rows,_spec=self.run_readability(None,self.write_code(self.prd_text("Plain text.")))
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  found=[r for r in rows if r["status"]=="readability"]
+  self.assertEqual(len(found),1)
+  self.assertEqual(found[0]["counts"]["total"],0); self.assertEqual(found[0]["base"],"none")
+  self.assertEqual(found[0]["schema"],"prd-readability/1"); self.assertNotIn("error",found[0])
+  self.assertNotIn("prd-readability",result.stderr)
+  self.assertIn('"status": "readability"',result.stdout)
+
+ def test_i2_new_lines_are_counted_apart_and_the_write_still_succeeds(self):
+  before=self.prd_text("old violation \u2460 here")
+  after=before+f"new violation \u2461 here\nroute rt-b890afc55528891c\n"
+  result,rows,spec=self.run_readability(before,self.write_code(after))
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  event=next(r for r in rows if r["status"]=="readability")
+  self.assertEqual(event["base"],"preimage")
+  self.assertEqual((event["counts"]["new"],event["counts"]["existing"],event["counts"]["total"]),(2,1,3))
+  self.assertEqual(event["counts"]["by_rule"],{"circled-char":2,"route-id":1})
+  first=before.splitlines().index("old violation \u2460 here")+1
+  self.assertEqual([(v["line"],v["age"],v["rule"]) for v in event["violations"]],
+                   [(first+1,"new","circled-char"),(first+2,"new","route-id"),(first,"existing","circled-char")])
+  notice=[l for l in result.stderr.splitlines() if l.startswith("prd-readability:")]
+  self.assertEqual(len(notice),1); self.assertIn("3 warnings (new 2, existing 1)",notice[0])
+  self.assertEqual((spec/"_internal/versions/v1/prd.md").read_text(encoding="utf-8"),before)
+  self.assertEqual((spec/"prd.md").read_text(encoding="utf-8"),after)
+  self.assertIn("snapshot",[r["status"] for r in rows])
+
+ def test_i3_fenced_code_is_not_flagged(self):
+  fence="`"*3
+  noisy=f"route rt-b890afc55528891c commit 1600e12 \u2460"
+  result,rows,_spec=self.run_readability(None,self.write_code(self.prd_text(fence,noisy,fence)))
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertEqual(next(r for r in rows if r["status"]=="readability")["counts"]["total"],0)
+  self.assertNotIn("prd-readability",result.stderr)
+
+ def test_i4_unchanged_prd_emits_no_readability_event(self):
+  before=self.prd_text("old violation \u2460 here")
+  result,rows,_spec=self.run_readability(before,"pass")
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertNotIn("readability",[r["status"] for r in rows])
+  self.assertNotIn("prd-readability",result.stderr)
+
+ def test_i5_child_exit_code_is_kept_when_the_prd_changed(self):
+  result,rows,_spec=self.run_readability(None,self.write_code(self.prd_text("bad \u2460"),exit_code=7))
+  self.assertEqual(result.returncode,7,result.stdout+result.stderr)
+  self.assertEqual(next(r for r in rows if r["status"]=="readability")["counts"]["total"],1)
+  self.assertEqual(rows[-1]["status"],"released"); self.assertEqual(rows[-1]["result"],7)
+
+ def test_i6_checker_failure_becomes_an_error_field_not_an_exception(self):
+  with tempfile.TemporaryDirectory() as td:
+   broken=Path(td)/"broken.py"; broken.write_text("raise RuntimeError('boom')\n")
+   original=TX.READABILITY_PATH
+   try:
+    for path in (Path(td)/"missing.py",broken):
+     with self.subTest(path=path.name):
+      TX.READABILITY_PATH=path
+      event,notice=TX.readability_event(Path("prd.md"),None,b"# T\n",  "rt-x",3)
+      self.assertEqual((event["status"],event["route_id"],event["version"]),("readability","rt-x",3))
+      self.assertIn("error",event); self.assertNotIn("counts",event); self.assertLessEqual(len(event["error"]),200)
+      self.assertTrue(notice.startswith("prd-readability: check skipped ("))
+      json.dumps(event)
+   finally:
+    TX.READABILITY_PATH=original
+  event,notice=TX.readability_event(Path("prd.md"),None,self.prd_text("ok").encode(),"rt-x",1)
+  self.assertEqual(event["counts"]["total"],0); self.assertIsNone(notice)
+
+ def test_i7_readability_precedes_released_which_stays_last(self):
+  result,rows,_spec=self.run_readability(self.prd_text("a"),self.write_code(self.prd_text("b \u2460")))
+  statuses=[r["status"] for r in rows]
+  self.assertEqual(statuses[-2:],["readability","released"])
+  self.assertEqual(statuses.count("released"),1)
+
 class CycleLayoutTest(unittest.TestCase):
  """W7C cycle layout (defect K): the transaction seeds the empty cycle spec
  root from the latest shared revision so the snapshot comes from the tool,
