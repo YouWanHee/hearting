@@ -270,6 +270,11 @@ class Session:
     title: Optional[str] = None        # harness session title (ai-title/DB title) — render name zone only, slug fallback when None
     model: Optional[str] = None
     effort: Optional[str] = None
+    # The runtime DID report an effort token, but it was the uninformative
+    # "default"/"inherit" kind (`_EMPTY_EFFORT`) — so `effort` stays None and this
+    # says "the runtime chose its own default" rather than "we know nothing".
+    # Distinguishes the two honest blanks the effort cell otherwise renders alike.
+    effort_default: bool = False
     ctx_pct: Optional[int] = None      # context window used %
     rl_5h: Optional[int] = None        # legacy fixed 5h slot (Claude + old Codex payloads)
     rl_7d: Optional[int] = None        # legacy fixed 7d slot (Claude + old Codex payloads)
