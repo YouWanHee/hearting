@@ -87,7 +87,8 @@ def capability_registry_digest(registry, capability, extra_recipes=()):
     recipes = list(extra_recipes)
     names = {capability}
     for recipe in recipes:
-        base = (recipe.get("compose") or {}).get("base_capability") if isinstance(recipe, dict) else None
+        meta = recipe.get("compose") if isinstance(recipe, dict) else None
+        base = meta.get("base_capability") if isinstance(meta, dict) else None
         if isinstance(base, str):
             names.add(base)
     recipes = [r for r in registry.get("recipes", []) if r.get("capability") in names] + recipes

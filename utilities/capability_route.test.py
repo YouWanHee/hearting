@@ -4237,6 +4237,9 @@ class TestValidationBasis(unittest.TestCase):
   next(r for r in edited["recipes"] if r["capability"]=="autopilot-ship")["probe"]="edited"
   self.assertEqual(base,R.TOPO.capability_registry_digest(edited,"autopilot-code"))
   self.assertNotEqual(base,R.TOPO.capability_registry_digest(edited,"autopilot-ship"))
+  # A hand-edited composed recipe with a malformed `compose` digests, never crashes.
+  for compose in ("x",["autopilot-ship"],None):
+   R.TOPO.capability_registry_digest(registry,"autopilot-code",[{"compose":compose}])
  def test_legacy_route_without_basis_keeps_stale_wording(self):
   route=R.compile_route(**self.args())
   legacy=json.loads(json.dumps(route)); legacy.pop("validation_basis")
