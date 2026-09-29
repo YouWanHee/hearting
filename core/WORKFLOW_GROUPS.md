@@ -98,3 +98,40 @@ The final recheck covers newly authored evidence immediately before apply;
 independent writers can still alter artifact bytes afterward, so the declaration
 does not claim an atomic snapshot of external artifact writes. Historical stale
 evidence remains readable and does not block an unrelated merge.
+
+## Incremental review of newly sealed cycles
+
+A cycle that no group covers is reviewed in the background right after it seals,
+with the same criteria as the 2026-09-29 full backfill. The trigger is a
+best-effort detached `artifact_workflow_group_review.py sweep --auto`; it never
+delays, fails, or changes a seal, and a busy or failed run is retried by a later seal.
+
+- **Targets (auto).** Sealed cycles with no judgement record that sealed at or after
+  the record's `enrolled_at`; failed cycles with fewer than 3 hard failures
+  (`invalid-response`, `apply-failed`); and cycles judged `unassigned` while open
+  that have since sealed (once). Enrollment is written by the first automatic
+  sweep that receives a trigger cycle, before any model call. Without it, only the
+  trigger cycles are reviewed; historical cycles are reviewed only by an explicit
+  `sweep --cycle` or `--since`. A cycle already in a group is never sent.
+- **Criteria.** Group only when a shared subgoal shows in the bodies; dates and
+  titles alone are no evidence. Declare a relation only on evidence that one cycle's
+  material was actually used as another's input. When the subgoal is clear but the
+  order is not, group and declare no relation. Stay inside the campaign, and give the
+  real reason for every cycle left ungrouped.
+- **Who decides.** The model decides meaning (`light` profile through the shared
+  provider cascade). Deterministic code only selects and bounds the input, checks
+  the response's structure (known group and cycle IDs, text limits, evidence paths
+  drawn from the listed candidates), and writes through the same
+  `prepare` → `apply` → `verify` path, always in merge mode.
+- **Failures.** A structurally invalid response rejects that campaign's review and
+  changes no declaration. A relation whose evidence cannot be bound is dropped alone;
+  its group and members still apply.
+- **Record.** `.runtime/artifact-producer/v1/workflow-group-reviews.json` is
+  producer-only and Cairn does not read it. Per cycle it keeps `verdict`
+  (`joined`, `new-group`, `unassigned`, `failed`), the model's reason, `profile`,
+  `harness`, and failure counters; it names no vendor model. A corrupt or foreign
+  record is never overwritten and pauses `--auto` sweeps.
+- **Switch.** `HEARTING_WORKFLOW_GROUP_REVIEW=off` disables the trigger and `--auto`
+  only; an explicit `sweep`, including `--dry-run`, is unaffected.
+
+No new gate, input, or agent obligation results from this review.

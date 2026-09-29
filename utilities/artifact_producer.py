@@ -4533,6 +4533,11 @@ def _commit_sealed(
     remove_interim(root, record["cycle_id"])
     artifact_locator.update_indexes(root, [record["campaign_id"]])
     artifact_cycle_titles.emit_after_seal_locked(root, sealed, document, directory / "manifest.json")
+    try:
+        import artifact_workflow_group_review  # lazy: it imports this module
+        artifact_workflow_group_review.launch_after_seal(root, sealed)
+    except Exception:  # noqa: BLE001 -- the review trigger never changes a seal
+        pass
 
 
 # ---------------------------------------------------------------------------
