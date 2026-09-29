@@ -296,12 +296,21 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
             codex_tick = prepare(sessions)
     except Exception:
         pass
+    opencode_tick = None
+    try:
+        prepare = getattr(modules.get("opencode"), "prepare_tick", None)
+        if prepare and any(s.harness == "opencode" for s in sessions):
+            opencode_tick = prepare(sessions)
+    except Exception:
+        pass
     for s in sessions:
         fn = enrichers.get(s.harness)
         if fn:
             try:
                 if s.harness == "codex" and codex_tick is not None:
                     fn(s, tick=codex_tick)
+                elif s.harness == "opencode" and opencode_tick is not None:
+                    fn(s, tick=opencode_tick)
                 else:
                     fn(s)
             except Exception:

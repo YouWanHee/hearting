@@ -7330,14 +7330,16 @@ class RouteChainWriterTest(ComposeRouteTest):
    err=self._emit(route,tmp)
    self.assertIn("route_chain_written=0",err)
    self.assertEqual(self.RC.read_tail("claude","sid-d2"),[])
- def test_opencode_identity_is_not_recorded(self):
+ def test_opencode_session_id_records_opencode_ledger(self):
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
     os.environ,{"OPENCODE_SESSION_ID":"sid-oc","AGENT_DISPATCH_ATTEMPT_ID":"",
                "AGENT_HOME":str(R.ROOT)},clear=False):
    os.environ.pop("CLAUDE_CODE_SESSION_ID",None); os.environ.pop("CODEX_THREAD_ID",None)
    route=self.compose(artifact_root=tmp)
-   self._emit(route,tmp)
-   self.assertEqual(self.RC.read_tail("opencode","sid-oc"),[])
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=1 harness=opencode",err)
+   self.assertEqual([line["route_id"] for line in self.RC.read_tail("opencode","sid-oc")],
+                    [route["route_id"]])
  def test_tmp_artifact_root_without_explicit_dir_is_not_recorded(self):
   with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-tmp","AGENT_DISPATCH_ATTEMPT_ID":"",
                                    "AGENT_HOME":str(R.ROOT)}):

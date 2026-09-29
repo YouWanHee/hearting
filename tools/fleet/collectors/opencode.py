@@ -162,20 +162,42 @@ def _process_started_ms(sess):
     return int((boot + ticks / clock_ticks) * 1000)
 
 
-def _query(cur, cwd, proc_start_ms=None):
-    # EXACT (N opencode sessions can share one directory): among this directory's
-    # top-level sessions, the one this process CREATED is the earliest whose
-    # time_created is at/after the process start — so bind to that, not to whichever
-    # session happens to be the most recently updated. Without it, every process in a
-    # shared directory collapses onto one row (measured 2026-09-29: three opencode panes
-    # on the primary checkout all rendered as a single session). A process that attached
-    # to a pre-existing session has no candidate here, and falls through to the previous
-    # newest-in-directory binding below, unchanged.
+def prepare_tick(sessions):
+    """`{pid: next same-directory opencode start (ms) | None}` for this tick.
+
+    A process owns the top-level sessions created between its own start and the next
+    same-directory opencode process's start; that window is what separates panes that
+    share a checkout without pinning a pane to the first session it ever opened.
+    """
+    starts = {}
+    for sess in sessions:
+        if getattr(sess, "harness", None) != "opencode" or not getattr(sess, "cwd", None):
+            continue
+        started = _process_started_ms(sess)
+        if started is not None:
+            starts.setdefault(sess.cwd, []).append((started, sess.pid))
+    until = {}
+    for rows in starts.values():
+        rows.sort()
+        for index, (_started, pid) in enumerate(rows):
+            until[pid] = rows[index + 1][0] if index + 1 < len(rows) else None
+    return until
+
+
+def _query(cur, cwd, proc_start_ms=None, until_ms=None):
+    # N opencode processes can share one directory, and one process can open several
+    # sessions over its life (/new). Bind to the most recently updated top-level session
+    # created inside this process's window [own start, next same-directory start): the
+    # window keeps panes apart, and "most recently updated" follows the session the pane
+    # is on now instead of the first one it ever created. A process that attached to a
+    # pre-existing session has no candidate here and keeps the older binding below.
     if proc_start_ms is not None:
+        bound = "AND time_created<? " if until_ms is not None else ""
+        args = (cwd, proc_start_ms) + ((until_ms,) if until_ms is not None else ())
         row = cur.execute(
             "SELECT %s FROM session WHERE directory=? AND parent_id IS NULL "
-            "AND time_created>=? ORDER BY time_created ASC LIMIT 1" % _COLS,
-            (cwd, proc_start_ms),
+            "AND time_created>=? %sORDER BY time_updated DESC LIMIT 1" % (_COLS, bound),
+            args,
         ).fetchone()
         if row:
             return row
@@ -250,7 +272,7 @@ def _child_sessions(con, sid):
     return out
 
 
-def enrich(sess):
+def enrich(sess, tick=None):
     # B-5: no hearting-managed writer exists yet for OpenCode (`writer_support ==
     # "not-implemented"`), so this always reads None today — the call is here so the
     # harness-parity contract (D) and a future writer both have one call site, matching
@@ -269,7 +291,8 @@ def enrich(sess):
     subagents = None
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
-        row = _query(con.cursor(), sess.cwd, _process_started_ms(sess))
+        row = _query(con.cursor(), sess.cwd, _process_started_ms(sess),
+                     (tick or {}).get(sess.pid))
         if row and row[0]:
             table = _message_table(con)
             cursor = _observed_cursor(con, table, row[0])
