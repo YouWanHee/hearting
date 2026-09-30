@@ -474,6 +474,77 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertFalse(os.path.exists(first))
 
+    def _spawn_counting_probes(self, sid, **kwargs):
+        """Call maybe_spawn with Popen stubbed; return (result, probe calls, spawns)."""
+        probes, spawns = [], []
+        real = rt.worker_argv
+
+        def counting(*args, **kw):
+            probes.append(args)
+            return real(*args, **kw)
+
+        with mock.patch.object(rt, "worker_argv", side_effect=counting), \
+                mock.patch.object(rt.subprocess, "Popen",
+                                  side_effect=lambda argv, **kw: spawns.append(list(argv)) or object()):
+            result = rt.maybe_spawn("claude", sid, self.transcript, **kwargs)
+        return result, probes, spawns
+
+    def test_debounced_session_skips_the_provider_probe(self):
+        now = time.time()
+        titles.write("debounced", "Title", now=now, offset=1)
+        result, probes, spawns = self._spawn_counting_probes("debounced", now=now + 5)
+        self.assertFalse(result)
+        self.assertEqual(probes, [])
+        self.assertEqual(spawns, [])
+
+    def test_unchanged_transcript_skips_the_provider_probe(self):
+        ts = time.time() - 10 * rt.DEBOUNCE_SEC
+        titles.write("unchanged", "Title", now=ts, offset=1)
+        os.utime(self.transcript, (ts - 100, ts - 100))
+        result, probes, spawns = self._spawn_counting_probes("unchanged")
+        self.assertFalse(result)
+        self.assertEqual(probes, [])
+        self.assertEqual(spawns, [])
+
+    def test_stale_session_still_probes_and_spawns_once(self):
+        result, probes, spawns = self._spawn_counting_probes("fresh-start")
+        self.assertTrue(result)
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(len(spawns), 1)
+
+    def test_fresh_lock_skips_the_probe_without_touching_the_lock(self):
+        lockdir = titles.lock_path("locked")
+        os.makedirs(lockdir)
+        result, probes, spawns = self._spawn_counting_probes("locked")
+        self.assertFalse(result)
+        self.assertEqual(probes, [])
+        self.assertEqual(spawns, [])
+        self.assertTrue(os.path.isdir(lockdir))
+
+    def test_stale_lock_is_reclaimed_by_the_existing_mkdir_path(self):
+        lockdir = titles.lock_path("stale-lock")
+        os.makedirs(lockdir)
+        old = time.time() - rt.WORKER_TIMEOUT * 3
+        os.utime(lockdir, (old, old))
+        result, probes, spawns = self._spawn_counting_probes("stale-lock")
+        self.assertTrue(result)
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(len(spawns), 1)
+        self.assertGreater(os.path.getmtime(lockdir), old)
+
+    def test_lock_taken_after_the_early_check_is_still_refused(self):
+        lockdir = titles.lock_path("raced")
+        real = rt.worker_argv
+
+        def racing_probe(*args, **kwargs):
+            os.makedirs(lockdir, exist_ok=True)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(rt, "worker_argv", side_effect=racing_probe), \
+                mock.patch.object(rt.subprocess, "Popen") as popen:
+            self.assertFalse(rt.maybe_spawn("claude", "raced", self.transcript))
+        popen.assert_not_called()
+
     def test_scheduler_targets_children_but_never_internal_sessions(self):
         # Dispatched children are first-class title targets (user 2026-07-16);
         # only fleet-internal workers (mem/title refreshers, app-servers) stay out.

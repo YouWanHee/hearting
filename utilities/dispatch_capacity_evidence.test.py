@@ -325,5 +325,300 @@ class QuotaEvidenceTests(unittest.TestCase):
         self.assertEqual(self.state(self.OBSERVED + 60), "ok")
 
 
+class EvidenceCacheTests(unittest.TestCase):
+    """The disk cache must never change an answer: every check compares it with a direct computation."""
+
+    setUp = QuotaEvidenceTests.setUp
+    write = QuotaEvidenceTests.write
+
+    def cache_file(self):
+        return Path(f"{self.jobs}.capacity-cache.json")
+
+    def settle(self, *paths, extra_ns=0):
+        """Backdate mtimes: the cache does not trust a file written within the last 100ms."""
+        for path in paths or (self.jobs, self.log):
+            stat = path.stat()
+            old = time.time_ns() - 5_000_000_000 + extra_ns
+            os.utime(path, ns=(stat.st_atime_ns, old))
+
+    def direct(self, fn, *args, **kwargs):
+        with mock.patch.object(Q, "_DISK_CACHE", False):
+            return fn(*args, **kwargs)
+
+    def answers(self, now, **kwargs):
+        env = kwargs.pop("env", self.env)
+        return (Q._usage(self.jobs, now=now, env=env, **kwargs),
+                Q.observations(self.jobs, now=now, env=env),
+                Q.active_limits(self.jobs, now=now, env=env, **{k: v for k, v in kwargs.items() if k == "models"}))
+
+    def assert_same_as_direct(self, now, **kwargs):
+        cached = self.answers(now, **kwargs)
+        again = self.answers(now, **kwargs)
+        self.assertEqual(cached, self.direct(self.answers, now, **kwargs))
+        self.assertEqual(cached, again)
+
+    def native_reads(self):
+        return mock.patch.object(Q, "_native_rows", wraps=Q._native_rows)
+
+    def test_cache_holds_only_minimal_private_evidence_beside_jobs_log(self):
+        self.settle()
+        Q.usage_states(self.jobs, now=self.now + 10, env=self.env)
+        cache = self.cache_file()
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        self.assertLess(cache.stat().st_size, 20_000)
+        text = cache.read_text()
+        data = json.loads(text)
+        self.assertEqual(set(data), {"schema", "jobs", "key", "horizon", "native", "legacy"})
+        # the evidence is the two log rows `native_quota` reads, not the jobs row or the log tail
+        for leaked in ("/repo", "launch_outcome", "governed-process-group-drained"):
+            self.assertNotIn(leaked, text)
+        self.assertEqual(len(data["native"][0]["e"]), 2)
+        self.assertEqual([p.name for p in self.home.glob("jobs.log*")],
+                         ["jobs.log", "jobs.log.capacity-cache.json"])
+
+    def test_same_answers_with_and_without_the_cache_across_now_scope_and_model(self):
+        other = {**self.env}
+        for label, scoped in (("scoped", True), ("unscoped", False)):
+            self.write(scope=scoped)
+            self.settle()
+            for now in (self.now - 10, self.now, self.now + 1, self.now + 86399, self.now + 86400,
+                        self.now + 86401, self.now + 8 * 86400 - 1, self.now + 8 * 86400 + 1,
+                        self.now + 9 * 86400):
+                for models in ({}, {"claude": "claude-opus-4-6"}, {"claude": "claude-sonnet-4-6"}):
+                    with self.subTest(label=label, now=now - self.now, models=models):
+                        self.assert_same_as_direct(now, models=models)
+            # another account never matches, whatever is cached
+            self.config.write_text(json.dumps({"oauthAccount": {"accountUuid": "other", "organizationUuid": "org-a"}}))
+            self.assert_same_as_direct(self.now + 10)
+            self.config.write_text(json.dumps({"oauthAccount": {"accountUuid": "account-a", "organizationUuid": "org-a"}}))
+
+    def test_model_scoped_credit_rejection_matches_the_direct_answer(self):
+        self.rows[0]["rate_limit_info"].update(rateLimitType="seven_day_overage_included",
+            overageStatus="rejected", unifiedWindows={"seven_day_overage_included": {"utilization": 1}})
+        self.write()
+        self.settle()
+        for now in (self.now, self.now + 86400):
+            for models in ({}, {"claude": "claude-opus-4-6"}, {"claude": "other"}):
+                with self.subTest(now=now - self.now, models=models):
+                    self.assert_same_as_direct(now, models=models)
+
+    def test_legacy_reset_and_unknown_window_boundaries_match_the_direct_answer(self):
+        observed = self.now
+        for label, text in (("clock", "limit \u00b7 resets 3am (Asia/Seoul)"), ("unknown", "You've hit your limit"),
+                            ("dated", "limit \u00b7 resets 2099-01-01 00:00 (UTC)")):
+            stamp = datetime.fromtimestamp(observed, timezone.utc).isoformat().replace("+00:00", "Z")
+            attempt = "att-legacy-" + label
+            log = self.home / f"job.{attempt}.claude.jsonl"
+            log.write_text(json.dumps({"type": "result", "is_error": True, "api_error_status": 429,
+                                       "session_id": "s", "result": text}) + "\n")
+            self.jobs.write_text(f"{stamp}\tdone\t/repo\t/work\tjob\tattempt_id={attempt},harness=claude,"
+                                 f"note=dead-capacity,failure_class=capacity,log_file={log}\n")
+            self.settle(self.jobs, log)
+            for delta in (-5, 0, 1, 1800, 3599, 3600, 3601, 86400, 40 * 86400):
+                for window in (60, 1):
+                    with self.subTest(label=label, delta=delta, window=window):
+                        cached = Q._usage(self.jobs, now=observed + delta, env=self.env, unknown_window_min=window)
+                        self.assertEqual(cached, self.direct(Q._usage, self.jobs, now=observed + delta,
+                                                             env=self.env, unknown_window_min=window))
+
+    def test_evidence_pair_answers_like_the_full_log_tail(self):
+        base = self.rows
+        other_session = {**base[0], "session_id": "sid-b"}
+        earlier_result = {"type": "result", "session_id": "sid-a", "is_error": False}
+        cases = {
+            "plain": base,
+            "noise": [{"type": "assistant"}, base[0], {"type": "assistant"}, base[1]],
+            "other-session-event-last": [base[0], other_session, base[1]],
+            "event-before-previous-result": [base[0], earlier_result, base[1]],
+            "event-after-terminal": [base[1], base[0]],
+            "no-event": [base[1]],
+            "accepted-event-supersedes": [base[0], {**base[0], "rate_limit_info": {
+                **base[0]["rate_limit_info"], "status": "allowed"}}, base[1]],
+            "two-events-latest-wins": [{**base[0], "rate_limit_info": {
+                **base[0]["rate_limit_info"], "resetsAt": self.now + 3600}}, base[0], base[1]],
+        }
+        for name, rows in cases.items():
+            for model in (None, "claude-opus-4-6"):
+                pair = Q._evidence_pair(rows, self.now, model)
+                for now in (self.now - 100, self.now, self.now + 86399, self.now + 86400, self.now + 9 * 86400):
+                    with self.subTest(case=name, model=model, now=now - self.now):
+                        expected = Q.native_quota(rows, observed_at=self.now, now=now, requested_model=model)
+                        actual = Q.native_quota(pair, observed_at=self.now, now=now, requested_model=model) if pair else None
+                        self.assertEqual(expected, actual)
+
+    def test_warm_call_reads_neither_jobs_log_nor_any_log_tail(self):
+        self.settle()
+        first = Q._usage(self.jobs, now=self.now + 10, env=self.env)
+        real = Path.read_text
+
+        def only_the_cache(path, *args, **kwargs):
+            self.assertNotEqual(path, self.jobs, "jobs.log re-read")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=only_the_cache), \
+                self.native_reads() as reads:
+            second = Q._usage(self.jobs, now=self.now + 10, env=self.env)
+            Q.observations(self.jobs, now=self.now + 10, env=self.env)
+        self.assertEqual(first, second)
+        reads.assert_not_called()
+
+    def test_one_call_reads_jobs_log_once(self):
+        self.settle()
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as reads:
+            Q._usage(self.jobs, now=self.now + 10, env=self.env)
+        self.assertEqual([c.args[0] for c in reads.call_args_list if c.args[0] == self.jobs], [self.jobs])
+
+    def test_jobs_log_append_rewrite_and_replace_show_on_the_next_read(self):
+        self.settle()
+        self.assertIn("claude", Q.active_limits(self.jobs, now=self.now + 10, env=self.env))
+        # append a second failed attempt; its log is new
+        attempt = "att-second"
+        log = self.home / f"job.{attempt}.claude.jsonl"
+        log.write_text("".join(json.dumps(r) + "\n" for r in self.rows))
+        line = self.jobs.read_text().replace(self.attempt, attempt).replace(str(self.log), str(log))
+        with self.jobs.open("a") as handle:
+            handle.write(line)
+        self.assertEqual([o["attempt_id"] for o in Q.observations(self.jobs, now=self.now + 10, env=self.env)],
+                         [self.attempt, attempt])
+        # same-size in-place rewrite that only moves mtime_ns
+        self.settle(self.jobs, extra_ns=0)
+        self.assertEqual(len(Q.observations(self.jobs, now=self.now + 10, env=self.env)), 2)
+        before = self.jobs.stat()
+        self.jobs.write_text(self.jobs.read_text().replace("harness=claude", "harness=cloude", 1))
+        os.utime(self.jobs, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        self.assertEqual(self.jobs.stat().st_size, before.st_size)
+        self.assertEqual([o["attempt_id"] for o in Q.observations(self.jobs, now=self.now + 10, env=self.env)],
+                         [attempt])
+        # atomic replace with the same size and the same mtime: only the inode differs
+        stat = self.jobs.stat()
+        replacement = self.home / "jobs.new"
+        replacement.write_text(self.jobs.read_text().replace("harness=cloude", "harness=claude", 1))
+        os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        os.replace(replacement, self.jobs)
+        self.assertEqual(len(Q.observations(self.jobs, now=self.now + 10, env=self.env)), 2)
+        self.assertEqual(Q.observations(self.jobs, now=self.now + 10, env=self.env),
+                         self.direct(Q.observations, self.jobs, now=self.now + 10, env=self.env))
+
+    def test_only_the_changed_reference_log_is_extracted_again(self):
+        attempt = "att-second"
+        log = self.home / f"job.{attempt}.claude.jsonl"
+        log.write_text("".join(json.dumps(r) + "\n" for r in self.rows))
+        with self.jobs.open("a") as handle:
+            handle.write(self.jobs.read_text().replace(self.attempt, attempt).replace(str(self.log), str(log)))
+        self.settle(self.jobs, self.log, log)
+        self.assertEqual(len(Q.observations(self.jobs, now=self.now + 10, env=self.env)), 2)
+        with self.native_reads() as reads:
+            Q.observations(self.jobs, now=self.now + 10, env=self.env)
+        reads.assert_not_called()
+        # a newer successful result ends the second attempt's rejection; the first is untouched
+        with log.open("a") as handle:
+            handle.write(json.dumps({"type": "result", "session_id": "sid-a", "is_error": False}) + "\n")
+        with self.native_reads() as reads:
+            found = Q.observations(self.jobs, now=self.now + 10, env=self.env)
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual([o["attempt_id"] for o in found], [self.attempt])
+        self.assertEqual(found, self.direct(Q.observations, self.jobs, now=self.now + 10, env=self.env))
+
+    def test_a_missing_reference_log_appearing_later_is_picked_up(self):
+        self.log.rename(self.home / "moved.jsonl")
+        self.settle(self.jobs)
+        self.assertEqual(Q.observations(self.jobs, now=self.now + 10, env=self.env), [])
+        self.assertEqual(Q.observations(self.jobs, now=self.now + 10, env=self.env), [])
+        (self.home / "moved.jsonl").rename(self.log)
+        self.assertEqual(len(Q.observations(self.jobs, now=self.now + 10, env=self.env)), 1)
+        self.log.chmod(0)
+        try:
+            self.assertEqual(Q.observations(self.jobs, now=self.now + 10, env=self.env),
+                             self.direct(Q.observations, self.jobs, now=self.now + 10, env=self.env))
+        finally:
+            self.log.chmod(0o600)
+        self.assertEqual(len(Q.observations(self.jobs, now=self.now + 10, env=self.env)), 1)
+
+    def test_unsettled_files_are_not_published_as_cache_keys(self):
+        Q.usage_states(self.jobs, now=self.now + 10, env=self.env)  # everything was just written
+        self.assertFalse(self.cache_file().exists())
+
+    def test_caller_registry_lines_win_over_the_disk_cache(self):
+        self.settle()
+        Q.usage_states(self.jobs, now=self.now + 10, env=self.env)
+        stored = self.cache_file().read_bytes()
+        self.assertEqual(Q.observations(self.jobs, now=self.now + 10, env=self.env, registry_lines=[]), [])
+        self.assertEqual(Q.active_limits(self.jobs, now=self.now + 10, env=self.env, registry_lines=[]), {})
+        self.assertEqual(len(Q.observations(self.jobs, now=self.now + 10, env=self.env)), 1)
+        self.assertEqual(stored, self.cache_file().read_bytes())
+
+    def test_damaged_or_foreign_cache_files_fall_back_to_the_direct_answer(self):
+        self.settle()
+        expected = self.direct(self.answers, self.now + 10)
+        good = None
+        for name, content in (
+            ("garbage", "not json{"),
+            ("empty", ""),
+            ("list", "[]"),
+            ("schema", None),
+            ("truncated", None),
+            ("bad-record", None),
+        ):
+            Q.usage_states(self.jobs, now=self.now + 10, env=self.env)
+            good = good or json.loads(self.cache_file().read_text())
+            data = json.loads(json.dumps(good))
+            if name == "schema":
+                data["schema"] = 99
+                content = json.dumps(data)
+            elif name == "truncated":
+                content = json.dumps(good)[:40]
+            elif name == "bad-record":
+                data["native"][0]["e"] = [1, 2]
+                content = json.dumps(data)
+            self.cache_file().write_text(content)
+            with self.subTest(name=name):
+                self.assertEqual(self.answers(self.now + 10), expected)
+                json.loads(self.cache_file().read_text())  # rewritten as a valid cache
+
+    def test_cache_for_a_later_now_is_not_used_for_an_earlier_one(self):
+        self.settle()
+        Q.usage_states(self.jobs, now=self.now + 9 * 86400, env=self.env)
+        self.assert_same_as_direct(self.now + 10)
+
+    def test_unwritable_directory_and_failed_replace_still_answer_directly(self):
+        self.settle()
+        expected = self.direct(self.answers, self.now + 10)
+        with mock.patch.object(os, "replace", side_effect=OSError("read-only")):
+            self.assertEqual(self.answers(self.now + 10), expected)
+        self.assertFalse(self.cache_file().exists())
+        self.assertEqual([p.name for p in self.home.glob("*.tmp")], [])
+        self.home.chmod(0o500)
+        try:
+            self.assertEqual(self.answers(self.now + 10), expected)
+        finally:
+            self.home.chmod(0o700)
+
+    def test_a_change_during_the_read_is_answered_directly_and_not_cached(self):
+        self.settle()
+        real = Path.read_text
+        state = {"raced": False}
+
+        def racing(path, *args, **kwargs):
+            text = real(path, *args, **kwargs)
+            if path == self.jobs and not state["raced"]:
+                state["raced"] = True
+                with self.jobs.open("a") as handle:
+                    handle.write("\n")
+            return text
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=racing):
+            first = Q.observations(self.jobs, now=self.now + 10, env=self.env)
+        self.assertEqual(len(first), 1)
+        self.assertFalse(self.cache_file().exists())
+        self.settle(self.jobs)
+        self.assertEqual(Q.observations(self.jobs, now=self.now + 10, env=self.env), first)
+
+    def test_unreadable_jobs_log_keeps_the_direct_contract(self):
+        missing = self.home / "absent.log"
+        self.assertEqual(Q.observations(missing, env=self.env), [])
+        self.assertEqual(Q._usage(missing, env=self.env), (dict.fromkeys(Q.HARNESSES, "unknown"), {}))
+        self.assertFalse(Path(f"{missing}.capacity-cache.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
