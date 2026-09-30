@@ -142,7 +142,7 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/checks.yml", workflow)
         checks = (HERE.parents[1] / ".github/workflows/checks.yml").read_text()
         self.assertIn("  workflow_call:", checks)
-        self.assertEqual(checks.count("ref: ${{ github.sha }}"), 4)
+        self.assertEqual(checks.count("ref: ${{ github.sha }}"), 6)
 
     def test_denied_checks_never_enter_publish_serialization(self):
         workflow = (HERE.parents[1] / ".github/workflows/release.yml").read_text()
@@ -173,6 +173,117 @@ class ReleaseGateTest(unittest.TestCase):
                 result = subprocess.run(["bash", "-e", "-c", script], cwd=directory,
                                         env=dict(env, RELEASE_HEAD=expected))
                 self.assertEqual(result.returncode, 0 if expected == actual else 1)
+
+
+def job_block(workflow: str, name: str) -> str:
+    """The text of one top-level job, without a YAML dependency."""
+    jobs = workflow.split("\njobs:\n", 1)[1]
+    match = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  \S+:\n|\Z)", jobs)
+    assert match, name
+    return match.group(1)
+
+
+class ChecksWorkflowContractTest(unittest.TestCase):
+    """The sharded Checks keep the names, permissions and gating Release relies on."""
+
+    def setUp(self):
+        root = HERE.parents[1] / ".github/workflows"
+        self.checks = (root / "checks.yml").read_text()
+        self.release = (root / "release.yml").read_text()
+
+    def test_required_check_name_survives_as_a_single_aggregate_job(self):
+        aggregate = job_block(self.checks, "full-test-suite")
+        self.assertIn("    name: full-test-suite\n", aggregate)
+        self.assertIn("    needs: [adaptation-boundary, full-suite-shard]\n", aggregate)
+        # always() so a failed or cancelled shard turns the aggregate red instead of skipping it.
+        self.assertIn("    if: always() && needs.adaptation-boundary.result == 'success'\n", aggregate)
+        self.assertNotIn("strategy:", aggregate)
+        # full_tests=false: every working step is skipped, so the job still succeeds.
+        steps = aggregate.split("    steps:\n", 1)[1].split("\n      - name:")
+        self.assertEqual(len(steps), 4)
+        for step in steps:
+            self.assertIn("if: needs.adaptation-boundary.outputs.full_tests == 'true'", step)
+        self.assertIn('"$SHARDS" != success', aggregate)
+        self.assertIn("--verify-shards", aggregate)
+        self.assertIn("actions/download-artifact@", aggregate)
+
+    def test_four_shards_run_in_parallel_within_the_old_time_budget(self):
+        shard = job_block(self.checks, "full-suite-shard")
+        self.assertIn("    needs: adaptation-boundary\n", shard)
+        self.assertIn("    if: needs.adaptation-boundary.outputs.full_tests == 'true'\n", shard)
+        self.assertIn("      fail-fast: false\n", shard)
+        self.assertIn("        shard: [1, 2, 3, 4]\n", shard)
+        self.assertIn("    timeout-minutes: 40\n", shard)
+        for option in ("--shard ${{ matrix.shard }}/4", "--suite-list", "--retries 1", "--xpass-nonfatal",
+                       "--strict-leak-sweep", "--diagnostics-dir", "--seed-baseline"):
+            self.assertIn(option, shard)
+        self.assertIn("sudo timeout 300 apt-get", shard)  # tracing fixtures are needed by each shard
+
+    def test_shard_and_marker_uploads_replace_an_earlier_attempt(self):
+        shard = job_block(self.checks, "full-suite-shard")
+        upload = shard.split("- name: Upload shard report", 1)[1]
+        self.assertIn("if: always()", upload)
+        self.assertIn("name: run-tests-report-shard-${{ matrix.shard }}-of-4", upload)
+        self.assertIn("overwrite: true", upload)
+        marker = job_block(self.checks, "validated-tree-marker")
+        self.assertIn("name: validated-tree-${{ steps.tree.outputs.tree }}", marker)
+        self.assertIn("overwrite: true", marker)
+        self.assertIn("git rev-parse 'HEAD^{tree}'", marker)
+
+    def test_marker_needs_a_fully_green_pull_request_run(self):
+        marker = job_block(self.checks, "validated-tree-marker")
+        self.assertIn("needs: [adaptation-boundary, install-lifecycle, dispatch-pid-namespace, full-test-suite]", marker)
+        condition = re.search(r"    if: >-\n((?:      .+\n)+)", marker).group(1)
+        for needed in ("github.event_name == 'pull_request'",
+                       "needs.adaptation-boundary.outputs.full_tests == 'true'",
+                       "needs.adaptation-boundary.result == 'success'",
+                       "needs.install-lifecycle.result == 'success'",
+                       "needs.dispatch-pid-namespace.result == 'success'",
+                       "needs.full-test-suite.result == 'success'"):
+            self.assertIn(needed, condition)
+        self.assertNotIn("always()", condition)
+
+    def test_only_the_scope_job_may_read_actions(self):
+        self.assertIn("      actions: read\n", job_block(self.checks, "adaptation-boundary"))
+        self.assertEqual(self.checks.count("actions: read"), 1)
+        self.assertRegex(self.checks, r"(?m)^permissions:\n  contents: read\n")
+        self.assertIn("GH_TOKEN: ${{ github.token }}", job_block(self.checks, "adaptation-boundary"))
+
+    def test_release_grants_the_called_checks_what_they_read_and_nothing_to_publish(self):
+        validation = job_block(self.release, "validation")
+        self.assertIn("      contents: read\n      # The called Checks job", validation)
+        self.assertIn("      actions: read\n", validation)
+        self.assertNotIn("write", validation)
+        self.assertIn("    permissions:\n      contents: write\n", job_block(self.release, "release"))
+        self.assertRegex(self.release, r"(?m)^permissions:\n  contents: read\n")
+
+    def test_every_action_is_pinned_to_a_full_commit(self):
+        for name, text in (("checks", self.checks), ("release", self.release)):
+            for reference in re.findall(r"(?m)^\s+uses: (\S+)", text):
+                if reference.startswith("./"):
+                    continue
+                with self.subTest(workflow=name, reference=reference):
+                    self.assertRegex(reference, r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+
+    def test_a_successful_main_push_checks_run_is_admitted_whatever_it_skipped(self):
+        # A main push whose expensive jobs were skipped (docs-only or a tree a
+        # PR already validated) still concludes success; admission reads only
+        # that conclusion, so no gate change is needed for the skip.
+        self.assertEqual(GATE.admit(self.event(), self.context()), {"head": HEAD, "validation_required": "false"})
+        for conclusion in ("failure", "cancelled"):
+            with self.assertRaises(GATE.Rejected):
+                GATE.admit(self.event(conclusion), self.context())
+
+    def context(self):
+        return {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_REPOSITORY_ID": "42",
+                "GITHUB_EVENT_NAME": "workflow_run", "GITHUB_SHA": TIP, "GITHUB_REF": "refs/heads/main"}
+
+    def event(self, conclusion="success"):
+        return {"action": "completed", "repository": dict(REPO), "workflow_run": {
+            "name": "Checks", "path": ".github/workflows/checks.yml", "event": "push",
+            "status": "completed", "conclusion": conclusion, "head_branch": "main",
+            "head_sha": HEAD, "head_commit": {"id": HEAD},
+            "repository": dict(REPO), "head_repository": dict(REPO)}}
 
 
 if __name__ == "__main__":
