@@ -804,6 +804,7 @@ EOF
     if [ "$1" = "compose" ]; then
       # SD-135: preset-free work route (shape/subgraph); same compiler.
       # SD-165: `--graph` tokens, including `capability:stage` parts, pass through unmodified.
+      # SD-164: so do `--shape framed` with its hints and `--route-plan <record>#<i>`.
       subcommand=compose
       shift
     elif [ "$1" = "stages" ]; then

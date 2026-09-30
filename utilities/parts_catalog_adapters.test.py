@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SD-165 (A165-1): the three adapters print the same part catalog and forward
-`capability:stage` graph tokens to the one compiler unmodified."""
+`capability:stage` graph tokens to the one compiler unmodified. SD-164: so do
+`--shape framed` with its hints and `--route-plan <record>#<i>`."""
 import json
 import os
 import subprocess
@@ -75,6 +76,60 @@ class AdapterParityTest(unittest.TestCase):
                 result = self.run_surface(argv, *args)
                 self.assertEqual(json.loads(result.stdout), expected)
                 self.assertIn("빌린 부품 autopilot-research:retrieval·autopilot-research:synthesis", result.stderr)
+
+    def compose_args(self, *extra):
+        return ("compose", "--slug", "sd164-parity", "--unassigned", "--cwd", str(self.repo),
+                "--artifact-root", str(self.artifacts), "--dispatch-evidence", str(self.evidence),
+                "--parent-harness", "claude", "--spec-read", "not-applicable", *extra)
+
+    def sealed_route(self, argv, *args):
+        """The route file one surface wrote, and the card text it printed."""
+        result = self.run_surface(argv, *args)
+        line = next(item for item in result.stderr.splitlines() if item.startswith("route_file="))
+        return json.loads(Path(line.partition("=")[2]).read_text(encoding="utf-8")), result.stderr
+
+    def test_framed_shape_and_its_hints_arrive_unchanged(self):
+        task = self.artifacts / "task.md"
+        task.write_text("Audit the parser and report.\n", encoding="utf-8")
+        args = self.compose_args("--shape", "framed", "--capability", "audit", "--capability-mode", "audit",
+                                 "--graph", "inspect,report", "--profile", "light", "--prompt-file", str(task))
+        expected, _ = self.sealed_route(PORTABLE, *args)
+        self.assertEqual(expected["capability"], "route-frame")          # the hints did not become the route
+        self.assertEqual(expected["selection"]["shape"], "framed")
+        hints = expected["work_request"]["routing_hints"]
+        self.assertEqual((hints["capability"], hints["graph"], hints["profile"]), ("audit", "inspect,report", "light"))
+        for name, argv in SURFACES.items():
+            with self.subTest(adapter=name):
+                route, card = self.sealed_route(argv, *args)
+                self.assertEqual(route, expected)
+                self.assertIn("frame이 방향과 경로를 조립해 제안합니다", card)
+
+    def test_route_plan_path_and_index_arrive_unchanged(self):
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import route_plan as RP
+        leg = {"capability": "autopilot-code", "shape": "staged", "graph": ["execute", "test", "report"]}
+        decision = RP.build_decision(
+            frame_route={"route_id": "rt-frame", "route_hash": "sha256:frame", "cycle_id": "cyc-frame"},
+            selected="yes", reason="", briefs=[], intent={"path": "intent.md", "sha256": "sha256:i"},
+            proposal={"legs": [leg]}, first_leg_compose={"leg": 0})
+        record = self.artifacts / "route-decision.json"
+        record.write_bytes(RP.render(RP.build_record(decision)))
+        graph = ("--shape", "staged", "--capability", "autopilot-code", "--graph", "execute,test,report")
+        args = self.compose_args(*graph, "--route-plan", f"{record}#0")
+        expected, _ = self.sealed_route(PORTABLE, *args)
+        self.assertEqual(expected["route_plan"]["index"], 0)             # the plan reached the compiler and sealed
+        self.assertEqual(expected["route_plan"]["digest"], RP.decision_digest(decision))
+        self.assertFalse([n for n in expected["nodes"] if n["id"].startswith("frame")])
+        for name, argv in SURFACES.items():
+            with self.subTest(adapter=name):
+                self.assertEqual(self.sealed_route(argv, *args)[0], expected)
+        # an unreadable plan is the same compose without it plus one card line, on every adapter
+        missing = self.compose_args(*graph, "--route-plan", f"{self.artifacts}/absent.json#0")
+        for name, argv in SURFACES.items():
+            with self.subTest(adapter=name, plan="unreadable"):
+                route, card = self.sealed_route(argv, *missing)
+                self.assertNotIn("route_plan", route)
+                self.assertIn("경로 계획을 읽지 못함", card)
 
 
 if __name__ == "__main__":

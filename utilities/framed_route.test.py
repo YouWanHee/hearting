@@ -8,6 +8,7 @@ refusal test against the unpatched gate.
 """
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -40,6 +41,73 @@ import capability_topology as CT  # noqa: E402
 
 FRAME_IDS = ["frame", "frame-alternative"]
 NODE_IDS = FRAME_IDS + ["route-decision"]
+
+# Frozen from `git show 45edc48a:capabilities/topologies.json` (the registry before the route-frame
+# recipe). They are literals, not a comparison with HEAD, so they mean the same in CI and after any
+# commit. Each global table is hashed as sha256 of its JSON (sorted keys, compact separators).
+FROZEN_GLOBAL_TABLE_DIGESTS = {
+    "schema_version": "4a44dc15364204a80fe80e9039455cc1608281820fe2b24f1e5233ade6af1dd5",
+    "intensities": "965abb3701067fd845cba3196ebd2c1725c399b515a884c452ebdc3e0e05186c",
+    "execution_topologies": "8622e71fa48d847df8c61544623832e7942dfad9f532b596507b270f7ee75f4c",
+    "worker_kinds": "c6e834172f80e8172f4576bece68a415ae0c60885cdeceebb8fce45fd7dc4b23",
+    "transports": "df28d7d66bcfe9326f606a8df9edd7f303db5930fd809b4c7c0b93915ea91d3e",
+    "runtime_requirements": "5da3cf55c86966df30193d5892070e4a8d489442ab7677b4b8cc18029be83921",
+    "tracking_values": "39c1812b31915d599cd78f61a68a976f492451f9445fdbaac8c36c720a90f4dd",
+    "tracked_gate_evidence": "271082bb2b02743cece7c1d50a653d41e61e3999572858b1d17a21b98f7f8de0",
+    "guard_preconditions": "ebf235004f9bea0626ded66d0fbf9298e4909d4e1bb2f7b6c070de557fe2660b",
+    "artifact_owners": "bf04f1e84e854aa45368ae6891d567b019dedfca4b9c07d4d2a86667230849b6",
+    "rollout": "c023090e49860a7b1c9f9117f74ec147b2782fa9954ac27252bde5b6758dbf67",
+    "inline_reasons": "d494c665c99149e73f546a3af5852a00c4b060605a039bb8203b27ca3a33ad3e",
+    "gate_command": "a7e4a42cb12603e15fbeed1660c23054e5c2e6cf9e176a928ac441da367e28bd",
+    "activation_conditions": "171ddc0dc24cebb02e7cb56d8d8ccf6b7837a8d0dfb9bd307f2c74c0aac1fe32",
+    "execution_surfaces": "de42c73e3068f58773195eb6f62568a1361e28edba1e32f8e0f8ef766d6c3374",
+    "fallback_hops": "b1ae1168c05d28a6a60e3776059a23a0a6379b294af1fd9d326c10d94cc84d07",
+    "unit_catalog": "ddaefe041bff3943462396e59385c3ca56f9f94633e329cd198fb6adfec86d34",
+    "unit_families": "b119cbdb257b25422902df25d95457d3f44b1e41d1cfca61fb6cd582b486b4d7",
+    "reserved_units": "8fd8169f3eb8d44d75a96b4ab0efd2bb0e9ccb39e9c89a7f615876053eef4d52",
+    "unit_kind_compatibility": "15d3d78228d77b8819bf83baa1538be02264e42bc72e92b5734c0f2e742ee54c",
+    "model_profiles": "bff612bb22e8bd13e7d5c899de3633859ee4632a182dc175eb7e792f6c64164a",
+    "owner_profile_by_intensity": "d9925418217de670821aba84a9018ba0fd58c36231e3108e8bb6b681f8318904",
+    "parallel_group_kinds": "cd159bee3f1b03ceabed5141486bc1d87c7d7ced2e539767a7b51451132c111d",
+    "parallel_join_policies": "bea0e3ec4c32132ca0641ce9a12dd75c620a9fc89ccc91c8a6bca8432f1bc24f",
+    "parallel_independence_axes": "3656cfa465a627ba95ffb6dbed164fc1c2e76dd4c07925efcd8cc308cbffc914",
+    "parallel_group_max_width": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+    "leg_classes": "b397c1e152fed9127aa83b832bad9d1fc69e0865906a163623937d9b3904fba8",
+    "auxiliary_checks": "b4cbc4bc242726351a6cf6b2c53c55b6e29c87e57c2cd9a837fa8291b0bfeafe",
+    "auxiliary_check_units": "7a8bd50e2fbcb0a574d1bae7e26362630cf3551907bf310272a7394795148e0a",
+    "workflow_states": "0ac55a71bde1486fc7b03d1696052959a76324ba31ee34bd458b9433c683747b",
+    "workflow_failure_states": "7f6c462b51c514f16b68e92e1f8196cc09e0504628a35274f14652645456fe2d",
+    "workflow_transitions": "8868f3b57cca8ad4beab4c558098ac10d22e4e0605da67e1ba03e26e8edd5f5e",
+    "continuation_kinds": "ecac7e09cb2322bb13a1a0b2a84b13a044d5d1552d090ba4a14d125e19269270",
+    "human_gate_positions": "fc45768a57481792e0643d4bec1faae15743411bc06096fdb1740f632f0707b0",
+    "artifact_buckets": "ccbd32ef24b84897147e3d1a0862a824d9c6f893a12aed07f53c9f77724cb835",
+    "producer_lifecycle": "a9f26a373d2e3af19f55be8c37b8cd0126f30165cdfa0407ef0242aa7c2f9816",
+    "part_catalog": "6888a60d9d25370095d9aa74fd9f0210d7d82be4d87350290c4f8b48e5ecf9c1",
+}
+FROZEN_GATE_CONTRACT_DIGEST = "53db72bbbcb6228d395819d147eb3a12eeba17161dbc06fe63cefa9389f469fb"
+FROZEN_RECIPE_COUNT = 14
+FROZEN_RECIPES_DIGEST = "21ca288a0ca277cb89f45809255d6344ba7bef72744d58cf39da10f92378a20d"
+FROZEN_CAPABILITY_REGISTRY_DIGESTS = {
+    "analyze-project": "sha256:160c04dc760b81584a7d445da0733c778d7caaabd12f43d606e72a00fb9ca574",
+    "analyze-user": "sha256:a787e6d28fbc54ba019dc635f462ddb9b5ffd1112f9a08ecf56dab950761899a",
+    "audit": "sha256:d2e6741875289ba300b4334b9a84e1cf99fcf1a4e60c73c6c594a1bcaa65d314",
+    "autopilot-apply": "sha256:317c03fb47f59789c1a12b15c1a0dcf93f60fcee57408f0ae1ab4cb45f6f7cd5",
+    "autopilot-code": "sha256:5ac6894bb49c421060551625bdcfdde3f7af9676f9f52f65373428bfb8030893",
+    "autopilot-design": "sha256:a0d62cb63ec8bd255f254417241c97856fbeae4095cde072a878f65c313cecca",
+    "autopilot-draft": "sha256:37c3b4a3fc45a5df8f199f220ef940dbc19ca8eae17e51b2b14f267053057af5",
+    "autopilot-lab": "sha256:41e59b4c50376ae247eb110b8f830693f67203d482c5017210ed89a5ac0cc55c",
+    "autopilot-refine": "sha256:f97b337937dd64cb49ba675b9e19bda3a05077e9389a73e4ad99ffed91f46729",
+    "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
+    "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",
+    "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb",
+}
+
+
+def _frozen_digest(value):
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
 
 
 def clean_environment():
@@ -325,32 +393,25 @@ class RegistryRegistrationTest(unittest.TestCase):
         self.assertFalse(CT.is_route_frame_terminal(other, other["standard_plus"]["nodes"][-1]))
 
     def test_the_global_tables_that_seal_every_digest_are_untouched(self):
-        head = subprocess.run(["git", "show", "HEAD:capabilities/topologies.json"], cwd=HERE.parent,
-                              text=True, capture_output=True, check=False)
-        if head.returncode:
-            self.skipTest("no git history in this checkout")
-        before, after = json.loads(head.stdout), self.registry()
-        for key in before:
-            if key in ("recipes", "completion_gate_contracts"):
-                continue
-            self.assertEqual(after[key], before[key], key)
-        self.assertEqual(after["recipes"][:len(before["recipes"])], before["recipes"])
-        # HEAD already carries the route-frame contracts (S1's commit); neither side may change the rest.
-        def others(table):
-            return {k: v for k, v in table.items() if k not in ("route-frame", "route-decision")}
-        self.assertEqual(others(after["completion_gate_contracts"]), others(before["completion_gate_contracts"]))
+        after = self.registry()
+        for key, digest in FROZEN_GLOBAL_TABLE_DIGESTS.items():
+            self.assertEqual(_frozen_digest(after[key]), digest, key)
+        # No global table was added either: the only other keys are the two per-name tables.
+        self.assertEqual(set(after) - set(FROZEN_GLOBAL_TABLE_DIGESTS), {"recipes", "completion_gate_contracts"})
+        self.assertEqual(_frozen_digest(after["recipes"][:FROZEN_RECIPE_COUNT]), FROZEN_RECIPES_DIGEST)
+        # The route-frame rows are the only additions to the gate contract table.
+        rest = {k: v for k, v in after["completion_gate_contracts"].items() if k not in ("route-frame", "route-decision")}
+        self.assertEqual(_frozen_digest(rest), FROZEN_GATE_CONTRACT_DIGEST)
 
     def test_other_capabilities_keep_their_registry_digest(self):
         registry = self.registry()
-        head = subprocess.run(["git", "show", "HEAD:capabilities/topologies.json"], cwd=HERE.parent,
-                              text=True, capture_output=True, check=False)
-        if head.returncode:
-            self.skipTest("no git history in this checkout")
-        before = json.loads(head.stdout)
-        for capability in sorted({r["capability"] for r in before["recipes"]}):
+        self.assertEqual(
+            sorted({r["capability"] for r in registry["recipes"]} - {"route-frame"}),
+            sorted(FROZEN_CAPABILITY_REGISTRY_DIGESTS),
+        )
+        for capability, digest in FROZEN_CAPABILITY_REGISTRY_DIGESTS.items():
             with self.subTest(capability=capability):
-                self.assertEqual(CT.capability_registry_digest(registry, capability),
-                                 CT.capability_registry_digest(before, capability))
+                self.assertEqual(CT.capability_registry_digest(registry, capability), digest)
 
     def test_the_producer_admits_the_internal_capability_and_checks_route_equality(self):
         self.assertEqual(P.INTERNAL_CAPABILITIES, ("route-frame",))

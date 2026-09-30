@@ -46,7 +46,8 @@ closes route/cycle at success or once idle. The commands below remain low-level 
 
 Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
 capability that owns the artifacts; §0.2.1 then picks the **shape** of the
-work before any preset. `direct`, `solo`, and `staged` go through
+work before any preset: new non-direct work defaults to `framed` (exceptions
+there). `direct`, `solo`, `staged`, and `framed` go through
 `utilities/capability-route.py compose` (one command — cwd, artifact root,
 tracking, drift verdict, spec-read gate, and both eligibility probes default
 from the checkout; a staged `--graph execute,test,report` is your own stage

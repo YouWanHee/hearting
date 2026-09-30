@@ -503,10 +503,35 @@ class ReviewStartTest(F.FramedStartTest):
                          (None, "block-missing", "proposal:none(block-missing)"))
         self.assertEqual((review["equal"], review["wording_differs"]), (False, False))
         self.assertIn("frame_downgrade", review)
-        self.assertIsNone(review["frame_downgrade"])                  # the capacity rule fills this
+        self.assertIsNone(review["frame_downgrade"])                  # nothing ran lower
         self.assertIn("route_proposals", result["next_step"])
         self.assertEqual(result["frame_interview"]["route_proposal_review"], review)
         self.assertEqual(len(self.calls), 2)                          # nothing launched to learn this
+
+    def test_a_frame_leg_retried_one_profile_lower_is_named_in_the_result_and_the_review(self):
+        self.start()
+        self.ready = True
+        self.steps = [{"state": "needs-interview", "required_action": "prepare-frame-question", "next_step": "go"}]
+        record = P.list_cycle_records(self.root)[0]
+        cycle = P.cycle_dir(self.root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
+        for node in F.FRAME_IDS:
+            (cycle / "shards" / node).mkdir(parents=True, exist_ok=True)
+            (cycle / "shards" / node / "direction-brief.md").write_text(brief([DIRECT]), encoding="utf-8")
+        summary = [{"node": "frame", "original_profile": "top", "actual_profile": "deep", "cause": "capacity",
+                    "attempt_id": "att-replacement", "original_attempt_id": "att-source"}]
+        W._ROUTE_MODULE = R
+        self.addCleanup(setattr, W, "_ROUTE_MODULE", None)
+        with mock.patch.object(W, "_frame_downgrade_summary", return_value=summary) as summarize:
+            result = self.start()
+        self.assertEqual(result["state"], "needs-interview")
+        self.assertEqual(result["frame_downgrade"], summary)                       # the frame summary
+        self.assertEqual(result["route_proposal_review"]["frame_downgrade"], summary)   # the interview result
+        self.assertTrue(all(call.args[0]["route_id"] == result["route_id"] for call in summarize.call_args_list))
+        self.ready = True
+        with mock.patch.object(W, "_frame_downgrade_summary", return_value=None):
+            quiet = self.start()
+        self.assertNotIn("frame_downgrade", quiet)                                  # no downgrade, no key
+        self.assertIsNone(quiet["route_proposal_review"]["frame_downgrade"])
 
     def test_a_failed_frame_never_lets_the_surviving_brief_decide(self):
         self.start()

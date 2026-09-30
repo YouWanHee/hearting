@@ -635,9 +635,29 @@ def _grouped_approvals(row):
 
 
 def _frame_downgrade_summary(route, jobs):
-    """Reserved for the capacity rule (plan D2): where a frame leg that was retried one profile lower
-    is named for the interview brief. The runtime reports nothing here until that rule lands."""
-    return None
+    """The frame legs that ran one profile lower because the first attempt stopped at a usage limit:
+    `[{node, original_profile, actual_profile, cause, attempt_id, original_attempt_id}]`, or None.
+
+    Only a replacement row the one transition reader (`dispatch_replacement.read_profile_transition`)
+    verifies is listed; the sealed route still says `top`, and this is where the person sees what
+    actually ran."""
+    import dispatch_replacement
+    found = []
+    for aid, (_, meta) in sorted(_rows(jobs).items()):
+        if (meta.get("route_id") != route["route_id"] or meta.get("worker_type") != "frame"
+                or not meta.get("replacement_original_attempt_id")):
+            continue
+        try:
+            transition = dispatch_replacement.read_profile_transition(
+                jobs, route=route, node=meta.get("route_node"), attempt_id=aid)
+        except (DispatchContractError, OSError, ValueError):
+            continue
+        if transition:
+            found.append({"node": meta["route_node"], "original_profile": transition["from"],
+                          "actual_profile": meta.get("model_profile") or transition["to"],
+                          "cause": transition["reason"], "attempt_id": aid,
+                          "original_attempt_id": meta["replacement_original_attempt_id"]})
+    return found or None
 
 
 def _proposal_review(route, path, jobs):
@@ -1069,6 +1089,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         result.pop("parent_next", None)
         result.pop("parent_next_command", None)
         result["frame_results"] = [_outcome(jobs, aid) for aid in sorted(attempts)]
+        downgrade = _frame_downgrade_summary(route, jobs)
+        if downgrade:
+            result["frame_downgrade"] = downgrade
         if any(outcome["classification"] != "success" for outcome in result["frame_results"]):
             return {**result, "state": "needs-attention", "reason": "frame-outcome-needs-inspection"}
         entry = next(n for n in route["nodes"] if {f["id"] for f in frames}.issubset(set(n.get("depends_on", []))))

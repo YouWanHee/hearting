@@ -719,4 +719,20 @@ class OpenCodeLaunchFenceFailure(unittest.TestCase):
         self.assertEqual(WH.read_launch_fence_failure(read_fd), (None, True))
 
 
+class OpenCodeFrameCapacityDowngrade(unittest.TestCase):
+    """D2 end to end on this adapter: argv -> profile -> register -> spawn claim. The flow itself lives
+    in utilities/dispatch_replacement.test.py (`FrameCapacityFlow`); here the real wrapper binds it."""
+    @staticmethod
+    def flow(case):
+        spec = importlib.util.spec_from_file_location("frame_capacity_flow", ROOT / "utilities/dispatch_replacement.test.py")
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module.FrameCapacityFlow(WH, "opencode", case)
+
+    def test_verified_transition_runs_deep_and_a_second_capacity_death_spawns_nothing(self):
+        self.flow(self).run()
+
+    def test_deep_without_a_claim_is_refused_by_the_profile_binding_and_by_registration(self):
+        self.flow(self).run_claimless()
+
+
 if __name__=="__main__": unittest.main()

@@ -252,8 +252,8 @@ When implementation or reporting requires result plots, experiment-log visualiza
 Registry-v6 widens only selected leverage points: `strong` uses 2-way plan and
 implementation-review groups; `thorough|adversarial` widen plan plus implementation
 review to three legs. Frame is not part of this widening — every intensity from
-`quick` up gets exactly two frame legs, fixed (see Step 0). Their model profiles and
-perspectives are deliberately asymmetric. Any additional security/material/specialist
+`quick` up gets exactly two frame legs, fixed (see Step 0). Both run `top` with distinct
+perspectives. Any additional security/material/specialist
 node still needs a validated compose-on-demand extension with disjoint output and a
 completion gate; never create an undeclared child or alter a sealed group width.
 
@@ -262,8 +262,8 @@ completion gate; never create an undeclared child or alter a sealed group width.
 Skip only for `direct` (orient-lite carries the framing posture inline). For `quick`
 and every `standard+` intensity, the direction gate already ran (owner-execution.md
 "Pre-Owner Direction Gate"): depth-0 itself launched exactly two frame legs — `frame`
-and `frame-alternative`, on two different harnesses, the anchor one tier above the
-owner's own model profile via `model_profile.frame_profile_for_owner` — as its own
+and `frame-alternative`, both `top` (a pin with a profile or an explicit profile wins; a
+route made from a proposal via `--route-plan` has no frame nodes) — as its own
 bootstrap layer, after route binding and producer begin but before owner launch. There is no third frame leg
 at any intensity; `strong+` widening applies only to plan and implementation review
 (above), never to frame. See `core/WORKFLOW.md` for the full depth-0 procedure.

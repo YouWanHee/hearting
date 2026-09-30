@@ -32,7 +32,7 @@ before this cycle keeps its own generation's gate name, binding and node
 shape and is **never retro-fitted** — the entry fence in
 `utilities/dispatch_contract.py` reads only the route object it was handed.
 
-Depth-0 launches the frame pair, joins both direction briefs, and builds
+Depth-0 launches the frame pair (both legs `top`, a pin or explicit profile wins; a route composed from an approved proposal via `--route-plan` has no frame nodes), joins both direction briefs, and builds
 `designs/<cycle>/01_refs/frame-summary.json` (five fields — 방향/대안/위험/범위
 변경/비용, ≤1KB) plus the **frame interview**
 `designs/<cycle>/01_refs/frame/interview.json` (SD-129: a one-sentence

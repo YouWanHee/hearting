@@ -343,6 +343,7 @@ case "$cmd" in
   compose)
     # SD-135: preset-free work route (shape/subgraph); same compiler, same bind.
     # SD-165: `--graph` tokens, including `capability:stage` parts, pass through unmodified.
+    # SD-164: so do `--shape framed` with its hints and `--route-plan <record>#<i>`.
     shift
     AGENT_HOME="$AGENT_ROOT" exec python3 "$ROOT/utilities/capability-route.py" compose "$@"
     ;;
