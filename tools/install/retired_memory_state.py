@@ -20,15 +20,17 @@ from pathlib import Path
 import paths
 
 _ID = r"[A-Za-z0-9._-]+"
+# Each pattern is the exact name an old writer created, as of 60fea1f7^ (the commit
+# before the distiller was retired). Regular files only: the old `.distill-budget-N`
+# slots were mkdir'd directories, so they are not listed and are never removed here.
 RETIRED_NAMES = tuple(re.compile(pattern + "$") for pattern in (
-    rf"\.distill-state-{_ID}",
-    rf"\.turn-state-{_ID}",
-    rf"\.codex-turn-state-{_ID}",
-    rf"\.opencode-turn-state-{_ID}",
-    rf"\.distill-err(?:-{_ID})?",
-    rf"\.distill-budget-{_ID}",
-    r"\.distill-failures\.log",
-    rf"\.(?:codex|opencode)-distill-(?:state|out|prompt|stamp)-{_ID}",
+    rf"\.distill-state-{_ID}",             # mem.py _distill_state_path(sid)
+    rf"\.turn-state-{_ID}",                # hooks/mem-turn-nudge.sh STATE
+    rf"\.codex-turn-state-{_ID}",          # adapters/codex/bin/preflight.sh turn counter
+    rf"\.distill-err-{_ID}",               # hooks/mem-distill-dispatch.sh ERRLOG (always -<sid>)
+    r"\.distill-failures\.log",            # hooks/mem-distill-dispatch.sh FAILLOG
+    rf"\.(?:codex|opencode)-distill-(?:out|prompt)-{_ID}",  # adapters/*/bin/distill-worker.sh
+    rf"\.opencode-distill-stamp-{_ID}",    # adapters/opencode/bin/preflight.sh debounce stamp
 ))
 
 
@@ -59,6 +61,7 @@ def retire(store=None) -> int:
         path = root / name
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
+                # destructive-ok: reason=remove one retired distiller state file; boundary=one allowlisted regular file directly inside the memory store
                 path.unlink()
                 removed += 1
         except OSError:

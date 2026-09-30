@@ -17,14 +17,10 @@ STALE = (
     ".distill-state-ses_f6b5dbfccffetI7z3sqjrkxtho",
     ".turn-state-0a1b2c3d-1111-2222-3333-444455556666",
     ".codex-turn-state-0a1b2c3d-1111-2222-3333-444455556666",
-    ".opencode-turn-state-ses_abc",
     ".distill-err-0a1b2c3d-1111-2222-3333-444455556666",
     ".distill-err-periodic-ebb01fce1f",
-    ".distill-err",
-    ".distill-budget-3",
     ".distill-failures.log",
     ".opencode-distill-stamp-ses_f5f1effe7eM36wup0mukiS",
-    ".opencode-distill-state-ses_abc",
     ".codex-distill-out-abc",
     ".codex-distill-prompt-abc",
 )
@@ -38,6 +34,8 @@ KEPT = (
     "README.md", ".gitignore", "notes.txt",
     ".distill-state", ".distill-statement-x", ".turn-state", ".distill-budget",
     ".xdistill-state-abc", ".distill-state-a/b",
+    ".distill-err", ".opencode-turn-state-ses_abc", ".opencode-distill-state-ses_abc",
+    ".codex-distill-state-abc", ".distill-budget-3",
 )
 
 
