@@ -103,7 +103,12 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
             ("depth_affinity_weight", 1.2, "depth_affinity_weight"),
             ("usage_headroom_exponent", 0, "usage_headroom_exponent"),
             ("depth_affinity", {"stage": "codex"}, "depth_affinity keys"),
-            ("depth_affinity", {"owner": "opencode"}, "enabled harnesses"),
+            ("depth_affinity", {"owner": "gemini"}, "known harnesses"),
+            ("harness_weights", {"opencode": 0}, "harness_weights.opencode"),
+            ("harness_weights", {"opencode": 1.5}, "harness_weights.opencode"),
+            ("harness_weights", {"opencode": True}, "harness_weights.opencode"),
+            ("harness_weights", {"gemini": 0.5}, "unknown harness"),
+            ("harness_weights", "opencode: 0.3", "block mapping"),
             ("depth_affinity_weight", True, "depth_affinity_weight"),
             ("usage_headroom_exponent", True, "usage_headroom_exponent"),
         ]
@@ -113,11 +118,15 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
             errors = D.validate(config, capmap)
             self.assertTrue(any(fragment in error for error in errors), (key, errors))
 
-    def test_each_enabled_harness_must_appear_once_per_profile(self):
+    def test_a_harness_left_out_of_a_profile_is_normal_not_a_finding(self):
+        # "This profile does not use that harness" (for example OpenCode absent
+        # from deep) is a valid choice, never an error or a warning.
         config = self.config()
         config["profiles"]["light"]["relief"] = []
-        errors = D.validate(config, D.load_topology_capabilities(D.default_topology_path()))
-        self.assertTrue(any("every enabled harness exactly once" in error for error in errors))
+        capmap = D.load_topology_capabilities(D.default_topology_path())
+        self.assertEqual(D.validate(config, capmap), [])
+        self.assertEqual(D.policy_warnings(config), [])
+        self.assertEqual(D.normalize_policy(config)["profiles"]["light"]["relief"], [])
 
     def test_user_local_config_precedes_repo_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,46 +160,39 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
         self.assertEqual(D.query_headless_policy(shipped),
                          {"claude_permission_mode": "bypass", "source": "config"})
 
-    def test_ac9_opencode_rejected_in_deep_quality_bands(self):
-        # AC 9 band placement gate: opencode in deep/balanced-deep primary is a
-        # validation error; opencode in light.primary stays legal.
+    def test_opencode_in_a_deep_primary_band_warns_but_validates(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())
         for band in ("deep", "balanced-deep"):
             config = self.config()
             config["profiles"][band]["primary"] = ["claude", "codex", "opencode"]
             config["profiles"][band]["last_resort"] = []
-            errors = D.validate(config, capmap)
+            self.assertEqual(D.validate(config, capmap), [])
+            warnings = D.policy_warnings(config)
             self.assertTrue(
-                any(band in error and "must not include opencode" in error for error in errors),
-                f"missing AC 9 rejection for {band}: {errors}",
+                any(band in w and "includes opencode" in w for w in warnings), warnings
+            )
+            # W3 changes nothing: the user's band is followed as written.
+            self.assertEqual(
+                D.normalize_policy(config)["profiles"][band]["primary"],
+                ["claude", "codex", "opencode"],
             )
         config = self.config()
         config["profiles"]["light"]["primary"] = ["claude", "codex", "opencode"]
         config["profiles"]["light"]["relief"] = []
         self.assertEqual(D.validate(config, capmap), [])
+        self.assertEqual(D.policy_warnings(config), [])
 
-    def test_empty_deep_primary_band_is_rejected(self):
-        # fm M3 / anchor M2: the quality-peer set is
-        # `deep.primary & balanced-deep.primary`, so an EMPTY primary band makes
-        # it empty and nullifies the very gate the config is supposed to define.
-        # Such a config passed validation before -- every enabled harness still
-        # appears exactly once, just in relief/last_resort -- so the rule has to
-        # live here, where the band is defined, not at its two consumers.
+    def test_empty_deep_primary_band_warns_and_names_the_peer_gate_outcome(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())
         for band in ("deep", "balanced-deep"):
             config = self.config()
             config["profiles"][band]["relief"] = ["claude", "codex"]
             config["profiles"][band]["primary"] = []
-            errors = D.validate(config, capmap)
-            # the coverage rule alone would have accepted this
-            self.assertFalse(
-                any("every enabled harness exactly once" in error for error in errors),
-                errors,
-            )
+            self.assertEqual(D.validate(config, capmap), [])
+            warnings = D.policy_warnings(config)
             self.assertTrue(
-                any(band in error and "must name at least one harness" in error
-                    for error in errors),
-                f"empty {band}.primary accepted: {errors}",
+                any("is empty" in w and "sole-gate-non-peer-harness" in w for w in warnings),
+                warnings,
             )
         # `light` may legitimately empty its primary band; it is not a
         # quality-peer band.
@@ -198,16 +200,9 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
         config["profiles"]["light"]["relief"] = ["claude", "codex", "opencode"]
         config["profiles"]["light"]["primary"] = []
         self.assertEqual(D.validate(config, capmap), [])
+        self.assertEqual(D.policy_warnings(config), [])
 
-    def test_disjoint_deep_primary_bands_are_rejected(self):
-        # M6: rejecting the EMPTY band closed one spelling of the hole. The
-        # quality-peer set is the INTERSECTION of the two bands, so two
-        # non-empty but DISJOINT bands nullify it just as completely and pass
-        # the coverage rule identically. After the AC 11 fix that is worse than
-        # before: the derived set is an empty frozenset rather than None, so
-        # `sole_gate` starts "ok", the gated list empties, and every
-        # peer-bearing parallel group is refused route-wide with a message that
-        # blames harness availability instead of this config.
+    def test_disjoint_deep_primary_bands_warn_and_derive_an_empty_peer_set(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())
         config = self.config()
         threshold = config["profiles"]["deep"]["promote_relief_below"]
@@ -219,21 +214,9 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
             "primary": ["codex"], "relief": ["claude"], "last_resort": ["opencode"],
             "promote_relief_below": threshold,
         }
-        errors = D.validate(config, capmap)
-        # neither existing rule sees it: every harness still appears exactly
-        # once, and neither band is empty
-        self.assertFalse(
-            any("every enabled harness exactly once" in error for error in errors),
-            errors,
-        )
-        self.assertFalse(
-            any("must name at least one harness" in error for error in errors), errors
-        )
-        self.assertTrue(
-            any("must share at least one harness" in error for error in errors),
-            f"disjoint deep bands accepted: {errors}",
-        )
-        # and this is what the accepted config would have derived
+        self.assertEqual(D.validate(config, capmap), [])
+        warnings = D.policy_warnings(config)
+        self.assertTrue(any("share no harness" in w for w in warnings), warnings)
         peer = importlib.util.spec_from_file_location(
             "dispatch_quality_peer_under_test",
             Path(__file__).with_name("dispatch_quality_peer.py"),
@@ -247,12 +230,133 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
             }),
             frozenset(),
         )
-        # one shared harness is enough; asymmetric bands stay legal
+        # one shared harness is enough; asymmetric bands stay legal and quiet
         config["profiles"]["balanced-deep"] = {
             "primary": ["claude", "codex"], "relief": [], "last_resort": ["opencode"],
             "promote_relief_below": threshold,
         }
         self.assertEqual(D.validate(config, capmap), [])
+        self.assertEqual(D.policy_warnings(config), [])
+
+    def test_opencode_only_setup_is_valid_without_warnings(self):
+        text = (
+            "schema_version: 3\n"
+            "harnesses:\n  enabled: [opencode]\n"
+            "profiles:\n"
+            + "".join(
+                f"  {name}:\n    primary: [opencode]\n    relief: []\n"
+                "    last_resort: []\n    promote_relief_below: 0\n"
+                for name in ("deep", "balanced-deep", "balanced", "light", "mini")
+            )
+            + "allocation:\n  strategy: balanced\n  window: 30\ncapabilities:\n"
+        )
+        config = D.parse_yaml_subset(text)
+        capmap = D.load_topology_capabilities(D.default_topology_path())
+        self.assertEqual(D.validate(config, capmap), [])
+        self.assertEqual(D.policy_warnings(config), [])
+        self.assertEqual(D.normalize_policy(config), config)
+
+    def test_recommendation_findings_are_normalized_not_rejected(self):
+        capmap = D.load_topology_capabilities(D.default_topology_path())
+        config = self.config()
+        config["harnesses"]["enabled"] = ["claude", "opencode"]
+        # W1: a band naming a disabled harness; W2: a harness in two bands.
+        config["profiles"]["deep"]["primary"] = ["claude", "codex"]
+        config["profiles"]["deep"]["relief"] = ["claude"]
+        # W5: a profile holding no enabled harness at all.
+        config["profiles"]["mini"] = {
+            "primary": ["codex"], "relief": [], "last_resort": [],
+            "promote_relief_below": 0,
+        }
+        # W6: affinity / depth_affinity / harness_weights naming a disabled harness.
+        config["capabilities"] = {"autopilot-code": {"execute": "codex"}}
+        config["allocation"]["depth_affinity"] = {"owner": "codex", "worker": "claude"}
+        config["allocation"]["harness_weights"] = {"codex": 0.5, "opencode": 0.3}
+        self.assertEqual(D.validate(config, capmap), [])
+        warnings = D.policy_warnings(config)
+        joined = "\n".join(warnings)
+        self.assertIn("profiles.deep.primary names disabled harness 'codex': ignored", joined)
+        self.assertIn("repeats 'claude' in primary and relief", joined)
+        self.assertIn("profiles.mini holds no enabled harness", joined)
+        self.assertIn("affinity autopilot-code.execute targets disabled harness 'codex'", joined)
+        self.assertIn("allocation.depth_affinity.owner names disabled harness 'codex'", joined)
+        self.assertIn("allocation.harness_weights.codex names a disabled harness", joined)
+        normalized = D.normalize_policy(config)
+        self.assertEqual(normalized["profiles"]["deep"]["primary"], ["claude"])
+        self.assertEqual(normalized["profiles"]["deep"]["relief"], [])
+        self.assertEqual(normalized["profiles"]["mini"]["last_resort"], ["claude", "opencode"])
+        self.assertEqual(normalized["capabilities"]["autopilot-code"], {})
+        self.assertEqual(normalized["allocation"]["depth_affinity"], {"worker": "claude"})
+        self.assertEqual(normalized["allocation"]["harness_weights"], {"opencode": 0.3})
+        # The input is never mutated; normalizing is idempotent.
+        self.assertEqual(config["profiles"]["deep"]["primary"], ["claude", "codex"])
+        self.assertEqual(D.normalize_policy(normalized), normalized)
+        # Structural damage is still an error.
+        broken = self.config()
+        broken["profiles"]["deep"]["primary"] = ["claude", "gemini"]
+        self.assertTrue(any("unknown harness" in e for e in D.validate(broken, capmap)))
+        broken = self.config()
+        broken["profiles"]["deep"]["primary"] = "claude"
+        self.assertTrue(any("must be a list" in e for e in D.validate(broken, capmap)))
+
+    def test_load_validated_returns_warnings_and_a_normalized_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "dispatch-defaults.yaml"
+            path.write_text(
+                "schema_version: 3\n"
+                "harnesses:\n  enabled: [claude, codex, opencode]\n"
+                "profiles:\n"
+                "  deep:\n    primary: [claude, codex, opencode]\n    relief: []\n"
+                "    last_resort: []\n    promote_relief_below: 0\n"
+                "  balanced-deep:\n    primary: [claude, codex]\n    relief: []\n"
+                "    last_resort: [opencode]\n    promote_relief_below: 0\n"
+                "  light:\n    primary: [claude, codex, opencode]\n    relief: []\n"
+                "    last_resort: []\n    promote_relief_below: 0\n"
+                "  mini:\n    primary: [claude, codex, opencode]\n    relief: []\n"
+                "    last_resort: []\n    promote_relief_below: 0\n"
+                "allocation:\n  strategy: balanced\n  window: 30\n"
+                "  harness_weights:\n    opencode: 0.3\n"
+                "capabilities:\n",
+                encoding="utf-8",
+            )
+            config, warnings = D.load_validated(path, D.default_topology_path())
+            self.assertTrue(any("profiles.deep.primary includes opencode" in w for w in warnings), warnings)
+            self.assertEqual(D.load_and_validate(path, D.default_topology_path()), config)
+            self.assertEqual(D.query_allocation(config)["harness_weights"], {"opencode": 0.3})
+            result = subprocess.run(
+                [sys.executable, str(MODULE), "validate", "--config", str(path)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("warning=profiles.deep.primary includes opencode", result.stdout)
+            allocation = subprocess.run(
+                [sys.executable, str(MODULE), "allocation", "--config", str(path)],
+                capture_output=True, text=True,
+            )
+            self.assertIn("harness_weights=opencode:0.3", allocation.stdout)
+            # A structurally broken file is still refused (exit 65).
+            path.write_text("schema_version: 3\nmystery: 1\n", encoding="utf-8")
+            broken = subprocess.run(
+                [sys.executable, str(MODULE), "validate", "--config", str(path)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(broken.returncode, 65)
+
+    def test_harness_weights_absent_leaves_the_allocation_bytes_unchanged(self):
+        config = self.config()
+        self.assertNotIn("harness_weights", D.query_allocation(config))
+        config["allocation"]["harness_weights"] = {"opencode": 0.3}
+        self.assertEqual(D.query_allocation(config)["harness_weights"], {"opencode": 0.3})
+
+    def test_harness_weights_parses_only_as_a_block_mapping(self):
+        block = D.parse_yaml_subset("allocation:\n  harness_weights:\n    opencode: 0.3\n")
+        self.assertEqual(block["allocation"]["harness_weights"], {"opencode": 0.3})
+        inline = D.parse_yaml_subset("allocation:\n  harness_weights: {opencode: 0.3}\n")
+        self.assertIsInstance(inline["allocation"]["harness_weights"], str)
+        capmap = D.load_topology_capabilities(D.default_topology_path())
+        config = self.config()
+        config["allocation"]["harness_weights"] = inline["allocation"]["harness_weights"]
+        self.assertTrue(any("block mapping" in e for e in D.validate(config, capmap)))
 
     def test_ac10_quality_peer_set_follows_the_config(self):
         # AC 10: the quality-peer derivation is config-driven, never hardcoded.

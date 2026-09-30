@@ -414,7 +414,8 @@ def ordering_score(scores, harness, neutral=ORDERING_NEUTRAL_SCORE):
 
 
 def allocation_deficit(scores, counts, candidates, *, neutral=ORDERING_NEUTRAL_SCORE,
-                       preferred=None, affinity_weight=0.5, headroom_exponent=1):
+                       preferred=None, affinity_weight=0.5, headroom_exponent=1,
+                       harness_weights=None):
     """Blend remaining headroom and round-robin balance into one continuous key.
 
     Headroom sets each candidate's *target share* of the next attempt; the
@@ -435,7 +436,10 @@ def allocation_deficit(scores, counts, candidates, *, neutral=ORDERING_NEUTRAL_S
     `(1-weight)/(n-1)` for each other); a neutral weight, an absent preference
     or a single candidate leaves every multiplier at 1.0, so equal headroom
     still reduces to exact round-robin. `headroom_exponent` sharpens the share
-    without moving any ordering boundary.
+    without moving any ordering boundary. `harness_weights` (optional
+    `allocation.harness_weights`, e.g. a slow harness at 0.3) multiplies each
+    named candidate's target share; an absent or empty mapping leaves the
+    formula exactly as it was.
     """
     n = len(candidates)
     neutral_affinity = (
@@ -450,7 +454,7 @@ def allocation_deficit(scores, counts, candidates, *, neutral=ORDERING_NEUTRAL_S
     }
     shares = {
         name: (float(neutral) if scores.get(name) is None else max(0.0, float(scores[name])))
-        ** headroom_exponent * multipliers[name]
+        ** headroom_exponent * multipliers[name] * float((harness_weights or {}).get(name, 1.0))
         for name in candidates
     }
     total = sum(shares.values())
@@ -489,7 +493,7 @@ def is_gated(scores, harness, *, usage_gate_used_percent=90):
 
 
 def rank_band(candidates, states, counts, declared_order, scores, *, strategy="capacity-aware", usage_gate_used_percent=90,
-              preferred=None, affinity_weight=0.5, headroom_exponent=1):
+              preferred=None, affinity_weight=0.5, headroom_exponent=1, harness_weights=None):
     """Rank eligible quality peers by headroom, then recent attempts and config order.
 
     Answers *eligibility*, not ordering: see `ordering_score` for the batch's
@@ -526,7 +530,8 @@ def rank_band(candidates, states, counts, declared_order, scores, *, strategy="c
         else:
             deficit = allocation_deficit(scores, counts, candidates, preferred=preferred,
                                          affinity_weight=affinity_weight,
-                                         headroom_exponent=headroom_exponent)
+                                         headroom_exponent=headroom_exponent,
+                                         harness_weights=harness_weights)
             key = lambda name: (
                 1 if is_gated(scores, name, usage_gate_used_percent=usage_gate_used_percent) else 0,
                 # Rounded so two identical inputs can never diverge on float
@@ -612,14 +617,14 @@ def ordered_candidates(ranks, band_order, scores, *, strategy="capacity-aware", 
 
 
 def select(policy, states, counts, declared_order, scores, *, strategy="capacity-aware", usage_gate_used_percent=90,
-           preferred=None, affinity_weight=0.5, headroom_exponent=1):
+           preferred=None, affinity_weight=0.5, headroom_exponent=1, harness_weights=None):
     """Select one harness without allowing capacity to erase quality boundaries."""
     ranks = {
         band: rank_band(
             policy.get(band, []), states, counts, declared_order, scores,
             strategy=strategy, usage_gate_used_percent=usage_gate_used_percent,
             preferred=preferred, affinity_weight=affinity_weight,
-            headroom_exponent=headroom_exponent,
+            headroom_exponent=headroom_exponent, harness_weights=harness_weights,
         )
         for band in ("primary", "relief", "last_resort")
     }

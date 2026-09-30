@@ -130,9 +130,12 @@ Intentionally untouched, when needed:
 **Quick and above: obtain approval before applying.** Write the current preview
 to `reviews/refine/preview.md` and raise `workflow-supervisor.py gate --route
 <route> --gate preview-disposition --block --artifact <preview>`. Use the
-existing bounded `await-release` command; depth-0 presents the preview and
-records the person's `proceed|revise|stop` decision. Quick's same conductor
-resumes after proceed; revise updates the preview and raises again. A changed
+existing bounded `await-release` command; when the gate is still blocked, the
+conductor parks (`verdict: BLOCKED`, blocker names the gate) or, as a continuation
+owner, keeps waiting (`core/WORKFLOW.md` §0.6). depth-0 presents the preview and
+records the person's `proceed|revise|stop` decision. A still-live conductor resumes
+after proceed; for a parked one, the proceed starts a continuation owner. A revise
+answered while the conductor is live updates the preview and raises again. A changed
 preview invalidates its earlier approval. `--review-only` ends after the preview
 without applying or raising an apply request. Direct keeps its inline behavior,
 with an explicit pause when `--confirm` is supplied.

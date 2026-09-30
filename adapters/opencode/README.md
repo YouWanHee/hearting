@@ -77,7 +77,7 @@ full masking.
 | harness status snapshot | Run `adapters/opencode/bin/preflight.sh status [cwd] [session-id]` for read-only artifact, notes, worktree, and git-risk signals. This does not replace OpenCode native model/context/session UI |
 | token self-regulation v2 | Phase 2 automatic hook accounting and the Phase 3 isolated experiment CLI are deferred. Shared Fleet modules may be inspected as portable source, but OpenCode projects no token-budget utility, production hook, activation flag, or runtime-config mutation |
 | adapter readiness | Run `adapters/opencode/bin/preflight.sh doctor` to check manifest freshness, native projections, and boundary rules in one command |
-| headless dispatch | Tool-contract check: `adapters/opencode/bin/preflight.sh headless --check <worktree>` verifies the worktree, `opencode run` availability, and installed OpenCode runtime projection (`hearting`, native Skills path, native Agents, native Commands, and guard plugin). Use `adapters/opencode/bin/preflight.sh dispatch --dry-run|--register|--start --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--agent <agent>] (--model-profile <deep|balanced-deep|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings)` to build the command and register open jobs. The optional worker mode is a non-owner projection that must equal the selected portable unit; `_kernel/owner` rejects a stage mode and accepts a route-sealed owner profile alone. Route-bound profiles select the complete user `~/.config/opencode/agent-config/models.conf` when valid and otherwise the complete shipped `config/models.conf`. Installation seeds the user copy once and never rewrites or removes it. Caller model/variant replacement is rejected, and substantive registered `mini` is denied. OpenCode declares its own `balanced-deep` tier (a different model from `deep`, since it has no effort axis to separate them), records `profile_granularity=collapsed-mini` plus `collapsed-balanced-to-light`, and omits `--variant` when the resolved value is `runtime-default`. Registry/Fleet rows keep capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same runtime projection check before launching. Use `liveness` while waiting and `harvest --mark-done` after main-session harvest; merge and cleanup remain outside the wrapper |
+| headless dispatch | Tool-contract check: `adapters/opencode/bin/preflight.sh headless --check <worktree>` verifies the worktree, `opencode run` availability, and installed OpenCode runtime projection (`hearting`, native Skills path, native Agents, native Commands, and guard plugin). Use `adapters/opencode/bin/preflight.sh dispatch --dry-run|--register|--start --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--agent <agent>] (--model-profile <deep|balanced-deep|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings)` to build the command and register open jobs. The optional worker mode is a non-owner projection that must equal the selected portable unit; `_kernel/owner` rejects a stage mode and accepts a route-sealed owner profile alone. Route-bound profiles select the complete user `~/.config/opencode/agent-config/models.conf` when valid and otherwise the complete shipped `config/models.conf`. Installation seeds the user copy once and never rewrites or removes it. Caller model/variant replacement is rejected, and substantive registered `mini` is denied. OpenCode declares its own `balanced-deep`, `light` and `mini` tiers (no deep tier: `deep` and `top` collapse onto balanced-deep), records `profile_granularity` per profile (`full`, `collapsed-deep-to-balanced-deep`, `collapsed-balanced-to-light`, `collapsed-top-to-balanced-deep`), applies a route-sealed `compose --pin` model (`model_source=pin`), and omits `--variant` when the resolved value is `runtime-default`. Registry/Fleet rows keep capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same runtime projection check before launching. Use `liveness` while waiting and `harvest --mark-done` after main-session harvest; merge and cleanup remain outside the wrapper |
 | QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps portable QA levels from `core/CONVENTIONS.md` to OpenCode assurance scope, selected-pass reviewer budgets, external-adversary requirements, max rounds, and inline fallback reporting. `stage_graph_selector=explicit-graph-or-intensity-default` means these budgets do not open stages or depth by themselves |
 | material browser fetch | Tool-contract check: `adapters/opencode/bin/preflight.sh browser-fetch --check <url>` verifies rendered browser access through the adapter-owned Playwright launcher before using `roles/modes/material/browser-fetch.md`. Exit 69 means the local browser stack is unavailable |
 | material data script | Tool-contract check: `adapters/opencode/bin/preflight.sh data-script --check <script.py>` verifies generated Python analysis scripts through the adapter-owned launcher before using `roles/modes/material/data-script.md` |
@@ -249,23 +249,28 @@ symlinked or generated into the config home as the adapter matures.
 
 ## Model Role and Execution-Profile Mapping
 
-OpenCode uses `provider/model-id` strings and an optional `variant`; there is no
-verified numeric effort axis. Behavioral roles resolve through `preflight.sh
+OpenCode uses `provider/model-id` strings and a `variant` (verified 2026-09-30 with
+`opencode run --format json --variant <v>` against each declared tier's model; the
+supported values per model are recorded in `config/models.conf`; the wrapper omits
+`--variant` only when the resolved value is `runtime-default`). There
+is no numeric effort axis. Behavioral roles resolve through `preflight.sh
 role`, while route-bound registered work carries one of these sealed profiles:
 
 | Model profile | OpenCode realization | Granularity |
 |---|---|---|
-| `deep` | configured deep tier / runtime default | distinct |
-| `balanced-deep` | configured **balanced-deep** tier / runtime default | distinct (its own model, not deep's) |
-| `balanced` | configured light tier / runtime default | collapsed to `light` (`collapsed-balanced-to-light`) |
-| `light` | configured light tier / runtime default | distinct |
-| `mini` | configured mini tier / runtime default | collapsed to `light`; lifecycle/micro-only, substantive dispatch-depth-1/2 work is rejected |
-| `top` | configured deep tier / runtime default | collapsed to `deep` (`collapsed-top-to-deep`): this account has no model above the deep flagship, so a route that sealed the `top` exception profile for its owner still runs here, typed as a demotion; the wrapper refuses `top` without that route, and no `--model` override runs under the `top` label. Unlike Claude and Codex this adapter still accepts `--inherit-model-settings`: it declares no main-session-only model, so there is nothing for an inherited setting to leak |
+| `deep` | configured **balanced-deep** tier (its declared variant, `xhigh`) | collapsed (`collapsed-deep-to-balanced-deep`): OpenCode declares no deep tier, and the shipped `dispatch-defaults.yaml` keeps OpenCode out of the deep band, so it takes deep work only when explicitly requested (`--owner opencode`, `--pin`) |
+| `balanced-deep` | configured balanced-deep tier (variant `xhigh`) | distinct |
+| `balanced` | configured light tier (variant `max`) | collapsed to `light` (`collapsed-balanced-to-light`) |
+| `light` | configured light tier (variant `max`) | distinct |
+| `mini` | configured mini tier (the light model, variant `high`, one step below light) | distinct variant; lifecycle/micro-only, substantive dispatch-depth-1/2 work is rejected |
+| `top` | configured balanced-deep tier | collapsed to `balanced-deep` (`collapsed-top-to-balanced-deep`): this account has no model above it, so a route that sealed the `top` exception profile for its owner still runs here, typed as a demotion; the wrapper refuses `top` without that route, and no `--model` override runs under the `top` label. Unlike Claude and Codex this adapter still accepts `--inherit-model-settings`: it declares no main-session-only model, so there is nothing for an inherited setting to leak |
 
 The portable policy assigns `balanced-deep` to quick one-shot conduction and `deep` to
 every standard+ owner. OpenCode preserves those sealed labels, but its current
-runtime realization collapses both to the configured deep tier and reports that
-reduced granularity explicitly.
+runtime realization maps both to the configured balanced-deep tier and reports that
+reduced granularity explicitly. A route can choose another OpenCode model once with
+`compose --pin <owner|frame|worker>=opencode:<provider/model>[@<variant>]`; the
+wrapper then reports `model_source=pin`.
 
 Non-route role compatibility overrides remain explicit and config-derived:
 

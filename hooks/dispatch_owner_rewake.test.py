@@ -380,6 +380,55 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertIn("--status done", message)
         self.assertNotIn("--failure-detail", message)
 
+    def parked_owner_receipt(self, status: str) -> str:
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        self.jobs.write_text(
+            "2026-08-06T00:00:00Z\tdone\t/repo\t/wt\towner\t"
+            "attempt_schema_version=2,attempt_id=att-owner-1,failure_class=blocked,"
+            "note=dead-worker-blocked,worker_type=owner,route_id=rt-owner,route_hash=sha256:owner,"
+            "launch_outcome=never-launched\n",
+            encoding="utf-8",
+        )
+        parked = {"gate": "full-run-authorization", "status": status, "epoch": 1,
+                  "artifact": "/tmp/gate.md", "route_file": "/tmp/rt-owner.json",
+                  "route_id": "rt-owner", "route_hash": "sha256:owner", "gated_nodes": ["full-run"]}
+        with mock.patch("dispatch_replacement.owner_parked_gate", return_value=parked):
+            return rewake.receipt(launch, "ready", "terminal-quiescent", self.root)
+
+    def test_parked_owner_wake_names_the_gate_not_a_failure(self) -> None:
+        message = self.parked_owner_receipt("blocked")
+        self.assertIn("required_action=human-gate:full-run-authorization", message)
+        self.assertIn("reason=owner-parked-at-human-gate", message)
+        self.assertIn("this is not a failure", message)
+        self.assertIn("workflow-supervisor.py release --route /tmp/rt-owner.json", message)
+        self.assertIn("--gate full-run-authorization", message)
+        self.assertIn("--decision proceed", message)
+        self.assertIn(f"--jobs {self.jobs}", message)
+        self.assertNotIn("inspect-done-failure", message)
+        self.assertIn("state=attention", message)
+
+    def test_released_parked_owner_wake_gives_the_start_handle(self) -> None:
+        message = self.parked_owner_receipt("proceed")
+        self.assertIn("reason=owner-parked-gate-released", message)
+        self.assertIn("capability-route.py start --route /tmp/rt-owner.json", message)
+        self.assertIn(f"--jobs {self.jobs}", message)
+        self.assertNotIn("--status done", message)  # the start handle replaces the harvest command
+
+    def test_unparked_failure_keeps_the_harvest_receipt(self) -> None:
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        self.jobs.write_text(
+            "2026-08-06T00:00:00Z\tdone\t/repo\t/wt\towner\t"
+            "attempt_schema_version=2,attempt_id=att-owner-1,failure_class=blocked,"
+            "note=dead-worker-blocked,worker_type=owner,launch_outcome=never-launched\n",
+            encoding="utf-8",
+        )
+        with mock.patch("dispatch_replacement.owner_parked_gate", return_value=None):
+            message = rewake.receipt(launch, "ready", "terminal-quiescent", self.root)
+        self.assertIn("required_action=inspect-done-failure", message)
+        self.assertNotIn("owner-parked", message)
+
     def write_marker_bound_owner(self, *, status: str = "open", child: bool = False):
         evidence = self.root / "report.md"
         evidence.write_text("fixture report\n", encoding="utf-8")
@@ -2257,7 +2306,7 @@ class GateCarrierTest(unittest.TestCase):
                 mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
             code = rewake.main()
         self.assertEqual(code, 2)
-        self.assertIn("owner=alive-waiting", stderr.getvalue())
+        self.assertIn("owner=waiting-or-parked", stderr.getvalue())
         self.assertLessEqual(run.call_count, 1)
 
     def test_probe_recovers_expired_claims_without_an_eight_attempt_dead_end(self):
@@ -2338,7 +2387,8 @@ class GateCarrierTest(unittest.TestCase):
         self.assertEqual(code, 2)
         text = stderr.getvalue()
         self.assertIn("human gate awaiting your decision", text)
-        self.assertIn("owner=alive-waiting", text)
+        self.assertIn("owner=waiting-or-parked", text)
+        self.assertIn("or has paused at the gate", text)
         self.assertIn("human-gate:frame-review", text)
         self.assertIn("await-release", text)
         self.assertIn("AskUserQuestion", text)
@@ -2396,7 +2446,7 @@ class GateCarrierTest(unittest.TestCase):
             code = rewake.main()
         # the wait resumed to the terminal receipt: two readiness probes, and
         # the notice on stderr is the ordinary attempt receipt, not a gate wake
-        self.assertNotIn("owner=alive-waiting", stderr.getvalue())
+        self.assertNotIn("owner=waiting-or-parked", stderr.getvalue())
         self.assertIn("attempt_id=att-gate-owner", stderr.getvalue())
         self.assertIn(code, (0, 2))
         self.assertEqual(run.call_count, 2)

@@ -26,6 +26,9 @@
 #     depth_affinity: {owner: claude, worker: codex}
 #     depth_affinity_weight: 0.65
 #     usage_headroom_exponent: 2
+#     harness_weights:                 # optional; block mapping only (an inline
+#       opencode: 0.3                  # {a: 1} map is not parsed); 0 < w <= 1,
+#                                      # default 1.0; `balanced` strategy only
 #   confirmation:                      # SD-123: post-frame direction gate
 #     mode: hybrid                     # hybrid | both | post-frame-only
 #   steward:                           # SD-122 (9): peer-session steward
@@ -35,6 +38,13 @@
 #       <canonical-topology-node-id>: <claude|codex|opencode|diverse>
 #   headless:
 #     claude_permission_mode: bypass   # bypass | allowlist
+#
+# The profile bands, quality-peer pairing and harness names below are
+# recommendations, not walls: a file that breaks one (a band naming a disabled
+# harness, OpenCode in a deep band, an OpenCode-only setup, ...) is still read as
+# written and the validator prints a `warning=` line. Only structural damage
+# (unknown keys, bad types or ranges) rejects the file. Leaving a harness out of a
+# profile means "do not use it for this profile".
 #
 # Value vocabulary for a capability/stage cell: claude | codex | opencode |
 # diverse (rank the checked pool by the sealed allocation policy) |
@@ -48,13 +58,16 @@ harnesses:
   enabled: [claude, codex, opencode]
 
 # Capacity reorders only within a band. OpenCode is not a quality peer of the
-# two primary harnesses: deep work reaches it only as a last resort, while
-# light/mini work may promote it when both primary gauges are genuinely tight.
+# two primary harnesses: it is left out of `deep` entirely (2026-09-30: OpenCode
+# is not used for deep-level work, so `deep` lists no OpenCode and neither does
+# its failover), holds only a last-resort seat for balanced-deep and balanced, and
+# is a peer for light/mini work, where its low `harness_weights` share below keeps
+# the slower runtime from taking an even third of the default placements.
 profiles:
   deep:
     primary: [claude, codex]
     relief: []
-    last_resort: [opencode]
+    last_resort: []
     promote_relief_below: 0
   balanced-deep:
     primary: [claude, codex]
@@ -93,6 +106,11 @@ allocation:
     worker: codex
   depth_affinity_weight: 0.65
   usage_headroom_exponent: 2
+  # OpenCode is slow: every enabled harness is a worker candidate, but it takes a
+  # smaller target share of default placements (`balanced` strategy). Explicit
+  # selection, pins and hard eligibility ignore this.
+  harness_weights:
+    opencode: 0.3
 
 # Registered headless permission posture (core/OPERATIONS.md §5.10). Hearting-
 # launched Claude workers and owners are unattended `claude -p` turns; without a

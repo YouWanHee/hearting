@@ -460,6 +460,68 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(len(self.calls),3)
         self.assertEqual(result['owner_attempt_id'],'att-owner-replacement')
 
+    def _parked_owner_row(self):
+        self.start();self.ready=self.released=True;self.start()
+        owner=W.attempt_id(self.route,'owner')
+        row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)
+        self.jobs.write_text(self.jobs.read_text().replace(
+            row,row.replace('\topen\t','\tdone\t')+',note=dead-worker-blocked,failure_class=blocked'))
+        self.ready=False
+        return owner
+
+    def _parked(self,status):
+        return {'gate':'full-run-authorization','status':status,'epoch':1,'raised_at':'2026-09-29T01:00:00Z',
+                'artifact':'/tmp/gate.md','route_file':str(self.path),'route_id':'rt-probe',
+                'route_hash':'sha256:probe','gated_nodes':['full-run']}
+
+    def test_parked_owner_waits_for_the_person_without_failure_or_wait(self):
+        self._parked_owner_row()
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('blocked')), \
+             mock.patch('dispatch_replacement.advance',side_effect=AssertionError('a blocked gate never continues')):
+            result=self.start()
+        self.assertEqual((result['state'],result['reason'],result['required_action']),
+                         ('waiting-human-gate','owner-parked-at-human-gate','answer-human-gate'))
+        self.assertEqual((result['gate'],result['gate_artifact']),('full-run-authorization','/tmp/gate.md'))
+        for token in ('--gate full-run-authorization','--decision proceed','--jobs '+str(self.jobs),'workflow-supervisor.py'):
+            self.assertIn(token,result['release_command'])
+        self.assertNotIn('parent_next',result)
+        self.assertIn('resume_command',result)
+        self.assertEqual(len(self.calls),3)
+
+    def test_stopped_gate_reports_without_replacement(self):
+        self._parked_owner_row()
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('stop')), \
+             mock.patch('dispatch_replacement.advance',side_effect=AssertionError('a stop never continues')):
+            result=self.start()
+        self.assertEqual((result['state'],result['reason']),('stopped','human-gate-stop'))
+        self.assertEqual(len(self.calls),3)
+
+    def test_revised_gate_with_parked_owner_needs_attention_without_continuation(self):
+        self._parked_owner_row()
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('revise')), \
+             mock.patch('dispatch_replacement.advance',side_effect=AssertionError('a revise never continues')):
+            result=self.start()
+        self.assertEqual((result['state'],result['reason'],result['required_action']),
+                         ('needs-attention','human-gate-revise-owner-parked','report-gate-revision'))
+        self.assertEqual(len(self.calls),3)
+
+    def test_released_parked_owner_continues_through_replacement(self):
+        owner=self._parked_owner_row()
+        row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)
+        def replace(jobs,aid,**kwargs):
+            if aid!=owner:return {'state':'not-applicable'}
+            with self.jobs.open('a') as f:
+                f.write(row.replace(owner,'att-owner-continuation').replace('\tdone\t','\topen\t')
+                        .replace(',note=dead-worker-blocked,failure_class=blocked','')
+                        +',replacement_original_attempt_id='+owner+',launch_claimed=1\n')
+            return {'state':'running','record':{'route_file':str(self.path)}}
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('proceed')), \
+             mock.patch('dispatch_replacement.advance',side_effect=replace), \
+             mock.patch('dispatch_replacement.effective_attempts',return_value=({'att-owner-continuation'},[])):
+            result=self.start()
+        self.assertEqual(result['state'],'running',result)
+        self.assertEqual(result['owner_attempt_id'],'att-owner-continuation')
+
     def test_unknown_process_retains_runtime_wait_without_replacement(self):
         self.start()
         for _ in range(3):
@@ -536,6 +598,44 @@ class WorkStartTest(unittest.TestCase):
         self.jobs.write_text(self.jobs.read_text().replace("route_hash=sha256:probe", "route_hash=sha256:other"))
         self.assertEqual(self.start()["reason"], "work-attempt-identity-conflict")
         self.assertEqual(len(self.calls), 2)
+
+    def adapters(self):
+        return [c[c.index("--adapter") + 1] if "--adapter" in c else None for c in self.calls]
+
+    def test_a_pinned_tool_is_passed_to_both_frame_legs_and_then_the_owner(self):
+        pins = {"contract_version": 1,
+                "owner": {"harness": "opencode", "model": None, "effort": None}}
+        self.route["selection_pins"] = pins
+        self.start()
+        # Both legs run on the one tool the caller named (SD-160 allows a shared
+        # harness); with no pin they stay on automatic selection (no --adapter).
+        self.assertEqual(self.adapters(), ["opencode", "opencode"])
+        self.ready = True; self.released = True
+        self.start()
+        self.assertEqual(self.adapters(), ["opencode", "opencode", "opencode"])
+
+    def test_a_frame_pin_wins_over_the_owner_pin_for_the_frame_legs_only(self):
+        self.route["selection_pins"] = {"contract_version": 1,
+            "owner": {"harness": "codex", "model": None, "effort": None},
+            "frame": {"harness": "opencode", "model": "provider/model", "effort": "max"}}
+        self.start()
+        self.assertEqual(self.adapters(), ["opencode", "opencode"])
+        self.ready = True; self.released = True
+        self.start()
+        self.assertEqual(self.adapters()[2], "codex")
+
+    def test_a_pinned_tool_the_route_never_probed_is_not_forced(self):
+        self.route["selection_pins"] = {"contract_version": 1,
+            "frame": {"harness": "claude", "model": None, "effort": None}}
+        result = self.start()
+        self.assertEqual(self.adapters(), [None, None])
+        self.assertEqual(result["frame_explicit_harness"], "unavailable:claude")
+
+    def test_a_route_without_pins_keeps_automatic_frame_selection(self):
+        self.assertNotIn("selection_pins", self.route)
+        result = self.start()
+        self.assertEqual(self.adapters(), [None, None])
+        self.assertNotIn("frame_explicit_harness", result)
 
     def test_quick_uses_the_sealed_candidate_pool(self):
         self.route["effective_intensity"] = "quick"

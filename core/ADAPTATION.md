@@ -146,7 +146,7 @@ Portable docs use role names, not vendor model names:
 | `external adversary` | Independent reviewer with different model/runtime/process assumptions |
 | `orchestrator` | Balanced mechanical coordination of already-decided tooling, paths, and report assembly; not a deep-conductor alias |
 
-Adapters map two independent portable axes: `model_role` describes behavior, while `model_profile` (`deep|balanced-deep|balanced|light|mini`) is the sealed result of the judgment-demand × execution-scope resolver. Each adapter declares concrete models, effort/variant projections, profile granularity, and interactive-main-only families in `adapters/<adapter>/config/models.conf`; every resolver, wrapper, generated agent, lifecycle worker, and documentation table derives from that single source. A route-bound job carries both sealed axes and rejects trailing model/effort replacement. `mini` is unavailable to substantive registered dispatch-depth-1/2 owners, stages, and reviewers. A profile may share another profile's concrete model as long as the resulting execution points stay distinct; the ladder is a set of operating points, not a set of models. An adapter lacking a verified effort/variant distinction may collapse only the explicitly documented operating point (OpenCode balanced to light) with reduced-granularity metadata. Non-route surfaces may retain checked explicit selection or inheritance when the resulting model is execution-surface eligible; main-only or unprovable inheritance is a typed deny.
+Adapters map two independent portable axes: `model_role` describes behavior, while `model_profile` (`deep|balanced-deep|balanced|light|mini`) is the sealed result of the judgment-demand × execution-scope resolver. Each adapter declares concrete models, effort/variant projections, profile granularity, and interactive-main-only families in `adapters/<adapter>/config/models.conf`; every resolver, wrapper, generated agent, lifecycle worker, and documentation table derives from that single source. A route-bound job carries both sealed axes and rejects trailing model/effort replacement; the only sanctioned model choice is the route-sealed `compose --pin` (wrappers report `model_source=pin`) and the checked capacity retry. `mini` is unavailable to substantive registered dispatch-depth-1/2 owners, stages, and reviewers. A profile may share another profile's concrete model as long as the resulting execution points stay distinct; the ladder is a set of operating points, not a set of models. An adapter lacking a verified effort/variant distinction may collapse only the explicitly documented operating point (OpenCode balanced to light, and — when an adapter declares no tier for a profile such as OpenCode `deep` — that profile onto its named tier, e.g. `collapsed-deep-to-balanced-deep`) with reduced-granularity metadata; leaving a tier out of the shipped config is how an adapter says "not for this profile", and the shipped `dispatch-defaults.yaml` leaves that harness out of the profile's band to match. Non-route surfaces may retain checked explicit selection or inheritance when the resulting model is execution-surface eligible; main-only or unprovable inheritance is a typed deny.
 
 Adapter and projection edits are derived core-first: change the portable invariant in
 `core/` first, read that governing core document in the current session, then update
@@ -348,7 +348,7 @@ stamp path in `core/HOOKS.md`.
   open owner attempt it also watches, once per interval, for
   a pending gate record addressed to this session and raised by that attempt;
   when one appears the hook spends its single wake immediately (exit 2,
-  `owner=alive-waiting`), leaves the record `sent-ambiguous` (the wake is
+  `owner=waiting-or-parked`), leaves the record `sent-ambiguous` (the wake is
   speculative, so the next-prompt sweep can still re-deliver it once if the
   wake was lost; the release retires it either way), and tells the session to
   put the `[방향 확인]` card and interview questions to the user and record
@@ -390,6 +390,24 @@ stamp path in `core/HOOKS.md`.
   A depth-0 session waits on `workflow-supervisor.py await-release`
   (bounded, read-only), and every launch surface refuses to start a node whose
   entry gate is not released (`human-gate-unreleased`/`human-gate-not-raised`).
+  An owner that ends `BLOCKED` at a gate it raised after it started, while the
+  nodes that gate holds back have not begun, is parked, not failed
+  (`dispatch_replacement.owner_parked_gate`, a read-only judgement over its typed
+  handoff, the route journal, completion markers, and stage rows). `resume_command`
+  reports it as `waiting-human-gate` with the exact release command. A person's
+  `release --decision proceed` then reports `owner_continuation` after the ledger
+  write: `owner-live` when an owner is still running, the shared `start` receipt when
+  it started the continuation owner (bounded by `OWNER_CONTINUATION_TIMEOUT_SECONDS`,
+  100), or `not-started` with a `resume_command` that finishes the same start later.
+  Only a person's release starts it; a registered headless owner's release does not.
+  The continuation is the family's one automatic replacement, so
+  `recovery_instructions` tells every replacement or continuation owner to keep
+  waiting on the bounded `await-release` at a later gate instead of parking. A
+  replacement owner's launch receives the route's own open cycle environment, so
+  its producer binding is published like the original owner's. The
+  Claude wake and the shared completion follow-up describe a parked owner as
+  paused at the gate, not failed. A revise or stop recorded while the owner is
+  parked starts nothing automatically.
   A Codex delivery uses a distinct strict `human-gate` receipt and `hg-dlv-*`
   gateway identity. It binds the route id/hash/file, gate raise epoch, exact
   live owner attempt and sealed batch, immutable registry, recipient thread and

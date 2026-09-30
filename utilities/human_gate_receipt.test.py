@@ -334,6 +334,7 @@ class HumanGateReceiptTest(unittest.TestCase):
         self.assertIn("workflow-supervisor.py release --route", value)
         self.assertIn("--jobs", value)
         self.assertIn("human decision is required", value)
+        self.assertIn("paused there", value)
         self.assertNotIn("preflight.sh harvest", value)
 
 

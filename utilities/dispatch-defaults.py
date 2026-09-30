@@ -8,6 +8,7 @@ affinity/owner/allocation/quality-band queries.  Schemas v1/v2 remain readable;
 schema v3 adds user-local enabled harnesses and per-profile quality bands;
 schema v4 adds `confirmation.mode` and `steward.child_permission_mode`.
 """
+import copy
 import json
 import os
 import sys
@@ -335,72 +336,24 @@ def validate(config, capmap):
                 allowed = set(QUALITY_BANDS) | {"promote_relief_below"}
                 for key in sorted(set(policy) - allowed):
                     errors.append(f"unknown profiles.{name} key: {key!r}")
-                flattened = []
                 for band in QUALITY_BANDS:
                     values = policy.get(band)
                     if not isinstance(values, list):
                         errors.append(f"profiles.{name}.{band} must be a list")
                         continue
-                    flattened.extend(values)
                     for h in values:
                         if h not in DISPATCHABLE_HARNESSES:
                             errors.append(f"profiles.{name}.{band} contains unknown harness: {h!r}")
-                if len(flattened) != len(set(flattened)):
-                    errors.append(f"profiles.{name} repeats a harness across quality bands")
-                if set(flattened) != set(enabled):
-                    errors.append(
-                        f"profiles.{name} bands must contain every enabled harness exactly once"
-                    )
                 threshold = policy.get("promote_relief_below")
                 if not isinstance(threshold, int) or not 0 <= threshold <= 100:
                     errors.append(
                         f"profiles.{name}.promote_relief_below must be an integer from 0 to 100"
                     )
-            # AC 9 band placement gate (D8-③): OpenCode is a light-tier harness and
-            # must never be placed in a deep/balanced-deep primary band; that would
-            # silently push the quality-peer gate authority onto a non-quality-peer
-            # family. light.primary may legitimately include opencode.
-            for deep_band in ("deep", "balanced-deep"):
-                band_primary = (profiles.get(deep_band) or {}).get("primary", [])
-                if "opencode" in band_primary:
-                    errors.append(
-                        f"profiles.{deep_band}.primary must not include opencode "
-                        "(quality-peer bands require claude/codex)"
-                    )
-                # fm M3 / anchor M2: the quality-peer set is
-                # `deep.primary & balanced-deep.primary`. An empty primary band
-                # validates under the coverage rule above (every enabled harness
-                # still appears exactly once, just in relief/last_resort) and
-                # makes that intersection empty -- a config that silently
-                # nullifies the gate it is supposed to define. The gate has to
-                # be defined at the layer that defines the band, not repaired at
-                # each of its two consumers.
-                if isinstance(band_primary, list) and not band_primary:
-                    errors.append(
-                        f"profiles.{deep_band}.primary must name at least one "
-                        "harness (an empty band nullifies the quality-peer set)"
-                    )
-            # M6: closing the EMPTY band closed only one spelling of the same
-            # hole. The quality-peer set is the INTERSECTION of the two bands, so
-            # two non-empty but disjoint bands nullify it just as completely and
-            # pass the coverage rule identically. After the AC 11 fix that is
-            # strictly worse than it was: `quality_peer` is an empty set rather
-            # than `None`, so `sole_gate` starts at "ok", the gated list comes out
-            # empty, and every peer-bearing parallel group route-wide is refused
-            # with `peer-gate:no-quality-peer-family-hard-eligible` -- a
-            # config error diagnosed as a harness-availability shortage.
-            deep_primary = (profiles.get("deep") or {}).get("primary")
-            balanced_primary = (profiles.get("balanced-deep") or {}).get("primary")
-            if (
-                isinstance(deep_primary, list) and deep_primary
-                and isinstance(balanced_primary, list) and balanced_primary
-                and not (set(deep_primary) & set(balanced_primary))
-            ):
-                errors.append(
-                    "profiles.deep.primary and profiles.balanced-deep.primary "
-                    "must share at least one harness (their intersection is the "
-                    "quality-peer set; disjoint bands nullify it)"
-                )
+            # Band placement (a band naming a disabled harness, one harness in
+            # several bands, OpenCode in a deep primary band, an empty or
+            # disjoint quality-peer pair, an unused enabled harness) is a
+            # recommendation, not a structural error: `policy_warnings` reports
+            # it and `normalize_policy` reads the file as the user wrote it.
 
     allocation = config.get("allocation")
     if version in {2, 3, 4}:
@@ -409,7 +362,7 @@ def validate(config, capmap):
         else:
             unknown_allocation = sorted(set(allocation) - {
                 "strategy", "window", "usage_gate_used_percent", "depth_affinity",
-                "depth_affinity_weight", "usage_headroom_exponent",
+                "depth_affinity_weight", "usage_headroom_exponent", "harness_weights",
             })
             for key in unknown_allocation:
                 errors.append(f"unknown allocation key: {key!r}")
@@ -427,14 +380,29 @@ def validate(config, capmap):
             depth_affinity = allocation.get("depth_affinity", {})
             if not isinstance(depth_affinity, dict) or not set(depth_affinity) <= {"owner", "worker"}:
                 errors.append("allocation.depth_affinity keys must be a subset of owner and worker")
-            elif any(value not in enabled for value in depth_affinity.values()):
-                errors.append("allocation.depth_affinity values must name enabled harnesses")
+            elif any(value not in DISPATCHABLE_HARNESSES for value in depth_affinity.values()):
+                errors.append("allocation.depth_affinity values must name known harnesses")
             weight = allocation.get("depth_affinity_weight", 0.5)
             if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0.0 <= weight <= 1.0:
                 errors.append("allocation.depth_affinity_weight must be a number from 0.0 to 1.0")
             exponent = allocation.get("usage_headroom_exponent", 1)
             if isinstance(exponent, bool) or not isinstance(exponent, int) or not 1 <= exponent <= 4:
                 errors.append("allocation.usage_headroom_exponent must be an integer from 1 to 4")
+            if "harness_weights" in allocation:
+                weights = allocation["harness_weights"]
+                if not isinstance(weights, dict):
+                    errors.append(
+                        "allocation.harness_weights must be a block mapping of harness -> weight "
+                        "(inline {a: 1} mappings are not supported by this parser)"
+                    )
+                else:
+                    for name, value in weights.items():
+                        if name not in DISPATCHABLE_HARNESSES:
+                            errors.append(f"allocation.harness_weights names an unknown harness: {name!r}")
+                        elif isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 < value <= 1.0:
+                            errors.append(
+                                f"allocation.harness_weights.{name} must be a number above 0 and at most 1"
+                            )
     elif allocation is not None:
         errors.append("allocation requires schema_version 2, 3, or 4")
 
@@ -530,14 +498,178 @@ def validate(config, capmap):
                         f"invalid affinity value for {cap_name}.{stage_name}: {value!r} "
                         f"(allowed: {sorted(AFFINITY_VALUES)}; model/effort values are never allowed here)"
                     )
-                elif version in {3, 4} and value != "diverse" and value not in enabled:
-                    errors.append(
-                        f"affinity {cap_name}.{stage_name} targets disabled harness: {value!r}"
-                    )
     return errors
 
 
-def load_and_validate(config_path, topology_path):
+def _enabled_harnesses(config):
+    """Enabled harness names for any schema version (empty when unreadable)."""
+    enabled = query_owners(config)
+    return list(enabled) if isinstance(enabled, list) else []
+
+
+def _band_lists(policy):
+    return {
+        band: list(policy.get(band))
+        for band in QUALITY_BANDS
+        if isinstance(policy.get(band), list)
+    }
+
+
+def policy_warnings(config):
+    """Recommendation findings for a structurally valid config.
+
+    None of these reject the file: `normalize_policy` reads the file the way
+    the warnings describe and the caller prints each line as `warning=<text>`.
+    W1 band names a disabled harness (ignored) · W2 one harness in several
+    bands (first band wins) · W3 OpenCode in a deep/balanced-deep primary band
+    · W4 deep/balanced-deep primary empty or disjoint (no quality-peer family)
+    · W5 a profile holds no enabled harness (all enabled harnesses become its
+    last resort) · W6 affinity, depth_affinity or harness_weights name a
+    disabled harness (that cell is ignored). A harness absent from a profile is
+    a normal "this profile does not use it", never a finding. W3/W4 only apply
+    while claude or codex is enabled: an OpenCode-only user has no
+    recommendation left to break.
+    """
+    warnings = []
+    version = config.get("schema_version")
+    enabled = _enabled_harnesses(config)
+    profiles = config.get("profiles")
+    if version in {3, 4} and isinstance(profiles, dict):
+        for name in MODEL_PROFILES:
+            policy = profiles.get(name)
+            if not isinstance(policy, dict):
+                continue
+            seen = {}
+            for band, values in _band_lists(policy).items():
+                for h in values:
+                    if h not in enabled:
+                        warnings.append(
+                            f"profiles.{name}.{band} names disabled harness {h!r}: ignored"
+                        )
+                    elif h in seen:
+                        warnings.append(
+                            f"profiles.{name} repeats {h!r} in {seen[h]} and {band}: "
+                            f"keeping {seen[h]}"
+                        )
+                    else:
+                        seen[h] = band
+            if enabled and not seen:
+                warnings.append(
+                    f"profiles.{name} holds no enabled harness: "
+                    "every enabled harness becomes its last_resort"
+                )
+        if {"claude", "codex"} & set(enabled):
+            for deep_band in ("deep", "balanced-deep"):
+                primary = (profiles.get(deep_band) or {}).get("primary")
+                if isinstance(primary, list) and "opencode" in primary:
+                    warnings.append(
+                        f"profiles.{deep_band}.primary includes opencode "
+                        "(quality-peer bands are recommended to be claude/codex)"
+                    )
+            deep_primary = (profiles.get("deep") or {}).get("primary")
+            balanced_primary = (profiles.get("balanced-deep") or {}).get("primary")
+            if isinstance(deep_primary, list) and isinstance(balanced_primary, list):
+                if not deep_primary or not balanced_primary:
+                    warnings.append(
+                        "profiles.deep.primary / profiles.balanced-deep.primary is empty: "
+                        "no quality-peer family (a parallel peer gate is recorded as "
+                        "sole-gate-non-peer-harness instead of refused)"
+                    )
+                elif not (set(deep_primary) & set(balanced_primary)):
+                    warnings.append(
+                        "profiles.deep.primary and profiles.balanced-deep.primary share no "
+                        "harness: no quality-peer family (a parallel peer gate is recorded as "
+                        "sole-gate-non-peer-harness instead of refused)"
+                    )
+        capabilities = config.get("capabilities")
+        if isinstance(capabilities, dict):
+            for cap_name, stagemap in capabilities.items():
+                if not isinstance(stagemap, dict):
+                    continue
+                for stage_name, value in stagemap.items():
+                    if value in DISPATCHABLE_HARNESSES and value not in enabled:
+                        warnings.append(
+                            f"affinity {cap_name}.{stage_name} targets disabled harness "
+                            f"{value!r}: ignored"
+                        )
+    allocation = config.get("allocation")
+    if isinstance(allocation, dict):
+        depth_affinity = allocation.get("depth_affinity")
+        if isinstance(depth_affinity, dict):
+            for key, value in depth_affinity.items():
+                if value in DISPATCHABLE_HARNESSES and value not in enabled:
+                    warnings.append(
+                        f"allocation.depth_affinity.{key} names disabled harness {value!r}: ignored"
+                    )
+        weights = allocation.get("harness_weights")
+        if isinstance(weights, dict):
+            for name in weights:
+                if name in DISPATCHABLE_HARNESSES and name not in enabled:
+                    warnings.append(
+                        f"allocation.harness_weights.{name} names a disabled harness: ignored"
+                    )
+    return warnings
+
+
+def normalize_policy(config):
+    """Return the policy the readers should use: recommendation findings applied.
+
+    Pure function over a structurally valid config (see `policy_warnings` for
+    W1/W2/W5/W6). W3/W4 change nothing here. The input is not mutated.
+    """
+    result = copy.deepcopy(config)
+    version = result.get("schema_version")
+    enabled = _enabled_harnesses(result)
+    profiles = result.get("profiles")
+    if version in {3, 4} and isinstance(profiles, dict):
+        for name in MODEL_PROFILES:
+            policy = profiles.get(name)
+            if not isinstance(policy, dict):
+                continue
+            placed = set()
+            for band in QUALITY_BANDS:
+                values = policy.get(band)
+                if not isinstance(values, list):
+                    continue
+                kept = []
+                for h in values:
+                    if h in enabled and h not in placed:
+                        kept.append(h)
+                        placed.add(h)
+                policy[band] = kept
+            if enabled and not placed:
+                policy["last_resort"] = list(enabled)
+        capabilities = result.get("capabilities")
+        if isinstance(capabilities, dict):
+            for stagemap in capabilities.values():
+                if not isinstance(stagemap, dict):
+                    continue
+                for stage_name in [
+                    key for key, value in stagemap.items()
+                    if value in DISPATCHABLE_HARNESSES and value not in enabled
+                ]:
+                    del stagemap[stage_name]
+    allocation = result.get("allocation")
+    if isinstance(allocation, dict):
+        depth_affinity = allocation.get("depth_affinity")
+        if isinstance(depth_affinity, dict):
+            for key in [k for k, v in depth_affinity.items() if v not in enabled]:
+                del depth_affinity[key]
+        weights = allocation.get("harness_weights")
+        if isinstance(weights, dict):
+            for name in [n for n in weights if n not in enabled]:
+                del weights[name]
+            if not weights:
+                del allocation["harness_weights"]
+    return result
+
+
+def load_validated(config_path, topology_path):
+    """Load, validate structure, normalize, and return `(config, warnings)`.
+
+    Structural errors raise `DefaultsConfigError`; recommendation findings come
+    back as warning strings and the returned config is already normalized.
+    """
     with open(config_path, encoding="utf-8") as f:
         text = f.read()
     config = parse_yaml_subset(text)
@@ -545,20 +677,26 @@ def load_and_validate(config_path, topology_path):
     errors = validate(config, capmap)
     if errors:
         raise DefaultsConfigError("; ".join(errors))
+    warnings = policy_warnings(config)
+    config = normalize_policy(config)
     # Merging before validation would turn a valid user file into a loud
     # failure for every user the moment the shipped baseline goes stale, so
     # this runs strictly after validation of the raw user config above. The
     # shipped file merging into itself would be a no-op anyway, but the path
     # comparison also avoids a redundant re-parse.
     if os.path.realpath(config_path) == os.path.realpath(SHIPPED_CONFIG_PATH):
-        return config
+        return config, warnings
     try:
         baseline = shipped_capability_baseline()
     except (DefaultsConfigError, OSError, json.JSONDecodeError) as exc:
         raise DefaultsConfigError(
             f"corrupt shipped dispatch-defaults baseline: {exc}"
         ) from exc
-    return merge_capability_baseline(config, capmap, baseline=baseline)
+    return merge_capability_baseline(config, capmap, baseline=baseline), warnings
+
+
+def load_and_validate(config_path, topology_path):
+    return load_validated(config_path, topology_path)[0]
 
 
 def query_affinity(config, capability, stage):
@@ -630,6 +768,10 @@ def query_allocation(config):
             "harness_order": list(query_owners(config)),
         }
         result.update({key: allocation.get(key, value) for key, value in neutral.items()})
+        # Optional and absent by default, so a config without weights seals
+        # the same allocation bytes as before this key existed.
+        if isinstance(allocation.get("harness_weights"), dict):
+            result["harness_weights"] = dict(allocation["harness_weights"])
         return result
     result = {
         "strategy": "config-order",
@@ -777,7 +919,7 @@ def main(argv):
     topology_path = _arg(rest, "--topology", default_topology_path())
 
     try:
-        config = load_and_validate(config_path, topology_path)
+        config, policy_findings = load_validated(config_path, topology_path)
     except (DefaultsConfigError, OSError, json.JSONDecodeError) as exc:
         print(f"dispatch-defaults: invalid config {config_path}: {exc}", file=sys.stderr)
         return 65
@@ -787,7 +929,7 @@ def main(argv):
         # Warnings never change the exit code: a valid file stays valid. They
         # exist because "valid" alone hid two weeks of a balanced-first decision
         # that never reached the user-owned file (2026-08-13 -> 2026-08-29).
-        for warning in allocation_warnings(config, config_path):
+        for warning in [*policy_findings, *allocation_warnings(config, config_path)]:
             print(f"warning={warning}")
         return 0
     if op == "affinity":
@@ -820,6 +962,9 @@ def main(argv):
         print(f"depth_affinity_weight={allocation['depth_affinity_weight']}")
         print(f"usage_headroom_exponent={allocation['usage_headroom_exponent']}")
         print("harness_order=" + ",".join(allocation["harness_order"]))
+        if allocation.get("harness_weights"):
+            weights = allocation["harness_weights"]
+            print("harness_weights=" + ",".join(f"{key}:{weights[key]}" for key in sorted(weights)))
         return 0
     if op == "opencode-policy":
         print(query_opencode_policy(config))

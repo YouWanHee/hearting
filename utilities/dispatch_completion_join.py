@@ -719,6 +719,7 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
     # route or synthesize a new workflow from generic harvest instructions.
     work_commands = {}
     completed_work = set()
+    parked_notes = []
     if jobs:
         from route_identity import route_hash
         for child in receipt["children"]:
@@ -740,6 +741,14 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
                 work_commands[child["attempt_id"]] = shlex.join([
                     sys.executable, str(Path(__file__).absolute().with_name("capability-route.py")),
                     "start", "--route", str(path), "--jobs", jobs])
+                if meta["worker_type"] == "owner" and child["required_action"] == "inspect-done-failure":
+                    import dispatch_replacement
+                    parked = dispatch_replacement.owner_parked_gate(Path(jobs), child["attempt_id"])
+                    if parked:
+                        parked_notes.append(
+                            f"Owner {child['attempt_id']} paused at human gate {parked['gate']} "
+                            f"({parked['status']}); this is not a failure. The start handle below returns "
+                            "the exact release command, or starts the continuation once the gate is released.")
             except (OSError, ValueError, KeyError, JoinContractError):
                 continue  # Legacy/corrupt context retains the exact inspection surface below.
     commands = [work_commands.get(child["attempt_id"]) or
@@ -750,7 +759,8 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
                 "Report the result to the user. No harvest, next-stage launch, route restart, or manual finalization is required.")
     if work_commands:
         text = "\n".join(dict.fromkeys(command for command in commands if command))
-        return ("Continue the existing work with its exact handle:\n" + text
+        return ("\n".join(parked_notes) + ("\n" if parked_notes else "")
+                + "Continue the existing work with its exact handle:\n" + text
                 + "\nThis reuses registered attempts and the shared outcome/cleanup controller. "
                   "It returns the current frame results and whether a native user question is ready. "
                   "Use those exact results; another cycle's artifact cannot replace a failed frame. "

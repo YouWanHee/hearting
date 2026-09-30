@@ -43,9 +43,19 @@ def _digest(value):
     return "sha256:" + hashlib.sha256(_bytes(value)).hexdigest()
 
 
+def _placed(path):
+    """Follow the producer's recorded placement: a checkpoint may move a loose plan
+    (``artifacts/plan.md`` -> ``artifacts/plans/plan.md``) after its marker was written."""
+    try:
+        from artifact_producer import resolve_placed_output
+        return resolve_placed_output(Path(path))
+    except Exception:
+        return Path(path)
+
+
 def _file(path):
     try:
-        resolved = Path(path).resolve(strict=True)
+        resolved = _placed(path).resolve(strict=True)
         if not stat.S_ISREG(resolved.stat().st_mode):
             raise OSError("not a regular file")
         data = resolved.read_bytes()

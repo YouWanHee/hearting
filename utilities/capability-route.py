@@ -1364,7 +1364,7 @@ def build_continuation_route(
     inherited_keys=(
         "schema_version","capability","capability_mode","slug","slug_truncated",
         "campaign_key","parent_cycle_id","campaign_unassigned","work_request",
-        "requested_intensity",
+        "selection_pins","requested_intensity",
         "effective_intensity","owner_model_profile","execution_topology",
         "owner_dispatch_depth","max_dispatch_depth","tracking",
         "tracked_gate_evidence","spec_touch","cwd","source_commit",
@@ -1464,6 +1464,7 @@ def build_continuation_route(
 def _verify_continuation_route(route):
     if route.get("continuation_contract_version") != CONTINUATION_CONTRACT_VERSION:
         raise ValueError("unsupported-continuation-contract-version")
+    _verify_selection_pins(route)
     required=(
         "source_route_id","source_route_hash","resume_from_node",
         "requested_boundary","reason","source_evidence_digest",
@@ -2190,28 +2191,52 @@ def _realize_conditional_extensions(recipe, effective_intensity):
             row["after"] = [terminal]
     return rows
 
+# Recommendation findings of the dispatch-defaults policy (`load_validated`)
+# collected while a route is sealed; `compose` prints them as `warning=` lines.
+# Warnings never change what is sealed beyond the normalization the loader
+# already applied.
+DISPATCH_DEFAULTS_WARNINGS = []
+
+
+def _note_warning(line):
+    if line not in DISPATCH_DEFAULTS_WARNINGS:
+        DISPATCH_DEFAULTS_WARNINGS.append(line)
+
+
 def _seal_dispatch_defaults(nodes, capability, owner_profile=None):
     """Return defaults digest/allocation and stamp each dispatch-depth-2 node's
     harness_affinity, BEFORE route_hash is computed. Absent config -> all
-    'unspecified' + digest None. Corrupt config -> fail-loud (reused loader
-    validator), surfaced as ValueError so main() exits 64. registry_digest is
-    a separate field and is never touched here."""
+    'unspecified' + digest None. Structurally corrupt config -> fail-loud
+    (reused loader validator), surfaced as ValueError so main() exits 64; a
+    recommendation the config breaks is a `warning=` line, not a failure.
+    Each depth-2 node and each depth-1 frame leg carries its profile's sealed
+    harness_policy, so a frame launched later reads the same bands the route
+    was sealed with instead of re-reading the live file. registry_digest is a
+    separate field and is never touched here."""
     config_path = DEFAULTS.default_config_path()
     if not os.path.exists(config_path):
         for node in nodes:
             if node.get("dispatch_depth") == 2:
                 node["harness_affinity"] = "unspecified"
                 node["harness_policy"] = None
+            elif _frame_node(node):
+                node["harness_policy"] = None
         return None, None, None
     try:
-        cfg = DEFAULTS.load_and_validate(config_path, DEFAULTS.default_topology_path())
+        cfg, findings = DEFAULTS.load_validated(config_path, DEFAULTS.default_topology_path())
     except DEFAULTS.DefaultsConfigError as exc:
         raise ValueError(f"corrupt dispatch-defaults config: {exc}")
+    for finding in findings:
+        _note_warning(f"warning=dispatch-defaults:{finding}")
     for node in nodes:
         if node.get("dispatch_depth") == 2:
             node["harness_affinity"] = DEFAULTS.query_stage_affinity(
                 cfg, capability, node.get("parallel_anchor", node["id"])
             )
+            node["harness_policy"] = DEFAULTS.query_profile_policy(
+                cfg, node["model_profile"]
+            )
+        elif _frame_node(node):
             node["harness_policy"] = DEFAULTS.query_profile_policy(
                 cfg, node["model_profile"]
             )
@@ -2569,7 +2594,16 @@ SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard"}
 INTENSITY_SHAPE = {"direct": "direct", "quick": "solo"}
 ROUTE_ORIGINS = ("preset", "compose")
 COMPOSE_DEFAULT_CAPABILITY = "autopilot-code"
-COMPOSE_DEFAULT_CHILDREN = ("claude", "codex")
+# Fallback when the user's policy names no enabled harnesses (no file, unreadable):
+# the shipped default enables all three.
+COMPOSE_DEFAULT_CHILDREN = ("claude", "codex", "opencode")
+SELECTION_PIN_TARGETS = ("owner", "frame", "worker")
+SELECTION_PIN_CONTRACT_VERSION = 1
+# The harness is split at the first ":" and the effort at the last "@", so a
+# model id may itself contain ":" (a provider tag) but never "@", whitespace,
+# "|" or ",".  Deliberately narrower than model_profile.SAFE_VALUE.
+SELECTION_PIN_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*$")
+SELECTION_PIN_EFFORT = re.compile(r"^[a-z]+$")
 COMPOSE_SPEC_CANDIDATES = ("spec/prd.md",)
 
 
@@ -2912,12 +2946,167 @@ def _compose_shared_spec_prds(root):
     return found
 
 
+def _parse_selection_pins(values, owner=None):
+    """Parse repeated `--pin <target>=<harness>[:<model>[@<effort>]]` values.
+
+    Returns `{target: {"harness", "model", "effort"}}` for the targets that were
+    given. `--owner H` is the same statement as `--pin owner=H`; naming two
+    different harnesses for the owner is a contradiction in the input.  Only a
+    value that cannot be read at all is refused -- a route without pins never
+    reaches this function with anything to refuse.
+    """
+    pins = {}
+    for raw in values or ():
+        target, sep, rest = str(raw).partition("=")
+        if not sep or target not in SELECTION_PIN_TARGETS:
+            raise ValueError(
+                f"compose-pin-invalid:{raw!r} (use <target>=<harness>[:<model>[@<effort>]], "
+                f"target one of {','.join(SELECTION_PIN_TARGETS)})")
+        if target in pins:
+            raise ValueError(f"compose-pin-invalid:{target} given twice")
+        harness, colon, remainder = rest.partition(":")
+        if harness not in DEFAULTS.DISPATCHABLE_HARNESSES:
+            raise ValueError(
+                f"compose-pin-invalid:{raw!r} unknown harness {harness!r} "
+                f"(one of {','.join(sorted(DEFAULTS.DISPATCHABLE_HARNESSES))})")
+        model = effort = None
+        if colon:
+            if not remainder:
+                raise ValueError(f"compose-pin-invalid:{raw!r} empty model")
+            model, at, tail = remainder.rpartition("@")
+            if not at:
+                model, effort = remainder, None
+            elif not model or not tail:
+                raise ValueError(f"compose-pin-invalid:{raw!r} empty model or effort around '@'")
+            else:
+                effort = tail
+            if not SELECTION_PIN_MODEL.fullmatch(model):
+                raise ValueError(
+                    f"compose-pin-invalid:{raw!r} model must start with a letter or digit and contain only letters, digits and ._/:-")
+            if effort is not None and not SELECTION_PIN_EFFORT.fullmatch(effort):
+                raise ValueError(f"compose-pin-invalid:{raw!r} effort must be lowercase letters")
+        pins[target] = {"harness": harness, "model": model, "effort": effort}
+    if owner:
+        if "owner" in pins and pins["owner"]["harness"] != owner:
+            raise ValueError(
+                f"compose-pin-owner-conflict:--owner {owner} vs --pin owner={pins['owner']['harness']}")
+        pins.setdefault("owner", {"harness": owner, "model": None, "effort": None})
+    return pins
+
+
+def _main_session_only_models(harness):
+    """The harness's `CFG_MAIN_SESSION_ONLY_MODELS`, or "" when it declares none
+    or its model config cannot be read (compose then leaves the pin alone; the
+    wrapper still refuses a restricted model at launch)."""
+    try:
+        import model_config
+        values, _receipt = model_config.resolve_config(harness)
+    except Exception:
+        return ""
+    return values.get("CFG_MAIN_SESSION_ONLY_MODELS", "")
+
+
+def _filter_top_pins(pins):
+    """`top-model-pin`: a main-session-only (top) model runs only in the main
+    session and in frame.  For the owner and worker targets compose drops just
+    the model part of the pin (the harness pin stays) and says so; frame keeps
+    its model.  Returns `(pins, warnings)`."""
+    kept, warnings = {}, []
+    for target, pin in pins.items():
+        pin = dict(pin)
+        if target != "frame" and pin["model"]:
+            import model_config
+            restricted = _main_session_only_models(pin["harness"])
+            if restricted and model_config.restricted_model(pin["model"], restricted):
+                warnings.append(
+                    f"warning=pin-dropped:{target}:{pin['model']}:main-session-only "
+                    "(top models run only in the main session and frame)")
+                pin["model"] = pin["effort"] = None
+        kept[target] = pin
+    return kept, warnings
+
+
+def _compose_default_children(pins=None):
+    """Child harnesses compose probes when `--children` is not given: every
+    harness the user's policy enables (`all-enabled-candidates`) plus any
+    harness a pin names.  An unreadable or absent policy falls back to the
+    shipped default set; a harness that is not installed shows up as an
+    `unsupported` probe tuple, never as a refusal."""
+    children = list(COMPOSE_DEFAULT_CHILDREN)
+    try:
+        path = DEFAULTS.default_config_path()
+        if os.path.exists(path):
+            cfg = DEFAULTS.load_and_validate(path, DEFAULTS.default_topology_path())
+            enabled = [h for h in DEFAULTS.query_owners(cfg) if isinstance(h, str)]
+            if enabled:
+                children = enabled
+    except (DEFAULTS.DefaultsConfigError, OSError, ValueError):
+        pass
+    for pin in (pins or {}).values():
+        if pin["harness"] not in children:
+            children.append(pin["harness"])
+    return tuple(children)
+
+
+def _apply_selection_pins(route, pins):
+    """Seal `pins` into `route` and stamp the worker pin on every depth-2 node.
+
+    A worker pin H becomes each depth-2 node's `harness_affinity` and moves H to
+    the front of that node's sealed `primary` band (removing it from the other
+    bands), so the ordinary affinity consumers pick H first while eligibility
+    and capacity keep their precedence.  A route with no pin gets no key.
+    """
+    if not pins:
+        return
+    route["selection_pins"] = {
+        "contract_version": SELECTION_PIN_CONTRACT_VERSION,
+        **{target: dict(pins[target]) for target in SELECTION_PIN_TARGETS if target in pins},
+    }
+    worker = pins.get("worker")
+    if worker is None:
+        return
+    harness = worker["harness"]
+    for node in route.get("nodes", []):
+        if node.get("dispatch_depth") != 2:
+            continue
+        node["harness_affinity"] = harness
+        policy = node.get("harness_policy")
+        if isinstance(policy, dict):
+            for band in ("relief", "last_resort"):
+                policy[band] = [h for h in policy.get(band, []) if h != harness]
+            policy["primary"] = [harness] + [h for h in policy.get("primary", []) if h != harness]
+
+
+def _verify_selection_pins(route):
+    """Structure-only check of a sealed `selection_pins`; absent means nothing to check."""
+    if "selection_pins" not in route:
+        return
+    pins = route["selection_pins"]
+    if not isinstance(pins, dict) or pins.get("contract_version") != SELECTION_PIN_CONTRACT_VERSION:
+        raise ValueError("invalid selection_pins contract")
+    if not set(pins) <= {"contract_version", *SELECTION_PIN_TARGETS}:
+        raise ValueError("invalid selection_pins key")
+    for target in SELECTION_PIN_TARGETS:
+        if target not in pins:
+            continue
+        pin = pins[target]
+        if not isinstance(pin, dict) or set(pin) != {"harness", "model", "effort"}:
+            raise ValueError(f"invalid selection_pins.{target} shape")
+        if pin["harness"] not in DEFAULTS.DISPATCHABLE_HARNESSES:
+            raise ValueError(f"invalid selection_pins.{target}.harness")
+        for key, pattern in (("model", SELECTION_PIN_MODEL), ("effort", SELECTION_PIN_EFFORT)):
+            value = pin[key]
+            if value is not None and not (isinstance(value, str) and pattern.fullmatch(value)):
+                raise ValueError(f"invalid selection_pins.{target}.{key}")
+
+
 def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artifact_root,
                   intensity=None, signals=(), spec_read=None, drift_verdict=None,
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
-                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False):
+                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
+                  selection_pins=None):
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
@@ -2974,11 +3163,11 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
     if shape == "staged" and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
-                                       children or COMPOSE_DEFAULT_CHILDREN)
+                                       children or _compose_default_children(selection_pins))
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
     if (shape == "solo" or owner_only) and registered_headless_evidence is None:
         readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
-                                                    parent_harness, children or COMPOSE_DEFAULT_CHILDREN)
+                                                    parent_harness, children or _compose_default_children(selection_pins))
         registered_headless_evidence = {"candidates": readiness["candidates"]}
     common = dict(
         signals=signals, transport=None, transport_evidence=transport_evidence,
@@ -3004,7 +3193,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if work_request is not None:
         from work_start import capture_request_context
         route["work_request"] = capture_request_context(work_request, route)
-    if unassigned or work_request is not None:
+    if selection_pins:
+        _apply_selection_pins(route, selection_pins)
+    if unassigned or work_request is not None or selection_pins:
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
@@ -3548,6 +3739,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     if "work_request" in route:
         from work_start import validate_request
         validate_request(route["work_request"])
+    _verify_selection_pins(route)
     if route.get("schema_version") != ROUTE_SCHEMA_VERSION:
         raise ValueError(
             f"legacy route schema_version={route.get('schema_version')!r} rejected for mutating/resume use"
@@ -3728,7 +3920,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     allocation = route.get("dispatch_allocation")
     if allocation is not None:
         required = {"strategy", "window", "harness_order"}
-        optional = {"usage_gate_used_percent", "depth_affinity", "depth_affinity_weight", "usage_headroom_exponent"}
+        optional = {"usage_gate_used_percent", "depth_affinity", "depth_affinity_weight", "usage_headroom_exponent",
+                    "harness_weights"}
         if not isinstance(allocation, dict) or not required <= set(allocation) or set(allocation) - required - optional:
             raise ValueError("invalid dispatch_allocation shape")
         if allocation.get("strategy") not in {
@@ -3758,6 +3951,15 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         exponent = allocation.get("usage_headroom_exponent", 1)
         if isinstance(exponent, bool) or not isinstance(exponent, int) or not 1 <= exponent <= 4:
             raise ValueError("invalid dispatch_allocation headroom exponent")
+        if "harness_weights" in allocation:
+            weights = allocation["harness_weights"]
+            if not isinstance(weights, dict) or any(
+                name not in DEFAULTS.DISPATCHABLE_HARNESSES
+                or isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 0.0 < value <= 1.0
+                for name, value in weights.items()
+            ):
+                raise ValueError("invalid dispatch_allocation harness weights")
         order = allocation.get("harness_order")
         if (
             not isinstance(order, list)
@@ -3810,7 +4012,9 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         owner_set = {
             harness for band in DEFAULTS.QUALITY_BANDS for harness in owner_policy[band]
         }
-        if owner_set != set(allocation["harness_order"]):
+        # A profile's policy may leave a pool harness out (for example OpenCode
+        # is not used for deep work); it may never name one outside the pool.
+        if not owner_set <= set(allocation["harness_order"]):
             raise ValueError("owner_harness_policy differs from dispatch allocation pool")
     realized_groups = {}
     for node in route.get("nodes", []):
@@ -4362,7 +4566,7 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
                 allow_unproven=True, jobs=None, expected_terminal_marker_digest=None,
                 terminal_commit_id=None, expected_owner_attempt_id=None,
                 expected_producer_binding_digest=None, inline_finish_id=None,
-                expected_summary_digest=None, inline_commit=None):
+                expected_summary_digest=None, inline_commit=None, autoclose=None):
     try:
         import inline_finish
         pending=inline_finish.pending_state(Path(route["artifact_root"]),route["route_id"])
@@ -4441,6 +4645,10 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
     if inline_finish_id is not None:
         outcome["inline_finish_id"] = inline_finish_id
         outcome["summary_digest"] = expected_summary_digest
+    # Closed by the runtime because nobody works on the route any more
+    # (utilities/route_autoclose.py), not by the session that composed it.
+    if autoclose is not None:
+        outcome["autoclose"] = dict(autoclose)
     # A-SD154-7: a route's closed outcome names every SD-154 revision recorded
     # under it, so a reader never has to walk completion-dir history by hand
     # to learn a gate's evidence was corrected mid-route.
@@ -7863,6 +8071,17 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         print(json.dumps(result,sort_keys=True))
     return output_path.resolve()
 
+def _route_autoclose(artifact_root, trigger):
+    """The runtime closes routes nobody works on any more (utilities/route_autoclose.py).
+    Bookkeeping only: it never fails or blocks the command that triggered it."""
+    try:
+        import route_autoclose
+        api=sys.modules.get(__name__)
+        if api is None: return
+        route_autoclose.report(route_autoclose.sweep(artifact_root,api=api,trigger=trigger))
+    except Exception as exc:  # noqa: BLE001
+        print(f"route_autoclose error={type(exc).__name__}",file=sys.stderr)
+
 def main():
     from dispatch_parent_completion import default_parent_harness
     p=argparse.ArgumentParser(allow_abbrev=False)
@@ -7888,7 +8107,12 @@ def main():
     cp.add_argument("--slug",required=True)
     cp.add_argument("--start",action="store_true",help="prepare and start the selected work; the runtime owns frame launches and waiting")
     cp.add_argument("--prompt-file",type=Path,help="the user's task, stored with the route for frame and owner execution")
-    cp.add_argument("--owner",choices=("claude","codex","opencode"),help="explicit owner runtime; otherwise use normal selection")
+    cp.add_argument("--owner",choices=("claude","codex","opencode"),help="explicit owner runtime; otherwise use normal selection (same as --pin owner=<harness>)")
+    cp.add_argument("--pin",action="append",default=[],metavar="TARGET=HARNESS[:MODEL[@EFFORT]]",
+                    help="choose the tool (and optionally model and effort) once; the route seals it for the owner, "
+                         "frame legs or depth-2 workers and every resume/replacement reuses it. TARGET is owner|frame|worker, "
+                         "e.g. --pin owner=opencode:<provider/model>@<effort> --pin worker=opencode. "
+                         "Top models are accepted for frame only (owner/worker keep the tool and drop the model with a warning)")
     cp.add_argument("--campaign-key",help="the work stream this route joins or creates (required unless --parent-cycle or --unassigned); `artifact_producer.py campaign-list` shows active keys. Size it as a stream with a one-sentence closing condition — not a project name, not a one-cycle task (join the stream that task serves)")
     cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
@@ -7909,7 +8133,7 @@ def main():
     cp.add_argument("--spec-read",default="auto",help="auto: refuse when a spec/prd.md exists unless you name it here")
     cp.add_argument("--drift-verdict",default=None); cp.add_argument("--tracking",choices=sorted(TRACKING),default=None)
     cp.add_argument("--artifact-guard",default=None)
-    cp.add_argument("--children",default=None,help="comma list of child harnesses to probe for staged/solo (default claude,codex)")
+    cp.add_argument("--children",default=None,help="comma list of child harnesses to probe for staged/solo (default: every harness enabled in the dispatch-defaults policy, plus pinned ones)")
     cp.add_argument("--parent-harness",default=None,choices=("claude","codex","opencode"),help="default: actual parent runtime")
     cp.add_argument("--jobs",default=None,help="registry for the readiness probe (default AGENT_DISPATCH_JOBS or the stable state root)")
     cp.add_argument("--dispatch-evidence",help="checked evidence JSON (skips the live probe)")
@@ -8051,6 +8275,10 @@ def main():
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
         a._route_chain_plan = _resolve_compose_plan(a)
+        DISPATCH_DEFAULTS_WARNINGS.clear()
+        pins=_parse_selection_pins(a.pin,a.owner)
+        pins,pin_warnings=_filter_top_pins(pins)
+        owner_pin=(pins.get("owner") or {}).get("harness")
         route=compose_route(
             capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
@@ -8058,7 +8286,7 @@ def main():
             spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
             artifact_guard=a.artifact_guard,
             children=[c.strip() for c in a.children.split(",") if c.strip()] if a.children else None,
-            parent_harness=a.owner or a.parent_harness or ("claude" if shape=="direct" else default_parent_harness("claude")),
+            parent_harness=owner_pin or a.parent_harness or ("claude" if shape=="direct" else default_parent_harness("claude")),
             dispatch_evidence=json.loads(Path(a.dispatch_evidence).read_text()) if a.dispatch_evidence else None,
             registered_headless_evidence=(json.loads(Path(a.registered_headless_evidence).read_text())
                                           if a.registered_headless_evidence else None),
@@ -8066,11 +8294,14 @@ def main():
             profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
             explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             profile=a.profile,
-            work_request={"text":a.prompt_file.read_text(),"owner_harness":a.owner} if a.prompt_file else None,
+            work_request={"text":a.prompt_file.read_text(),"owner_harness":owner_pin} if a.prompt_file else None,
+            selection_pins=pins or None,
         )
+        for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
+            print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
         if a.explain:
-            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
+            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin),file=sys.stderr)
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
                               "effective_intensity":route["effective_intensity"],"shape":shape,
@@ -8080,14 +8311,15 @@ def main():
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "campaign":compose_campaign_selection(route),
-                              "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=a.owner),
+                              "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_pin),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
+        _route_autoclose(artifact_root,"compose")
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
-        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
+        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError

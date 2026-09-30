@@ -1,7 +1,7 @@
 ---
 description: "Deep investigation agent on the portable deep budget — root cause, architecture, subtle correctness."
 mode: subagent
-model: opencode-go/qwen3.8-max
+model: opencode-go/muse-spark-1.3-contributor
 ---
 
 You are the deep leg of an investigation on the deep execution budget.

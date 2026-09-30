@@ -528,6 +528,33 @@ class CapacityPolicyTests(unittest.TestCase):
             ["claude", "codex"], {"claude": 80, "codex": 80},
             preferred="claude", affinity_weight=.65, headroom_exponent=2), ["claude", "codex"])
 
+    def test_harness_weights_default_keeps_the_existing_formula_and_low_weight_ranks_later(self):
+        args = ({"claude": 80, "codex": 80, "opencode": 80}, {"claude": 0, "codex": 0, "opencode": 0},
+                ["claude", "codex", "opencode"])
+        base = C.allocation_deficit(*args)
+        self.assertEqual(C.allocation_deficit(*args, harness_weights=None), base)
+        self.assertEqual(C.allocation_deficit(*args, harness_weights={}), base)
+        self.assertEqual(C.allocation_deficit(*args, harness_weights={"opencode": 1.0}), base)
+        weighted = C.allocation_deficit(*args, harness_weights={"opencode": 0.3})
+        self.assertLess(weighted["opencode"], weighted["claude"])
+        self.assertAlmostEqual(sum(weighted.values()), 1.0, places=6)
+        states = {"claude": "ok", "codex": "ok", "opencode": "ok"}
+        counts = {"claude": 0, "codex": 0, "opencode": 0}
+        scores = {"claude": 80, "codex": 80, "opencode": 80}
+        order = ["opencode", "claude", "codex"]  # declared order would favour opencode
+        self.assertEqual(C.rank_band(["claude", "codex", "opencode"], states, counts, order, scores,
+            strategy="balanced")[0], "opencode")
+        self.assertEqual(C.rank_band(["claude", "codex", "opencode"], states, counts, order, scores,
+            strategy="balanced", harness_weights={"opencode": 0.3})[-1], "opencode")
+        # A weighted harness still wins once the others have used their share.
+        busy = {"claude": 5, "codex": 5, "opencode": 0}
+        self.assertEqual(C.rank_band(["claude", "codex", "opencode"], states, busy, order, scores,
+            strategy="balanced", harness_weights={"opencode": 0.3})[0], "opencode")
+        name, _band, _ranks, _promote = C.select(
+            {"primary": ["claude", "codex", "opencode"], "relief": [], "last_resort": []},
+            states, counts, order, scores, strategy="balanced", harness_weights={"opencode": 0.3})
+        self.assertNotEqual(name, "opencode")
+
     def test_single_candidate_is_neutral_for_all_weights(self):
         for weight in (0, .5, 1.0):
             for exponent in (1, 2):

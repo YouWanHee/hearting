@@ -710,7 +710,20 @@ def assign_harnesses(
         node_exclusions: dict[str, set[str]] = {}
         from dispatch_capacity_evidence import active_limits
         quota_limits = active_limits(jobs, profile=node.get("model_profile")) if jobs is not None else {}
+        node_policy = node.get("harness_policy")
+        policy_members = (
+            {name for band in ("primary", "relief", "last_resort")
+             for name in (node_policy.get(band) or [])}
+            if isinstance(node_policy, dict) else None
+        )
         for adapter in SUPPORTED_BATCH_HARNESSES:
+            if policy_members is not None and adapter not in policy_members:
+                # The profile's policy does not use this harness (for example
+                # OpenCode is absent from `deep`): it is not a candidate here,
+                # not merely ranked last.
+                exclusions.setdefault(adapter, set()).add("outside-profile-policy")
+                node_exclusions.setdefault(adapter, set()).add("outside-profile-policy")
+                continue
             if adapter in quota_limits:
                 reason = f"quota-until-{quota_limits[adapter]['reset_epoch']}"
                 exclusions.setdefault(adapter, set()).add(reason)
@@ -753,7 +766,15 @@ def assign_harnesses(
             index for index, node in enumerate(nodes)
             if node.get("leg_class") == "peer"
         ]
-        if peer_indices:
+        if peer_indices and not quality_peer:
+            # The user's policy defines no quality-peer family (for example an
+            # OpenCode-only setup, or a `--profile light` route with no
+            # balanced-deep policy). That is a policy shape, not a shortage,
+            # so the group proceeds and `sole-gate-non-peer-harness` is
+            # recorded. A defined peer set that is merely unavailable keeps
+            # the SD-100 refusals below.
+            sole_gate = "degraded"
+        elif peer_indices:
             gated = [
                 rows for rows in combinations
                 if any(rows[index][0] in quality_peer for index in peer_indices)
@@ -887,6 +908,7 @@ def assign_harnesses(
                     preferred=CAPACITY.preferred_for_depth(allocation, 2),
                     affinity_weight=allocation.get("depth_affinity_weight", 0.5),
                     headroom_exponent=allocation.get("usage_headroom_exponent", 1),
+                    harness_weights=allocation.get("harness_weights"),
                 )
                 gate_order = (gated_legs, 0.0)
                 allocation_order = (

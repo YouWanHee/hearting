@@ -89,6 +89,19 @@ class DispatchAllocationTest(unittest.TestCase):
             ["depth_affinity", "depth_affinity_weight", "usage_gate_used_percent", "usage_headroom_exponent"],
         )
 
+    def test_harness_weights_is_read_by_balanced_only(self):
+        inert = self.allocation.inert_allocation_keys
+        base = {"window": 30, "harness_weights": {"opencode": 0.3}}
+        self.assertEqual(inert({**base, "strategy": "balanced"}), {})
+        self.assertEqual(
+            inert({**base, "strategy": "capacity-aware"}),
+            {"harness_weights": "ignored under capacity-aware"},
+        )
+        self.assertEqual(
+            inert({**base, "strategy": "least-recent-attempts"}),
+            {"harness_weights": "ignored under least-recent-attempts"},
+        )
+
     def test_inert_keys_only_report_keys_that_are_actually_present(self):
         inert = self.allocation.inert_allocation_keys
         self.assertEqual(inert({"strategy": "capacity-aware", "window": 30}), {})

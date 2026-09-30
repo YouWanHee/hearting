@@ -35,9 +35,10 @@ show the diff preview, apply only on the user's confirm. `review` keeps its
 `transaction` cannot start before a release. After `review`, the owner writes
 the diff preview to `reviews/refine/preview.md`, raises the gate with
 `workflow-supervisor.py gate --route <route> --gate preview-disposition --block
---artifact <absolute path to preview.md>`, and waits on
+--artifact <absolute path to preview.md>`, and calls
 `workflow-supervisor.py await-release --route <route> --gate preview-disposition`
-(exit 0 proceed, 3 revise, 4 stop) — never polling, never self-releasing.
+(exit 0 proceed, 3 revise, 4 stop); when the gate is still blocked it parks or keeps
+waiting as `core/WORKFLOW.md` §0.6 describes — no polling loop and no self-release.
 Depth-0 shows the preview and records `workflow-supervisor.py release --route
 <route> --gate preview-disposition --decision proceed|revise|stop --actor user`.
 A registered owner cannot release `preview-disposition` itself, including

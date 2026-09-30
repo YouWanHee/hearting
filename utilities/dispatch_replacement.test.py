@@ -36,8 +36,8 @@ class ReplacementTest(unittest.TestCase):
         fragment=R.seal_launch_input(args,'codex','the raw task')
         self.meta.update(D.parse_registry_metadata(fragment));self.write(self.meta)
 
-    def write(self,meta,status='done',append=False):
-        line='now\t'+status+'\t'+str(self.root)+'\t'+str(self.root)+'\ttask\t'+','.join(k+'='+v for k,v in meta.items())+'\n'
+    def write(self,meta,status='done',append=False,stamp='now'):
+        line=stamp+'\t'+status+'\t'+str(self.root)+'\t'+str(self.root)+'\ttask\t'+','.join(k+'='+v for k,v in meta.items())+'\n'
         with self.jobs.open('a' if append else 'w') as f:f.write(line)
 
     def claim(self):return R.claim(self.jobs,'att-source')
@@ -218,6 +218,35 @@ class ReplacementTest(unittest.TestCase):
                 self.assertFalse(any(k.startswith('AGENT_OWNER_ROUTE_') for k in kw['env']))
                 or SimpleNamespace(returncode=0)))
         self.assertEqual(result['reason'],'replacement-launch-pending')
+
+    def _launch_env(self,worker_type,prepare):
+        self.write({**self.meta,'worker_type':worker_type,'route_file':str(self.path)} if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
+        seen={}
+        def run(command,**kw):
+            seen.update(kw['env']);return SimpleNamespace(returncode=0)
+        stale={'AGENT_ARTIFACT_CYCLE_ID':'cyc-stale','AGENT_ARTIFACT_OUTPUT_DIR':'/stale/out'}
+        with mock.patch.dict(os.environ,stale),mock.patch.object(R,'_authorized'),\
+                mock.patch('dispatch_replacement_batch.command',return_value=None),\
+                mock.patch('artifact_producer.prepare_route_artifact_env',side_effect=prepare) as prep:
+            R.advance(self.jobs,'att-source',run=run)
+        return seen,prep
+
+    def test_owner_replacement_launch_gets_the_routes_own_cycle_env(self):
+        route_env={'AGENT_ARTIFACT_ROOT':str(self.root),'AGENT_ARTIFACT_CYCLE_ID':'cyc-route','AGENT_ARTIFACT_OUTPUT_DIR':'/route/out'}
+        env,prep=self._launch_env('owner',lambda *a,**k:route_env)
+        prep.assert_called_once_with(self.path,start=False,jobs=self.jobs)
+        self.assertEqual((env['AGENT_ARTIFACT_CYCLE_ID'],env['AGENT_ARTIFACT_OUTPUT_DIR']),('cyc-route','/route/out'))
+
+    def test_owner_replacement_launch_survives_a_failed_cycle_lookup(self):
+        import artifact_producer
+        for error in (artifact_producer.ProducerError('route-artifact-root-missing'),OSError('gone'),ValueError('bad')):
+            env,_=self._launch_env('owner',mock.Mock(side_effect=error))
+            self.assertEqual(env['AGENT_ARTIFACT_CYCLE_ID'],'cyc-stale')
+
+    def test_stage_replacement_launch_env_is_not_touched_by_the_route_cycle(self):
+        env,prep=self._launch_env('frame',lambda *a,**k:{'AGENT_ARTIFACT_CYCLE_ID':'cyc-route'})
+        prep.assert_not_called()
+        self.assertEqual(env['AGENT_ARTIFACT_CYCLE_ID'],'cyc-stale')
 
     def test_exhausted_sd106_budget_cannot_start_new_family(self):
         for addition in [{'recovery_exhausted':'1'}, {'start_permitted':'0'},
@@ -613,5 +642,143 @@ class ReplacementTest(unittest.TestCase):
             self.jobs, self.jobs.read_text().splitlines(), current, route=route))
         self.assertEqual(R.claim(self.jobs, current['attempt_id'])['original_attempt_id'], current['attempt_id'])
 
+
+    # -- an owner that stopped BLOCKED at a human gate is waiting, not dead ------------
+    GATE='full-run-authorization'
+    OWNER_STAMP='2026-09-29T00:00:00Z'
+    RAISED_AT='2026-09-29T01:00:00Z'
+
+    def _parked_route(self,raiser_type=None):
+        raiser={'id':'smoke','continuation':{'kind':'human-gate','gate':self.GATE}}
+        if raiser_type:raiser['worker_type']=raiser_type
+        self.route['nodes']=[raiser,{'id':'full-run','depends_on':['smoke']}]
+        self.route['human_gate_bindings']=[{'gate':self.GATE,'node':'full-run','position':'entry'}]
+
+    def _journal(self,*entries):
+        import workflow_state as WS
+        ledger=WS.WorkflowLedger(self.route['route_id'],self.route['route_hash'],jobs=self.jobs)
+        ledger.journal_path.parent.mkdir(parents=True,exist_ok=True)
+        with ledger.journal_path.open('a') as f:
+            for state,evidence,at in entries:
+                f.write(json.dumps({'workflow_state':state,'evidence':evidence,'at':at})+'\n')
+        return ledger
+
+    def _raise(self,at=None):return ('BLOCKED_HUMAN_GATE',{'gate':self.GATE,'artifact':'/tmp/gate.md'},at or self.RAISED_AT)
+    def _proceed(self):return ('RUNNING',{'released_gate':self.GATE,'decision':'proceed'},'2026-09-29T02:00:00Z')
+
+    def _parked_owner(self,*journal,raiser_type=None,**changes):
+        self._parked_route(raiser_type)
+        self.owner={**self.meta,'worker_type':'owner','note':'dead-worker-blocked','failure_class':'blocked',**changes}
+        self.write(self.owner,stamp=self.OWNER_STAMP)
+        self._journal(*journal)
+
+    def test_parked_owner_at_blocked_gate_is_not_replaced(self):
+        self._parked_owner(self._raise())
+        found=R.owner_parked_gate(self.jobs,'att-source')
+        self.assertEqual((found['gate'],found['status'],found['epoch'],found['gated_nodes']),(self.GATE,'blocked',1,['full-run']))
+        with self.assertRaises(D.DispatchContractError) as caught:self.claim()
+        self.assertEqual(caught.exception.reason,'replacement-not-silent-death')
+        result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual((result['state'],result['parked_gate']['gate']),('not-applicable',self.GATE))
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def test_released_parked_owner_is_replaced_once_with_gate_proof(self):
+        self._parked_owner(self._raise(),self._proceed())
+        with mock.patch.object(R,'_terminal_absent',return_value=False):
+            record=self.claim()
+            self.assertEqual((record['proof']['parked_gate'],record['proof']['gate_epoch']),(self.GATE,1))
+            self.assertEqual(self.claim(),record)
+            lines=self.jobs.read_text().splitlines()
+            R.validate_claim_source(self.jobs,lines,record)
+
+    def test_parked_proof_requires_owner_raise_and_unstarted_gated_node(self):
+        def completion():
+            marker=D.dispatch_state_root(self.jobs)/'completion'/'rt-test'/'full-run.json'
+            marker.parent.mkdir(parents=True);marker.write_text('{}')
+        def stage_row():
+            self.write({**self.meta,'attempt_id':'att-stage','route_node':'full-run','worker_type':'stage'},append=True)
+        cases={
+            'raise-before-owner-start':lambda:self._parked_owner(self._raise('2026-08-01T00:00:00Z')),
+            'frame-raiser':lambda:self._parked_owner(self._raise(),raiser_type='frame'),
+            'gated-node-completed':lambda:(self._parked_owner(self._raise()),completion()),
+            'gated-node-started':lambda:(self._parked_owner(self._raise()),stage_row()),
+            'ordinary-failure-note':lambda:self._parked_owner(self._raise(),note='dead-worker-fail'),
+            'owner-still-open':lambda:self._parked_owner(self._raise()) or self.write(self.owner,'open',stamp=self.OWNER_STAMP),
+        }
+        for name,build in cases.items():
+            with self.subTest(case=name):
+                self.tearDown_case()
+                build()
+                self.assertIsNone(R.owner_parked_gate(self.jobs,'att-source'))
+                with self.assertRaises(D.DispatchContractError):self.claim()
+
+    def tearDown_case(self):
+        import shutil
+        for name in ('completion','rt-test'):
+            shutil.rmtree(D.dispatch_state_root(self.jobs)/name,ignore_errors=True)
+        for child in R._directory(self.jobs).iterdir():
+            if child.name!='inputs':shutil.rmtree(child,ignore_errors=True)
+        (self.jobs.parent/'recovery-attention').exists() and shutil.rmtree(self.jobs.parent/'recovery-attention')
+        self.write(self.meta)
+
+    def test_revise_or_stop_parked_owner_never_replaces(self):
+        cases={'revise':('RUNNING',{'released_gate':self.GATE,'decision':'revise'},'2026-09-29T02:00:00Z'),
+               'stop':('CANCELLED',{'gate':self.GATE,'abandon_reason':'operator-decision'},'2026-09-29T02:00:00Z')}
+        for decision,event in cases.items():
+            with self.subTest(decision=decision):
+                self.tearDown_case()
+                self._parked_owner(self._raise(),event)
+                self.assertEqual(R.owner_parked_gate(self.jobs,'att-source')['status'],decision)
+                self.assertEqual(R.advance(self.jobs,'att-source',authority_check=lambda *_:True)['state'],'not-applicable')
+                with self.assertRaises(D.DispatchContractError):self.claim()
+                self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def test_parked_recovery_instructions_forbid_reraising_the_gate(self):
+        self._parked_owner(self._raise(),self._proceed())
+        with mock.patch.object(R,'_terminal_absent',return_value=False):record=self.claim()
+        text=R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',
+                                     jobs_path=self.jobs,attempt_id=record['replacement_attempt_id']))
+        for expected in (f'Do not raise {self.GATE} again','await-release','--max 0','--answers-out',R.CONTINUATION_WAIT_NOTE):
+            self.assertIn(expected,text)
+
+    def test_every_replacement_owner_is_told_to_wait_live_at_a_later_gate(self):
+        def parked_record():
+            self._parked_owner(self._raise(),self._proceed())
+            with mock.patch.object(R,'_terminal_absent',return_value=False):return self.claim()
+        def silent_record():
+            self.write({**self.meta,'worker_type':'owner'});return self.claim()
+        for name,build,parked in (('parked-original',parked_record,True),('silent-death-original',silent_record,False)):
+            with self.subTest(origin=name):
+                self.tearDown_case()
+                record=build()
+                args=SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',jobs_path=self.jobs,
+                                     attempt_id=record['replacement_attempt_id'])
+                text=R.recovery_instructions(args)
+                for expected in (R.CONTINUATION_WAIT_NOTE,'await-release','do not end the turn at the gate',
+                                 'Verified recovery context','report any second failure as needs-attention'):
+                    self.assertIn(expected,text)
+                self.assertEqual('Do not raise' in text,parked)
+                self.assertEqual(R.recovery_instructions(SimpleNamespace(**{**vars(args),'worker_type':'stage'})),'')
+
+    def test_owner_parked_gate_is_read_only(self):
+        self._parked_owner(self._raise(),self._proceed())
+        def snapshot():return (self.jobs.read_bytes(),sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob('*')))
+        before=snapshot()
+        self.assertEqual(R.owner_parked_gate(self.jobs,'att-source')['status'],'proceed')
+        self.assertEqual(snapshot(),before)
+        self.assertFalse(any(p.name=='state.json' for p in self.root.rglob('*')))
+
+    def test_first_automatic_retry_is_admitted_at_spawn_with_its_own_row(self):
+        route,path=self._legacy_real_route('spawn-self')
+        R._route.return_value=(path,route)
+        original={**self._legacy_row('att-f-original',route,path),'note':'dead-invalid-envelope'}
+        retry={**self._legacy_row('att-f-retry',route,path),'automatic_retry_of':'att-f-original'}
+        self.write(original);before=self.jobs.read_text().splitlines()
+        self.write(retry,'open',append=True);spawned=self.jobs.read_text().splitlines()
+        self.assertIsNone(R.admission(self.jobs,before,retry))    # registration: own row not yet present
+        self.assertIsNone(R.admission(self.jobs,spawned,retry))   # spawn: own row present
+        second={**retry,'attempt_id':'att-f-second'}
+        with self.assertRaises(D.DispatchContractError) as caught:R.admission(self.jobs,spawned,second)
+        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
 
 if __name__=='__main__':unittest.main()

@@ -98,7 +98,9 @@ registered evaluation route or attempt, or an explicit human gate — so a run t
 finishes with "evaluate it later" written in prose is not complete. The
 `full-run-authorization` human gate binds to `full-run` as an entry gate, which
 makes `smoke`'s continuation a human gate: a full run is never started
-automatically.
+automatically. While the person decides, the owner parks or keeps waiting as
+`core/WORKFLOW.md` §0.6 describes; a proceed for a parked owner starts the
+continuation owner that launches `full-run`.
 
 This replaced a graph whose last node was the training process itself. On
 2026-08-04 the BC_ResNet_tf run finished training and its hard-negative loop, the
