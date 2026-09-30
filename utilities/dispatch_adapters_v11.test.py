@@ -720,6 +720,30 @@ class AdapterV11Test(unittest.TestCase):
     rows=jobs.read_text(encoding="utf-8").splitlines()
     self.assertIn("\tdone\t",rows[0]); self.assertIn("note=dead-timeout",rows[0])
     self.assertIn("\topen\t",rows[1]); self.assertNotIn("note=",rows[1])
+ def test_row_rewrites_never_truncate_the_registry_a_reader_holds(self):
+  # A lock-free reader (the owner supervisor's first row lookup) opened the
+  # registry just before the launcher recorded the child's pid. An in-place
+  # rewrite truncated that file under it and the owner died on startup with
+  # attempt-row-not-unique. The rewrite must replace the file instead.
+  for harness in ("codex","claude","opencode"):
+   for action in ("annotate","close"):
+    with self.subTest(harness=harness,action=action), tempfile.TemporaryDirectory() as td:
+     jobs=Path(td)/"jobs.log"; worktree="/fixture/worktree"; slug="owner"
+     contract=("attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+               "execution_surface=registered-headless,registered_worker=1,"
+               "fallback_hop=same-harness-headless")
+     original=f"2026-07-20T00:00:00Z\topen\t/repo\t{worktree}\t{slug}\t{contract},attempt_id=att-a\n"
+     jobs.write_text(original,encoding="utf-8")
+     wrapper=self.load_wrapper(harness)
+     with jobs.open(encoding="utf-8") as reader:
+      if action=="annotate":
+       self.assertTrue(wrapper.annotate_job_row(jobs,slug,worktree,"pid=42","att-a"))
+      else:
+       self.assertTrue(wrapper.close_job_row(jobs,slug,worktree,"timeout","","att-a"))
+      self.assertEqual(reader.read(),original)
+     current=jobs.read_text(encoding="utf-8")
+     self.assertIn("pid=42" if action=="annotate" else "note=dead-timeout",current)
+     self.assertEqual(len(current.splitlines()),1)
  def test_launch_receipt_states_the_parent_next_action(self):
   # The parent's whole model-visible delivery contract is `parent_next`
   # (`utilities/parent_next_directive.py`). Pin it at the wrapper, not just at
