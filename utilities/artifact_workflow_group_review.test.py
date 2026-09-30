@@ -283,6 +283,28 @@ class SelectionTest(ReviewBase):
             R.sweep(self.root, auto=True, invoke=later)
             self.assertNotIn(cid, sum(later.targets, []))
 
+    def test_withdrawn_empty_is_recorded_without_a_model_and_never_reassessed(self):
+        cycle = self.seal(slug="withdrawn")
+        cid = cycle["cycle_id"]
+        item = R.Outcome(cycle_id=cid, campaign_id=cycle["campaign_id"], verdict="withdrawn-empty",
+                         group_id="wgrp_" + "a" * 32, reason="cycle ended with no durable output",
+                         cycle_state="abandoned", declaration_sha256="sha256:" + "b" * 64, profile=None)
+        self.assertTrue(R.record_outcomes(self.root, [item], mode="autoclose", now=None, lock_timeout=0))
+        entry = self.record()["cycles"][cid]
+        self.assertEqual((entry["verdict"], entry["mode"], entry["profile"], entry["cycle_state"]),
+                         ("withdrawn-empty", "autoclose", None, "abandoned"))
+        self.assertEqual(entry["group_id"], "wgrp_" + "a" * 32)
+        _status, doc = R.read_record(self.root)
+        picked = R.select_targets(self.root, doc, auto=True, cycles=[cid])
+        self.assertEqual(picked.by_campaign, {})
+        self.assertIn(cid, picked.considered)
+        # A held admission lock is a soft failure, not a wait.
+        lock = R.admission._acquire_lock(self.root, 5)
+        try:
+            self.assertFalse(R.record_outcomes(self.root, [item], mode="autoclose", now=None, lock_timeout=0))
+        finally:
+            R.admission._release_lock(self.root, lock)
+
     def test_limit_applies_before_the_campaign_split(self):
         ids = [self.seal(key=key, slug=f"{key}{i}", now=PAST + n)["cycle_id"]
                for n, (key, i) in enumerate([("one", 0), ("two", 0), ("one", 1)])]

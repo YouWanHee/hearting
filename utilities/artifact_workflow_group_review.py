@@ -307,10 +307,13 @@ def read_record(root: Path) -> Tuple[str, Optional[Dict[str, Any]]]:
     return "ok", doc
 
 
-def _update_record(root: Path, mutate: Callable[[Dict[str, Any]], None]) -> bool:
-    """Read-merge-write under the producer admission lock; False when it cannot be done."""
+def _update_record(root: Path, mutate: Callable[[Dict[str, Any]], None],
+                   lock_timeout: Optional[float] = None) -> bool:
+    """Read-merge-write under the producer admission lock; False when it cannot be done.
+    `lock_timeout` bounds the wait (default: the admission default; 0 never waits)."""
     try:
-        lock = admission._acquire_lock(root, admission.LOCK_TIMEOUT_DEFAULT)
+        lock = admission._acquire_lock(
+            root, admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout)
     except Exception:  # noqa: BLE001 -- busy admission is a soft failure
         return False
     try:
@@ -359,9 +362,11 @@ class Outcome:
     harness: Optional[str] = None
     failure_class: Optional[str] = None
     dropped_relations: int = 0
+    profile: Optional[str] = PROFILE  # None: no model judged this outcome
 
 
-def record_outcomes(root: Path, outcomes: Sequence[Outcome], *, mode: str, now: Optional[float]) -> bool:
+def record_outcomes(root: Path, outcomes: Sequence[Outcome], *, mode: str, now: Optional[float],
+                    lock_timeout: Optional[float] = None) -> bool:
     reviewed_at = _now_iso(now)
 
     def mutate(doc: Dict[str, Any]) -> None:
@@ -379,13 +384,13 @@ def record_outcomes(root: Path, outcomes: Sequence[Outcome], *, mode: str, now: 
                 "campaign_id": item.campaign_id, "verdict": item.verdict, "group_id": item.group_id,
                 "stage_label": item.stage_label, "reason": item.reason, "reviewed_at": reviewed_at,
                 "cycle_state": item.cycle_state, "mode": mode,
-                "declaration_sha256": item.declaration_sha256, "profile": PROFILE,
+                "declaration_sha256": item.declaration_sha256, "profile": item.profile,
                 "harness": item.harness, "failure_class": item.failure_class,
                 "failures": failures, "hard_failures": hard,
                 "dropped_relations": item.dropped_relations,
             }
 
-    return _update_record(root, mutate)
+    return _update_record(root, mutate, lock_timeout)
 
 
 # ---------------------------------------------------------------------------
