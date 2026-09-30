@@ -96,7 +96,7 @@ Apply mutations in cheatsheet order. Create one commit per successful mutation w
 
 ### Stage D — Handback
 
-Do not merge automatically. Return the verified branch or worktree for user review. Keep the report to at most eight lines in the selected user-facing language:
+Use the handback part only when it is included in the route-start approval. Record the result in that approved handback scope. Do not request a second handback approval. Do not merge automatically. Return the verified branch or worktree for user review. Keep the report to at most eight lines in the selected user-facing language:
 
 ```text
 ✓ autopilot-apply — {cheatsheet} → {source}

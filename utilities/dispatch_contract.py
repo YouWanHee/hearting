@@ -6403,13 +6403,10 @@ def _human_gate_entry_fence(
     #      `predecessor.continuation = {kind: human-gate, gate}` ->
     #      BLOCKED_HUMAN_GATE -> release; a binding with no raising continuation
     #      is satisfied by the §0.4 card;
-    #   2. the gate is in FENCED_HUMAN_GATES -- the gates whose owner contract
-    #      actually implements the raise and the wait. The topology still
-    #      declares raising continuations for three more gates
-    #      (`explicit-handback`, `full-run-authorization`, `deploy-authorization`)
-    #      that no capability document, skill or owner reference tells an owner
-    #      to raise; fencing those would turn a declaration into a mandatory
-    #      step nobody documented (round 2, B1).
+    #   2. the gate is in FENCED_HUMAN_GATES -- the two gates whose owner
+    #      contracts implement the raise and wait. Older sealed routes can
+    #      still carry historical bindings for other gate names; new topology
+    #      entries do not declare those three start approvals as gates.
     # A gate joins the set in the same change that teaches its owner to raise
     # it; `dispatch_contract.test.py` pins the set against the real topology.
     # The three direction gates the other autopilot recipes used to declare

@@ -1,8 +1,8 @@
 # Procedure
 
-The full cycle is **setup** → user training → **eval**. With `--mode auto`, infer the branch from the request. Each mode is an independent invocation and persists state in `pipeline_state.yaml`.
+The full cycle is **setup** → approved `full-run` → **eval**. With `--mode auto`, infer the branch from the request. Each mode is an independent invocation and persists state in `pipeline_state.yaml`.
 
-> **Stage-dispatch contract for standard+:** dispatch durable setup, eval, and report stages as separate dispatch-depth-2 headless sessions under OPERATIONS §5.10. Units run inside their assigned stage session. Use file-only handoff: read inputs from artifacts and never rely on earlier conversational context. The dispatch-depth-1 conductor passes paths and collects only verdicts and status. **Do not dispatch the actual experiment run:** it is long, asynchronous, and human-gated by the pending `_RUNLOG.md` row. Keep using the existing `lab-runner.yaml` profile for that segment. Direct, quick, and one-off run guidance remain inline. Stage sessions never redispatch; dispatch depth 3+ is forbidden.
+> **Stage-dispatch contract for standard+:** dispatch durable setup, eval, and report stages as separate dispatch-depth-2 headless sessions under OPERATIONS §5.10. Units run inside their assigned stage session. Use file-only handoff: read inputs from artifacts and never rely on earlier conversational context. The dispatch-depth-1 conductor passes paths and collects only verdicts and status. **Run the experiment only when the route-start approval includes the `full-run` part and the selected environment is executable.** The resource runner handles the long asynchronous run and records it in `_RUNLOG.md`; otherwise leave this part out and provide its command for a later compose. Direct, quick, and one-off run guidance remain inline. Stage sessions never redispatch; dispatch depth 3+ is forbidden.
 
 #### Setup steps and their parts
 
@@ -12,7 +12,7 @@ The stage list lives in one place: `capabilities/topologies.json` (recipe plus `
 |---|---|---|
 | S1 spec | owner step (the `research/plan-review` unit reviews the draft at standard+) | Writes `experiments/{date}_{slug}/experiment_spec.md` from recent `_RUNLOG.md` rows and research artifacts; it is the `setup-contract` input of `scaffold` |
 | S2 scaffold | `autopilot-lab:scaffold` | `train.py`, `eval.py`, `config.yaml`, and the `metrics.jsonl` logger from `experiment_spec.md` plus the reference or parent config |
-| S3 run | `autopilot-lab:smoke` → `autopilot-lab:full-run` → `autopilot-lab:run-verify` → `autopilot-lab:handoff` | S3-3 hash-bound smoke, then the detached full run — **not an agent dispatch**; long, asynchronous, human-gated — with the pending `_RUNLOG.md` row and `run.json` in running status, its verification, and the handoff record |
+| S3 run | `autopilot-lab:smoke` → `autopilot-lab:full-run` → `autopilot-lab:run-verify` → `autopilot-lab:handoff` | S3-3 hash-bound smoke, then the detached full run when its part is included in start approval; otherwise provide the command and compose this part later, followed by verification and handoff |
 
 See `eval-procedure.md` for E2, E3-2, and E3-3.
 
@@ -90,14 +90,14 @@ Do not introduce new layers, modify in-use layers in the parent/reference model 
 
 ### S3 — Run guidance and pending RUNLOG
 
-**S3-1. Provide the command:**
+**S3-1. Provide the command for a later compose when `full-run` is not included:**
 
 ```bash
 cd experiments/{date}_{slug}
 python train.py --config config.yaml
 ```
 
-The user may submit it to a cluster instead. Do not auto-run training because GPU, queue, and cluster environments vary. The user returns through eval mode afterward.
+The user may submit it to a cluster instead when that environment is outside the approved execution scope. The user returns through eval mode afterward.
 
 **Choose the host from the inventory, not by habit.** When
 `${XDG_CONFIG_HOME:-$HOME/.config}/hearting/compute-hosts.yaml` exists, read
@@ -105,9 +105,7 @@ The user may submit it to a cluster instead. Do not auto-run training because GP
 are reachable and how much GPU memory each has free right now. Propose the host
 whose free memory and idle load fit the run, and say why — the session host is
 a default, not an answer. This selects a host; it does not start anything.
-Launching still needs the user's go-ahead and the WORKFLOW §0.3 pre-execution
-gate, after which `compute-hosts run <host> --env <conda> --cwd <dir> -- <cmd>`
-starts it detached and returns a run id that outlives this session.
+Launching requires the route-start approval to include this environment and part; `compute-hosts run <host> --env <conda> --cwd <dir> -- <cmd>` starts it detached and returns a run id that outlives this session.
 
 **S3-2. Append one pending row before the run** to `<artifact-root>/experiments/_RUNLOG.md`, leaving the result as `—`. This makes in-flight work and duplicate setup visible during long queues and mirrors `pipeline_state.run: in_progress`.
 

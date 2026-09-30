@@ -6554,7 +6554,9 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(omitted["capability_mode"],"default")
   self.assertEqual(omitted["nodes"],explicit["nodes"])
   self.assertEqual([n["id"] for n in omitted["nodes"]],["release-setup","security-review","release-review","deploy","post-deploy-verify"])
-  self.assertEqual(omitted["human_gates"],["deploy-authorization"])
+  self.assertEqual(omitted["human_gates"],[])
+  self.assertEqual(omitted["human_gate_bindings"],[])
+  self.assertIn("시작 승인 deploy (autopilot-ship:deploy)",R.compose_card(omitted))
   R.verify_route(omitted,R.ROOT)
  def test_ship_package_cannot_select_deployment_nodes(self):
   with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node:deploy"):

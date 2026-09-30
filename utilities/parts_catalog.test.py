@@ -500,7 +500,7 @@ class StagesTest(unittest.TestCase):
 
     def test_text_form_keeps_the_stage_line_prefix(self):
         text = self.blocks("--capability", "autopilot-lab")
-        self.assertIn("  full-run unit=_kernel/resource human_gate=full-run-authorization "
+        self.assertIn("  full-run unit=_kernel/resource "
                       "part=autopilot-lab:full-run shareable=1 optional=0 start_approval=full-run ", text)
         self.assertIn("  diagnose unit=qa/ml-debug part=autopilot-lab:diagnose shareable=1 optional=1 ", text)
         self.assertIn("  borrow autopilot-lab:smoke unit=qa/ml-debug ", text)
@@ -547,9 +547,9 @@ class ResourceShareTest(CatalogBase):
             "parts/autopilot-lab/full-run/checkpoints/**"])
         self.assertEqual(full["start_approval"], "full-run")
         self.assertNotIn("start_approval", smoke)
-        # Until the declared gates are retired (route 2/3) the borrowed smoke still raises its gate.
-        self.assertEqual(route["human_gate_bindings"], [
-            {"gate": "full-run-authorization", "node": "autopilot-lab-full-run", "position": "entry"}])
+        # The borrowed smoke has no human gate; the borrowed full-run part carries the start approval.
+        self.assertEqual(route["human_gates"], [])
+        self.assertEqual(route["human_gate_bindings"], [])
         self.assertEqual(self.node(route, "test")["inputs"], [
             "source-diff", "parts/autopilot-lab/full-run/run.json", "parts/autopilot-lab/full-run/logs/**"])
         self.assertEqual(R.route_start_approvals(route), [{
@@ -558,6 +558,28 @@ class ResourceShareTest(CatalogBase):
         card = R.compose_card(route)
         self.assertIn("빌린 부품 autopilot-lab:smoke·autopilot-lab:full-run", card)
         self.assertIn("시작 승인 full-run (autopilot-lab:full-run)", card)
+
+    def test_host_parts_show_start_approval_and_unmarked_routes_do_not(self):
+        for capability, mode, mark, part in (
+            ("autopilot-lab", "setup", "full-run", "autopilot-lab:full-run"),
+            ("autopilot-ship", "default", "deploy", "autopilot-ship:deploy"),
+            ("autopilot-apply", "default", "handback", "autopilot-apply:handback"),
+        ):
+            route = R.compile_route(
+                capability, mode, "strong", cwd=R.ROOT, artifact_root=self.root, predicates=[],
+                transport="headless", tracking="tracked", tracked_gate_evidence=T.gate_evidence(),
+                dispatch_evidence=T.dispatch_evidence(),
+                registered_headless_evidence=T.registered_headless(), slug="sd165")
+            self.assertIn(f"시작 승인 {mark} ({part})", R.compose_card(route))
+        self.assertNotIn("시작 승인", R.compose_card(self.compose()))
+
+    def test_lab_partial_graph_keeps_inline_smoke_and_supervised_full_run(self):
+        route = self.compose("autopilot-lab", "setup", "smoke,full-run,run-verify")
+        nodes = {node["id"]: node for node in route["nodes"]}
+        self.assertEqual(nodes["smoke"]["continuation"], {"kind": "inline-next"})
+        self.assertEqual(nodes["full-run"]["continuation"], {"kind": "supervised"})
+        self.assertEqual(route["human_gates"], [])
+        self.assertEqual(route["human_gate_bindings"], [])
 
     def test_smoke_omitted_attestation_comes_from_the_prior_cycle(self):
         self.cycle(("experiments/reviews/smoke-attestation.json",), "res-fill", "autopilot-lab", "setup")

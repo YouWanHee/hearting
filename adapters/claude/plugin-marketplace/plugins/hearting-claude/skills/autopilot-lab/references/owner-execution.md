@@ -16,7 +16,7 @@ This capability fills the gap between research, specification, and production co
 | **`autopilot-lab`** | Prototype a training setup or evaluate a checkpoint | `experiments/` |
 | `autopilot-code` | Refine, productionize, or package code | `plans/` |
 
-Heavy training and evaluation run in the user's compute environment, cluster, GPU queue, or scheduler. `autopilot-lab` prepares commands and scaffolds before the run, then analyzes and records results after the run. Do not claim that remote compute was executed unless the user explicitly places an executable environment in scope and the normal approval contract permits it.
+Heavy training and evaluation use the selected compute environment, cluster, GPU queue, or scheduler. At route start, the card obtains approval for any included `full-run` part. Execute it only in the environment included in that scope; otherwise provide the command and leave the part out for a later compose. Never infer access to a remote environment from approval to run training.
 
 ## Reference Index
 
@@ -40,7 +40,7 @@ experiment readiness check
                   ↓
 optional reproducibility blueprint: autopilot-spec --mode research,cli
                   ↓
-autopilot-lab: setup → [user runs training] → eval
+autopilot-lab: setup → [approved full-run part] → eval
                   ↓
 graduate reusable code or winning configuration through autopilot-code
 ```
@@ -60,7 +60,7 @@ Keep orchestration in the parent session and edits or setup in the worktree. Res
 
 ## Experiment Lifecycle
 
-One experiment normally uses two invocations: **setup** → user-run training → **eval**. Together they fill one `_RUNLOG` entry.
+One experiment normally uses setup and eval invocations. When `full-run` is included in the start-approved setup route, its supervised run and verification fill the same `_RUNLOG` entry; otherwise compose that part separately after approval.
 
 | Mode | When | Work | Output/state |
 |---|---|---|---|
@@ -107,7 +107,7 @@ Follow an explicit artifact or audience language when provided. Otherwise, use t
 ### `--mode`
 
 - `auto`: infer `setup` or `eval` from the request and available artifacts
-- `setup`: define and scaffold a training experiment; the user runs heavy training
+- `setup`: define and scaffold a training experiment; run `full-run` only when its part is included in the start-approved scope
 - `eval`: evaluate and analyze a completed checkpoint, then summarize the result
 
 ### `--parent <slug>`

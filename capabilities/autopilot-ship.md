@@ -26,8 +26,9 @@ Default mode is an application deployment-setup entrypoint for projects with an 
 and substantially complete functionality. Guide the first ship setup,
 environment, domain, and migration deployment; select hosting (Vercel, Fly,
 Railway, Cloudflare, or EAS); create CI/CD files, `.env.example`, domain guidance,
-and a deployment record. The user runs real deployment commands; this skill
-provides guidance only. Keep it distinct from autopilot-spec's initial
+and a deployment record. The route card obtains approval for the selected
+`deploy` part at start. Within that approved scope, the owner may run deployment
+and verification; otherwise leave `deploy` out for a later compose. Keep it distinct from autopilot-spec's initial
 spec/skeleton work. It may be rerun for environment changes, added domains, or
 production migration deployment.
 
@@ -88,7 +89,7 @@ Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concre
 
 Pipeline intensity follows `core/CONVENTIONS.md §1`: `direct` has no plan stage or durable plan artifact; `quick` is one registered-headless dispatch-depth-1 one-shot conductor with its inline micro-plan plus plan-check-lite; `standard+` uses the capability's durable work-cycle plan when applicable. This recipe has no separate `plan-check` node (only `autopilot-code` declares one): `quick` checks its micro-plan inline (plan-check-lite), and `standard+` reviews through the recipe's own review stages — `security-review`, `release-review`, and `post-deploy-verify` — rather than after every stage. Verification rigor for those reviews and final verify is derived from intensity; it does not name a model or introduce a separate stage graph. `capabilities/topologies.json` (recipe plus `part_catalog`) is the one stage list; `capability-route.py stages --capability autopilot-ship` prints it.
 
-## Stage Graph and Deploy Authorization
+## Stage Graph and Start Approval
 
 ### Package
 
@@ -113,14 +114,13 @@ re-seal published source reports, experiment records, or previous archives.
 ### Default deployment/release
 
 The default `standard+` graph is `release-setup → {security-review, release-review} →
-deploy → post-deploy-verify`. Both readiness reviews declare a `human-gate`
-continuation naming `deploy-authorization`, which binds to `deploy` as an entry
-gate: readiness passing never starts a deployment by itself. `deploy` records the
-authorized deployment, and `post-deploy-verify` is the terminal node — the
-workflow is not complete when the deploy command returns, only when the
-post-deploy verification gate holds. The part catalog also declares
-`start_approval: deploy` on `autopilot-ship:deploy` — data for the route card
-and the frame catalog, not a gate.
+deploy → post-deploy-verify`. Readiness reviews continue inline after their
+existing dependencies pass. The part catalog declares `start_approval: deploy`
+on `autopilot-ship:deploy`; the route card obtains that approval before this
+route starts. If deployment was not approved or is outside the selected route,
+leave `deploy` out and compose it separately after approval. When included,
+`deploy` records the authorized deployment, and `post-deploy-verify` is the
+terminal node — the workflow is complete only after verification.
 
 At `adversarial` the `security-review` group realizes a third
 `failure-mode-check` leg with `leg_class: auxiliary`. Its arbiter is the
@@ -132,8 +132,7 @@ or rejected, with the reason) and registers it with
 `capability-owner` node, so it does not pass a wrapper start-gate: here the
 enforcement is the route's terminal-gate observation, which carries a failed
 `parallel_group:security-review` row and holds `terminal_gate_proven` false
-until the record exists. The human `deploy-authorization` gate is a separate
-axis and does not substitute for it. `core/OPERATIONS.md §5.10` owns the
+until the record exists. The route-start approval for `deploy` is separate from this arbitration evidence and does not substitute for it. `core/OPERATIONS.md §5.10` owns the
 transaction and its typed refusals.
 
 **Open, and owned by the spec, not by this document.** `deploy` is the one node
@@ -148,10 +147,7 @@ invent here. Until it is decided, the owner checks the arbitration record itself
 before running `deploy`; that is procedure, and this paragraph says plainly that
 it is not enforcement.
 
-Before this graph existed, `deploy-authorization` was declared with no node that
-realized it and both readiness reviews were terminal, so a ship route could
-"complete" with nothing deployed and nothing verified. `core/WORKFLOW.md §0.6`
-now rejects a declared human gate that binds to no node.
+Older sealed routes may still contain the historical `deploy-authorization` binding. New default compiles use the start approval mark and inline readiness continuations.
 
 ## Guard Requirements
 

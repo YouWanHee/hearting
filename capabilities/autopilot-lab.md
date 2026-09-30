@@ -17,10 +17,11 @@ This is the portable capability contract for `autopilot-lab`. It defines runtime
 
 ## Invocation Semantics
 
-Rapid experiment prototype entrypoint. The user runs heavy training; the lab
-supports the work before and after it. `setup` prepares an experiment from spec
-to scaffold and run commands. `eval` owns experiment evaluation, synthetic
-failure reproduction, model comparison, and the resulting analysis and report,
+Rapid experiment prototype entrypoint. `setup` prepares an experiment from spec
+through scaffold, smoke, and the full run when the execution environment and
+`full-run` part are included in the approval obtained at route start. Otherwise,
+report the run command and leave the part out for a later compose. `eval` owns
+experiment evaluation, synthetic failure reproduction, model comparison, and the resulting analysis and report,
 including interpretation of already fixed metrics without new measurements.
 Prose and HTML reports remain lab outputs; audio/media uses playback HTML.
 Reuse sufficient existing results and select only the needed stages. Extension
@@ -96,11 +97,11 @@ observes its exact termination and advances to `run-verify`, and only `handoff`
 is terminal. `handoff`'s gate is satisfied by *recording the successor* — a
 registered evaluation route or attempt, or an explicit human gate — so a run that
 finishes with "evaluate it later" written in prose is not complete. The
-`full-run-authorization` human gate binds to `full-run` as an entry gate, which
-makes `smoke`'s continuation a human gate: a full run is never started
-automatically. While the person decides, the owner parks or keeps waiting as
-`core/WORKFLOW.md` §0.6 describes; a proceed for a parked owner starts the
-continuation owner that launches `full-run`.
+`full-run` carries `start_approval: full-run`; the route card obtains approval
+for this part before the route starts. Leave `full-run` out when the approval
+or executable environment is absent, and compose it separately after approval.
+The resource runner continues to enforce route verification, hash-bound smoke
+attestation, config provenance, the governor, and its `supervised` continuation.
 
 This replaced a graph whose last node was the training process itself. On
 2026-08-04 the BC_ResNet_tf run finished training and its hard-negative loop, the

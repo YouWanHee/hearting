@@ -3540,9 +3540,8 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     borrowed = list(dict.fromkeys(node["part"] for node in route["nodes"] if node.get("part")))
     if borrowed:  # SD-165: parts taken from another recipe, written under parts/<capability>/<stage>/
         card += f"\n  빌린 부품 {'·'.join(borrowed)}"
-        for row in route_start_approvals(route):
-            if row["borrowed"]:
-                card += f"\n  시작 승인 {row['start_approval']} ({row['part']})"
+    for row in route_start_approvals(route):
+        card += f"\n  시작 승인 {row['start_approval']} ({row['part']})"
     from artifact_producer import route_cycle_for, cycle_dir, default_bucket, ProducerError
     try:
         record = route_cycle_for(Path(route["artifact_root"]), route)

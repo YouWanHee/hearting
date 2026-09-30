@@ -166,8 +166,7 @@
             "unit": "qa/code-review",
             "model_profile": "light",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "explicit-handback"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -245,16 +244,8 @@
         "apply-verify",
         "apply-handback"
       ],
-      "human_gates": [
-        "explicit-handback"
-      ],
-      "human_gate_bindings": [
-        {
-          "gate": "explicit-handback",
-          "node": "handback",
-          "position": "entry"
-        }
-      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
       "resume_retry_boundaries": [
         "apply",
         "verify"
@@ -1808,8 +1799,7 @@
             "unit": "qa/ml-debug",
             "model_profile": "balanced-deep",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "full-run-authorization"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -2005,16 +1995,8 @@
         "lab-run-verify",
         "lab-setup-handoff"
       ],
-      "human_gates": [
-        "full-run-authorization"
-      ],
-      "human_gate_bindings": [
-        {
-          "gate": "full-run-authorization",
-          "node": "full-run",
-          "position": "entry"
-        }
-      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
       "resume_retry_boundaries": [
         "scaffold",
         "smoke",
@@ -3039,8 +3021,7 @@
             "unit": "qa/security-review",
             "model_profile": "balanced-deep",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "deploy-authorization"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -3075,8 +3056,7 @@
             "unit": "qa/code-review",
             "model_profile": "light",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "deploy-authorization"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -3233,16 +3213,8 @@
         "ship-deploy",
         "ship-post-deploy-verify"
       ],
-      "human_gates": [
-        "deploy-authorization"
-      ],
-      "human_gate_bindings": [
-        {
-          "gate": "deploy-authorization",
-          "node": "deploy",
-          "position": "entry"
-        }
-      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
       "resume_retry_boundaries": [
         "release-setup",
         "security-review",
@@ -4188,7 +4160,7 @@
     },
     "authorized-full-run": {
       "kind": "custom",
-      "doc": "human-gated detached resource run; not an agent gate"
+      "doc": "supervised detached resource run; approval is obtained at route start"
     },
     "hash-bound-eval": {
       "kind": "custom",

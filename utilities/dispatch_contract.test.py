@@ -3170,10 +3170,9 @@ class DispatchContractTest(unittest.TestCase):
     self.assertEqual(foreign.read_only_state()["workflow_state"],"CREATED")
 
  def test_a_binding_no_node_raises_is_not_fenced(self):
-  """review round 1, B1: `intent-confirmation`, `direction-confirmation`,
-  `preview-disposition`, `explicit-handback` are bound at entry in the topology
-  but no node's continuation raises them -- the §0.4 card satisfies them, and
-  no command in the harness could release them. Only a gate that some node
+  """Historical routes may carry bindings that no node's continuation raises;
+  the §0.4 card satisfies them, and no command in the harness could release
+  them. Only a gate that some node
   raises (`continuation.kind == human-gate`) is fenced."""
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); route,path=self._gated_route(base)

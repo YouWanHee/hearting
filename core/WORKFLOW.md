@@ -344,6 +344,7 @@ fields and this order. In Korean, the canonical card is:
 이유: <현재 배경과 작업이 필요한 이유>
 경로: <primary entry capability> · <mode/intensity> — <선택 이유>
 범위: <포함 범위와 중요한 제외 대상>
+시작 승인 (필요 시): <선택한 경로가 표시한 승인 대상 부품 — 이 leg의 실행 범위>
 완료: <산출물과 검증 기준>
 
 → 진행 / 수정: <틀린 부분> / 중단
@@ -351,13 +352,16 @@ fields and this order. In Korean, the canonical card is:
 
 When the runtime exposes a native structured-question surface (Claude
 `AskUserQuestion`, Codex `request_user_input`), deliver this confirmation
-through it: the five fields form the question body and the options are exactly
+through it: the five confirmation fields form the question body; the optional
+start-approval line is scope metadata, and the options are exactly
 진행 (recommended) / 수정 / 중단. The plain-text card above is the fallback when
 no such surface exists or it fails. The structured form changes only the
 delivery surface — never the five fields, their order, the one-time approval
 semantics, or the exemptions below.
 
-Keep each value to one line. Do not include alternative menus, internal
+Keep each confirmation value to one line. Include the start-approval line only
+when the route carries marked parts; it is not an additional required answer.
+Do not include alternative menus, internal
 sub-Skills, or extended reasoning. The card applies when any of these observable
 conditions holds:
 
@@ -375,6 +379,15 @@ or factual answer still follows `roles/response-policy.md` "Local evidence
 before recall" when the repository holds covering research or document
 artifacts. `direct` is an explicit route shown in the card with its
 reason, not a silent no-route decision.
+
+The optional `시작 승인` line appears when the selected route carries parts
+marked with `start_approval`; it lists those parts and records approval for
+this leg before it starts. Approval covers only the parts shown in this leg.
+Unapproved parts stay out and can be composed separately after approval. A
+later leg with an unapproved part, a changed `next_leg`, and the
+destructive/external notice exceptions below use this same card. The answer
+stays in the existing intent, decision record, or work request; owners and
+workers continue without waiting for an entry approval mid-run.
 
 **Small-work notice (SD-136).** When the compiled route is `direct` or `solo`
 (`quick`) and its sealed `small_work_confirmation` is `notice` — the shipped
@@ -812,7 +825,7 @@ under §0.4, and internal routing is automatic. Portable model roles come from
 | `autopilot-code` in app mode | General code flow plus design critique at plan review and after render, DB migration safety, and automatic deploy after an authorized push |
 | `autopilot-draft` | Material figure/data/reference work, writing implementation, editorial polish, and research fact-check |
 | `autopilot-refine` | Reuse the draft roles plus editorial review |
-| `autopilot-lab` | Setup uses research plan review, implementation scaffold, and QA smoke tests. Evaluation uses functional QA, figure generation, and research survey; at `standard+`, checkpoint evaluation, media generation, report assembly, and independent verification dispatch as stage workers under the eval execution topology in `capabilities/autopilot-lab.md`. The actual long-running training run is asynchronous and human-gated through RUNLOG ⏳ rather than a stage-worker dispatch. |
+| `autopilot-lab` | Setup uses research plan review, implementation scaffold, and QA smoke tests. Evaluation uses functional QA, figure generation, and research survey; at `standard+`, checkpoint evaluation, media generation, report assembly, and independent verification dispatch as stage workers under the eval execution topology in `capabilities/autopilot-lab.md`. The actual long-running training run is asynchronous and supervised through RUNLOG ⏳ rather than a stage-worker dispatch. |
 | `analyze-user` | Cross-project material collection plus editorial review |
 
 For every durable stage at `standard+`, use an independent headless session under `OPERATIONS §5.10`; the named team roles run inside that session, and the dispatch-depth-1 conductor passes only artifact paths. Direct stays dispatch depth 0, and a depth-0-run bootstrap layer — two frame legs with distinct personas and usage-aware harness selection, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile — runs ahead of quick, which stays one registered-headless dispatch-depth-1 one-shot conductor.
