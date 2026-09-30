@@ -52,7 +52,11 @@ def _proc_start(pid: int) -> str:
 
 class RouteAutocloseTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-")
+        # A background child the code under test starts may still be writing into
+        # the fixture root at teardown (CI flake 2026-09-29/30, "Directory not
+        # empty"); cleanup must not turn that into a failure. Root cause is
+        # tracked separately.
+        self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-", ignore_cleanup_errors=True)
         self.base = base = Path(self.temp.name)
         self.repo, self.root = base / "repo", base / "artifacts"
         self.repo.mkdir(); self.root.mkdir()
