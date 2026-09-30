@@ -1344,9 +1344,6 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
             return False
     elif not transcript or not os.path.isfile(transcript):
         return False
-    probe_argv = worker_argv("probe")
-    if not _executable_available(probe_argv):
-        return False
     now = time.time() if now is None else now
     previous = titles.read(sid, harness=harness) or {}
     ts = previous.get("ts") if isinstance(previous.get("ts"), (int, float)) else 0
@@ -1362,6 +1359,18 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         return False
 
     lockdir = titles.lock_path(sid, harness=harness)
+    # Read-only early exit: a plainly fresh lock means another refresher owns this
+    # session, so skip the provider probe. Anything unclear (missing, stale, stat
+    # error) falls through; the atomic mkdir below stays the only authority.
+    try:
+        if now - os.path.getmtime(lockdir) <= WORKER_TIMEOUT * 2:
+            return False
+    except OSError:
+        pass
+    # The probe runs the provider cascade, so it goes after the cheap debounce checks.
+    probe_argv = worker_argv("probe")
+    if not _executable_available(probe_argv):
+        return False
     os.makedirs(os.path.dirname(lockdir), exist_ok=True)
     try:
         os.mkdir(lockdir)
