@@ -5127,6 +5127,11 @@ class SourceCensusTest(unittest.TestCase):
   # then compares the pending finish intent's route ID with that admitted
   # binding. This is finish-tuple integrity, not another cycle selection.
   "_inline_producer_binding_check",
+  # The shared helper `_finalize_route` and `cycle_route_admission` consult
+  # before a lineage-fork/superseded refusal. Its route-id comparison is a
+  # visited-set guard so a lineage loop never reads as closed; it selects no
+  # cycle for a live route.
+  "closed_lineage_handover",
  })
 
  def test_a25_7_cycle_ownership_and_lineage_single_site(self):
