@@ -414,6 +414,33 @@ def _validate_document(root: Path, campaign: Mapping[str, Any], directory: Path,
     return doc
 
 
+def _preimage(raw: bytes, campaign: Mapping[str, Any], root_id: str, repo_id: str) -> dict[str, Any]:
+    """Read the declaration on disk for `replace`: its shape and identity only.
+
+    `replace` states everything the new document keeps, so the old one need not
+    still pass member and evidence checks -- a member cycle that ended empty
+    leaves the campaign, and evidence written long ago may be stale. The new
+    document is still validated in full, and the preimage digest guards
+    concurrent change.
+    """
+    doc = dict(_closed(_json(raw), TOP_FIELDS, "declaration-fields-invalid"))
+    if (type(doc["schema_version"]) is not int or doc["schema_version"] != 1 or doc["contract"] != CONTRACT
+            or doc["artifact_root_id"] != root_id or doc["repository_id"] != repo_id
+            or doc["campaign_id"] != campaign["campaign_id"]):
+        raise WorkflowGroupError("declaration-identity-mismatch")
+    if not isinstance(doc["groups"], list):
+        raise WorkflowGroupError("group-count-invalid")
+    for group in doc["groups"]:
+        _closed(group, GROUP_FIELDS, "group-fields-invalid")
+        if not isinstance(group["members"], list) or not isinstance(group["relations"], list):
+            raise WorkflowGroupError("group-array-invalid")
+        for member in group["members"]:
+            _closed(member, MEMBER_FIELDS, "member-fields-invalid")
+        for relation in group["relations"]:
+            _closed(relation, RELATION_FIELDS, "relation-fields-invalid")
+    return doc
+
+
 def _load_existing(path: Path) -> dict[str, Any] | None:
     raw = _regular(path, missing=True)
     return None if raw is None else _json(raw)
@@ -512,9 +539,10 @@ def _merge(existing: list[dict[str, Any]], proposed: list[dict[str, Any]]) -> li
     return result
 
 
-def _new_evidence(existing: dict[str, Any] | None, desired: dict[str, Any],
-                  *, replace: bool) -> list[dict[str, Any]]:
-    prior = {} if replace or existing is None else {
+def _new_evidence(existing: dict[str, Any] | None, desired: dict[str, Any]) -> list[dict[str, Any]]:
+    """Evidence of relations that differ from the declaration on disk; a relation kept
+    byte for byte is history, not new, in `merge` and `replace` alike."""
+    prior = {} if existing is None else {
         (group["group_id"], relation["from_cycle_id"], relation["to_cycle_id"]): relation
         for group in existing["groups"] for relation in group["relations"]
     }
@@ -567,8 +595,12 @@ def prepare(root: Path, campaign_id: str, proposal: Mapping[str, Any], *, replac
     campaign, directory, root_id, repo_id = _context(root, campaign_id)
     path = directory / NAME
     before_raw = _regular(path, missing=True)
-    existing = None if before_raw is None else _validate_document(
-        root, campaign, directory, root_id, repo_id, _json(before_raw))
+    if before_raw is None:
+        existing = None
+    elif replace:
+        existing = _preimage(before_raw, campaign, root_id, repo_id)
+    else:
+        existing = _validate_document(root, campaign, directory, root_id, repo_id, _json(before_raw))
     groups, _ = _proposal_groups(root, campaign, proposal, allow_missing_id=True)
     if replace:
         desired_groups = groups
@@ -578,7 +610,7 @@ def prepare(root: Path, campaign_id: str, proposal: Mapping[str, Any], *, replac
     doc = {"schema_version": 1, "contract": CONTRACT, "artifact_root_id": root_id,
            "repository_id": repo_id, "campaign_id": campaign_id, "groups": desired_groups}
     _validate_document(root, campaign, directory, root_id, repo_id, doc)
-    refs = _new_evidence(existing, doc, replace=replace)
+    refs = _new_evidence(existing, doc)
     if _evidence_size(root, [ref for group in doc["groups"] for relation in group["relations"]
                              for ref in relation["evidence_refs"]]) > MAX_EVIDENCE_TOTAL:
         raise WorkflowGroupError("evidence-total-size-limit")
@@ -586,6 +618,40 @@ def prepare(root: Path, campaign_id: str, proposal: Mapping[str, Any], *, replac
     return {"plan_schema_version": 1, "contract": CONTRACT, "campaign_id": campaign_id,
             "mode": "replace" if replace else "merge", "before_sha256": _digest(before_raw) if before_raw else None,
             "after_sha256": _digest(desired_raw), "document": doc, "new_evidence": refs}
+
+
+def prepare_withdrawal(root: Path, campaign_id: str, cycle_ids: Any) -> dict[str, Any] | None:
+    """A `replace` plan that drops ``cycle_ids`` and the relations ending at them.
+
+    Read-only. A group left with no member is dropped; untouched groups keep their
+    order and content. Returns None when no listed cycle is a member.
+    """
+    root = Path(root).resolve()
+    campaign, directory, root_id, repo_id = _context(root, campaign_id)
+    before_raw = _regular(directory / NAME, missing=True)
+    if before_raw is None:
+        return None
+    existing = _preimage(before_raw, campaign, root_id, repo_id)
+    leaving = set(cycle_ids)
+    groups: list[dict[str, Any]] = []
+    changed = False
+    for group in existing["groups"]:
+        members = [item for item in group["members"] if item["cycle_id"] not in leaving]
+        if len(members) == len(group["members"]):
+            groups.append(group)
+            continue
+        changed = True
+        if members:
+            relations = [item for item in group["relations"]
+                         if item["from_cycle_id"] not in leaving and item["to_cycle_id"] not in leaving]
+            groups.append({**group, "members": members, "relations": relations})
+    if not changed:
+        return None
+    doc = {**existing, "groups": groups}
+    _validate_document(root, campaign, directory, root_id, repo_id, doc)
+    return {"plan_schema_version": 1, "contract": CONTRACT, "campaign_id": campaign_id,
+            "mode": "replace", "before_sha256": _digest(before_raw), "after_sha256": _digest(_bytes(doc)),
+            "document": doc, "new_evidence": _new_evidence(existing, doc)}
 
 
 def _validate_plan(value: Any) -> Mapping[str, Any]:
@@ -602,10 +668,13 @@ def _validate_plan(value: Any) -> Mapping[str, Any]:
     return plan
 
 
-def apply(root: Path, plan_value: Mapping[str, Any]) -> dict[str, Any]:
+def apply(root: Path, plan_value: Mapping[str, Any], *, lock_timeout: float | None = None) -> dict[str, Any]:
+    """`lock_timeout` bounds the wait for the producer admission lock (default 30 seconds);
+    a background caller passes 0, and a held lock raises `AdmissionBusy` unwrapped."""
     root = Path(root).resolve()
     plan = _validate_plan(plan_value)
-    lock = admission._acquire_lock(root, admission.LOCK_TIMEOUT_DEFAULT)
+    lock = admission._acquire_lock(
+        root, admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout)
     try:
         campaign, directory, root_id, repo_id = _context(root, plan["campaign_id"])
         path = directory / NAME
@@ -617,7 +686,12 @@ def apply(root: Path, plan_value: Mapping[str, Any]) -> dict[str, Any]:
             return {"status": "already-applied", **verify(root, plan["campaign_id"], expected=plan["after_sha256"])}
         if current_digest != plan["before_sha256"]:
             raise WorkflowGroupError("declaration-preimage-conflict")
-        old = None if before_raw is None else _validate_document(root, campaign, directory, root_id, repo_id, _json(before_raw))
+        if before_raw is None:
+            old = None
+        elif plan["mode"] == "replace":
+            old = _preimage(before_raw, campaign, root_id, repo_id)
+        else:
+            old = _validate_document(root, campaign, directory, root_id, repo_id, _json(before_raw))
         if plan["mode"] == "merge":
             old_groups = {group["group_id"]: group for group in (old["groups"] if old else [])}
             for gid, group in old_groups.items():
@@ -635,7 +709,7 @@ def apply(root: Path, plan_value: Mapping[str, Any]) -> dict[str, Any]:
                        for item in group["relations"]):
                     raise WorkflowGroupError("merge-removal-forbidden", gid)
         expected_new: list[dict[str, Any]] = []
-        old_relations = {} if plan["mode"] == "replace" else {
+        old_relations = {
             (g["group_id"], r["from_cycle_id"], r["to_cycle_id"]): r
             for g in (old["groups"] if old else []) for r in g["relations"]}
         all_refs = [ref for group in doc["groups"] for relation in group["relations"]
