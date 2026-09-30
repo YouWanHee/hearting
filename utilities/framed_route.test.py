@@ -54,7 +54,9 @@ class FramedBase(T.ProducerTestBase):
         patch = mock.patch.dict(os.environ, clean_environment(), clear=True)
         patch.start()
         self.addCleanup(patch.stop)
-        os.environ["AGENT_HOME"] = str(Path(self._tmp.name) / "agent-home")
+        # The runtime that compiles is the runtime that runs: a route published with the gates on
+        # refuses a mismatched runtime root, exactly as the public compose does.
+        os.environ["AGENT_HOME"] = str(R.ROOT)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         self.activate()
 
@@ -333,8 +335,10 @@ class RegistryRegistrationTest(unittest.TestCase):
                 continue
             self.assertEqual(after[key], before[key], key)
         self.assertEqual(after["recipes"][:len(before["recipes"])], before["recipes"])
-        self.assertEqual({k: v for k, v in after["completion_gate_contracts"].items()
-                          if k not in ("route-frame", "route-decision")}, before["completion_gate_contracts"])
+        # HEAD already carries the route-frame contracts (S1's commit); neither side may change the rest.
+        def others(table):
+            return {k: v for k, v in table.items() if k not in ("route-frame", "route-decision")}
+        self.assertEqual(others(after["completion_gate_contracts"]), others(before["completion_gate_contracts"]))
 
     def test_other_capabilities_keep_their_registry_digest(self):
         registry = self.registry()
@@ -402,7 +406,7 @@ class RouteDecisionRecordTest(unittest.TestCase):
         with_leg = {**record, "first_leg": {"route_id": "rt-fedcba9876543210"}}
         self.assertEqual(with_leg["digest"], record["digest"])
         selected = RP.build_decision(frame_route=self.FRAME, selected="Option A", reason="", briefs=self.BRIEFS,
-                                     intent=self.INTENT, proposal={"legs": [1]})
+                                     intent=self.INTENT, proposal={"legs": [1]}, first_leg_compose={"leg": 0})
         first = RP.build_record(selected)
         bound = RP.bind_first_leg(first, {"route_id": "rt-fedcba9876543210"})
         self.assertEqual(bound["digest"], first["digest"])
@@ -414,7 +418,8 @@ class RouteDecisionRecordTest(unittest.TestCase):
 
     def test_first_leg_is_added_once_and_never_changed(self):
         selected = RP.build_record(RP.build_decision(frame_route=self.FRAME, selected="A", reason="",
-                                                     briefs=self.BRIEFS, intent=self.INTENT))
+                                                     briefs=self.BRIEFS, intent=self.INTENT,
+                                                     proposal={"legs": [1]}, first_leg_compose={"leg": 0}))
         bound = RP.bind_first_leg(selected, {"route_id": "rt-1", "route_hash": "h"})
         self.assertEqual(RP.bind_first_leg(bound, {"route_id": "rt-1"}), bound)
         self.assertEqual(RP.bind_first_leg(bound, {"start_receipt": {"x": 1}})["first_leg"],
@@ -636,19 +641,6 @@ class FramedEndingTest(EndingBase):
         self.assertEqual(self.record_path().read_bytes(), before)
         intent = RP.read_record(self.record_path())["decision"]["intent"]
         self.assertNotEqual(intent["sha256"], RP.file_digest(self.output / "shards/frame/intent.md"))
-
-    def test_a_record_that_selects_a_proposal_is_not_this_sessions_ending(self):
-        selected = RP.build_record(RP.build_decision(
-            frame_route={"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
-                         "cycle_id": P.list_cycle_records(self.root)[0]["cycle_id"]},
-            selected="Option A", reason="", briefs=[], intent={"path": "x", "sha256": "0" * 64},
-            proposal={"legs": []}))
-        self.record_path().parent.mkdir(parents=True, exist_ok=True)
-        self.record_path().write_bytes(RP.render(selected))
-        result = self.settle()
-        self.assertEqual((result["state"], result["reason"]),
-                         ("needs-attention", "route-decision-selection-unsupported"))
-        self.assertEqual(self.cli_calls, [])
 
     def test_two_starts_at_once_settle_one_decision(self):
         import threading
@@ -944,7 +936,12 @@ class FramedStartTest(FramedBase):
     def test_the_composed_work_request_text_reaches_each_frame_launch(self):
         self.start()
         for command in self.calls:
-            self.assertEqual(command[command.index("--prompt-text") + 1], "Decide how to do this")
+            # A frame leg is handed a prompt file: the request first, then hints and the full catalogue.
+            self.assertNotIn("--prompt-text", command)
+            text = Path(command[command.index("--prompt-file") + 1]).read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("Decide how to do this\n"))
+            self.assertIn("## Part catalogue", text)
+        self.assertEqual(len({c[c.index("--prompt-file") + 1] for c in self.calls}), 1)
 
     def test_an_autoclosed_framed_route_composes_again_as_a_framed_route(self):
         command = W._compose_again(self.route)

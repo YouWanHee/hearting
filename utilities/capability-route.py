@@ -1384,6 +1384,8 @@ def build_continuation_route(
         # embedded composed_recipe loses its hash seal. (`route_origin`/`shape`
         # live inside `selection`, inherited above.)
         "composed","composed_recipe",
+        # An approved route plan's leg keeps pointing at its plan when it resumes.
+        "route_plan",
     )
     route={key:json.loads(json.dumps(source_route[key]))
            for key in inherited_keys if key in source_route}
@@ -2381,6 +2383,16 @@ def _quick_gate_bindings(recipe):
     return bindings
 
 
+def _frameless_recipe(recipe):
+    """The recipe as a leg of an approved route plan sees it: the frame pair, its gate and its
+    binding are gone, exactly as for a capability that never had a frame layer."""
+    view=json.loads(json.dumps(recipe))
+    view["standard_plus"]["nodes"]=[n for n in view["standard_plus"]["nodes"] if not _frame_node(n)]
+    view["human_gates"]=[g for g in view["human_gates"] if g!="frame-review"]
+    view["human_gate_bindings"]=[b for b in view["human_gate_bindings"] if b.get("gate")!="frame-review"]
+    return view
+
+
 def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *, legacy=False):
     demands = profile_demands or {}
     explicit_profiles = explicit_profiles or {}
@@ -2574,7 +2586,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                   registered_headless_evidence=None, slug=None,
                          route_origin="preset", shape=None, profile_demands=None,
-                         explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
+                         explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None,
+                         route_plan=None, frameless=False):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -2586,7 +2599,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         registered_headless_evidence=registered_headless_evidence, slug=slug,
         campaign_key=campaign_key, parent_cycle_id=parent_cycle_id,
         route_origin=route_origin, shape=shape, profile_demands=profile_demands,
-        explicit_profiles=explicit_profiles, profile=profile)
+        explicit_profiles=explicit_profiles, profile=profile,
+        route_plan=route_plan, frameless=frameless)
 
 # ---------------------------------------------------------------------------
 # compose: the preset-free work route (SD-135).
@@ -3327,8 +3341,16 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
-                  selection_pins=None):
-    """Resolve every default, then compile through the ordinary sealer."""
+                  selection_pins=None, route_plan=None, frameless=False):
+    """Resolve every default, then compile through the ordinary sealer.
+
+    `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
+    and compiles without frame nodes; `frameless` alone is the same compile without the seal, the form
+    a proposal leg is validated in.
+    """
+    import route_plan as RP
+    sealed_plan = RP.sealed_form(route_plan) if route_plan is not None else None
+    frameless = frameless or route_plan is not None
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
     routing_hints = None
@@ -3393,7 +3415,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         raise ValueError("compose-direct-signals-conflict")
     readiness = None
     find_input = None
-    if shape == "staged" and graph and not unassigned:
+    frame_ids = [n["id"] for n in base["standard_plus"]["nodes"] if _frame_node(n)]
+    planned_full = shape == "staged" and not graph and frameless and bool(frame_ids)
+    if shape == "staged" and (graph or planned_full) and not unassigned:
         try:
             import artifact_producer
             find_input = artifact_producer.input_source_finder(
@@ -3403,8 +3427,15 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             find_input = None
     capabilities = {recipe["capability"] for recipe in registry["recipes"]
                     if recipe["capability"] != ROUTE_FRAME_CAPABILITY}
-    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph, capabilities), find_input)
-                       if shape == "staged" and graph else base)
+    if find_input is not None and frameless:
+        find_input = _frame_brief_finder(registry, capability, find_input)
+    if planned_full:
+        # No graph: the recipe's own order, minus the frame nodes the plan already ran.
+        graph_spec = [(n["id"], None) for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
+    else:
+        graph_spec = parse_graph_spec(graph, capabilities) if shape == "staged" and graph else None
+    selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input)
+                       if graph_spec is not None else base)
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
     if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
@@ -3422,8 +3453,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         registered_headless_evidence=registered_headless_evidence,
         route_origin="compose", shape=shape,
         profile_demands=profile_demands, explicit_profiles=explicit_profiles, profile=profile,
+        route_plan=sealed_plan, frameless=frameless,
     )
-    if shape == "staged" and graph:
+    if graph_spec is not None:
         recipe = selected_recipe
         route = compile_composed_route(
             recipe, capability_mode, requested, cwd, artifact_root,
@@ -3446,6 +3478,113 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
+
+
+def _frame_brief_finder(registry, capability, finder):
+    """Let a leg of an approved plan find the frame cycle's two briefs under the names its recipe reads.
+
+    A recipe that keeps its frame briefs under its own names (design, spec) maps them, through the
+    part catalogue's brief-name table, to the canonical `shards/<frame>/direction-brief.md` outputs
+    the framed route's cycle holds. Names that already match (code, draft, refine) need no mapping.
+    """
+    names = TOPO.frame_brief_inputs(registry, capability)
+    outputs = (TOPO.part_catalog(registry).get("frame") or {}).get("brief_outputs") or []
+    table = dict(zip(names, outputs)) if len(names) == len(outputs) else {}
+
+    def find(name):
+        return finder(name) or (finder(table[name]) if name in table else None)
+    return find
+
+
+def proposal_readiness(frame_route, jobs):
+    """One read-only readiness probe shared by every proposal leg's memory compile."""
+    from dispatch_parent_completion import default_parent_harness
+    return _compose_readiness(frame_route["cwd"], jobs, default_parent_harness("claude"),
+                              _compose_default_children(None))
+
+
+def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
+    spec = ((frame_route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source") or "auto"
+    return dict(
+        capability=leg_args["capability"], capability_mode=leg_args["capability_mode"], shape=leg_args["shape"],
+        graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug, cwd=frame_route["cwd"],
+        artifact_root=frame_route["artifact_root"],
+        spec_read="auto" if str(spec).startswith("compose-auto:") else spec,
+        campaign_key=frame_route.get("campaign_key"), parent_cycle_id=frame_cycle_id)
+
+
+def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
+    """Memory compile of one proposal leg in the frame-less form a `--route-plan` compile uses.
+
+    `readiness` is a zero-argument probe, called only for a leg that needs checked dispatch evidence.
+    Nothing is written, started or recorded: no route file, no route-chain line, no producer call.
+    The registry, graph, order, unit, scope and gate rules are the ones compose applies when it seals.
+    """
+    import route_plan as RP
+    return compose_route(
+        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                              slug=f"{frame_route.get('slug') or 'framed'}-leg{index}"),
+        **_leg_evidence(leg, readiness), frameless=True)
+
+
+def _leg_evidence(leg, readiness):
+    if leg["shape"] == "direct":
+        return {}
+    probe = readiness()
+    return {"dispatch_evidence": {"tuples": probe["tuples"], "native_subagent": []},
+            "registered_headless_evidence": {"candidates": probe["candidates"]}}
+
+
+def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness):
+    """The approved first leg, compiled in memory with its route-plan reference sealed.
+
+    Same arguments the printed compose command carries: the leg's shape, graph, capability, mode and
+    intensity, `--route-plan <record>#0`, the frame cycle as parent and the same campaign.
+    """
+    import route_plan as RP
+    return compose_route(
+        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                              slug=f"{context['slug']}-leg0"),
+        **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
+        parent_harness=context.get("owner") or "claude")
+
+
+def declared_start_approvals(leg, registry=None):
+    """`(start_approval, part id)` pairs a proposal leg declares in the part catalogue.
+
+    Read from the catalogue alone (no compile, no probe), so anything rendered from it is the same on
+    every replay. Only a staged leg carries stage parts.
+    """
+    if leg.get("shape") != "staged":
+        return []
+    registry = registry or TOPO.load_registry()
+    capability = leg["capability"]
+    recipes = [r for r in registry["recipes"] if r["capability"] == capability and capability != ROUTE_FRAME_CAPABILITY]
+    if not recipes:
+        return []
+    mode = leg.get("mode")
+    base = (next((r for r in recipes if "dev" in r["modes"]), recipes[0]) if mode is None
+            else next((r for r in recipes if mode in r["modes"]), None))
+    if base is None:
+        return []
+    known = {r["capability"] for r in registry["recipes"]} - {ROUTE_FRAME_CAPABILITY}
+    tokens = leg.get("graph") or [n["id"] for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
+    rows = []
+    for token in tokens:
+        head, _, rest = token.partition(":")
+        part = f"{head}:{rest.partition(':')[0]}" if rest and head in known else f"{base['capability']}:{head}"
+        approval = TOPO.part_row(registry, part).get("start_approval")
+        if approval:
+            rows.append((approval, part))
+    return rows
+
+
+def publish_composed_route(route, artifact_root, *, plan=None):
+    """The compose CLI's write tail for an already compiled route: canonical write-once,
+    owner binding and one route-chain line. Returns the canonical route path."""
+    shim = argparse.Namespace(command="compose", start=True, output=None, owner=None, full_record=False)
+    shim._route_chain_plan = (plan, "explicit" if plan else None)
+    return _emit_compiled_route(shim, route, artifact_root)
 
 
 COMPOSE_CAMPAIGN_LIST_CAP = 12
@@ -3543,7 +3682,7 @@ def route_start_approvals(route, registry=None):
     return rows
 
 
-def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
+def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
@@ -3583,6 +3722,8 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    if route_plan_unreadable:
+        card += "\n  경로 계획을 읽지 못함"
     notice = _compose_spec_read_notice(route)
     if notice:
         card += "\n" + notice
@@ -3615,7 +3756,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                          registered_headless_evidence=None, slug=None, composed=False,
                   route_origin="preset", shape=None, profile_demands=None,
-                  explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
+                  explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None,
+                  route_plan=None, frameless=False):
     dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     if (capability==ROUTE_FRAME_CAPABILITY) != (shape=="framed"):
@@ -3665,6 +3807,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     elif effective=="quick":
         if transport not in (None, "headless"):
             raise ValueError(f"invalid quick transport: {transport!r}")
+        if frameless:
+            # A leg of an approved route plan was framed already: its one-shot runs without the quick frame pair.
+            recipe=_frameless_recipe(recipe)
         if (requested=="direct" and set(predicates)!=known_pred
                 and registered_headless_evidence is None):
             # H6: an explicit direct request whose predicates do not all hold
@@ -3890,6 +4035,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     if composed:
         payload["composed"]=True
         payload["composed_recipe"]=json.loads(json.dumps(recipe))
+    if route_plan is not None:
+        payload["route_plan"]=json.loads(json.dumps(route_plan))
     digest=route_hash(payload); payload["route_hash"]=digest; payload["route_id"]=ROUTE_IDENTITY.route_id_from_hash(digest)
     owner_attempt_id=_resolve_owner_attempt_id()
     payload["owner_attempt_id"]=owner_attempt_id
@@ -4026,6 +4173,11 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         from work_start import validate_request
         validate_request(route["work_request"])
     _verify_selection_pins(route)
+    if "route_plan" in route:
+        # Only the field's own format is verified; the record it names may be gone without
+        # making the route unverifiable (`next_leg` simply has nothing to read then).
+        import route_plan as RP
+        RP.validate_sealed(route["route_plan"])
     if route.get("schema_version") != ROUTE_SCHEMA_VERSION:
         raise ValueError(
             f"legacy route schema_version={route.get('schema_version')!r} rejected for mutating/resume use"
@@ -4144,6 +4296,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         route_recipe=TOPO.resolve_recipe(
             registry, route.get("capability"), route.get("capability_mode")
         )
+        if route.get("route_plan") is not None and route.get("effective_intensity")=="quick":
+            route_recipe=_frameless_recipe(route_recipe)
         if route.get("effective_intensity") not in ("direct", "quick"):
             expected_nodes=json.loads(json.dumps(route_recipe["standard_plus"]["nodes"]))
             expected_nodes=_expand_parallel_groups(
@@ -5145,6 +5299,12 @@ def route_status(artifact_root, *, diagnostics=None):
                 row["closed_at"]=closure.get("closed_at"); row["head_commit"]=closure.get("head_commit")
                 row["stale_closure"]=closure.get("route_hash")!=raw.get("route_hash")
                 row["registry_current"]=closure.get("registry_current",True)
+                if (raw.get("route_plan") is not None and closure.get("terminal_gate_proven") is True
+                        and not closure.get("autoclose") and not row["stale_closure"]):
+                    import route_plan as RP
+                    next_leg=RP.next_leg_for_route(raw)
+                    if next_leg is not None:
+                        row["next_leg"]=next_leg
             rows.append(row)
             by_route_id.setdefault(row["route_id"],[]).append(row["route_file"])
     for row in rows:
@@ -8344,7 +8504,7 @@ def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None
             pass
 
 
-def _resolve_compose_plan(a):
+def _resolve_compose_plan(a, route_plan=None):
     """`(plan, plan_source)` for the compose CLI's `--plan` input (plan §3 B-1.5). An explicit
     `--plan` is validated eagerly — before any route work — and its failure is a normal
     `ValueError("compose-plan-invalid:...")`, never swallowed. With no explicit plan, an
@@ -8359,6 +8519,10 @@ def _resolve_compose_plan(a):
         known = {r["capability"] for r in TOPO.load_registry()["recipes"]
                  if r["capability"] != ROUTE_FRAME_CAPABILITY}
         return rc.parse_plan(a.plan, known), "explicit"
+    if route_plan is not None:
+        # Display only: the approved legs' capability order, never a permission or a hash input.
+        import route_plan as RP
+        return RP.display_plan(route_plan["legs"]), "explicit"
     if rc is None:
         return None, None
     try:
@@ -8487,6 +8651,7 @@ def main():
     cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
     cp.add_argument("--plan",default=None,help="optional declared capability sequence for this session's route chain, e.g. research,draft,apply; shown in Fleet, not sealed into the route")
+    cp.add_argument("--route-plan",default=None,metavar="RECORD#INDEX",help="runtime-generated: leg INDEX of an approved route decision record; compiles without frame nodes and seals its reference")
     cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
@@ -8514,7 +8679,7 @@ def main():
     cp.add_argument("--full-record",action="store_true",help="print all sealed evidence; default prints choices and the canonical route_file")
     cp.add_argument("--help-all",action="help",help="also show advanced/compatibility inputs")
     if "--help-all" not in sys.argv:
-        advanced = {"parent_cycle", "profile_demands", "explicit_profiles", "intensity", "artifact_root",
+        advanced = {"route_plan", "parent_cycle", "profile_demands", "explicit_profiles", "intensity", "artifact_root",
                     "drift_verdict", "tracking", "artifact_guard", "parent_harness", "jobs",
                     "dispatch_evidence", "registered_headless_evidence", "transport_evidence", "output", "full_record"}
         for option in cp._actions:
@@ -8640,7 +8805,15 @@ def main():
             raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
-        a._route_chain_plan = _resolve_compose_plan(a)
+        route_plan_binding, route_plan_unreadable = None, False
+        if a.route_plan:
+            # Unreadable, mismatched or out of range: the same compose as without the argument, plus one card line.
+            import route_plan as RP
+            try:
+                route_plan_binding = RP.read_route_plan(a.route_plan, artifact_root)
+            except (OSError, ValueError):
+                route_plan_unreadable = True
+        a._route_chain_plan = _resolve_compose_plan(a, route_plan_binding)
         DISPATCH_DEFAULTS_WARNINGS.clear()
         pins=_parse_selection_pins(a.pin,a.owner)
         pins,pin_warnings=_filter_top_pins(pins)
@@ -8662,13 +8835,14 @@ def main():
             explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             profile=a.profile,
             work_request={"text":a.prompt_file.read_text(),"owner_harness":owner_pin} if a.prompt_file else None,
-            selection_pins=pins or None,
+            selection_pins=pins or None,route_plan=route_plan_binding,
         )
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
         if a.explain:
-            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin),file=sys.stderr)
+            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
+                               route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
                               "effective_intensity":route["effective_intensity"],"shape":shape,
@@ -8686,7 +8860,8 @@ def main():
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
-        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin),file=sys.stderr)
+        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
+                           route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError

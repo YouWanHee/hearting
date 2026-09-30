@@ -82,7 +82,7 @@ class PublicInlineFinishTest(unittest.TestCase):
                    "--artifact-root", str(self.root), "--tracking", "tracked",
                    "--prompt-file", str(self.prompt),
                    "--spec-read", "fixture", "--drift-verdict", "within-spec", "--artifact-guard", "fixture",
-                   "--owner", "codex", "--parent-harness", "codex"]
+                   "--owner", "codex", "--parent-harness", "codex", *self.extra_compose_arguments()]
         composed = subprocess.run(compose, cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
         self.assertEqual(composed.returncode, 0, composed.stderr)
         route_receipt = json.loads(composed.stdout)
@@ -107,6 +107,9 @@ class PublicInlineFinishTest(unittest.TestCase):
             "--summary-file", str(self.summary),
         ]
         self.env = os.environ.copy()
+
+    def extra_compose_arguments(self):
+        return []
 
     def tearDown(self):
         for key, value in self.old_env.items():
@@ -464,6 +467,122 @@ class PublicInlineFinishTest(unittest.TestCase):
         refused = self.finish()
         self.assertNotEqual(refused.returncode, 0)
         self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
+
+
+class NextLegFinishTest(PublicInlineFinishTest):
+    """A direct route that is leg 0 of an approved route plan reports `next_leg` on finish and replay."""
+
+    PLAN_INDEX = 0
+
+    def extra_compose_arguments(self):
+        import route_plan
+        self.task_file = self.base / "leg-task.md"
+        self.task_file.write_text("the reusable work request\n", encoding="utf-8")
+        leg = {"capability": "autopilot-code", "mode": "dev", "shape": "direct", "graph": None, "intensity": None,
+               "why": "x"}
+        second = {**leg, "shape": "staged", "graph": ["execute", "test"]}
+        frame = {"route_id": "rt-" + "1" * 16, "route_hash": "sha256:" + "2" * 64, "cycle_id": "cyc_" + "3" * 32}
+        decision = route_plan.build_decision(
+            frame_route=frame, selected="Go", reason="", briefs=[], intent={"path": "x", "sha256": "0" * 64},
+            proposal={"summary": "two", "legs": [leg, second], "entry_approvals": []},
+            first_leg_compose={"leg": 0, "context": {
+                "cwd": str(self.repo), "artifact_root": str(self.root), "slug": "inline-finish-test",
+                "campaign_key": "inline-finish-test", "parent_cycle": frame["cycle_id"],
+                "prompt_file": str(self.task_file), "prompt_sha256": "0" * 64, "spec_read": "fixture", "owner": None}})
+        self.record_path = self.root / "decisions" / "route-decision.json"
+        self.record_path.parent.mkdir(parents=True)
+        self.record_path.write_bytes(route_plan.render(route_plan.build_record(decision)))
+        return ["--route-plan", f"{self.record_path}#{self.PLAN_INDEX}"]
+
+    def test_the_first_finish_and_every_replay_carry_the_same_next_leg(self):
+        first = json.loads(self.finish().stdout)
+        self.assertEqual(self.route["route_plan"]["index"], 0)
+        next_leg = first["next_leg"]
+        self.assertEqual((next_leg["index"], next_leg["leg"]["shape"]), (1, "staged"))
+        import shlex
+        argv = shlex.split(next_leg["compose_command"])
+        self.assertEqual(argv[argv.index("--route-plan") + 1], f"{self.record_path}#1")
+        self.assertEqual(argv[argv.index("--parent-cycle") + 1], self.cycle["cycle_id"])
+        self.assertEqual(argv[argv.index("--campaign-key") + 1], "inline-finish-test")
+        self.assertEqual(argv[argv.index("--graph") + 1], "execute,test")
+        self.assertNotIn("--start", argv)
+        replay = json.loads(self.finish().stdout)
+        self.assertTrue(replay["replay"])
+        self.assertEqual(replay["next_leg"], next_leg)
+        self.assertEqual({k: v for k, v in replay.items() if k not in ("replay",)},
+                         {k: v for k, v in first.items() if k not in ("replay",)})
+
+    def test_the_stored_receipt_and_its_identity_are_untouched(self):
+        self.finish()
+        stored = artifact_producer and json.loads(
+            (self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").read_text())["receipt"]
+        self.assertEqual(set(stored), {"schema", "inline_finish_id", "route_id", "route_hash", "cycle_id",
+                                       "terminal_marker_digest", "manifest_digest", "commit", "replay"})
+
+    def test_the_start_receipt_of_the_finished_route_and_route_status_carry_the_same_next_leg(self):
+        next_leg = json.loads(self.finish().stdout)["next_leg"]
+        started = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+                                  "--route", str(self.route_file), "--jobs", str(self.jobs)],
+                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        receipt = json.loads(started.stdout)
+        self.assertEqual((receipt["state"], receipt["required_action"]), ("completed", "advance-completed"))
+        self.assertEqual(receipt["next_leg"], next_leg)
+        for control in ("parent_next", "parent_next_command"):
+            self.assertNotIn(control, receipt)
+        self.assertNotIn("next_leg", receipt["required_action"])
+        status = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "status",
+                                 "--artifact-root", str(self.root)], cwd=self.repo, env=os.environ.copy(),
+                                capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        rows = [row for row in json.loads(status.stdout) if row["route_id"] == self.route["route_id"]]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["next_leg"], next_leg)
+        self.assertTrue(rows[0]["closed"])
+
+    def test_a_route_that_has_not_finished_has_no_next_leg_anywhere(self):
+        status = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "status",
+                                 "--artifact-root", str(self.root)], cwd=self.repo, env=os.environ.copy(),
+                                capture_output=True, text=True)
+        rows = [row for row in json.loads(status.stdout) if row["route_id"] == self.route["route_id"]]
+        self.assertFalse(rows[0]["closed"])
+        self.assertNotIn("next_leg", rows[0])
+
+    def test_a_vanished_record_leaves_the_receipt_as_it_was_without_the_key(self):
+        self.finish()
+        self.record_path.unlink()
+        replay = json.loads(self.finish().stdout)
+        self.assertNotIn("next_leg", replay)
+        self.assertTrue(replay["replay"])
+
+
+class LastLegFinishTest(NextLegFinishTest):
+    PLAN_INDEX = 1
+
+    def test_the_first_finish_and_every_replay_carry_the_same_next_leg(self):
+        first = json.loads(self.finish().stdout)
+        self.assertNotIn("next_leg", first)
+        self.assertNotIn("next_leg", json.loads(self.finish().stdout))
+        started = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+                                  "--route", str(self.route_file), "--jobs", str(self.jobs)],
+                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(json.loads(started.stdout)["state"], "completed")
+        self.assertNotIn("next_leg", started.stdout)
+        status = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "status",
+                                 "--artifact-root", str(self.root)], cwd=self.repo, env=os.environ.copy(),
+                                capture_output=True, text=True)
+        self.assertNotIn("next_leg", status.stdout)
+
+
+# The plan subclasses only add their own tests: do not run the inherited ones a second time.
+for _klass in (NextLegFinishTest, LastLegFinishTest):
+    for _name in dir(PublicInlineFinishTest):
+        if _name.startswith("test_") and _name not in _klass.__dict__:
+            setattr(_klass, _name, None)
+LastLegFinishTest.test_the_stored_receipt_and_its_identity_are_untouched = None
+LastLegFinishTest.test_a_vanished_record_leaves_the_receipt_as_it_was_without_the_key = None
+LastLegFinishTest.test_the_start_receipt_of_the_finished_route_and_route_status_carry_the_same_next_leg = None
+LastLegFinishTest.test_a_route_that_has_not_finished_has_no_next_leg_anywhere = None
 
 
 if __name__ == "__main__":

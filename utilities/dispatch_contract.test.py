@@ -3246,6 +3246,9 @@ class DispatchContractTest(unittest.TestCase):
    # (user decision 2026-09-10: an approval, not a direction, so not absorbed)
    ("autopilot-refine","preview-disposition","transaction","human-gate-not-raised"),
    ("autopilot-spec","frame-review","research","human-gate-not-raised"),
+   # the framed route (SD-164) binds the same gate at the entry of its model-less terminal,
+   # so the decision cannot be settled before the person has answered
+   ("route-frame","frame-review","route-decision","human-gate-not-raised"),
   ],seen)
   self.assertEqual({row[1] for row in fenced},set(D.FENCED_HUMAN_GATES))
   self.assertGreaterEqual(len(seen),5)

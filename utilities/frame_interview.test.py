@@ -470,5 +470,132 @@ class OffMenuAnswerTest(unittest.TestCase):
                              for e in FI.validate_answers(interview, answers)))
 
 
+LEG = {"capability": "autopilot-lab", "mode": "setup", "shape": "staged",
+       "graph": ["scaffold", "smoke", "full-run", "run-verify", "handoff"], "intensity": None}
+
+
+def routed_interview(**overrides):
+    """An interview with a route question (q-scope) and an approval question (q-cap)."""
+    interview = good_interview()
+    proposal = {"summary": "Set it up and run it", "legs": [LEG],
+                "entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-cap"}]}
+    interview["route_proposals"] = {"question": "q-scope", "by_option": {"Both (recommended)": proposal}}
+    interview.update(overrides)
+    return interview
+
+
+class RouteProposalsTest(unittest.TestCase):
+    """The optional `route_proposals` field: reference checks only, and no change without it."""
+
+    def test_a_field_whose_references_exist_is_valid(self):
+        self.assertEqual(FI.validate(routed_interview(), intensity="standard"), [])
+
+    def test_the_references_are_checked(self):
+        cases = {
+            "not an object": ("route_proposals", "x", "expected exactly"),
+            "extra key": ("route_proposals", {"question": "q-scope", "by_option": {}, "x": 1}, "expected exactly"),
+            "no such question": ("route_proposals", {"question": "nope", "by_option": {"a": {}}}, "no such question"),
+            "empty mapping": ("route_proposals", {"question": "q-scope", "by_option": {}}, "at least one"),
+        }
+        for label, (key, value, text) in cases.items():
+            with self.subTest(label):
+                errors = FI.validate(routed_interview(**{key: value}))
+                self.assertTrue(any(text in e for e in errors), errors)
+        label_missing = routed_interview()
+        label_missing["route_proposals"]["by_option"] = {"Not a label": {"legs": [LEG]}}
+        self.assertTrue(any("not an option of question" in e for e in FI.validate(label_missing)))
+
+    def test_a_label_that_two_options_share_is_ambiguous(self):
+        interview = routed_interview()
+        interview["questions"][0]["options"][1]["label"] = "Both (recommended)"
+        self.assertTrue(any("ambiguous" in e for e in FI.validate(interview)))
+
+    def test_approval_references_need_a_yes_no_question_inside_the_proposals_legs(self):
+        interview = routed_interview()
+        approval = interview["route_proposals"]["by_option"]["Both (recommended)"]["entry_approvals"]
+        approval[0]["question"] = "q-none"
+        self.assertTrue(any("no such approval question" in e for e in FI.validate(interview)))
+        approval[0]["question"] = "q-scope"                      # the route question cannot approve itself
+        self.assertTrue(any("no such approval question" in e for e in FI.validate(interview)))
+        interview = routed_interview()
+        interview["questions"][1]["kind"] = "choice"
+        self.assertTrue(any("an approval question is yes-no" in e for e in FI.validate(interview)))
+        interview = routed_interview()
+        interview["route_proposals"]["by_option"]["Both (recommended)"]["entry_approvals"][0]["leg"] = 3
+        self.assertTrue(any("outside the proposal's legs" in e for e in FI.validate(interview)))
+        for bad in ({"key": "full-run"}, {"key": "full-run", "leg": 0, "question": "q-cap", "x": 1}):
+            interview = routed_interview()
+            interview["route_proposals"]["by_option"]["Both (recommended)"]["entry_approvals"] = [bad]
+            self.assertTrue(any("expected exactly" in e for e in FI.validate(interview)))
+
+    def test_proposal_metadata_is_not_scanned_for_harness_words_but_the_questions_still_are(self):
+        interview = routed_interview()
+        self.assertEqual(FI.validate(interview), [])              # capability, graph and start_approval are data
+        self.assertIn("full-run", json.dumps(interview["route_proposals"]))
+        interview["questions"][0]["question"] = "Should the owner re-raise the gate?"
+        self.assertTrue(any("harness word" in e for e in FI.validate(interview)))
+
+    def test_declining_either_answer_is_a_valid_answer(self):
+        interview = routed_interview()
+        for route_choice, approval_choice in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            answers = good_answers(interview)
+            answers["answers"]["q-scope"]["choice"] = route_choice
+            answers["answers"]["q-cap"]["choice"] = approval_choice
+            self.assertEqual(FI.validate_answers(interview, answers), [], (route_choice, approval_choice))
+        off = good_answers(interview)
+        off["answers"]["q-scope"] = {"choice": "none", "note": "Something else, please."}
+        self.assertEqual(FI.validate_answers(interview, off), [])
+        unanswered = good_answers(interview)
+        unanswered["answers"]["q-cap"]["choice"] = None
+        self.assertTrue(FI.validate_answers(interview, unanswered))
+
+    def test_route_choice_and_approvals_read_the_answers_the_way_the_runtime_needs(self):
+        interview = routed_interview()
+        answers = good_answers(interview)
+        chosen = FI.route_choice(interview, answers)
+        self.assertEqual((chosen["state"], chosen["label"]), ("selected", "Both (recommended)"))
+        self.assertEqual(chosen["proposal"]["legs"][0]["capability"], "autopilot-lab")
+        self.assertEqual(FI.approvals_given(interview, answers, chosen["proposal"]),
+                         [{"key": "full-run", "leg": 0, "question": "q-cap", "label": "Yes (recommended)", "accepted": True}])
+        answers["answers"]["q-cap"]["choice"] = "No, fewer"
+        self.assertFalse(FI.approvals_given(interview, answers, chosen["proposal"])[0]["accepted"])
+        answers["answers"]["q-scope"]["choice"] = 1
+        self.assertEqual(FI.route_choice(interview, answers)["state"], "declined")
+        answers["answers"]["q-scope"] = {"choice": "none", "note": "x"}
+        self.assertEqual(FI.route_choice(interview, answers)["state"], "off-menu")
+        self.assertIsNone(FI.route_choice(good_interview(), good_answers(good_interview())))
+
+    def test_intent_records_the_route_and_the_approvals_only_when_the_field_is_present(self):
+        interview = routed_interview()
+        answers = good_answers(interview)
+        scope = {("full-run", 0): ["autopilot-lab:full-run"]}
+        text = FI.render_intent(interview, answers, now="2026-10-01", approval_scope=scope)
+        self.assertIn("## Route\n\nSelected route: Set it up and run it", text)
+        self.assertIn("- Leg 0: autopilot-lab / setup / staged / scaffold,smoke,full-run,run-verify,handoff  (starts now)", text)
+        self.assertIn("- full-run for leg 0 (autopilot-lab:full-run) — question `q-cap`: approved", text)
+        plain = copy.deepcopy(interview)
+        del plain["route_proposals"]
+        self.assertNotIn("## Route", FI.render_intent(plain, answers, now="2026-10-01", approval_scope=scope))
+        self.assertEqual(FI.render_intent(plain, answers, now="2026-10-01"),
+                         FI.render_intent(plain, answers, now="2026-10-01", approval_scope=scope))
+        # the person's correction still comes first, and is never widened into an approval
+        answers["understanding_confirmed"] = False
+        answers["correction"] = "Not quite: only the setup."
+        corrected = FI.render_intent(interview, answers, now="2026-10-01", approval_scope=scope)
+        self.assertLess(corrected.index("User's correction"), corrected.index("## Route"))
+        answers["answers"]["q-cap"]["choice"] = 1
+        self.assertIn("question `q-cap`: declined", FI.render_intent(interview, answers, now="2026-10-01", approval_scope=scope))
+
+    def test_without_the_field_everything_is_byte_identical(self):
+        interview = good_interview()
+        answers = good_answers(interview)
+        self.assertEqual(FI.validate(interview), [])
+        self.assertEqual(FI.validate_answers(interview, answers), [])
+        self.assertEqual(json.dumps(FI.answers_template(interview), sort_keys=True),
+                         json.dumps(FI.answers_template({**interview}), sort_keys=True))
+        self.assertNotIn("route", FI.render_intent(interview, answers, now="2026-10-01").lower().split("## decisions")[1].split("## open")[0])
+        self.assertEqual(FI.render_intent(interview, answers, now="2026-10-01"),
+                         FI.render_intent(interview, answers, now="2026-10-01", approval_scope={}))
+
 if __name__ == "__main__":
     unittest.main()

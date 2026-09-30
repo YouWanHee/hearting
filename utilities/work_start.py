@@ -32,6 +32,7 @@ import owner_write_advisory as OWNER_WRITE_ADVISORY
 import route_plan as RP
 
 ROOT = Path(__file__).resolve().parents[1]
+_ROUTE_MODULE = None
 START_WINDOW_SECONDS = 600
 # A concurrency-cap refusal (class-cap/global-cap) carries no timestamp
 # evidence to size a wait from -- this is the one bounded guess `--wait`
@@ -41,6 +42,68 @@ _REFUSAL_RECEIPT_KEYS = {
     "reason", "child_spawned", "retryable", "refusal", "worker_class",
     "retry_after_seconds", "frees_at",
 }
+
+
+def _route_module():
+    """`capability-route.py` as a module, for the catalogue and the first leg's compile.
+
+    Loaded on first use: the compiler imports this module lazily, so the dependency stays
+    one-way at import time (the same idiom `dispatch_contract._route_module` uses).
+    """
+    global _ROUTE_MODULE
+    if _ROUTE_MODULE is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("capability_route_framed", ROOT / "utilities/capability-route.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _ROUTE_MODULE = module
+    return _ROUTE_MODULE
+
+
+def _decision_home(root):
+    """Runtime-owned files of framed decisions: the frame prompt, the first leg's prompt and snapshot."""
+    return Path(root) / ".runtime" / "framed-decision"
+
+
+def _keep_first(path, encoded):
+    """Write `encoded` unless the file exists; either way return the bytes that are there."""
+    from artifact_receipt import _write_once
+    if path.is_symlink():
+        raise ValueError(f"frame-input-symlink: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_once(path.parent, path, encoded)
+    return path.read_bytes()
+
+
+def frame_task_text(route):
+    """What every frame leg of one route receives: the request, the hints, the full part catalogue.
+
+    The catalogue is `stages_block` for every capability -- the exact source `capability-route.py
+    stages` prints -- rendered as JSON, never parsed back from CLI text. Both legs get the same
+    text and nothing of each other.
+    """
+    module = _route_module()
+    registry = module.TOPO.load_registry()
+    blocks = [module.stages_block(registry, recipe) for recipe in registry["recipes"]
+              if recipe["capability"] != module.ROUTE_FRAME_CAPABILITY]
+    request = route["work_request"]
+    lines = [request["text"].rstrip(), "", "## Routing hints (suggestions, never orders)", ""]
+    hints = request.get("routing_hints") or {}
+    lines += [f"- {key}: {value}" for key, value in sorted(hints.items())] or ["- none"]
+    lines += ["", "## Part catalogue", "",
+              "Every capability, its modes and its stage parts (`id`, unit and unit choices, inputs and outputs,",
+              "`shareable`, `start_approval`, human gates, and the parts another capability may borrow as",
+              "`capability:stage`). Assemble section 8 of your brief from this catalogue alone.", "",
+              "```json", json.dumps(blocks, sort_keys=True, separators=(",", ":"), ensure_ascii=False), "```", "",
+              "## Independence", "",
+              "You are one of two frame legs working blind to each other: do not read another leg's brief.", ""]
+    return "\n".join(lines)
+
+
+def _frame_prompt_file(route):
+    path = _decision_home(route["artifact_root"]) / f"{route['route_id']}.frame-prompt.md"
+    _keep_first(path, frame_task_text(route).encode("utf-8"))
+    return path
 
 
 def _store_once(path, value):
@@ -164,6 +227,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         for node in route["nodes"] if node.get("worker_type") == "frame"]})
     if response is not None:
         _store_once(answer_path, response)
+        _checkpoint("after-answer-save")
 
     def command(operation, *options):
         argv = [sys.executable, str(Path(runtime_root) / "utilities/workflow-supervisor.py"), operation,
@@ -189,9 +253,12 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         raise ValueError("frame-raise-pending: the gate was not durably registered")
     intent = frame_dir / "intent.md"
     if decision == "proceed":
-        rendered = FI.render_intent(question, response, now=question["created"])
+        rendered = FI.render_intent(
+            question, response, now=question["created"],
+            **({"approval_scope": _approval_scope(question, response)} if "route_proposals" in question else {}))
         saved = directory / "intent.md"
         _store_bytes_once(saved, rendered.encode())
+        _checkpoint("after-intent-render")
         if not intent.exists() or intent.read_text() != rendered:
             WS._atomic_write(intent, rendered)
     if resolution["status"] == "blocked":
@@ -311,8 +378,12 @@ def _start(route, path, jobs, node, harness, run):
     command = [sys.executable, str(ROOT / "utilities/dispatch-owner.py"), "--start",
                "--route-evidence", str(path), "--jobs", str(jobs),
                "--slug", route["slug"] + "-" + node,
-               "--attempt-id", attempt_id(route, node),
-               "--prompt-text", route["work_request"]["text"]]
+               "--attempt-id", attempt_id(route, node)]
+    if node == "owner" or not route.get("artifact_root"):
+        # A route with no artifact root has no runtime home for a prompt file; every sealed route has one.
+        command += ["--prompt-text", route["work_request"]["text"]]
+    else:
+        command += ["--prompt-file", str(_frame_prompt_file(route))]
     if node != "owner":
         command += ["--route-node", node]
     if harness:
@@ -528,15 +599,276 @@ def _framed_facts(root, output):
     return rows, {"path": intent.relative_to(root).as_posix(), "sha256": RP.file_digest(intent)}
 
 
-def _framed_settle(route, path, jobs, result, *, closed=None):
-    """Fix the decision, complete the model-less terminal, close the route, finalize the cycle.
+# Test-only seam: a callable `hook(name)` a test sets to stop the transaction at a named boundary
+# (raise, or exit the process). It is never set by the runtime and there is no flag for it.
+FAULT_HOOK = None
+
+
+def _checkpoint(name):
+    return FAULT_HOOK(name) if FAULT_HOOK is not None else None
+
+
+def _proposal_rows(route, jobs, root, record, output):
+    """Each brief's proposal row, every leg validated by a memory compile (nothing written or started)."""
+    module = _route_module()
+    readiness = {}
+
+    def probe():
+        if "value" not in readiness:
+            readiness["value"] = module.proposal_readiness(route, jobs)
+        return readiness["value"]
+
+    def compile_leg(leg, index):
+        return module.compile_proposal_leg(leg, index, frame_route=route, frame_cycle_id=record["cycle_id"],
+                                           readiness=probe)
+
+    return [RP.evaluate_brief(output / "shards" / node / "direction-brief.md", root=root, node=node,
+                              compile_leg=compile_leg, start_approvals=module.route_start_approvals)
+            for node in ("frame", "frame-alternative")]
+
+
+def _grouped_approvals(row):
+    groups = {}
+    for item in (row.get("facts") or {}).get("start_approvals", []):
+        groups.setdefault((item["leg"], item["start_approval"]), []).append(item["part"])
+    return [{"leg": leg, "key": key, "parts": sorted(parts)} for (leg, key), parts in sorted(groups.items())]
+
+
+def _frame_downgrade_summary(route, jobs):
+    """Reserved for the capacity rule (plan D2): where a frame leg that was retried one profile lower
+    is named for the interview brief. The runtime reports nothing here until that rule lands."""
+    return None
+
+
+def _proposal_review(route, path, jobs):
+    """Information for the session that writes the interview: both validated proposals (or none with
+    the reason), whether they are equal, the start-approval parts each leg would carry, and the
+    frame downgrade summary. Nothing here is a decision."""
+    root, record, output = _framed_cycle(route)
+    rows = _proposal_rows(route, jobs, root, record, output)
+    return {
+        "proposals": [{
+            **{key: row[key] for key in ("node", "proposal", "reason", "brief_path", "sha256")},
+            "display": RP.none_text(row["reason"]) if row["proposal"] is None else "proposal",
+            "legs": (row.get("facts") or {}).get("legs", []),
+            "start_approvals": _grouped_approvals(row)} for row in rows],
+        "equal": RP.proposals_equal(rows),
+        "wording_differs": RP.wording_differs(rows),
+        "frame_downgrade": _frame_downgrade_summary(route, jobs),
+    }
+
+
+def _approval_scope(question, response):
+    """`{(key, leg): [part ids]}` for the approvals of the route the answers selected, from the
+    part catalogue alone, so the intent renders the same on every replay."""
+    import frame_interview as FI
+    choice = FI.route_choice(question, response)
+    if not choice or choice["proposal"] is None:
+        return {}
+    module = _route_module()
+    registry = module.TOPO.load_registry()
+    scope = {}
+    for approval in choice["proposal"].get("entry_approvals") or []:
+        leg = choice["proposal"]["legs"][approval["leg"]]
+        scope[(approval["key"], approval["leg"])] = sorted(
+            {part for key, part in module.declared_start_approvals(leg, registry) if key == approval["key"]})
+    return scope
+
+
+def _recorded_interview(route, jobs):
+    """The interview and answers the frame-review gate recorded for this route."""
+    import workflow_state as WS
+    resolution = WS.human_gate_resolution(
+        WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).journal(), "frame-review")
+    artifact = resolution.get("artifact")
+    if not artifact or not Path(artifact).is_file():
+        return None, None
+    return json.loads(Path(artifact).read_text()), resolution.get("answers")
+
+
+def _leg_task_text(route, root, output, briefs, intent, approvals):
+    """The work request of every leg of an approved route: the original request, the agreed intent,
+    the brief paths with their digests, and the approvals actually given."""
+    lines = [route["work_request"]["text"].rstrip(), "", "## Agreed intent", "",
+             (output / "shards/frame/intent.md").read_text(encoding="utf-8").rstrip(), "",
+             "## Frame briefs (read-only input)", ""]
+    lines += [f"- {root / row['path']} (sha256 {row['sha256']})" for row in briefs]
+    lines += ["", "## Start approvals given", ""]
+    lines += [f"- {row['key']} for leg {row['leg']} ({', '.join(row['parts']) or 'steps named in the question'}): "
+              + ("approved" if row["accepted"] else "not approved") for row in approvals["given"]] or ["- none"]
+    return "\n".join(lines) + "\n"
+
+
+def _decide(route, jobs, root, record, output, briefs, intent):
+    """The decision part for this frame route: the approved first leg, or `selected: none` with the reason."""
+    import frame_interview as FI
+    frame_route = {"route_id": route["route_id"], "route_hash": route["route_hash"], "cycle_id": record["cycle_id"]}
+
+    def ended(reason, rows=None):
+        if rows is None:
+            return RP.none_decision(frame_route=frame_route, briefs=briefs, intent=intent, reason=reason)
+        return RP.build_decision(frame_route=frame_route, selected=RP.NONE, reason=reason, briefs=briefs,
+                                 intent=intent, proposals=rows)
+
+    interview, answers = _recorded_interview(route, jobs)
+    if not isinstance(interview, dict) or not isinstance(answers, dict) or "route_proposals" not in interview:
+        return ended(RP.NO_PROPOSAL_READ)
+    rows = _proposal_rows(route, jobs, root, record, output)
+    shown = [{key: row[key] for key in ("node", "proposal", "reason", "brief_path", "sha256", "source") if key in row}
+             for row in rows]
+    choice = FI.route_choice(interview, answers)
+    if choice is None:
+        return ended(RP.NO_PROPOSAL_READ)
+    if choice["state"] != "selected":
+        return ended({"declined": "route-declined", "off-menu": "route-off-menu"}.get(choice["state"], "route-unanswered"), shown)
+    match = next((row for row in rows if row["proposal"] is not None
+                  and RP.same_proposal(row["proposal"], choice["proposal"])), None)
+    if match is None:
+        return ended("proposal-not-verified", shown)
+    given = []
+    for row in FI.approvals_given(interview, answers, choice["proposal"]):
+        parts = sorted({item["part"] for item in match["facts"]["start_approvals"]
+                        if item["leg"] == row["leg"] and item["start_approval"] == row["key"]})
+        given.append({**row, "parts": parts})
+    for item in match["facts"]["start_approvals"]:
+        if item["leg"] == 0 and not any(row["accepted"] and row["leg"] == 0 and row["key"] == item["start_approval"]
+                                        for row in given):
+            return ended(f"approval-missing:{item['start_approval']}", shown)
+    approvals = {"given": given}
+    prompt = _decision_home(root) / f"{route['route_id']}.leg-task.md"
+    task = _keep_first(prompt, _leg_task_text(route, root, output, briefs, intent, approvals).encode("utf-8"))
+    leg = match["proposal"]["legs"][0]
+    source = ((route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source") or "auto"
+    record_rel = (output / RP.RECORD_RELATIVE).relative_to(root).as_posix()
+    compose = {
+        "leg": 0, **{key: leg[key] for key in ("capability", "mode", "shape", "graph", "intensity")},
+        "route_plan": record_rel + "#0",
+        "context": {"cwd": route["cwd"], "artifact_root": str(root), "slug": route.get("slug") or "framed",
+                    "campaign_key": route.get("campaign_key"), "parent_cycle": record["cycle_id"],
+                    "prompt_file": str(prompt), "prompt_sha256": hashlib.sha256(task).hexdigest(),
+                    "spec_read": "auto" if str(source).startswith("compose-auto:") else source,
+                    "owner": (route.get("work_request") or {}).get("owner_harness")}}
+    return RP.build_decision(frame_route=frame_route, selected=choice["label"], reason="", briefs=briefs,
+                             intent=intent, proposal=match["proposal"], proposals=shown, approvals=approvals,
+                             first_leg_compose=compose)
+
+
+def _replace_record(record_path, new_record):
+    """Monotonic rewrite of the record: the decision part and its digest must be unchanged."""
+    current = RP.read_record(record_path)
+    if current["decision"] != new_record["decision"] or current["digest"] != new_record["digest"]:
+        raise ValueError("route-decision-conflict: the decision part is immutable")
+    from workflow_state import _atomic_write
+    _atomic_write(record_path, RP.render(new_record).decode("utf-8"))
+
+
+def _bind(record_path, **first_leg):
+    """Add first-leg facts (or confirm the same ones again) and rewrite the record."""
+    record = RP.read_record(record_path)
+    bound = RP.bind_first_leg(record, first_leg)
+    if bound != record:
+        _replace_record(record_path, bound)
+    return bound
+
+
+def _first_leg_started(leg_result, jobs, route):
+    """The start receipt is complete: a direct leg answered `execute-inline`; a registered owner
+    is registered and started (its launch receipt said registered=1 started=1 child_spawned=1)."""
+    if route["effective_intensity"] == "direct":
+        return leg_result.get("state") == "inline" and leg_result.get("required_action") == "execute-inline"
+    aid = leg_result.get("owner_attempt_id")
+    if not aid or not leg_result.get("owner_started") or aid not in _rows(jobs):
+        return False
+    tokens = {token for launch in leg_result.get("launches", []) for token in (launch.get("receipt") or "").split()}
+    return not tokens or {"registered=1", "started=1", "child_spawned=1"} <= tokens
+
+
+def _first_leg(route, path, jobs, result, root, record, output, record_path, decision_record, *,
+               wait, run, sleep, clock):
+    """Compile, publish and start the approved first leg; bind each fact into the record before the
+    next step. Returns `(record, None)` once its start receipt is stored, or `(None, response)` to
+    hand the caller the first leg's own state while the frame route stays open."""
+    module = _route_module()
+    decision = decision_record["decision"]
+    compose = decision["first_leg_compose"]
+    context = compose["context"]
+    first = decision_record.get("first_leg") or {}
+    if "snapshot" not in first:
+        binding = RP.read_route_plan(f"{record_path}#0", root)
+        readiness = {}
+
+        def probe():
+            if "value" not in readiness:
+                readiness["value"] = module.proposal_readiness(route, jobs)
+            return readiness["value"]
+        leg = {key: compose[key] for key in ("capability", "mode", "shape", "graph", "intensity")}
+        try:
+            leg_route = module.compile_first_leg(
+                leg, frame_route=route, frame_cycle_id=record["cycle_id"], context=context, binding=binding,
+                work_request={"text": Path(context["prompt_file"]).read_text(encoding="utf-8"),
+                              "owner_harness": context.get("owner")}, readiness=probe)
+        except ValueError as exc:
+            return None, {**result, "state": "needs-attention", "reason": "first-leg-compose-refused",
+                          "detail": str(exc), "required_action": "inspect-preparation",
+                          "record_file": str(record_path),
+                          "next_step": "The decision record is kept. Correct what the compose error names, then run "
+                              "resume_command again, or compose the route yourself from the record's proposal."}
+        # Key order is part of the route's bytes (the validators read some tables in declared order),
+        # so the snapshot keeps it; `route_hash` is order-independent.
+        raw = (json.dumps(leg_route, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        snapshot = _decision_home(root) / f"{route['route_id']}.leg0.{digest[:16]}.route.json"
+        _keep_first(snapshot, raw)
+        decision_record = _bind(record_path, snapshot={
+            "path": snapshot.relative_to(root).as_posix(), "sha256": digest,
+            "route_id": leg_route["route_id"], "route_hash": leg_route["route_hash"]})
+        first = decision_record["first_leg"]
+        _checkpoint("after-compiled-snapshot")
+    snap = first["snapshot"]
+    snapshot_path = root / snap["path"]
+    if RP.file_digest(snapshot_path) != snap["sha256"]:
+        raise ValueError("route-decision-conflict: the first leg's snapshot changed")
+    leg_path = module.canonical_route_path(str(root), snap["route_id"])
+    if not Path(leg_path).exists():
+        module.publish_composed_route(json.loads(snapshot_path.read_text(encoding="utf-8")), str(root),
+                                      plan=RP.display_plan(decision["proposal"]["legs"]))
+    leg_path = Path(leg_path)
+    published = json.loads(leg_path.read_text(encoding="utf-8"))
+    if (published.get("route_id"), published.get("route_hash")) != (snap["route_id"], snap["route_hash"]):
+        raise ValueError("route-decision-conflict: the published first leg differs from its snapshot")
+    _checkpoint("after-route-publish")
+    if "route" not in first:
+        decision_record = _bind(record_path, route={
+            "route_id": snap["route_id"], "route_hash": snap["route_hash"],
+            "route_file": leg_path.relative_to(root).as_posix()})
+        first = decision_record["first_leg"]
+    _checkpoint("after-route-bind")
+    if "start_receipt" in first:
+        return decision_record, None
+    leg_route = module.verify_route(published)
+    leg_result = start_work(leg_route, leg_path, jobs, wait=wait, run=run, sleep=sleep, clock=clock)
+    if not _first_leg_started(leg_result, jobs, leg_route):
+        return None, leg_result
+    _checkpoint("after-first-start")
+    encoded = json.dumps(leg_result, sort_keys=True, ensure_ascii=False)
+    decision_record = _bind(record_path, start_receipt=json.loads(encoded),
+                            receipt_digest="sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest())
+    _checkpoint("after-first-start-receipt")
+    return decision_record, None
+
+
+def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=subprocess.run,
+                   sleep=time.sleep, clock=time.time):
+    """Fix the decision, start its first leg, complete the model-less terminal, close the route and
+    finalize the cycle.
 
     Every step reads what is already on disk and does only what is missing, so repeating `start`
-    after any interruption finishes the same single decision. S1 knows no proposal, so the
-    decision is `selected: none` and the main session composes the next route itself.
+    after any interruption finishes the same single decision, route and attempt. A decision that
+    selects no proposal ends as `selected: none`: nothing starts and the main session composes next.
     """
-    import artifact_producer as producer
+    import artifact_producer
     import dispatch_terminal_commit
+    producer = artifact_producer
     root, record, output = _framed_cycle(route)
     lock_path = root / ".runtime" / "framed-decision" / (route["route_id"] + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -560,24 +892,39 @@ def _framed_settle(route, path, jobs, result, *, closed=None):
                 if facts is None:
                     return {**result, "state": "needs-attention", "reason": "frame-outcome-needs-inspection"}
                 briefs, intent = facts
-                decision_record = RP.build_record(RP.none_decision(
-                    frame_route={"route_id": route["route_id"], "route_hash": route["route_hash"],
-                                 "cycle_id": record["cycle_id"]}, briefs=briefs, intent=intent))
+                _checkpoint("after-intent-save")
+                decision_record = RP.build_record(_decide(route, jobs, root, record, output, briefs, intent))
                 _store_bytes_once(record_path, RP.render(decision_record))
+                _checkpoint("after-decision-write")
             decision = decision_record["decision"]
-            if decision["selected"] != RP.NONE:
-                return {**result, "state": "needs-attention", "reason": "route-decision-selection-unsupported"}
+            started = decision["selected"] != RP.NONE
+            if started:
+                decision_record, response = _first_leg(
+                    route, path, jobs, result, root, record, output, record_path, decision_record,
+                    wait=wait, run=run, sleep=sleep, clock=clock)
+                if response is not None:
+                    return response
             if closed is None:
                 _route_cli(jobs, "complete", "--route", str(path), "--node", RP.TERMINAL_NODE,
                            "--evidence", str(record_path))
+                _checkpoint("after-complete")
                 _route_cli(jobs, "close", "--route", str(path), "--summary",
-                           "framed route ended without a proposal: " + decision["reason"])
+                           ("framed route started its first leg " + decision_record["first_leg"]["route"]["route_id"])
+                           if started else "framed route ended without a proposal: " + decision["reason"])
+                _checkpoint("after-close")
             producer.finalize_exact_cycle(root, cycle_id=record["cycle_id"], expected_binding={
                 "kind": "runtime_producer_binding_v1", "campaign_id": record["campaign_id"],
                 "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
-                "cycle_record_digest": dispatch_terminal_commit.cycle_identity_digest(record)})
+                "cycle_record_digest": dispatch_terminal_commit.cycle_identity_digest(record)},
+                crash_after_manifest=_checkpoint("finalize-crash-after-manifest") is True)
+            _checkpoint("after-finalize")
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    if started:
+        receipt = dict(decision_record["first_leg"]["start_receipt"])
+        receipt["route_decision"] = {"record_file": str(record_path), "selected": decision["selected"],
+                                     "frame_route_id": route["route_id"]}
+        return receipt
     intent_file = root / decision["intent"]["path"]
     return {**result, "state": "completed", "reason": "route-decision-none", "required_action": "compose-route",
             "selected": decision["selected"], "decision_reason": decision["reason"],
@@ -621,7 +968,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             return {**result, "state": "needs-attention", "reason": "route-closed-unproven",
                     "required_action": "inspect-closed-route", "outcome": closed}
         if RP.is_framed_route(route):
-            return _framed_settle(route, path, jobs, result, closed=closed)
+            return _framed_settle(route, path, jobs, result, closed=closed, wait=wait, run=run,
+                                  sleep=sleep, clock=clock)
         owner = closed.get("terminal_owner_attempt_id")
         rows = _rows(jobs)
         if owner and owner not in rows:
@@ -634,7 +982,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                 if settlement.state != "complete":
                     return {**result, "state": "needs-attention", "reason": "workflow-completion-pending",
                             "required_action": "inspect-recovery", "outcome": closed}
-        return {**result, "state": "completed", "required_action": "advance-completed", "outcome": closed}
+        return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
+                                      "outcome": closed})
     if route["effective_intensity"] == "direct":
         from artifact_producer import prepare_route_artifact_env
         return {**result, "state": "inline", "required_action": "execute-inline",
@@ -734,12 +1083,19 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             gate_pending = True
         if gate_pending or interview or answers:
             step = frame_interview_step(route, path, jobs, interview=interview, answers=answers, decision=decision)
+            if RP.is_framed_route(route) and step["state"] == "needs-interview":
+                step = {**step, "route_proposal_review": _proposal_review(route, path, jobs),
+                        "next_step": step.get("next_step", "") + " route_proposal_review holds each brief's validated route "
+                            "proposal (or proposal:none(reason)), whether the two are equal, and the start-approval parts "
+                            "in scope. Write one route question and map its option labels to proposals in "
+                            "route_proposals {question, by_option}; put each start-approval question beside it "
+                            "(the approving option first). Do not invent a route no brief proposed."}
             result.update(frame_interview=step, gate="frame-review", task=request["text"])
             if step["state"] != "released":
                 return {**result, **step}
             owner_frame_launch_gate(SimpleNamespace(route_file=str(path)), "start", ROOT, jobs)
     if RP.is_framed_route(route):
-        return _framed_settle(route, path, jobs, result)
+        return _framed_settle(route, path, jobs, result, wait=wait, run=run, sleep=sleep, clock=clock)
     rows = _rows(jobs)
     aid = _slot(route, "owner", rows)
     refusal = None
@@ -816,14 +1172,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "node": replacement.get("node", "")}
     if joined["state"] == "ready":
         outcome = _outcome(jobs, aid)
-        return {**result, "state": "completed" if outcome["classification"] == "success" else "needs-attention",
-                "result": outcome}
+        return _with_next_leg(route, {
+            **result, "state": "completed" if outcome["classification"] == "success" else "needs-attention",
+            "result": outcome})
     status, metadata = _rows(jobs).get(aid, (status, metadata))
     if status == "done":
         from dispatch_terminal_commit import inspect_owner_completion
         outcome = _outcome(jobs, aid)
         if outcome["classification"] == "success":
-            return {**result, "state": "completed", "result": outcome}
+            return _with_next_leg(route, {**result, "state": "completed", "result": outcome})
         return {**result, "state": "needs-attention", "reason": "owner-settlement-pending",
                 "required_action": outcome["required_action"], "result": outcome,
                 "closure": inspect_owner_completion(jobs, status, metadata),
@@ -838,6 +1195,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             "next_step": "You are the parent session; the owner runs as a separate attempt. Do not kill, "
                 "replace, or redo its work inline. Follow parent_next: end-turn means yield; "
                 "bounded-wait means run parent_next_command once."}
+
+
+def _with_next_leg(route, result):
+    """Attach the route plan's next leg to a `completed` receipt. Information only: it is never
+    written into `parent_next`, `parent_next_command` or `required_action`, and nothing starts it."""
+    if result.get("state") != "completed" or route.get("route_plan") is None:
+        return result
+    leg = RP.next_leg_for_route(route)
+    return {**result, "next_leg": leg} if leg else result
 
 
 def _compose_again(route) -> str:
