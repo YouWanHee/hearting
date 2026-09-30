@@ -243,6 +243,15 @@ class ReplacementTest(unittest.TestCase):
             env,_=self._launch_env('owner',mock.Mock(side_effect=error))
             self.assertEqual(env['AGENT_ARTIFACT_CYCLE_ID'],'cyc-stale')
 
+    def test_owner_replacement_launch_drops_a_stale_parent_output_dir(self):
+        stale={'AGENT_ARTIFACT_PARENT_OUTPUT_DIR':'/stale/parent'}
+        with mock.patch.dict(os.environ,stale):
+            env,_=self._launch_env('owner',lambda *a,**k:{'AGENT_ARTIFACT_CYCLE_ID':'cyc-route'})
+        self.assertNotIn('AGENT_ARTIFACT_PARENT_OUTPUT_DIR',env)
+        with mock.patch.dict(os.environ,stale):
+            env,_=self._launch_env('owner',lambda *a,**k:{'AGENT_ARTIFACT_PARENT_OUTPUT_DIR':'/route/parent'})
+        self.assertEqual(env['AGENT_ARTIFACT_PARENT_OUTPUT_DIR'],'/route/parent')
+
     def test_stage_replacement_launch_env_is_not_touched_by_the_route_cycle(self):
         env,prep=self._launch_env('frame',lambda *a,**k:{'AGENT_ARTIFACT_CYCLE_ID':'cyc-route'})
         prep.assert_not_called()
