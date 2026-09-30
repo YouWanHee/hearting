@@ -145,13 +145,13 @@ class DisplayHistoryTest(SeenTestCase):
         self.assertEqual(len(ids_in(self.candidates(self.sid("two")))), 6)
 
     def test_no_session_means_no_deduplication(self):
-        for placeholder in ("memory-prompt-hook", "opencode-plugin", ""):
+        for placeholder in ("memory-prompt-hook", "opencode-plugin", "codex-hook", ""):
             with self.subTest(placeholder=placeholder):
                 first = self.candidates(placeholder)
                 second = self.candidates(placeholder)
                 self.assertEqual(len(ids_in(first)), 6)
                 self.assertEqual(first, second)
-        for placeholder in ("memory-prompt-hook", "opencode-plugin", ""):
+        for placeholder in ("memory-prompt-hook", "opencode-plugin", "codex-hook", ""):
             self.assertEqual(
                 list(self.seen_dir.glob(f"{session_digest(placeholder)}.*")), [],
                 "a placeholder session must never own a history file")
@@ -346,7 +346,7 @@ class ResetSignalTest(SeenTestCase):
         result = self.mem("_seen-reset", "--session-id", session)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(len(ids_in(self.candidates(session))), 6)
-        for placeholder in ("memory-prompt-hook", ""):
+        for placeholder in ("memory-prompt-hook", "codex-hook", ""):
             self.assertEqual(self.mem("_seen-reset", "--session-id", placeholder).returncode, 0)
 
     def test_codex_session_start_compact_and_clear_call_the_same_helper(self):

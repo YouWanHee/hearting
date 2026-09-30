@@ -108,7 +108,8 @@ CANDIDATE_SEEN_MAX_IDS = 512
 CANDIDATE_SEEN_TTL_SECONDS = 24 * 60 * 60
 CANDIDATE_SEEN_LOCK_WAIT_SECONDS = 1.0
 # Values a bridge passes when it has no real session; they must never share a history.
-CANDIDATE_SEEN_SESSIONLESS = frozenset({"", "memory-prompt-hook", "opencode-plugin"})
+CANDIDATE_SEEN_SESSIONLESS = frozenset(
+    {"", "memory-prompt-hook", "opencode-plugin", "codex-hook"})
 CANDIDATE_HOOK_STDIN_SECONDS = 0.5
 # Optional short body (off unless MEM_CANDIDATE_BODY=1): one clearly leading,
 # newly shown record, at most CANDIDATE_BODY_MAX_CHARS characters, paid for by
