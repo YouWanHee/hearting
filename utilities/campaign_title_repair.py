@@ -1289,6 +1289,8 @@ def auto_title(root: Path, *, campaign_ids: Sequence[str] = (), mode: str = "exp
                     lock_fd = R._try_flock(root, root / AUTO_LOCK_REL)
     finally:
         R._unlock(lock_fd)
+    if passes >= R.MAX_PASSES and result["status"] != "declaration-unreadable":
+        _hand_off_pending(root)  # a seal queued during the last pass: one detached follow-up drains it
     return result
 
 
@@ -1381,32 +1383,49 @@ def backfill_roots(root_declaration: Path, *, dry_run: bool = False, limit: int 
     return {"status": "dry-run" if dry_run else "ok", "roots": rows, "totals": totals}
 
 
+def _spawn_auto(root: Path, campaign_ids: Sequence[str]) -> bool:
+    """Start one detached `auto` child for the campaigns; never raises, waits, or reads the declaration."""
+    try:
+        import artifact_identity
+        import artifact_workflow_group_review as R
+        if auto_disabled() or R.in_test_process():
+            return False
+        if not campaign_ids or any(not isinstance(cid, str) or not artifact_identity.is_well_formed(cid, "campaign")
+                                   for cid in campaign_ids):
+            return False
+        if not (Path(root) / R.CUTOVER_REL).is_file():
+            return False
+        workdir = R.neutral_workdir()
+        argv = [sys.executable, str(Path(__file__).resolve()), "auto", "--artifact-root", str(root)]
+        for campaign_id in campaign_ids:
+            argv += ["--campaign", campaign_id]
+        subprocess.Popen(
+            [*argv, "--mode", "seal"],
+            cwd=str(workdir if workdir.is_dir() else Path(__file__).resolve().parent), env=R._child_env(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        return True
+    except Exception:  # noqa: BLE001 -- a trigger never fails its caller
+        return False
+
+
+def _hand_off_pending(root: Path) -> bool:
+    """At the pass cap, after the lock is released: leave pending markers to exactly one detached follow-up run."""
+    try:
+        pending = _pending_ids(root)
+        return bool(pending) and _spawn_auto(root, pending)
+    except Exception:  # noqa: BLE001 -- the hand-off never fails the run
+        return False
+
+
 def launch_after_seal(root: Path, record: Mapping[str, Any]) -> bool:
     """Spawn one detached `auto` call for a just-sealed cycle's campaign; never raises, waits, or reads.
 
     The caller holds the producer admission lock, so every read of the declaration,
     campaign, and manifests belongs to the detached child.
     """
-    try:
-        import artifact_identity
-        import artifact_workflow_group_review as R
-        if auto_disabled() or R.in_test_process():
-            return False
-        campaign_id = record.get("campaign_id")
-        if not isinstance(campaign_id, str) or not artifact_identity.is_well_formed(campaign_id, "campaign"):
-            return False
-        if not (Path(root) / R.CUTOVER_REL).is_file():
-            return False
-        workdir = R.neutral_workdir()
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "auto", "--artifact-root", str(root),
-             "--campaign", campaign_id, "--mode", "seal"],
-            cwd=str(workdir if workdir.is_dir() else Path(__file__).resolve().parent), env=R._child_env(),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
-        return True
-    except Exception:  # noqa: BLE001 -- a trigger never fails a seal
-        return False
+    campaign_id = record.get("campaign_id") if isinstance(record, Mapping) else None
+    return _spawn_auto(root, [campaign_id] if isinstance(campaign_id, str) else [])
 
 
 def main(argv: Sequence[str] | None = None) -> int:

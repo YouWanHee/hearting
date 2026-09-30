@@ -575,6 +575,32 @@ class AutoSelectionAndWriteTest(AutoBase):
         self.assertEqual([row["status"] for row in self.log_rows()], ["queued", "written", "written"])
         self.assertEqual(self.log_rows()[2]["mode"], "pending")
 
+    def test_seal_queued_during_the_final_pass_is_handed_off_once(self):
+        first = self.seal(key="cap-first", slug="a")
+        late = self.seal(key="cap-late", slug="b")
+        calls = []
+
+        def invoke(prompt):
+            calls.append(prompt)
+            repair._touch_pending(self.root, late["campaign_id"])  # queued while the final pass runs
+            return json.dumps({"display_title": "마지막 패스 제목", "reason": "근거 한 문장"}, ensure_ascii=False), "claude"
+
+        with patch.object(R, "MAX_PASSES", 1), patch.object(R, "in_test_process", return_value=False), \
+                patch.object(repair.subprocess, "Popen") as popen:
+            result = repair.auto_title(self.root, campaign_ids=[first["campaign_id"]], mode="seal", invoke=invoke)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([row["status"] for row in result["targets"]], ["written"])
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[2:], ["auto", "--artifact-root", str(self.root), "--campaign", late["campaign_id"],
+                                    "--mode", "seal"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(repair._pending_ids(self.root), [late["campaign_id"]])  # left for the follow-up run
+        with patch.object(R, "in_test_process", return_value=False), patch.object(repair.subprocess, "Popen") as popen:
+            repair.auto_title(self.root, campaign_ids=[late["campaign_id"]], mode="seal", invoke=fake("따라온 제목"))
+        popen.assert_not_called()  # a run that drains everything hands nothing off
+        self.assertEqual(repair._pending_ids(self.root), [])
+
     def test_pending_marker_for_an_already_titled_campaign_is_cleared(self):
         begun = self.seal(key="stale", slug="a")
         self.assertEqual(self.auto(begun, fake("이미 제목이 있는 캠페인"))["targets"][0]["status"], "written")
