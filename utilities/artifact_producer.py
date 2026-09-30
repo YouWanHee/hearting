@@ -1483,14 +1483,22 @@ def input_source_finder(root: Path, *, parent_cycle_id: Optional[str] = None,
     return find
 
 
-def _composing_anchor(route_id):
-    """The depth-0 session whose route-chain ledger says it composed ``route_id``, else None."""
+def _composing_anchor(route_id, root=None):
+    """The depth-0 session whose route-chain ledger says it composed ``route_id``, else None.
+
+    A route file is written once, so its mtime bounds the ledgers that can hold the compose line.
+    """
     try:
+        created = None
+        try:
+            created = (Path(root) / ".runtime" / "routes" / f"{route_id}.json").stat().st_mtime if root else None
+        except OSError:
+            pass
         tools_dir = Path(__file__).resolve().parents[1] / "tools"
         if str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))
         from fleet import route_chain
-        return route_chain.composing_anchor(route_id)
+        return route_chain.composing_anchor(route_id, not_before=created)
     except Exception:
         return None
 
@@ -1534,7 +1542,7 @@ def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str,
     if group_id:
         env["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"] = group_id
     if route_chain_identity is None and route:
-        route_chain_identity = _composing_anchor(route.get("route_id"))
+        route_chain_identity = _composing_anchor(route.get("route_id"), root)
     parent_output = _parent_output_dir(root, record, route, route_chain_identity)
     if parent_output:
         env["AGENT_ARTIFACT_PARENT_OUTPUT_DIR"] = parent_output

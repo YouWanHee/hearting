@@ -270,8 +270,8 @@ interview (§0.4): one route question in the person's words — yes-no when the
 two proposals are equal, choice when they differ, "다르게" being the existing
 off-menu answer — plus a `route_proposals` field `{question, by_option}` that
 maps each option label to the proposal it selects; a start-approval question for
-each approval part, yes-no with the approving option first and an id equal to
-the brief's section 7 id. Together with the direction questions they stay inside
+each approval part, yes-no with the approving option marked `"approves": true`
+and an id equal to the brief's section 7 id. Together with the direction questions they stay inside
 `QUESTION_CAP`; offer only routes a brief proposed. After the answers, the
 same `start` records the decision, compiles and starts the first leg only
 (`--route-plan <record>#0`, `--parent-cycle <frame cycle>`), and closes the frame

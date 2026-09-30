@@ -480,6 +480,7 @@ def routed_interview(**overrides):
     proposal = {"summary": "Set it up and run it", "legs": [LEG],
                 "entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-cap"}]}
     interview["route_proposals"] = {"question": "q-scope", "by_option": {"Both (recommended)": proposal}}
+    interview["questions"][1]["options"][0]["approves"] = True
     interview.update(overrides)
     return interview
 
@@ -527,6 +528,45 @@ class RouteProposalsTest(unittest.TestCase):
             interview = routed_interview()
             interview["route_proposals"]["by_option"]["Both (recommended)"]["entry_approvals"] = [bad]
             self.assertTrue(any("expected exactly" in e for e in FI.validate(interview)))
+
+    def test_an_approval_question_marks_exactly_one_option_as_approving(self):
+        for label, mark in (("none marked", lambda o: None),
+                            ("both marked", lambda o: [x.update(approves=True) for x in o]),
+                            ("non-boolean", lambda o: o[0].update(approves="yes")),
+                            ("non-boolean on the other option", lambda o: o[1].update(approves=1))):
+            with self.subTest(label):
+                interview = routed_interview()
+                options = interview["questions"][1]["options"]
+                del options[0]["approves"]
+                mark(options)
+                errors = FI.validate(interview)
+                self.assertTrue(any("q-cap" in e and "approves" in e for e in errors), errors)
+
+    def test_the_approving_option_may_come_second_and_the_declining_one_first(self):
+        interview = routed_interview()
+        options = interview["questions"][1]["options"]
+        options.reverse()                                           # "No, fewer" first, the marked "Yes" second
+        self.assertEqual(FI.validate(interview, intensity="standard"), [])
+        answers = good_answers(interview)
+        proposal = FI.route_choice(interview, answers)["proposal"]
+        answers["answers"]["q-cap"]["choice"] = 0                   # the declining option, now first
+        row = FI.approvals_given(interview, answers, proposal)[0]
+        self.assertEqual((row["label"], row["accepted"]), ("No, fewer", False))
+        answers["answers"]["q-cap"]["choice"] = 1                   # the approving option, now second
+        row = FI.approvals_given(interview, answers, proposal)[0]
+        self.assertEqual((row["label"], row["accepted"]), ("Yes (recommended)", True))
+        answers["answers"]["q-cap"]["choice"] = "Yes (recommended)"
+        self.assertTrue(FI.approvals_given(interview, answers, proposal)[0]["accepted"])
+        answers["answers"]["q-cap"]["choice"] = None
+        self.assertFalse(FI.approvals_given(interview, answers, proposal)[0]["accepted"])
+
+    def test_approves_is_not_required_outside_approval_questions(self):
+        interview = routed_interview()
+        self.assertNotIn("approves", interview["questions"][0]["options"][0])      # the route question
+        self.assertEqual(FI.validate(interview), [])
+        plain = good_interview()                                    # no route_proposals at all
+        self.assertEqual(FI.validate(plain), [])
+        self.assertFalse(any("approves" in json.dumps(q) for q in plain["questions"]))
 
     def test_proposal_metadata_is_not_scanned_for_harness_words_but_the_questions_still_are(self):
         interview = routed_interview()

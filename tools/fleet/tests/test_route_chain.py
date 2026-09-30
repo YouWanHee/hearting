@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -130,6 +131,35 @@ class ComposingAnchorTest(EnvTmpTestCase):
         self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}))
         self.assertEqual(route_chain.composing_anchor(
             self.ROUTE["route_id"], {"CLAUDE_CODE_SESSION_ID": "sess-b"}), ("claude", "sess-b"))
+
+
+    def test_an_older_composing_ledger_is_found_past_any_number_of_newer_unrelated_ones(self):
+        """The route's creation time, not a count of recent ledgers, bounds the scan."""
+        created = time.time() - 10_000
+        self.put("composer", "compose")
+        self._age("composer", created + 100)                                  # after the route, before the rest
+        self.put("older-than-route", "compose")
+        self._age("older-than-route", created - 500)                          # cannot hold this route's compose
+        other = {"route_id": "rt-" + "c" * 32, "artifact_root": "/x", "campaign_key": "k"}
+        for n in range(route_chain.ANCHOR_SCAN_FILES + 6):
+            self.put(f"unrelated-{n}", "compose", route=other)
+            self._age(f"unrelated-{n}", created + 1_000 + n)
+        route_id = self.ROUTE["route_id"]
+        self.assertEqual(route_chain.composing_anchor(route_id, {}, not_before=created), ("claude", "composer"))
+        # without the route's creation time the old count bound stays, and misses it
+        self.assertIsNone(route_chain.composing_anchor(route_id, {}))
+        # a ledger last written before the route existed is not scanned, even when it carries the line
+        self.assertIsNone(route_chain.composing_anchor(route_id, {}, not_before=created + 200))
+
+    def test_two_newer_ledgers_claiming_the_route_still_give_no_anchor(self):
+        created = time.time() - 10_000
+        for sid in ("sess-a", "sess-b"):
+            self.put(sid, "compose")
+            self._age(sid, created + 50)
+        self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}, not_before=created))
+
+    def _age(self, session_id, mtime):
+        os.utime(route_chain.ledger_path("claude", session_id), (mtime, mtime))
 
 
 class BuildLineTest(EnvTmpTestCase):

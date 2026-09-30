@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -519,6 +520,27 @@ class SameFlowLedgerTest(SourceBase):
         with self.session("worker-D", 1):
             self.assertIsNone(self.chain.writer_identity())
             self.assertEqual(self.chain.composing_anchor(route["route_id"]), ("claude", "sess-A"))
+
+    def test_a163f_4d_an_older_composing_ledger_is_found_past_more_than_sixty_four_newer_unrelated_ones(self):
+        """The composing session is found by the route's own creation time, not by how many ledgers are newer."""
+        y = self.flow_cycle("sess-A")
+        self.flow_cycle("sess-B")                      # a newer same-capability cycle: the wrong answer if the anchor is missed
+        with self.session("sess-A"):
+            route, route_file = self.route("direct", slug="next-a", campaign_key="mixed")
+            R._record_route_chain(route, str(route_file), "compose")
+        now = time.time()
+        os.utime(route_file, (now - 2000, now - 2000))                         # the route was written long ago
+        with self.session("sess-A"):
+            os.utime(self.chain.ledger_path("claude", "sess-A"), (now - 1000, now - 1000))
+        unrelated = {"route_id": "rt-" + "9" * 32, "artifact_root": str(self.root), "campaign_key": "mixed"}
+        for n in range(self.chain.ANCHOR_SCAN_FILES + 6):
+            sid = f"busy-{n}"
+            with self.session(sid):
+                self.assertTrue(self.chain.append("claude", sid, self.chain.build_line(
+                    unrelated, event="compose", harness="claude", session_id=sid, route_file="/x/route.json")))
+        expected = str((Path(y["cycle_dir"]) / "artifacts").resolve())
+        with self.session(None):
+            self.assertEqual(P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)[PARENT_VAR], expected)
 
     def test_a163f_4c_two_sessions_claiming_one_route_and_a_start_only_line_give_no_anchor(self):
         route = {"route_id": "rt-" + "1" * 32, "artifact_root": str(self.root), "campaign_key": "mixed"}

@@ -882,7 +882,8 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         proposal = {"summary": "Set the experiment up and run it", "legs": [leg],
                     "entry_approvals": [{"key": "full-run", "leg": 0, "question": "run-ok"}]}
         ask = lambda qid, text, labels: {"id": qid, "topic": qid, "question": text, "kind": "yes-no", "recommended": 0,
-                                         "options": [{"label": label, "means": label} for label in labels],
+                                         "options": [{"label": label, "means": label, **({"approves": True} if at == 0 else {})}
+                                                     for at, label in enumerate(labels)],
                                          "why": "Only you can decide this."}
         question = {**self.question, "questions": [
             ask("go", "이 순서로 진행할까요?", ["예, 이 순서로", "아니요, 다르게"]),
@@ -922,6 +923,20 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         off.write_text(json.dumps(answers))
         intent = Path(self.step(interview=self.question_file, answers=off)["intent_file"]).read_text()
         self.assertIn("No route was selected (a different direction was chosen)", intent)
+
+    def test_an_approval_question_without_exactly_one_approving_option_is_refused_before_a_gate_is_raised(self):
+        for label, marks in (("none marked", (False, False)), ("both marked", (True, True))):
+            with self.subTest(label):
+                self.setUp()
+                question, answer = self.routed()
+                for option, mark in zip(question["questions"][1]["options"], marks):
+                    option.pop("approves", None)
+                    if mark:
+                        option["approves"] = True
+                self.question_file.write_text(json.dumps(question))
+                with self.assertRaisesRegex(ValueError, "frame-input-invalid: approval question 'run-ok'"):
+                    self.step(interview=self.question_file, answers=answer)
+                self.assertEqual(self.calls, [])
 
     def test_a_route_proposals_reference_that_points_nowhere_is_refused_before_a_gate_is_raised(self):
         question, answer = self.routed()

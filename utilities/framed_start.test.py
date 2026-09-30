@@ -59,9 +59,11 @@ def brief(legs, *, summary="Do the work", approvals=None, section=True, tail="")
     return head + "## 8. 경로 조립 제안\n\n```yaml\n" + text + "```\n" + tail
 
 
-def question(qid, *, kind="yes-no", topic=None, labels=("네", "아니요")):
+def question(qid, *, kind="yes-no", topic=None, labels=("네", "아니요"), approves=None):
+    """`approves` is the index of the option that approves (an approval question carries exactly one)."""
     return {"id": qid, "topic": topic or qid, "question": f"{qid}?", "kind": kind,
-            "options": [{"label": label, "means": label} for label in labels],
+            "options": [{"label": label, "means": label, **({"approves": True} if at == approves else {})}
+                        for at, label in enumerate(labels)],
             "recommended": 0, "why": "only you can say"}
 
 
@@ -301,11 +303,11 @@ class NoneEndingTest(StartBase):
 class ApprovalTest(StartBase):
     """Start approvals: taken in the one interview, valid only for the leg and parts the user saw."""
 
-    def lab(self, *, approval=True, approval_choice=None):
+    def lab(self, *, approval=True, approval_choice=None, labels=("예, 지금 시작", "아니요, 나중에"), approves=0):
         approvals = [{"key": "full-run", "leg": 0, "question": "run-ok"}] if approval else []
         self.set_briefs(LAB_SETUP, LAB_SETUP, approvals=approvals)
         self.set_interview({"legs": [LAB_SETUP], "entry_approvals": approvals},
-                           extra_questions=[question("run-ok", labels=("예, 지금 시작", "아니요, 나중에"))] if approval else (),
+                           extra_questions=[question("run-ok", labels=labels, approves=approves)] if approval else (),
                            approval_choice=approval_choice)
 
     def test_a164_10_a_yes_to_the_approval_starts_the_leg_and_records_what_was_approved(self):
@@ -325,6 +327,33 @@ class ApprovalTest(StartBase):
         given = self.record()["decision"]["approvals"] if False else None
         self.assertEqual(self.record()["decision"]["reason"], "approval-missing:full-run")
 
+    def test_an_approving_option_that_is_second_starts_the_leg_when_chosen(self):
+        self.lab(labels=("아니요, 나중에", "예, 지금 시작"), approves=1, approval_choice=1)
+        result = self.settle()
+        self.assertEqual(result["state"], "running", result)
+        given = self.record()["decision"]["approvals"]["given"]
+        self.assertEqual([(row["label"], row["accepted"]) for row in given], [("예, 지금 시작", True)])
+        self.assertEqual(len(self.leg_routes()), 1)
+
+    def test_a_declining_option_that_is_first_does_not_approve_when_chosen(self):
+        self.lab(labels=("아니요, 나중에", "예, 지금 시작"), approves=1, approval_choice=0)
+        NoneEndingTest.assert_none(self, "approval-missing:full-run")
+        self.assertEqual(self.record()["decision"]["reason"], "approval-missing:full-run")
+        self.assertEqual(self.leg_calls, [])
+
+    def test_a_question_with_no_marked_option_or_two_marked_options_starts_nothing(self):
+        for label, marks in (("none marked", None), ("both marked", "both")):
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                self.lab(approves=marks)
+                if marks == "both":
+                    for option in self.interview["questions"][1]["options"]:
+                        option["approves"] = True
+                self.assertTrue(any("approves" in e for e in FI.validate(self.interview)))
+                NoneEndingTest.assert_none(self, "approval-missing:full-run")
+                self.assertEqual(self.leg_calls, [])
+
     def test_a_leg_with_an_approval_part_and_no_approval_asked_ends_as_none(self):
         self.lab(approval=False)
         NoneEndingTest.assert_none(self, "approval-missing:full-run")
@@ -333,7 +362,7 @@ class ApprovalTest(StartBase):
         approvals = [{"key": "full-run", "leg": 1, "question": "run-ok"}]
         self.set_briefs([DIRECT, LAB_SETUP], [DIRECT, LAB_SETUP], approvals=approvals)
         self.set_interview({"legs": [DIRECT, LAB_SETUP], "entry_approvals": approvals},
-                           extra_questions=[question("run-ok", labels=("예", "아니요"))])
+                           extra_questions=[question("run-ok", labels=("예", "아니요"), approves=0)])
         result = self.settle()                     # leg 0 is direct: no approval part, so it starts
         self.assertEqual(result["state"], "inline", result)
         given = self.record()["decision"]["approvals"]["given"]

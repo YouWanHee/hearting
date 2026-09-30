@@ -119,8 +119,8 @@ MAX_ANSWERS_BYTES = (
 NONE_SENTINEL = "none"
 
 
-# The yes-no option that approves is the first one; choosing the other option declines.
-APPROVE_INDEX = 0
+# An approval question marks its approving option with `"approves": true` (exactly one of its two
+# options); choosing the other option declines. Position carries no meaning.
 ROUTE_PROPOSAL_KEYS = frozenset({"question", "by_option"})
 APPROVAL_FIELDS = frozenset({"key", "leg", "question"})
 
@@ -309,6 +309,7 @@ def _route_proposal_errors(interview: dict, questions: list) -> list[str]:
     if not isinstance(by_option, dict) or not by_option:
         return ["route_proposals.by_option: must map at least one option label to a proposal"]
     errors: list[str] = []
+    approval_ids: set[str] = set()
     labels = _labels(table[qid])
     for label, proposal in by_option.items():
         where = f"route_proposals.by_option[{label!r}]"
@@ -334,6 +335,23 @@ def _route_proposal_errors(interview: dict, questions: list) -> list[str]:
                 errors.append(f"{at}.question: no such approval question {approval['question']!r}")
             elif _text(asked.get("kind")) != "yes-no":
                 errors.append(f"{at}.question: an approval question is yes-no")
+            else:
+                approval_ids.add(approval["question"])
+    for asked_id in sorted(approval_ids):
+        errors += _approves_errors(asked_id, table[asked_id])
+    return errors
+
+
+def _approves_errors(qid: str, question: dict) -> list[str]:
+    """An approval question marks the one option that approves with `"approves": true`."""
+    options = [o for o in question.get("options", []) if isinstance(o, dict)] \
+        if isinstance(question.get("options"), list) else []
+    errors = [f"approval question {qid!r}: option {_text(o.get('label'))!r} has a non-boolean `approves`"
+              for o in options if "approves" in o and not isinstance(o["approves"], bool)]
+    marked = sum(1 for o in options if o.get("approves") is True)
+    if marked != 1:
+        errors.append(f"approval question {qid!r}: mark exactly one option `\"approves\": true` "
+                      f"(found {marked})")
     return errors
 
 
@@ -372,9 +390,18 @@ def route_choice(interview: dict, answers: dict):
     return {"state": chosen["state"], "label": None, "proposal": None}
 
 
+def _approves(question, index) -> bool:
+    """True only for the one option marked `approves: true`; a question with no mark or two marks approves nothing."""
+    options = question.get("options") if isinstance(question, dict) else None
+    if not isinstance(options, list) or not isinstance(index, int) or not 0 <= index < len(options):
+        return False
+    marked = [at for at, option in enumerate(options) if isinstance(option, dict) and option.get("approves") is True]
+    return marked == [index]
+
+
 def approvals_given(interview: dict, answers: dict, proposal) -> list:
     """Each `entry_approvals` row of the selected proposal with the answer to its question:
-    `{key, leg, question, label, accepted}`. Only an explicit first-option yes accepts."""
+    `{key, leg, question, label, accepted}`. Only the option marked `approves: true` accepts."""
     if not isinstance(proposal, dict):
         return []
     table = _question_table(interview.get("questions") or [])
@@ -384,7 +411,7 @@ def approvals_given(interview: dict, answers: dict, proposal) -> list:
         question = table.get(approval.get("question"))
         chosen = resolve_answer(question, given.get(approval.get("question"))) if question else {"state": "unanswered", "label": None, "index": None}
         rows.append({"key": approval.get("key"), "leg": approval.get("leg"), "question": approval.get("question"),
-                     "label": chosen["label"], "accepted": chosen["state"] == "chosen" and chosen["index"] == APPROVE_INDEX})
+                     "label": chosen["label"], "accepted": chosen["state"] == "chosen" and _approves(question, chosen["index"])})
     return rows
 
 

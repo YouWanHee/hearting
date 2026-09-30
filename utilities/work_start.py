@@ -1112,7 +1112,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                             "proposal (or proposal:none(reason)), whether the two are equal, and the start-approval parts "
                             "in scope. Write one route question and map its option labels to proposals in "
                             "route_proposals {question, by_option}; put each start-approval question beside it "
-                            "(the approving option first). Do not invent a route no brief proposed."}
+                            "(mark its approving option \"approves\": true). Do not invent a route no brief proposed."}
             result.update(frame_interview=step, gate="frame-review", task=request["text"])
             if step["state"] != "released":
                 return {**result, **step}

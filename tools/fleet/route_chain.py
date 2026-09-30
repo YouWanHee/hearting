@@ -80,7 +80,11 @@ def writer_identity(environ=None):
     return harness, session_id
 
 
+# Without the route's creation time the lookup keeps to this many of the newest ledgers.
 ANCHOR_SCAN_FILES = 64
+# A ledger that composed a route was appended to at or after the route was written; this absorbs
+# the timestamp granularity and small clock differences between the route and the state volumes.
+ANCHOR_MTIME_SLACK = 5.0
 
 
 def _composes(harness, session_id, route_id):
@@ -88,13 +92,17 @@ def _composes(harness, session_id, route_id):
                for line in read_tail(harness, session_id, max_bytes=1024 * 1024))
 
 
-def composing_anchor(route_id, environ=None):
+def composing_anchor(route_id, environ=None, not_before=None):
     """``(harness, session_id)`` of the depth-0 session whose ledger says it composed ``route_id``.
 
     The answer comes from ledger evidence, never from the asking process: a worker, a
     supervisor, or a session that only started the route is not the composing session. Its
-    own ledger is tried first; otherwise exactly one other recent ledger must carry a
-    composing line for the route. No evidence, or more than one session, is None.
+    own ledger is tried first; otherwise exactly one other ledger must carry a composing line
+    for the route. No evidence, or more than one session, is None.
+
+    ``not_before`` is the route's creation time (its file's mtime): a ledger last modified
+    before it cannot hold the route's compose line, so every later ledger is scanned. Without
+    it only the ``ANCHOR_SCAN_FILES`` most recently modified ledgers are.
     """
     if not isinstance(route_id, str) or not route_id:
         return None
@@ -115,8 +123,12 @@ def composing_anchor(route_id, environ=None):
                 recent.append((os.stat(os.path.join(directory, name)).st_mtime, harness, name[:-len(".jsonl")]))
             except OSError:
                 continue
+    if isinstance(not_before, (int, float)) and not isinstance(not_before, bool):
+        candidates = [row for row in recent if row[0] >= not_before - ANCHOR_MTIME_SLACK]
+    else:
+        candidates = sorted(recent, reverse=True)[:ANCHOR_SCAN_FILES]
     found = set()
-    for _mtime, harness, session_id in sorted(recent, reverse=True)[:ANCHOR_SCAN_FILES]:
+    for _mtime, harness, session_id in candidates:
         if (harness, session_id) != own and _composes(harness, session_id, route_id):
             found.add((harness, session_id))
     return next(iter(found)) if len(found) == 1 else None
