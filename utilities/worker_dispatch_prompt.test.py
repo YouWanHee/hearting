@@ -346,5 +346,91 @@ class ReleasedTaskPromptTest(unittest.TestCase):
             WB.released_task_prompt(self.args())
 
 
+class UnitBootstrapPromptTest(unittest.TestCase):
+    """A declared unit gets the same bootstrap section from all three adapters, in the
+    same place; a unit without a declaration gets none."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(self._tmp.name).resolve()
+        self.worktree = tmp / "proj-lab"
+        self.worktree.mkdir()
+        self.artifact_root = tmp / ".agent_reports"
+        cycle = self.artifact_root / "campaigns" / "camp" / "2026-01-01_old"
+        (cycle / "artifacts" / "experiments" / "e1").mkdir(parents=True)
+        (cycle / "manifest.json").write_text("{}", encoding="utf-8")
+        self.exemplar = cycle / "artifacts" / "experiments" / "e1" / "REPORT.md"
+        self.exemplar.write_text("# Old report\n" + "x" * 2048, encoding="utf-8")
+        store = tmp / "store"
+        store.mkdir()
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ARTIFACT_")}
+        env.update(MEM_STORE=str(store), MEM_RECALL_EVENTS=str(tmp / "events.jsonl"),
+                   MEM_RECALL_RECEIPTS=str(tmp / "receipts"))
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        subprocess.run(
+            [sys.executable, str(ROOT / "tools/memory/mem.py"), "add", "durable", "feedback",
+             "Always ship the report as HTML with tables and audio players.", "--scope", "global",
+             "--headline", "report format html deliverable preference"],
+            check=True, capture_output=True, cwd=self.worktree)
+
+    def _render(self, harness, unit, gate, node, worker_type="stage", capability="autopilot-lab"):
+        wrapper, model, _suffix = ADAPTERS[harness]
+        spec = importlib.util.spec_from_file_location(f"bootstrap_{harness}", wrapper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        args = module.parser().parse_args([
+            "--worktree", str(self.worktree), "--slug", "bootstrap", "--capability", capability,
+            "--capability-mode", "eval", "--intensity", "standard", "--dispatch-depth", "2",
+            "--worker-type", worker_type, "--unit", unit, "--completion-gate", gate,
+            "--prompt-text", "Write the lab evaluation report", "--jobs", str(self.worktree / "jobs.log"), *model])
+        args.attempt_id = "att-bootstrap"
+        args.route_id = None
+        args.route_node = node
+        args.artifact_root = str(self.artifact_root)
+        render = module.prompt if harness == "opencode" else module.dispatch_prompt
+        return render(args)[0]
+
+    @staticmethod
+    def _section(prompt):
+        start = prompt.find("Unit bootstrap material")
+        return prompt[start:prompt.find("Assignment:", start)] if start >= 0 else ""
+
+    def test_three_adapters_carry_the_same_bootstrap_section(self):
+        sections = {}
+        for harness in ADAPTERS:
+            with self.subTest(harness=harness):
+                prompt = self._render(harness, "editorial/report", "lab-report", "report")
+                section = self._section(prompt)
+                sections[harness] = section
+                self.assertIn("assigned_contract: autopilot-lab", prompt)
+                self.assertIn("eval-procedure.md", prompt)
+                self.assertIn(str(self.exemplar), section)
+                self.assertIn("Always ship the report as HTML", section)
+                self.assertTrue(section.endswith("\n\n"))
+                self.assertLess(prompt.index("Unit bootstrap material"), prompt.index("Assignment:"))
+        self.assertEqual(len(set(sections.values())), 1)
+        self.assertTrue(next(iter(sections.values())))
+
+    def test_undeclared_stage_prompt_unchanged(self):
+        for harness in ADAPTERS:
+            for worker_type, unit, gate, node in (("stage", "qa/test", "code-test", "test"),
+                                                  ("review", "qa/test", "lab-independent-verify", "independent-verify")):
+                with self.subTest(harness=harness, worker_type=worker_type):
+                    prompt = self._render(harness, unit, gate, node, worker_type=worker_type)
+                    self.assertNotIn("Unit bootstrap material", prompt)
+                    self.assertNotIn("Always ship the report", prompt)
+
+    def test_catalog_declarations(self):
+        for unit in ("editorial/report", "research/research-survey", "editorial/polish"):
+            self.assertTrue(WB.unit_bootstrap_declaration(ROOT, unit), unit)
+        self.assertEqual(WB.unit_bootstrap_declaration(ROOT, "research/research-survey")["gates"], ("research-report",))
+        self.assertEqual(WB.unit_bootstrap_declaration(ROOT, "editorial/polish")["gates"], ("audit-report",))
+        for unit in ("qa/test", "dev/backend", "material/figure-gen", "_kernel/owner"):
+            self.assertEqual(WB.unit_bootstrap_declaration(ROOT, unit), {}, unit)
+
+
 if __name__ == "__main__":
     unittest.main()

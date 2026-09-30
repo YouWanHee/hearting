@@ -640,7 +640,7 @@
   },
   "editorial/report": {
    "family": "editorial",
-   "role": "fast writer",
+   "role": "deep editor",
    "worker_type": "stage",
    "floor": "low"
   },

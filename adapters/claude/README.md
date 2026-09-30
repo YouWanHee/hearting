@@ -83,7 +83,7 @@ The Claude Code adapter maps portable roles from `core/CONVENTIONS.md §2` to co
 | `fast reviewer` | `sonnet` | Broad cost-efficient coverage, typo, style, cross-reference, structure, and verbatim checks |
 | `fast fact-checker` | `sonnet` | Narrow citation, venue, year, metric, and lineage checks against source artifacts |
 | `fast writer` | `sonnet` | Short mechanical synthesis of verified artifacts |
-| `deep editor` | `opus` | Reader-facing prose that must read well: final reports, polish, translation |
+| `deep editor` | `opus` | Reader-facing prose written for a person to read: final reports, polish, translation |
 | `deep reviewer` | `opus` | methodology, domain expertise, completeness, safety/security, architecture risk |
 | `deep maker` | `opus` | Planning, research synthesis, and visual/editorial work requiring high judgment |
 | `deep orchestrator` | `opus` xhigh | Stage gates, failover, and evidence judgment for standard+ dispatch-depth-1 ownership |

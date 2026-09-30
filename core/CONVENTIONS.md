@@ -109,7 +109,7 @@ Shared contracts use model roles rather than concrete model names. Vendor-specif
 | `deep reviewer` | High-reasoning domain and methodology judgment | methodology, safety/security, architecture risk, standard+ quality review |
 | `fast fact-checker` | Narrow comparison of claims against source artifacts with limited creativity | citation, venue, year, metric, lineage, table values |
 | `fast writer` | Low-cost assembly of verified artifacts into a user-facing summary | Short mechanical synthesis |
-| `deep editor` | Reader-facing prose that must read well | Final reports, polish, translation |
+| `deep editor` | Reader-facing prose written for a person to read | Final reports, polish, translation |
 | `deep maker` | Generation requiring aesthetic, strategic, architectural, or domain judgment | Planning, research synthesis, visual design, editorial rewrite |
 | `deep orchestrator` | High-judgment conductor for stage gates, failover, and evidence synthesis | Standard+ dispatch-depth-1 capability owner |
 | `external adversary` | Hostile review through an independent engine or runtime | Adversarial verification |

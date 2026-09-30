@@ -3,7 +3,7 @@
   "canonical_manifest": "harness-manifest.json",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:7fc152f5d99a5346207970c9ab5af660943220715a869110ac5c916557ea6853",
+    "digest": "sha256:c34241beee25396e50996c2f96932cd50eebf35772459b8f3bc96de7722e67a5",
     "capabilities": 12,
     "recipes": 28
   },
@@ -433,7 +433,7 @@
     },
     "editorial/report": {
       "family": "editorial",
-      "role": "fast writer",
+      "role": "deep editor",
       "worker_type": "stage",
       "floor": "low"
     },

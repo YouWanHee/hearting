@@ -112,7 +112,7 @@ from owner_route_binding import (  # noqa: E402
     validate_runtime_requirements,
 )
 from worker_bootstrap import (
-    ARTIFACT_PRODUCER_CYCLE_ENV, artifact_cycle_environment, artifact_context_prompt, released_task_prompt, assignment_prompt, contract_read_prompt,
+    ARTIFACT_PRODUCER_CYCLE_ENV, artifact_cycle_environment, artifact_context_prompt, released_task_prompt, assignment_prompt, contract_read_prompt, unit_bootstrap_prompt,
     assigned_contract,
     render_worker_bootstrap,
     runtime_progress_prompt,
@@ -837,6 +837,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"{heartbeat}"
         f"{stage_session_prompt(args)}"
         f"{released_task_prompt(args)}"
+        f"{unit_bootstrap_prompt(args, task, os.environ)}"
         f"{assignment_prompt(args, task, os.environ)}"
         "End with the kernel's exact three-line handoff as the entire final message — "
         "no summary sentence before it, nothing after it.\n",
