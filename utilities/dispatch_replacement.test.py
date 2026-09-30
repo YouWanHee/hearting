@@ -781,4 +781,192 @@ class ReplacementTest(unittest.TestCase):
         with self.assertRaises(D.DispatchContractError) as caught:R.admission(self.jobs,spawned,second)
         self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
 
+    # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
+    def _owner(self,**changes):
+        self.write({**self.meta,'worker_type':'owner',**changes})
+
+    def _capacity_owner(self):
+        self._owner(note='dead-capacity',failure_class='capacity')
+
+    def _successor(self,record,parent,status='done',**changes):
+        """The registered replacement row of `record`, sealed like the adapter seals it."""
+        aid=record['replacement_attempt_id']
+        source=R._rows(self.jobs.read_text().splitlines())[record['original_attempt_id']][1]
+        replay=R.launch_input(self.jobs,record['original_attempt_id'],source)
+        args=SimpleNamespace(**vars(self.args));args.attempt_id=aid
+        args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        meta={k:v for k,v in parent.items() if k not in ('note','failure_class','launch_outcome','replacement_input_digest')}
+        meta.update(attempt_id=aid,automatic_retry_of=record['original_attempt_id'],launch_claimed='1',
+                    replacement_family_id=record['family_id'],replacement_original_attempt_id=record['original_attempt_id'],
+                    replacement_ordinal='1',replacement_claim_digest=R._digest(record),**changes)
+        meta.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
+        self.write(meta,status,append=True)
+        return meta
+
+    def _die(self,meta,**changes):
+        """Rewrite a successor row as terminal with the given death."""
+        rows=[l for l in self.jobs.read_text().splitlines()
+              if not D.row_has_attempt(l.split('\t')[5],meta['attempt_id'])]
+        self.jobs.write_text('\n'.join(rows)+'\n')
+        meta={**meta,**changes};self.write(meta,append=True);return meta
+
+    def test_death_kind_names_why_a_row_may_be_replaced(self):
+        row=lambda note='',status='done',**m:([ 'now',status],{**self.meta,'worker_type':'owner','note':note,**m})
+        self.assertEqual(R.death_kind(*row('dead-exact-pid')),'silent')
+        self.assertEqual(R.death_kind(*row('dead-capacity',failure_class='capacity')),'capacity')
+        self.assertEqual(R.death_kind(*row('dead-worker-fail',failure_class='capacity')),'capacity')
+        for case in (row('dead-capacity',status='cancelled'),row('dead-capacity',status='killed'),
+                     row('cancelled-by-user'),row('dead-worker-fail'),
+                     (['now','done'],{**self.meta,'worker_type':'frame','note':'dead-capacity'}),
+                     (['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity'})):
+            self.assertIsNone(R.death_kind(*case),case)
+
+    def test_capacity_death_with_invalid_capacity_terminal_is_settled_absent(self):
+        self.absent.stop()
+        def settle(state,failure_class):
+            return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
+                              return_value={'state':state,'failure_class':failure_class})
+        self._capacity_owner()
+        with settle('invalid','capacity'):
+            self.assertEqual(self.claim()['proof']['death_kind'],'capacity')
+        for state,failure in (('invalid','contract-violation'),('valid','pass')):
+            with self.subTest(state=state),settle(state,failure):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.death_proof(*R._rows(self.jobs.read_text().splitlines())['att-source'])
+                self.assertEqual(caught.exception.reason,'replacement-result-settlement-required')
+        # a silent death is settled only by an absent result, capacity evidence does not help it
+        self._owner(note='dead-exact-pid')
+        with settle('invalid','capacity'),self.assertRaises(D.DispatchContractError) as caught:
+            self.claim()
+        self.assertEqual(caught.exception.reason,'replacement-result-settlement-required')
+
+    def test_capacity_replacement_death_opens_a_new_capacity_family_not_exhaustion(self):
+        self._capacity_owner()
+        first=self.claim()
+        self.assertIn('after_capacity',first['logical_node'])
+        one=self._successor(first,self.meta|{'worker_type':'owner'})
+        # the replacement stops at a limit too: a new family for a new pause
+        one=self._die(one,note='dead-capacity',failure_class='capacity')
+        second=R.claim(self.jobs,one['attempt_id'])
+        self.assertNotEqual(second['family_id'],first['family_id'])
+        self.assertEqual(second['logical_node']['after_capacity'],one['attempt_id'])
+        self.assertEqual(second['original_attempt_id'],one['attempt_id'])
+        self.assertEqual(R.claim(self.jobs,one['attempt_id']),second)  # replay, not a third claim
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),2)
+
+    def test_silent_budget_is_one_even_after_capacity_generations(self):
+        self._capacity_owner()
+        first=self.claim()
+        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
+        second=R.claim(self.jobs,one['attempt_id'])
+        two=self._die(self._successor(second,one),note='dead-exact-pid',failure_class='contract')
+        silent=R.claim(self.jobs,two['attempt_id'])     # the one silent replacement is still there
+        self.assertNotIn('after_capacity',silent['logical_node'])
+        three=self._die(self._successor(silent,two),note='dead-exact-pid',failure_class='contract')
+        with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,three['attempt_id'])
+        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        # and the reverse order: the silent budget used first is not refilled by a later pause
+        self.jobs.write_text('');import shutil;shutil.rmtree(R._directory(self.jobs)/'claims');shutil.rmtree(R._directory(self.jobs)/'by-source')
+        self._owner(note='dead-exact-pid')
+        silent=self.claim()
+        one=self._die(self._successor(silent,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
+        pause=R.claim(self.jobs,one['attempt_id'])
+        self.assertIn('after_capacity',pause['logical_node'])
+        two=self._die(self._successor(pause,one),note='dead-exact-pid',failure_class='contract')
+        with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,two['attempt_id'])
+        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+
+    def test_replacement_row_as_source_binds_through_index_not_row(self):
+        self._capacity_owner()
+        first=self.claim()
+        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
+        second=R.claim(self.jobs,one['attempt_id'])
+        row=R._rows(self.jobs.read_text().splitlines())[one['attempt_id']][1]
+        self.assertEqual(row['replacement_family_id'],first['family_id'])       # its own creation, untouched
+        self.assertEqual(R.source_reservation(self.jobs,one['attempt_id'])['family_id'],second['family_id'])
+        self.assertEqual(R.source_binding(self.jobs,row),
+                         (second['family_id'],second['replacement_attempt_id'],R._digest(second)))
+        source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        self.assertEqual(R.source_binding(self.jobs,source),
+                         (first['family_id'],first['replacement_attempt_id'],R._digest(first)))
+        self.assertIsNone(R.source_binding(self.jobs,{**row,'attempt_id':'att-never-a-source'}))
+
+    def test_capacity_wait_writes_nothing(self):
+        self._capacity_owner()
+        def files():return sorted(str(p.relative_to(R._directory(self.jobs))) for p in R._directory(self.jobs).rglob('*') if p.is_file())
+        before=(files(),self.jobs.read_bytes())
+        result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual((result['state'],result['reason'],result['source_attempt_id']),
+                         ('needs-attention','replacement-capacity-wait','att-source'))
+        hold={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True)
+        self.assertEqual((result['reason'],result['retry_at']),('replacement-capacity-wait','2100-01-01T00:00:00Z'))
+        # the hold also stops an ordinary silent replacement before any claim
+        self._owner(note='dead-exact-pid');before=(files(),self.jobs.read_bytes())
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual(result['reason'],'replacement-capacity-wait')
+        self.assertEqual((files(),self.jobs.read_bytes()),before)
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+        # the wait stays a valid supervisor attention item
+        self.assertEqual(R.validate_attention(self.jobs,[result])[0]['reason'],'replacement-capacity-wait')
+
+    def test_a_launched_replacement_is_not_disturbed_by_a_later_hold_or_release_change(self):
+        self._owner(note='dead-exact-pid')
+        record=self.claim()
+        self._successor(record,self.meta|{'worker_type':'owner'},'open')
+        hold={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold), \
+             mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}), mock.patch.object(R,'ROOT',self.root/'newer-release'):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual(result.get('state'),'running',result)
+        self.assertEqual(result['attempt_id'],record['replacement_attempt_id'])
+
+    def test_stage_worker_capacity_death_is_not_a_replacement_source(self):
+        self.write({**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity','failure_class':'capacity'})
+        self.assertIsNone(R.death_kind(['now','done'],R._rows(self.jobs.read_text().splitlines())['att-source'][1]))
+        self.assertEqual(R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True)['state'],'not-applicable')
+        _,_,attention=R.advance_batch(self.jobs,{'att-source'},authority_check=lambda *_:True)
+        self.assertEqual(attention,[])
+        with self.assertRaises(D.DispatchContractError):self.claim()
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def test_capacity_recovery_text_says_resume_not_replace(self):
+        self._capacity_owner()
+        record=self.claim()
+        text=R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',
+                                     jobs_path=self.jobs,attempt_id=record['replacement_attempt_id']))
+        self.assertIn('stopped at a usage limit; this resumes it',text)
+        self.assertNotIn('You replace exact-dead attempt',text)
+        self.assertIn(R.CONTINUATION_WAIT_NOTE,text)
+
+    def test_cleanup_pending_owner_is_settled_only_when_the_runtime_can_prove_it(self):
+        self._owner()
+        calls=[]
+        for state,expected in (('unverifiable',[('att-source',True)]),('live',[]),('quiescent',[])):
+            calls.clear()
+            rows=R._rows(self.jobs.read_text().splitlines())
+            with mock.patch.object(D,'attempt_process_quiescence',return_value=SimpleNamespace(state=state,reason='r')), \
+                 mock.patch.object(D,'resolve_attempt_cleanup',side_effect=lambda j,a,apply=False:calls.append((a,apply))):
+                R._settle_terminal_cleanup(self.jobs,rows,'att-source',rows['att-source'][1])
+            self.assertEqual(calls,expected,state)
+
+    def test_release_drift_is_a_diagnostic_and_identity_stays_strict(self):
+        replay=R.launch_input(self.jobs,'att-source',R._rows(self.jobs.read_text().splitlines())['att-source'][1])
+        old={**replay,'launch_home':'/releases/v-old','resolved':{'model':'m1','permission_mode':'default'}}
+        R._check_tuple(old,old)
+        newer={**old,'launch_home':replay['launch_home'],'resolved':{'model':'m2','permission_mode':'default'}}
+        with mock.patch.dict(os.environ,{'HEARTING_GATES':'off'}):
+            R._check_tuple(newer,old)
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R._check_tuple({**newer,'resolved':{'model':'m2','permission_mode':'config'}},old)
+            self.assertEqual((caught.exception.reason,caught.exception.detail),('replacement-input-tuple-mismatch','resolved'))
+            with self.assertRaises(D.DispatchContractError):R._check_tuple({**newer,'harness':'claude'},old)
+        with mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}),self.assertRaises(D.DispatchContractError) as caught:
+            R._check_tuple(newer,old)
+        self.assertEqual(caught.exception.reason,'replacement-runtime-drift')
+        same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
+        with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
+
 if __name__=='__main__':unittest.main()

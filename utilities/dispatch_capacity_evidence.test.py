@@ -252,6 +252,78 @@ class QuotaEvidenceTests(unittest.TestCase):
                 self.assertIn("capacity-quota-until-", reason)
                 spawn.assert_not_called()
 
+    # -- an owner that died at a usage limit (`dead-capacity`) is a hold on its harness ----
+    OBSERVED = int(datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc).timestamp())  # 02:00 in Asia/Seoul
+
+    def write_capacity(self, lines, *, observed=None, scope=True, note="dead-capacity"):
+        observed = self.OBSERVED if observed is None else observed
+        self.log.write_text("".join(lines))
+        stamp = datetime.fromtimestamp(observed, timezone.utc).isoformat().replace("+00:00", "Z")
+        metadata = {"attempt_id": self.attempt, "harness": "claude", "note": note, "failure_class": "capacity",
+                    "log_file": str(self.log), "model": "claude-opus-4-6", "worker_type": "owner"}
+        if scope:
+            metadata.update(Q.launch_scope("claude", self.env))
+        self.jobs.write_text(f"{stamp}\tdone\t/repo\t/work\tjob\t" + ",".join(f"{k}={v}" for k, v in metadata.items()) + "\n")
+
+    @staticmethod
+    def result_line(text):
+        return json.dumps({"type": "result", "is_error": True, "api_error_status": 429, "session_id": "s",
+                           "result": text}) + "\n"
+
+    def state(self, now):
+        return Q.usage_states(self.jobs, now=now, env=self.env)["claude"]
+
+    def test_dead_capacity_result_text_reset_limits_until_reset(self):
+        self.write_capacity([self.result_line("You've hit your session limit \u00b7 resets 3am (Asia/Seoul)")])
+        reset = int(datetime(2026, 9, 29, 18, 0, tzinfo=timezone.utc).timestamp())  # 03:00 KST
+        self.assertTrue(self.state(self.OBSERVED + 1800).startswith("limited("))
+        hold = Q.harness_hold(self.jobs, "claude", now=self.OBSERVED + 1800, env=self.env)
+        self.assertEqual(hold["until_epoch"], reset)
+        self.assertEqual(self.state(reset + 60), "ok")
+        self.assertIsNone(Q.harness_hold(self.jobs, "claude", now=reset + 60, env=self.env))
+        self.assertIsNone(Q.harness_hold(self.jobs, "codex", now=self.OBSERVED + 1800, env=self.env))
+
+    def test_dead_capacity_without_reset_uses_unknown_window(self):
+        self.write_capacity([self.result_line("You've hit your limit")])
+        self.assertEqual(self.state(self.OBSERVED + 1800), "limited(unknown-reset)")
+        self.assertEqual(Q.harness_hold(self.jobs, "claude", now=self.OBSERVED + 1800, env=self.env)["until_epoch"],
+                         self.OBSERVED + 3600)
+        self.assertEqual(self.state(self.OBSERVED + 3601), "ok")
+
+    def test_dead_capacity_other_quota_scope_is_ignored(self):
+        self.write_capacity([self.result_line("limit \u00b7 resets 3am (Asia/Seoul)")])
+        self.config.write_text(json.dumps({"oauthAccount": {"accountUuid": "other", "organizationUuid": "org-a"}}))
+        self.assertEqual(self.state(self.OBSERVED + 60), "ok")
+        self.assertIsNone(Q.harness_hold(self.jobs, "claude", now=self.OBSERVED + 60, env=self.env))
+
+    def test_dead_capacity_reads_only_last_result_line_in_tail(self):
+        future = "limit \u00b7 resets 2099-01-01 00:00 (UTC)"
+        past = "limit \u00b7 resets 2020-01-01 00:00 (UTC)"
+        # an earlier result and a line beyond the tail are not the attempt's outcome
+        filler = json.dumps({"type": "assistant", "text": "x" * (Q.TAIL_BYTES + 1000)}) + "\n"
+        self.write_capacity([self.result_line(future), filler, self.result_line(past)])
+        self.assertEqual(self.state(self.OBSERVED + 60), "ok")
+        self.write_capacity([self.result_line(future), json.dumps({"type": "assistant"}) + "\n",
+                             self.result_line("You've hit your limit")])
+        self.assertEqual(self.state(self.OBSERVED + 60), "limited(unknown-reset)")
+
+    def test_dead_capacity_unmatched_reset_text_uses_unknown_window(self):
+        for text in ("limit \u00b7 resets Oct 1, 3am (UTC)", "limit \u00b7 resets in 2 hours"):
+            with self.subTest(text=text):
+                self.write_capacity([self.result_line(text)])
+                self.assertEqual(self.state(self.OBSERVED + 60), "limited(unknown-reset)")
+
+    def test_timezone_reaches_date_only_as_an_environment_value(self):
+        marker = self.home / "injected"
+        self.write_capacity([self.result_line(f"limit \u00b7 resets 3am (Asia/Seoul; touch {marker})")])
+        self.assertTrue(self.state(self.OBSERVED + 60).startswith("limited("))
+        self.assertFalse(marker.exists())
+
+    def test_dead_capacity_that_passed_is_not_a_hold(self):
+        self.write_capacity([self.result_line("limit \u00b7 resets 3am (Asia/Seoul)")])
+        self.jobs.write_text(self.jobs.read_text().replace("failure_class=capacity", "failure_class=pass"))
+        self.assertEqual(self.state(self.OBSERVED + 60), "ok")
+
 
 if __name__ == "__main__":
     unittest.main()
