@@ -14,6 +14,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 PREFLIGHT = ROOT / "adapters" / "codex" / "bin" / "preflight.sh"
 LOCAL_EVIDENCE_HOOK = ROOT / "hooks" / "local-evidence-inject.sh"
+MEM_PY = ROOT / "tools" / "memory" / "mem.py"
 
 
 def first_string(mapping: dict[str, Any], *keys: str) -> str:
@@ -96,6 +97,26 @@ def local_evidence_context(current_cwd: str) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+def forget_shown_candidates(payload: dict[str, Any]) -> None:
+    """After compact or clear the model no longer holds what memory showed it.
+
+    The same ``mem.py`` helper the other harnesses call empties this session's
+    candidate display history; every failure is silent.
+    """
+    source = nested_string(payload, "source").lower()
+    sid = session_id(payload)
+    if source not in {"compact", "clear"} or not sid or not MEM_PY.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(MEM_PY), "_seen-reset", "--session-id", sid],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def env_truthy(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
@@ -130,6 +151,7 @@ def main() -> int:
 
     parts = []
     if not is_worker_session():
+        forget_shown_candidates(payload)
         if env_truthy("CODEX_SESSION_MEMORY_INJECT"):
             parts.append(run_preflight("memory", current_cwd))
         parts.append(local_evidence_context(current_cwd))

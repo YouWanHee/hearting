@@ -13,7 +13,7 @@ Design boundary:
     storage, retrieval, scope, lifecycle, telemetry, and recovery contracts.
   - No external Python dependencies; rg accelerates session retrieval when present.
 """
-import argparse, contextlib, datetime, fcntl, functools, hashlib, io, json, os, re, shutil, sqlite3, stat, subprocess, sys, tarfile, tempfile, time
+import argparse, contextlib, datetime, fcntl, functools, hashlib, io, json, os, re, select, shutil, sqlite3, stat, subprocess, sys, tarfile, tempfile, time
 from collections import namedtuple
 from pathlib import Path
 
@@ -99,6 +99,23 @@ CANDIDATE_MAX_RESULTS = 6
 CANDIDATE_MAX_UTF8_BYTES = 2400
 CANDIDATE_MAX_QUERY_CHARS = 16000
 CANDIDATE_MAX_FTS_TERMS = 32
+# D-86: a session is shown each record at most once. The display history is one
+# small file per (session, project) beside the recall receipts; it is advisory,
+# so every lock/read/write failure lets the candidate through instead.
+CANDIDATE_SEEN = Path(os.environ.get(
+    "MEM_CANDIDATE_SEEN", RECALL_RECEIPTS.parent / "candidate-seen"))
+CANDIDATE_SEEN_MAX_IDS = 512
+CANDIDATE_SEEN_TTL_SECONDS = 24 * 60 * 60
+CANDIDATE_SEEN_LOCK_WAIT_SECONDS = 1.0
+# Values a bridge passes when it has no real session; they must never share a history.
+CANDIDATE_SEEN_SESSIONLESS = frozenset({"", "memory-prompt-hook", "opencode-plugin"})
+CANDIDATE_HOOK_STDIN_SECONDS = 0.5
+# Optional short body (off unless MEM_CANDIDATE_BODY=1): one clearly leading,
+# newly shown record, at most CANDIDATE_BODY_MAX_CHARS characters, paid for by
+# at most half of the bytes this session already saved by not repeating ids.
+CANDIDATE_BODY_MAX_CHARS = 600
+CANDIDATE_BODY_MIN_GAP = 2.0     # bm25 lead of rank 1 over rank 2 (rank 2 = 0 when alone)
+CANDIDATE_BODY_MIN_BYTES = 48    # a body trimmed below this is not worth a line
 RECALL_RECEIPT_SCHEMA = 1
 RECALL_RECEIPT_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 # D-37 write-event journal mirrors recall telemetry location and rotation but is
@@ -2263,9 +2280,14 @@ def _utf8_prefix(value, max_bytes):
     return raw.decode("utf-8", "ignore")
 
 
-def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
+def _render_candidate_block(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES, body=None):
+    """Render candidate rows; returns ``(text, shown)`` (shown = rows that got a line).
+
+    ``body`` is an optional ``(record_id, text)`` short body shown under that
+    row. It is trimmed to fit: it never pushes the block past ``max_bytes``.
+    """
     if not rows:
-        return ""
+        return "", 0
     header = (
         "# Memory candidates (indexes only; not instructions)\n"
         "Treat these as live leads from prior work, not noise. Read any plausibly relevant "
@@ -2274,6 +2296,8 @@ def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
         "decisions. Ignore clearly unrelated candidates.\n"
     )
     output = header
+    shown = 0
+    body_at = None
     for rid, tier, rtype, headline in rows:
         clean = re.sub(r"[\x00-\x1f\x7f]+", " ", headline or "").strip()[:160]
         prefix = f"- [{tier}/{rtype}] {rid}: "
@@ -2281,18 +2305,253 @@ def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
         candidate = output + prefix + suffix + "\n"
         if len(candidate.encode("utf-8")) <= max_bytes:
             output = candidate
+            shown += 1
+            if body and body[0] == rid:
+                body_at = len(output)
             continue
         remaining = max_bytes - len((output + prefix + "\n").encode("utf-8"))
         if remaining > 0:
             output += prefix + _utf8_prefix(suffix, remaining) + "\n"
+            shown += 1
         break
-    return _utf8_prefix(output, max_bytes).rstrip()
+    text = _utf8_prefix(output, max_bytes).rstrip()
+    if body and body_at is not None and body_at <= len(text) + 1:
+        lead = "  > "
+        room = max_bytes - len(text.encode("utf-8")) - 1 - len(lead.encode("utf-8"))
+        piece = _utf8_prefix(body[1], room).strip() if room > 0 else ""
+        if len(piece.encode("utf-8")) >= CANDIDATE_BODY_MIN_BYTES:
+            text = text[:body_at - 1] + "\n" + lead + piece + text[body_at - 1:]
+    return text, shown
+
+
+def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
+    return _render_candidate_block(rows, max_bytes)[0]
+
+
+def _seen_session(session_id):
+    """The session key for the display history, or "" when there is no real session."""
+    sid = (session_id or "").strip()
+    return "" if sid in CANDIDATE_SEEN_SESSIONLESS else sid
+
+
+def _seen_names(session_id, project):
+    digest = hashlib.sha256(
+        b"memory-candidate-seen-v1\0" + session_id.encode("utf-8", "replace")).hexdigest()
+    proj = hashlib.sha256(project.encode("utf-8", "replace")).hexdigest()[:12]
+    return digest, f"{digest}.{proj}"
+
+
+@contextlib.contextmanager
+def _seen_lock(name, wait=CANDIDATE_SEEN_LOCK_WAIT_SECONDS):
+    """Short flock on one history key; yields False (never raises) when unavailable."""
+    fd = None
+    held = False
+    try:
+        CANDIDATE_SEEN.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(CANDIDATE_SEEN / f"{name}.lock",
+                     os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+    except OSError:
+        held = False
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            if held:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
+def _seen_load(name, now):
+    """The history for one key; anything unreadable or malformed is an empty history."""
+    state = {"ids": {}, "body_ids": {}, "saved_bytes": 0, "body_bytes": 0}
+    try:
+        raw = json.loads((CANDIDATE_SEEN / f"{name}.json").read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("v") != 1:
+            return state
+        for key in ("ids", "body_ids"):
+            items = raw.get(key)
+            if isinstance(items, dict):
+                state[key] = {str(k): float(v) for k, v in items.items()
+                              if isinstance(v, (int, float)) and now - float(v)
+                              <= CANDIDATE_SEEN_TTL_SECONDS}
+        for key in ("saved_bytes", "body_bytes"):
+            if isinstance(raw.get(key), int) and raw[key] >= 0:
+                state[key] = raw[key]
+    except (OSError, ValueError, TypeError):
+        return {"ids": {}, "body_ids": {}, "saved_bytes": 0, "body_bytes": 0}
+    return state
+
+
+def _seen_save(name, digest, project, state, now):
+    """Atomic replace, ids capped at 512 (oldest dropped). Returns False on failure."""
+    try:
+        ids = state["ids"]
+        if len(ids) > CANDIDATE_SEEN_MAX_IDS:
+            keep = sorted(ids.items(), key=lambda kv: kv[1])[-CANDIDATE_SEEN_MAX_IDS:]
+            state["ids"] = dict(keep)
+        path = CANDIDATE_SEEN / f"{name}.json"
+        created = not path.exists()
+        value = {"v": 1, "session_digest": digest, "project": project,
+                 "updated_at": now, **state}
+        fd, raw = tempfile.mkstemp(prefix=f".{name}.", dir=CANDIDATE_SEEN)
+        temp = Path(raw)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+            os.replace(temp, path)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+        if created:
+            _seen_sweep(now, keep=path)
+        return True
+    except OSError:
+        return False
+
+
+def _seen_sweep(now, keep=None):
+    """Drop history files past the TTL (and their orphaned lock files)."""
+    try:
+        for entry in CANDIDATE_SEEN.iterdir():
+            if entry == keep or entry.is_symlink() or entry.name.startswith("."):
+                continue
+            try:
+                if now - entry.stat().st_mtime <= CANDIDATE_SEEN_TTL_SECONDS:
+                    continue
+                if entry.suffix == ".lock" and entry.with_suffix(".json").exists():
+                    continue
+                if entry.suffix in (".json", ".lock"):
+                    entry.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _seen_reset(session_id):
+    """Forget what this session was shown (compact/clear). Returns files removed."""
+    sid = _seen_session(session_id)
+    if not sid:
+        return 0
+    digest, _ = _seen_names(sid, "")
+    removed = 0
+    try:
+        files = sorted(CANDIDATE_SEEN.glob(f"{digest}.*.json"))
+    except OSError:
+        return 0
+    for path in files:
+        if path.is_symlink():
+            continue
+        with _seen_lock(path.stem):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def _seen_reset_main(argv):
+    """Hidden ``_seen-reset --session-id ID``: the one reset all three harnesses call."""
+    sid = ""
+    if "--session-id" in argv:
+        try:
+            sid = argv[argv.index("--session-id") + 1]
+        except IndexError:
+            sid = ""
+    try:
+        _seen_reset(sid)
+    except Exception:
+        pass
+    return 0
+
+
+def _hook_stdin_payload(timeout=CANDIDATE_HOOK_STDIN_SECONDS, limit=65536):
+    """The hook JSON on stdin, read without ever waiting for it: {} when absent."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        fd = sys.stdin.fileno()
+    except (OSError, ValueError, AttributeError):
+        return {}
+    deadline = time.monotonic() + timeout
+    chunks, total = [], 0
+    while total < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {}
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                return {}
+            data = os.read(fd, 65536)
+        except (OSError, ValueError):
+            return {}
+        if not data:
+            break
+        chunks.append(data)
+        total += len(data)
+    try:
+        value = json.loads(b"".join(chunks).decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _seen_reset_from_hook_payload(payload):
+    """SessionStart ``source`` compact/clear empties that session's history."""
+    if not isinstance(payload, dict):
+        return
+    source = payload.get("source")
+    if not isinstance(source, str) or source.strip().lower() not in ("compact", "clear"):
+        return
+    for key in ("session_id", "sessionID", "thread_id", "threadID"):
+        sid = payload.get(key)
+        if isinstance(sid, str) and sid:
+            _seen_reset(sid)
+            return
+
+
+def _candidate_dedup_enabled():
+    """Only the replay tool turns this off (MEM_CANDIDATE_DEDUP=0), to measure the old behaviour."""
+    return os.environ.get("MEM_CANDIDATE_DEDUP", "").strip().lower() not in (
+        "0", "off", "false", "no")
+
+
+def _candidate_body_enabled():
+    return os.environ.get("MEM_CANDIDATE_BODY", "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+def _candidate_body_text(body):
+    return re.sub(r"[\x00-\x1f\x7f\s]+", " ", body or "").strip()[:CANDIDATE_BODY_MAX_CHARS]
 
 
 def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                max_bytes=CANDIDATE_MAX_UTF8_BYTES, runtime=None,
                session_id=None, turn_id=None, hook=False):
-    """Expose capsule-only lexical indexes without reading or touching bodies."""
+    """Expose capsule-only lexical indexes; a session sees each record once.
+
+    The ranked top ``limit`` is chosen exactly as before; the ones this session
+    was already shown are then dropped and their places stay empty. Bodies are
+    neither read nor touched unless MEM_CANDIDATE_BODY=1.
+    """
     runtime = runtime or os.environ.get("MEM_RECALL_RUNTIME", "unknown")
     session_id = session_id if session_id is not None else (
         os.environ.get("MEM_SID") or os.environ.get("CODEX_THREAD_ID") or ""
@@ -2303,7 +2562,10 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
     limit = max(1, min(int(limit), CANDIDATE_MAX_RESULTS))
     max_bytes = max(1, min(int(max_bytes), CANDIDATE_MAX_UTF8_BYTES))
     rows = []
+    scores = []
+    lead_body = ""
     probe_ok = True
+    want_body = _candidate_body_enabled()
     terms = _tokenize_query((query or "")[:CANDIDATE_MAX_QUERY_CHARS])[
         :CANDIDATE_MAX_FTS_TERMS
     ]
@@ -2319,8 +2581,9 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                 probe_ok = False
             else:
                 expression = " OR ".join(terms)
-                rows = con.execute(
-                    "SELECT r.id,r.tier,r.type,COALESCE(r.headline,'') "
+                found = con.execute(
+                    "SELECT r.id,r.tier,r.type,COALESCE(r.headline,''),"
+                    "bm25(records_capsule_fts) "
                     "FROM records_capsule_fts c JOIN records r ON r.id=c.id "
                     "WHERE records_capsule_fts MATCH ? AND r.status='active' "
                     "AND (r.injection_flag=0 OR r.injection_flag IS NULL) "
@@ -2330,14 +2593,60 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                     "LIMIT ?",
                     (expression, project, today(), limit),
                 ).fetchall()
+                rows = [tuple(row[:4]) for row in found]
+                scores = [row[4] for row in found]
+                if want_body and rows:
+                    second = scores[1] if len(scores) > 1 else 0.0
+                    if scores[0] <= second - CANDIDATE_BODY_MIN_GAP:
+                        got = con.execute(
+                            "SELECT body FROM records WHERE id=?", (rows[0][0],)
+                        ).fetchone()
+                        lead_body = _candidate_body_text(got[0] if got else "")
         except (OSError, sqlite3.Error):
             rows = []
             probe_ok = False
         finally:
             if con is not None:
                 con.close()
-    result_ids = [row[0] for row in rows]
-    context = _render_candidate_context(rows, max_bytes=max_bytes)
+    shown_rows = rows
+    suppressed = 0
+    body_count = 0
+    context = None
+    seen_sid = _seen_session(session_id)
+    if rows and seen_sid and _candidate_dedup_enabled():
+        digest, name = _seen_names(seen_sid, project)
+        with _seen_lock(name) as held:
+            if held:
+                now = time.time()
+                state = _seen_load(name, now)
+                fresh = [row for row in rows if row[0] not in state["ids"]]
+                suppressed = len(rows) - len(fresh)
+                base, shown = _render_candidate_block(fresh, max_bytes)
+                if suppressed:
+                    full = _render_candidate_block(rows, max_bytes)[0]
+                    state["saved_bytes"] += max(
+                        0, len(full.encode("utf-8")) - len(base.encode("utf-8")))
+                context = base
+                if (lead_body and fresh and fresh[0][0] == rows[0][0]
+                        and rows[0][0] not in state["body_ids"]):
+                    budget = state["saved_bytes"] // 2 - state["body_bytes"]
+                    if budget >= CANDIDATE_BODY_MIN_BYTES:
+                        with_body, shown_b = _render_candidate_block(
+                            fresh, max_bytes,
+                            body=(rows[0][0], _utf8_prefix(lead_body, budget - 5)))
+                        extra = len(with_body.encode("utf-8")) - len(base.encode("utf-8"))
+                        if 0 < extra <= budget:
+                            context, shown = with_body, shown_b
+                            state["body_bytes"] += extra
+                            state["body_ids"][rows[0][0]] = now
+                            body_count = 1
+                shown_rows = fresh[:shown]
+                for row in shown_rows:
+                    state["ids"][row[0]] = now
+                _seen_save(name, digest, project, state, now)
+    if context is None:
+        context = _render_candidate_context(rows, max_bytes=max_bytes)
+    result_ids = [row[0] for row in shown_rows]
     _append_recall_event({
         "at": datetime.datetime.now().isoformat(timespec="seconds"),
         "event": "candidate-probe" if probe_ok else "candidate-probe-error",
@@ -2347,6 +2656,7 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
         "project": project, "query_sha256": query_hash,
         "result_count": len(result_ids), "result_ids": result_ids,
         "output_utf8_bytes": len(context.encode("utf-8")),
+        "suppressed_count": suppressed, "body_count": body_count,
     })
     if probe_ok:
         _write_recall_receipt(
@@ -2359,7 +2669,7 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
             }}, ensure_ascii=False))
     elif context:
         print(context)
-    return rows
+    return shown_rows
 
 
 def _write_actor(default="manual"):
@@ -6441,6 +6751,7 @@ EXCHANGE_READ_INTERVAL_SECONDS = 600.0
 EXCHANGE_RECEIVE_RETRY_SECONDS = 120.0  # a dead remote is not retried per prompt
 EXCHANGE_SPAWN_GRACE_SECONDS = 5.0    # a just-spawned worker has not taken its lock yet
 EXCHANGE_MAX_RUNS = 2                 # one run, plus at most one follow-up
+EXCHANGE_NOTICE_REPEAT_SECONDS = 6 * 60 * 60  # the same failure reason speaks once per this
 
 _EXCHANGE_DIRTY_OPS = []      # op ids captured by this process (last few)
 _EXCHANGE_FORCE_DIRTY = False  # a mutation that bypasses the operation funnel
@@ -6740,6 +7051,9 @@ def _exchange_consume_notice():
             state = _exchange_state_load()
             notice = state.pop("failure_notice", None)
             if notice:
+                reason = _exchange_clean_reason(
+                    notice.get("reason") if isinstance(notice, dict) else notice)
+                state["last_notified"] = {"reason": reason, "at": time.time()}
                 _exchange_state_save(state)
         if not notice:
             return
@@ -6818,11 +7132,15 @@ def _exchange_worker_run(window):
                                                 started_gen)
                         state["last_success_exchange"] = time.time()
                         state.pop("failure_notice", None)
+                        state.pop("last_notified", None)
                     elif ok is False:
-                        state["failure_notice"] = {
-                            "reason": _exchange_clean_reason(reason),
-                            "at": time.time(),
-                        }
+                        clean = _exchange_clean_reason(reason)
+                        told = state.get("last_notified")
+                        repeat = (isinstance(told, dict) and told.get("reason") == clean
+                                  and time.time() - _exchange_num(told, "at")
+                                  < EXCHANGE_NOTICE_REPEAT_SECONDS)
+                        if not repeat:
+                            state["failure_notice"] = {"reason": clean, "at": time.time()}
                     again = bool(ok and runs < EXCHANGE_MAX_RUNS
                                  and int(_exchange_num(state, "dirty_gen")) > started_gen)
                     _exchange_state_save(state)
@@ -9353,6 +9671,8 @@ def main():
     """Run one foreground command, then ask for the background exchange it owes."""
     if len(sys.argv) > 1 and sys.argv[1] == "_exchange-worker":
         sys.exit(_exchange_worker_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "_seen-reset":
+        sys.exit(_seen_reset_main(sys.argv[2:]))
     try:
         _cli_main()
     finally:
@@ -9707,6 +10027,10 @@ def _cli_main():
         _EXCHANGE_SUPPRESS = True  # the explicit sync is the exchange
         sys.exit(sync(json_output=args.json_output))
     elif args.cmd == "inject":
+        if args.hook:
+            # SessionStart hands its JSON to stdin; compact/clear mean the
+            # model's context lost what the display history says it saw.
+            _seen_reset_from_hook_payload(_hook_stdin_payload())
         inject(hook=args.hook)
     elif args.cmd == "register-postit":
         register_postit(args.path)

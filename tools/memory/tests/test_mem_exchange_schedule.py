@@ -420,6 +420,54 @@ class ExchangeScheduleTest(unittest.TestCase):
         self.assertEqual(set(self._outbox_states("a")), {"confirmed"})
         self.assertNotIn("failure_notice", self._state("a"))
 
+    def test_the_same_failure_reason_is_announced_once_per_six_hours(self):
+        good_remote = self.remote
+        self.remote = self.root / "missing-remote.git"
+        try:
+            self._mem("a", "add", "durable", "lesson", "first offline write",
+                      "--headline", "offline one", remote=True)
+            self._wait_idle("a")
+            first = self._mem("a", "recall", "offline", remote=True)
+            self.assertEqual(first.stderr.count("[sync]"), 1, first.stderr)
+            self.assertIn("last_notified", self._state("a"))
+
+            # The same reason again, soon after: nothing new to announce.
+            self._mem("a", "add", "durable", "lesson", "second offline write",
+                      "--headline", "offline two", remote=True)
+            self._wait_idle("a")
+            self.assertNotIn("failure_notice", self._state("a"))
+            quiet = self._mem("a", "recall", "offline", remote=True)
+            self.assertNotIn("[sync]", quiet.stderr)
+
+            # Six hours later the same reason speaks again.
+            told = self._state("a")["last_notified"]
+            told["at"] = time.time() - 7 * 60 * 60
+            self._set_state("a", last_notified=told)
+            self._mem("a", "add", "durable", "lesson", "third offline write",
+                      "--headline", "offline three", remote=True)
+            self._wait_idle("a")
+            self.assertIn("failure_notice", self._state("a"))
+            late = self._mem("a", "recall", "offline", remote=True)
+            self.assertEqual(late.stderr.count("[sync]"), 1, late.stderr)
+
+            # A different reason is never held back by the old one.
+            self._set_state("a", last_notified={"reason": "some-other-reason",
+                                                "at": time.time()})
+            self._mem("a", "add", "durable", "lesson", "fourth offline write",
+                      "--headline", "offline four", remote=True)
+            self._wait_idle("a")
+            self.assertIn("failure_notice", self._state("a"))
+        finally:
+            self.remote = good_remote
+
+        # A successful exchange forgets what was announced.
+        self._mem("a", "add", "durable", "lesson", "written after recovery",
+                  "--headline", "recovered write", remote=True)
+        self._wait_idle("a")
+        state = self._state("a")
+        self.assertNotIn("failure_notice", state)
+        self.assertNotIn("last_notified", state)
+
     def test_the_worker_survives_its_parents_process_group_being_killed(self):
         env = self._environment("a", remote=True, extra={"MEM_EXCHANGE_WINDOW_SECONDS": "3"})
         parent = subprocess.Popen(

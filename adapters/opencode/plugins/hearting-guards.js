@@ -225,6 +225,23 @@ function collectPreflight(command, args) {
   return [result.stdout, result.stderr].filter(Boolean).join("\n").trim()
 }
 
+// A compacted session no longer holds the candidates memory showed it, so its
+// display history is emptied through the one shared mem.py helper (fail-open).
+// A brand-new session ID starts with an empty history on its own.
+function forgetShownCandidates(sessionID) {
+  if (!sessionID || isWorkerSession()) return
+  try {
+    spawnSync("python3", [path.join(root, "tools", "memory", "mem.py"),
+      "_seen-reset", "--session-id", sessionID], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      stdio: "ignore",
+      timeout: 3000,
+      killSignal: "SIGKILL",
+    })
+  } catch {}
+}
+
 function collectCandidates(args) {
   const result = spawnSync(preflight, ["candidates", ...args], {
     cwd: root,
@@ -325,6 +342,7 @@ export const AgentHarnessGuards = async (ctx) => {
   event: async ({ event }) => {
     if (event && event.type === "session.compacted") {
       runWorkerState("compact-after", event)
+      forgetShownCandidates(event.properties && event.properties.sessionID)
     }
     // session.idle fires after each turn (the session is waiting for the user).
     // Use it as the memory-sync trigger; preflight session-end debounces per
