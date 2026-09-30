@@ -22,6 +22,87 @@ sys.modules[SPEC.name] = M
 SPEC.loader.exec_module(M)
 
 
+class RegistrySnapshotMemoTest(unittest.TestCase):
+    ROW = "1\topen\t/w\t/w\towner\tattempt_id=%s,unit=_kernel/owner\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.jobs = Path(self.tmp.name) / "jobs.log"
+        self.jobs.write_text(self.ROW % "att-a", encoding="utf-8")
+        M._SNAPSHOT_MEMO = None
+
+    def tearDown(self):
+        M._SNAPSHOT_MEMO = None
+        self.tmp.cleanup()
+
+    def _reads(self):
+        return mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text)
+
+    def test_second_snapshot_is_served_without_reading_the_file(self):
+        first = M._registry_snapshot(self.jobs)
+        with self._reads() as reads:
+            second = M._registry_snapshot(self.jobs)
+        self.assertEqual(reads.call_count, 0)
+        self.assertEqual(first, second)
+
+    def test_callers_cannot_change_the_next_snapshot(self):
+        first = M._registry_snapshot(self.jobs)
+        first[0][0][1] = "closed"
+        first[0][1]["attempt_id"] = "tampered"
+        first.append((["x"], {}))
+        again = M._registry_snapshot(self.jobs)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0][0][1], "open")
+        self.assertEqual(again[0][1]["attempt_id"], "att-a")
+
+    def test_append_same_size_rewrite_and_atomic_replace_show_on_the_next_read(self):
+        M._registry_snapshot(self.jobs)
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(self.ROW % "att-b")
+        self.assertEqual([r[1]["attempt_id"] for r in M._registry_snapshot(self.jobs)],
+                         ["att-a", "att-b"])
+        before = self.jobs.stat()
+        self.jobs.write_text((self.ROW % "att-a") + (self.ROW % "att-c"), encoding="utf-8")
+        os.utime(self.jobs, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        self.assertEqual([r[1]["attempt_id"] for r in M._registry_snapshot(self.jobs)],
+                         ["att-a", "att-c"])
+        stat = self.jobs.stat()
+        replacement = Path(self.tmp.name) / "jobs.new"
+        replacement.write_text((self.ROW % "att-a") + (self.ROW % "att-d"), encoding="utf-8")
+        os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        os.replace(replacement, self.jobs)
+        self.assertEqual([r[1]["attempt_id"] for r in M._registry_snapshot(self.jobs)],
+                         ["att-a", "att-d"])
+
+    def test_a_read_that_races_a_change_is_not_memoized(self):
+        real = Path.read_text
+
+        def racing(path, *args, **kwargs):
+            text = real(path, *args, **kwargs)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(self.ROW % "att-race")
+            return text
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=racing):
+            first = M._registry_snapshot(self.jobs)
+        self.assertEqual(len(first), 1)
+        self.assertIsNone(M._SNAPSHOT_MEMO)
+        self.assertEqual(len(M._registry_snapshot(self.jobs)), 2)
+
+    def test_a_memo_hit_takes_no_jobs_lock(self):
+        M._registry_snapshot(self.jobs)
+        with mock.patch.object(M, "_jobs_lock", side_effect=AssertionError("locked")):
+            M._registry_snapshot(self.jobs)
+            M._owner_snapshot(self.jobs, "att-a")
+
+    def test_unreadable_registry_keeps_the_typed_error(self):
+        M._registry_snapshot(self.jobs)
+        self.jobs.unlink()
+        with self.assertRaises(M.OwnerRouteBindingError) as caught:
+            M._registry_snapshot(self.jobs)
+        self.assertEqual(str(caught.exception), "owner-route-jobs-unreadable")
+
+
 class OwnerRouteBindingTest(unittest.TestCase):
     def test_owner_tuple_failure_details(self):
         self.assertEqual(M.owner_binding_tuple_failure_fields(
