@@ -4397,14 +4397,24 @@ def _owner_terminal_observation(route,node,*,jobs=None):
             fields=line.split("\t")
             if len(fields)!=6: continue
             meta=parse_registry_metadata(fields[5])
-            if (meta.get("worker_type")=="owner" and meta.get("dispatch_depth")=="1"
-                    and meta.get("owner_route_id")==route["route_id"]):
+            if meta.get("worker_type")!="owner" or meta.get("dispatch_depth")!="1": continue
+            try:
+                identity=ROUTE_IDENTITY.registered_node_identity(meta,node)
+            except ValueError:
+                continue
+            if identity==(route["route_id"],route["route_hash"],node["id"]):
                 owners.append((fields,meta))
         if not owners: return absent("owner-attempt-absent")
         fields,meta=owners[-1]
         binding,_=resolve_owner_route_lifecycle(jobs,owner_attempt_id=meta["attempt_id"])
-        if (binding is None or binding.route_id!=route["route_id"] or binding.route_hash!=route["route_hash"]
-                or meta.get("registered_worker")!="1"):
+        # A one-shot owner sealed by `route_*` fields alone (its supervisor closed the row
+        # before the marker writer ran) has no lifecycle binding; the quick node-bound
+        # contract that `dispatch_terminal_commit.validate_owner_route` enforces stands in.
+        node_bound=(binding is None and route.get("effective_intensity")=="quick"
+                    and not any(k in meta for k in ("owner_route_file","owner_route_id","owner_route_hash"))
+                    and Path(meta.get("route_file","")).resolve()==canonical_route_path(route["artifact_root"],route["route_id"]))
+        if not ((binding is not None and binding.route_id==route["route_id"] and binding.route_hash==route["route_hash"])
+                or node_bound) or meta.get("registered_worker")!="1":
             return absent("owner-route-identity-mismatch")
         if fields[1]!="done" or not verdict_pass(meta):
             return absent("owner-terminal-not-pass")
