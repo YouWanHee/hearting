@@ -33,6 +33,15 @@ cycle stays `autopilot-code --mode audit`. Measuring new data quality or
 reproducing an experimental failure is lab/eval; inspecting already completed
 evidence is audit. This boundary preserves both code-review capabilities.
 
+The preset is `inspect → report`. An explicit graph may borrow the research
+map-reduce parts for a parallel survey and synthesis inside the audit cycle,
+`--graph inspect,autopilot-research:retrieval,autopilot-research:synthesis,report`
+(written under `parts/autopilot-research/<stage>/`; audit's `map_anchor` for
+them is declared in `part_catalog.hosts`), and may pick
+`report:research/research-survey` when the report is a proposal rather than a
+polish of findings. `capability-route.py stages --capability audit` lists the
+parts.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Artifact Ownership

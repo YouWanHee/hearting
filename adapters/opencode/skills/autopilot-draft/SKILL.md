@@ -1,6 +1,6 @@
 ---
 name: autopilot-draft
-description: "Use when a new document has an independent audience and document goal. Not for experiment reports (lab), existing-document edits, or code."
+description: "Use when a new document has an independent audience and document goal. Owns document; default preset. Not for experiment reports (lab), existing-document edits, or code."
 metadata:
   portable_source: capabilities/autopilot-draft.md
   adapter: opencode

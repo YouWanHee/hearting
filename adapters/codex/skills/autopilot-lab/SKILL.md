@@ -1,6 +1,6 @@
 ---
 name: autopilot-lab
-description: "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements. Not for reusable evaluation code, independent documents, or fixed-data document layout/caption edits."
+description: "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements. Owns experiments; default preset. Not for reusable evaluation code, independent documents, or fixed-data document layout/caption edits."
 ---
 
 # autopilot-lab

@@ -1,6 +1,6 @@
 ---
 name: analyze-user
-description: "Use when durable cross-project user preferences must be inferred from coding, writing, or analysis evidence and stored as a profile. Not for one-project context recovery, casual preference acknowledgment, or ordinary task execution."
+description: "Use when durable cross-project user preferences must be inferred from coding, writing, or analysis evidence and stored as a profile. Owns profile; default preset. Not for one-project context recovery, casual preference acknowledgment, or ordinary task execution."
 metadata:
   portable_source: capabilities/analyze-user.md
   adapter: opencode

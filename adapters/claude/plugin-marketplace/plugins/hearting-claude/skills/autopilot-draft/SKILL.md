@@ -1,7 +1,7 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
 name: autopilot-draft
-description: "Use when a new document has an independent audience and document goal. Not for experiment reports (lab), existing-document edits, or code."
+description: "Use when a new document has an independent audience and document goal. Owns document; default preset. Not for experiment reports (lab), existing-document edits, or code."
 argument-hint: "<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]"
 metadata:
   group: entry
@@ -9,7 +9,7 @@ metadata:
   invocation_class: entry-router
   modes: ["paper", "presentation", "doc"]
   blurb: "Draft independent documents through strategy, verification, and editing."
-  use_when: "Use when a new document has an independent audience and document goal."
+  use_when: "Use when a new document has an independent audience and document goal. Owns document; default preset."
   not_for: "Not for experiment reports (lab), existing-document edits, or code."
 ---
 

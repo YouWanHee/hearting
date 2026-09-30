@@ -1,6 +1,6 @@
 ---
 name: autopilot-research
-description: "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence."
+description: "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Owns research; default preset. Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence."
 metadata:
   portable_source: capabilities/autopilot-research.md
   adapter: opencode

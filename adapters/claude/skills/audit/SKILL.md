@@ -1,7 +1,7 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
 name: audit
-description: "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification."
+description: "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Owns audit report; default preset. Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification."
 argument-hint: "<artifact_path> [--scope auto|facts|style|structure|cross-ref|coverage|all] [--read-only] [--report-only] [--no-fact-check]"
 metadata:
   group: ops
@@ -9,7 +9,7 @@ metadata:
   invocation_class: entry-router
   modes: []
   blurb: "Read-oriented post-run inspection for artifact drift, inconsistency, and omissions."
-  use_when: "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims."
+  use_when: "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Owns audit report; default preset."
   not_for: "Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification."
 ---
 

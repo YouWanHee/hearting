@@ -4,13 +4,15 @@ The full cycle is **setup** → user training → **eval**. With `--mode auto`, 
 
 > **Stage-dispatch contract for standard+:** dispatch durable setup, eval, and report stages as separate dispatch-depth-2 headless sessions under OPERATIONS §5.10. Units run inside their assigned stage session. Use file-only handoff: read inputs from artifacts and never rely on earlier conversational context. The dispatch-depth-1 conductor passes paths and collects only verdicts and status. **Do not dispatch the actual experiment run:** it is long, asynchronous, and human-gated by the pending `_RUNLOG.md` row. Keep using the existing `lab-runner.yaml` profile for that segment. Direct, quick, and one-off run guidance remain inline. Stage sessions never redispatch; dispatch depth 3+ is forbidden.
 
-#### Setup stage-worker mapping
+#### Setup steps and their parts
 
-| Stage | Unit | Input artifacts | Output artifacts | Write class |
-|---|---|---|---|---|
-| S1 spec | `research/plan-review` unit | Recent `_RUNLOG.md` rows and research artifacts | `experiments/{date}_{slug}/experiment_spec.md` | Dispatched dispatch depth 2 |
-| S2 scaffold | `dev/new-lib` unit | `experiment_spec.md` plus reference or parent config | `train.py`, `eval.py`, `config.yaml`, and `metrics.jsonl` logger | Dispatched dispatch depth 2 |
-| S3 run | User or cluster submit | `config.yaml` | Pending `_RUNLOG.md` row and `run.json` with running status | **Not dispatched**; long, asynchronous, human-gated |
+The stage list lives in one place: `capabilities/topologies.json` (recipe plus `part_catalog`), printed by `capability-route.py stages --capability autopilot-lab`. Units, inputs, outputs, write scope, and gates come from there; this table only maps the procedure steps below to part ids.
+
+| Procedure step | Part | What the step adds to the part contract |
+|---|---|---|
+| S1 spec | owner step (the `research/plan-review` unit reviews the draft at standard+) | Writes `experiments/{date}_{slug}/experiment_spec.md` from recent `_RUNLOG.md` rows and research artifacts; it is the `setup-contract` input of `scaffold` |
+| S2 scaffold | `autopilot-lab:scaffold` | `train.py`, `eval.py`, `config.yaml`, and the `metrics.jsonl` logger from `experiment_spec.md` plus the reference or parent config |
+| S3 run | `autopilot-lab:smoke` → `autopilot-lab:full-run` → `autopilot-lab:run-verify` → `autopilot-lab:handoff` | S3-3 hash-bound smoke, then the detached full run — **not an agent dispatch**; long, asynchronous, human-gated — with the pending `_RUNLOG.md` row and `run.json` in running status, its verification, and the handoff record |
 
 See `eval-procedure.md` for E2, E3-2, and E3-3.
 

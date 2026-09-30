@@ -25,8 +25,8 @@ Heavy training and evaluation run in the user's compute environment, cluster, GP
 | `auto-load-context.md` | Every invocation, Step 0 (required) | Context loading from project conventions, optional user-profile conventions, `_RUNLOG`, parent or prior experiments, similar models, and readiness checks |
 | `data-contract.md` | When writing machine-readable logs, `run.json`, dispatch data, or `report/` | Append-only `metrics.jsonl`, lifecycle manifest, parent-lineage source of truth, terminal dispatch event, and iframe report contract |
 | `config-provenance.md` | Before a full run or when reviewing config lineage | Resolution, sealing, manifest verification, smoke binding, and promotion handoff |
-| `setup-procedure.md` | `--mode setup` or auto→setup | S1 spec and review, S2 scaffold and logger, S3 run guidance, `_RUNLOG` pending state, `run.json` birth record, and smoke/debug options |
-| `eval-procedure.md` | `--mode eval` or auto→eval | E1 eval spec, E2 execution guidance, E3 analysis, figures, paper comparison, `REPORT.md`, `STORY.md`, `_RUNLOG` completion, `run.json` finalization, and dispatch event |
+| `setup-procedure.md` | `--mode setup` or auto→setup | S1 spec and review, S2 scaffold and logger, S3 run guidance, `_RUNLOG` pending state, `run.json` birth record, and smoke/debug options; its step table maps S1–S3 to part ids (`capability-route.py stages --capability autopilot-lab` is the stage list) |
+| `eval-procedure.md` | `--mode eval` or auto→eval | E1 eval spec, E2 execution guidance, E3 analysis, figures, paper comparison, `REPORT.md`, `STORY.md`, `_RUNLOG` completion, `run.json` finalization, and dispatch event; its step table maps E1–E3 to part ids, including the optional `eval-spec`, `eval-smoke`, and `diagnose` parts |
 | `outputs-and-examples.md` | When resolving output layout, graduation, handoff, return format, or examples | Supported experiment layouts, `pipeline_state.yaml`, graduation to spec/code, optional continuity notes, return format, and worked examples |
 
 ## Workflow Position

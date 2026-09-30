@@ -226,6 +226,10 @@ artifact and the entire evaluation ran inline in the main session.
 
 The precedence above decides which capability **owns the artifacts** of a
 request. It does not oblige the session to run that entry's whole recipe.
+An entry's recipe is an assembly preset: the default when nothing else is
+chosen and an example of how its parts fit together. The route is the sealed
+stage list, assembled from the part catalog (`capabilities/topologies.json`
+recipes plus `part_catalog`, SD-165).
 Before proposing a route, choose the **shape** of the work from its size; the
 shape and explicit choices determine the route; defaults only fill omissions:
 
@@ -233,7 +237,7 @@ shape and explicit choices determine the route; defaults only fill omissions:
 |---|---|---|
 | `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --campaign-key <stream> --slug <slug>` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
-| `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's valid stage ids, units, and human gates with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
+| `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's parts (stage ids, summaries, inputs/outputs, units, human gates, `shareable`, `start_approval`, optional and borrowable parts) with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
 <task>` with the selected shape/graph (the campaign choice is required:
@@ -283,7 +287,12 @@ records `compose` or `preset`, `selection.shape` records the shape, a staged
 route is `composed: true` with its recipe embedded, and every staged node
 keeps its unit, gate, write scope, model profile, and permissions from the
 owning capability's recipe. A stage id may name a unit from the node's
-declared `unit_choices` (`execute:dev/refactor`); a human gate a kept node
+declared `unit_choices` (`execute:dev/refactor`). A `capability:stage` token
+(`autopilot-research:retrieval`) borrows a shareable part of another recipe:
+it keeps its unit and gate, is written under `parts/<capability>/<stage>/`
+inside the host's artifact scope, and seals the name mapping as `part_io`; the
+host capability still owns the artifacts, and a token that is not a registered
+shareable part is the same unknown-node refusal as any other. A human gate a kept node
 raises is rebound to the entry of the node that now follows it and dropped
 when nothing follows; a declared parallel group survives only when its anchor
 is kept and is not the new terminal. Composition changes route *shape* only —

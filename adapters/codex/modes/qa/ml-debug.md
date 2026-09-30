@@ -48,8 +48,13 @@ aliases: {}
 
 # Unit: qa/ml-debug
 
-Diagnose ML training incidents by reading code, parsing logs, and ranking hypotheses.
+Diagnose ML training incidents and evaluation results by reading code, parsing logs
+and results, and ranking hypotheses.
 **Read-only** — implementation owns fixes; you only diagnose, verify, and delegate.
+
+Three assignments reach this unit: a training incident (below), a **result
+diagnosis** (`autopilot-lab:diagnose`, or `metrics` run with this unit), and a
+**smoke check** (`smoke`, `eval-smoke`).
 
 ## Symptoms → Likely causes
 
@@ -73,6 +78,28 @@ Diagnose ML training incidents by reading code, parsing logs, and ranking hypoth
    recent diff, not from the symptom table alone.
 4. **Report the top 1–3 causes** — each with confidence, exact evidence lines, a small
    runnable verification method, and a fix direction for the implementation role.
+
+## Result diagnosis
+
+When the assignment is why evaluation results look the way they do (a metric gap,
+a field sample that fails, a regression between checkpoints):
+
+1. Read `raw-results/**` and `summary-stats.json`, plus any field samples or
+   reproduction conditions the assignment names.
+2. State each hypothesis with the evidence for and against it.
+3. Give the conditions under which the result reproduces.
+4. Give a verdict per hypothesis (supported, refuted, open).
+5. Name the one experiment that would falsify the leading hypothesis.
+
+Write `reviews/diagnosis.md` in that order (hypotheses, reproduction conditions,
+verdict, falsifying experiment).
+
+## Smoke check
+
+Run the smallest pass that exercises the real path and write the attestation with
+`tools/smoke-attestation.py attest`, binding the exact inputs: config and scaffold
+for a setup `smoke`; checkpoint, eval-spec and the config snapshot for an
+`eval-smoke`. A failed or stale attestation is the finding; do not repair it.
 
 ## Report
 

@@ -783,4 +783,140 @@ class DepthOneFrameNeverReachesWorkerTypeForKindTest(unittest.TestCase):
         self.assertEqual(seen, 10)  # five standard+ recipes x two frame legs
 
 
+class PartCatalogTest(unittest.TestCase):
+    """SD-165: the catalog describes, widens and adds; it never redefines a recipe."""
+    def setUp(self):
+        self.r = T.load_registry()
+        self.parts = self.r["part_catalog"]["parts"]
+    def invalid(self, mutate, message):
+        r = copy.deepcopy(self.r); mutate(r["part_catalog"], r)
+        self.assertRaisesRegex(T.TopologyError, message, T.validate_registry, r)
+    def test_every_recipe_stage_has_one_row_and_a_summary(self):
+        T.validate_registry(self.r)
+        stages = {f"{r['capability']}:{n['id']}" for r in self.r["recipes"] for n in r["standard_plus"]["nodes"]}
+        optional = {part for part, row in self.parts.items() if "optional" in row}
+        self.assertEqual(set(self.parts), stages | optional)
+        self.assertEqual(optional, {"autopilot-lab:diagnose", "autopilot-lab:eval-spec", "autopilot-lab:eval-smoke"})
+        self.invalid(lambda c, r: c["parts"].pop("audit:inspect"), "lacks a row for recipe stages")
+        self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(summary=""), "one-line summary")
+        self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(gate="x"), "unknown catalog fields")
+        self.invalid(lambda c, r: c["parts"].update({"audit:nope": {"summary": "x"}}), "not a recipe stage")
+        self.invalid(lambda c, r: c.update(extra=1), "exactly schema_version, frame, hosts, parts")
+    def test_a_registry_without_the_catalog_is_still_valid(self):
+        r = copy.deepcopy(self.r); del r["part_catalog"]
+        for gate in ("lab-diagnose", "lab-eval-spec"): del r["completion_gate_contracts"][gate]
+        T.validate_registry(r)
+        self.assertEqual(T.part_row(r, "audit:report"), {})
+        self.assertEqual(T.borrowable_parts(r, r["recipes"][0]), [])
+    def test_source_writing_and_owner_parts_cannot_be_declared_shareable(self):
+        self.invalid(lambda c, r: c["parts"]["autopilot-code:execute"].update(shareable=True),
+                     "write outside the cycle cannot be shared")
+        self.invalid(lambda c, r: c["parts"]["autopilot-lab:publish"].update(shareable=True), "cannot be shared")
+        self.invalid(lambda c, r: c["parts"]["autopilot-design:build"].update(shareable=True),
+                     "only an implicit-anchor recipe")
+        self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(hosts=["audit"]), "hosts is only valid")
+        self.invalid(lambda c, r: c["parts"]["autopilot-lab:smoke"].update(hosts=["nope"]), "known capabilities")
+    def test_widened_choices_and_name_mapping_are_checked(self):
+        self.invalid(lambda c, r: c["parts"]["autopilot-code:execute"].update(unit_choices=["dev/backend"]),
+                     "cannot redefine the node's own")
+        self.invalid(lambda c, r: c["parts"]["autopilot-lab:metrics"].update(unit_choices=["qa/ml-debug"]),
+                     "not in unit_choices")
+        self.invalid(lambda c, r: c["parts"]["autopilot-lab:eval-run"].update(input_names={"nope": "eval-spec.md"}),
+                     "input_names must map")
+        self.invalid(lambda c, r: c["parts"]["autopilot-lab:eval-run"].update(input_names={"eval-spec": "nope.md"}),
+                     "input_names must map")
+    def test_optional_part_is_validated_as_a_node_of_its_recipe(self):
+        def wrong_gate(c, r): c["parts"]["autopilot-lab:diagnose"]["optional"]["node"]["completion_gate"] = "lab-metrics"
+        self.invalid(wrong_gate, "carrying node's unit")
+        def escape(c, r): c["parts"]["autopilot-lab:diagnose"]["optional"]["node"]["write_scope"] = ["metrics.jsonl"]
+        self.invalid(escape, "reviewer may write isolated verdicts only|outputs outside write_scope")
+        def order(c, r): c["parts"]["autopilot-lab:diagnose"]["optional"]["after"] = ["scaffold"]
+        self.invalid(order, "must name stages of its recipe")
+        def renamed(c, r): c["parts"]["autopilot-lab:diagnose"]["optional"]["node"]["id"] = "other"
+        self.invalid(renamed, "node id must equal the stage id")
+        self.assertEqual([stage for stage, _row in T.recipe_optional_parts(
+            self.r, T.resolve_recipe(self.r, "autopilot-lab", "eval"))], ["diagnose", "eval-spec", "eval-smoke"])
+        self.assertEqual(T.recipe_optional_parts(self.r, T.resolve_recipe(self.r, "autopilot-lab", "setup")), [])
+    def test_unit_io_gate_accepts_a_declared_choice_only(self):
+        r = copy.deepcopy(self.r)
+        lab = T.resolve_recipe(r, "autopilot-lab", "setup")
+        node = next(n for n in lab["standard_plus"]["nodes"] if n["id"] == "scaffold")
+        node.update(unit="dev/backend", role=T._unit_frontmatter("dev/backend")["role"])
+        T._validate_gate_contracts(lab, r)  # dev/new-lib (the gate's unit) is a declared choice
+        node["unit_choices"] = ["dev/backend"]
+        self.assertRaisesRegex(T.TopologyError, "carrying node's unit", T._validate_gate_contracts, lab, r)
+    def test_relocation_lands_in_every_host_scope_class(self):
+        synthesis = lambda host, mode: T.resolve_shared_part(
+            self.r, T.resolve_recipe(self.r, host, mode), "autopilot-research:synthesis")
+        move = lambda part, kind, path: T.relocate_part_path(part["scope"], kind, part["capability"], part["stage"], path)
+        self.assertEqual(move(synthesis("autopilot-code", "dev"), "pipeline-stage", "cards/**"),
+                         ["parts/autopilot-research/synthesis/cards/**"])
+        self.assertEqual(move(synthesis("audit", "default"), "pipeline-stage", "cards/**"),
+                         ["parts/autopilot-research/synthesis/cards/**"])
+        self.assertEqual(move(synthesis("autopilot-design", "default"), "pipeline-stage", "cards/**"), [
+            "designs/<cycle>/parts/autopilot-research/synthesis/cards/**",
+            "spec/design/parts/autopilot-research/synthesis/cards/**"])
+        audit = T.resolve_recipe(self.r, "audit", "default")
+        retrieval = T.resolve_shared_part(self.r, audit, "autopilot-research:retrieval")
+        self.assertEqual(retrieval["merged_anchor"], "map_anchor")
+        self.assertNotIn("map_anchor", audit["artifact_scope"])  # the recipe itself is untouched
+        moved = move(retrieval, "map-worker", "shards/retrieval/**")
+        self.assertEqual(moved, ["shards/parts/autopilot-research/retrieval/shards/retrieval/**"])
+        for suffix in ("alternative", "assumption"):  # a realized leg stays inside the part directory
+            leg = T._parallel_path(moved[0], suffix)
+            self.assertTrue(leg.startswith("shards/parts/autopilot-research/retrieval/"), leg)
+            T._validate_bucket_anchor(dict(audit, artifact_scope=retrieval["scope"]), self.r, [leg], None,
+                                      "leg", require_anchor_tail=True)
+        smoke = T.resolve_shared_part(self.r, T.resolve_recipe(self.r, "autopilot-code", "dev"), "autopilot-lab:smoke")
+        attestation = move(smoke, "review-worker", "reviews/smoke-attestation.json")[0]
+        self.assertEqual(attestation, "_internal/parts/autopilot-lab/smoke/reviews/smoke-attestation.json")
+        self.assertTrue(T._parallel_path(attestation, "alternative").startswith("_internal/parts/autopilot-lab/smoke/"))
+    def test_what_cannot_be_borrowed_resolves_to_none(self):
+        audit = T.resolve_recipe(self.r, "audit", "default")
+        research = T.resolve_recipe(self.r, "autopilot-research", "academic")
+        apply = T.resolve_recipe(self.r, "autopilot-apply", "default")
+        for host, part in ((audit, "autopilot-code:execute"), (audit, "autopilot-lab:nope"),
+                           (audit, "autopilot-research:report"), (audit, "autopilot-lab:full-run"),
+                           (research, "autopilot-research:retrieval"), (apply, "autopilot-research:retrieval")):
+            self.assertIsNone(T.resolve_shared_part(self.r, host, part), part)
+        self.assertEqual(T.borrowable_parts(self.r, audit), [
+            "autopilot-research:retrieval", "autopilot-research:synthesis", "autopilot-lab:diagnose"])
+        self.invalid(lambda c, r: c["hosts"].update({"autopilot-code": {"map_anchor": "shards"}}),
+                     "redeclares an anchor its recipe already has")
+    def test_digest_ignores_the_catalog_until_a_recipe_uses_it(self):
+        before = {c: T.capability_registry_digest(self.r, c) for c in ("audit", "autopilot-lab", "autopilot-code")}
+        r = copy.deepcopy(self.r)
+        r["part_catalog"]["parts"]["audit:report"]["summary"] = "changed"
+        r["part_catalog"]["parts"]["autopilot-research:retrieval"]["shareable"] = False
+        r["part_catalog"]["hosts"]["audit"]["map_anchor"] = "elsewhere"
+        self.assertEqual({c: T.capability_registry_digest(r, c) for c in before}, before)
+        self.assertNotEqual(T.registry_digest(r), T.registry_digest(self.r))
+        composed = {"capability": "audit", "compose": {
+            "base_capability": "audit", "parts": ["autopilot-research:retrieval"]}}
+        using = T.capability_registry_digest(self.r, "audit", [composed])
+        self.assertNotEqual(using, T.capability_registry_digest(r, "audit", [composed]))
+        plain = {"capability": "audit", "compose": {"base_capability": "audit"}}
+        self.assertEqual(T.capability_registry_digest(self.r, "audit", [plain]),
+                         T.capability_registry_digest(r, "audit", [plain]))
+        origin = copy.deepcopy(self.r)  # the borrowed part's origin recipe is part of what the route derives from
+        T.resolve_recipe(origin, "autopilot-research", "academic")["standard_plus"]["nodes"][0]["role"] = "changed"
+        self.assertNotEqual(using, T.capability_registry_digest(origin, "audit", [composed]))
+        self.assertEqual(T.capability_registry_digest(self.r, "audit", [plain]),
+                         T.capability_registry_digest(origin, "audit", [plain]))
+    def test_frame_is_one_part_and_recipe_frames_are_its_aliases(self):
+        frame = self.r["part_catalog"]["frame"]
+        self.assertEqual(set(frame["briefs"]), {
+            "autopilot-code", "autopilot-design", "autopilot-draft", "autopilot-refine", "autopilot-spec"})
+        self.assertEqual(T.frame_brief_inputs(self.r, "autopilot-code"), frame["brief_outputs"])
+        self.assertEqual(T.frame_brief_inputs(self.r, "autopilot-spec"), [
+            "spec/_internal/research/frame/direction-brief.md",
+            "spec/_internal/research/frame-alternative/direction-brief.md"])
+        self.assertEqual(T.frame_brief_inputs(self.r, "audit"), [])
+        self.invalid(lambda c, r: c["frame"]["template"].update(unit="plan/plan-author"),
+                     "frame alias differs from the catalog template")
+        self.invalid(lambda c, r: c["frame"]["briefs"]["autopilot-code"].update(consumer="execute"),
+                     "frame brief mapping does not match")
+        self.invalid(lambda c, r: c["frame"]["briefs"].pop("autopilot-spec"), "cover exactly the recipes")
+
+
 if __name__ == "__main__": unittest.main()

@@ -123,6 +123,7 @@ usage() {
 usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh read <file> [session-id]
        preflight.sh route <capability> [cwd] [session-id] [mode] [intensity]
+       preflight.sh stages [--capability <name>] [--json]
        preflight.sh capability <name> [cwd] [session-id]
        preflight.sh skill <name> [cwd] [session-id]
        preflight.sh session-end [cwd] [session-id]
@@ -341,8 +342,14 @@ case "$cmd" in
     ;;
   compose)
     # SD-135: preset-free work route (shape/subgraph); same compiler, same bind.
+    # SD-165: `--graph` tokens, including `capability:stage` parts, pass through unmodified.
     shift
     AGENT_HOME="$AGENT_ROOT" exec python3 "$ROOT/utilities/capability-route.py" compose "$@"
+    ;;
+  stages)
+    # SD-165: the part catalog a graph is assembled from; same output on every adapter.
+    shift
+    AGENT_HOME="$AGENT_ROOT" exec python3 "$ROOT/utilities/capability-route.py" stages "$@"
     ;;
   route)
     if [ "${2:-}" = "--capability" ]; then

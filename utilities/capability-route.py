@@ -2059,6 +2059,10 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
                 leg["write_scope"] = [
                     _parallel_path(path, suffix) for path in base["write_scope"]
                 ]
+                if "part_io" in leg:  # SD-165: a borrowed leg's own outputs moved with it
+                    leg["part_io"] = {
+                        name: _parallel_path(path, suffix) if path in base["outputs"] else path
+                        for name, path in base["part_io"].items()}
             leg["model_profile"] = leg_spec["model_profile"]
             leg.pop("profile_demand", None)
             if "profile_demand" in leg_spec:
@@ -2611,8 +2615,14 @@ def shape_for_intensity(effective):
     return INTENSITY_SHAPE.get(effective, "staged")
 
 
-def parse_graph_spec(text):
-    """`execute,test,report` or `execute:dev/refactor,test` -> [(id, unit|None)]."""
+def parse_graph_spec(text, capabilities=None):
+    """`execute,test,report` or `execute:dev/refactor,test` -> [(id, unit|None)].
+
+    SD-165: when the first segment names a registered capability the token is a
+    part id, `autopilot-lab:diagnose` or `autopilot-lab:metrics:qa/ml-debug`,
+    and the returned key is `capability:stage`. Every other token parses as
+    before.
+    """
     if not isinstance(text, str) or not text.strip():
         raise ValueError("compose-graph-empty")
     rows = []
@@ -2624,6 +2634,12 @@ def parse_graph_spec(text):
         node_id = node_id.strip()
         if not re.fullmatch(r"[a-z][a-z0-9-]*", node_id):
             raise ValueError(f"compose-graph-node-invalid:{node_id}")
+        if unit and capabilities and node_id in capabilities:
+            stage, _, unit = unit.partition(":")
+            stage = stage.strip()
+            if not re.fullmatch(r"[a-z][a-z0-9-]*", stage):
+                raise ValueError(f"compose-graph-node-invalid:{node_id}:{stage}")
+            node_id = f"{node_id}:{stage}"
         rows.append((node_id, unit.strip() or None))
     ids = [row[0] for row in rows]
     if len(ids) != len(set(ids)):
@@ -2631,7 +2647,7 @@ def parse_graph_spec(text):
     return rows
 
 
-def _compose_inputs(base_nodes, base_node, kept, find_input=None):
+def _compose_inputs(base_nodes, base_node, kept, find_input=None, alternates=None):
     """Keep the base node's declared inputs wherever they can still exist.
 
     An input stays when it is not produced by any recipe node (an external
@@ -2644,6 +2660,10 @@ def _compose_inputs(base_nodes, base_node, kept, find_input=None):
     compose must yield exactly the preset's inputs. (Canary review round 1
     B1, round 2 M2.) SD-163: when `find_input(name)` finds a same-named prior
     output, the input stays and its source is returned in the second value.
+    SD-165: `alternates(name, dropped_producers | None)` names further prior
+    outputs to look for -- the relocated name of a borrowed part, or the part
+    output the catalog maps an external input to. The input's own name is
+    always tried first, so a sealed source replays through `sealed.get`.
     """
     producers = {}
     for candidate in base_nodes.values():
@@ -2655,7 +2675,13 @@ def _compose_inputs(base_nodes, base_node, kept, find_input=None):
         if owners is None or owners & kept or TOPO._is_semantic_output(item):
             if item not in inputs:
                 inputs.append(item)
-        elif find_input is not None and (source := find_input(item)) is not None:
+            names = alternates(item, None) if alternates is not None and owners is None else ()
+        else:
+            names = (item, *(alternates(item, owners) if alternates is not None else ()))
+        if find_input is None:
+            continue
+        source = next((found for name in names if (found := find_input(name)) is not None), None)
+        if source is not None:
             if item not in inputs:
                 inputs.append(item)
             sources[item] = source
@@ -2699,6 +2725,25 @@ def _compose_graph_order_violation(base_nodes, ids):
     return None
 
 
+def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
+    """Suffixes of a borrowed group's auxiliary legs that no selected node arbitrates.
+
+    Same rule `_validate_gate_contracts` applies to a recipe: a review anchor is
+    merged by the conductor; a map or pipeline anchor needs exactly one direct
+    consumer whose gate declares `auxiliary_arbiter`.
+    """
+    auxiliary = [leg["suffix"] for leg in group["legs"] if leg.get("leg_class") == "auxiliary"]
+    if not auxiliary or anchor["kind"] == "review-worker":
+        return []
+    if anchor["kind"] == "pipeline-stage":
+        consumers = [node for node in consumers if node["kind"] == "review-worker"]
+    contracts = registry.get("completion_gate_contracts") or {}
+    if len(consumers) == 1 and (contracts.get(consumers[0]["completion_gate"]) or {}).get(
+            "auxiliary_arbiter") is True:
+        return []
+    return auxiliary
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
@@ -2709,37 +2754,104 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     follows), and a parallel group survives only when its anchor is kept and is
     not the new terminal (G6). Validation stays with `_validate_recipe` --
     this function never re-implements a rule, it only assembles.
+
+    SD-165: a graph key is a host stage id, an optional catalog part of the host
+    recipe, or a registered shareable `capability:stage`. A borrowed part keeps
+    its unit, kind and gate and is relocated under `parts/<capability>/<stage>/`
+    inside the host's own artifact scope; the name mapping is sealed as
+    `part_io`. A graph that names none of these assembles exactly as before.
     """
+    host = base_recipe["capability"]
     base_nodes = {node["id"]: node for node in base_recipe["standard_plus"]["nodes"]}
-    ids = [node_id for node_id, _ in graph_spec]
-    unknown = [node_id for node_id in ids if node_id not in base_nodes]
+    optional = dict(TOPO.recipe_optional_parts(registry, base_recipe))
+    # `view` is what a key may resolve to locally; `order` carries the
+    # precedence edges used only by the caller-order check (sealed `depends_on`
+    # is always rewritten in the caller's order below).
+    view = dict(base_nodes)
+    view.update({stage: row["optional"]["node"] for stage, row in optional.items()})
+    order = {node_id: {"depends_on": list(node.get("depends_on") or [])} for node_id, node in view.items()}
+    for stage, row in optional.items():
+        order[stage]["depends_on"] = list(row["optional"]["after"])
+        for follower in row["optional"]["before"]:
+            order[follower]["depends_on"].append(stage)
+    rows, unknown = [], []
+    for key, unit in graph_spec:
+        capability, separator, stage = key.partition(":")
+        if separator and capability == host and stage in view:
+            key, separator = stage, ""
+        if not separator:
+            if key not in view:
+                unknown.append(key)
+                continue
+            rows.append((key, key, unit, None))
+            continue
+        part = TOPO.resolve_shared_part(registry, base_recipe, key)
+        if part is None:
+            unknown.append(key)
+            continue
+        rows.append((key, f"{capability}-{stage}", unit, part))
     if unknown:
         raise ValueError(
             "compose-graph-unknown-node:" + ",".join(unknown)
-            + " (available: " + ",".join(base_nodes) + ")"
+            + " (available: " + ",".join(view) + ")"
             + " (run `capability-route.py stages --capability "
             + base_recipe["capability"] + "` to list valid stage ids)"
         )
-    violation = _compose_graph_order_violation(base_nodes, ids)
+    ids = [row[1] for row in rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("compose-graph-duplicate-node")
+    source_of = {node_id: (part["node"] if part else view[node_id]) for _, node_id, _, part in rows}
+    for _, node_id, _, part in rows:
+        if part:
+            borrowed_ids = {p["stage"]: other for _, other, _, p in rows
+                            if p and p["recipe"] is part["recipe"]}
+            order[node_id] = {"depends_on": [borrowed_ids[dep] for dep in part["node"].get("depends_on") or []
+                                             if dep in borrowed_ids]}
+    violation = _compose_graph_order_violation(order, ids)
     if violation:
         consumer, producer = violation
         raise ValueError(
             f"compose-graph-order:{consumer}-before-{producer} "
-            "(recipe order: " + ",".join(base_nodes) + ")"
+            "(recipe order: " + ",".join(view) + ")"
         )
     def gate_group(node_id):
-        base = base_nodes[node_id]
+        base = source_of[node_id]
         continuation = base.get("continuation") or {}
         if continuation.get("kind") == "human-gate":
             return continuation["gate"], tuple(base.get("depends_on", []))
         return None
 
+    host_kept = {node_id for _, node_id, _, part in rows if part is None}
+    # The catalog's input-name lookup fills a SUBGRAPH; a full recipe graph and a
+    # preset never ask (stage-dispatch 13.64.3: "in a partial graph").
+    strict = len(host_kept & set(base_nodes)) < len(base_nodes)
+    selected_outputs = {out for node_id in ids for out in source_of[node_id].get("outputs") or []}
+
+    def producers_in(capability, name):
+        stages = [node["id"] for recipe in registry["recipes"] if recipe["capability"] == capability
+                  for node in recipe["standard_plus"]["nodes"] if name in (node.get("outputs") or [])]
+        stages += [part_id.partition(":")[2] for part_id, row in (TOPO.part_catalog(registry).get("parts") or {}).items()
+                   if part_id.partition(":")[0] == capability and isinstance(row.get("optional"), dict)
+                   and name in (row["optional"]["node"].get("outputs") or [])]
+        return sorted(set(stages))
+
+    scope = json.loads(json.dumps(base_recipe["artifact_scope"]))
     nodes = []
     overrides = {}
-    for index, (node_id, unit) in enumerate(graph_spec):
-        node = json.loads(json.dumps(base_nodes[node_id]))
+    used_parts = set()
+    meta = {}
+    for index, (key, node_id, unit, part) in enumerate(rows):
+        node = json.loads(json.dumps(source_of[node_id]))
+        part_id = key if part else f"{host}:{node_id}"
+        catalog_row = TOPO.part_row(registry, part_id)
+        capability = part["capability"] if part else host
         if unit:
             choices = node.get("unit_choices")
+            widened = catalog_row.get("unit_choices")
+            if choices is None and widened and unit != node.get("unit") and unit in widened:
+                # A widened choice is merged only when the graph actually picks it.
+                choices = node["unit_choices"] = list(widened)
+                used_parts.add(part_id)
             if choices is not None and unit not in choices:
                 raise ValueError(
                     f"compose-unit-not-in-choices:{node_id}:{unit} (choices: {','.join(choices)})"
@@ -2748,7 +2860,27 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
                 raise ValueError(f"compose-unit-override-reserved:{node_id}")
             node["unit"] = unit
             node["role"] = TOPO._unit_frontmatter(unit)["role"]
-            overrides[node_id] = unit
+            overrides[key] = unit
+        originals = list(node.get("outputs") or [])
+        moved = {}
+        if part:
+            kind = node["kind"]
+            def relocate(path, _kind=kind, _part=part):
+                return TOPO.relocate_part_path(_part["scope"], _kind, _part["capability"], _part["stage"], path)
+            node["id"] = node_id
+            node["write_scope"] = [target for path in node["write_scope"] for target in relocate(path)]
+            for out in originals:
+                if not TOPO._is_semantic_output(out):
+                    moved[out] = relocate(out)[0]
+            node["outputs"] = [moved.get(out, out) for out in originals]
+            node["part"] = key
+            if catalog_row.get("start_approval"):
+                node["start_approval"] = catalog_row["start_approval"]
+            if part["merged_anchor"]:
+                scope[part["merged_anchor"]] = part["scope"][part["merged_anchor"]]
+            used_parts.add(key)
+        elif node_id in optional:
+            used_parts.add(part_id)
         previous = nodes[-1] if nodes else None
         node["depends_on"] = [previous["id"]] if previous else []
         if previous and gate_group(previous["id"]):
@@ -2764,14 +2896,63 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
                         break
                     raisers.append(prior["id"])
                 node["depends_on"] = list(reversed(raisers))
-        node["inputs"], sources = _compose_inputs(base_nodes, base_nodes[node_id], set(ids), find_input)
+        input_names = catalog_row.get("input_names") or {}
+        if part:
+            origin_nodes = {n["id"]: n for n in part["recipe"]["standard_plus"]["nodes"]}
+            kept = {p["stage"] for _, _, _, p in rows if p and p["recipe"] is part["recipe"]}
+        else:
+            origin_nodes, kept = base_nodes, set(ids)
+
+        def alternates(name, owners, _capability=capability, _names=input_names):
+            if owners is not None:  # every recipe producer was dropped: also look under the borrowed name
+                return tuple(f"parts/{_capability}/{stage}/{name}" for stage in sorted(owners))
+            target = _names.get(name)
+            if not target or not strict or target in selected_outputs:
+                return ()
+            return (name, target, *(f"parts/{_capability}/{stage}/{target}"
+                                    for stage in producers_in(_capability, target)))
+
+        node["inputs"], sources = _compose_inputs(origin_nodes, source_of[node_id], kept, find_input, alternates)
         if sources:
             node["input_sources"] = sources
+            if set(sources) & set(input_names):
+                used_parts.add(part_id)
         node.pop("terminal", None)
         node.pop("terminal_gate", None)
         node.pop("continuation", None)
         node.pop("parallel_group", None)
         nodes.append(node)
+        meta[node_id] = {"part_id": part_id, "originals": originals, "moved": moved,
+                         "input_names": input_names, "catalog": bool(part) or node_id in optional}
+    # SD-165 name mapping, sealed as `part_io` (absent on a route that uses no catalog part).
+    produced = {}
+    for index, node in enumerate(nodes):
+        info = meta[node["id"]]
+        io = {}
+        inputs = []
+        for name in node["inputs"]:
+            target = produced.get(name, name)
+            if target != name:  # the nearest producer is a borrowed part: read its relocated path
+                io[name] = target
+            if target not in inputs:
+                inputs.append(target)
+        for name, target in info["input_names"].items():
+            if name in inputs and target in produced:  # catalog name mapping to a selected producer
+                io[name] = produced[target]
+                used_parts.add(info["part_id"])
+        if index and meta[nodes[index - 1]["id"]]["catalog"]:
+            # A catalog part's result reaches the next stage brief even when that
+            # stage's recipe inputs never named it.
+            handed = [out for out in nodes[index - 1]["outputs"] if not TOPO._is_semantic_output(out)]
+            if handed and not set(handed) & (set(inputs) | set(io.values())):
+                inputs.extend(handed)
+        node["inputs"] = inputs
+        io.update(info["moved"])
+        if io:
+            node["part_io"] = io
+        for original, sealed in zip(info["originals"], node["outputs"]):
+            if not TOPO._is_semantic_output(original):
+                produced[original] = sealed
     terminal = nodes[-1]
     terminal["terminal"] = True
     terminal["terminal_gate"] = terminal["completion_gate"]
@@ -2790,7 +2971,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     bindings, gates = [], []
     gate_anchor: dict[str, str] = {}
     for index, node in enumerate(nodes[:-1]):
-        base = base_nodes[node["id"]]
+        base = source_of[node["id"]]
         continuation = base.get("continuation") or {}
         if continuation.get("kind") == "human-gate":
             gate = continuation["gate"]
@@ -2811,13 +2992,20 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     kept_ids = set(ids)
     for row in base_recipe.get("human_gate_bindings") or []:
         node_id = row.get("node")
-        if (row.get("position") == "entry" and node_id in kept_ids
+        if (row.get("position") == "entry" and node_id in kept_ids and node_id in base_nodes
                 and not (base_nodes[node_id].get("depends_on") or [])
                 and row.get("gate") not in gates):
             bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
             gates.append(row["gate"])
+    declared_groups = [(group, False) for group in base_recipe["standard_plus"].get("parallel_groups") or []]
+    for _, node_id, _, part in rows:
+        if part:  # a borrowed anchor brings its own group, re-keyed to the borrowed node id
+            declared_groups.extend(
+                (dict(json.loads(json.dumps(group)), id=node_id, node=node_id), True)
+                for group in part["recipe"]["standard_plus"].get("parallel_groups") or []
+                if group["node"] == part["stage"])
     groups, omitted_groups = [], []
-    for group in base_recipe["standard_plus"].get("parallel_groups") or []:
+    for group, borrowed in declared_groups:
         anchor = next((n for n in nodes if n["id"] == group["node"]), None)
         if anchor is None or anchor is terminal:
             continue
@@ -2827,8 +3015,17 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
             # The preset's fan-out requires a review consumer. A caller who
             # selected a smaller graph did not select that fan-out obligation.
             omitted_groups.append({"id": group["id"], "reason": "review-consumer-not-selected"})
-        else:
-            groups.append(json.loads(json.dumps(group)))
+            continue
+        group = json.loads(json.dumps(group))
+        dropped = _unarbitrated_auxiliary_legs(registry, group, anchor, consumers) if borrowed else []
+        if dropped:
+            # Peer legs stay; an auxiliary leg nobody arbitrates is left out.
+            group["legs"] = [leg for leg in group["legs"] if leg["suffix"] not in dropped]
+            group["width_by_intensity"] = {
+                tier: min(width, len(group["legs"])) for tier, width in group["width_by_intensity"].items()}
+            omitted_groups.append({"id": group["id"], "reason": "auxiliary-arbiter-not-selected",
+                                   "legs": dropped})
+        groups.append(group)
     extensions = [
         json.loads(json.dumps(row))
         for row in base_recipe.get("conditional_extensions") or []
@@ -2841,7 +3038,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
         "topology_class": base_recipe["topology_class"],
         "direct_predicates": list(base_recipe["direct_predicates"]),
         "promotion_signals": list(base_recipe["promotion_signals"]),
-        "artifact_scope": json.loads(json.dumps(base_recipe["artifact_scope"])),
+        "artifact_scope": scope,
         "quick": json.loads(json.dumps(base_recipe["quick"])),
         "standard_plus": {
             "topology": base_recipe["standard_plus"].get("topology", base_recipe["topology_class"]),
@@ -2857,9 +3054,12 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
         "human_gates": sorted(set(gates)),
         "human_gate_bindings": bindings,
         "resume_retry_boundaries": list(ids),
-        "compose": {"origin": "compose", "shape": "staged", "graph": list(ids),
+        "compose": {"origin": "compose", "shape": "staged", "graph": [row[0] for row in rows],
                     "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
     }
+    if used_parts:
+        # Catalog rows this recipe derives from; `capability_registry_digest` reads it.
+        recipe["compose"]["parts"] = sorted(used_parts)
     if groups:
         recipe["standard_plus"]["parallel_groups"] = groups
     if omitted_groups:
@@ -3178,7 +3378,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                 artifact_root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key)
         except ImportError:
             find_input = None
-    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph), find_input)
+    capabilities = {recipe["capability"] for recipe in registry["recipes"]}
+    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph, capabilities), find_input)
                        if shape == "staged" and graph else base)
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
     if shape == "staged" and not owner_only and dispatch_evidence is None:
@@ -3296,6 +3497,26 @@ def _compose_campaign_line(selection):
     return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
+def route_start_approvals(route, registry=None):
+    """Start-approval marks of the parts a route carries (SD-165; stage-dispatch 13.63.7).
+
+    A declaration for the card, the frame catalog and the interview -- never a
+    gate, fence or wait. A borrowed node seals its mark; a host's own stage is
+    looked up in the part catalog as `<capability>:<stage>`.
+    """
+    registry = registry or TOPO.load_registry()
+    rows, seen = [], set()
+    for node in route.get("nodes") or []:
+        borrowed = node.get("part")
+        part = borrowed or f"{route.get('capability')}:{node.get('parallel_anchor') or node.get('id')}"
+        approval = node.get("start_approval") if borrowed else TOPO.part_row(registry, part).get("start_approval")
+        if approval and part not in seen:
+            seen.add(part)
+            rows.append({"node": node.get("parallel_anchor") or node.get("id"), "part": part,
+                         "start_approval": approval, "borrowed": bool(borrowed)})
+    return rows
+
+
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
@@ -3316,6 +3537,12 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
         source_dir = os.path.commonpath([str(Path(source["path"]).parent) for source in sourced.values()])
         card += (f"\n  입력 {'·'.join(sourced)} ← {','.join(sorted({s['cycle_id'] for s in sourced.values()}))}"
                  f" {Path(route['artifact_root']) / source_dir}")
+    borrowed = list(dict.fromkeys(node["part"] for node in route["nodes"] if node.get("part")))
+    if borrowed:  # SD-165: parts taken from another recipe, written under parts/<capability>/<stage>/
+        card += f"\n  빌린 부품 {'·'.join(borrowed)}"
+        for row in route_start_approvals(route):
+            if row["borrowed"]:
+                card += f"\n  시작 승인 {row['start_approval']} ({row['part']})"
     from artifact_producer import route_cycle_for, cycle_dir, default_bucket, ProducerError
     try:
         record = route_cycle_for(Path(route["artifact_root"]), route)
@@ -7856,6 +8083,54 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     _launch_open_cycle_checkpoint(route)
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}
 
+def stages_block(registry, recipe):
+    """One recipe's parts for `stages` and the frame catalog (SD-165, 13.64.5).
+
+    Recipe stages in recipe order, then the recipe's optional catalog parts,
+    then the parts of other recipes this host can borrow. The catalog is the
+    only source: a frame assembles a graph from this output alone.
+    """
+    capability=recipe["capability"]
+    group_by_node={g.get("node"):g.get("id") for g in (recipe["standard_plus"].get("parallel_groups") or [])}
+    gate_by_node={}
+    for row in recipe.get("human_gate_bindings") or []:
+        gate_by_node.setdefault(row.get("node"), []).append(row.get("gate"))
+    aliases=(TOPO.part_catalog(registry).get("frame") or {}).get("aliases") or []
+    def part_view(part_id,node,origin,*,optional=False,local=True):
+        catalog_row=TOPO.part_row(registry,part_id)
+        placement=catalog_row.get("optional") or {}
+        produced={out for other in origin["standard_plus"]["nodes"] for out in other.get("outputs") or []}
+        return {
+            "id":node["id"] if local else part_id,"unit":node.get("unit"),
+            "unit_choices":node.get("unit_choices") or catalog_row.get("unit_choices") or [],
+            "parallel_group":group_by_node.get(node["id"]) if local else None,
+            "human_gates":gate_by_node.get(node["id"], []) if local else [],
+            "terminal":local and node.get("terminal") is True,
+            "part":part_id,"summary":catalog_row.get("summary",""),"kind":node.get("kind"),
+            "inputs":list(node.get("inputs") or []),
+            "external_inputs":[name for name in node.get("inputs") or []
+                               if name not in produced and not TOPO._is_semantic_output(name)],
+            "optional_inputs":list(catalog_row.get("optional_inputs") or []),
+            "outputs":list(node.get("outputs") or []),
+            "shareable":catalog_row.get("shareable") is True,
+            "start_approval":catalog_row.get("start_approval"),
+            "optional":optional,
+            "after":list(placement.get("after") or []),"before":list(placement.get("before") or []),
+            "frame_alias":local and node["id"] in aliases and node.get("unit")=="plan/frame",
+        }
+    nodes=[part_view(f"{capability}:{node['id']}",node,recipe) for node in recipe["standard_plus"]["nodes"]]
+    nodes+=[part_view(f"{capability}:{stage}",row["optional"]["node"],recipe,optional=True)
+            for stage,row in TOPO.recipe_optional_parts(registry,recipe)]
+    borrowable=[]
+    for part_id in TOPO.borrowable_parts(registry,recipe):
+        origin,node=TOPO.part_recipe(registry,part_id)
+        borrowable.append(part_view(part_id,node,origin,optional="optional" in TOPO.part_row(registry,part_id),
+                                    local=False))
+    return {"capability":capability,"modes":list(recipe["modes"]),
+            "topology_class":recipe["topology_class"],"nodes":nodes,"borrowable":borrowable,
+            "frame_brief_inputs":TOPO.frame_brief_inputs(registry,capability)}
+
+
 def _compose_artifact_root(cwd):
     script=ROOT/"utilities"/"artifact-root.sh"
     result=subprocess.run(["sh",str(script),str(cwd)],text=True,capture_output=True,check=False)
@@ -8266,35 +8541,30 @@ def main():
         rows=[r for r in registry["recipes"] if a.capability is None or r["capability"]==a.capability]
         if not rows:
             raise ValueError(f"unknown capability: {a.capability}")
-        blocks=[]
-        for recipe in rows:
-            group_by_node={g.get("node"):g.get("id") for g in (recipe["standard_plus"].get("parallel_groups") or [])}
-            gate_by_node={}
-            for row in recipe.get("human_gate_bindings") or []:
-                gate_by_node.setdefault(row.get("node"), []).append(row.get("gate"))
-            blocks.append({
-                "capability":recipe["capability"],"modes":list(recipe["modes"]),
-                "topology_class":recipe["topology_class"],
-                "nodes":[{
-                    "id":node["id"],"unit":node.get("unit"),
-                    "unit_choices":node.get("unit_choices") or [],
-                    "parallel_group":group_by_node.get(node["id"]),
-                    "human_gates":gate_by_node.get(node["id"], []),
-                    "terminal":node.get("terminal") is True,
-                } for node in recipe["standard_plus"]["nodes"]],
-            })
+        blocks=[stages_block(registry,recipe) for recipe in rows]
         if a.json:
             print(json.dumps(blocks,sort_keys=True))
         else:
+            def line(node):
+                choices=f" unit_choices={','.join(node['unit_choices'])}" if node["unit_choices"] else ""
+                group=f" parallel_group={node['parallel_group']}" if node["parallel_group"] else ""
+                gates=f" human_gate={','.join(node['human_gates'])}" if node["human_gates"] else ""
+                terminal=" terminal=1" if node["terminal"] else ""
+                approval=f" start_approval={node['start_approval']}" if node["start_approval"] else ""
+                extra=f" optional_in={','.join(node['optional_inputs'])}" if node["optional_inputs"] else ""
+                if node["after"]: extra+=f" after={','.join(node['after'])}"
+                if node["before"]: extra+=f" before={','.join(node['before'])}"
+                return (f"{node['id']} unit={node['unit']}{choices}{group}{gates}{terminal}"
+                        f" part={node['part']} shareable={int(node['shareable'])} optional={int(node['optional'])}"
+                        f"{approval} in={','.join(node['inputs'])}{extra} out={','.join(node['outputs'])}"
+                        f" -- {node['summary']}")
             for block in blocks:
                 print(f"capability={block['capability']} modes={','.join(block['modes'])} "
                       f"topology={block['topology_class']}")
                 for node in block["nodes"]:
-                    choices=f" unit_choices={','.join(node['unit_choices'])}" if node["unit_choices"] else ""
-                    group=f" parallel_group={node['parallel_group']}" if node["parallel_group"] else ""
-                    gates=f" human_gate={','.join(node['human_gates'])}" if node["human_gates"] else ""
-                    terminal=" terminal=1" if node["terminal"] else ""
-                    print(f"  {node['id']} unit={node['unit']}{choices}{group}{gates}{terminal}")
+                    print("  "+line(node))
+                for node in block["borrowable"]:
+                    print("  borrow "+line(node))
         return 0
     if a.command=="compose":
         shape=a.shape or ("staged" if a.graph else "direct")

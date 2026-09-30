@@ -103,6 +103,7 @@ usage() {
   cat <<'EOF'
 usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh read <file> [session-id]
+       preflight.sh stages [--capability <name>] [--json]
        preflight.sh capability <name> [cwd] [session-id]
        preflight.sh skill <name> [cwd] [session-id]
        preflight.sh memory [cwd]
@@ -799,10 +800,15 @@ EOF
     shift
     "$ROOT/adapters/opencode/bin/role-map.sh" "$@"
     ;;
-  compose|route)
+  compose|route|stages)
     if [ "$1" = "compose" ]; then
       # SD-135: preset-free work route (shape/subgraph); same compiler.
+      # SD-165: `--graph` tokens, including `capability:stage` parts, pass through unmodified.
       subcommand=compose
+      shift
+    elif [ "$1" = "stages" ]; then
+      # SD-165: the part catalog a graph is assembled from; same output on every adapter.
+      subcommand=stages
       shift
     else
       if [ "${2:-}" != "--capability" ]; then

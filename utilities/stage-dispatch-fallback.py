@@ -1048,7 +1048,8 @@ def wrapper_command(
     lifecycle = getattr(args, "launch_lifecycle", DETACHED)
     worker_type = worker_type_for_kind(node["kind"])
     contract = assigned_contract(
-        capability=route["capability"],
+        # SD-165: a borrowed part reads its origin capability's contract.
+        capability=(node.get("part") or "").partition(":")[0] or route["capability"],
         worker_type=worker_type,
         route_node=node["id"],
         completion_gate=node.get("completion_gate"),

@@ -6792,6 +6792,12 @@ class ComposeRouteTest(TestRoute):
   plan_node=next(n for n in block["nodes"] if n["id"]=="plan")
   self.assertIn("frame-review",plan_node["human_gates"])
   self.assertTrue(next(n for n in block["nodes"] if n["id"]=="report")["terminal"])
+  # SD-165: every stage is a part `capability:stage` with its catalog fields
+  self.assertEqual(execute_node["part"],"autopilot-code:execute")
+  self.assertFalse(execute_node["shareable"]); self.assertFalse(execute_node["optional"])
+  self.assertIsNone(execute_node["start_approval"]); self.assertTrue(execute_node["summary"])
+  self.assertEqual(execute_node["inputs"],["plan.md","checklist.md"])
+  self.assertIn("autopilot-research:synthesis",[n["part"] for n in block["borrowable"]])
   # every-capability form and the text rendering both work too
   result_all=subprocess.run([sys.executable,str(P),"stages"],text=True,capture_output=True,env=env)
   self.assertEqual(result_all.returncode,0,result_all.stderr)
