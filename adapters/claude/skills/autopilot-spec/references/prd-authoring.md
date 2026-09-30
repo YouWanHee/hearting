@@ -35,7 +35,7 @@ The body below the summary block holds only the current contract.
 - **Current content only.** A revision rewrites the affected section in place and deletes superseded or retired content; the previous text survives in the `_internal/versions/v{N}/prd.md` snapshot. In `research` mode a closed step shrinks to its one-line verdict with evidence links, and a rejected track stays, kept short.
 - **History outside the body.** Revision reasons, quoted user wording, triggers, supersede tables, and per-version narrative go to `pipeline_summary.md`. Body headings and paragraphs carry no `⟨vN, date⟩`-style tags; the summary heading holds the only version tag.
 - **No internal tracking IDs.** Commit hashes, route IDs (`rt-…`), revision IDs (`rrev_…`), cycle and attempt IDs (`cyc_…`, `att-…`), and session or pane names belong in `pipeline_summary.md`.
-- **Sentences.** Conclusion first, one fact per sentence. Use plain numbers and letters, not circled or enclosed characters such as ①, ⓐ, or ⅰ.
+- **Sentences.** Conclusion first, one fact per sentence. Use plain numbers and letters, never circled or otherwise enclosed digits, letters, or small roman numerals.
 - **Headings (recommended).** Top-level sections use one form, `## N. Title`. Do not mark a heading as partially superseded — rewrite the section instead.
 
 `utilities/spec-transaction.py` checks the mechanical part of these rules whenever a transaction changes `prd.md`. It emits one `readability` event with counts per rule, split into lines new in this revision and lines carried over, prints one stderr line when anything is found, and never changes the exit code. `python3 "$AGENT_HOME/utilities/prd_readability.py" check <prd.md> [--base <previous prd.md>]` shows the same report before writing.
