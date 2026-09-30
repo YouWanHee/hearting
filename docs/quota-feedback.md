@@ -6,6 +6,7 @@ Claude의 실제 주간 거절이 `dead-launch-exit-1`로 남아 다음 frame �
 
 - launcher는 실제 자식 환경의 구독 계정·조직 또는 명시 OAuth token 선택을 해시로 기록한다. runtime home은 인증 선택을 읽는 위치이며 계정 식별자에 섞지 않는다. 같은 계정의 다른 설정 디렉터리도 quota를 공유한다. 식별 원문과 토큰을 원장에 싣지 않는다. 계정 결속을 산출할 수 없거나 API/provider 경로이면 주간 구독 증거를 임의로 결속하지 않는다.
 - `dispatch_capacity_evidence.py`가 정확한 native session의 실패와 structured rejected window를 결합한다. reset, model scope, 계정 범위가 맞을 때만 현재 선택에 적용한다. 일반 429·인증 실패·허용 이벤트·이전 턴·과도한 reset은 주간 quota 증거가 아니다.
+- 같은 reader는 jobs.log 옆 `jobs.log.capacity-cache.json`(0600)에 후보 행과 로그에서 뽑은 최소 증거만 저장해 반복 파싱을 줄인다. 만료·scope·모델·reset 판정은 매 호출 다시 하며, 파일이 없거나 깨졌거나 쓸 수 없으면 캐시 없이 직접 계산한 결과와 같다.
 - `usage-check.sh`의 독립 awk 판정을 없애고 같은 reader의 얇은 CLI로 바꿨다. 기존 문자형 한도도 이 reader가 처리한다. scoped native 증거를 손실된 문자 marker가 다시 전 계정/전 모델 제한으로 넓힐 수 없다. 옛 시각형 reset은 관측일 기준으로 해석해 매일 제한이 부활하지 않는다.
 - owner 선택, d=2 fallback, 병렬 배치와 용량 점수가 같은 증거를 소비한다. 품질 범위와 봉인된 후보 집합은 유지한다. 주간 전체 quota에 모델만 바꾼 같은 하네스 재시도를 쓰지 않는다. reset 뒤에는 같은 route를 재개할 수 있다.
 - frame 완료 게이트도 이미 확인된 계정 결속 quota를 소비한다. 다른 route에서 얻은 증거 때문에 회피한 후보를 다시 실패시킬 필요가 없다. 두 frame에 적용되는 모델 범위, 원 실패의 정리 완료, 충돌 부재, 현 route의 추가 실행 부재를 확인하고 기존 degradation 원장에 증거 attempt를 기록한다. 실제 두 frame 결과와 사용자 승인은 여전히 필요하다.
