@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""session-tidy: seat state, session cards, session ledger, result notices, hook text.
+
+One entry point for the parts of ``session-tidy`` that a session touches directly:
+
+    session_tidy.py card [--harness H] [--session-id S] [--cwd D] [--file F | --text T]
+        Write the calling session's card (body from stdin, a file or --text).
+        Prints one line: ``card=<path> seat=<key>``.  Nothing is required.
+    session_tidy.py hook --harness H --event start|prompt|compact --session-id S
+                         [--source X] [--transcript P] [--cwd D] [--reread]
+        Record the session in the seat ledger and print the injection text for a
+        card / result notice this session is due, or nothing at all.  A hook never
+        fails: any problem is silent and exits 0.
+    session_tidy.py status [--json] [--cwd D]
+        Print where the state lives and what is waiting.
+
+Later slices add ``enqueue`` and ``handoff`` on top of the helpers here
+(``resolve_seat``, ``seat_lock``, ``read_latest_card``, ``write_notice``,
+``session_summary``); the detached runner is ``session_tidy_runner.py``.
+
+State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
+(directories 0700, files 0600, temp file + rename, symlinks refused):
+
+    cards/<seat>.json|.md   latest card (canonical JSON + readable text)
+    card-history/<seat>/    bounded older cards
+    sessions/<seat>.jsonl   seat ledger: one line per hook/card event
+    consumed/<seat>.json    who already received the latest card generation
+    reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
+    notices/<seat>.json     result lines waiting for the next start/prompt
+    locks/<seat>.lock       flock for the read-modify-write above
+    watermarks/  decisions/pending/  runs/  queue/  runner.lock   (other slices)
+
+The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project.
+A worker marker is checked before the pane: a worker that inherited its
+supervisor's pane id gets no card, ledger line or notice.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
+import time
+from typing import Callable, Iterator, Optional
+
+SCHEMA = 1
+HARNESSES = ("claude", "codex", "opencode")
+CARD_BODY_MAX_BYTES = 8 * 1024
+INJECTION_MAX_BYTES = 2400
+NOTICE_MAX_BYTES = 500
+CARD_HISTORY_KEEP = 20
+LEDGER_FOLD_LINES = 500
+LEDGER_KEEP_RAW = 100
+PROMPT_LEDGER_THROTTLE_SEC = 20
+COMPACT_DEDUPE_SEC = 60
+AUTHOR_STALE_SEC = 10 * 60
+
+
+class StateError(Exception):
+    """The state folder is unsafe (a symlink) or unusable."""
+
+
+# ---------------------------------------------------------------------------
+# State folder primitives
+# ---------------------------------------------------------------------------
+
+def state_root() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "hearting" / "session-tidy"
+
+
+def _reject_symlink(path: Path) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise StateError(f"refusing symlink: {path}")
+
+
+def ensure_dir(path: Path) -> Path:
+    """Create ``path`` (0700) below the state root; refuse symlinks on the way."""
+    root = state_root()
+    path = Path(path)
+    if path != root and root not in path.parents:
+        raise StateError(f"outside the state root: {path}")
+    chain = [root] + [p for p in reversed(path.parents) if root in p.parents] + ([path] if path != root else [])
+    for part in chain:
+        _reject_symlink(part)
+        if not part.exists():
+            part.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if part == root or root in part.parents:
+            with contextlib.suppress(OSError):
+                os.chmod(part, 0o700)
+    return path
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path = Path(path)
+    ensure_dir(path.parent)
+    _reject_symlink(path)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def atomic_write_json(path: Path, value) -> None:
+    atomic_write(path, (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=1) + "\n").encode("utf-8"))
+
+
+def read_bytes(path: Path) -> Optional[bytes]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def read_json(path: Path):
+    raw = read_bytes(path)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+@contextlib.contextmanager
+def seat_lock(seat_key: str) -> Iterator[None]:
+    """Serialize hook consumption, ledger appends and card writes for one seat."""
+    lock_dir = ensure_dir(state_root() / "locks")
+    path = lock_dir / f"{seat_key}.lock"
+    _reject_symlink(path)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def now_epoch() -> float:
+    return time.time()
+
+
+def iso_utc(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _digest(*parts: str, size: int = 20) -> str:
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:size]
+
+
+# ---------------------------------------------------------------------------
+# Worker check, harness / session identity, seat
+# ---------------------------------------------------------------------------
+
+def is_worker(env=None) -> bool:
+    """Same markers as hooks/mem-recall-inject.sh; checked before any pane."""
+    env = os.environ if env is None else env
+    if env.get("AGENT_SESSION_ROLE") == "worker" or env.get("AGENT_DISPATCH_CHILD") == "1":
+        return True
+    if env.get("AGENT_DISPATCH_DEPTH"):
+        return True
+    if env.get("FLEET_TITLE_REFRESH") == "1" or env.get("MEM_DISTILL") == "1":
+        return True
+    return any(key.startswith("OPENCODE_DISPATCH") and value for key, value in env.items())
+
+
+# Session-id variables the harnesses export to tool subprocesses.
+SESSION_ENV = (
+    ("claude", ("CLAUDE_CODE_SESSION_ID",)),
+    ("codex", ("CODEX_THREAD_ID", "CODEX_SESSION_ID")),
+    ("opencode", ("OPENCODE_SESSION_ID",)),
+)
+
+
+def session_from_env(harness: Optional[str] = None, env=None) -> tuple[Optional[str], Optional[str]]:
+    """(harness, session id) from the harness-provided variables, or (harness, None)."""
+    env = os.environ if env is None else env
+    for name, keys in SESSION_ENV:
+        if harness and name != harness:
+            continue
+        for key in keys:
+            if env.get(key):
+                return name, env[key].strip()
+    return harness, None
+
+
+_PROJECT_KEYS: dict[str, str] = {}
+PROJECT_KEY_TTL_SEC = 6 * 3600
+
+
+def _project_key_cache() -> Path:
+    return state_root() / "project-keys.json"
+
+
+def project_key_for(cwd) -> str:
+    """The memory tool's project key (origin, common root, marker), never raising.
+
+    ``mem.project_key`` runs three ``git`` calls (slow on a loaded NFS box), and a
+    pane-less prompt hook needs it every turn, so the answer is cached per cwd for
+    a few hours next to the rest of the state.
+    """
+    cwd = str(cwd or os.getcwd())
+    if cwd in _PROJECT_KEYS:
+        return _PROJECT_KEYS[cwd]
+    now = now_epoch()
+    cache = read_json(_project_key_cache())
+    hit = cache.get(cwd) if isinstance(cache, dict) else None
+    if isinstance(hit, dict) and hit.get("key") and now - float(hit.get("at", 0)) < PROJECT_KEY_TTL_SEC:
+        _PROJECT_KEYS[cwd] = str(hit["key"])
+        return _PROJECT_KEYS[cwd]
+    key = ""
+    try:
+        memory_dir = str(Path(__file__).resolve().parents[1] / "tools" / "memory")
+        if memory_dir not in sys.path:
+            sys.path.insert(0, memory_dir)
+        import mem  # type: ignore
+
+        key = str(mem.project_key(cwd, seed=False) or "")
+    except BaseException:  # noqa: BLE001 - a hook never fails because of the key
+        key = ""
+    if not key:
+        with contextlib.suppress(OSError):
+            key = "cwd:" + str(Path(cwd).resolve())
+        key = key or "cwd:" + cwd
+    _PROJECT_KEYS[cwd] = key
+    with contextlib.suppress(Exception):
+        fresh = {c: v for c, v in (cache.items() if isinstance(cache, dict) else [])
+                 if isinstance(v, dict) and now - float(v.get("at", 0)) < PROJECT_KEY_TTL_SEC}
+        fresh[cwd] = {"key": key, "at": now}
+        atomic_write_json(_project_key_cache(), dict(list(fresh.items())[-200:]))
+    return key
+
+
+@dataclasses.dataclass(frozen=True)
+class Seat:
+    kind: str            # "pane" | "project"
+    key: str             # hash used in file names
+    pane: str = ""
+    harness: str = ""
+    project_key: str = ""
+
+    def as_dict(self) -> dict:
+        return {"kind": self.kind, "key": self.key, "pane": self.pane,
+                "harness": self.harness, "project_key": self.project_key}
+
+
+def seat_for_project(harness: str, project_key: str) -> Seat:
+    return Seat("project", _digest("project", harness, project_key), "", harness, project_key)
+
+
+def resolve_seat(harness: Optional[str], cwd=None, env=None) -> Seat:
+    env = os.environ if env is None else env
+    pane = (env.get("HERDR_PANE_ID") or "").strip()
+    if pane:
+        return Seat("pane", _digest("pane", pane), pane, harness or "", "")
+    return seat_for_project(harness or "unknown", project_key_for(cwd))
+
+
+# ---------------------------------------------------------------------------
+# Seat ledger
+# ---------------------------------------------------------------------------
+
+def _ledger_path(seat: Seat) -> Path:
+    return state_root() / "sessions" / f"{seat.key}.jsonl"
+
+
+def _read_ledger_lines(seat: Seat) -> list[dict]:
+    raw = read_bytes(_ledger_path(seat))
+    entries = []
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("sid"):
+            entries.append(item)
+    return entries
+
+
+def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
+    """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
+    out: dict[tuple[str, str], dict] = {}
+    for item in _read_ledger_lines(seat):
+        key = (str(item.get("harness") or ""), str(item["sid"]))
+        row = out.setdefault(key, {"harness": key[0], "sid": key[1], "first_seen": item.get("first_seen", item.get("ts", 0)),
+                                   "last_seen": 0, "epoch": 0, "transcript": "", "cwd": "",
+                                   "last_event": "", "last_event_at": 0, "last_compact_at": 0})
+        ts = float(item.get("ts", 0) or 0)
+        row["first_seen"] = min(float(row["first_seen"] or ts), float(item.get("first_seen", ts) or ts))
+        if ts >= row["last_seen"]:
+            row["last_seen"] = ts
+            row["last_event"] = item.get("event", "")
+            row["last_event_at"] = ts
+        row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
+        if item.get("transcript"):
+            row["transcript"] = item["transcript"]
+        if item.get("cwd"):
+            row["cwd"] = item["cwd"]
+        if item.get("event") == "compact" or item.get("source") == "compact":
+            row["last_compact_at"] = max(row["last_compact_at"], ts)
+    return out
+
+
+def latest_session(seat: Seat, harness: Optional[str] = None) -> Optional[dict]:
+    rows = [r for r in session_summary(seat).values() if not harness or r["harness"] == harness]
+    return max(rows, key=lambda r: r["last_seen"]) if rows else None
+
+
+def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str = "",
+                 transcript: str = "", cwd: str = "", now: Optional[float] = None,
+                 bump_epoch: bool = False) -> dict:
+    """Append one ledger line (caller holds the seat lock). Returns the session row."""
+    now = now_epoch() if now is None else now
+    summary = session_summary(seat).get((harness, sid))
+    epoch = summary["epoch"] if summary else 0
+    if event == "prompt" and summary and not transcript \
+            and now - summary["last_seen"] < PROMPT_LEDGER_THROTTLE_SEC and not bump_epoch:
+        return summary
+    if bump_epoch:
+        epoch += 1
+    entry = {"ts": now, "harness": harness, "sid": sid, "event": event, "epoch": epoch}
+    if source:
+        entry["source"] = source
+    if transcript:
+        entry["transcript"] = transcript
+    if cwd:
+        entry["cwd"] = cwd
+    if summary is None:
+        entry["first_seen"] = now
+    path = _ledger_path(seat)
+    ensure_dir(path.parent)
+    _reject_symlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    _fold_ledger(seat)
+    return session_summary(seat).get((harness, sid), entry)
+
+
+def _fold_ledger(seat: Seat) -> None:
+    """Keep the ledger small: old sessions become one summary line each."""
+    lines = _read_ledger_lines(seat)
+    if len(lines) <= LEDGER_FOLD_LINES:
+        return
+    recent = lines[-LEDGER_KEEP_RAW:]
+    older = lines[:-LEDGER_KEEP_RAW]
+    folded: dict[tuple[str, str], dict] = {}
+    for item in older:
+        key = (str(item.get("harness") or ""), str(item["sid"]))
+        row = folded.setdefault(key, {"harness": key[0], "sid": key[1], "event": "summary", "epoch": 0,
+                                      "first_seen": item.get("first_seen", item.get("ts", 0)), "ts": 0})
+        row["first_seen"] = min(row["first_seen"], item.get("first_seen", item.get("ts", 0)))
+        row["ts"] = max(row["ts"], item.get("ts", 0))
+        row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
+        for field in ("transcript", "cwd"):
+            if item.get(field):
+                row[field] = item[field]
+    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + recent)
+    atomic_write(_ledger_path(seat), body.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Cards
+# ---------------------------------------------------------------------------
+
+def card_json_path(seat: Seat) -> Path:
+    return state_root() / "cards" / f"{seat.key}.json"
+
+
+def card_text_path(seat: Seat) -> Path:
+    return state_root() / "cards" / f"{seat.key}.md"
+
+
+def sanitize_body(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    text = "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())
+    return _cut_bytes(text.strip(), CARD_BODY_MAX_BYTES)[0]
+
+
+def _cut_bytes(text: str, limit: int) -> tuple[str, bool]:
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text, False
+    return raw[:limit].decode("utf-8", "ignore"), True
+
+
+def read_latest_card(seat: Seat) -> Optional[dict]:
+    card = read_json(card_json_path(seat))
+    if isinstance(card, dict) and card.get("schema") == SCHEMA and isinstance(card.get("body"), str):
+        return card
+    return None
+
+
+def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
+               now: Optional[float] = None) -> dict:
+    """Write the seat's newest card (caller holds the seat lock)."""
+    now = now_epoch() if now is None else now
+    body = sanitize_body(body)
+    summary = session_summary(seat).get((harness, sid))
+    previous = read_latest_card(seat)
+    generation = int(previous.get("generation", 0)) + 1 if previous else 1
+    card = {
+        "schema": SCHEMA,
+        "seat": seat.as_dict(),
+        "author": {"harness": harness, "sid": sid, "epoch": summary["epoch"] if summary else 0},
+        "authored_at": iso_utc(now),
+        "authored_at_epoch": now,
+        "generation": generation,
+        "cwd": cwd,
+        "body": body,
+    }
+    if previous:
+        history = ensure_dir(state_root() / "card-history" / seat.key)
+        atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
+        for old in sorted(history.glob("*.json"))[:-CARD_HISTORY_KEEP]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+    atomic_write_json(card_json_path(seat), card)
+    header = f"# session card {generation} — {card['authored_at']} ({harness} {sid[:8]})\n\n"
+    atomic_write(card_text_path(seat), (header + body + "\n").encode("utf-8"))
+    return card
+
+
+# ---------------------------------------------------------------------------
+# Consumption bookkeeping and notices
+# ---------------------------------------------------------------------------
+
+def _consumed_path(seat: Seat) -> Path:
+    return state_root() / "consumed" / f"{seat.key}.json"
+
+
+def _receipt(harness: str, sid: str, epoch: int) -> str:
+    return f"{harness}:{sid}:{epoch}"
+
+
+def _reread_path(harness: str, sid: str) -> Path:
+    return state_root() / "reread" / f"{harness}-{_digest(sid, size=16)}.json"
+
+
+def _notices_path(seat: Seat) -> Path:
+    return state_root() / "notices" / f"{seat.key}.json"
+
+
+def write_notice(seat: Seat, text: str, *, author_harness: str = "", author_sid: str = "",
+                 now: Optional[float] = None) -> dict:
+    """Leave one result line for the seat's next start/prompt (takes the seat lock)."""
+    now = now_epoch() if now is None else now
+    line = " ".join((text or "").split())
+    line = _cut_bytes("".join(ch for ch in line if ch.isprintable()), NOTICE_MAX_BYTES)[0]
+    item = {"id": secrets.token_hex(6), "text": line, "created": now,
+            "author": {"harness": author_harness, "sid": author_sid}}
+    with seat_lock(seat.key):
+        data = read_json(_notices_path(seat))
+        items = data.get("items", []) if isinstance(data, dict) else []
+        items.append(item)
+        atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": items[-20:]})
+    return item
+
+
+def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] = None,
+                    summary: Optional[dict] = None) -> list[dict]:
+    """Notices this session should show: its own, or a departed author's."""
+    now = now_epoch() if now is None else now
+    data = read_json(_notices_path(seat))
+    items = data.get("items", []) if isinstance(data, dict) else []
+    if not items:
+        return []
+    sessions = summary if summary is not None else session_summary(seat)
+    me = sessions.get((harness, sid))
+    out = []
+    for item in items:
+        author = item.get("author") or {}
+        a_key = (author.get("harness") or "", author.get("sid") or "")
+        if not a_key[1] or a_key == (harness, sid):
+            out.append(item)
+            continue
+        theirs = sessions.get(a_key)
+        if theirs is None:
+            out.append(item)          # author unknown to the ledger: nobody else will show it
+            continue
+        replaced = bool(me) and me["first_seen"] > theirs["last_seen"]
+        stale = now - theirs["last_seen"] > AUTHOR_STALE_SEC
+        if replaced and (seat.kind == "pane" or stale):
+            out.append(item)
+    return out
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return "방금"
+    if seconds < 3600:
+        return f"{seconds // 60}분 전"
+    if seconds < 172800:
+        return f"{seconds // 3600}시간 전"
+    return f"{seconds // 86400}일 전"
+
+
+def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> str:
+    """Card text within ``cap`` UTF-8 bytes; header and the file path always survive."""
+    author = card.get("author") or {}
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(card.get("authored_at_epoch") or now)))
+    header = (f"[세션 카드] 같은 자리에서 이어받는 작업 카드 — 작성 {stamp} "
+              f"({_ago(now - float(card.get('authored_at_epoch') or now))}, {author.get('harness', '')} "
+              f"{str(author.get('sid', ''))[:8]})")
+    footer = f"카드 전문: {card_path}"
+    cut_note = "…(이하 생략)"
+    body = card.get("body", "")
+    fixed = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+    room = cap - fixed
+    if room <= 0:
+        return _cut_bytes(f"{header}\n{footer}", cap)[0]
+    if len(body.encode("utf-8")) <= room:
+        return f"{header}\n{body}\n{footer}"
+    room -= len(cut_note.encode("utf-8")) + 1
+    trimmed = _cut_bytes(body, max(0, room))[0].rstrip()
+    return f"{header}\n{trimmed}\n{cut_note}\n{footer}"
+
+
+# ---------------------------------------------------------------------------
+# Hook
+# ---------------------------------------------------------------------------
+
+def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript: str = "",
+             cwd: str = "", reread: bool = False, env=None, now: Optional[float] = None,
+             emit: Optional[Callable[[str], None]] = None) -> str:
+    """Record the session, and print the card / notices it is due exactly once.
+
+    Returns the text that was emitted ("" for none). The receipt is written only
+    after ``emit`` returned, so a hook whose output never went out keeps the card
+    for the next start or prompt.
+    """
+    env = os.environ if env is None else env
+    if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact"):
+        return ""
+    now = now_epoch() if now is None else now
+    seat = resolve_seat(harness, cwd or None, env)
+    with seat_lock(seat.key):
+        if reread:
+            saved = read_json(_reread_path(harness, sid))
+            summary = session_summary(seat).get((harness, sid))
+            text = str(saved.get("text") or "") if isinstance(saved, dict) and summary \
+                and saved.get("epoch") == summary["epoch"] else ""
+            if text and emit:
+                emit(text)
+            return text
+        prior = session_summary(seat).get((harness, sid))
+        # SessionStart(source=compact) and a separate compact event describe the same
+        # compaction; count it once.
+        compacting = (event == "compact" or source == "compact") and not (
+            prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+        row = record_event(seat, harness, sid, event, source=source, transcript=transcript,
+                           cwd=cwd, now=now, bump_epoch=compacting)
+        if event == "compact":
+            return ""
+        epoch = int(row.get("epoch", 0) or 0)
+        parts: list[str] = []
+        notices = pending_notices(seat, harness, sid, now=now)
+        notice_block = ""
+        if notices:
+            notice_block = "\n".join(f"[정리 결과] {n['text']}" for n in notices)
+            notice_block = _cut_bytes(notice_block, NOTICE_MAX_BYTES)[0]
+            parts.append(notice_block)
+        card = read_latest_card(seat)
+        card_due = False
+        if card:
+            author = card.get("author") or {}
+            same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
+            eligible = (not same_session) or epoch > int(author.get("epoch", 0) or 0)
+            consumed = read_json(_consumed_path(seat))
+            done = set(consumed.get("receipts", [])) if isinstance(consumed, dict) \
+                and consumed.get("generation") == card.get("generation") else set()
+            card_due = eligible and _receipt(harness, sid, epoch) not in done
+            if card_due:
+                room = INJECTION_MAX_BYTES - len(notice_block.encode("utf-8")) - (1 if notice_block else 0)
+                parts.append(build_card_injection(card, card_text_path(seat), now, room))
+        text = "\n".join(parts)
+        if not text:
+            return ""
+        (emit or (lambda t: None))(text)
+        if card_due:
+            consumed = read_json(_consumed_path(seat))
+            receipts = list(consumed.get("receipts", [])) if isinstance(consumed, dict) \
+                and consumed.get("generation") == card.get("generation") else []
+            receipts.append(_receipt(harness, sid, epoch))
+            atomic_write_json(_consumed_path(seat), {"schema": SCHEMA, "generation": card["generation"],
+                                                     "receipts": receipts[-200:]})
+        if notices:
+            shown = {n["id"] for n in notices}
+            data = read_json(_notices_path(seat))
+            rest = [i for i in (data.get("items", []) if isinstance(data, dict) else []) if i.get("id") not in shown]
+            atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest})
+        atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": text, "at": now})
+        return text
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):  # a hook must never exit non-zero because of its arguments
+        raise ValueError(message)
+
+
+def _emit_stdout(text: str) -> None:
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
+    best: tuple[Optional[Seat], Optional[dict]] = (None, None)
+    for name in HARNESSES:
+        seat = seat_for_project(name, project_key_for(cwd))
+        row = latest_session(seat, name)
+        if row and (best[1] is None or row["last_seen"] > best[1]["last_seen"]):
+            best = (seat, row)
+    return best
+
+
+def cmd_card(args) -> int:
+    if is_worker():
+        print("card=none reason=worker")
+        return 0
+    cwd = args.cwd or os.getcwd()
+    if args.text is not None:
+        body = args.text
+    elif args.file:
+        body = Path(args.file).read_text(encoding="utf-8", errors="replace")
+    else:
+        body = sys.stdin.read()
+    if not sanitize_body(body):
+        print("card=none reason=empty-body")
+        return 0
+    harness, sid = args.harness, args.session_id
+    if not sid:
+        harness, sid = session_from_env(harness)
+    detected = harness or session_from_env(None)[0]
+    seat = resolve_seat(detected, cwd)
+    if not sid or not harness:
+        ledger_row = latest_session(seat, harness)
+        if ledger_row is None and seat.kind == "project" and not detected:
+            seat, ledger_row = _guess_seat_from_ledgers(cwd)
+        if ledger_row:
+            harness = harness or ledger_row["harness"]
+            sid = sid or ledger_row["sid"]
+    if seat is None:
+        print("card=none reason=no-seat")
+        return 0
+    harness = harness or detected or "unknown"
+    sid = sid or f"unknown-{secrets.token_hex(4)}"
+    with seat_lock(seat.key):
+        record_event(seat, harness, sid, "card", cwd=cwd)
+        write_card(seat, harness, sid, body, cwd=cwd)
+    print(f"card={card_text_path(seat)} seat={seat.key}")
+    return 0
+
+
+def cmd_hook(args) -> int:
+    try:
+        sid = args.session_id or session_from_env(args.harness)[1] or ""
+        run_hook(args.harness, args.event, sid, source=args.source or "", transcript=args.transcript or "",
+                 cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout)
+    except BaseException:  # noqa: BLE001 - a hook is silent on every failure
+        pass
+    return 0
+
+
+def cmd_status(args) -> int:
+    harness, sid = session_from_env(None)
+    seat = resolve_seat(harness, args.cwd or os.getcwd())
+    card = read_latest_card(seat)
+    notices = read_json(_notices_path(seat))
+    info = {
+        "state_root": str(state_root()),
+        "seat": seat.as_dict(),
+        "worker": is_worker(),
+        "card": {"generation": card["generation"], "authored_at": card["authored_at"],
+                 "path": str(card_text_path(seat))} if card else None,
+        "sessions": len(session_summary(seat)),
+        "notices": len(notices.get("items", [])) if isinstance(notices, dict) else 0,
+    }
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"state_root={info['state_root']}")
+        print(f"seat={seat.key} kind={seat.kind}")
+        print("card=" + (f"gen{card['generation']} {card['authored_at']}" if card else "none"))
+        print(f"sessions={info['sessions']} notices={info['notices']} worker={int(info['worker'])}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _Parser(prog="session_tidy.py", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
+    card = sub.add_parser("card", help="write the calling session's card")
+    card.add_argument("--harness", choices=HARNESSES)
+    card.add_argument("--session-id")
+    card.add_argument("--cwd")
+    card.add_argument("--file")
+    card.add_argument("--text")
+    card.set_defaults(func=cmd_card)
+    hook = sub.add_parser("hook", help="record the session; print the card/notice it is due")
+    hook.add_argument("--harness", required=True)
+    hook.add_argument("--event", required=True)
+    hook.add_argument("--session-id")
+    hook.add_argument("--source")
+    hook.add_argument("--transcript")
+    hook.add_argument("--cwd")
+    hook.add_argument("--reread", action="store_true")
+    hook.set_defaults(func=cmd_hook)
+    status = sub.add_parser("status", help="show state location and what is waiting")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--cwd")
+    status.set_defaults(func=cmd_status)
+    return parser
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    try:
+        args, _unknown = parser.parse_known_args(argv)
+    except ValueError:
+        if argv and argv[0] == "hook":
+            return 0
+        parser.print_usage(sys.stderr)
+        return 2
+    except SystemExit as exc:
+        return 0 if (argv and argv[0] == "hook") else int(exc.code or 0)
+    try:
+        return int(args.func(args) or 0)
+    except StateError as exc:
+        if args.command == "hook":
+            return 0
+        print(f"session-tidy: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
