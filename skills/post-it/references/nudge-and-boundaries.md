@@ -25,8 +25,8 @@ Both paths are separate views of one `memory.db` store.
 
 | Path | Store location | Update |
 |---|---|---|
-| `<agent-home>/projects/*/memory/`, the harness auto-memory write surface | SessionEnd `mem sync --json` absorbs into local `memory.db`; optional remote sync exchanges immutable v2 operations and never pushes `dump.jsonl` | Harness automatic write → sync |
-| DB working tier used by this skill through `mem note`/`mem add` | Direct local project-scoped `memory.db` records plus a compatibility-only `dump.jsonl` projection | Only through user invocation of `/post-it` |
+| `<agent-home>/projects/*/memory/`, the harness auto-memory write surface | Not read by routine sync (D-79); an explicit `mem migrate --all-projects` imports it once. Nothing runs at session end; optional remote sync exchanges immutable v2 operations and never pushes `dump.jsonl` | Harness automatic write → manual import |
+| DB working tier used by this skill through `mem note`/`mem add` | Direct local project-scoped `memory.db` records plus a compatibility-only `dump.jsonl` projection, refreshed by the background exchange that follows each write | Only through user invocation of `/post-it` |
 
 Distinguish them as follows:
 

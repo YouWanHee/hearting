@@ -96,7 +96,7 @@ full masking.
 | capability mapping | `adapters/opencode/bin/preflight.sh capability-info <capability>` reports OpenCode's native Skill/command realization and instruction-only or tool-contract status; root Skill compatibility references are not projected and report `compat_reference=not-projected` |
 | model role mapping | `adapters/opencode/bin/preflight.sh role <portable-role>` resolves portable model roles through OpenCode adapter environment variables |
 | mode mapping | `adapters/opencode/bin/preflight.sh mode-info <family/mode>` reports whether a mode is portable, tool-contract, or unsupported for OpenCode; tool-contract and unsupported adapter-coupled modes include machine-readable `tool_contract`, optional `tool_contract_check`, `runtime_surface`, and `fallback` fields |
-| memory sync | Plugin `event`/`session.idle` → detached `preflight session-end` → `mem sync --json`. No automatic distiller (D-78) |
+| memory sync | None at `session.idle` (D-82; `preflight session-end` is removed). `mem.py` exchanges in the background after writes and stale reads; `session.compacted` empties the candidate display history. No automatic distiller (D-78) |
 | memory store | `tools/memory/{mem.py,protocol_v2.py,git_exchange_v2.py,sync_v2.py}` are runtime-neutral |
 | permission model | OpenCode native `permission` config (`allow`/`ask`/`deny` per tool, per-agent override); adapter documents recommended rules, not a harness guard replacement |
 | statusline | OpenCode TUI footer is native; no user shell statusline surface in config schema; harness status signals stay instruction-only/preflight |
