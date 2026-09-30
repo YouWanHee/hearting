@@ -184,6 +184,8 @@ class CompletionMarkerTest(unittest.TestCase):
             # -> HOME; inheriting any of the three would send this fixture's
             # env-less markers into the invoking developer's real state root.
             "HOME": str(self.stable_home),
+            # `complete` would start a detached checkpoint that outlives the fixture root.
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
         }
         env.pop("AGENT_DISPATCH_JOBS", None)
         env.pop("XDG_STATE_HOME", None)
