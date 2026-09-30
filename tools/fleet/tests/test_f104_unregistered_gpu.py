@@ -233,18 +233,94 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
         self.assertNotIn("미등록", "\n".join(text))
 
-    def test_job_strip_key_follows_the_drawn_job_only(self):
-        snapshot, _child, job = self._job_owned_gpu()
+    def _group_keys(self, snapshot, sessions, jobs):
         render.set_compute_hosts(snapshot)
         gpu_resources = render._gpu_session_resources()
-        self.assertEqual(render._gpu_strip_keys([], gpu_resources, [job]),
-                         {("codex", SESSION_ID)})
+        group = {"sessions": list(sessions), "jobs": list(jobs)}
+        return render._group_emission(group, True, True, gpu_resources)["gpu_strip_keys"]
+
+    def test_job_strip_key_follows_the_drawn_job_only(self):
+        snapshot, _child, job = self._job_owned_gpu()
+        self.assertEqual(self._group_keys(snapshot, [], [job]), {("codex", SESSION_ID)})
         owner = DispatchJob(key="autopilot-code", slug="own", cwd=SR_CWD, harness="codex",
                             liveness="working", depth=1)
         folded = DispatchJob(key="autopilot-code", slug="stage", cwd=SR_CWD, harness="codex",
                              liveness="done", depth=2, parent_slug="own")
         folded._runtime_session_id = SESSION_ID
-        self.assertEqual(render._gpu_strip_keys([], gpu_resources, [owner, folded]), set())
+        self.assertEqual(self._group_keys(snapshot, [], [owner, folded]), set())
+
+    def _dead_owner_job(self, **overrides):
+        fields = dict(key="autopilot-code", slug="dead-owner", cwd=SR_CWD, harness="codex",
+                      liveness="dead", note="dead-runtime-exit")
+        fields.update(overrides)
+        job = DispatchJob(**fields)
+        job._runtime_session_id = SESSION_ID
+        job._dead_terminal_owner = True
+        return job
+
+    def _gpu_snapshot(self):
+        owner = _session_owner()
+        return _snapshot((0, [_process(owner=owner, session_owner=owner)]))
+
+    def _texts(self, snapshot, sessions, jobs, show_all):
+        self.addCleanup(setattr, render, "_SHOW_ALL", render._SHOW_ALL)
+        render._SHOW_ALL = show_all
+        return self.gpu_text(snapshot, sessions, jobs)
+
+    def test_dropped_dead_owner_orphan_leaves_the_card_row_to_show_the_process(self):
+        snapshot = self._gpu_snapshot()
+        job = self._dead_owner_job()
+        text = self._texts(snapshot, [], [job], show_all=False)
+        rows = [line for line in text if "● GPU" in line]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("미등록", rows[0])
+        self.assertEqual(self._group_keys(snapshot, [], [job]), set())
+        # --all draws the job row and its strip, so the card row steps aside
+        text = self._texts(snapshot, [], [job], show_all=True)
+        rows = [line for line in text if "● GPU" in line]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("미등록", "\n".join(text))
+
+    def test_nested_dead_owner_job_draws_its_strip_so_the_process_shows_once(self):
+        snapshot = self._gpu_snapshot()
+        parent = Session(harness="claude", pid=201, proc_start="21", cwd=SR_CWD,
+                         session_id="parent-session", title="lead", liveness="working")
+        job = self._dead_owner_job(is_child=True)
+        job.parent_sid = parent.session_id
+        job.parent_cwd = SR_CWD
+        for show_all in (False, True):
+            text = self._texts(snapshot, [parent], [job], show_all=show_all)
+            self.assertEqual(sum(line.count("● GPU") for line in text), 1, show_all)
+            self.assertNotIn("미등록", "\n".join(text))
+
+    def test_children_of_a_duplicate_session_id_draw_once_or_fall_back_to_the_card(self):
+        snapshot = self._gpu_snapshot()
+
+        def session(pid, sid="dup-session"):
+            return Session(harness="claude", pid=pid, proc_start=str(pid), cwd=SR_CWD,
+                           session_id=sid, title="lead", liveness="working")
+
+        job = DispatchJob(key="autopilot-code", slug="job1", cwd=SR_CWD, harness="codex",
+                          liveness="working", is_child=True)
+        job._runtime_session_id = SESSION_ID
+        job.parent_sid = "dup-session"
+        text = self._texts(snapshot, [session(301), session(302)], [job], show_all=False)
+        self.assertEqual(sum(line.count("● GPU") for line in text), 1)
+        self.assertNotIn("미등록", "\n".join(text))
+
+    def test_children_of_a_mem_worker_session_are_dropped_so_the_card_row_shows_it(self):
+        snapshot = self._gpu_snapshot()
+        mem = Session(harness="claude", pid=401, proc_start="41", cwd=SR_CWD,
+                      session_id="mem-session", title="mem", liveness="working")
+        mem.mem_worker = True
+        job = DispatchJob(key="autopilot-code", slug="job1", cwd=SR_CWD, harness="codex",
+                          liveness="working", is_child=True)
+        job._runtime_session_id = SESSION_ID
+        job.parent_sid = "mem-session"
+        text = self._texts(snapshot, [mem], [job], show_all=False)
+        rows = [line for line in text if "● GPU" in line]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("미등록", rows[0])
 
     def test_folded_job_draws_no_strip_so_the_card_row_shows_it_once(self):
         snapshot, _child, _job = self._job_owned_gpu()
