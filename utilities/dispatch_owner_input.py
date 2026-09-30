@@ -20,6 +20,9 @@ from dispatch_completion_join import exact_attempt_row
 from dispatch_contract import supervisor_lease_is_held, supervisor_lease_path
 
 
+PLACEHOLDER_THREAD = "pending-native-session"
+
+
 class InputError(ValueError):
     pass
 
@@ -47,6 +50,9 @@ def _locked(jobs, attempt, *, create=False):
     path = _path(jobs, attempt)
     if create:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    elif not os.path.lexists(path):
+        # No state means no supervisor ever accepted input; do not create a lock for it.
+        raise InputError("owner-input-unsupported")
     if not path.parent.exists():
         raise InputError("owner-input-unsupported")
     fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -86,9 +92,20 @@ def _transition(item, state, **evidence):
     item["events"].append({"state": state, "time": time.time(), **evidence})
 
 
-def _public(value, *, live=False):
+def _preconsumer(value):
+    """Registered state that no consumer has bound yet (no generation, placeholder thread)."""
+    return "generation" not in value and value.get("thread_id") == PLACEHOLDER_THREAD
+
+
+def _reachable(row, value, live):
+    """A live consumer or a still-open row waiting for its first consumer can take input."""
+    return live or (row.status in {"open", "running"} and _preconsumer(value))
+
+
+def _public(value, *, live=False, reachable=None):
+    reachable = live if reachable is None else reachable
     return {"attempt_id": value["attempt_id"], "thread_id": value["thread_id"],
-            "transport": value["transport"], "accepting": value["accepting"] and live,
+            "transport": value["transport"], "accepting": value["accepting"] and reachable,
             "supervisor_live": live,
             "requests": [{key: item[key] for key in item if key != "text"}
                          for item in value["requests"]],
@@ -104,12 +121,13 @@ def inspect(jobs, attempt):
         if value["target"] != target:
             raise InputError("owner-input-target-changed")
         live = supervisor_lease_is_held(jobs, row.metadata)
-        result = _public(value, live=live)
+        reachable = _reachable(row, value, live)
+        result = _public(value, live=live, reachable=reachable)
         for item in result["requests"]:
             item["delivery_observation"] = (
-                "delivery-unknown" if not live and item["state"] == "sending" else
-                "undelivered" if not live and item["state"] == "queued" else item["state"])
-        if not live:
+                "delivery-unknown" if not reachable and item["state"] == "sending" else
+                "undelivered" if not reachable and item["state"] == "queued" else item["state"])
+        if not reachable:
             # Observation does not rewrite uncertain transport history.
             result["next_step"] = "Supervisor unavailable; retain the correction and inspect its exact receipt before recovery."
         return result
@@ -132,10 +150,12 @@ def submit(jobs, attempt, text, request_id=None):
             if item["id"] == request_id:
                 if item["digest"] != digest:
                     raise InputError("correction-id-content-conflict")
-                return {**_public(value, live=supervisor_lease_is_held(jobs, row.metadata)),
+                live = supervisor_lease_is_held(jobs, row.metadata)
+                return {**_public(value, live=live, reachable=_reachable(row, value, live)),
                         "request_id": request_id, "duplicate": True}
+        live = supervisor_lease_is_held(jobs, row.metadata)
         if (not value["accepting"] or row.status not in {"open", "running"}
-                or not supervisor_lease_is_held(jobs, row.metadata)):
+                or not _reachable(row, value, live)):
             raise InputError("owner-input-unavailable-retain-correction")
         item = {"id": request_id, "digest": digest, "text": text, "events": [],
                 "source_session": os.environ.get("CODEX_THREAD_ID") or
@@ -143,7 +163,25 @@ def submit(jobs, attempt, text, request_id=None):
         _transition(item, "queued")
         value["requests"].append(item)
         _write(path, value)
-        return {**_public(value, live=True), "request_id": request_id, "duplicate": False}
+        return {**_public(value, live=live, reachable=True), "request_id": request_id, "duplicate": False}
+
+
+def initialize_owner_input(jobs, attempt, transport):
+    """Open input admission for a registered owner before its consumer exists.
+
+    Idempotent: an existing state is only identity-checked, never rewritten.
+    """
+    row, target = _target(jobs, attempt)
+    if row.status not in {"open", "running"}:
+        raise InputError("owner-input-unavailable-retain-correction")
+    with _locked(jobs, attempt, create=True) as (path, value):
+        if value is not None:
+            if value["target"] != target:
+                raise InputError("owner-input-target-changed")
+            return
+        _write(path, {"schema_version": 1, "attempt_id": attempt, "target": target,
+                      "requests": [], "thread_id": PLACEHOLDER_THREAD,
+                      "transport": transport, "accepting": True})
 
 
 class OwnerInput:
@@ -156,10 +194,12 @@ class OwnerInput:
                 raise InputError("owner-input-target-changed")
             value = value or {"schema_version": 1, "attempt_id": attempt,
                               "target": target, "requests": []}
+            first_binding = _preconsumer(value)
             for item in value["requests"]:
                 if item["state"] == "sending":
                     _transition(item, "delivery-unknown", reason="supervisor-restarted")
-                elif item["state"] == "queued" and value.get("thread_id") != thread_id:
+                elif (item["state"] == "queued" and value.get("thread_id") != thread_id
+                      and not first_binding):
                     _transition(item, "undelivered", reason="owner-thread-changed")
             value.update(thread_id=thread_id, transport=transport, accepting=True,
                          generation=self.generation)
@@ -186,7 +226,7 @@ class OwnerInput:
     def bind_initial_thread(self, thread):
         if not thread or thread == self.thread_id:
             return
-        if self.thread_id != "pending-native-session":
+        if self.thread_id != PLACEHOLDER_THREAD:
             raise InputError("owner-input-thread-changed")
         with self.state() as (path, value):
             value["thread_id"] = thread
@@ -309,9 +349,10 @@ def unresolved_revision(jobs, attempt):
     with _locked(jobs, attempt) as (_, value):
         if value is None or value["target"] != target:
             return ""
+        reachable = _reachable(row, value, live)
         items = [(i["id"], i["state"]) for i in value["requests"]
                  if i["state"] in {"delivery-unknown", "undelivered"}
-                 or (not live and i["state"] in {"queued", "sending"})]
+                 or (not reachable and i["state"] in {"queued", "sending"})]
         return _digest(items) if items else ""
 
 
