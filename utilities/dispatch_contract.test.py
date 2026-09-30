@@ -123,6 +123,34 @@ class FrameLaunchGateTest(unittest.TestCase):
     self.fixture(base,("codex","codex"))
     D.owner_frame_launch_gate(binding,"start",base,jobs)
 
+ def test_owner_gate_accepts_a_fan_out_after_the_frame_pair(self):
+  # 2026-09-30 Cairn report: autopilot-spec standard starts research and
+  # research-alternative after the two frames; the gate demanded one entry.
+  import workflow_state as WS
+  from types import SimpleNamespace
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);route,path,jobs,markers,rows=self.fixture(base)
+   route["nodes"]=route["nodes"][:2]+[{"id":n,"depends_on":["frame","frame-alternative"]}
+                                      for n in ("research","research-alternative")]
+   route["human_gate_bindings"]=[{"gate":"frame-review","node":"research","position":"entry"}]
+   path.write_text(json.dumps(route))
+   binding=SimpleNamespace(route_file=str(path))
+   with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+        mock.patch.object(D,"completion_attempt_readiness",return_value=D.AttemptReadiness("ready","test")):
+    ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+    ledger.set_workflow_state("BLOCKED_HUMAN_GATE",evidence={"gate":"frame-review"},actor="gate")
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.owner_frame_launch_gate(binding,"start",base,jobs)
+    self.assertEqual(caught.exception.reason,"human-gate-unreleased")
+    ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
+      "decision":"proceed","actor_kind":"human","released_by":"test-person"},actor="gate")
+    D.owner_frame_launch_gate(binding,"start",base,jobs)
+   route["nodes"]=route["nodes"][:2]
+   path.write_text(json.dumps(route))
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.owner_frame_launch_gate(binding,"start",base,jobs)
+   self.assertEqual(caught.exception.reason,"frame-owner-entry-invalid")
+
  def test_legacy_same_harness_pair_needs_no_quota_proof_or_degradation(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td);route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))
