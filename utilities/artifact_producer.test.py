@@ -4,6 +4,7 @@
 Every fixture uses an isolated temporary artifact root and `AGENT_HOME`; the
 real canonical root, registry, and routes directory are never touched.
 """
+import dataclasses
 import importlib.util
 import fcntl
 import json
@@ -4878,6 +4879,233 @@ class RouteLineageBindingTest(ProducerTestBase):
                                         route_id=a["route_id"])
         self.assertEqual(output, Path(begun["cycle_dir"]) / "artifacts")
         self.assertEqual(len(self._bindings(begun["cycle_id"])), 1)
+
+    # -- closed lineage handover (auto-close leftovers) ---------------------
+    def _handover_shape(self, a, b, *, bind=False):
+        """A cycle C1 begun at ``a``, then a second cycle C2 begun at the
+        continuation ``b`` while C1 was briefly not open (the shape a real
+        root showed: a resumed route began a fresh cycle inside C1's lineage). C1 is open again."""
+        first = self._begin(a)
+        if bind:
+            self.assertTrue(R.bind_continuation_cycle(self.root, a, b)["bound"])
+        record = P.read_cycle_record(self.root, first["cycle_id"])
+        P._write_cycle_record(self.root, dict(record, state="abandoned"), exclusive=False)
+        second = self._begin(b)
+        self.assertEqual(second["status"], "begun")
+        P._write_cycle_record(self.root, record, exclusive=False)
+        return first, second
+
+    def _seal_abandoned(self, cycle, rel="plans/handover/note.md"):
+        self.write_output(cycle, rel, b"leftover\n")
+        return P.finalize(self.root, cycle_id=cycle["cycle_id"], state="abandoned",
+                          abandon_reason="route-unrecoverable")
+
+    def _manifest_route_ids(self, sealed):
+        document = json.loads(Path(sealed["manifest_path"]).read_text(encoding="utf-8"))
+        return [row["route_id"] for row in document["routes"]]
+
+    def test_closed_lineage_cycle_seals_on_its_own_route(self):
+        a = self._root_route("handover-own")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        first, second = self._handover_shape(a, b)
+        first_record = P.read_cycle_record(self.root, first["cycle_id"])
+        second_record = P.read_cycle_record(self.root, second["cycle_id"])
+        # The lineage is live: the D-120 answers are the ones a running route gets.
+        with self.assertRaises(P.ProducerError) as caught:
+            P.route_cycle_for(self.root, b)
+        self.assertEqual(caught.exception.code, "route-cycle-binding-ambiguous")
+        self.assertEqual(P.cycle_route_admission(self.root, first_record, a, finalize=True).reason,
+                         "cycle-route-binding-mismatch:superseded-route")
+        self.assertEqual(P.closed_lineage_handover(self.root, first_record),
+                         P.LineageHandover(False, frozenset()))
+        self.assertEqual(P._finalize_route(self.root, first_record)["route_id"], c["route_id"])
+        for route in (a, b, c):
+            self._close(route)
+        # Closed: each cycle owns the stretch up to the next cycle's begin route.
+        handover = P.closed_lineage_handover(self.root, P.read_cycle_record(self.root, first["cycle_id"]))
+        self.assertEqual(handover, P.LineageHandover(True, frozenset({b["route_id"]})))
+        self.assertEqual(P._finalize_route(self.root, first_record)["route_id"], a["route_id"])
+        self.assertEqual(P._finalize_route(self.root, second_record)["route_id"], c["route_id"])
+        sealed_first = self._seal_abandoned(first)
+        sealed_second = self._seal_abandoned(second)
+        self.assertEqual(self._manifest_route_ids(sealed_first), [a["route_id"]])
+        self.assertEqual(self._manifest_route_ids(sealed_second), [c["route_id"]])
+        # Sealed replay re-judges the manifest route with the same rule.
+        for cycle, sealed in ((first, sealed_first), (second, sealed_second)):
+            record = P.read_cycle_record(self.root, cycle["cycle_id"])
+            document = json.loads(Path(sealed["manifest_path"]).read_text(encoding="utf-8"))
+            P.resolve_cycle_manifest_route(self.root, record, document)
+            self.assertEqual(P.finalize(self.root, cycle_id=cycle["cycle_id"], state="abandoned",
+                                        abandon_reason="route-unrecoverable")["storage_state"], "sealed")
+
+    def test_closed_lineage_fork_seals_each_branch(self):
+        a = self._root_route("handover-fork")
+        self._publish_root(a)
+        x = self._continuation(a, reason="fork-x")
+        y = self._continuation(a, reason="fork-y")
+        first = self._begin(a)
+        record = P.read_cycle_record(self.root, first["cycle_id"])
+        P._write_cycle_record(self.root, dict(record, state="abandoned"), exclusive=False)
+        second = self._begin(y)
+        P._write_cycle_record(self.root, record, exclusive=False)
+        first_record = P.read_cycle_record(self.root, first["cycle_id"])
+        # Live: the fork stays a refusal.
+        with self.assertRaisesRegex(P.ProducerError, "lineage-fork"):
+            P._finalize_route(self.root, first_record)
+        self.assertEqual(P.cycle_route_admission(self.root, first_record, x, finalize=True).reason,
+                         "cycle-route-binding-mismatch:lineage-fork")
+        for route in (a, x, y):
+            self._close(route)
+        self.assertEqual(P._finalize_route(self.root, first_record)["route_id"], x["route_id"])
+        sealed_first = self._seal_abandoned(first)
+        sealed_second = self._seal_abandoned(second)
+        self.assertEqual(self._manifest_route_ids(sealed_first), [x["route_id"]])
+        self.assertEqual(self._manifest_route_ids(sealed_second), [y["route_id"]])
+
+    def test_index_duplicate_reproduced_and_resolved(self):
+        a = self._root_route("handover-index")
+        self._publish_root(a)
+        b = self._continuation(a)
+        first, second = self._handover_shape(a, b, bind=True)
+        first_record = P.read_cycle_record(self.root, first["cycle_id"])
+        self.assertEqual([row["route_id"] for row in first_record["route_bindings"]],
+                         [a["route_id"], b["route_id"]])
+        for route in (a, b):
+            self._close(route)
+        sealed_second = self._seal_abandoned(second)
+        self.assertEqual(self._manifest_route_ids(sealed_second), [b["route_id"]])
+        # Before the fix the leaf B was chosen for the first cycle too. Build that
+        # document and let the index judge it: the key (root, B) is C2's.
+        directory = P.cycle_dir(self.root, first_record["campaign_id"], first["cycle_id"], first_record)
+        self.write_output(first, "plans/handover/note.md", b"leftover\n")
+        rows, violations = P._enumerate_output(directory)
+        self.assertEqual(violations, [])
+        document = P.build_manifest(self.root, first_record, b, rows, state="abandoned",
+                                    primary=None, allow_open_route=False,
+                                    allocator=P.artifact_identity.IdAllocator(), now=None,
+                                    abandon_reason="route-unrecoverable", support_locators=(), reserved=None)
+        index = adm.load_index(self.root)
+        identity = P.artifact_lifecycle.read_root_identity(self.root)
+        report = P.artifact_index.check(
+            index, document, idempotency_key=first["cycle_id"],
+            manifest_digest=P.artifact_manifest.manifest_digest(document),
+            repository_id=identity.repository_id if identity else None)
+        self.assertIn("index-route-composite-duplicate", [v.code for v in report.violations])
+        root_id = document["artifact_root_id"]
+        self.assertEqual(index.routes[root_id][b["route_id"]]["cycle_id"], second["cycle_id"])
+        # After: C1 seals on A, both keys coexist.
+        sealed_first = self._seal_abandoned(first)
+        self.assertEqual(self._manifest_route_ids(sealed_first), [a["route_id"]])
+        index = adm.load_index(self.root)
+        self.assertEqual(index.routes[root_id][a["route_id"]]["cycle_id"], first["cycle_id"])
+        self.assertEqual(index.routes[root_id][b["route_id"]]["cycle_id"], second["cycle_id"])
+
+    def test_index_key_already_held_still_rejects(self):
+        a = self._root_route("handover-index-held")
+        self._publish_root(a)
+        b = self._continuation(a)
+        first, second = self._handover_shape(a, b)
+        for route in (a, b):
+            self._close(route)
+        # A foreign sealed cycle already holds the key C1 would claim (A): the
+        # invariant is not weakened, the seal is still refused.
+        index = adm.load_index(self.root)
+        root_id = next(iter(adm.load_index(self.root).routes), None) or P.artifact_lifecycle.read_root_identity(
+            self.root).artifact_root_id
+        routes = {key: dict(value) for key, value in index.routes.items()}
+        routes.setdefault(root_id, {})[a["route_id"]] = {"cycle_id": "cyc_" + "f" * 32, "route_hash": None}
+        held = dataclasses.replace(index, routes=routes)
+        with mock.patch.object(adm, "load_index", return_value=held):
+            with self.assertRaisesRegex(P.ProducerError, "index-rejected"):
+                self._seal_abandoned(first)
+        self.assertEqual(P.read_cycle_record(self.root, first["cycle_id"])["state"], "open")
+
+    def test_abandoned_seal_excludes_symlinks_and_completed_still_refuses(self):
+        a = self._root_route("handover-symlinks")
+        self._publish_root(a)
+        begun = self._begin(a)
+        self._close(a)
+        target_dir = Path(begun["cycle_dir"]) / "artifacts" / "plans" / "links"
+        target_dir.mkdir(parents=True)
+        (target_dir / "real.md").write_bytes(b"real\n")
+        locked = Path(self._tmp.name) / "locked.txt"
+        locked.write_bytes(b"secret\n")
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o600)
+        (target_dir / "relative.md").symlink_to("real.md")
+        (target_dir / "locked.md").symlink_to(locked)
+        (target_dir / "dangling.md").symlink_to("missing.md")
+        links = {"artifacts/plans/links/relative.md": "real.md",
+                 "artifacts/plans/links/locked.md": str(locked),
+                 "artifacts/plans/links/dangling.md": "missing.md"}
+        cycle_id = begun["cycle_id"]
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed", exclude_symlinks=True)
+        self.assertEqual(caught.exception.code, "symlink-exclusion-requires-abandoned")
+        with self.assertRaisesRegex(P.ProducerError, "output-invalid.*symlink-forbidden|symlink-forbidden"):
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        with self.assertRaisesRegex(P.ProducerError, "symlink-forbidden"):
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="route-unrecoverable")
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+        self.assertNotIn("excluded_symlinks", P.read_cycle_record(self.root, cycle_id))
+        sealed = P.finalize(self.root, cycle_id=cycle_id, state="abandoned",
+                            abandon_reason="route-unrecoverable", exclude_symlinks=True)
+        self.assertEqual(sealed["status"], "sealed")
+        self.assertEqual(sorted(sealed["excluded_symlinks"]), sorted(links))
+        document = json.loads(Path(sealed["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual([row["locator"]["path"] for row in document["artifact_revisions"]],
+                         ["artifacts/plans/links/real.md"])
+        self.assertEqual(sorted(P.read_cycle_record(self.root, cycle_id)["excluded_symlinks"]), sorted(links))
+        for rel, value in links.items():
+            self.assertEqual(os.readlink(Path(begun["cycle_dir"]) / rel), value)
+        self.assertEqual(locked.stat().st_mode & 0o777, 0)
+        locked.chmod(0o600)
+        self.assertEqual(locked.read_bytes(), b"secret\n")
+
+    def test_excluded_symlinks_survive_a_crash_after_the_manifest_is_published(self):
+        a = self._root_route("handover-symlink-crash")
+        self._publish_root(a)
+        begun = self._begin(a)
+        self._close(a)
+        target_dir = Path(begun["cycle_dir"]) / "artifacts" / "plans" / "links"
+        target_dir.mkdir(parents=True)
+        (target_dir / "real.md").write_bytes(b"real\n")
+        (target_dir / "relative.md").symlink_to("real.md")
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=begun["cycle_id"], state="abandoned",
+                       abandon_reason="route-unrecoverable", exclude_symlinks=True, crash_after_manifest=True)
+        P.recover(self.root)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        self.assertEqual(record["state"], "sealed")
+        self.assertEqual(record["excluded_symlinks"], ["artifacts/plans/links/relative.md"])
+
+    def test_closed_lineage_handover_reports_open_tree(self):
+        a = self._root_route("handover-report")
+        self._publish_root(a)
+        b = self._continuation(a)
+        first, second = self._handover_shape(a, b)
+        first_record = P.read_cycle_record(self.root, first["cycle_id"])
+        second_record = P.read_cycle_record(self.root, second["cycle_id"])
+        self._close(a)
+        # B is still open: a live tree hands nothing over.
+        self.assertEqual(P.closed_lineage_handover(self.root, first_record), P.LineageHandover(False, frozenset()))
+        self._close(b)
+        self.assertEqual(P.closed_lineage_handover(self.root, first_record),
+                         P.LineageHandover(True, frozenset({b["route_id"]})))
+        self.assertEqual(P.closed_lineage_handover(self.root, second_record),
+                         P.LineageHandover(True, frozenset()))
+        # No other cycle begins inside the tree: closed, nothing handed over.
+        lone = self._root_route("handover-report-lone")
+        self._publish_root(lone)
+        lone_child = self._continuation(lone)
+        lone_cycle = self._begin(lone)
+        lone_record = P.read_cycle_record(self.root, lone_cycle["cycle_id"])
+        self._close(lone)
+        self.assertEqual(P.closed_lineage_handover(self.root, lone_record), P.LineageHandover(False, frozenset()))
+        self._close(lone_child)
+        self.assertEqual(P.closed_lineage_handover(self.root, lone_record), P.LineageHandover(True, frozenset()))
 
 
 class CycleBucketDeclarationTest(unittest.TestCase):

@@ -35,6 +35,10 @@ interrupted one left: a cycle behind a runtime-written closure is sealed at
 once, any other closed-but-unsealed cycle after `QUIET_SECONDS`.  A session
 that comes back to an automatically closed route is not refused: `finish`
 reports it closed and succeeds, `start` hands back a compose command.
+A cycle inside a closed lineage that other cycles began in seals on its own
+stretch of the lineage; an abandoned seal leaves symbolic links out of the
+manifest and records them.  A workflow-group member that ended with no durable
+output is withdrawn from its campaign's declaration in the same sweep.
 
 The sweep writes under the artifact root only and reads the checkout with
 `git rev-parse` alone.  It takes no lock it would wait for and spends at most
@@ -61,6 +65,9 @@ BUDGET_SECONDS = 20.0
 # the answer rarely changes within minutes, and asking costs a registry and
 # process scan.  Closing later by at most this much is the safe direction.
 RECHECK_SECONDS = 600
+# Bumped when the rules that decide whether a cycle can be sealed change: an
+# earlier sweep's "cannot seal" is then asked once more under the new rules.
+SEAL_RULES = 2
 WALK_LIMIT = 2000
 # A terminal registry row may still have its wrapper process publishing; rows
 # older than this are not re-probed on every sweep.
@@ -436,13 +443,30 @@ def _transient(result: str) -> bool:
     return any(word in result for word in _TRANSIENT)
 
 
-def _seal_cycle(root: Path, route: Mapping[str, Any], proven) -> str:
-    """Seal the route's open cycle with an existing state; never waits on a lock."""
+def _closed_lineage(root: Path, record: Mapping[str, Any] | None) -> bool:
+    """Whether the cycle's whole lineage is closed, so "which cycle continues
+    this route" is no longer a live question."""
     import artifact_producer
+    if record is None:
+        return False
     try:
-        record = artifact_producer.route_cycle_for(root, route)
-    except Exception as exc:
-        return "cycle-unresolved:" + str(exc)[:80]
+        return artifact_producer.closed_lineage_handover(root, record).closed
+    except Exception:
+        return False
+
+
+def _seal_cycle(root: Path, route: Mapping[str, Any], proven, *, record: Mapping[str, Any] | None = None) -> str:
+    """Seal the route's open cycle with an existing state; never waits on a lock.
+    A `record` whose lineage is closed is sealed as it is; otherwise the route
+    is asked which cycle it continues, and an ambiguous answer stops the seal."""
+    import artifact_producer
+    if _closed_lineage(root, record):
+        pass
+    else:
+        try:
+            record = artifact_producer.route_cycle_for(root, route)
+        except Exception as exc:
+            return "cycle-unresolved:" + str(exc)[:80]
     if not record:
         return "no-open-cycle"
     try:
@@ -459,7 +483,8 @@ def _seal_cycle(root: Path, route: Mapping[str, Any], proven) -> str:
             pass
     try:
         result = artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="abandoned",
-                                            abandon_reason="route-unrecoverable", lock_timeout=0)
+                                            abandon_reason="route-unrecoverable", lock_timeout=0,
+                                            exclude_symlinks=True)
     except Exception as exc:
         return "cycle-left-open:" + str(exc)[:80]
     return "cycle-abandoned-empty" if result.get("status") == "no-lineage" else "cycle-abandoned"
@@ -511,6 +536,7 @@ class _Memory:
         self.unsealable = data.get("unsealable") if isinstance(data.get("unsealable"), dict) else {}
         self.failed_routes = data.get("failed_routes") if isinstance(data.get("failed_routes"), dict) else {}
         self.kept = data.get("kept") if isinstance(data.get("kept"), dict) else {}
+        self.workflow_groups = data.get("workflow_groups") if isinstance(data.get("workflow_groups"), dict) else {}
         self.changed = False
 
     def recently_kept(self, key: str, now: float) -> str | None:
@@ -528,7 +554,8 @@ class _Memory:
         temporary = self.path.with_name(f".state.{os.getpid()}.tmp")
         temporary.write_text(json.dumps({"schema": 1, "settled_cycles": self.settled,
                                          "unsealable": self.unsealable, "failed_routes": self.failed_routes,
-                                         "kept": self.kept}, sort_keys=True), encoding="utf-8")
+                                         "kept": self.kept, "workflow_groups": self.workflow_groups},
+                                        sort_keys=True), encoding="utf-8")
         os.replace(temporary, self.path)
 
 
@@ -596,7 +623,8 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
             continue
         remembered = memory.unsealable.get(cycle_id)
         if (remembered and remembered.get("signature") == record["_signature"]
-                and remembered.get("outcome_signature") == outcome_signature):
+                and remembered.get("outcome_signature") == outcome_signature
+                and remembered.get("rules") == SEAL_RULES):
             continue
         try:
             quick = json.loads(begin_outcome.read_text(encoding="utf-8"))
@@ -617,14 +645,116 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
             if why:
                 memory.keep("cycle:" + cycle_id, why, now)
                 continue
-            result = _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"))
+            result = _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"), record=record)
         results.append({"cycle_id": cycle_id, "route_id": record["route_id"], "cycle": result})
         if _left_open(result) and not _transient(result):
             memory.unsealable[cycle_id] = {"signature": record["_signature"],
                                            "outcome_signature": outcome_signature,
-                                           "reason": result, "at": _iso(now)}
+                                           "rules": SEAL_RULES, "reason": result, "at": _iso(now)}
             memory.changed = True
     return results
+
+
+def _ended_empty(root: Path, record: Mapping[str, Any] | None) -> bool:
+    """A cycle that ended with no durable output: abandoned (or a completed
+    request that found nothing), and no manifest was ever published."""
+    import artifact_producer
+    if not record or record.get("state") not in ("abandoned", "no-lineage") or record.get("manifest_digest"):
+        return False
+    try:
+        directory = artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+    except Exception:
+        return True   # the directory went with the empty cycle
+    return not os.path.lexists(directory / "manifest.json")
+
+
+def _declared_members(path: Path) -> list[str]:
+    """Cycle ids a declaration names, read loosely: anything unreadable names none."""
+    try:
+        groups = json.loads(path.read_text(encoding="utf-8")).get("groups")
+        return [item["cycle_id"] for group in groups for item in group["members"]]
+    except Exception:
+        return []
+
+
+def _withdraw_empty_members(root: Path, memory: _Memory, *, deadline, now) -> list[dict]:
+    """Take workflow-group members that ended with no durable output out of their
+    campaign's declaration, with the existing prepare -> apply -> verify, and
+    record why.  A declaration that is missing or invalid, or a lock that is held,
+    only defers this; it never touches a seal.  A declaration is not re-read
+    until it or one of its members' cycle records changes."""
+    import artifact_admission
+    import artifact_producer
+    import artifact_workflow_group_review as review
+    import artifact_workflow_groups as groups
+    rows: list[dict] = []
+    records = root / ".runtime" / "artifact-producer" / "v1" / "cycles"
+    try:
+        entries = sorted(os.scandir(root / "campaigns"), key=lambda entry: entry.name)
+    except OSError:
+        return rows
+    for entry in entries:
+        if time.monotonic() >= deadline:
+            break
+        path = Path(entry.path) / groups.NAME
+        try:
+            if entry.is_symlink() or not entry.is_dir() or path.is_symlink() or not path.is_file():
+                continue
+        except OSError:
+            continue
+        signature = _signature(path)
+        memo = memory.workflow_groups.get(entry.name)
+        if (isinstance(memo, dict) and memo.get("declaration") == signature
+                and all(_signature(records / f"{cycle_id}.json") == stamp
+                        for cycle_id, stamp in (memo.get("members") or {}).items())):
+            continue
+        members = _declared_members(path)
+        try:
+            row = _withdraw_from(root, path, members, groups, review, artifact_producer, now=now)
+        except artifact_admission.AdmissionBusy:
+            continue   # a held lock: the next sweep asks again
+        except groups.WorkflowGroupError as exc:
+            if exc.code == "declaration-preimage-conflict":
+                continue   # the declaration changed under us: so will the next look
+            row = None
+        except Exception:
+            row = None
+        if row:
+            rows.append(row)
+        memory.workflow_groups[entry.name] = {
+            "declaration": _signature(path),
+            "members": {cycle_id: _signature(records / f"{cycle_id}.json") for cycle_id in members}}
+        memory.changed = True
+    return rows
+
+
+def _withdraw_from(root: Path, path: Path, members: list[str], groups, review, artifact_producer, *, now):
+    """The withdrawal for one declaration, or None when there is nothing to withdraw."""
+    ended = {}
+    for cycle_id in members:
+        record = artifact_producer.read_cycle_record(root, cycle_id)
+        if _ended_empty(root, record):
+            ended[cycle_id] = record
+    if not ended:
+        return None
+    declaration = json.loads(path.read_text(encoding="utf-8"))
+    campaign_id = declaration["campaign_id"]
+    plan = groups.prepare_withdrawal(root, campaign_id, list(ended))
+    if plan is None:
+        return None
+    groups.apply(root, plan, lock_timeout=0)
+    groups.verify(root, campaign_id, expected=plan["after_sha256"])
+    left = {item["cycle_id"]: group["group_id"] for group in declaration["groups"] for item in group["members"]}
+    review.record_outcomes(
+        root, [review.Outcome(
+            cycle_id=cycle_id, campaign_id=campaign_id, verdict="withdrawn-empty", group_id=left.get(cycle_id),
+            reason="cycle ended with no durable output (no manifest); withdrawn by route auto-close",
+            cycle_state=record["state"], declaration_sha256=plan["after_sha256"], profile=None)
+            for cycle_id, record in ended.items() if cycle_id in left],
+        mode="autoclose", now=now, lock_timeout=0)
+    return {"campaign_id": campaign_id, "cycle_ids": [cycle_id for cycle_id in ended if cycle_id in left],
+            "groups_removed": len(declaration["groups"]) - len(plan["document"]["groups"]),
+            "result": "withdrawn"}
 
 
 def sweep(artifact_root, *, api, trigger: str, campaign_id: str | None = None,
@@ -783,13 +913,18 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
             records = _open_cycles(root, memory)
         summary["cycles"] = _seal_unsealed_cycles(root, api, records, gather, memory,
                                                   deadline=deadline, now=now, campaign_id=campaign_id)
+    if time.monotonic() < deadline:
+        withdrawn = _withdraw_empty_members(root, memory, deadline=deadline, now=now)
+        if withdrawn:
+            summary["withdrawn"] = withdrawn
 
 
 def report(summary: Mapping[str, Any], stream=None) -> None:
     """One stderr line; silent when nothing happened."""
     stream = stream or sys.stderr
     closed, cycles, errors = summary.get("closed") or [], summary.get("cycles") or [], summary.get("errors") or []
-    if not (closed or cycles or errors or summary.get("deferred")):
+    withdrawn = sum(len(row["cycle_ids"]) for row in summary.get("withdrawn") or [])
+    if not (closed or cycles or errors or summary.get("deferred") or withdrawn):
         return
     reasons: dict[str, int] = {}
     for row in closed:
@@ -797,4 +932,5 @@ def report(summary: Mapping[str, Any], stream=None) -> None:
     left_open = sum(_left_open(row["cycle"]) for row in cycles)
     print("route_autoclose closed=%d cycles_sealed=%d cycles_left_open=%d deferred=%d errors=%d reasons=%s" % (
         len(closed), len(cycles) - left_open, left_open, summary.get("deferred", 0), len(errors),
-        ",".join(f"{k}:{v}" for k, v in sorted(reasons.items())) or "-"), file=stream)
+        ",".join(f"{k}:{v}" for k, v in sorted(reasons.items())) or "-") + (
+        f" withdrawn={withdrawn}" if withdrawn else ""), file=stream)
