@@ -259,9 +259,12 @@ def _commit_dump():
     prints a ONE-LINE stderr warning while sync itself stays non-fatal.
     History compaction is an explicit operator action: ``mem maintenance
     [--squash-days N] [--apply]`` squashes old auto-sync history and gcs (see
-    ``maintenance()``); it is run by the session finalizer or the user, never
-    a daemon. Routine sync never pushes this compatibility projection;
-    ``MEM_DUMP_PUSH=1`` is only a deprecated alias for immutable v2 exchange.
+    ``maintenance()``); the user or an agent runs it on request, and nothing
+    runs it on session end. The background exchange (``_exchange_worker_main``)
+    calls this after every routine run, which is what keeps the local mirror
+    current without a session finalizer. Routine sync never pushes this
+    compatibility projection; ``MEM_DUMP_PUSH=1`` is only a deprecated alias
+    for immutable v2 exchange.
     """
     if os.environ.get("MEM_DUMP_COMMIT") == "0":
         return  # Explicit escape hatch.
@@ -294,8 +297,9 @@ def maintenance(squash_days=14, apply=False):
     """Compact the dump repository: squash old auto-sync history, then gc.
 
     Companion policy for plain-commit dump mode (audit W1/W2): commits now
-    accumulate one per sync, so an OPERATOR (session finalizer or the user —
-    never a daemon) periodically squashes first-parent history older than
+    accumulate one per sync (and one per background exchange that changed the
+    dump), so an OPERATOR (the user or an agent on request — never a daemon
+    and never a session-end hook) periodically squashes first-parent history older than
     ``squash_days`` into a single root commit and garbage-collects loose
     objects. Retained commits keep their trees, subjects, and dates
     byte-identically, so HEAD's tree and the worktree never change. Dry-run
@@ -1662,6 +1666,9 @@ def _capture_v2_operation(con, kind, *, post_ids=(), tombstones=None,
     sync_v2.record_local_operation(
         con, operation, installation_fingerprint=installation_fingerprint
     )
+    # The one place every committed semantic mutation passes: remember it so the
+    # foreground command can ask for a background exchange once it ends.
+    _exchange_mark_dirty(operation["op_id"])
     for rid, action in tombstones.items():
         prior_bytes = protocol_v2.canonical_bytes(prior_states.get(rid) or {})
         tombstone = next(item["tombstone"] for item in mutations
@@ -2130,6 +2137,18 @@ def _has_cjk(s):
     return bool(re.search(r"[　-鿿가-힯]", s))
 
 
+def _unexpired_sql(alias="r"):
+    """Read-side expiry fence, one definition for inject, candidates, and recall.
+
+    Expiry is applied for real by the write side (``lifecycle``), so a read
+    only has to keep an expired working record out of sight until then. A
+    pending delivery never expires. The single ``?`` is ``today()``.
+    """
+    prefix = f"{alias}." if alias else ""
+    return (f"({prefix}expires IS NULL OR {prefix}expires>=? "
+            f"OR {prefix}delivery_state='pending')")
+
+
 def _visibility_clause(alias="r", all_projects=False, include_superseded=False):
     """Shared read fence: flagged rows never surface; default is current project + global."""
     prefix = f"{alias}." if alias else ""
@@ -2306,9 +2325,10 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                     "WHERE records_capsule_fts MATCH ? AND r.status='active' "
                     "AND (r.injection_flag=0 OR r.injection_flag IS NULL) "
                     "AND (r.scope='global' OR r.cwd_origin=?) "
+                    f"AND {_unexpired_sql('r')} "
                     "ORDER BY bm25(records_capsule_fts),r.strength DESC,r.updated DESC "
                     "LIMIT ?",
-                    (expression, project, limit),
+                    (expression, project, today(), limit),
                 ).fetchall()
         except (OSError, sqlite3.Error):
             rows = []
@@ -2421,6 +2441,7 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
                 conds.append("(r.scope='global' OR r.cwd_origin=?)"); p.append(encc)
             if not include_superseded:
                 conds.append("r.status='active'")
+                conds.append(_unexpired_sql("r")); p.append(today())
             if topic:
                 conds.append("EXISTS (SELECT 1 FROM record_topics rt "
                              "WHERE rt.record_id=r.id AND rt.topic=?)")
@@ -3155,6 +3176,7 @@ def import_dump(path, recovery=False):
                 _sync_capsule_row(con, rid)
                 n += 1
         con.commit()
+        _exchange_mark_dirty()  # this path writes records without a v2 operation
     finally:
         con.close()
     print(f"[import] {n} records ← {Path(path).name}")
@@ -3878,7 +3900,12 @@ def activate(rid):
         con.close()
 
 
-def lifecycle(apply=False):
+def lifecycle(apply=False, dup_scan=True):
+    """Report or apply working-record expiry; optionally flag durable near-duplicates.
+
+    The background exchange passes ``dup_scan=False``: it only has to make the
+    expiry the read side already hides real, not rescan the whole store.
+    """
     print(f"# lifecycle  ({'APPLY' if apply else 'report'})")
     con = get_con()
     try:
@@ -3888,7 +3915,7 @@ def lifecycle(apply=False):
         expired_rows = list(db_iter_records(
             con, "tier='working' AND expires IS NOT NULL AND expires < ?", (today(),)))
         # Flag durable near-duplicates.
-        dups = near_dup_groups(con, "delivery_state!='pending'")
+        dups = near_dup_groups(con, "delivery_state!='pending'") if dup_scan else []
 
         protected = []
         deleted = 0
@@ -5517,12 +5544,12 @@ def inject(max_working=None, max_durable=None, hook=False):
         # Exclude injection-flagged records; trusted profile reads remain separate.
         work = list(db_iter_records(
             con, "status='active' AND tier='working' AND cwd_origin=? "
-                 "AND (expires IS NULL OR expires >= ? OR delivery_state='pending')"
+                 f"AND {_unexpired_sql('')}"
                  " AND (injection_flag=0 OR injection_flag IS NULL)",
             (encc, today())))
         dur  = list(db_iter_records(
             con, "status='active' AND tier='durable' AND scope='project' AND cwd_origin=? "
-                 "AND (expires IS NULL OR expires >= ? OR delivery_state='pending')"
+                 f"AND {_unexpired_sql('')}"
                  " AND (injection_flag=0 OR injection_flag IS NULL)",
             (encc, today())))
         # Collect cleanup candidates while the connection remains open.
@@ -6004,7 +6031,12 @@ def _persistent_remote_guard(ref):
     return str(row[1])
 
 
+_LAST_SYNC_STATUS = None
+
+
 def _emit_sync(status, json_output):
+    global _LAST_SYNC_STATUS
+    _LAST_SYNC_STATUS = dict(status)
     if json_output:
         print(json.dumps(status, sort_keys=True, ensure_ascii=False))
     else:
@@ -6099,8 +6131,15 @@ def sync(json_output=False):
         }, json_output)
 
 
-def _sync_locked(json_output=False):
-    """Run local maintenance and an optional, safety-gated immutable exchange."""
+def _sync_locked(json_output=False, routine=False, apply_expiry=False):
+    """Run local maintenance and an optional, safety-gated immutable exchange.
+
+    ``routine`` is the background exchange: it takes the same safety path
+    (policy, fetch validation, fold, old-writer fence, render, publish,
+    confirm) but skips ``migrate``, the full ``index_build(rebuild=True)``, and
+    the duplicate scan. ``apply_expiry`` (write-triggered runs only) makes the
+    working-record expiry real; a read-triggered run only receives and exports.
+    """
     identity_con = get_con()
     try:
         identity_con.execute("BEGIN IMMEDIATE")
@@ -6128,24 +6167,32 @@ def _sync_locked(json_output=False):
         "remote-confirm": "pending",
     }
     with contextlib.redirect_stdout(sink):
-        try:
-            n = migrate(apply=True, absorb_auto_memory=False)
-            phases["migrate"] = "ok"
-        except Exception as e:
-            phases["migrate"] = "failed"
-            sys.stderr.write(f"[sync] migrate failed; continuing: {e}\n")
-        try:
-            lifecycle(apply=True)
-            phases["lifecycle"] = "ok"
-        except Exception as e:
-            phases["lifecycle"] = "failed"
-            sys.stderr.write(f"[sync] lifecycle failed; continuing: {e}\n")
-        try:
-            index_build(rebuild=True)
-            phases["index"] = "ok"
-        except Exception as e:
-            phases["index"] = "failed"
-            sys.stderr.write(f"[sync] index failed: {e}\n")
+        if routine:
+            phases["migrate"] = "skipped"
+            phases["index"] = "skipped"
+        else:
+            try:
+                n = migrate(apply=True, absorb_auto_memory=False)
+                phases["migrate"] = "ok"
+            except Exception as e:
+                phases["migrate"] = "failed"
+                sys.stderr.write(f"[sync] migrate failed; continuing: {e}\n")
+        if routine and not apply_expiry:
+            phases["lifecycle"] = "skipped"
+        else:
+            try:
+                lifecycle(apply=True, dup_scan=not routine)
+                phases["lifecycle"] = "ok"
+            except Exception as e:
+                phases["lifecycle"] = "failed"
+                sys.stderr.write(f"[sync] lifecycle failed; continuing: {e}\n")
+        if not routine:
+            try:
+                index_build(rebuild=True)
+                phases["index"] = "ok"
+            except Exception as e:
+                phases["index"] = "failed"
+                sys.stderr.write(f"[sync] index failed: {e}\n")
         try:
             export_dump()
             _commit_dump()
@@ -6232,6 +6279,7 @@ def _sync_locked(json_output=False):
         phases["remote-fetch-validate"] = "ok"
         result = _ingest_and_fold_snapshot(snapshot, ref)
         phases["remote-fold"] = "ok"
+        _exchange_note_receive()
         with contextlib.redirect_stdout(sink):
             export_dump()
             _commit_dump()
@@ -6376,6 +6424,433 @@ def _sync_locked(json_output=False):
             reason = "sync-invariant-failure"
         return _emit_sync({**common, "status": "hard-failure", "exit_code": 2,
                            "reason": reason}, json_output)
+
+
+# ---------- background exchange (D-83) ----------
+# One exchange, two triggers. A foreground command that committed a mutation
+# (W) and a main-session read whose last successful receive is stale (R) both
+# ask ``_schedule_exchange`` to start the same detached ``_exchange-worker``;
+# the worker runs the existing ``_sync_locked`` safety path in routine mode.
+# Nothing here waits for the exchange, and every failure here is swallowed: a
+# write or read never fails or slows down because the exchange could not start.
+EXCHANGE_STATE_FILE = ".exchange-state.json"
+EXCHANGE_RUN_LOCK = ".exchange-run.lock"
+EXCHANGE_SCHEDULE_LOCK = ".exchange-schedule.lock"
+EXCHANGE_WINDOW_SECONDS = 20.0        # writes that arrive inside it share one run
+EXCHANGE_READ_INTERVAL_SECONDS = 600.0
+EXCHANGE_RECEIVE_RETRY_SECONDS = 120.0  # a dead remote is not retried per prompt
+EXCHANGE_SPAWN_GRACE_SECONDS = 5.0    # a just-spawned worker has not taken its lock yet
+EXCHANGE_MAX_RUNS = 2                 # one run, plus at most one follow-up
+
+_EXCHANGE_DIRTY_OPS = []      # op ids captured by this process (last few)
+_EXCHANGE_FORCE_DIRTY = False  # a mutation that bypasses the operation funnel
+_EXCHANGE_SUPPRESS = False     # this command already ran the exchange itself
+_EXCHANGE_IN_WORKER = False
+
+
+def _exchange_mode():
+    """``on`` (default), ``off`` (MEM_EXCHANGE_AUTO=0), or ``inline`` (tests)."""
+    value = os.environ.get("MEM_EXCHANGE_AUTO", "").strip().lower()
+    if value in ("0", "off", "false", "no"):
+        return "off"
+    if value == "inline":
+        return "inline"
+    return "on"
+
+
+def _exchange_in_worker():
+    return _EXCHANGE_IN_WORKER or os.environ.get("MEM_EXCHANGE_WORKER") == "1"
+
+
+def _exchange_mark_dirty(op_id=None):
+    """Remember that this process changed the store (the funnel calls this)."""
+    global _EXCHANGE_FORCE_DIRTY
+    if op_id is None:
+        _EXCHANGE_FORCE_DIRTY = True
+        return
+    _EXCHANGE_DIRTY_OPS.append(op_id)
+    del _EXCHANGE_DIRTY_OPS[:-32]
+
+
+def _exchange_write_committed():
+    """True when a mutation of this process really reached the database."""
+    if _EXCHANGE_FORCE_DIRTY:
+        return True
+    if not _EXCHANGE_DIRTY_OPS:
+        return False
+    con = None
+    try:
+        con = sqlite3.connect(DB.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+        marks = ",".join("?" for _ in _EXCHANGE_DIRTY_OPS)
+        return con.execute(
+            f"SELECT 1 FROM sync_outbox WHERE op_id IN ({marks}) LIMIT 1",
+            _EXCHANGE_DIRTY_OPS,
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return True
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _exchange_open_lock(name):
+    STORE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(STORE / name, flags, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise OSError(f"unsafe exchange lock file: {name}")
+    return fd
+
+
+def _exchange_try_flock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+@contextlib.contextmanager
+def _exchange_schedule_lock(wait=0.3):
+    """Short non-blocking reservation lock; yields False instead of waiting long."""
+    fd = None
+    held = False
+    try:
+        fd = _exchange_open_lock(EXCHANGE_SCHEDULE_LOCK)
+        deadline = time.monotonic() + wait
+        while True:
+            if _exchange_try_flock(fd):
+                held = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+    except OSError:
+        pass
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            try:
+                if held:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _exchange_run_lock_busy():
+    """True while some worker holds this store's run lock."""
+    try:
+        fd = _exchange_open_lock(EXCHANGE_RUN_LOCK)
+    except OSError:
+        return False
+    try:
+        if _exchange_try_flock(fd):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def _exchange_state_load():
+    """Read the small state file; a missing or damaged file is an empty state."""
+    try:
+        data = json.loads((STORE / EXCHANGE_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _exchange_state_save(state):
+    """Atomically replace the state file (caller holds the schedule lock)."""
+    temp = None
+    try:
+        fd, raw = tempfile.mkstemp(prefix=".exchange-state.", dir=STORE)
+        temp = Path(raw)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, sort_keys=True))
+        os.replace(temp, STORE / EXCHANGE_STATE_FILE)
+        temp = None
+    except OSError:
+        pass
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+
+
+def _exchange_num(state, key):
+    value = state.get(key)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _exchange_note_receive():
+    """Record that a remote fetch+fold just succeeded (R's staleness clock)."""
+    try:
+        with _exchange_schedule_lock(wait=2.0) as held:
+            if held:
+                state = _exchange_state_load()
+                state["last_success_receive"] = time.time()
+                _exchange_state_save(state)
+    except Exception:
+        pass
+
+
+def _exchange_main_session():
+    """False inside any worker/dispatch child: only a main session triggers R."""
+    env = os.environ
+    if env.get("AGENT_SESSION_ROLE") == "worker":
+        return False
+    if env.get("AGENT_DISPATCH_CHILD") == "1":
+        return False
+    depth = env.get("AGENT_DISPATCH_DEPTH", "").strip()
+    if depth:
+        try:
+            if int(depth) > 0:
+                return False
+        except ValueError:
+            return False
+    if env.get("OPENCODE_DISPATCH_SLUG", "").strip():
+        return False
+    if env.get("FLEET_TITLE_REFRESH") == "1":
+        return False
+    return True
+
+
+def _exchange_read_interval():
+    try:
+        value = float(os.environ.get("MEM_SYNC_READ_INTERVAL_SECONDS", ""))
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    return EXCHANGE_READ_INTERVAL_SECONDS
+
+
+def _exchange_window():
+    try:
+        value = float(os.environ.get("MEM_EXCHANGE_WINDOW_SECONDS", ""))
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    return EXCHANGE_WINDOW_SECONDS
+
+
+def _exchange_read_due(state, now):
+    return (now - _exchange_num(state, "last_success_receive") > _exchange_read_interval()
+            and now - _exchange_num(state, "last_receive_attempt")
+            > EXCHANGE_RECEIVE_RETRY_SECONDS)
+
+
+def _exchange_spawn(window):
+    """Start the detached worker; never wait for it, never raise."""
+    if _exchange_mode() == "inline":
+        _exchange_worker_run(0.0)
+        return
+    try:
+        env = dict(os.environ)
+        env["MEM_EXCHANGE_WORKER"] = "1"
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()),
+             "_exchange-worker", "--window", repr(float(window))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+            start_new_session=True, cwd=str(STORE), env=env,
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def _schedule_exchange(kind):
+    """Ask for one background exchange: ``write`` (W) or ``read`` (R)."""
+    if _exchange_mode() == "off" or _exchange_in_worker():
+        return
+    now = time.time()
+    if kind == "read":
+        # Cheap, lock-free pre-checks first: most reads stop here.
+        if not (_exchange_main_session() and DB.exists()):
+            return
+        if not _exchange_read_due(_exchange_state_load(), now):
+            return
+        try:
+            if not sync_v2.remote_policy(_sync_environment()).get("enabled"):
+                return
+        except Exception:
+            return
+    spawn = False
+    with _exchange_schedule_lock() as held:
+        if not held:
+            return
+        state = _exchange_state_load()
+        starting = now - _exchange_num(state, "worker_spawned_at") < EXCHANGE_SPAWN_GRACE_SECONDS
+        busy = _exchange_run_lock_busy()
+        if kind == "write":
+            state["dirty_gen"] = int(_exchange_num(state, "dirty_gen")) + 1
+            if busy:
+                state["rerun_requested"] = True
+        elif busy or starting or not _exchange_read_due(state, now):
+            return
+        else:
+            state["last_receive_attempt"] = now
+        if not busy and not starting:
+            spawn = True
+            state["worker_spawned_at"] = now
+        _exchange_state_save(state)
+    if spawn:
+        _exchange_spawn(_exchange_window() if kind == "write" else 0.0)
+
+
+def _exchange_after_command():
+    """Run once when a foreground command ends: W trigger for committed writes."""
+    if _EXCHANGE_SUPPRESS or _exchange_in_worker() or _exchange_mode() == "off":
+        return
+    if _exchange_write_committed():
+        _schedule_exchange("write")
+
+
+def _exchange_read_trigger():
+    """R trigger at the start of inject/candidates/recall; never raises."""
+    try:
+        _schedule_exchange("read")
+    except Exception:
+        pass
+
+
+def _exchange_clean_reason(value):
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "unknown")).strip()
+    return text[:120] or "unknown"
+
+
+def _exchange_consume_notice():
+    """Print the last background failure once, then clear it (foreground only)."""
+    try:
+        if not _exchange_state_load().get("failure_notice"):
+            return
+        notice = None
+        with _exchange_schedule_lock() as held:
+            if not held:
+                return
+            state = _exchange_state_load()
+            notice = state.pop("failure_notice", None)
+            if notice:
+                _exchange_state_save(state)
+        if not notice:
+            return
+        reason = _exchange_clean_reason(
+            notice.get("reason") if isinstance(notice, dict) else notice)
+        if reason == "remote-unavailable":
+            sys.stderr.write(
+                "[sync] remote unreachable in the last background exchange; "
+                "local changes are kept and will be sent on a later write or read\n")
+        else:
+            sys.stderr.write(
+                f"[sync] last background exchange failed: {reason} "
+                "— will retry on the next write or read\n")
+    except Exception:
+        pass
+
+
+def _exchange_run_once(apply_expiry):
+    """One routine pass. Returns ``(ok, reason)``; ok is None when merely busy."""
+    global _LAST_SYNC_STATUS
+    _LAST_SYNC_STATUS = None
+    try:
+        with _sync_process_lock():
+            _sync_locked(json_output=True, routine=True, apply_expiry=apply_expiry)
+    except _SyncLockBusy:
+        return None, "local sync busy"
+    except (OSError, sync_v2.SyncError) as exc:
+        return False, ("local-io-failure" if isinstance(exc, OSError)
+                       else "local-sync-invariant-failed")
+    except Exception as exc:
+        return False, type(exc).__name__
+    status = _LAST_SYNC_STATUS or {}
+    if int(status.get("exit_code", 2)) == 0:
+        return True, None
+    return False, status.get("reason") or status.get("status")
+
+
+def _exchange_worker_run(window):
+    """The worker body: one run lock, a batching window, then at most two passes."""
+    global _EXCHANGE_IN_WORKER
+    _EXCHANGE_IN_WORKER = True
+    try:
+        run_fd = _exchange_open_lock(EXCHANGE_RUN_LOCK)
+    except OSError:
+        return 0
+    try:
+        if not _exchange_try_flock(run_fd):
+            with _exchange_schedule_lock(wait=2.0) as held:
+                if held:
+                    state = _exchange_state_load()
+                    state["rerun_requested"] = True
+                    _exchange_state_save(state)
+            return 0
+        if window > 0:
+            time.sleep(window)
+        runs = 0
+        while True:
+            runs += 1
+            with _exchange_schedule_lock(wait=5.0) as held:
+                state = _exchange_state_load()
+                started_gen = int(_exchange_num(state, "dirty_gen"))
+                write_triggered = started_gen > int(_exchange_num(state, "done_gen"))
+                if held:
+                    state["last_receive_attempt"] = time.time()
+                    state["rerun_requested"] = False
+                    state["worker_spawned_at"] = 0
+                    state["run_count"] = int(_exchange_num(state, "run_count")) + 1
+                    _exchange_state_save(state)
+            ok, reason = _exchange_run_once(write_triggered)
+            again = False
+            with _exchange_schedule_lock(wait=5.0) as held:
+                if held:
+                    state = _exchange_state_load()
+                    if ok:
+                        state["done_gen"] = max(int(_exchange_num(state, "done_gen")),
+                                                started_gen)
+                        state["last_success_exchange"] = time.time()
+                        state.pop("failure_notice", None)
+                    elif ok is False:
+                        state["failure_notice"] = {
+                            "reason": _exchange_clean_reason(reason),
+                            "at": time.time(),
+                        }
+                    again = bool(ok and runs < EXCHANGE_MAX_RUNS
+                                 and int(_exchange_num(state, "dirty_gen")) > started_gen)
+                    _exchange_state_save(state)
+                    if not again:
+                        # Free the run lock while still holding the reservation
+                        # lock, so a request landing now sees either a live worker
+                        # that will notice it or a free lock that spawns a new one.
+                        fcntl.flock(run_fd, fcntl.LOCK_UN)
+            if not again:
+                return 0
+    finally:
+        os.close(run_fd)
+        _EXCHANGE_IN_WORKER = False
+
+
+def _exchange_worker_main(argv):
+    """Entry point of the hidden ``_exchange-worker`` subcommand."""
+    os.environ["MEM_EXCHANGE_WORKER"] = "1"
+    window = 0.0
+    if "--window" in argv:
+        try:
+            window = max(0.0, float(argv[argv.index("--window") + 1]))
+        except (ValueError, IndexError):
+            window = 0.0
+    try:
+        return _exchange_worker_run(window)
+    except Exception:
+        return 0
 
 
 # ---------- CLI ----------
@@ -8875,6 +9350,20 @@ def _migration_command_locked(args):
 
 
 def main():
+    """Run one foreground command, then ask for the background exchange it owes."""
+    if len(sys.argv) > 1 and sys.argv[1] == "_exchange-worker":
+        sys.exit(_exchange_worker_main(sys.argv[2:]))
+    try:
+        _cli_main()
+    finally:
+        try:
+            _exchange_after_command()
+        except Exception:
+            pass
+
+
+def _cli_main():
+    global _EXCHANGE_SUPPRESS
     ap = argparse.ArgumentParser(prog="mem", description="Unified Memory System", allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True,
                             parser_class=functools.partial(argparse.ArgumentParser, allow_abbrev=False))
@@ -9104,6 +9593,14 @@ def main():
 
     args = ap.parse_args()
 
+    # A failed background exchange is reported once, by the next command a
+    # person or agent runs. Hook-driven reads (candidates, inject) stay silent:
+    # nobody sees their stderr, so they must not use the notice up.
+    if args.cmd not in ("candidates", "inject", "recall-gate"):
+        _exchange_consume_notice()
+    if args.cmd in ("recall", "candidates", "inject"):
+        _exchange_read_trigger()
+
     if args.cmd == "add":
         write_record(
             args.tier, args.scope, args.type, args.body,
@@ -9207,6 +9704,7 @@ def main():
     elif args.cmd == "stats":
         stats()
     elif args.cmd == "sync":
+        _EXCHANGE_SUPPRESS = True  # the explicit sync is the exchange
         sys.exit(sync(json_output=args.json_output))
     elif args.cmd == "inject":
         inject(hook=args.hook)

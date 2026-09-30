@@ -28,6 +28,9 @@ hearting_test_isolate() {
   # test can reach a real remote unless it names a local bare repository itself.
   printf '%s\n' '{"enabled": false}' >"$XDG_CONFIG_HOME/hearting/memory-sync.json" || return 1
   unset MEM_SYNC_REMOTE MEM_SYNC_REMOTE_URL MEM_SYNC_DIR MEM_SYNC_REF MEM_DUMP_PUSH
+  # No detached exchange worker unless a test turns the scheduler on itself: the
+  # hundreds of `mem add` calls in the suites must not race temp-dir cleanup.
+  export MEM_EXCHANGE_AUTO=0
   git config --global --add safe.directory "$PWD" >/dev/null 2>&1 || return 1
   for _hti_var in HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CONFIG_HOME TMPDIR MEM_STORE; do
     eval "_hti_path=\${$_hti_var}"

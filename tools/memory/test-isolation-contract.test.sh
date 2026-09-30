@@ -22,7 +22,8 @@ XDG_CONFIG_HOME="$ambient_cfg"
 MEM_SYNC_REMOTE=1
 MEM_SYNC_REMOTE_URL="git@example.invalid:x/y.git"
 MEM_DUMP_PUSH=1
-export XDG_CONFIG_HOME MEM_SYNC_REMOTE MEM_SYNC_REMOTE_URL MEM_DUMP_PUSH
+MEM_EXCHANGE_AUTO=on
+export XDG_CONFIG_HOME MEM_SYNC_REMOTE MEM_SYNC_REMOTE_URL MEM_DUMP_PUSH MEM_EXCHANGE_AUTO
 hearting_test_isolate "$ROOT_FIX/fixture"
 [ "$MEM_STORE" = "$ROOT_FIX/fixture/store" ]
 [ "$HOME" = "$ROOT_FIX/fixture/home" ]
@@ -32,6 +33,8 @@ hearting_test_isolate "$ROOT_FIX/fixture"
 [ "$TMPDIR" = "$ROOT_FIX/fixture/tmp" ]
 [ "$(cksum "$ambient_cfg/hearting/memory-sync.json")" = "$cfg_before" ]
 [ -z "${MEM_SYNC_REMOTE:-}${MEM_SYNC_REMOTE_URL:-}${MEM_DUMP_PUSH:-}" ]
+# No detached exchange worker unless a test turns the scheduler on itself.
+[ "$MEM_EXCHANGE_AUTO" = "0" ]
 grep -q '"enabled": false' "$XDG_CONFIG_HOME/hearting/memory-sync.json"
 # The isolated policy resolves to remote off through the real reader.
 resolved=$(python3 - "$ROOT/tools/memory" <<'PY'

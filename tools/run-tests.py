@@ -158,6 +158,9 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     env["HEARTING_GATES"] = "on"
     # A suite that seals a cycle must not start the background workflow-group review.
     env["HEARTING_WORKFLOW_GROUP_REVIEW"] = "off"
+    # Same for the memory exchange: no detached worker races the temp-dir cleanup;
+    # the scheduler's own suite turns it back on.
+    env["MEM_EXCHANGE_AUTO"] = "0"
     env["HOME"] = str(home)
     env["XDG_STATE_HOME"] = str(xdg_state)
     env["XDG_DATA_HOME"] = str(xdg_data)
