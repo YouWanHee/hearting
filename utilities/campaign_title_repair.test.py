@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -531,7 +532,58 @@ class AutoSelectionAndWriteTest(AutoBase):
         finally:
             R._unlock(held)
         self.assertEqual((result["status"], result["targets"], invoke.calls), ("busy", [], []))
+        self.assertEqual(result["queued"], [begun["campaign_id"]])
+        self.assertEqual(repair._pending_ids(self.root), [begun["campaign_id"]])
         self.assertEqual(self.auto(begun, fake("이제는 쓰는 제목"))["targets"][0]["status"], "written")
+        self.assertEqual(repair._pending_ids(self.root), [])
+
+    def test_campaign_sealed_while_another_run_holds_the_lock_is_titled(self):  # A14b
+        first = self.seal(key="race-first", slug="a")
+        paused, resume = threading.Event(), threading.Event()
+        titles = iter(["첫 번째 캠페인 제목", "두 번째 캠페인 제목"])
+        seen = []
+
+        def invoke(prompt):
+            seen.append(data_of(prompt)["campaign"]["current_title"])
+            if len(seen) == 1:
+                paused.set()  # the first run has selected its targets and holds the lock
+                self.assertTrue(resume.wait(30))
+            return json.dumps({"display_title": next(titles), "reason": "근거 한 문장"}, ensure_ascii=False), "claude"
+
+        outcome = {}
+        worker = threading.Thread(target=lambda: outcome.update(repair.auto_title(
+            self.root, campaign_ids=[first["campaign_id"]], mode="seal", invoke=invoke)))
+        worker.start()
+        try:
+            self.assertTrue(paused.wait(30))
+            second = self.seal(key="race-second", slug="b")
+            busy = self.auto(second, fake("호출되면 안 되는 제목"))
+            self.assertEqual((busy["status"], busy["targets"]), ("busy", []))
+            self.assertEqual(repair._pending_ids(self.root), [second["campaign_id"]])
+            self.assertIn(("queued", "busy-pending"), [(row["status"], row.get("code")) for row in self.log_rows()])
+        finally:
+            resume.set()
+            worker.join(60)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome["status"], "ok")
+        self.assertEqual([row["campaign_id"] for row in outcome["targets"]],
+                         [first["campaign_id"], second["campaign_id"]])
+        self.assertEqual([row["status"] for row in outcome["targets"]], ["written", "written"])
+        titled = {entry["campaign_id"] for entry in self.declaration()["entries"]}
+        self.assertEqual(titled, {first["campaign_id"], second["campaign_id"]})
+        self.assertEqual(repair._pending_ids(self.root), [])
+        self.assertEqual([row["status"] for row in self.log_rows()], ["queued", "written", "written"])
+        self.assertEqual(self.log_rows()[2]["mode"], "pending")
+
+    def test_pending_marker_for_an_already_titled_campaign_is_cleared(self):
+        begun = self.seal(key="stale", slug="a")
+        self.assertEqual(self.auto(begun, fake("이미 제목이 있는 캠페인"))["targets"][0]["status"], "written")
+        repair._touch_pending(self.root, begun["campaign_id"])
+        repair._touch_pending(self.root, "not-a-campaign")
+        self.assertEqual(repair._pending_ids(self.root), [begun["campaign_id"]])
+        invoke = fake("다시 쓰면 안 되는 제목")
+        repair.auto_title(self.root, campaign_ids=[begun["campaign_id"]], mode="seal", invoke=invoke)
+        self.assertEqual((invoke.calls, repair._pending_ids(self.root)), ([], []))
 
 
 

@@ -51,6 +51,7 @@ REPAIR_LOCK_TIMEOUT = artifact_admission.LOCK_TIMEOUT_DEFAULT
 # Automatic display titles (see "automatic display titles" below).
 AUTO_LOG_REL = Path(".runtime/artifact-producer/v1/campaign-title-auto.jsonl")
 AUTO_LOCK_REL = Path(".runtime/artifact-producer/v1/campaign-title-auto.lock")
+AUTO_PENDING_REL = Path(".runtime/artifact-producer/v1/campaign-title-auto-pending")
 AUTO_DISABLE_ENV = "HEARTING_CAMPAIGN_TITLE_AUTO"
 AUTO_LOG_MAX_BYTES = 256 * 1024
 AUTO_LOG_KEEP_LINES = 500
@@ -1205,70 +1206,141 @@ def _default_invoke(prompt: str) -> tuple[str, Optional[str]]:
                            out_tag="campaign-title", label="campaign-title")
 
 
+def _touch_pending(root: Path, campaign_id: str) -> None:
+    import artifact_identity
+    if not artifact_identity.is_well_formed(campaign_id, "campaign"):
+        return
+    directory = Path(root) / AUTO_PENDING_REL
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / campaign_id).touch()
+
+
+def _pending_ids(root: Path) -> list[str]:
+    """Campaigns whose seal found the root busy; one marker per campaign id keeps the set bounded."""
+    import artifact_identity
+    try:
+        names = sorted(entry.name for entry in (Path(root) / AUTO_PENDING_REL).iterdir())
+    except OSError:
+        return []
+    return [name for name in names if artifact_identity.is_well_formed(name, "campaign")]
+
+
+def _clear_pending(root: Path, campaign_ids: Iterable[str]) -> None:
+    for campaign_id in campaign_ids:
+        try:
+            (Path(root) / AUTO_PENDING_REL / campaign_id).unlink()
+        except OSError:
+            pass
+
+
 def auto_title(root: Path, *, campaign_ids: Sequence[str] = (), mode: str = "explicit", dry_run: bool = False,
                invoke: Optional[Callable[[str], tuple]] = None, limit: int | None = None,
                lock_timeout: float | None = None) -> Dict[str, Any]:
-    """Pick and write Korean display titles for the root's target campaigns; one failure never stops the next."""
+    """Pick and write Korean display titles for the root's target campaigns; one failure never stops the next.
+
+    A run that finds the root lock busy leaves a pending marker per requested campaign; the
+    lock holder drains those markers before and after it releases the lock, so a campaign
+    sealed during another run is titled by that run, never lost.
+    """
     import artifact_workflow_group_review as R
     root = Path(root)
     result: Dict[str, Any] = {"status": "dry-run" if dry_run else "ok", "artifact_root": str(root),
                               "targets": [], "protected": 0, "waiting": 0}
-    lock_fd = None
-    if not dry_run:
-        try:
-            (root / AUTO_LOCK_REL).parent.mkdir(parents=True, exist_ok=True)
-            lock_fd = R._try_flock(root, root / AUTO_LOCK_REL)
-        except OSError:
-            lock_fd = None
-        if lock_fd is None:
-            result["status"] = "busy"
-            return result
-    try:
-        try:
-            selection = select_auto_targets(root, campaign_ids=campaign_ids)
-        except AutoTitleError as exc:
-            result["status"] = "declaration-unreadable"
-            result["code"] = exc.code
-            if not dry_run:
-                _append_auto_log(root, {"at": _now_iso(), "mode": mode, "status": "failed",
-                                        "failure_class": exc.failure_class, "code": exc.code})
-            return result
-        result["protected"], result["waiting"] = len(selection.protected), len(selection.waiting)
-        reserved = dict(selection.visible)
-        run = invoke or _default_invoke
-        for target in (selection.targets[:limit] if limit else selection.targets):
-            row: Dict[str, Any] = {"campaign_id": target.campaign_id, "campaign_locator": target.locator,
-                                   "reason": target.reason}
-            try:
-                prompt = build_title_input(root, target, reserved)
-                text, harness = run(prompt)
-                if harness:
-                    row["harness"] = harness
-                if not isinstance(text, str) or not text.strip():
-                    raise AutoTitleError("unavailable", "no-response")
-                title, _why = validate_title_response(text, target, reserved)
-                if dry_run:
-                    row.update(status="proposed", display_title=title)
-                else:
-                    outcome = write_auto_entry(root, target, title, lock_timeout=lock_timeout)
-                    if outcome["status"] == "written":
-                        row.update(status="written", display_title=title)
-                        reserved[target.campaign_id] = title
-                    else:
-                        row.update(status="skipped", code=outcome["code"])
-            except AutoTitleError as exc:
-                row.update(status="failed", failure_class=exc.failure_class, code=exc.code)
-            except Exception as exc:  # noqa: BLE001 -- one campaign's failure never stops the rest
-                row.update(status="failed", failure_class="unavailable", code=f"unexpected:{type(exc).__name__}")
-            result["targets"].append(row)
-            if not dry_run:
-                _append_auto_log(root, {"at": _now_iso(), "mode": mode, **{
-                    key: row.get(key) for key in ("campaign_id", "campaign_locator", "status", "failure_class",
-                                                  "code", "harness")}})
+    if dry_run:
+        _auto_pass(root, result, campaign_ids, mode, True, invoke, limit, lock_timeout, set(), True)
         return result
+    lock_fd = None
+    try:
+        (root / AUTO_LOCK_REL).parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = R._try_flock(root, root / AUTO_LOCK_REL)
+    except OSError:
+        lock_fd = None
+    if lock_fd is None:
+        result["status"] = "busy"
+        try:
+            for campaign_id in campaign_ids:
+                _touch_pending(root, campaign_id)
+        except OSError:
+            pass
+        if campaign_ids:
+            result["queued"] = list(campaign_ids)
+            _append_auto_log(root, {"at": _now_iso(), "mode": mode, "status": "queued", "code": "busy-pending",
+                                    "campaign_ids": list(campaign_ids)})
+        return result
+    attempted: set = set()  # a campaign is tried once per run; failures wait for the next seal
+    passes = 0
+    try:
+        while lock_fd is not None and passes < R.MAX_PASSES:
+            passes += 1
+            pending = _pending_ids(root)
+            if passes == 1:
+                ids = list(dict.fromkeys([*campaign_ids, *pending])) if campaign_ids else []
+            else:
+                ids = [cid for cid in pending if cid not in attempted]
+            if passes == 1 or ids:
+                if not _auto_pass(root, result, ids, mode if passes == 1 else "pending", False, invoke, limit,
+                                  lock_timeout, attempted, passes == 1):
+                    break  # the declaration is unreadable; markers stay for the run after it is repaired
+            _clear_pending(root, pending)
+            if not _pending_ids(root):
+                R._unlock(lock_fd)
+                lock_fd = None
+                if _pending_ids(root):  # a seal landed while the lock was being released
+                    lock_fd = R._try_flock(root, root / AUTO_LOCK_REL)
     finally:
-        if lock_fd is not None:
-            R._unlock(lock_fd)
+        R._unlock(lock_fd)
+    return result
+
+
+def _auto_pass(root: Path, result: Dict[str, Any], campaign_ids: Sequence[str], mode: str, dry_run: bool,
+               invoke: Optional[Callable[[str], tuple]], limit: int | None, lock_timeout: float | None,
+               attempted: set, first: bool) -> bool:
+    """One selection-and-write pass under the run's lock; False when the declaration cannot be read."""
+    try:
+        selection = select_auto_targets(root, campaign_ids=campaign_ids)
+    except AutoTitleError as exc:
+        result["status"] = "declaration-unreadable"
+        result["code"] = exc.code
+        if not dry_run:
+            _append_auto_log(root, {"at": _now_iso(), "mode": mode, "status": "failed",
+                                    "failure_class": exc.failure_class, "code": exc.code})
+        return False
+    if first:  # only the run's first pass reports the selection counts
+        result["protected"], result["waiting"] = len(selection.protected), len(selection.waiting)
+    reserved = dict(selection.visible)
+    run = invoke or _default_invoke
+    targets = [target for target in selection.targets if target.campaign_id not in attempted]
+    for target in (targets[:limit] if limit else targets):
+        attempted.add(target.campaign_id)
+        row: Dict[str, Any] = {"campaign_id": target.campaign_id, "campaign_locator": target.locator,
+                               "reason": target.reason}
+        try:
+            prompt = build_title_input(root, target, reserved)
+            text, harness = run(prompt)
+            if harness:
+                row["harness"] = harness
+            if not isinstance(text, str) or not text.strip():
+                raise AutoTitleError("unavailable", "no-response")
+            title, _why = validate_title_response(text, target, reserved)
+            if dry_run:
+                row.update(status="proposed", display_title=title)
+            else:
+                outcome = write_auto_entry(root, target, title, lock_timeout=lock_timeout)
+                if outcome["status"] == "written":
+                    row.update(status="written", display_title=title)
+                    reserved[target.campaign_id] = title
+                else:
+                    row.update(status="skipped", code=outcome["code"])
+        except AutoTitleError as exc:
+            row.update(status="failed", failure_class=exc.failure_class, code=exc.code)
+        except Exception as exc:  # noqa: BLE001 -- one campaign's failure never stops the rest
+            row.update(status="failed", failure_class="unavailable", code=f"unexpected:{type(exc).__name__}")
+        result["targets"].append(row)
+        if not dry_run:
+            _append_auto_log(root, {"at": _now_iso(), "mode": mode, **{
+                key: row.get(key) for key in ("campaign_id", "campaign_locator", "status", "failure_class",
+                                              "code", "harness")}})
+    return True
 
 
 def backfill_roots(root_declaration: Path, *, dry_run: bool = False, limit: int | None = None,
@@ -1338,7 +1410,10 @@ def launch_after_seal(root: Path, record: Mapping[str, Any]) -> bool:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 1)[0],
+        epilog="exit codes: 0 done; 65 blocked or refused (JSON on stdout); "
+               "2 usage error (a missing or unknown option, reported by argparse on stderr)")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("prepare")
     p.add_argument("--root-declaration", type=Path, required=True)
