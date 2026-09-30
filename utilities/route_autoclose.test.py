@@ -44,7 +44,11 @@ INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR
 
 
 def isolated_env(**explicit) -> dict:
-    return {**{key: os.environ[key] for key in INHERITED if key in os.environ}, **explicit}
+    # The group-review switch is pinned last: a sealed cycle would otherwise start
+    # a detached sweep that keeps writing into the fixture root while teardown
+    # removes it (the runner sets the switch, but INHERITED drops it).
+    return {**{key: os.environ[key] for key in INHERITED if key in os.environ}, **explicit,
+            "HEARTING_WORKFLOW_GROUP_REVIEW": "off"}
 
 
 def _proc_start(pid: int) -> str:
@@ -53,11 +57,7 @@ def _proc_start(pid: int) -> str:
 
 class RouteAutocloseTest(unittest.TestCase):
     def setUp(self):
-        # A background child the code under test starts may still be writing into
-        # the fixture root at teardown (CI flake 2026-09-29/30, "Directory not
-        # empty"); cleanup must not turn that into a failure. Root cause is
-        # tracked separately.
-        self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-", ignore_cleanup_errors=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-")
         self.base = base = Path(self.temp.name)
         self.repo, self.root = base / "repo", base / "artifacts"
         self.repo.mkdir(); self.root.mkdir()
