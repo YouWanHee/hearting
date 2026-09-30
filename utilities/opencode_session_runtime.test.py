@@ -192,5 +192,34 @@ for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'r
         self.assertTrue(module.shell_command(args, self.f.base/'prompt', self.f.base/'log').startswith('opencode run '))
 
 
+    def test_input_queued_before_the_first_turn_binds_the_native_session(self):
+        import dispatch_owner_input as owner_input
+        f = self.f
+        native = f.base/'native.py'
+        native.write_text("""
+import json, os, sys
+prompt = sys.stdin.read()
+with open(os.environ['FAKE_TRACE'], 'a') as f:
+ f.write(json.dumps({'args':sys.argv[1:], 'prompt':prompt}) + '\\n')
+text = 'artifact: -\\nverdict: PASS\\nblocker: none'
+for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'reason':'stop'})]:
+ print(json.dumps({'type':kind,'sessionID':'ses_actual','part':part}))
+""")
+        f.jobs.write_text(fixture.owner_row(f.lease).replace('harness=claude', 'harness=opencode'))
+        owner_input.initialize_owner_input(f.jobs, fixture.PARENT, 'opencode-next-turn')
+        owner_input.submit(f.jobs, fixture.PARENT, 'early word', 'early')
+        command = f.command() + ['--runtime-harness', 'opencode', '--opencode-command', shlex.join([sys.executable, str(native)])]
+        result = subprocess.run(command, input='initial', text=True, capture_output=True,
+                                env=f.child_env(FAKE_TRACE=str(f.trace)), timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        turns = [json.loads(line) for line in f.trace.read_text().splitlines()]
+        self.assertEqual(len(turns), 1)
+        self.assertIn('early word', turns[0]['prompt'])
+        self.assertNotIn('--session', turns[0]['args'])
+        receipt = owner_input.inspect(f.jobs, fixture.PARENT)
+        self.assertEqual(receipt['requests'][0]['state'], 'turn-completed')
+        self.assertEqual(receipt['thread_id'], 'ses_actual')
+
+
 if __name__ == '__main__':
     unittest.main()
