@@ -170,11 +170,19 @@ class CensusTest(unittest.TestCase):
             # to each of the five standard+ recipes, and autopilot-code already
             # declared one `frame` node, so the recipe node population grew by
             # nine.
-            # eligible stays 23: refine's `review -> transaction` keeps its
-            # `preview-disposition` human-gate continuation (an approval before
-            # the edit applies, not a direction gate), so the frame layer adds
-            # no eligible boundary.
-            (49, 23, 14, 13, 12),
+            # Three boundaries are newly eligible because their predecessors'
+            # continuations are now `inline-next`, passing the continuation-
+            # kind filter: apply verify -> handback, lab smoke -> full-run, and
+            # ship security-review -> release-review. The terminal-successor
+            # filter drops verify -> handback; the final advance-class filter
+            # drops smoke -> full-run because full-run is `model-required`.
+            # release-review -> deploy never becomes eligible: deploy has two
+            # dependencies, so the fan-in filter drops it. Census pairs
+            # adjacent recipe nodes, making the ship row the two readiness
+            # reviews in recipe order (security-review -> release-review).
+            # refine review -> transaction stays excluded by its
+            # preview-disposition human-gate continuation.
+            (49, 26, 16, 15, 13),
         )
         expected_standard_boundaries = [
             ("autopilot-apply", "apply", "verify"),
@@ -189,6 +197,7 @@ class CensusTest(unittest.TestCase):
             ("autopilot-lab", "media", "report"),
             ("autopilot-lab", "report", "independent-verify"),
             ("autopilot-research", "synthesis", "report"),
+            ("autopilot-ship", "security-review", "release-review"),
         ]
         actual = [(b["recipe"], b["predecessor"], b["successor"]) for b in standard["boundaries"]]
         self.assertEqual(actual, expected_standard_boundaries)

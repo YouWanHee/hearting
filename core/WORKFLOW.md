@@ -216,7 +216,7 @@ a mode retains its existing deployment/release behavior (`default`).
 | "Infer on the received field samples and one or two simulations, then package them" | `autopilot-lab --mode eval` | Only missing requested inference; ship/package for delivery, no full-dataset expansion |
 | "Fix the reusable archive builder" | `autopilot-code` | Program implementation, not packaging an existing result |
 | "Write an independent presentation for the recipient" | `autopilot-draft` | New document goal, not file collection |
-| "Deploy the application to production" | `autopilot-ship` | Existing default deployment authorization and verification remain |
+| "Deploy the application to production" | `autopilot-ship` | Obtain deploy approval at route start; retain post-deploy verification |
 
 Added after a 2026-07-14 incident where a checkpoint reevaluation with report
 regeneration was routed to `autopilot-refine` as primary from its surface

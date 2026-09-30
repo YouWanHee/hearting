@@ -33,7 +33,7 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     ),
     ("autopilot-apply", ('default',)): (
-        "eb9d1ee50cf6d9c88b96a08bace1f06985cdfccaa87be448aa85307174632eac",
+        "500c7944f76dfdd6f0199659b723308355767411f7af45d5d20a3880ba4ebad0",
         "a9b802f929cb1efdf839e4bae6f9f7c03bad3466d6193b9ff23d22a4ba9faaa9",
     ),
     ("autopilot-code", ('audit', 'debug', 'dev')): (
@@ -49,7 +49,7 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "e51f3d86b5ead6ac1573610fe55fb0994de2b86658fb1ef09a6c227bc487b0cb",
     ),
     ("autopilot-lab", ('setup',)): (
-        "5b2a8597888c3e3ffed75c389af2b4b5e01d14503e883b2a684be2d0ecb45178",
+        "63cc4cc283c09fce7abf3831d9de80209602bb489cbd7549871b3d2efeffda8d",
         "d06d03e9406c69a6d152d7c828ae6f271f5a3bf6588790d6d7b9d8509b7df964",
     ),
     ("autopilot-lab", ('eval',)): (
@@ -68,7 +68,7 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "200eacddabdd14d82ffc0da1233434eb9d78ed3a64a0f9ee3f925523559543e9",
     ),
     ("autopilot-ship", ('default',)): (
-        "9082445b19699eee098dbbb307b8edf3339a3f3ea65ef84f8c1e688c1f16799c",
+        "a7fa4c8b7b23ed061370cb4f3d998dbe1e5ff8a1eb841aa4057d2e2771222e65",
         "228bb08fccc6ebc2dd7ab6dc77e9714c52cb8d7f12b0a283e61cac3613532f5e",
     ),
     ("autopilot-ship", ('package',)): (
