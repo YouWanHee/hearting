@@ -21,7 +21,7 @@ through adapter-owned wrappers or native agent surfaces.
 | `dev` | `dev/new-lib` | `fast implementer` | `stage` | `low` | `roles/units/dev/new-lib.md` |
 | `dev` | `dev/refactor` | `fast implementer` | `stage` | `low` | `roles/units/dev/refactor.md` |
 | `editorial` | `editorial/polish` | `deep editor` | `stage` | `low` | `roles/units/editorial/polish.md` |
-| `editorial` | `editorial/report` | `fast writer` | `stage` | `low` | `roles/units/editorial/report.md` |
+| `editorial` | `editorial/report` | `deep editor` | `stage` | `low` | `roles/units/editorial/report.md` |
 | `editorial` | `editorial/review` | `fast reviewer` | `review` | `low` | `roles/units/editorial/review.md` |
 | `editorial` | `editorial/translate` | `deep editor` | `stage` | `low` | `roles/units/editorial/translate.md` |
 | `material` | `material/browser-fetch` | `fast tool worker` | `support` | `near-zero` | `roles/units/material/browser-fetch.md` |

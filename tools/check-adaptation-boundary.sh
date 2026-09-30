@@ -878,7 +878,7 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'role_set=fast reviewer,deep reviewer,external adversary' /tmp/codex-role-verification.out \
     || ! adapters/codex/bin/role-map.sh report >/tmp/codex-role-report.out 2>/tmp/codex-role-report.err \
     || ! grep -Fq 'pipeline_stage=report' /tmp/codex-role-report.out \
-    || ! grep -Fq 'portable_model_role=fast writer' /tmp/codex-role-report.out \
+    || ! grep -Fq 'portable_model_role=deep editor' /tmp/codex-role-report.out \
     || ! grep -Fq 'role <portable-role|role-profile|pipeline-stage>' adapters/codex/bin/preflight.sh \
     || ! grep -Fq 'role <portable-role|role-profile|pipeline-stage>' adapters/codex/README.md \
     || ! grep -Fq 'role <portable-role|role-profile|pipeline-stage>' adapters/codex/AGENTS.md; then

@@ -197,6 +197,30 @@ class RouteDemand(unittest.TestCase):
             self.assertNotEqual(other["route_hash"],route["route_hash"])
         self.assertEqual(route["owner_profile_selection"]["source"],"legacy")
 
+    def _compile_report_node(self, capability, mode, signal, node_id, **kwargs):
+        route = R.compile_route(**self.args(capability=capability, capability_mode=mode,
+            requested_intensity="standard", predicates=[], signals=[signal], transport="headless",
+            inline_reason=None, dispatch_evidence=self.dispatch(self.nested()), **kwargs))
+        R.verify_route(route, R.ROOT)
+        return next(n for n in route["nodes"] if n["id"] == node_id)
+
+    def test_reader_facing_report_nodes_default_to_balanced_deep(self):
+        for capability, mode, signal, node_id, source in (
+                ("autopilot-code", "dev", "shared-contract", "report", "matrix"),
+                ("autopilot-lab", "eval", "resource-run", "report", "legacy"),
+                ("autopilot-design", "default", "multi-write-scope", "handoff", "legacy"),
+                ("autopilot-draft", "doc", "artifact-fanout", "finalize", "legacy")):
+            node = self._compile_report_node(capability, mode, signal, node_id)
+            self.assertEqual((node["model_profile"], node["role"]), ("balanced-deep", "deep editor"), capability)
+            self.assertEqual(node["profile_selection"]["source"], source, capability)
+
+    def test_report_default_yields_to_explicit_node_profile(self):
+        node = self._compile_report_node("autopilot-code", "dev", "shared-contract", "report",
+                                         explicit_profiles={"report": "light"})
+        self.assertEqual(node["model_profile"], "light")
+        self.assertEqual(node["profile_selection"]["source"], "explicit")
+        self.assertEqual(node["profile_selection"]["reason"], "explicit-profile-choice")
+
     def test_owner_floor_unknown_target_and_partial_reject(self):
         for demands in ({"__owner__":{}},{"execute":{}},{"absent":demand()}):
             with self.assertRaises(ValueError): self.compile(profile_demands=demands)

@@ -579,7 +579,7 @@
             "depends_on": [
               "test"
             ],
-            "role": "fast writer",
+            "role": "deep editor",
             "inputs": [
               "plan.md",
               "checklist.md",
@@ -604,7 +604,7 @@
               "inline"
             ],
             "unit": "editorial/report",
-            "model_profile": "balanced",
+            "model_profile": "balanced-deep",
             "terminal": true,
             "terminal_gate": "code-report",
             "advance_class": "model-required",
@@ -612,9 +612,9 @@
             "commit_expected": false,
             "profile_demand": {
               "schema_version": 1,
-              "judgment_requirement": "predetermined",
+              "judgment_requirement": "important",
               "execution_scope": "extended-multistep",
-              "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+              "judgment_reason": "The report is the reader-facing artifact; its readability and faithful synthesis are the judgment the user asked to prioritize (2026-09-30).",
               "execution_reason": "Assemble verified implementation and test artifacts into the final reports.",
               "evidence_refs": [
                 "capabilities/autopilot-code.md#portable-procedure",
@@ -1048,7 +1048,7 @@
               "visual-verify",
               "critic-review"
             ],
-            "role": "fast writer",
+            "role": "deep editor",
             "inputs": [
               "designs/<cycle>/04_review/verify/verdict.yaml",
               "designs/<cycle>/04_review/critic/verdict.json",
@@ -1071,7 +1071,7 @@
               "inline"
             ],
             "unit": "editorial/report",
-            "model_profile": "light",
+            "model_profile": "balanced-deep",
             "terminal": true,
             "terminal_gate": "design-handoff",
             "advance_class": "model-required",
@@ -1487,7 +1487,7 @@
               "quality-review",
               "fact-verify"
             ],
-            "role": "fast writer",
+            "role": "deep editor",
             "inputs": [
               "draft/**",
               "reviews/draft/quality/verdict.json",
@@ -1510,7 +1510,7 @@
               "inline"
             ],
             "unit": "editorial/report",
-            "model_profile": "light",
+            "model_profile": "balanced-deep",
             "terminal": true,
             "terminal_gate": "draft-finalize",
             "advance_class": "model-required",
@@ -2170,7 +2170,7 @@
             "depends_on": [
               "media"
             ],
-            "role": "fast writer",
+            "role": "deep editor",
             "inputs": [
               "metrics.jsonl",
               "summary-stats.json",
@@ -2196,7 +2196,7 @@
               "inline"
             ],
             "unit": "editorial/report",
-            "model_profile": "light",
+            "model_profile": "balanced-deep",
             "continuation": {
               "kind": "inline-next"
             },

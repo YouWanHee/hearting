@@ -108,7 +108,8 @@ Shared contracts use model roles rather than concrete model names. Vendor-specif
 | `fast reviewer` | Low-cost, low-latency broad review with known ground truth or surface-heavy checks | quick/light QA, style, coverage, cross-reference, verbatim matching |
 | `deep reviewer` | High-reasoning domain and methodology judgment | methodology, safety/security, architecture risk, standard+ quality review |
 | `fast fact-checker` | Narrow comparison of claims against source artifacts with limited creativity | citation, venue, year, metric, lineage, table values |
-| `fast writer` | Low-cost assembly of verified artifacts into a user-facing summary | Final report and short synthesis |
+| `fast writer` | Low-cost assembly of verified artifacts into a user-facing summary | Short mechanical synthesis |
+| `deep editor` | Reader-facing prose that must read well | Final reports, polish, translation |
 | `deep maker` | Generation requiring aesthetic, strategic, architectural, or domain judgment | Planning, research synthesis, visual design, editorial rewrite |
 | `deep orchestrator` | High-judgment conductor for stage gates, failover, and evidence synthesis | Standard+ dispatch-depth-1 capability owner |
 | `external adversary` | Hostile review through an independent engine or runtime | Adversarial verification |
@@ -220,7 +221,7 @@ Role binding rules:
   the relevant review persona into a separate execution through the standard
   transport. The same harness is sufficient; there is no separate wrapper-team agent.
 
-For standard+ code stage dispatch, role and profile are explicit: ordinary frame/plan use `deep maker + balanced-deep`, execute uses `fast implementer + light`, test/report use their fast roles with `light`, and route-selected high-risk or parallel legs override only the profile declared for that leg. Strong plan convergence uses `deep`; thorough implementation-risk exploration may deliberately use `light` while a failure-mode review uses `deep`.
+For standard+ code stage dispatch, role and profile are explicit: ordinary frame/plan use `deep maker + balanced-deep`, execute uses `fast implementer + light`, test uses `fast reviewer` with `light`, report (the reader-facing final artifact) uses `deep editor` with `balanced-deep` as a recommended default that `--profile`, `--explicit-profiles`, or `--pin` can change, and route-selected high-risk or parallel legs override only the profile declared for that leg. Strong plan convergence uses `deep`; thorough implementation-risk exploration may deliberately use `light` while a failure-mode review uses `deep`.
 
 ---
 

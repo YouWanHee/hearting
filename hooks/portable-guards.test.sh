@@ -1224,7 +1224,7 @@ if "$CODEX" role planning >"$TMP/codex_role_planning.out" 2>"$TMP/codex_role_pla
   && grep -q '^role_set=fast reviewer,deep reviewer,external adversary$' "$TMP/codex_role_verify.out" \
   && "$CODEX" role report >"$TMP/codex_role_report.out" 2>"$TMP/codex_role_report.err" \
   && grep -q '^pipeline_stage=report$' "$TMP/codex_role_report.out" \
-  && grep -q '^portable_model_role=fast writer$' "$TMP/codex_role_report.out"; then
+  && grep -q '^portable_model_role=deep editor$' "$TMP/codex_role_report.out"; then
   ok "codex role wrapper maps pipeline stages to portable unit-catalog roles"
 else
   bad "codex role wrapper should map pipeline stages to portable unit-catalog roles"
