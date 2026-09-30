@@ -15,17 +15,24 @@ dispatchable behavior atom. This guard enforces, stdlib-only:
 4. Consumer surfaces (repo-root skills/** and capabilities/*.md) no longer
    reference the retired persona paths `roles/modes/` and `agent-modes/`
    (adapters/claude/agent-modes/) — those re-homed into roles/units/.
+5. The optional `bootstrap:` block (memory/exemplar/gates) uses only known
+   sub-keys and vocabulary (utilities/worker_bootstrap.py) and names existing
+   completion gates. Authoring-time lint only; the runtime ignores unknown values.
 
 Exit 1 on any violation; `-v` lists every scanned file.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UNITS = ROOT / "roles" / "units"
+sys.path.insert(0, str(ROOT / "utilities"))
+from worker_bootstrap import BOOTSTRAP_EXEMPLAR_KINDS, BOOTSTRAP_MEMORY_TOPICS  # noqa: E402
+BOOTSTRAP_KEYS = ("memory", "exemplar", "gates")
 
 # Surfaces that must not reference the retired persona paths. Consumer-facing .md
 # trees only (2026-07-22 verify finding: adapter Skill projections, plugin mirrors,
@@ -181,6 +188,38 @@ def check_unit_file(path: Path, violations: list[str]) -> None:
         if looks_like_path(value) and not resolve_ref(path, value):
             violations.append(
                 f"{rel(path)}:{ln}: io.return ref '{value}' does not resolve to a file")
+    check_bootstrap_block(path, fields, nested, violations)
+
+
+def check_bootstrap_block(path: Path, fields, nested, violations: list[str], gates=None) -> None:
+    """Optional `bootstrap:` declaration; a unit without it is never touched."""
+    if "bootstrap" not in fields:
+        return
+    if gates is None:
+        try:
+            gates = set(json.loads((ROOT / "capabilities" / "topologies.json").read_text(
+                encoding="utf-8")).get("completion_gate_contracts", {}))
+        except (OSError, ValueError):
+            gates = None
+    for key, (value, ln) in nested.items():
+        parent, _, sub = key.partition(".")
+        if parent != "bootstrap":
+            continue
+        if sub not in BOOTSTRAP_KEYS:
+            violations.append(f"{rel(path)}:{ln}: unknown bootstrap key '{sub}' (allowed: {list(BOOTSTRAP_KEYS)})")
+            continue
+        items = [v.strip().strip("\"'") for v in value.strip("[]").split(",") if v.strip()]
+        if not items:
+            violations.append(f"{rel(path)}:{ln}: bootstrap.{sub} is empty")
+        if sub == "memory":
+            allowed, label = set(BOOTSTRAP_MEMORY_TOPICS), "memory topic"
+        elif sub == "exemplar":
+            allowed, label = set(BOOTSTRAP_EXEMPLAR_KINDS), "exemplar kind"
+        else:
+            allowed, label = gates, "completion gate"
+        for item in items:
+            if allowed is not None and item not in allowed:
+                violations.append(f"{rel(path)}:{ln}: bootstrap.{sub} {label} '{item}' is not known")
 
 
 def scan_model_literals(path: Path, violations: list[str]) -> None:
