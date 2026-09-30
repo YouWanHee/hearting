@@ -163,22 +163,6 @@ function runWorkerState(action, payload = {}) {
   return (result.stdout || "").trim()
 }
 
-function spawnDetached(command, args) {
-  // Fire-and-forget: must not block the user's turn. The child runs the
-  // preflight session-end → no-tools distiller worker independently.
-  try {
-    const child = spawn(preflight, [command, ...args], {
-      cwd: root,
-      env: { ...process.env, AGENT_HOME: root },
-      detached: true,
-      stdio: "ignore",
-    })
-    child.unref()
-  } catch {
-    // best-effort; distillation is non-critical
-  }
-}
-
 function spawnSummary(sid, phase) {
   if (!sid || isWorkerSession()) return
   try {
@@ -345,13 +329,11 @@ export const AgentHarnessGuards = async (ctx) => {
       forgetShownCandidates(event.properties && event.properties.sessionID)
     }
     // session.idle fires after each turn (the session is waiting for the user).
-    // Use it as the memory-sync trigger; preflight session-end debounces per
-    // session. Mirrors the Claude SessionEnd and Codex session-end detached sync.
+    // It refreshes the summary and pane and touches the heartbeat; memory has no
+    // idle or session-end step (it exchanges after writes and reads, D-82/D-83).
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
-      const sid = eventSid || "opencode-plugin"
       if (!isWorkerSession()) {
-        spawnDetached("session-end", [baseDir(ctx), sid])
         spawnSummary(eventSid, "final")
         projectPane(eventSid)
       }

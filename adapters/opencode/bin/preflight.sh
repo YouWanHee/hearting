@@ -787,13 +787,6 @@ portable_source=capabilities/autopilot-design.md
 note=OpenCode design capabilities have native Skill/Command guidance and an adapter-owned render/screenshot/console harness. Run it for every design HTML output, then inspect the screenshot before claiming visual completion.
 EOF
     ;;
-  session-end)
-    cwd=${2:-$PWD}
-    sid=${3:-opencode}
-    # D-42 defense in depth: workers never sync from session.idle/session-end.
-    is_worker_session && exit 0
-    (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || true
-    ;;
   role)
     [ "$#" -ge 2 ] || { echo "opencode preflight: role requires a portable role" >&2; exit 64; }
     shift

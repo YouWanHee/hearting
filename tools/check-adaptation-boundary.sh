@@ -902,7 +902,7 @@ check_codex_bin_wrappers() {
     fi
   done
 
-  for p in 'preflight.sh session-end' 'preflight.sh prompt-signal' 'preflight.sh token-budget' 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh ui-info' 'preflight.sh tui-config' 'preflight.sh subagent-info' 'preflight.sh loop-info' 'preflight.sh qa-policy'; do
+  for p in 'preflight.sh prompt-signal' 'preflight.sh token-budget' 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh ui-info' 'preflight.sh tui-config' 'preflight.sh subagent-info' 'preflight.sh loop-info' 'preflight.sh qa-policy'; do
     if ! grep -Fq "$p" adapters/codex/AGENTS.md; then
       fail_msg "adapters/codex/AGENTS.md must document manual Codex lifecycle wrapper $p"
     fi
@@ -975,7 +975,8 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'emit_context(' adapters/codex/hooks/sessionstart-lifecycle.py \
     || ! grep -Fq '"SessionStart"' adapters/codex/hooks/sessionstart-lifecycle.py \
     || ! grep -Fq 'hookSpecificOutput' adapters/codex/hooks/sessionstart-lifecycle.py \
-    || ! grep -Fq 'run_preflight("session-end"' adapters/codex/hooks/sessionend-lifecycle.py \
+    || grep -Fq 'session-end' adapters/codex/hooks/sessionend-lifecycle.py \
+    || ! grep -Fq 'launch_trigger("codex"' adapters/codex/hooks/sessionend-lifecycle.py \
     || grep -Fq 'subprocess' adapters/codex/hooks/stop-lifecycle.py \
     || grep -Fq 'session-end' adapters/codex/hooks/stop-lifecycle.py \
     || grep -Fq 'join_session_batch(' adapters/codex/hooks/stop-lifecycle.py \
@@ -1916,7 +1917,8 @@ check_codex_native_hook_projection() {
   if ! grep -Fq '"PostToolUse"' "$hook_json" || ! grep -Fq 'posttooluse-read-marker.py' "$hook_json"; then
     fail_msg "$hook_json must register the Codex PostToolUse read marker"
   fi
-  for bridge in "$session_bridge" "$sessionend_bridge" "$prompt_bridge" "$post_bridge" "$read_bridge"; do
+  # The SessionEnd bridge calls no preflight: memory has no session-end step (D-82).
+  for bridge in "$session_bridge" "$prompt_bridge" "$post_bridge" "$read_bridge"; do
     if ! grep -Fq 'adapters" / "codex" / "bin" / "preflight.sh' "$bridge"; then
       fail_msg "$bridge must call the Codex preflight wrapper"
     fi
@@ -1974,8 +1976,8 @@ PY
   if ! grep -Fq '"read"' "$read_bridge"; then
     fail_msg "$read_bridge must call the Codex read preflight"
   fi
-  if ! grep -Fq '"session-end"' "$sessionend_bridge"; then
-    fail_msg "$sessionend_bridge must call the Codex session-end preflight"
+  if grep -Fq '"session-end"' "$sessionend_bridge" || ! grep -Fq 'clear_wait' "$sessionend_bridge"; then
+    fail_msg "$sessionend_bridge must keep the Fleet cleanup and call no memory preflight"
   fi
   if ! grep -Fq 'PreToolUse' adapters/codex/README.md \
     || ! grep -Fq 'PostToolUse' adapters/codex/README.md \
