@@ -36,6 +36,11 @@ _REPO_ROOT = _find_repo_root()
 _STATUSLINE = os.path.join(_REPO_ROOT, "adapters", "claude", "statusline.sh")
 
 
+
+# Provider order is cached for a minute in production; each test here varies the
+# selection inputs within one process, so the cache is off unless a test turns it on.
+os.environ["FLEET_PROVIDER_ORDER_TTL_SECONDS"] = "0"
+
 class _ConfigHomeMixin:
     """Points runtime/config state at a fresh tmp dir."""
 
@@ -947,6 +952,34 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
             self.assertEqual(rt.run_worker("some prompt"), "")
         finally:
             _shutil.which = orig_which
+
+    def test_provider_order_is_reused_within_its_ttl(self):
+        """Title refreshes reuse one computed order instead of rescanning the registry."""
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        calls = []
+        real_run = rt.subprocess.run
+        def counting_run(argv, *args, **kwargs):
+            if argv and str(argv[0]).endswith("usage-check.sh"):
+                calls.append(argv)
+            return real_run(argv, *args, **kwargs)
+        saved = {k: os.environ.get(k) for k in ("XDG_STATE_HOME", "FLEET_PROVIDER_ORDER_TTL_SECONDS", "HARNESS_CAPACITY_SCORES")}
+        os.environ["XDG_STATE_HOME"] = state.name
+        os.environ["FLEET_PROVIDER_ORDER_TTL_SECONDS"] = "60"
+        os.environ["HARNESS_CAPACITY_SCORES"] = "claude:80,codex:50"
+        rt.subprocess.run = counting_run
+        try:
+            first = rt.selected_providers()
+            second = rt.selected_providers()
+        finally:
+            rt.subprocess.run = real_run
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(calls), 1)
 
     def test_cascade_skips_an_uninstalled_leader(self):
         """An absent first quality peer must fall through, not go blank."""
