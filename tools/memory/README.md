@@ -71,6 +71,7 @@ python3 <agent-home>/tools/memory/mem.py <command>
 | `show <id> [--all] [--include-superseded]` | Show one visible record with capsule, temporal metadata, and full body. |
 | `consume <id>` | Move a pending handoff/thread to consumed. Retrieval and injection never consume records implicitly. |
 | `restore <id>` | Restore one record from the graveyard while preserving action/canonical metadata. |
+| `history <id> [--show N \| --restore N]` | A `--source` write with a different body replaces the record's body in place (same ID); the replaced body, headline, tags and metadata are kept in the local, append-only `<STORE>/source-history.jsonl` (mode 0600, not part of the dump or the exchange; rotated to `source-history.<timestamp>.jsonl` past 1 MiB, never trimmed). `history <id>` lists them newest first, `--show N` prints one, `--restore N` writes it back — that write keeps the body it displaces, so the change can be undone the same way. A repeated identical body keeps nothing. Only global records and the current project's own are visible. |
 | `index [--rebuild]` | Rebuild the FTS5 tables embedded in `memory.db`. |
 | `export [--target dump\|profile] [--apply]` | Export `dump.jsonl` or an on-demand human-readable profile cache. Profile export is dry-run unless `--apply` is supplied. |
 | `import <dump.jsonl>` | Compatibility import of the materialized v1 view. It cannot recreate v2 frontiers/conflicts/tombstones/quarantine or peer/outbox state, so normal and recovery imports both refuse once any v2 protocol state exists. |

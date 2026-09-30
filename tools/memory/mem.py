@@ -1761,6 +1761,77 @@ def find_dup(tier, scope, body, cwd_origin, con=None):
     return None
 
 
+SOURCE_HISTORY = STORE / "source-history.jsonl"
+SOURCE_HISTORY_MAX_BYTES = 1024 * 1024
+
+
+def _source_history_max_bytes():
+    raw = os.environ.get("MEM_SOURCE_HISTORY_MAX_BYTES", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return SOURCE_HISTORY_MAX_BYTES
+    return value if value > 0 else SOURCE_HISTORY_MAX_BYTES
+
+
+def _source_history_files():
+    """Rotated generations oldest first, then the active file."""
+    rotated = sorted(SOURCE_HISTORY.parent.glob("source-history.*.jsonl"))
+    return rotated + ([SOURCE_HISTORY] if SOURCE_HISTORY.is_file() else [])
+
+
+def _source_history_append(entry):
+    """Keep a replaced body after its overwrite committed; never fail the write.
+
+    The local, append-only file is a recovery aid: it is not part of the dump
+    or of the v2 exchange.  When it grows past the size cap it is renamed to a
+    timestamped generation, so no body is ever dropped.  Returns True when the
+    entry is on disk.
+    """
+    line = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
+    try:
+        SOURCE_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            size = SOURCE_HISTORY.stat().st_size if SOURCE_HISTORY.is_file() else 0
+        except OSError:
+            size = 0
+        if size and size + len(line.encode("utf-8")) > _source_history_max_bytes():
+            stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+            SOURCE_HISTORY.rename(
+                SOURCE_HISTORY.with_name(f"source-history.{stamp}.jsonl"))
+        fd = os.open(SOURCE_HISTORY,
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                     0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+    except OSError as e:
+        sys.stderr.write(
+            f"[history] could not keep the previous body of {entry.get('id')}: {e}\n")
+        return False
+
+
+def _source_history_entries(rid):
+    """Every kept entry for one record, oldest first."""
+    found = []
+    for path in _source_history_files():
+        try:
+            with path.open(encoding="utf-8") as f:
+                for raw in f:
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict) and entry.get("id") == rid:
+                        found.append(entry)
+        except OSError:
+            continue
+    return found
+
+
 def write_record(tier, scope, rtype, body, cwd_origin=None, tags=None, links=None,
                  source=None, quiet=False, requires_consume=False, journal_action=None,
                  journal_insert_only=False, journal_actor=None,
@@ -1831,6 +1902,23 @@ def write_record(tier, scope, rtype, body, cwd_origin=None, tags=None, links=Non
                 new_expires = None
             # Recompute injection_flag whenever the body changes.
             new_inj_flag = 1 if "injection-pattern" in flags else 0
+            # A different body replaces the old one in place; keep the old text
+            # (after the commit below) so it can be brought back.
+            replaced = None
+            prev = con.execute(
+                "SELECT body, headline, updated, tags, links FROM records WHERE id=?",
+                (existing,)).fetchone()
+            if prev is not None and prev[0] != body:
+                replaced = {
+                    "v": 1, "id": existing, "tier": tier, "scope": scope,
+                    "type": rtype, "source": source, "cwd_origin": cwd_origin,
+                    "prev_headline": prev[1], "prev_body": prev[0],
+                    "prev_updated": prev[2],
+                    "prev_tags": json.loads(prev[3]) if prev[3] else [],
+                    "prev_links": json.loads(prev[4]) if prev[4] else [],
+                    "replaced_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "actor": journal_actor if journal_actor in WRITE_ACTORS else _write_actor(),
+                }
             con.execute(
                 "UPDATE records SET body=?, updated=?, expires=?, tags=?, links=?,"
                 " injection_flag=?, delivery_state=CASE "
@@ -1852,8 +1940,11 @@ def write_record(tier, scope, rtype, body, cwd_origin=None, tags=None, links=Non
                 con, "put", post_ids=[existing], reason="source-upsert"
             )
             con.commit()
+            kept = _source_history_append(replaced) if replaced else False
             if not quiet:
                 print(f"[upsert] {tier}/{scope} source={source} → {existing}")
+                if kept:
+                    print(f"[history] previous body kept; undo: mem history {existing} --restore 1")
             if journal_action and not journal_insert_only:
                 _append_write_event(journal_action, existing, tier=tier, scope=scope,
                                      rtype=rtype, actor=journal_actor,
@@ -4116,6 +4207,67 @@ def restore(rid):
         return True
     finally:
         con.close()
+
+
+def history_command(rid, show=None, restore_index=None):
+    """List, show, or bring back bodies a source-keyed overwrite replaced.
+
+    Entries are numbered newest first.  Bringing one back is itself a source
+    overwrite, so the body it displaces is kept too and the change can be
+    undone the same way.  Only global records and the current project's own
+    records are visible.
+    """
+    pkey = project_key(Path.cwd())
+    entries = [e for e in reversed(_source_history_entries(rid))
+               if e.get("scope") == "global" or e.get("cwd_origin") == pkey]
+    if show is None and restore_index is None:
+        if not entries:
+            print(f"[history] no previous body kept for {rid}")
+            return 0
+        head = entries[0]
+        print(f"[history] {rid} source={head.get('source')} — "
+              f"{len(entries)} previous bod{'y' if len(entries) == 1 else 'ies'}, newest first")
+        for n, entry in enumerate(entries, 1):
+            first = _first_line(entry.get("prev_body") or "")[:60]
+            print(f"  {n}. replaced {entry.get('replaced_at')} "
+                  f"(written {entry.get('prev_updated')}, by {entry.get('actor')}, "
+                  f"{len(entry.get('prev_body') or '')} chars): {first}")
+        print(f"show one: mem history {rid} --show N   bring one back: "
+              f"mem history {rid} --restore N")
+        return 0
+    index = show if show is not None else restore_index
+    if index < 1 or index > len(entries):
+        print(f"[history] no entry {index} for {rid}")
+        return 1
+    entry = entries[index - 1]
+    if show is not None:
+        print(f"[history] {rid} entry {index} replaced {entry.get('replaced_at')}")
+        print(entry.get("prev_body") or "")
+        return 0
+    con = get_con()
+    try:
+        live = find_by_source(entry["tier"], entry["scope"], entry["type"],
+                              entry["source"], entry["cwd_origin"], con)
+        pending = None
+        if live == rid:
+            pending = con.execute(
+                "SELECT delivery_state FROM records WHERE id=?", (rid,)).fetchone()
+    finally:
+        con.close()
+    if live != rid:
+        print(f"[history] {rid} is not the active record for source "
+              f"{entry.get('source')}; nothing restored")
+        return 1
+    done = write_record(
+        entry["tier"], entry["scope"], entry["type"], entry["prev_body"],
+        cwd_origin=entry["cwd_origin"], tags=entry.get("prev_tags"),
+        links=entry.get("prev_links"), source=entry["source"],
+        requires_consume=bool(pending and pending[0] == "pending"),
+        journal_action="update", headline=entry.get("prev_headline"))
+    if done is None:
+        return 1
+    print(f"[history] restored entry {index} of {rid}")
+    return 0
 
 
 def _in_current_project(con, rid, pkey=None):
@@ -8838,6 +8990,15 @@ def main():
     rs = sub.add_parser("restore", help="Restore the latest graveyard entry for one record")
     rs.add_argument("id")
 
+    hy = sub.add_parser(
+        "history",
+        help="List, show, or bring back bodies a source-keyed overwrite replaced")
+    hy.add_argument("id")
+    hy_act = hy.add_mutually_exclusive_group()
+    hy_act.add_argument("--show", type=int, metavar="N", help="Print entry N (newest first)")
+    hy_act.add_argument("--restore", type=int, metavar="N", dest="restore_index",
+                        help="Bring entry N back; the body it displaces is kept too")
+
     ix = sub.add_parser("index", help="Build the FTS5 index")
     ix.add_argument("--rebuild", action="store_true")
 
@@ -9007,6 +9168,8 @@ def main():
         sys.exit(migration_command(args))
     elif args.cmd == "restore":
         sys.exit(0 if restore(args.id) else 1)
+    elif args.cmd == "history":
+        sys.exit(history_command(args.id, show=args.show, restore_index=args.restore_index))
     elif args.cmd == "index":
         index_build(rebuild=args.rebuild)
     elif args.cmd == "project":
