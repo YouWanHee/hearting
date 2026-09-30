@@ -128,7 +128,6 @@ def is_worker_session() -> bool:
         or bool(os.environ.get("AGENT_DISPATCH_DEPTH"))
         or bool(os.environ.get("OPENCODE_DISPATCH_SLUG"))
         or os.environ.get("FLEET_TITLE_REFRESH") == "1"
-        or os.environ.get("MEM_DISTILL") == "1"
     )
 
 

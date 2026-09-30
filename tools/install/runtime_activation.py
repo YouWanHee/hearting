@@ -37,6 +37,7 @@ import harness_manifest
 import dispatch_contract
 import model_config
 import projector
+import retired_memory_state
 import safe_fs
 import user_model_config
 
@@ -2610,6 +2611,7 @@ def activate(
         protected_paths=_activation_protected_paths(runtime, scope),
         commit_callback=commit_state,
     )
+    retired_memory_state.retire()  # distiller-era state files, once; silent
     return status(runtime, scope)
 
 

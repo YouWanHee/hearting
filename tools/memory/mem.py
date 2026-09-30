@@ -636,24 +636,6 @@ def norm_body(body):
     return re.sub(r"[\s\W_]+", " ", body.lower()).strip()
 
 
-def _distill_state_path(sid):
-    return STORE / f".distill-state-{sid}"
-
-
-def read_marker(sid):
-    """Read the last processed session-distillation UUID."""
-    p = _distill_state_path(sid)
-    if not p.exists():
-        return ""
-    return p.read_text(encoding="utf-8").strip()
-
-
-def advance_marker(sid, last_uuid):
-    """Advance the marker to ``last_uuid``."""
-    STORE.mkdir(parents=True, exist_ok=True)
-    _distill_state_path(sid).write_text(last_uuid + "\n", encoding="utf-8")
-
-
 # ---------- frontmatter for migration input and projection output ----------
 def parse_record(text):
     if not text.startswith("---"):
@@ -3348,22 +3330,6 @@ class OpenCodeExportSource:
 
 
 # Other runtime adapters need only implement the same ``messages()`` interface.
-
-
-def ingest_session(source):
-    """Yield normalized messages strictly after the shared marker.
-
-    Yield all messages when no marker exists, and none when a recorded marker is
-    absent from the source to avoid conservative re-duplication.
-    """
-    after = read_marker(source.sid)
-    started = not after
-    for msg in source.messages():
-        if not started:
-            if msg.uuid == after:
-                started = True
-            continue
-        yield msg
 
 
 # ---------- export / import ----------

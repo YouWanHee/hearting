@@ -63,8 +63,7 @@ is_worker_session() {
     || [ "${AGENT_DISPATCH_CHILD:-}" = "1" ] \
     || [ -n "${AGENT_DISPATCH_DEPTH:-}" ] \
     || [ -n "${OPENCODE_DISPATCH_SLUG:-}" ] \
-    || [ "${FLEET_TITLE_REFRESH:-}" = "1" ] \
-    || [ "${MEM_DISTILL:-}" = "1" ]
+    || [ "${FLEET_TITLE_REFRESH:-}" = "1" ]
 }
 
 opencode_config_content_has_opencode_skills() {

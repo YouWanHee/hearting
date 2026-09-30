@@ -67,8 +67,7 @@ function isWorkerSession() {
     process.env.AGENT_DISPATCH_CHILD === "1" ||
     Boolean(process.env.AGENT_DISPATCH_DEPTH) ||
     Boolean(process.env.OPENCODE_DISPATCH_SLUG) ||
-    process.env.FLEET_TITLE_REFRESH === "1" ||
-    process.env.MEM_DISTILL === "1"
+    process.env.FLEET_TITLE_REFRESH === "1"
   )
 }
 

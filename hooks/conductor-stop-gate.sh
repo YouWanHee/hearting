@@ -22,7 +22,6 @@
 #     - AGENT_DISPATCH_SELF_SLUG set (from dispatch-headless.py, needed to match
 #       open children whose parent= equals my own slug)
 #     - stop_hook_active is NOT already true (loop guard — never infinite-block)
-#   Recursion guard: MEM_DISTILL=1 → drain stdin, exit 0.
 #
 #   Logic:
 #     1. Resolve jobs.log via agent-home.sh (same registry as the wrapper /
@@ -52,8 +51,6 @@ canonical_jobs() {
     printf '%s/jobs.log\n' "$root"
   fi
 }
-
-[ "${MEM_DISTILL:-}" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
 
 # Emit a Stop-hook block decision. Claude Stop hook schema: {"decision":"block",
 # "reason":"..."} keeps the turn open and feeds `reason` back to the model.
