@@ -956,6 +956,7 @@ def main(argv):
                 if values["--worker-type"] == "frame":
                     from artifact_producer import prepare_route_artifact_env, ProducerError
                     try:
+                        child_env.pop("AGENT_ARTIFACT_PARENT_OUTPUT_DIR", None)  # SD-163: no stale source
                         child_env.update(prepare_route_artifact_env(
                             Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
                     except ProducerError as exc:
@@ -980,6 +981,7 @@ def main(argv):
             if values["--worker-type"] == "owner":
                 from artifact_producer import prepare_route_artifact_env, ProducerError
                 try:
+                    child_env.pop("AGENT_ARTIFACT_PARENT_OUTPUT_DIR", None)  # SD-163: no stale source
                     child_env.update(prepare_route_artifact_env(
                         Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
                 except ProducerError as exc:

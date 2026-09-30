@@ -946,6 +946,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None):
             # route's own open cycle; the caller's environment is not that cycle.
             try:
                 from artifact_producer import ProducerError, prepare_route_artifact_env
+                env.pop('AGENT_ARTIFACT_PARENT_OUTPUT_DIR', None)  # SD-163: no stale source
                 env.update(prepare_route_artifact_env(Path(record['route_file']), start=False,
                                                       jobs=Path(jobs)))
             except (ProducerError, OSError, ValueError):

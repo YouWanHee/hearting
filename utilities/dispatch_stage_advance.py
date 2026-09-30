@@ -403,8 +403,8 @@ def _has_partial_dependency(route: dict, completed: FrozenSet[str], started: Fro
 
 def render_stage_brief(route: dict, node: dict) -> tuple:
     """`stage_brief_template_v1` — reads ONLY route capability/mode/intensity
-    and the node's unit/inputs/outputs/write_scope/completion_gate. Never
-    creative prose. Returns (text, digest)."""
+    and the node's unit/inputs/input_sources/outputs/write_scope/completion_gate.
+    Never creative prose. Returns (text, digest)."""
 
     template = (
         "capability: {capability}\n"
@@ -425,6 +425,10 @@ def render_stage_brief(route: dict, node: dict) -> tuple:
         write_scope=",".join(node.get("write_scope") or []),
         completion_gate=node.get("completion_gate"),
     )
+    sources = node.get("input_sources")
+    if isinstance(sources, dict) and sources:  # SD-163: only when inputs were filled from a prior cycle
+        template += "input_sources: " + ",".join(
+            f"{name}={sources[name].get('path')}" for name in node.get("inputs") or [] if name in sources) + "\n"
     digest = "sha256:" + hashlib.sha256(
         (BRIEF_TEMPLATE_ID + "\n" + template).encode("utf-8")
     ).hexdigest()
