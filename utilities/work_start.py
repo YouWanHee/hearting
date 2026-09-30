@@ -456,9 +456,9 @@ def _capacity_pause(result, attention, resume):
     waiting = {**result, "state": "waiting-capacity", "reason": "owner-capacity-wait",
                "required_action": "resume-after-capacity", "harness": attention.get("harness", ""),
                "source_attempt_id": attention.get("source_attempt_id", ""),
-               "next_step": "The owner stopped at a usage limit; nothing failed and nothing was started. "
-                   "After retry_at run resume_command once from the session that owns the route; it starts "
-                   "the replacement owner and keeps completed stages."}
+               "next_step": "The harness is at a usage limit; nothing failed and nothing was started. "
+                   "After retry_at run resume_command once from the session that owns the route; "
+                   "completed stages are kept."}
     if attention.get("retry_at"):
         waiting["retry_at"] = attention["retry_at"]
     if attention.get("usage_state"):

@@ -416,6 +416,15 @@ def _is_capacity_record(record):
     return 'after_capacity' in ((record or {}).get('logical_node') or {})
 
 
+def _replacement_in_flight(jobs, rows, source):
+    """Has this source's replacement already launched and is it still running or done well?"""
+    binding = source_binding(jobs, source)
+    row = rows.get(binding[1]) if binding and binding[1] else None
+    if not row or row[1].get('launch_claimed') != '1':
+        return False
+    return row[0][1] in {'open','running'} or DC.verdict_pass(row[1])
+
+
 def _in_capacity_family(jobs, meta):
     """Is this replacement row the launch of a capacity family (a pause, not a budget)?"""
     family = meta.get('replacement_family_id')
@@ -1073,7 +1082,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
     if kind is None:
         parked = owner_parked_gate(jobs, aid) if source.get('note') == 'dead-worker-blocked' else None
         return {'state': 'not-applicable', 'parked_gate': parked} if parked else {'state':'not-applicable'}
-    if kind == 'capacity' and not resume_capacity:
+    if kind == 'capacity' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return _capacity_wait(jobs, aid, source)
     try:
         if authority_check is None:

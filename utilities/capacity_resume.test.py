@@ -356,6 +356,13 @@ class CapacityResumeTest(unittest.TestCase):
         # (b) one start does
         self.assertEqual(self.start()["state"], "running")
         first = self.replacement_id()
+        # the launched replacement is left alone by automatic ticks: no attention, no new launch
+        launched = len(self.calls)
+        effective, lineage, attention = R.advance_batch(
+            self.jobs, {"att-owner"}, authority_check=lambda *_: True, run=self.launcher)
+        self.assertEqual(attention, [])
+        self.assertEqual(len(lineage), 1)
+        self.assertEqual(len(self.calls), launched)
         # (c) the replacement stops at a limit as well: waits while limited, then resumes as a new family
         self.set_status(first, "done", note="dead-capacity", failure_class="capacity", launch_claimed="1")
         self.set_limit(first, LIMITED)
