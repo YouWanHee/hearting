@@ -6685,7 +6685,7 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     Returns the closure facts the caller seals on the row. Checks, in order:
     the node is a review node and the row a review worker; no review round of
     the node is still open/running and the terminated rounds exhaust the
-    budget; the node has no canonical marker from another attempt; the exact
+    budget; the node has no current canonical marker from another attempt; the exact
     attempt log still proves a FAIL handoff with a readable in-root review
     artifact; the evidence is a registry-safe, in-root `*.owner-closure.md`
     distinct from that artifact with the closure frontmatter; and its body
@@ -6730,9 +6730,16 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
             existing=json.loads(canonical.read_text(encoding="utf-8"))
         except (OSError,ValueError):
             refuse("node-already-complete","canonical-marker-unreadable")
-        if existing.get("attempt_id")!=own:
-            # SD-70: one node, one exact attempt. A second closure would
-            # overwrite the canonical marker and leave two rows claiming it.
+        # SD-70: one node, one exact attempt. A second closure would
+        # overwrite the canonical marker and leave two rows claiming it. A
+        # marker the reader fence already treats as not current (a later row
+        # for the node was recorded, e.g. a correction added a review round)
+        # claims nothing, so closing the latest round may replace it. Inline,
+        # resource and continuation markers are never fenced by readers, so
+        # they stay current here and still refuse.
+        superseded=(_registered_marker_fence(route,node,existing,lines)=="completion-attempt-not-current"
+                    and _registered_marker_fence(route,node,{"attempt_id":own},lines) is None)
+        if existing.get("attempt_id")!=own and not superseded:
             refuse("node-already-complete",f"attempt={existing.get('attempt_id') or '-'}")
     terminal=inspect_terminal_attempt(
         row_metadata.get("log_file"),
