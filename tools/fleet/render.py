@@ -40,6 +40,7 @@ import time
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
+from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump
 from .session_handle import display_name as _display_name
 from .session_handle import _cell_width as _session_handle_cell_width
@@ -3417,6 +3418,8 @@ def _visible_group_jobs(jobs, show_sessions, show_jobs):
 
 def _group_activity_rank(g):
     members_live = [s.liveness for s in g["sessions"]] + [j.liveness for j in g["jobs"]]
+    if g.get("gpu"):
+        members_live.append("working")
     if "working" in members_live:
         return 0
     elif "idle" in members_live:
@@ -4613,14 +4616,25 @@ def _gpu_process_rows(gpu, indent, width):
     return rows
 
 
+def _fresh_compute_hosts():
+    """`(snapshot, age_s)` of the cached host sample, or `(None, None)` once stale.
+
+    The refresh pump retains its last good host sample during a stall.
+    That sample no longer proves the process is still running.
+    """
+    if _COMPUTE_HOSTS is None or _COMPUTE_HOSTS_SET_AT is None:
+        return None, None
+    age = time.monotonic() - _COMPUTE_HOSTS_SET_AT
+    if age > 3 * _COMPUTE_HOST_INTERVAL:
+        return None, None
+    return _COMPUTE_HOSTS, max(0.0, age)
+
+
 def _gpu_session_resources(snapshot=None):
     """Exact full-session-id GPU relations, normalized once for every Fleet view."""
     if snapshot is None:
-        snapshot = _COMPUTE_HOSTS
-        # The refresh pump retains its last good host sample during a stall.
-        # That sample no longer proves the process is still running.
-        if (_COMPUTE_HOSTS_SET_AT is None or
-                time.monotonic() - _COMPUTE_HOSTS_SET_AT > 3 * _COMPUTE_HOST_INTERVAL):
+        snapshot, _age = _fresh_compute_hosts()
+        if snapshot is None:
             return {}
     if not isinstance(snapshot, dict):
         return {}
@@ -4729,6 +4743,40 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
     if sum(_dw(text) for text, _key in build(resources, False, False)) <= width:
         return [fit(resources)]
     return [fit([resource]) for resource in resources]
+
+
+_GPU_WORK_NAME_W = 48
+
+
+def _gpu_work_row(entry, term_width=None):
+    """F-104 card row for a live GPU process no run registry or session line shows."""
+    indent = _conn_indent(0, False)
+    width = max(20, int(term_width or 200))
+    command = _gpu_safe_text(entry.get("command"))
+    if command:
+        name = _gpu_process_label(command)
+    else:
+        name = os.path.basename(_gpu_safe_text(entry.get("process_name"))) or "process"
+    name = _clip_w(name, _GPU_WORK_NAME_W)
+    indexes = ",".join(str(i) for i in entry.get("gpu_indexes") or ())
+    identity = "GPU %s:%s" % (_gpu_safe_text(entry.get("host") or "?"), indexes)
+    elapsed = entry.get("elapsed_s")
+    tag = _gpu_safe_text(entry.get("owner_label")) or "미등록"
+
+    def build(show_time, show_tag):
+        pulse_key = "g_work" if _BLINK_ON else "g_work_off"
+        segs = [(indent, None), ("●", pulse_key), (" ", None), (identity, "name_dim"),
+                (" · ", "dim"), (name, "name_dim")]
+        if entry.get("used_memory_mib") is not None:
+            segs += [(" · " + _gpu_gib(entry["used_memory_mib"]) + " GB", "dim")]
+        if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
+            segs += [(" · " + fmt_min(elapsed // 60), "dim")]
+        if show_tag:
+            segs += [(" · ", "dim"), (tag, "lvl_y")]
+        return segs
+
+    return _fit_strip([lambda: build(True, True), lambda: build(True, False),
+                       lambda: build(False, False)], width)
 
 
 def _gpu_process_label(command):
@@ -5895,7 +5943,23 @@ def _resource_rows(resources, section):
     return rows
 
 
-def _group_emission(g, show_sessions, show_jobs):
+def _shown_group_sessions(group_sessions):
+    return (group_sessions if _SHOW_ALL else
+            [s for s in group_sessions if session_parent_visible(s)])
+
+
+def _gpu_strip_keys(shown, gpu_resources):
+    """Sessions whose F-88 GPU strip is actually drawn (F-104 dedup source)."""
+    keys = set()
+    for s in shown:
+        if getattr(s, "mem_worker", False):
+            continue  # a mem row is drawn by _mem_row alone, without a GPU strip
+        if _gpu_resources_for_session(s, gpu_resources):
+            keys.add((s.harness, s.session_id or getattr(s, "_runtime_session_id", None)))
+    return keys
+
+
+def _group_emission(g, show_sessions, show_jobs, gpu_resources=None):
     """Single source of truth for the session rows that the group loop emits.
 
     The earlier visible_order calculation is a conservative card-anchor approximation;
@@ -5906,19 +5970,25 @@ def _group_emission(g, show_sessions, show_jobs):
     if not _SHOW_ALL:
         group_jobs = [j for j in group_jobs
                       if j.liveness != "dead" or getattr(j, "_dead_terminal_owner", False)]
-    empty = not group_sessions and not group_jobs
+    gpu = g.get("gpu") or []
+    empty = not group_sessions and not group_jobs and not gpu
     if empty:
         return {"group_sessions": group_sessions, "group_jobs": group_jobs,
-                "empty": True, "fold": False, "shown": [], "hidden": 0}
+                "empty": True, "fold": False, "shown": [], "hidden": 0,
+                "gpu": [], "gpu_strip_keys": set()}
     live_sessions = [s for s in group_sessions
                      if s.liveness not in ("stale", "dead") and not s.app_server]
     must_show_jobs = any(not getattr(j, "afterglow", False) for j in group_jobs)
-    fold = (not _SHOW_ALL) and (not live_sessions) and (not must_show_jobs)
-    shown = (group_sessions if _SHOW_ALL else
-             [s for s in group_sessions if session_parent_visible(s)])
+    shown = _shown_group_sessions(group_sessions)
+    strip_keys = _gpu_strip_keys(shown, gpu_resources or {})
+    # GPU work is live work: a card holding a GPU row or a drawn session GPU
+    # strip is never folded away.
+    fold = ((not _SHOW_ALL) and (not live_sessions) and (not must_show_jobs)
+            and (not gpu) and (not strip_keys))
     return {"group_sessions": group_sessions, "group_jobs": group_jobs,
             "empty": False, "fold": fold, "shown": shown,
-            "hidden": len(group_sessions) - len(shown)}
+            "hidden": len(group_sessions) - len(shown),
+            "gpu": gpu, "gpu_strip_keys": strip_keys}
 
 
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
@@ -6091,6 +6161,22 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     show_sessions = section in ("fleet", "both")
     show_jobs = section in ("dispatch", "both")
 
+    # F-104: live GPU processes neither a registered run nor a drawn session GPU
+    # strip shows land on their cwd's project card (same rule as LAB RESOURCES).
+    gpu_work = {}
+    if show_jobs:
+        strip_keys = set()
+        if show_sessions:
+            for g in groups.values():
+                strip_keys |= _gpu_strip_keys(
+                    _shown_group_sessions(g["sessions"]), gpu_resources)
+        snapshot, age_s = _fresh_compute_hosts()
+        for entry in _compute_hosts.unregistered_gpu(
+                snapshot, resources or (), strip_keys, age_s or 0.0):
+            gpu_work.setdefault(entry["project"], []).append(entry)
+    for gk, entries in gpu_work.items():
+        groups.setdefault(gk, {"sessions": [], "jobs": []})["gpu"] = entries
+
     order = sorted(groups.keys(), key=lambda name: (
         0 if name == _SYSTEM_GROUP else 1, _group_sort_key(name, groups[name])))
 
@@ -6104,11 +6190,14 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             group_jobs = _visible_group_jobs(g["jobs"], show_sessions, show_jobs)
             if not _SHOW_ALL:
                 group_jobs = [j for j in group_jobs if j.liveness != "dead"]
-            if not group_sessions and not group_jobs:
+            group_gpu = g.get("gpu") or []
+            if not group_sessions and not group_jobs and not group_gpu:
                 continue
             live_sessions = [s for s in group_sessions
                              if s.liveness not in ("stale", "dead") and not s.app_server]
-            if (not _SHOW_ALL) and not live_sessions and not group_jobs:
+            if ((not _SHOW_ALL) and not live_sessions and not group_jobs and not group_gpu
+                    and not _gpu_strip_keys(_shown_group_sessions(group_sessions),
+                                            gpu_resources)):
                 continue
             visible_order.append(name)
         # Reconcile only card anchors, but retain folded/empty groups in the
@@ -6120,8 +6209,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         visible_tiers = {name: _group_activity_rank(groups[name]) for name in visible_order}
         order = live_order.reconcile_groups(visible_order, visible_tiers) + non_card_order
 
-    emission_by_group = {name: _group_emission(groups[name], show_sessions, show_jobs)
-                         for name in order}
+    emission_by_group = {
+        name: _group_emission(groups[name], show_sessions, show_jobs, gpu_resources)
+        for name in order}
     tag_by_key = {}
     for emission in emission_by_group.values():
         for s in emission["shown"]:
@@ -6346,7 +6436,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # The section title has no indicator glyph; the title itself carries active state.
         # while the group works, plain bold otherwise. Doubles with the active card tint.
         n_work = sum(1 for s in live_sessions if s.liveness == "working") + \
-                 sum(1 for j in group_jobs if j.liveness == "working")
+                 sum(1 for j in group_jobs if j.liveness == "working") + \
+                 len(emission["gpu"])
         # cooling (round-6, user 2026-07-03): no active work, but the newest session transcript
         # A write within the cooling window indicates a directory that just finished.
         # state between hot (green ●) and cold (no glyph): a grey ring + time-since-done, so a
@@ -6730,6 +6821,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # is preserved exactly as the confirmed edge, not re-derived as project-level loss.
         for gj in _sort_group_jobs(grace_jobs):
             _emit_dispatch_tree(gj, orphan=False)
+
+        # F-104: live GPU work that no registry run or session GPU strip shows.
+        for entry in emission["gpu"]:
+            lines.append(_gpu_work_row(entry, term_width))
 
         # F-19 repo rows (사용자 확정 2026-07-16): this card's own today-mem events, below a
         # subtle in-band divider — entirely silent when the repo has none (healthy-silent,

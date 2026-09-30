@@ -636,7 +636,7 @@ def proc_stat(pid):
         raw = Path("/proc") / str(pid) / "stat"
         text = raw.read_text(encoding="utf-8", errors="replace")
         rest = text[text.rfind(")") + 2:].split()
-        return {"ppid": int(rest[1]), "start": int(rest[19])}
+        return {"ppid": int(rest[1]), "pgid": int(rest[2]), "start": int(rest[19])}
     except (OSError, ValueError, IndexError):
         return None
 
@@ -799,6 +799,45 @@ def process_command(pid, expected_start, process_name):
     if (after is None or after["start"] != expected_start or not same_euid(pid)):
         return fallback
     return command_text(raw.split(b"\0")) or fallback
+
+
+CWD_BYTES_MAX = 4096
+
+
+def process_cwd(pid, expected_start):
+    # F-104: cwd only places a card; it is never ownership evidence.
+    before = proc_stat(pid)
+    if (before is None or before["start"] != expected_start or not same_euid(pid)):
+        return None
+    try:
+        target = os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        return None
+    after = proc_stat(pid)
+    if after is None or after["start"] != expected_start:
+        return None
+    if target.endswith(" (deleted)"):
+        target = target[:-len(" (deleted)")]
+    if (not target.startswith("/") or len(target.encode("utf-8", "replace")) > CWD_BYTES_MAX
+            or any(ord(char) < 32 or ord(char) == 127 for char in target)):
+        return None
+    return target
+
+
+def process_elapsed_s(start_ticks, uptime):
+    # Host-local: uptime and clock ticks come from the same machine as the process.
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+        return max(0, int(uptime - start_ticks / hz))
+    except (OSError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def host_uptime_s():
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 ENV_KEYS = {
@@ -1035,6 +1074,7 @@ process_rows, process_error = smi("--query-compute-apps=gpu_uuid,pid,process_nam
 if process_rows is None:
     payload["process_error"] = process_error
 else:
+    uptime = host_uptime_s()
     for row in process_rows:
         if len(row) != 4:
             continue
@@ -1055,6 +1095,10 @@ else:
             "command": process_command(pid, stat["start"], process_name)
             if stat is not None else command_text([process_name]),
             "owner": owner, "attribution_reason": reason,
+            "pgid": stat["pgid"] if stat is not None else None,
+            "cwd": process_cwd(pid, stat["start"]) if stat is not None else None,
+            "elapsed_s": process_elapsed_s(stat["start"], uptime)
+            if stat is not None and uptime is not None else None,
         }
         if session_owner is not None:
             process["session_owner"] = session_owner

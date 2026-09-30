@@ -145,6 +145,10 @@ def _snapshot_json(sessions, jobs, resource_jobs=None, usage=None, disabled=None
         out["hearting"] = dict(hearting)
     if compute_host_snapshot is not None:
         out["compute_hosts"] = compute_host_snapshot
+        # F-104: live GPU processes no registered run owns; session_owner tells
+        # a consumer which of them a session line also shows.
+        out["unregistered_gpu"] = compute_hosts.unregistered_gpu(
+            compute_host_snapshot, resource_jobs)
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
