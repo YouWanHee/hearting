@@ -87,6 +87,51 @@ class LedgerPathTest(EnvTmpTestCase):
         self.assertEqual(path, os.path.join(self.chains_dir, "claude", "sess-a.1.jsonl"))
 
 
+class WriterIdentityTest(EnvTmpTestCase):
+    def test_depth_zero_single_native_session_is_the_anchor(self):
+        self.assertEqual(route_chain.writer_identity({"CLAUDE_CODE_SESSION_ID": "sess-a"}),
+                         ("claude", "sess-a"))
+        self.assertEqual(route_chain.writer_identity(
+            {"CODEX_THREAD_ID": "thr-1", "AGENT_DISPATCH_DEPTH": "0"}), ("codex", "thr-1"))
+
+    def test_workers_ambiguity_and_unsafe_ids_have_no_anchor(self):
+        self.assertIsNone(route_chain.writer_identity(
+            {"CLAUDE_CODE_SESSION_ID": "sess-a", "AGENT_DISPATCH_DEPTH": "1"}))
+        self.assertIsNone(route_chain.writer_identity(
+            {"CLAUDE_CODE_SESSION_ID": "sess-a", "OPENCODE_SESSION_ID": "oc-1"}))
+        self.assertEqual(route_chain.writer_identity(
+            {"CLAUDE_CODE_SESSION_ID": "sess-a", "OPENCODE_SESSION_ID": "oc-1",
+             "AGENT_DISPATCH_CALLER_HARNESS": "opencode"}), ("opencode", "oc-1"))
+        self.assertIsNone(route_chain.writer_identity({"CLAUDE_CODE_SESSION_ID": "../escape"}))
+        self.assertIsNone(route_chain.writer_identity({}))
+
+
+class ComposingAnchorTest(EnvTmpTestCase):
+    ROUTE = {"route_id": "rt-" + "a" * 32, "artifact_root": "/x", "campaign_key": "k"}
+
+    def put(self, session_id, event, route=None):
+        line = route_chain.build_line(route or self.ROUTE, event=event, harness="claude",
+                                      session_id=session_id, route_file="/x/r.json")
+        self.assertTrue(route_chain.append("claude", session_id, line))
+
+    def test_the_composing_ledger_names_the_anchor_for_any_asking_process(self):
+        self.put("sess-a", "compose")
+        for env in ({"CLAUDE_CODE_SESSION_ID": "sess-a"},
+                    {"CLAUDE_CODE_SESSION_ID": "worker-d", "AGENT_DISPATCH_DEPTH": "1"}, {}):
+            self.assertEqual(route_chain.composing_anchor(self.ROUTE["route_id"], env), ("claude", "sess-a"))
+
+    def test_start_only_unknown_and_contested_routes_have_no_anchor(self):
+        self.put("sess-a", "start")
+        self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}))
+        self.assertIsNone(route_chain.composing_anchor("rt-" + "b" * 32, {}))
+        self.assertIsNone(route_chain.composing_anchor(None, {}))
+        self.put("sess-a", "compose")
+        self.put("sess-b", "compose")
+        self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}))
+        self.assertEqual(route_chain.composing_anchor(
+            self.ROUTE["route_id"], {"CLAUDE_CODE_SESSION_ID": "sess-b"}), ("claude", "sess-b"))
+
+
 class BuildLineTest(EnvTmpTestCase):
     def _route(self, **overrides):
         base = {

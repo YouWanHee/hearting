@@ -80,6 +80,7 @@ Runtime-specific details stay out of portable capability meaning:
 | `draft-refine` | sub | - | [`draft-refine.md`](draft-refine.md) | Refine a draft by applying memo/review feedback to a document strategy or draft. | `adapters/claude/skills/draft-refine/SKILL.md` | `adapters/codex/skills/draft-refine/SKILL.md` | `adapters/opencode/skills/draft-refine/SKILL.md`; `adapters/opencode/commands/draft-refine.md` |
 | `draft-strategy` | sub | rebuttal, paper, review, report, proposal, presentation | [`draft-strategy.md`](draft-strategy.md) | Create an initial document strategy and evidence-based writing plan. | `adapters/claude/skills/draft-strategy/SKILL.md` | `adapters/codex/skills/draft-strategy/SKILL.md` | `adapters/opencode/skills/draft-strategy/SKILL.md`; `adapters/opencode/commands/draft-strategy.md` |
 | `post-it` | ops | - | [`post-it.md`](post-it.md) | Store project/cross-project notes and handoffs in working memory. | `adapters/claude/skills/post-it/SKILL.md` | `adapters/codex/skills/post-it/SKILL.md` | `adapters/opencode/skills/post-it/SKILL.md`; `adapters/opencode/commands/post-it.md` |
+| `route-frame` | sub | - | [`route-frame.md`](route-frame.md) | Compiler-internal framed front end: two top-tier frame legs and a model-less runtime terminal that fixes the route decision. | compiler-internal: none | compiler-internal: none | compiler-internal: none |
 
 ## Adapter Requirements
 

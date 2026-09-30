@@ -11,9 +11,35 @@
   "autopilot-refine": "sha256:f97b337937dd64cb49ba675b9e19bda3a05077e9389a73e4ad99ffed91f46729",
   "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
   "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",
-  "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb"
+  "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb",
+  "route-frame": "sha256:00b90489f7ac06edb802424cbccb44a60f5c12fc01813e150c0bdbd9f85b1979"
  },
  "scenarios": {
+  "framed:route-frame": {
+   "briefs": {
+    "frame": "sha256:9dcc93c08de8e51b989f615e1ea4b6dac4dc4535259a51f1267c50ee2473d7a6",
+    "frame-alternative": "sha256:6a5b0d7a959fe4c56127d1fe4f664ae237a6f3312b44fbcfbd10b57c6e635020"
+   },
+   "card": "[경로] route-frame · framed(standard) frame→frame-alternative→route-decision · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 2개: sd165-lab, sd165-code\n  frame이 방향과 경로를 조립해 제안합니다\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회",
+   "completion_gates": "31917371286f7b7174f7",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "750d5eab8cf92fa0eaca",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "route-decision"
+   ],
+   "nodes": {
+    "frame": "3342eaff881322f19bb0",
+    "frame-alternative": "42ab22c3d7f8ee3eb199",
+    "route-decision": "118b078f8655b56d1102"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "487935e3cb1809a682f9",
+   "workflow_contract": "06d32468156759abf3e8"
+  },
   "full:analyze-project:code": {
    "briefs": {
     "analyze": "sha256:f90361c0ad894333e324d02b4dc62cef5fc65c099b9c7e090cd97a62a0bef77b",
@@ -143,8 +169,8 @@
    ],
    "nodes": {
     "execute": "62bee46ff60e1439a352",
-    "frame": "eb0afadadf36386a30ca",
-    "frame-alternative": "ab297bd924d81c5d2ece",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
     "impl-review": "67159d8c3d1024937397",
     "plan": "16ecd56ef296d3a01a58",
     "plan-check": "1af0490d85bdae3c5139",
@@ -186,8 +212,8 @@
    "nodes": {
     "build": "c5090fd1c60edd227efb",
     "critic-review": "c5127078b910c3e4f26b",
-    "frame": "44f3d4faa04d4e844294",
-    "frame-alternative": "bb0bceca20cf5d00ee3d",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
     "handoff": "d43048210014552287c5",
     "refs": "646330cf1023f9a6177d",
     "refs-alternative": "f644e4997492b717feb4",
@@ -231,8 +257,8 @@
     "draft-production": "6257dbf84f6acc53acb2",
     "fact-verify": "939c42edaf963a217389",
     "finalize": "cfb9ce42387a6051c148",
-    "frame": "034ab0491b4e8845c041",
-    "frame-alternative": "17b4357668464496eba0",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
     "material-strategy": "b057ce3a9d574d0237d6",
     "material-strategy-alternative": "5f8711c08f9e62852876",
     "quality-review": "d1a05306ede30ea58a78",
@@ -335,8 +361,8 @@
     "transaction"
    ],
    "nodes": {
-    "frame": "44cb7fe5a35045e7f7f6",
-    "frame-alternative": "43f7a39b19d687c4aea0",
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
     "review": "fbfd888a48cf35110d6c",
     "transaction": "d6732a9044ff372d85b5"
    },
@@ -456,8 +482,8 @@
     "prd-transaction"
    ],
    "nodes": {
-    "frame": "c3c468b0b048674c0411",
-    "frame-alternative": "79996897dd0b07532a5f",
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
     "prd-transaction": "1bf3bc9546a9752b719c",
     "research": "dc092f1e003d2a3eab66",
     "research-alternative": "11aacc87b246af85b232",
@@ -982,8 +1008,8 @@
    ],
    "nodes": {
     "execute": "de546b5b6db75e89abd5",
-    "frame": "eb0afadadf36386a30ca",
-    "frame-alternative": "ab297bd924d81c5d2ece",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
     "impl-review": "fe09366a6dd009208672",
     "plan": "3be56b34984cc1e4cd55",
     "plan-check": "f89cf48792bf2e3daf2d",
@@ -1029,8 +1055,8 @@
    ],
    "nodes": {
     "execute": "17d2fa0ad8f38ff24143",
-    "frame": "eb0afadadf36386a30ca",
-    "frame-alternative": "ab297bd924d81c5d2ece",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
     "impl-review": "a5e2fd0fec3f6256ade2",
     "impl-review-alternative": "e41ce04d72b6837ba8bb",
     "plan": "389f4f1181e84367abbc",
@@ -1085,8 +1111,8 @@
    ],
    "nodes": {
     "execute": "380a4a81eaf18c71167e",
-    "frame": "eb0afadadf36386a30ca",
-    "frame-alternative": "ab297bd924d81c5d2ece",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
     "impl-review": "b332734ae04c33825e18",
     "impl-review-alternative": "b4b8689c9fe63379c2a8",
     "impl-review-failure-mode": "73da4288ba0735d17c33",
@@ -1133,8 +1159,8 @@
    "nodes": {
     "build": "89f360f894ab033b22bf",
     "critic-review": "4b52a2069190def77a9f",
-    "frame": "44f3d4faa04d4e844294",
-    "frame-alternative": "bb0bceca20cf5d00ee3d",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
     "handoff": "84170812dc0d8b556ead",
     "refs": "200b42bbfecb1d192ad9",
     "refs-alternative": "73e3ecb484519fccab5b",
@@ -1179,8 +1205,8 @@
     "build": "89f360f894ab033b22bf",
     "critic-review": "6faa722dbdf50f2b8769",
     "critic-review-alternative": "819f501d4d9953e24b0b",
-    "frame": "44f3d4faa04d4e844294",
-    "frame-alternative": "bb0bceca20cf5d00ee3d",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
     "handoff": "ccde71e95a073ddddf48",
     "refs": "200b42bbfecb1d192ad9",
     "refs-alternative": "73e3ecb484519fccab5b",
@@ -1226,8 +1252,8 @@
     "build": "89f360f894ab033b22bf",
     "critic-review": "6faa722dbdf50f2b8769",
     "critic-review-alternative": "819f501d4d9953e24b0b",
-    "frame": "44f3d4faa04d4e844294",
-    "frame-alternative": "bb0bceca20cf5d00ee3d",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
     "handoff": "ccde71e95a073ddddf48",
     "refs": "200b42bbfecb1d192ad9",
     "refs-alternative": "73e3ecb484519fccab5b",
@@ -1271,8 +1297,8 @@
     "draft-production": "7c407542a8483771687e",
     "fact-verify": "a3719946e63f21e9863d",
     "finalize": "0776755afd14b8d63f10",
-    "frame": "034ab0491b4e8845c041",
-    "frame-alternative": "17b4357668464496eba0",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
     "material-strategy": "82d2c9f860bda2a82c6c",
     "material-strategy-alternative": "bbc0cc7c3f798b882a69",
     "quality-review": "a621ce06ad36f29af303",
@@ -1322,8 +1348,8 @@
     "fact-verify": "39b67d5c89c92f36e6c7",
     "fact-verify-alternative": "9fafb25d72ffbafad72e",
     "finalize": "1be28cfc895a082d9043",
-    "frame": "034ab0491b4e8845c041",
-    "frame-alternative": "17b4357668464496eba0",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
     "material-strategy": "82d2c9f860bda2a82c6c",
     "material-strategy-alternative": "bbc0cc7c3f798b882a69",
     "quality-review": "bf5d7319046c4f4a71a0",
@@ -1377,8 +1403,8 @@
     "fact-verify": "39b67d5c89c92f36e6c7",
     "fact-verify-alternative": "9fafb25d72ffbafad72e",
     "finalize": "d72492c033aadfe9b3a7",
-    "frame": "034ab0491b4e8845c041",
-    "frame-alternative": "17b4357668464496eba0",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
     "material-strategy": "82d2c9f860bda2a82c6c",
     "material-strategy-alternative": "bbc0cc7c3f798b882a69",
     "quality-review": "6b0f2193a807a77ad3ec",
@@ -1639,8 +1665,8 @@
     "transaction"
    ],
    "nodes": {
-    "frame": "44cb7fe5a35045e7f7f6",
-    "frame-alternative": "43f7a39b19d687c4aea0",
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
     "review": "626bc93d343ee593237a",
     "transaction": "d6732a9044ff372d85b5"
    },
@@ -1670,8 +1696,8 @@
     "transaction"
    ],
    "nodes": {
-    "frame": "44cb7fe5a35045e7f7f6",
-    "frame-alternative": "43f7a39b19d687c4aea0",
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
     "review": "576a462c54e3767439d6",
     "review-alternative": "75853cc015ba893895ae",
     "transaction": "73b0e6d83c97548f3441"
@@ -1702,8 +1728,8 @@
     "transaction"
    ],
    "nodes": {
-    "frame": "44cb7fe5a35045e7f7f6",
-    "frame-alternative": "43f7a39b19d687c4aea0",
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
     "review": "576a462c54e3767439d6",
     "review-alternative": "75853cc015ba893895ae",
     "transaction": "73b0e6d83c97548f3441"
@@ -2009,8 +2035,8 @@
     "prd-transaction"
    ],
    "nodes": {
-    "frame": "c3c468b0b048674c0411",
-    "frame-alternative": "79996897dd0b07532a5f",
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
     "prd-transaction": "1bf3bc9546a9752b719c",
     "research": "336080f7a89c0f87ad95",
     "research-alternative": "df772cf92e4411b634d2",
@@ -2046,8 +2072,8 @@
     "prd-transaction"
    ],
    "nodes": {
-    "frame": "c3c468b0b048674c0411",
-    "frame-alternative": "79996897dd0b07532a5f",
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
     "prd-transaction": "cf40ecbd9894f4fe9344",
     "research": "336080f7a89c0f87ad95",
     "research-alternative": "df772cf92e4411b634d2",
@@ -2088,8 +2114,8 @@
     "prd-transaction"
    ],
    "nodes": {
-    "frame": "c3c468b0b048674c0411",
-    "frame-alternative": "79996897dd0b07532a5f",
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
     "prd-transaction": "4ddac8dc4bb96b3db1b2",
     "research": "0ff659b8fa149c7f1231",
     "research-alternative": "fbd5640f70eceb2840af",

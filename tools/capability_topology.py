@@ -124,12 +124,63 @@ def expected_recipe_keys(manifest=None):
     # the `entry` group) needs a recipe so a producer cycle can be issued for
     # it at direct/quick/standard+.
     return {(name, mode) for name, spec in manifest["capabilities"].items()
-            if spec.get("invocation", {}).get("class") == "entry-router"
+            if spec.get("invocation", {}).get("class") in ("entry-router", "compiler-internal")
             for mode in (spec["modes"] or ["default"])}
 
 
 def recipe_keys(registry):
     return {(r["capability"], mode) for r in registry["recipes"] for mode in r["modes"]}
+
+
+ROUTE_FRAME_CAPABILITY = "route-frame"
+ROUTE_DECISION_KIND = "runtime-terminal"
+ROUTE_FRAME_NODE_IDS = ["frame", "frame-alternative", "route-decision"]
+
+
+def is_route_frame_terminal(recipe, node):
+    """Whether ``node`` is the one model-less runtime terminal this registry accepts.
+
+    The runtime terminal is not a worker kind and is not in `worker_kinds`: it is
+    accepted only as the `route-decision` node of the `route-frame` recipe, and only
+    when the whole recipe has the exact shape checked by `_validate_route_frame_shape`.
+    Every other recipe that names such a node fails the ordinary worker-kind check.
+    """
+    return (isinstance(recipe, dict) and recipe.get("capability") == ROUTE_FRAME_CAPABILITY
+            and isinstance(node, dict) and node.get("id") == "route-decision"
+            and node.get("kind") == ROUTE_DECISION_KIND)
+
+
+def _validate_route_frame_shape(recipe):
+    """Exact shape of the compiler-internal framed route: two `top` frame legs and the terminal."""
+    cap = ROUTE_FRAME_CAPABILITY
+    graph = recipe["standard_plus"]
+    nodes = graph.get("nodes", [])
+    if [n.get("id") for n in nodes] != ROUTE_FRAME_NODE_IDS:
+        raise TopologyError(f"{cap}: nodes must be exactly {ROUTE_FRAME_NODE_IDS}")
+    frame, alternative, decision = nodes
+    for leg in (frame, alternative):
+        if (leg.get("kind") != "map-worker" or leg.get("unit") != "plan/frame"
+                or leg.get("worker_type") != "frame" or leg.get("dispatch_depth") != 1
+                or leg.get("depends_on") != [] or leg.get("launch_authority") != "depth-0"
+                or leg.get("continuation") != {"kind": "human-gate", "gate": "frame-review"}):
+            raise TopologyError(f"{cap}:{leg.get('id')}: frame leg shape mismatch")
+    expected_decision = {
+        "id": "route-decision", "kind": ROUTE_DECISION_KIND, "depends_on": ["frame", "frame-alternative"],
+        "dispatch_depth": 0, "execution_surface": "inline", "registered_worker": False,
+        "terminal": True, "terminal_gate": "route-decision", "completion_gate": "route-decision",
+        "commit_expected": False, "advance_class": "runtime-eligible", "resource_class": "normal",
+    }
+    if any(decision.get(key) != value for key, value in expected_decision.items()):
+        raise TopologyError(f"{cap}:route-decision: runtime terminal shape mismatch")
+    if any(key in decision for key in ("unit", "model_profile", "worker_type", "fallback_hops",
+                                       "continuation", "unit_choices", "role")):
+        raise TopologyError(f"{cap}:route-decision: a runtime terminal carries no unit, role or model")
+    if (recipe["human_gates"] != ["frame-review"]
+            or recipe["human_gate_bindings"] != [{"gate": "frame-review", "node": "route-decision",
+                                                  "position": "entry"}]):
+        raise TopologyError(f"{cap}: exactly one frame-review binding at the terminal entry is required")
+    if graph.get("parallel_groups") or recipe.get("conditional_extensions"):
+        raise TopologyError(f"{cap}: no parallel groups or extensions")
 
 
 def _scope_root(scope):
@@ -881,6 +932,8 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
     if any(str(i).startswith("_") for i in ids):
         raise TopologyError(f"{recipe['capability']}: route-node-id-reserved-prefix")
     by_id = {n["id"]: n for n in nodes}
+    if recipe["capability"] == ROUTE_FRAME_CAPABILITY:
+        _validate_route_frame_shape(recipe)
     actual_max_dispatch_depth = max(
         (
             node.get("dispatch_depth", 0)
@@ -906,12 +959,16 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
             raise TopologyError(
                 f"{recipe['capability']}:{node['id']}: invalid runtime requirements"
             )
-        if node.get("kind") not in registry["worker_kinds"]:
+        runtime_terminal = is_route_frame_terminal(recipe, node)
+        if node.get("kind") not in registry["worker_kinds"] and not runtime_terminal:
             raise TopologyError(f"{recipe['capability']}:{node['id']}: invalid worker kind")
-        _validate_unit_ref(recipe, node, registry)
+        if not runtime_terminal:
+            _validate_unit_ref(recipe, node, registry)
         if "profile_demand" in node:
             PROFILE.resolve_profile_demand(node["profile_demand"])
-        if node["kind"] == "resource-runner":
+        if runtime_terminal:
+            pass  # exact shape is checked once for the whole recipe below
+        elif node["kind"] == "resource-runner":
             if "model_profile" in node:
                 raise TopologyError(
                     f"{recipe['capability']}:{node['id']}: resource runner cannot carry model_profile"
@@ -1527,6 +1584,8 @@ def _validate_part_catalog(registry, owner_profile):
     capabilities = {recipe["capability"] for recipe in registry["recipes"]}
     node_ids = {}
     for recipe in registry["recipes"]:
+        if recipe["capability"] == ROUTE_FRAME_CAPABILITY:
+            continue  # compiler-internal: never composable, so it has no catalog parts
         for node in recipe["standard_plus"]["nodes"]:
             key = f"{recipe['capability']}:{node['id']}"
             if key in node_ids:
@@ -1636,7 +1695,8 @@ def _validate_part_catalog(registry, owner_profile):
         raise TopologyError("part_catalog.frame.template lacks a template field")
     aliases = frame["aliases"]
     framed = {recipe["capability"] for recipe in registry["recipes"]
-              if any(node["id"] in aliases for node in recipe["standard_plus"]["nodes"])}
+              if recipe["capability"] != ROUTE_FRAME_CAPABILITY
+              and any(node["id"] in aliases for node in recipe["standard_plus"]["nodes"])}
     if not isinstance(frame["briefs"], dict) or set(frame["briefs"]) != framed:
         raise TopologyError("part_catalog.frame.briefs must cover exactly the recipes that carry a frame")
     for recipe in registry["recipes"]:

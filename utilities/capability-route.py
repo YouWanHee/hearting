@@ -1750,6 +1750,10 @@ def _evidence_parent_dispatch_depth(nodes, owner_dispatch_depth):
     if a recipe ever seals evidence at another depth, and cross-checks the two
     structural facts the route already states about itself.
     """
+    if [n.get("id") for n in nodes] == list(TOPO.ROUTE_FRAME_NODE_IDS) and nodes[-1].get("kind") == TOPO.ROUTE_DECISION_KIND:
+        # The framed route has no depth-2 consumer: its checked tuples describe the runtime that
+        # launches the two frame legs, and it names the same parent depth as every recipe.
+        return owner_dispatch_depth
     if not any(node.get("dispatch_depth") == EVIDENCE_CONSUMER_DISPATCH_DEPTH for node in nodes):
         raise ValueError(
             "dispatch-evidence-without-consumer-node: checked tuples were sealed but no "
@@ -2285,6 +2289,11 @@ def _owner_node(node, effective):
             and node.get("dispatch_depth") == 1 and node.get("unit") == "_kernel/owner")
 
 
+def _no_model_node(node):
+    """Whether `node` runs no model: a detached resource run, or the framed route's runtime terminal."""
+    return node.get("kind") in ("resource-runner", TOPO.ROUTE_DECISION_KIND)
+
+
 def _frame_node(node):
     """Whether `node` is a frame bootstrap leg: the depth-1 direction-setting
     pair that the depth-0 session launches itself, ahead of any owner. Mirrors
@@ -2341,9 +2350,8 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
         if seal_persona:
             node.setdefault("perspective", "primary-frame" if node.get("id") == "frame"
                             else "alternative-frame")
-        # `frame` is the anchor leg (the one raised a tier); every other leg of
-        # the pair -- today only `frame-alternative` -- stays at the owner's
-        # working tier so the pair keeps two genuinely different voices.
+        # Both frame perspectives get the same top-tier default. Explicit
+        # route selections are applied later and retain precedence.
         profile = rungs["anchor" if node.get("id") == "frame" else "others"]
         node["model_profile"] = profile
         if profile == PROFILE.TOP_PROFILE:
@@ -2351,10 +2359,8 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
             # the legacy "explicit profile, no demand" path -- the resolver
             # refuses that with `profile-demand-required`. Give the anchor a
             # real explicit selection instead: the owner's own demand when the
-            # caller supplied one (same judgment, same evidence, one
-            # decision), otherwise the frame shape's intrinsic demand, whose
-            # reasons say in as many words that the shape is speaking rather
-            # than task-specific evidence somebody gathered.
+            # caller supplied one, otherwise the frame shape's intrinsic
+            # demand. Each leg seals its own selection and demand.
             node["profile_explicit"] = True
             node["profile_demand"] = json.loads(json.dumps(
                 owner_demand or PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
@@ -2379,7 +2385,7 @@ def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *
     demands = profile_demands or {}
     explicit_profiles = explicit_profiles or {}
     for node in nodes:
-        if node.get("kind") == "resource-runner":
+        if _no_model_node(node):
             continue
         node_id = node["id"]
         demand = demands.get(node_id, node.get("profile_demand"))
@@ -2403,7 +2409,7 @@ def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *
 
 
 def _profile_input_maps(nodes, demands, explicit):
-    valid = {n["id"] for n in nodes if n.get("kind") != "resource-runner"} | {"__owner__"}
+    valid = {n["id"] for n in nodes if not _no_model_node(n)} | {"__owner__"}
     normalized = {}
     for label, values in (("profile_demands", demands), ("explicit_profiles", explicit)):
         if values is not None and (not isinstance(values, dict) or set(values) - valid):
@@ -2456,7 +2462,7 @@ def _verify_profile_contract(route):
         profile=route.get("owner_model_profile"), existing_versioned_stage=True,
     )
     for node in route.get("nodes", []):
-        if node.get("kind") == "resource-runner":
+        if _no_model_node(node):
             continue
         PROFILE.validate_profile_selection(node.get("profile_selection"), node.get("profile_demand"),
                                            profile=node.get("model_profile"), existing_versioned_stage=True)
@@ -2593,8 +2599,11 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
 # through the SAME validator, sealer, verifier and guards as a preset route --
 # composition changes route shape only (WORKFLOW §7 compose-on-demand).
 # ---------------------------------------------------------------------------
-COMPOSE_SHAPES = ("direct", "solo", "staged")
-SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard"}
+COMPOSE_SHAPES = ("direct", "solo", "staged", "framed")
+SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard", "framed": "standard"}
+# The compiler-internal capability behind `--shape framed`. No person and no model names it; a
+# route of any other shape can never seal it (`compose-shape-invalid`).
+ROUTE_FRAME_CAPABILITY = TOPO.ROUTE_FRAME_CAPABILITY
 INTENSITY_SHAPE = {"direct": "direct", "quick": "solo"}
 ROUTE_ORIGINS = ("preset", "compose")
 COMPOSE_DEFAULT_CAPABILITY = "autopilot-code"
@@ -3322,12 +3331,25 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
+    routing_hints = None
+    if shape == "framed":
+        # The shape itself picks the compiler-internal capability. Whatever was typed for the
+        # ordinary shapes is only a hint for the work request: recorded, never sealed as the
+        # route's capability, never refused as an argument conflict, never applied to a model.
+        routing_hints = {key: value for key, value in (
+            ("capability", capability), ("capability_mode", capability_mode),
+            ("graph", graph), ("profile", profile)) if value}
+        capability, capability_mode, graph, profile = ROUTE_FRAME_CAPABILITY, "default", None, None
+        if intensity not in (None, "standard"):
+            raise ValueError("compose-shape-intensity-mismatch:framed")
     if shape != "staged" and graph:
         raise ValueError(f"compose-graph-only-staged:{shape}")
     registry = TOPO.load_registry()
     # A capability may own several recipes (autopilot-lab: setup, eval); the
-    # requested mode picks the recipe that declares it.
-    candidates = [r for r in registry["recipes"] if r["capability"] == capability]
+    # requested mode picks the recipe that declares it. The internal framed
+    # capability exists only for the framed shape.
+    candidates = [r for r in registry["recipes"] if r["capability"] == capability
+                  and (capability != ROUTE_FRAME_CAPABILITY or shape == "framed")]
     if not candidates:
         raise ValueError(f"compose-capability-unknown:{capability}")
     if capability_mode is None:
@@ -3358,7 +3380,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if campaign_key is None and parent_cycle_id is None and not unassigned:
         raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root))
     if tracking is None:
-        tracking = "tracked" if shape == "staged" else "untracked"
+        tracking = "tracked" if shape in ("staged", "framed") else "untracked"
     gate = {
         "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
         "drift_verdict": drift_verdict or "no-spec-impact: compose default (caller asserted no spec-significant change)",
@@ -3375,14 +3397,16 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         try:
             import artifact_producer
             find_input = artifact_producer.input_source_finder(
-                artifact_root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key)
+                artifact_root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key,
+                capability=capability, route_chain_identity=_route_chain_identity("compose", None))
         except ImportError:
             find_input = None
-    capabilities = {recipe["capability"] for recipe in registry["recipes"]}
+    capabilities = {recipe["capability"] for recipe in registry["recipes"]
+                    if recipe["capability"] != ROUTE_FRAME_CAPABILITY}
     selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph, capabilities), find_input)
                        if shape == "staged" and graph else base)
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
-    if shape == "staged" and not owner_only and dispatch_evidence is None:
+    if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
                                        children or _compose_default_children(selection_pins))
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
@@ -3413,6 +3437,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         route["campaign_unassigned"] = True
     if work_request is not None:
         from work_start import capture_request_context
+        if routing_hints:
+            work_request = {**work_request, "routing_hints": routing_hints}
         route["work_request"] = capture_request_context(work_request, route)
     if selection_pins:
         _apply_selection_pins(route, selection_pins)
@@ -3521,7 +3547,8 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
-    graph = "→".join(ids) if route.get("composed") else (ids[0] if ids else "-")
+    framed = shape == "framed"
+    graph = "→".join(ids) if route.get("composed") or framed else (ids[0] if ids else "-")
     gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
     card = (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
@@ -3529,6 +3556,9 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
         f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
         + _compose_campaign_line(compose_campaign_selection(route))
     )
+    if framed:
+        card += ("\n  frame이 방향과 경로를 조립해 제안합니다"
+                 "\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회")
     sourced = {}
     for node in route["nodes"]:
         for name, source in (node.get("input_sources") or {}).items():
@@ -3588,6 +3618,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                   explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
     dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
+    if (capability==ROUTE_FRAME_CAPABILITY) != (shape=="framed"):
+        raise ValueError(f"compose-shape-invalid:{shape}")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
     slug_fields={}
@@ -3734,7 +3766,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     if profile is not None:
         if profile not in PROFILE.PORTABLE_PROFILES:
             raise ValueError("profile-explicit-unknown:" + str(profile))
-        explicit_profiles = {**{n["id"]: profile for n in nodes if n.get("kind") != "resource-runner"},
+        explicit_profiles = {**{n["id"]: profile for n in nodes if not _no_model_node(n)},
                              "__owner__": profile, **(explicit_profiles or {})}
     profile_demands, explicit_profiles = _profile_input_maps(nodes, profile_demands, explicit_profiles)
     owner_demand = profile_demands.get("__owner__")
@@ -4128,7 +4160,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 by_id = {n["id"]: n for n in expected_nodes}
                 for node in route.get("nodes", []):
                     expected = by_id.get(node.get("id"))
-                    if expected and node.get("kind") != "resource-runner" and any(
+                    if expected and not _no_model_node(node) and any(
                         node.get(key) != expected.get(key)
                         for key in ("profile_demand", "profile_selection", "model_profile")):
                         raise ValueError("node-profile-declaration-mismatch:" + node["id"])
@@ -4138,6 +4170,17 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             if ([n.get("id") for n in route.get("nodes", [])]
                     != [n.get("id") for n in expected_nodes]):
                 raise ValueError("route nodes differ from the declared recipe")
+            if (route.get("capability") == ROUTE_FRAME_CAPABILITY
+                    and route.get("profile_selection_contract_version") == 1
+                    and [_node_identity(n) for n in route.get("nodes", [])]
+                    != [_node_identity(n) for n in expected_nodes]):
+                # The framed route's model-less terminal is accepted only as exactly the recipe's node.
+                raise ValueError("route-frame nodes differ from the sealed recipe")
+    if (route.get("capability") == ROUTE_FRAME_CAPABILITY) != (route.get("selection", {}).get("shape") == "framed"):
+        raise ValueError("route-frame-shape-mismatch")
+    if route.get("capability") == ROUTE_FRAME_CAPABILITY and (
+            route.get("composed") or route.get("effective_intensity") != "standard"):
+        raise ValueError("route-frame-shape-mismatch")
     expected_extensions=_realize_conditional_extensions(
         route_recipe, route.get("effective_intensity")
     )
@@ -6745,6 +6788,10 @@ def complete_node(
     intent at all, so a quick one-shot owner's completion left no record and
     no carrier could ever deliver it.
     """
+    if node_id=="route-decision" and isinstance(node,dict) and node.get("kind")==TOPO.ROUTE_DECISION_KIND:
+        marker=_complete_framed_terminal(route,node,evidence,jobs)
+        _launch_open_cycle_checkpoint(route)
+        return marker,None
     artifact_root=route.get("artifact_root")
     route_id=route.get("route_id")
     pending=None
@@ -6776,6 +6823,29 @@ def complete_node(
             pass
     _launch_open_cycle_checkpoint(route)
     return marker, row
+
+
+def _complete_framed_terminal(route, node, evidence, jobs):
+    """The framed route's runtime terminal completes without a model attempt, once its two frame
+    legs are complete, the frame-review gate is released, and the evidence is this route's own
+    `route_decision_v1` record. The marker is the ordinary inline-axes marker."""
+    import route_plan
+    from dispatch_contract import completion_marker_gate
+    if not route_plan.is_framed_route(route):
+        raise ValueError("route-frame-shape-mismatch")
+    route_file=str(canonical_route_path(route["artifact_root"],route["route_id"]))
+    registry=Path(jobs) if jobs else Path(_compose_default_jobs())
+    try:
+        # The one gate every entry node passes: both frame legs have a current completion marker
+        # and the frame-review human gate bound at this node's entry is released.
+        completion_marker_gate(route_file,node["id"],"start",ROOT,registry)
+    except DispatchContractError as exc:
+        raise ValueError(f"framed-terminal-not-ready:{exc.reason}") from exc
+    frame_route=route_plan.read_record(evidence)["decision"]["frame_route"]
+    if (frame_route["route_id"],frame_route["route_hash"])!=(route["route_id"],route["route_hash"]):
+        raise ValueError("route-decision-invalid:frame_route")
+    marker,_row=_complete_node_locked(route,node,node["id"],evidence)
+    return marker
 
 
 def _launch_open_cycle_checkpoint(route):
@@ -8222,16 +8292,13 @@ def _route_chain_identity(event, route):
             return None
         harness, sid = anchor
         return harness, sid, depth, os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
-    try:
-        from dispatch_parent_completion import interactive_parent_identity
-        harness, sid = interactive_parent_identity()
-    except Exception:
-        return None
-    if not harness or not sid:
-        return None
     rc = _route_chain_module()
-    if rc is None or rc.WRITER_SUPPORT.get(harness) != "env":
+    if rc is None:
         return None
+    anchor = rc.writer_identity()
+    if anchor is None:
+        return None
+    harness, sid = anchor
     return harness, sid, depth, None
 
 
@@ -8289,7 +8356,8 @@ def _resolve_compose_plan(a):
     if a.plan:
         if rc is None:
             raise ValueError("compose-plan-invalid:route-chain-unavailable")
-        known = {r["capability"] for r in TOPO.load_registry()["recipes"]}
+        known = {r["capability"] for r in TOPO.load_registry()["recipes"]
+                 if r["capability"] != ROUTE_FRAME_CAPABILITY}
         return rc.parse_plan(a.plan, known), "explicit"
     if rc is None:
         return None, None
@@ -8423,9 +8491,9 @@ def main():
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
                     help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
-    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph); default staged with --graph, else direct")
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default staged with --graph, else direct")
     cp.add_argument("--graph",default=None,help="optional staged subgraph in your order (see `capability-route.py stages --capability <cap>` for valid ids); incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
-    cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
+    cp.add_argument("--capability",default=None,help=f"default {COMPOSE_DEFAULT_CAPABILITY}; a hint only with --shape framed"); cp.add_argument("--capability-mode",default=None)
     cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
     cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
     cp.add_argument("--signal",action="append",default=[],
@@ -8537,7 +8605,8 @@ def main():
         dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="stages":
         registry=TOPO.load_registry()
-        rows=[r for r in registry["recipes"] if a.capability is None or r["capability"]==a.capability]
+        rows=[r for r in registry["recipes"] if r["capability"]!=ROUTE_FRAME_CAPABILITY
+              and (a.capability is None or r["capability"]==a.capability)]
         if not rows:
             raise ValueError(f"unknown capability: {a.capability}")
         blocks=[stages_block(registry,recipe) for recipe in rows]
@@ -8577,7 +8646,8 @@ def main():
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         route=compose_route(
-            capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
+            capability=a.capability if shape=="framed" else (a.capability or COMPOSE_DEFAULT_CAPABILITY),
+            capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
             campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,unassigned=a.unassigned,
             spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,

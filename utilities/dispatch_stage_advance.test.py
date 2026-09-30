@@ -182,7 +182,10 @@ class CensusTest(unittest.TestCase):
             # reviews in recipe order (security-review -> release-review).
             # refine review -> transaction stays excluded by its
             # preview-disposition human-gate continuation.
-            (49, 26, 16, 15, 13),
+            # base 49 -> 51: the compiler-internal `route-frame` recipe adds its two frame legs (each
+            # with a continuation); the terminal is model-less and forms no eligible boundary
+            # (two dependencies, so the fan-in filter drops it).
+            (51, 26, 16, 15, 13),
         )
         expected_standard_boundaries = [
             ("autopilot-apply", "apply", "verify"),
@@ -206,7 +209,8 @@ class CensusTest(unittest.TestCase):
         self.assertEqual(
             (strong["base"], strong["eligible"], strong["non_terminal"],
              strong["commit_expected_excluded"], strong["runtime_advanced"]),
-            (49, 9, 3, 3, 3),
+            # base 49 -> 51: the same two `route-frame` frame legs as in the standard census above.
+            (51, 9, 3, 3, 3),
         )
         expected_strong_boundaries = [
             ("autopilot-lab", "metrics", "media"),

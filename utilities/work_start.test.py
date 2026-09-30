@@ -256,6 +256,17 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["state"], "needs-attention", result)
         self.assertEqual(result["reason"], "frame-launch-not-admitted")
 
+    def test_no_harness_declaring_top_is_frame_harness_unavailable_with_no_attempt(self):
+        def undeclared(command, **kwargs):
+            receipt = ("status=unavailable\ntop_undeclared=claude,codex,opencode\n"
+                       "check=failed\nreason=frame-harness-unavailable\nchild_spawned=0\n")
+            return subprocess.CompletedProcess(command, 65, receipt, "")
+        result = W.start_work(self.route, self.path, self.jobs, run=undeclared)
+        self.assertEqual(result["state"], "needs-attention", result)
+        self.assertEqual(result["reason"], "frame-harness-unavailable")
+        self.assertEqual(result["frame_attempts"], [])
+        self.assertEqual(len(result["launches"]), 1)  # the anchor leg stopped the start; nothing else launched
+
     def test_automatic_frames_use_real_selector_usage_gate_before_wrapper_launch(self):
         owner = load("work_start_capacity_owner", W.ROOT / "utilities/dispatch-owner.py")
         self.route.update(cwd=self.tmp.name, capability="autopilot-code", capability_mode="debug",

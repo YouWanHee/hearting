@@ -20,6 +20,12 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # 2026-09-27 SD-160: only group digests re-frozen after removing required
 # cross-harness axes; node fields, width, persona and budget remain unchanged.
 PRESERVED_FULL_FIELD_DIGESTS = {
+    # Added with the compiler-internal framed recipe (v3.0 part 3): two `top` frame legs and the
+    # model-less runtime terminal. No other entry moves.
+    ('route-frame', ('default',)): (
+        "44e1486d40c78fe62c4f5475ad239ed9af3cbeef8ffb5414c3fa92a878811606",
+        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    ),
     ('analyze-project', ('code', 'doc', 'paper')): (
         "75b8d6819bd9c94e787225b3c9673901037f95e9d7a80bd4fd774a0a4fdc7214",
         "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
@@ -90,7 +96,7 @@ def full_field_digest(value):
 class TestTopology(unittest.TestCase):
     def setUp(self): self.r = T.load_registry()
     def test_exact_coverage_and_digest(self):
-        result = T.validate_registry(self.r); self.assertEqual((12, 28), (result["capabilities"], result["recipes"])); self.assertEqual(T.registry_digest(self.r), T.registry_digest(json.loads(json.dumps(self.r, sort_keys=True))))
+        result = T.validate_registry(self.r); self.assertEqual((13, 29), (result["capabilities"], result["recipes"])); self.assertEqual(T.registry_digest(self.r), T.registry_digest(json.loads(json.dumps(self.r, sort_keys=True))))
     def test_missing_coverage(self):
         r=copy.deepcopy(self.r); r["recipes"].pop(); self.assertRaises(T.TopologyError, T.validate_registry, r)
     def test_cycle(self):
@@ -780,7 +786,7 @@ class DepthOneFrameNeverReachesWorkerTypeForKindTest(unittest.TestCase):
                             "kind fallback cannot prove the fallback was not used",
                         )
                     seen += 1
-        self.assertEqual(seen, 10)  # five standard+ recipes x two frame legs
+        self.assertEqual(seen, 12)  # five standard+ recipes x two frame legs, plus route-frame's two
 
 
 class PartCatalogTest(unittest.TestCase):
@@ -793,7 +799,8 @@ class PartCatalogTest(unittest.TestCase):
         self.assertRaisesRegex(T.TopologyError, message, T.validate_registry, r)
     def test_every_recipe_stage_has_one_row_and_a_summary(self):
         T.validate_registry(self.r)
-        stages = {f"{r['capability']}:{n['id']}" for r in self.r["recipes"] for n in r["standard_plus"]["nodes"]}
+        stages = {f"{r['capability']}:{n['id']}" for r in self.r["recipes"] for n in r["standard_plus"]["nodes"]
+                  if r["capability"] != "route-frame"}  # compiler-internal: never composable, no catalog parts
         optional = {part for part, row in self.parts.items() if "optional" in row}
         self.assertEqual(set(self.parts), stages | optional)
         self.assertEqual(optional, {"autopilot-lab:diagnose", "autopilot-lab:eval-spec", "autopilot-lab:eval-smoke"})

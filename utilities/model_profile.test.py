@@ -514,11 +514,11 @@ class TopExceptionProfileTest(unittest.TestCase):
 class FrameTierLadder(unittest.TestCase):
     def test_the_ladder_maps_every_owner_profile_to_its_frame_pair(self):
         expected = {
-            "top": {"anchor": "top", "others": "deep"},
-            "deep": {"anchor": "top", "others": "deep"},
-            "balanced-deep": {"anchor": "deep", "others": "deep"},
-            "balanced": {"anchor": "balanced-deep", "others": "balanced-deep"},
-            "light": {"anchor": "balanced", "others": "balanced"},
+            "top": {"anchor": "top", "others": "top"},
+            "deep": {"anchor": "top", "others": "top"},
+            "balanced-deep": {"anchor": "top", "others": "top"},
+            "balanced": {"anchor": "top", "others": "top"},
+            "light": {"anchor": "top", "others": "top"},
         }
         for owner, rungs in expected.items():
             with self.subTest(owner=owner):
@@ -539,6 +539,7 @@ class FrameTierLadder(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(PROFILE.frame_profile_for_owner(value),
                                  PROFILE.FRAME_PROFILE_LADDER["light"])
+                self.assertEqual(PROFILE.frame_profile_for_owner(value), {"anchor": "top", "others": "top"})
 
     def test_the_returned_mapping_cannot_mutate_the_table(self):
         rungs = PROFILE.frame_profile_for_owner("deep")

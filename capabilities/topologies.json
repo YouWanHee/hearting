@@ -4014,6 +4014,141 @@
         "target_relative": true,
         "review_anchor": "reviews"
       }
+    },
+    {
+      "capability": "route-frame",
+      "modes": [
+        "default"
+      ],
+      "topology_class": "staged",
+      "direct_predicates": [
+        "atomic-outcome"
+      ],
+      "promotion_signals": [],
+      "quick": {
+        "topology": "one-shot-owner",
+        "worker_kind": "capability-owner",
+        "write_scope": [
+          "shards/frame/**"
+        ],
+        "owner_dispatch_depth": 1,
+        "max_dispatch_depth": 1,
+        "model_profile": "balanced-deep"
+      },
+      "standard_plus": {
+        "topology": "staged",
+        "nodes": [
+          {
+            "id": "frame",
+            "kind": "map-worker",
+            "depends_on": [],
+            "role": "deep maker",
+            "inputs": [
+              "task"
+            ],
+            "outputs": [
+              "shards/frame/direction-brief.md"
+            ],
+            "write_scope": [
+              "shards/frame/**"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "route-frame",
+            "dispatch_depth": 1,
+            "launch_authority": "depth-0",
+            "worker_type": "frame",
+            "unit": "plan/frame",
+            "model_profile": "deep",
+            "continuation": {
+              "kind": "human-gate",
+              "gate": "frame-review"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          },
+          {
+            "id": "frame-alternative",
+            "kind": "map-worker",
+            "depends_on": [],
+            "role": "deep maker",
+            "inputs": [
+              "task"
+            ],
+            "outputs": [
+              "shards/frame-alternative/direction-brief.md"
+            ],
+            "write_scope": [
+              "shards/frame-alternative/**"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "route-frame",
+            "dispatch_depth": 1,
+            "launch_authority": "depth-0",
+            "worker_type": "frame",
+            "unit": "plan/frame",
+            "model_profile": "deep",
+            "continuation": {
+              "kind": "human-gate",
+              "gate": "frame-review"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          },
+          {
+            "id": "route-decision",
+            "kind": "runtime-terminal",
+            "depends_on": [
+              "frame",
+              "frame-alternative"
+            ],
+            "inputs": [
+              "shards/frame/direction-brief.md",
+              "shards/frame-alternative/direction-brief.md"
+            ],
+            "outputs": [
+              "shards/frame/route-decision.json"
+            ],
+            "write_scope": [
+              "shards/frame/route-decision.json"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "route-decision",
+            "dispatch_depth": 0,
+            "execution_surface": "inline",
+            "registered_worker": false,
+            "terminal": true,
+            "terminal_gate": "route-decision",
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          }
+        ],
+        "owner_dispatch_depth": 1,
+        "max_dispatch_depth": 1
+      },
+      "completion_gates": [
+        "route-frame",
+        "route-decision"
+      ],
+      "human_gates": [
+        "frame-review"
+      ],
+      "human_gate_bindings": [
+        {
+          "gate": "frame-review",
+          "node": "route-decision",
+          "position": "entry"
+        }
+      ],
+      "resume_retry_boundaries": [
+        "frame",
+        "frame-alternative"
+      ],
+      "artifact_scope": {
+        "cycle_anchors": [
+          "campaigns/<campaign-locator>/<cycle-locator>/artifacts"
+        ],
+        "map_anchor": "shards"
+      }
     }
   ],
   "execution_surfaces": [
@@ -4311,6 +4446,14 @@
     "lab-eval-spec": {
       "kind": "unit-io",
       "unit": "plan/plan-author"
+    },
+    "route-frame": {
+      "kind": "unit-io",
+      "unit": "plan/frame"
+    },
+    "route-decision": {
+      "kind": "custom",
+      "doc": "capabilities/route-frame.md: runtime terminal record route_decision_v1, fixed by the runtime after the single frame interview; no model attempt"
     }
   },
   "model_profiles": {

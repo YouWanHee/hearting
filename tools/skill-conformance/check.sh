@@ -41,7 +41,7 @@ while IFS=$'\t' read -r name class _rest; do
   [ -z "$name" ] && continue
   [[ "$name" == \#* ]] && continue
   case "$class" in
-    user-only|parent-invoked|entry-router|model-support) ;;
+    user-only|parent-invoked|entry-router|model-support|compiler-internal) ;;
     *) echo "FAIL: unknown invocation class '$class' for $name"; fail=1; continue ;;
   esac
   if [ -n "${policy_class[$name]+x}" ]; then
@@ -70,6 +70,12 @@ if [ -z "$portable_names" ]; then
   exit 1
 fi
 policy_names_sorted=$(printf '%s\n' "${policy_names[@]}" | sort)
+# A compiler-internal capability is classified and documented but is never a Skill:
+# every Skill-tree comparison below runs over the portable names without it.
+internal_names=$(for name in "${policy_names[@]}"; do
+  [ "${policy_class[$name]}" = "compiler-internal" ] && printf '%s\n' "$name"
+done | sort)
+skill_names=$(comm -23 <(printf '%s\n' "$portable_names") <(printf '%s\n' "$internal_names"))
 missing_policy=$(comm -23 <(printf '%s\n' "$portable_names") <(printf '%s\n' "$policy_names_sorted"))
 extra_policy=$(comm -13 <(printf '%s\n' "$portable_names") <(printf '%s\n' "$policy_names_sorted"))
 [ -n "$missing_policy" ] && { echo "FAIL: portable capabilities missing from invocation policy: $missing_policy"; fail=1; }
@@ -101,8 +107,8 @@ for skills_dir in "$@"; do
 
   if [ "$default_scope" -eq 1 ]; then
     actual_names=$(printf '%s\n' "$body" | awk -F'\t' 'NF{print $1}' | sort)
-    missing=$(comm -23 <(printf '%s\n' "$portable_names") <(printf '%s\n' "$actual_names"))
-    extra=$(comm -13 <(printf '%s\n' "$portable_names") <(printf '%s\n' "$actual_names"))
+    missing=$(comm -23 <(printf '%s\n' "$skill_names") <(printf '%s\n' "$actual_names"))
+    extra=$(comm -13 <(printf '%s\n' "$skill_names") <(printf '%s\n' "$actual_names"))
     [ -n "$missing" ] && { echo "FAIL: portable capabilities missing from $skills_dir: $missing"; fail=1; }
     [ -n "$extra" ] && { echo "FAIL: non-portable skills present in $skills_dir: $extra"; fail=1; }
   fi
@@ -121,6 +127,10 @@ for skills_dir in "$@"; do
 
   for name in "${policy_names[@]}"; do
     row=$(printf '%s\n' "$body" | awk -F'\t' -v n="$name" '$1==n{print; exit}')
+    if [ "${policy_class[$name]}" = "compiler-internal" ]; then
+      [ -z "$row" ] || { echo "FAIL: compiler-internal capability has a Skill in $skills_dir: $name"; fail=1; }
+      continue
+    fi
     if [ -z "$row" ]; then
       echo "FAIL: classified skill missing from $skills_dir: $name"
       fail=1
@@ -165,7 +175,7 @@ for skills_dir in "$@"; do
         fail=1
       fi
     done <<EOF
-$portable_names
+$skill_names
 EOF
   fi
 

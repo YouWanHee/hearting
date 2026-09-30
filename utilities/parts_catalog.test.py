@@ -89,6 +89,12 @@ class CatalogBase(T.ProducerTestBase):
             dispatch_evidence={"tuples": [T.nested("claude", "codex")]},
             registered_headless_evidence=T.registered_headless(), **kw)
 
+    def compose_framed(self, **kw):
+        return R.compose_route(
+            capability=None, capability_mode=None, shape="framed", graph=None, slug="sd165", cwd=R.ROOT,
+            artifact_root=self.root, spec_read="fixture", unassigned=True,
+            dispatch_evidence={"tuples": [T.nested("claude", "codex")]}, **kw)
+
     @staticmethod
     def node(route, node_id):
         return next(n for n in route["nodes"] if n["id"] == node_id)
@@ -111,8 +117,10 @@ def _normalize(text, case):
 
 
 def _recipes():
+    """The recipes a person can compose or preset; the compiler-internal framed recipe is reached
+    only through `--shape framed` and has its own scenario."""
     return [(r["capability"], sorted(r["modes"])[0], [n["id"] for n in r["standard_plus"]["nodes"]])
-            for r in TOPO.load_registry()["recipes"]]
+            for r in TOPO.load_registry()["recipes"] if r["capability"] != R.ROUTE_FRAME_CAPABILITY]
 
 
 def golden_payload(case):
@@ -138,7 +146,8 @@ def golden_payload(case):
                  "nodes": {n["id"]: _digest(n) for n in route["nodes"]},
                  "input_sources": {n["id"]: n["input_sources"] for n in route["nodes"] if "input_sources" in n},
                  "card": R.compose_card(route),
-                 "briefs": {n["id"]: ADVANCE.render_stage_brief(route, n)[1] for n in route["nodes"]}}
+                 "briefs": {n["id"]: ADVANCE.render_stage_brief(route, n)[1] for n in route["nodes"]
+                            if n.get("kind") != "runtime-terminal"}}
         entry.update({key: _digest(route[key]) for key in GOLDEN_KEYS if key in route})
         scenarios[name] = entry
 
@@ -161,6 +170,8 @@ def golden_payload(case):
     lab_ids = next(ids for capability, mode, ids in _recipes() if (capability, mode) == ("autopilot-lab", "eval"))
     record("prior:lab-eval:full", lambda: case.compose("autopilot-lab", "eval", ",".join(lab_ids),
                                                         campaign_key="sd165-lab"))
+    # The compiler-internal framed route: its own scenario, never part of the user-preset enumeration.
+    record("framed:route-frame", lambda: case.compose_framed())
     registry = TOPO.load_registry()
     digests = {capability: TOPO.capability_registry_digest(registry, capability)
                for capability in sorted({r["capability"] for r in registry["recipes"]})}
@@ -381,7 +392,10 @@ class LabEvalPartsTest(CatalogBase):
         self.assertIn("입력 ", R.compose_card(route))
 
     def test_a_borrowed_attestation_is_found_under_its_relocated_name(self):
-        self.cycle(("_internal/parts/autopilot-lab/smoke/reviews/smoke-attestation.json",), "code-fill")
+        # SD-163 correction (spec 13.65): a prior cycle of another capability is another flow, so the
+        # cycle that holds the borrowed file is one of the composing capability.
+        self.cycle(("_internal/parts/autopilot-lab/smoke/reviews/smoke-attestation.json",), "code-fill",
+                   "autopilot-lab", "eval")
         route = self.compose("autopilot-lab", "eval", "eval-run,metrics,report", campaign_key="code-fill")
         source = self.node(route, "eval-run")["input_sources"]["smoke-attestation"]
         self.assertTrue(source["path"].endswith(
@@ -462,7 +476,8 @@ class StagesTest(unittest.TestCase):
 
     def test_every_part_carries_the_catalog_fields(self):
         blocks = json.loads(self.blocks("--json"))
-        self.assertEqual(len(blocks), len(TOPO.load_registry()["recipes"]))
+        self.assertEqual(len(blocks), len(_recipes()))  # the internal framed recipe is never listed
+        self.assertNotIn("route-frame", {block["capability"] for block in blocks})
         keys = {"id", "unit", "unit_choices", "parallel_group", "human_gates", "terminal", "part", "summary",
                 "kind", "inputs", "external_inputs", "optional_inputs", "outputs", "shareable",
                 "start_approval", "optional", "after", "before", "frame_alias"}
@@ -582,7 +597,8 @@ class ResourceShareTest(CatalogBase):
         self.assertEqual(route["human_gate_bindings"], [])
 
     def test_smoke_omitted_attestation_comes_from_the_prior_cycle(self):
-        self.cycle(("experiments/reviews/smoke-attestation.json",), "res-fill", "autopilot-lab", "setup")
+        # SD-163 correction (spec 13.65): the prior cycle is one of the composing (code) capability.
+        self.cycle(("experiments/reviews/smoke-attestation.json",), "res-fill")
         route = self.compose(graph="execute,autopilot-lab:full-run,test,report", campaign_key="res-fill")
         R.verify_route(route, R.ROOT)
         full = self.node(route, "autopilot-lab-full-run")

@@ -5,6 +5,7 @@ reuse the adapter's atomic claim; all completion decisions use the shared join.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ from dispatch_parent_completion import default_parent_session_id, interactive_pa
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
 from parent_next_directive import parent_next
 import owner_write_advisory as OWNER_WRITE_ADVISORY
+import route_plan as RP
 
 ROOT = Path(__file__).resolve().parents[1]
 START_WINDOW_SECONDS = 600
@@ -202,12 +204,20 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
 
 def validate_request(value):
     if (not isinstance(value, dict) or not {"text", "owner_harness"} <= set(value)
-            or set(value) - {"text", "owner_harness", "workflow_group_context"}):
+            or set(value) - {"text", "owner_harness", "workflow_group_context", "routing_hints"}):
         raise ValueError("work-request-invalid")
     if not isinstance(value["text"], str) or not value["text"].strip():
         raise ValueError("work-request-empty")
     if value["owner_harness"] not in {None, "claude", "codex", "opencode"}:
         raise ValueError("work-request-owner-invalid")
+    if "routing_hints" in value:
+        # What a framed compose was given for the ordinary shapes: recorded only, never sealed.
+        hints = value["routing_hints"]
+        if (not isinstance(hints, dict) or not hints
+                or set(hints) - {"capability", "capability_mode", "graph", "profile"}
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 512
+                       for item in hints.values())):
+            raise ValueError("work-request-routing-hints-invalid")
     if "workflow_group_context" in value:
         import artifact_identity
         from artifact_workflow_groups import GROUP_ID
@@ -483,6 +493,100 @@ def _outcome(jobs, aid):
     return result
 
 
+def _route_cli(jobs, *argv):
+    """One `capability-route.py` command under this start's registry; a failure keeps its text."""
+    env = {**os.environ, "AGENT_DISPATCH_JOBS": str(jobs)}
+    done = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), *argv],
+                          text=True, capture_output=True, check=False, env=env)
+    if done.returncode:
+        raise ValueError(f"framed-{argv[0]}-pending: {done.stderr.strip()} {done.stdout.strip()}")
+    return done.stdout
+
+
+def _framed_cycle(route):
+    """The one producer cycle this framed route began, open or sealed."""
+    import artifact_producer as producer
+    root = Path(route["artifact_root"]).resolve()
+    records = [row for row in producer.list_cycle_records(root) if row.get("route_id") == route["route_id"]]
+    if len(records) != 1:
+        raise ValueError("frame-cycle-required: the framed route has no single producer cycle")
+    record = records[0]
+    return root, record, producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
+
+
+def _framed_facts(root, output):
+    """The two brief rows and the intent row the decision binds, or None when a file is missing."""
+    rows = []
+    for node in ("frame", "frame-alternative"):
+        brief = output / "shards" / node / "direction-brief.md"
+        if brief.is_symlink() or not brief.is_file():
+            return None
+        rows.append({"node": node, "path": brief.relative_to(root).as_posix(), "sha256": RP.file_digest(brief)})
+    intent = output / "shards/frame/intent.md"
+    if intent.is_symlink() or not intent.is_file():
+        return None
+    return rows, {"path": intent.relative_to(root).as_posix(), "sha256": RP.file_digest(intent)}
+
+
+def _framed_settle(route, path, jobs, result, *, closed=None):
+    """Fix the decision, complete the model-less terminal, close the route, finalize the cycle.
+
+    Every step reads what is already on disk and does only what is missing, so repeating `start`
+    after any interruption finishes the same single decision. S1 knows no proposal, so the
+    decision is `selected: none` and the main session composes the next route itself.
+    """
+    import artifact_producer as producer
+    import dispatch_terminal_commit
+    root, record, output = _framed_cycle(route)
+    lock_path = root / ".runtime" / "framed-decision" / (route["route_id"] + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if closed is None:
+                # A start that waited on the lock may find the decision already ended.
+                from dispatch_notice_state import closed_outcome
+                closed = closed_outcome(Path(path), route)
+                if closed and closed.get("terminal_gate_proven") is not True:
+                    return {**result, "state": "needs-attention", "reason": "route-closed-unproven",
+                            "required_action": "inspect-closed-route", "outcome": closed}
+            record_path = output / RP.RECORD_RELATIVE
+            if record_path.exists():
+                decision_record = RP.read_record(record_path)
+            elif closed:
+                raise ValueError("route-decision-missing: the route closed without its decision record")
+            else:
+                facts = _framed_facts(root, output)
+                if facts is None:
+                    return {**result, "state": "needs-attention", "reason": "frame-outcome-needs-inspection"}
+                briefs, intent = facts
+                decision_record = RP.build_record(RP.none_decision(
+                    frame_route={"route_id": route["route_id"], "route_hash": route["route_hash"],
+                                 "cycle_id": record["cycle_id"]}, briefs=briefs, intent=intent))
+                _store_bytes_once(record_path, RP.render(decision_record))
+            decision = decision_record["decision"]
+            if decision["selected"] != RP.NONE:
+                return {**result, "state": "needs-attention", "reason": "route-decision-selection-unsupported"}
+            if closed is None:
+                _route_cli(jobs, "complete", "--route", str(path), "--node", RP.TERMINAL_NODE,
+                           "--evidence", str(record_path))
+                _route_cli(jobs, "close", "--route", str(path), "--summary",
+                           "framed route ended without a proposal: " + decision["reason"])
+            producer.finalize_exact_cycle(root, cycle_id=record["cycle_id"], expected_binding={
+                "kind": "runtime_producer_binding_v1", "campaign_id": record["campaign_id"],
+                "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
+                "cycle_record_digest": dispatch_terminal_commit.cycle_identity_digest(record)})
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    intent_file = root / decision["intent"]["path"]
+    return {**result, "state": "completed", "reason": "route-decision-none", "required_action": "compose-route",
+            "selected": decision["selected"], "decision_reason": decision["reason"],
+            "record_file": str(record_path), "intent_file": str(intent_file),
+            "brief_files": [str(root / row["path"]) for row in decision["briefs"]],
+            "next_step": "No route was proposed, so nothing starts automatically. Read intent_file and "
+                "brief_files, decide the next route, and compose it yourself."}
+
+
 def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=None,
              decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
     """Advance preparation once; repeating this call creates no duplicate job."""
@@ -516,6 +620,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         if closed.get("terminal_gate_proven") is not True:
             return {**result, "state": "needs-attention", "reason": "route-closed-unproven",
                     "required_action": "inspect-closed-route", "outcome": closed}
+        if RP.is_framed_route(route):
+            return _framed_settle(route, path, jobs, result, closed=closed)
         owner = closed.get("terminal_owner_attempt_id")
         rows = _rows(jobs)
         if owner and owner not in rows:
@@ -571,6 +677,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     if refusal:
                         return _capacity_wait(result, aid, node["id"], refusal, resume, clock)
                     receipt_lines = result["launches"][-1]["receipt"].splitlines()
+                    if "reason=frame-harness-unavailable" in receipt_lines and "child_spawned=0" in receipt_lines:
+                        return {**result, "state": "needs-attention", "reason": "frame-harness-unavailable",
+                                "frame_attempts": sorted(attempts)}
                     if (node["id"] == "frame-alternative" and result["launches"][-1]["exit_code"] == 75
                             and "check=deferred" in receipt_lines
                             and "reason=frame-first-attempt-pending" in receipt_lines
@@ -629,6 +738,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             if step["state"] != "released":
                 return {**result, **step}
             owner_frame_launch_gate(SimpleNamespace(route_file=str(path)), "start", ROOT, jobs)
+    if RP.is_framed_route(route):
+        return _framed_settle(route, path, jobs, result)
     rows = _rows(jobs)
     aid = _slot(route, "owner", rows)
     refusal = None
@@ -737,9 +848,11 @@ def _compose_again(route) -> str:
         task.write_text(str((route.get("work_request") or {}).get("text") or ""), encoding="utf-8")
     selection = route.get("selection") if isinstance(route.get("selection"), dict) else {}
     shape = selection.get("shape") or ("direct" if route.get("effective_intensity") == "direct" else "staged")
+    # A framed compose names no capability: the shape is the route.
+    named = [] if shape == "framed" else ["--capability", route["capability"],
+                                          "--capability-mode", str(route.get("capability_mode") or "default")]
     argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
-            "--slug", str(route.get("slug") or route["route_id"]), "--capability", route["capability"],
-            "--capability-mode", str(route.get("capability_mode") or "default"), "--shape", shape,
+            "--slug", str(route.get("slug") or route["route_id"]), *named, "--shape", shape,
             "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
             "--prompt-file", str(task), "--start"]
     if route.get("campaign_key"):
