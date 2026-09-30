@@ -9017,6 +9017,25 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
             f"attempt={prior} outcome={decision.outcome} responsible={decision.responsible} action={decision.action}")
 
 
+# Stable facts of one attempt's work. A row whose launcher never claimed it may be
+# relaunched by a new launcher whose per-launch values (lease nonce, release home,
+# parent runtime pid, sealed input digest) differ.
+_RELAUNCH_STABLE_KEYS = (
+    "attempt_id", "attempt_schema_version", "harness", "worker_type", "dispatch_depth",
+    "capability", "parent_sid", "parent_attempt_id", "route_id", "route_hash", "route_node",
+    "owner_route_id", "owner_route_hash", "automatic_retry_of",
+    "replacement_original_attempt_id", "replacement_family_id", "replacement_claim_digest",
+)
+
+
+def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> bool:
+    return (fields[1] == "open" and metadata.get("launch_claimed") == "0"
+            and metadata.get("launch_started") != "1" and not metadata.get("pid")
+            and fields[2:5] == row_fields[2:5]
+            and all(metadata.get(key, "") == row_metadata.get(key, "")
+                    for key in _RELAUNCH_STABLE_KEYS))
+
+
 def claim_attempt_row(
     jobs: Path,
     attempt_id: str,
@@ -9090,10 +9109,19 @@ def claim_attempt_row(
                 metadata = parse_registry_metadata(fields[5])
                 validate_attempt_metadata(metadata)
                 if _immutable_attempt_identity(fields) != _immutable_attempt_identity(row_fields):
-                    raise DispatchContractError(
-                        "attempt-identity-conflict",
-                        f"attempt_id={attempt_id}",
-                    )
+                    if not _never_launched_same_work(fields, metadata, row_fields, row_metadata):
+                        raise DispatchContractError(
+                            "attempt-identity-conflict",
+                            f"attempt_id={attempt_id}",
+                        )
+                    # A launcher stopped before its claim left only this row; the
+                    # new launcher's row (its own lease nonce, release, parent
+                    # runtime) takes its place.
+                    fields = list(row_fields)
+                    if not launch:
+                        lines[index] = "\t".join(fields) + ",launch_claimed=0"
+                        _atomic_registry_replace(jobs, lines)
+                        return False
                 if not launch or metadata.get("launch_claimed") == "1" or fields[1] != "open":
                     return False
                 _automatic_retry_admission(lines, row_metadata)

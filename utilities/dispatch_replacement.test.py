@@ -318,6 +318,28 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(result['reason'],'replacement-launch-pending')
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
 
+    def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        seen=[]
+        def slow(command,**kwargs):
+            seen.append((command,kwargs['timeout']))
+            raise subprocess.TimeoutExpired(command,kwargs['timeout'],output='waiting on disk',stderr=b'')
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+            first=R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual(first['reason'],'replacement-launch-timeout')
+        self.assertIn('waiting on disk',first['launcher_diagnostic'])
+        self.assertEqual(seen[0][1],R.LAUNCHER_TIMEOUT_SECONDS)
+        self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
+                    'note':'registered','launch_claimed':'0'},'open',append=True)
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+            R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
+
+    def test_an_io_failure_keeps_its_cause(self):
+        with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
+            result=R.advance(self.jobs,'att-source',run=mock.Mock())
+        self.assertEqual(result['reason'],'replacement-observation-unavailable')
+        self.assertEqual(result['detail'],'OSError: disk gone')
+
     def test_concurrent_actual_spawn_releases_one_fenced_process(self):
         record=self.claim();aid=record['replacement_attempt_id']
         source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
