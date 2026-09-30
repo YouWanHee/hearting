@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
+READABILITY_PATH=ROOT/"utilities/prd_readability.py"
 SPEC=importlib.util.spec_from_file_location("worker_route_guard",ROOT/"utilities/worker-route-guard.py")
 GUARD=importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(GUARD)
 sys.path.insert(0,str(ROOT/"utilities"))
@@ -26,6 +27,18 @@ def emit(event, events=None):
     print(line,flush=True)
     if events:
         with open(events,"a",encoding="utf-8") as fh: fh.write(line+"\n")
+
+
+def readability_event(prd: Path, preimage: bytes | None, postimage: bytes, route_id: str, version: int) -> tuple[dict, str | None]:
+    """Warn-only PRD readability receipt. Never raises; the write result is not its business."""
+    base={"status":"readability","route_id":route_id,"version":version,"path":str(prd)}
+    try:
+        spec=importlib.util.spec_from_file_location("prd_readability",READABILITY_PATH)
+        module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        report=module.check_bytes(postimage,preimage)
+        return {**base,**report},module.stderr_line(report)
+    except Exception as exc:
+        return {**base,"error":f"{type(exc).__name__}: {exc}"[:200]},f"prd-readability: check skipped ({type(exc).__name__})"
 
 
 def select_seed_reference(artifact: Path, receipt: dict | None, *, reference_id: str | None = None,
@@ -559,6 +572,13 @@ def main():
         if preimage is not None and postimage is None and result.returncode==0:
             emit({"status":"blocked","reason":"prd-missing-after-transaction","route_id":route["route_id"],"version":version},args.events)
             result=subprocess.CompletedProcess(command,65)
+        if postimage is not None and postimage!=preimage:
+            event,notice=readability_event(prd,preimage,postimage,route["route_id"],version)
+            try:
+                emit(event,args.events)
+                if notice: print(notice,file=sys.stderr,flush=True)
+            except Exception:
+                pass
         emit({"status":"released","route_id":route["route_id"],"version":version,"result":result.returncode,"snapshot":snapshot_status},args.events)
         lock.seek(0); lock.truncate(); lock.flush(); os.fsync(lock.fileno())
         return result.returncode
