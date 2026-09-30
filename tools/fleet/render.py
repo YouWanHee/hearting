@@ -5948,28 +5948,68 @@ def _shown_group_sessions(group_sessions):
             [s for s in group_sessions if session_parent_visible(s)])
 
 
-def _gpu_strip_keys(shown, gpu_resources):
-    """Sessions whose F-88 GPU strip is actually drawn (F-104 dedup source)."""
+def _drawn_gpu_jobs(group_jobs):
+    """Dispatch jobs `_emit_dispatch_tree` will draw (a folded child draws nothing)."""
+    visible_parents = {
+        j.slug for j in group_jobs
+        if j.slug and max(1, int(getattr(j, "depth", 1) or 1)) < 2}
+    drawn = []
+    for j in group_jobs:
+        if _is_plugin_agent(j):
+            continue  # a plugin row is drawn by _plugin_agent_row, without a GPU strip
+        if getattr(j, "parent_slug", None) and max(1, int(getattr(j, "depth", 1) or 1)) >= 2:
+            if j.parent_slug in visible_parents:
+                if not _SHOW_ALL and _fold_completed_child(j):
+                    continue  # absorbed into the conductor breadcrumb
+            elif not _SHOW_ALL and j.liveness in _DETACHED_FINISHED_LIVENESS:
+                continue  # finished child of a departed owner stays behind `a`
+        drawn.append(j)
+    return drawn
+
+
+def _emitted_group_jobs(g, show_sessions, show_jobs):
+    group_jobs = _visible_group_jobs(g["jobs"], show_sessions, show_jobs)
+    if not _SHOW_ALL:
+        group_jobs = [j for j in group_jobs
+                      if j.liveness != "dead" or getattr(j, "_dead_terminal_owner", False)]
+    return group_jobs
+
+
+def _gpu_strip_keys(shown, gpu_resources, group_jobs=(), session_by_identity=None):
+    """Entities whose F-88 GPU strip is actually drawn (F-104 dedup source).
+
+    `shown` are the drawn sessions; `group_jobs` are the emitted dispatch jobs, whose
+    strip is keyed by `_runtime_session_id` (or the exact pid/start child session) even
+    when that hidden child session is not on the board.
+    """
     keys = set()
     for s in shown:
         if getattr(s, "mem_worker", False):
             continue  # a mem row is drawn by _mem_row alone, without a GPU strip
         if _gpu_resources_for_session(s, gpu_resources):
             keys.add((s.harness, s.session_id or getattr(s, "_runtime_session_id", None)))
+    for job in _drawn_gpu_jobs(group_jobs):
+        owner = job if _gpu_resources_for_session(job, gpu_resources) else None
+        if owner is None and session_by_identity:
+            job_session = _session_for_job(session_by_identity, job)
+            if job_session is not None and _gpu_resources_for_session(job_session, gpu_resources):
+                owner = job_session
+        if owner is not None:
+            keys.add((owner.harness,
+                      getattr(owner, "session_id", None)
+                      or getattr(owner, "_runtime_session_id", None)))
     return keys
 
 
-def _group_emission(g, show_sessions, show_jobs, gpu_resources=None):
+def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
+                    session_by_identity=None):
     """Single source of truth for the session rows that the group loop emits.
 
     The earlier visible_order calculation is a conservative card-anchor approximation;
     it is intentionally separate from this exact emit predicate.
     """
     group_sessions = g["sessions"] if show_sessions else []
-    group_jobs = _visible_group_jobs(g["jobs"], show_sessions, show_jobs)
-    if not _SHOW_ALL:
-        group_jobs = [j for j in group_jobs
-                      if j.liveness != "dead" or getattr(j, "_dead_terminal_owner", False)]
+    group_jobs = _emitted_group_jobs(g, show_sessions, show_jobs)
     gpu = g.get("gpu") or []
     empty = not group_sessions and not group_jobs and not gpu
     if empty:
@@ -5980,8 +6020,8 @@ def _group_emission(g, show_sessions, show_jobs, gpu_resources=None):
                      if s.liveness not in ("stale", "dead") and not s.app_server]
     must_show_jobs = any(not getattr(j, "afterglow", False) for j in group_jobs)
     shown = _shown_group_sessions(group_sessions)
-    strip_keys = _gpu_strip_keys(shown, gpu_resources or {})
-    # GPU work is live work: a card holding a GPU row or a drawn session GPU
+    strip_keys = _gpu_strip_keys(shown, gpu_resources or {}, group_jobs, session_by_identity)
+    # GPU work is live work: a card holding a GPU row or a drawn session/job GPU
     # strip is never folded away.
     fold = ((not _SHOW_ALL) and (not live_sessions) and (not must_show_jobs)
             and (not gpu) and (not strip_keys))
@@ -6161,15 +6201,16 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     show_sessions = section in ("fleet", "both")
     show_jobs = section in ("dispatch", "both")
 
-    # F-104: live GPU processes neither a registered run nor a drawn session GPU
+    # F-104: live GPU processes neither a registered run nor a drawn session/job GPU
     # strip shows land on their cwd's project card (same rule as LAB RESOURCES).
     gpu_work = {}
     if show_jobs:
         strip_keys = set()
-        if show_sessions:
-            for g in groups.values():
-                strip_keys |= _gpu_strip_keys(
-                    _shown_group_sessions(g["sessions"]), gpu_resources)
+        for g in groups.values():
+            strip_keys |= _gpu_strip_keys(
+                _shown_group_sessions(g["sessions"]) if show_sessions else [],
+                gpu_resources, _emitted_group_jobs(g, show_sessions, show_jobs),
+                session_by_identity)
         snapshot, age_s = _fresh_compute_hosts()
         for entry in _compute_hosts.unregistered_gpu(
                 snapshot, resources or (), strip_keys, age_s or 0.0):
@@ -6197,7 +6238,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                              if s.liveness not in ("stale", "dead") and not s.app_server]
             if ((not _SHOW_ALL) and not live_sessions and not group_jobs and not group_gpu
                     and not _gpu_strip_keys(_shown_group_sessions(group_sessions),
-                                            gpu_resources)):
+                                            gpu_resources, group_jobs, session_by_identity)):
                 continue
             visible_order.append(name)
         # Reconcile only card anchors, but retain folded/empty groups in the
@@ -6210,7 +6251,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         order = live_order.reconcile_groups(visible_order, visible_tiers) + non_card_order
 
     emission_by_group = {
-        name: _group_emission(groups[name], show_sessions, show_jobs, gpu_resources)
+        name: _group_emission(groups[name], show_sessions, show_jobs, gpu_resources,
+                              session_by_identity)
         for name in order}
     tag_by_key = {}
     for emission in emission_by_group.values():

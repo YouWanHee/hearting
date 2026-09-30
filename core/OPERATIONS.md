@@ -858,9 +858,10 @@ registered jobs/runs keep their existing presentation. An expired probe sample
 loses its session GPU items. This read-only projection neither creates a
 resource-run registry entry nor changes the process lifecycle.
 A live GPU process that no working registered resource run (same pid and start,
-or same process group on the Fleet host) and no drawn session GPU line shows
-appears once under its `project_of(cwd)` project card, tagged `미등록`, with
-its GPU, VRAM, and running time; a process whose cwd cannot be read goes to
+or same process group on the Fleet host) and no drawn GPU line (session or
+dispatch job row) shows appears once under its `project_of(cwd)` project card,
+tagged `미등록` (or the owner's `job:`/`run:` label when the probe found owner
+evidence), with its GPU, VRAM, and running time; a process whose cwd cannot be read goes to
 `(unknown)`. The cwd only places the card and is never ownership evidence. The
 row uses the same probe sample, is read-only, adds no registry entry, and
 disappears with an expired sample.

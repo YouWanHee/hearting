@@ -814,7 +814,7 @@ def process_cwd(pid, expected_start):
     except OSError:
         return None
     after = proc_stat(pid)
-    if after is None or after["start"] != expected_start:
+    if after is None or after["start"] != expected_start or not same_euid(pid):
         return None
     if target.endswith(" (deleted)"):
         target = target[:-len(" (deleted)")]

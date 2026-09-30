@@ -16,7 +16,7 @@ if str(TOOLS) not in sys.path:
 
 from fleet import fleet, render  # noqa: E402
 from fleet.collectors import compute_hosts  # noqa: E402
-from fleet.model import ResourceJob, Session, fmt_min  # noqa: E402
+from fleet.model import DispatchJob, ResourceJob, Session, fmt_min  # noqa: E402
 
 
 SR_CWD = "/home/nas/user/Uihyeop/NN_Zoo/SR_CorrNet_DSC"
@@ -203,6 +203,60 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         row = next(i for i, line in enumerate(text) if "● GPU moving4:0" in line)
         self.assertGreater(row, header)
 
+    def _job_owned_gpu(self, **job_overrides):
+        owner = _session_owner()
+        snapshot = _snapshot((0, [_process(owner=owner, session_owner=owner)]))
+        # The dispatch child's own session is hidden (is_child); its job row draws the strip.
+        child = Session(harness="codex", pid=101, proc_start="11", cwd=SR_CWD,
+                        session_id=SESSION_ID, title="worker", liveness="working",
+                        is_child=True)
+        fields = dict(key="autopilot-code", slug="job1", cwd=SR_CWD, harness="codex",
+                      is_child=True, liveness="working")
+        fields.update(job_overrides)
+        job = DispatchJob(**fields)
+        job._runtime_session_id = SESSION_ID
+        return snapshot, child, job
+
+    def gpu_text(self, snapshot, sessions, jobs):
+        render.set_compute_hosts(snapshot)
+        built = render._build_lines(list(sessions), list(jobs), "both", False, 0,
+                                    term_width=120)
+        return [render._plain(line) if line is not None else "" for line in built]
+
+    def test_process_shown_in_dispatch_job_strip_is_not_repeated(self):
+        snapshot, child, job = self._job_owned_gpu()
+        text = self.gpu_text(snapshot, [child], [job])
+        self.assertEqual(sum(line.count("● GPU") for line in text), 1)
+        self.assertNotIn("미등록", "\n".join(text))
+        # the same holds when the hidden child session is not in the snapshot at all
+        text = self.gpu_text(snapshot, [], [job])
+        self.assertEqual(sum(line.count("● GPU") for line in text), 1)
+        self.assertNotIn("미등록", "\n".join(text))
+
+    def test_job_strip_key_follows_the_drawn_job_only(self):
+        snapshot, _child, job = self._job_owned_gpu()
+        render.set_compute_hosts(snapshot)
+        gpu_resources = render._gpu_session_resources()
+        self.assertEqual(render._gpu_strip_keys([], gpu_resources, [job]),
+                         {("codex", SESSION_ID)})
+        owner = DispatchJob(key="autopilot-code", slug="own", cwd=SR_CWD, harness="codex",
+                            liveness="working", depth=1)
+        folded = DispatchJob(key="autopilot-code", slug="stage", cwd=SR_CWD, harness="codex",
+                             liveness="done", depth=2, parent_slug="own")
+        folded._runtime_session_id = SESSION_ID
+        self.assertEqual(render._gpu_strip_keys([], gpu_resources, [owner, folded]), set())
+
+    def test_folded_job_draws_no_strip_so_the_card_row_shows_it_once(self):
+        snapshot, _child, _job = self._job_owned_gpu()
+        owner = DispatchJob(key="autopilot-code", slug="own", cwd=SR_CWD, harness="codex",
+                            liveness="working", depth=1)
+        folded = DispatchJob(key="autopilot-code", slug="stage", cwd=SR_CWD, harness="codex",
+                             liveness="done", depth=2, parent_slug="own")
+        folded._runtime_session_id = SESSION_ID
+        text = self.gpu_text(snapshot, [], [owner, folded])
+        self.assertEqual(sum(line.count("● GPU") for line in text), 1)
+        self.assertIn("미등록", next(line for line in text if "● GPU" in line))
+
     def test_projection_cost_is_bounded(self):
         hosts = []
         for h in range(3):
@@ -212,12 +266,22 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
                              cwd="/data/proj%d" % (p % 5))
                     for p in range(20)]}
                 for g in range(8)]})
-        snapshot = {"configured": True, "hosts": hosts}
-        started = time.perf_counter()
-        entries = compute_hosts.unregistered_gpu(snapshot)
-        elapsed = time.perf_counter() - started
-        self.assertEqual(len(entries), 480)
-        self.assertLess(elapsed, 0.05)
+        snapshot = {"configured": True, "observed_at": time.time(), "hosts": hosts}
+
+        def build():
+            started = time.perf_counter()
+            built = render._build_lines([], [], "both", False, 0, term_width=120)
+            return time.perf_counter() - started, built
+
+        render.set_compute_hosts({"configured": True, "observed_at": time.time(), "hosts": []})
+        baseline, _ = build()
+        render.set_compute_hosts(snapshot)
+        with_gpu, built = build()
+        text = [render._plain(line) for line in built if line is not None]
+        self.assertEqual(sum(line.count("● GPU") for line in text), 480)
+        self.assertEqual(len(compute_hosts.unregistered_gpu(snapshot)), 480)
+        # Generous ceiling for slow CI; the plan's target is ~50 ms of added work.
+        self.assertLess(with_gpu - baseline, 0.5)
 
 
 class UnregisteredGpuJsonTest(unittest.TestCase):
