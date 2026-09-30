@@ -121,12 +121,14 @@ RULES (the same criteria used for the 2026-09-29 full backfill):
 4. Stay inside this campaign. Do not force unrelated cycles together. For every
    target you leave ungrouped, give the real reason.
 5. For each TARGET choose exactly one: join (an existing group_id whose subgoal the
-   target shares or continues), new (a new group of >= 2 members; members may
-   include listed UNGROUPED cycles of this campaign), or none. Keep the granularity
+   target shares or continues), new (a new group; it may hold this target alone
+   or also listed UNGROUPED cycles of this campaign), or none. Keep the granularity
    of the existing groups: a target that carries an existing group's subgoal
    forward (its next step, handoff, deployment, or fix) joins that group even when
    several targets could also form a smaller group of their own; start a new group
-   only for a subgoal no existing group covers.
+   only for a subgoal no existing group covers. A target that starts such a subgoal
+   (for example a new outside request) opens its own new group even as the only
+   member; do not fold it into an existing group just to avoid a one-cycle group.
 6. Write titles, stage labels, reasons, and rationales in the language already
    used by this campaign's existing group titles, or otherwise by its documents.
    Title <= 120 chars, stage label <= 40, reason / rationale <= 280, one line each.
@@ -874,7 +876,7 @@ def validate_response(text: str, review_input: ReviewInput) -> ValidatedDecision
         if not isinstance(key, str) or not key or key in new_groups:
             raise ReviewError("invalid-response", "new-group-key")
         members = item["members"]
-        if not isinstance(members, list) or not 2 <= len(members) <= 64:
+        if not isinstance(members, list) or not 1 <= len(members) <= 64:
             raise ReviewError("invalid-response", "new-group-size")
         new_groups[key] = {"key": key, "title": _text(item["title"], 120, "group-title-invalid"),
                            "raw_members": [_closed(m, _MEMBER_KEYS, "member-keys") for m in members]}
