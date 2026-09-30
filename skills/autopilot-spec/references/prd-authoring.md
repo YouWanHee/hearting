@@ -16,16 +16,38 @@ A PRD is an agent artifact and grows verbose; the user-facing blueprint must sta
 - **비전 한 줄**: <what this project is, in one line>
 - **현재 형태**: <current shape/stage, ≤3 lines>
 - **활성 결정·불변식**: <5–10 bullets — the decisions and invariants that currently govern the work>
-- **진행 중·직후 사이클**: <≤3 bullets>
+- **진행 중·직후 사이클**: <≤3 bullets — what is being done now and what comes next, one line each>
 <!-- BLUEPRINT-SUMMARY:END -->
 ```
 
 Rules:
 
-- **Hard cap 40 lines** between the markers. The block is a blueprint, not a changelog — rewrite it to stay current and short; never append version history into it.
+- **Bounded for a human reader**: at most **40 lines** between the markers, **160 characters** per item (a list item with its continuation lines, or a paragraph), and **2,500 characters** for the whole block, counted as Unicode characters. The block is a blueprint, not a changelog — rewrite it to stay current and short; never append version history into it. Only blank lines may sit between the H1 title and the BEGIN marker; a history quote there moves to `pipeline_summary.md`.
+- **Plain words**: no `§N` section references, internal abbreviations, or identifiers in the block; spell out a necessary term on first use. The in-progress bullets say what is being done now and what comes next — not commit or registration history.
 - **Same-transaction refresh**: every update-mode transaction (major or minor) refreshes the block together with the body under the same `.pipeline-lock`, and the block's `⟨v{N}⟩` marker matches the version being written. A stale summary is drift.
 - **Legacy adoption**: a PRD without the block gains it on its next update; do not run a separate sweep just to inject blocks.
 - **Stable contract**: the marker strings are consumed downstream by deterministic extractors (e.g., the Cairn spec mirror shows the block as the default blueprint view and feeds it to routing/steward context — Cairn PRD §54.10). Never rename, localize, or nest the markers; write the block content in the artifact language of the PRD.
+
+### PRD Body Rules
+
+The body below the summary block holds only the current contract.
+
+- **Current content only.** A revision rewrites the affected section in place and deletes superseded or retired content; the previous text survives in the `_internal/versions/v{N}/prd.md` snapshot. In `research` mode a closed step shrinks to its one-line verdict with evidence links, and a rejected track stays, kept short.
+- **History outside the body.** Revision reasons, quoted user wording, triggers, supersede tables, and per-version narrative go to `pipeline_summary.md`. Body headings and paragraphs carry no `⟨vN, date⟩`-style tags; the summary heading holds the only version tag.
+- **No internal tracking IDs.** Commit hashes, route IDs (`rt-…`), revision IDs (`rrev_…`), cycle and attempt IDs (`cyc_…`, `att-…`), and session or pane names belong in `pipeline_summary.md`.
+- **Sentences.** Conclusion first, one fact per sentence. Use plain numbers and letters, never circled or otherwise enclosed digits, letters, or small roman numerals.
+- **Headings (recommended).** Top-level sections use one form, `## N. Title`. Do not mark a heading as partially superseded — rewrite the section instead.
+
+`utilities/spec-transaction.py` checks the mechanical part of these rules whenever a transaction changes `prd.md`. It emits one `readability` event with counts per rule, split into lines new in this revision and lines carried over, prints one stderr line when anything is found, and never changes the exit code. `python3 "$AGENT_HOME/utilities/prd_readability.py" check <prd.md> [--base <previous prd.md>]` shows the same report before writing.
+
+### Current-Contract Rewrite
+
+A legacy PRD that accumulated history is rewritten once into a current-contract edition:
+
+1. Run it as one **major** update-mode transaction; the helper snapshots the old PRD as usual.
+2. Write a preservation table to `spec/_internal/rewrite/v{N}-preservation.md`, where `N` is the transaction's `AGENT_SPEC_NEXT_VERSION`. One row per decision, invariant, and acceptance criterion of the old PRD: old location, new location, and `kept`, `merged`, or `superseded by <what>`. No row stays empty.
+3. Rewrite the body and the summary block under the rules above. Move history into `pipeline_summary.md`, citing the snapshot and the table.
+4. Aim for zero new-line findings in the transaction's `readability` event; review the table with the user as a major update.
 
 ### Step 1: Collect Information and Confirm
 
@@ -135,16 +157,16 @@ Use the following PRD structure. Render descriptive prose in the user's communic
 
 <!-- BLUEPRINT-SUMMARY:BEGIN -->
 ## ✦ 청사진 요약 ⟨v1, YYYY-MM-DD⟩
-(비전 한 줄 · 현재 형태 · 활성 결정·불변식 · 진행 중 사이클 — ≤40 lines, see Blueprint Summary Block above)
+(비전 한 줄 · 현재 형태 · 활성 결정·불변식 · 진행 중 사이클 — ≤40 lines, ≤160 chars per item, ≤2,500 chars; see Blueprint Summary Block above)
 <!-- BLUEPRINT-SUMMARY:END -->
 
-## Common
+## 1. Common
 - Module structure
 - Dependencies
 - Language and runtime versions
 - License
 
-## [app] (only when selected)
+## N. [app] (only when selected)
 ### Feature list (P0/P1/P2)
 ### User scenarios (3–5)
 ### Nonfunctional requirements
@@ -152,35 +174,35 @@ Use the following PRD structure. Render descriptive prose in the user's communic
 ### API Contract (shared by backend and frontend: endpoint, body, error, auth)
 ### Screen flow (when a UI exists)
 
-## [library] (only when selected)
+## N. [library] (only when selected)
 ### Public API (exported functions, classes, and types)
 ### Usage examples (for README)
 ### Compatibility and versioning (semver policy)
 ### Module structure, such as src/{io,core,utils}/
 
-## [api] (only when selected)
+## N. [api] (only when selected)
 ### Endpoints (POST /api/X, GET /api/Y, ...)
 ### Body and response shapes
 ### Error codes
 ### Auth (token / OAuth / API key)
 ### Rate limiting
 
-## [cli] (only when selected)
+## N. [cli] (only when selected)
 ### Commands (train / eval / serve / ...)
 ### Options (--config / --resume / --output / ...)
 ### Input/output formats
 ### Exit codes
 
-## [research] (only when selected)
+## N. [research] (only when selected)
 ### Premises and measured constants (task context; empirical constants with source experiments)
-### Step ladder (Step N: status done/active/planned — objective, configuration, decision criteria, follow-on; a closed step keeps its verdict + evidence link)
+### Step ladder (Step N: status done/active/planned — objective, configuration, decision criteria, follow-on; a closed step keeps only its one-line verdict + evidence link)
 ### Decision protocols (operating targets and judgment axes, with user-confirmation dates)
 ### Execution order (resource-aware run order, such as GPU allocation)
-### Rejected tracks (rejection basis + revival cues; keep, never delete)
+### Rejected tracks (rejection basis + revival cues, kept short; never delete)
 ### Completion criteria (per-step deliverables incl. `_RUNLOG` lineage)
 ### Reproduction contract (entry points, `configs/*.yaml` structure, reproduction commands, expected metrics, baseline comparison)
 
-## Architecture Diagrams
+## N. Architecture Diagrams
 
 ### Component diagram (Mermaid; first-class for every mode)
 Show module-level composition and dependencies at a glance:
@@ -221,7 +243,7 @@ flowchart LR
 Do not generate optional diagrams by default. Add them only on an explicit request such as `/autopilot-spec --add-diagram <type>` or a reasoned complexity inference such as five or more entities, a state-heavy domain, or a complex flow.
 ````
 
-For one mode, include only that mode section. For combined modes, keep each section independent.
+For one mode, include only that mode section. For combined modes, keep each section independent. Number the included top-level sections in order.
 
 ### Step 3.5: Coupled Updates When the PRD Changes
 

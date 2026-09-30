@@ -5146,6 +5146,11 @@ class SourceCensusTest(unittest.TestCase):
   # then compares the pending finish intent's route ID with that admitted
   # binding. This is finish-tuple integrity, not another cycle selection.
   "_inline_producer_binding_check",
+  # The shared helper `_finalize_route` and `cycle_route_admission` consult
+  # before a lineage-fork/superseded refusal. Its route-id comparison is a
+  # visited-set guard so a lineage loop never reads as closed; it selects no
+  # cycle for a live route.
+  "closed_lineage_handover",
  })
 
  def test_a25_7_cycle_ownership_and_lineage_single_site(self):
@@ -6895,6 +6900,132 @@ class ShipPackageOwnerCompletionTest(OwnerRegisteredCompletionTest):
  def fixture(self, **overrides):
   return super().fixture(capability="autopilot-ship",capability_mode="package",
    node_id="package",**overrides)
+
+
+class OwnerNodeBoundTerminalTest(unittest.TestCase):
+ """A one-shot owner row sealed by `route_*` fields still proves its terminal.
+
+ The supervisor may close the registered row (`completed-supervisor`) before
+ the marker writer runs. The no-marker reader then has only the row and its
+ exact handoff, so it must read the node-bound shape as well as `owner_route_*`.
+ """
+
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+  self.base=Path(self.tmp.name)
+  self.work=self.base/"work"; self.work.mkdir()
+  self.artifacts=self.base/"artifacts"; self.artifacts.mkdir()
+  self.jobs=self.base/"state"/"jobs.log"; self.jobs.parent.mkdir()
+  previous=os.environ.get("AGENT_ARTIFACT_ROOT")
+  os.environ["AGENT_ARTIFACT_ROOT"]=str(self.artifacts)
+  self.addCleanup(lambda: os.environ.pop("AGENT_ARTIFACT_ROOT",None) if previous is None
+                  else os.environ.__setitem__("AGENT_ARTIFACT_ROOT",previous))
+  self.route=R.compile_route(
+   "autopilot-code","dev","quick",self.work,self.artifacts,
+   predicates=[],transport=None,tracking="tracked",
+   tracked_gate_evidence={"spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+    "drift_verdict":"within-spec","workflow_mode":"tracked",
+    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"}},
+   registered_headless_evidence={"candidates":[
+    {"harness":harness,"transport":"headless","surface":"registered-headless",
+     "status":"supported","probe_source":"fixture-probe","probe_time":"2026-07-20T00:00:00Z"}
+    for harness in ("codex","claude")]})
+  self.node=next(n for n in self.route["nodes"] if n["id"]=="one-shot")
+  self.route_file=R.canonical_route_path(self.artifacts,self.route["route_id"])
+  self.route_file.parent.mkdir(parents=True); self.route_file.write_text(json.dumps(self.route))
+  self.evidence=self.artifacts/"report.md"; self.evidence.write_text("검증 완료\n")
+
+ def log(self,harness,name="owner.log"):
+  handoff=f"artifact: {self.evidence}\nverdict: PASS\nblocker: none"
+  if harness=="claude":
+   rows=[{"type":"result","subtype":"success","is_error":False,"result":handoff}]
+  else:
+   rows=[{"type":"item.completed","item":{"type":"agent_message","text":handoff}},
+         {"type":"turn.completed"}]
+  path=self.base/name
+  path.write_text("".join(json.dumps(row)+"\n" for row in rows)); return path
+
+ def row(self,harness="claude",attempt="att-node-bound",**overrides):
+  """One done owner row that carries no `owner_route_*` key."""
+  meta={"attempt_id":attempt,"worker_type":"owner","unit":"_kernel/owner","dispatch_depth":"1",
+   "registered_worker":"1","harness":harness,"route_file":str(self.route_file),
+   "route_id":self.route["route_id"],"route_hash":self.route["route_hash"],"route_node":"one-shot",
+   "workflow_completion":"runtime-v1","note":"completed-supervisor","failure_class":"pass",
+   "log_file":str(self.log(harness,f"{attempt}.log")),"artifact_root":str(self.artifacts),
+   "pid":"2147483647","pid_start":"1"}
+  meta.update(overrides)
+  return "\t".join(["2026-09-30T00:00:00Z","done",str(self.work),str(self.work),"owner",
+   ",".join(k+"="+v for k,v in meta.items() if v is not None)])
+
+ def observe(self,*rows,route=None):
+  self.jobs.write_text("".join(r+"\n" for r in rows))
+  route=route or self.route
+  with mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
+       mock.patch.object(R,"owner_terminal_prerequisites",return_value={}):
+   return R.terminal_gate_observation(route,jobs=self.jobs,exact_terminal=True)["one-shot"]
+
+ def assertProven(self,gate,attempt):
+  self.assertTrue(gate["passed"],gate)
+  self.assertEqual(gate["source"],"owner-terminal")
+  self.assertEqual(gate["attempt_id"],attempt)
+  self.assertEqual(gate["evidence"],str(self.evidence))
+  self.assertEqual(gate["reason"],"owner-terminal-verified")
+
+ def test_node_bound_owner_passes_without_a_marker_for_both_harnesses(self):
+  for harness in ("claude","codex"):
+   with self.subTest(harness=harness):
+    marker=R.completion_dir(self.route["route_id"],jobs=self.jobs)/"one-shot.json"
+    self.assertFalse(marker.exists())
+    self.assertProven(self.observe(self.row(harness,f"att-{harness}")),f"att-{harness}")
+
+ def test_owner_route_row_still_passes(self):
+  owner=self.row(attempt="att-owner-route",route_id=None,route_hash=None,route_node=None,
+   owner_route_id=self.route["route_id"],owner_route_hash=self.route["route_hash"],
+   owner_route_file=str(self.route_file))
+  self.assertProven(self.observe(owner),"att-owner-route")
+
+ def test_foreign_route_or_node_rows_are_never_the_proof(self):
+  good=self.row(attempt="att-good")
+  foreign=(self.row(attempt="att-other-route",route_id="rt-0000000000000000"),
+           self.row(attempt="att-other-hash",route_hash="sha256:"+"0"*64),
+           self.row(attempt="att-other-node",route_node="frame"))
+  for row in foreign:
+   with self.subTest(order="after",row=row.split("attempt_id=")[1].split(",")[0]):
+    self.assertProven(self.observe(good,row),"att-good")
+   with self.subTest(order="before",row=row.split("attempt_id=")[1].split(",")[0]):
+    self.assertProven(self.observe(row,good),"att-good")
+   with self.subTest(order="only",row=row.split("attempt_id=")[1].split(",")[0]):
+    gate=self.observe(row)
+    self.assertFalse(gate["passed"],gate)
+    self.assertEqual(gate["reason"],"owner-attempt-absent")
+
+ def test_incomplete_owner_binding_does_not_use_the_node_bound_path(self):
+  half=self.row(attempt="att-half",owner_route_id=self.route["route_id"],
+                owner_route_hash=self.route["route_hash"])
+  gate=self.observe(half)
+  self.assertFalse(gate["passed"],gate)
+  self.assertIn(gate["reason"],("owner-route-identity-mismatch","owner-terminal-evidence-unverified"))
+
+ def test_node_bound_owner_needs_a_quick_route(self):
+  gate=self.observe(self.row(),route=dict(self.route,effective_intensity="standard"))
+  self.assertFalse(gate["passed"],gate)
+  self.assertEqual(gate["reason"],"owner-route-identity-mismatch")
+
+ def test_node_bound_owner_needs_this_routes_file(self):
+  other=self.artifacts/".runtime"/"routes"/"rt-elsewhere.json"; other.write_text("{}")
+  gate=self.observe(self.row(route_file=str(other)))
+  self.assertFalse(gate["passed"],gate)
+  self.assertEqual(gate["reason"],"owner-route-identity-mismatch")
+
+ def test_owner_route_row_advanced_to_another_route_still_mismatches(self):
+  owner=self.row(attempt="att-advanced",route_id=None,route_hash=None,route_node=None,
+   owner_route_id=self.route["route_id"],owner_route_hash=self.route["route_hash"],
+   owner_route_file=str(self.route_file))
+  moved=mock.Mock(route_id="rt-0000000000000000",route_hash="sha256:"+"0"*64)
+  with mock.patch("owner_route_binding.resolve_owner_route_lifecycle",return_value=(moved,"advanced")):
+   gate=self.observe(owner)
+  self.assertFalse(gate["passed"],gate)
+  self.assertEqual(gate["reason"],"owner-route-identity-mismatch")
 
 
 class ExactFenceFailureModeTest(unittest.TestCase):

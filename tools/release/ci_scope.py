@@ -36,7 +36,46 @@ def published_tag(context):
     return tag
 
 
-def select(repo, event, context, *, released_tag=None):
+def gh_api(path):
+    result = subprocess.run(
+        ["gh", "api", path], check=True, capture_output=True, text=True, timeout=15,
+    )
+    return json.loads(result.stdout)
+
+
+def validated_pr_tree(repo, head, context, api):
+    """Return the tree SHA that a successful same-repository PR Checks run vouched for.
+
+    The marker artifact name is only a search key. What is trusted is the run
+    the API attributes it to, together with the tree computed from this
+    checkout. Anything short of a clean match returns None (or raises), and
+    the caller then runs the full suite.
+    """
+    repository = context.get("GITHUB_REPOSITORY", "")
+    if not context.get("GH_TOKEN") or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        return None
+    tree = PLAN.git(repo, "rev-parse", f"{head}^{{tree}}").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        return None
+    repository_id = context.get("GITHUB_REPOSITORY_ID", "")
+    listing = api(f"repos/{repository}/actions/artifacts?name=validated-tree-{tree}&per_page=100")
+    for artifact in listing["artifacts"]:
+        if artifact["name"] != f"validated-tree-{tree}" or artifact["expired"] is not False:
+            continue
+        run = api(f"repos/{repository}/actions/runs/{int(artifact['workflow_run']['id'])}")
+        base, fork = run["repository"], run["head_repository"]
+        if (base["full_name"].lower() == repository.lower()
+                and (not repository_id or str(base["id"]) == repository_id)
+                and fork["id"] == base["id"]
+                and run["path"] == ".github/workflows/checks.yml"
+                and run["event"] == "pull_request"
+                and run["status"] == "completed"
+                and run["conclusion"] == "success"):
+            return tree
+    return None
+
+
+def select(repo, event, context, *, released_tag=None, api=gh_api):
     kind = context.get("GITHUB_EVENT_NAME")
     head = context.get("GITHUB_SHA") or "HEAD"
     try:
@@ -64,6 +103,15 @@ def select(repo, event, context, *, released_tag=None):
         paths = [path for path in result.stdout.split("\0") if path]
         if paths and all(documentation_path(path) for path in paths):
             return False, "documentation-only"
+        if kind == "push":
+            # Only a change that would otherwise run everything asks whether
+            # the PR already ran this exact tree; any doubt keeps the full run.
+            try:
+                tree = validated_pr_tree(repo, head, context, api)
+            except Exception:
+                tree = None
+            if tree:
+                return False, f"validated-pr-tree:{tree}"
         return True, "runtime-test-or-unclassified-change"
     except (PLAN.PlanError, subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError):
         return True, "comparison-unavailable"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -52,7 +53,11 @@ def _proc_start(pid: int) -> str:
 
 class RouteAutocloseTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-")
+        # A background child the code under test starts may still be writing into
+        # the fixture root at teardown (CI flake 2026-09-29/30, "Directory not
+        # empty"); cleanup must not turn that into a failure. Root cause is
+        # tracked separately.
+        self.temp = tempfile.TemporaryDirectory(prefix="route-autoclose-test-", ignore_cleanup_errors=True)
         self.base = base = Path(self.temp.name)
         self.repo, self.root = base / "repo", base / "artifacts"
         self.repo.mkdir(); self.root.mkdir()
@@ -689,6 +694,333 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertIn("route_autoclose closed=1", done.stderr)
         after = snapshot()
         self.assertEqual(sorted(key for key in after if before.get(key) != after[key]), [])
+
+
+def _load(name: str, file: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "utilities" / file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PRODUCER_FIXTURE = _load("route_autoclose_producer_fixture", "artifact_producer.test.py")
+
+
+class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
+    """Sweep-level cases for what earlier sweeps left open: cycles of a closed
+    lineage other cycles began in, and workflow-group members that ended empty.
+    Lineages are built with the producer fixture and swept in-process; every
+    path is a temporary root."""
+
+    fixture = PRODUCER_FIXTURE
+
+    def setUp(self):
+        super().setUp()
+        self.P, self.R = self.fixture.P, self.fixture.R
+        lineage = self.fixture.RouteLineageBindingTest
+        for name in ("_root_route", "_publish_root", "_continuation", "_begin", "_close"):
+            setattr(self, name, getattr(lineage, name).__get__(self))
+        self._campaign_writes = 0
+
+    # -- fixtures -------------------------------------------------------
+    def _begin_all(self, routes):
+        """One cycle per route, the way a resumed route began a fresh cycle inside an
+        earlier cycle's lineage: the earlier ones are held not-open while it begins."""
+        cycles = []
+        for route in routes:
+            held = [self.P.read_cycle_record(self.root, cycle["cycle_id"]) for cycle in cycles]
+            for record in held:
+                self.P._write_cycle_record(self.root, dict(record, state="abandoned"), exclusive=False)
+            cycles.append(self._begin(route))
+            for record in held:
+                self.P._write_cycle_record(self.root, record, exclusive=False)
+        for index, cycle in enumerate(cycles):
+            self.write_output(cycle, f"plans/leftover-{index}/note.md", f"cycle {index}\n".encode())
+        return cycles
+
+    def _close_unproven(self, route):
+        path = self.R.canonical_route_path(self.root, route["route_id"])
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        checked = self.R.verify_route(dict(raw), None, allow_stale_registry=True)
+        self.R.close_route(checked, path, None, "fixture", allow_unproven=True,
+                           autoclose={"reason": "idle", "trigger": "compose", "closed_by": "runtime",
+                                      "proof": "not-claimed", "at": "2026-09-30T00:00:00Z"})
+
+    def _sweep(self, hours=2):
+        import route_autoclose
+        return route_autoclose.sweep(self.root, api=self.R, trigger="compose", now=time.time() + hours * 3600)
+
+    def _record(self, cycle):
+        return self.P.read_cycle_record(self.root, cycle["cycle_id"])
+
+    def _manifest_routes(self, cycle):
+        record = self._record(cycle)
+        directory = self.P.cycle_dir(self.root, record["campaign_id"], cycle["cycle_id"], record)
+        document = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        return [row["route_id"] for row in document["routes"]]
+
+    def _results(self, summary):
+        return {row["cycle_id"]: row["cycle"] for row in summary["cycles"]}
+
+    # -- lineages ---------------------------------------------------------
+    def test_handed_over_lineage_cycles_seal_on_their_own_routes(self):
+        a = self._root_route("leftover-own")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycles = self._begin_all([a, b, c])
+        for route in (a, b, c):
+            self._close_unproven(route)
+        started = time.monotonic()
+        summary = self._sweep()
+        elapsed = time.monotonic() - started
+        print(f"route_autoclose_test lineage-sweep seconds={elapsed:.3f}", file=sys.stderr)
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(self._results(summary), {cycle["cycle_id"]: "cycle-abandoned" for cycle in cycles})
+        for cycle, route in zip(cycles, (a, b, c)):
+            self.assertEqual(self._record(cycle)["state"], "sealed")
+            self.assertEqual(self._manifest_routes(cycle), [route["route_id"]])
+
+    def test_open_lineage_tree_keeps_ambiguity(self):
+        import route_autoclose
+        a = self._root_route("leftover-live")
+        self._publish_root(a)
+        b = self._continuation(a)
+        first, second = self._begin_all([a, b])
+        self._close_unproven(a)   # B stays open: the lineage is live
+        summary = self._sweep()
+        self.assertTrue(all(row["cycle"].startswith("cycle-left-open") for row in summary["cycles"]), summary)
+        self.assertEqual(self._record(first)["state"], "open")
+        self.assertEqual(self._record(second)["state"], "open")
+        self.assertFalse((self.P.cycle_dir(self.root, self._record(first)["campaign_id"], first["cycle_id"])
+                          / "manifest.json").exists())
+        # The ambiguity is not bypassed for a live tree, whatever record is offered.
+        self.assertTrue(route_autoclose._seal_cycle(self.root, b, False, record=self._record(first))
+                        .startswith("cycle-unresolved:route-cycle-binding-ambiguous"))
+        self.assertEqual(self._record(first)["state"], "open")
+
+    def test_lineage_fork_cycle_seals(self):
+        a = self._root_route("leftover-fork")
+        self._publish_root(a)
+        x = self._continuation(a, reason="leftover-fork-x")
+        y = self._continuation(a, reason="leftover-fork-y")
+        first = self._begin(a)
+        record = self._record(first)
+        self.P._write_cycle_record(self.root, dict(record, state="abandoned"), exclusive=False)
+        second = self._begin(y)
+        self.P._write_cycle_record(self.root, record, exclusive=False)
+        for cycle in (first, second):
+            self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        for route in (a, x, y):
+            self._close_unproven(route)
+        summary = self._sweep()
+        self.assertEqual(self._results(summary), {first["cycle_id"]: "cycle-abandoned",
+                                                  second["cycle_id"]: "cycle-abandoned"})
+        self.assertEqual(self._manifest_routes(first), [x["route_id"]])
+        self.assertEqual(self._manifest_routes(second), [y["route_id"]])
+
+    def test_index_duplicate_shape_seals_on_begin_route(self):
+        a = self._root_route("leftover-index")
+        self._publish_root(a)
+        b = self._continuation(a)
+        first = self._begin(a)
+        self.assertTrue(self.R.bind_continuation_cycle(self.root, a, b)["bound"])
+        record = self._record(first)
+        self.P._write_cycle_record(self.root, dict(record, state="abandoned"), exclusive=False)
+        second = self._begin(b)
+        self.P._write_cycle_record(self.root, record, exclusive=False)
+        for cycle in (first, second):
+            self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        for route in (a, b):
+            self._close_unproven(route)
+        sealed = self.P.finalize(self.root, cycle_id=second["cycle_id"], state="abandoned",
+                                 abandon_reason="route-unrecoverable")
+        self.assertEqual(sealed["status"], "sealed")
+        summary = self._sweep()
+        self.assertEqual(self._results(summary), {first["cycle_id"]: "cycle-abandoned"})
+        self.assertEqual(self._manifest_routes(first), [a["route_id"]])
+        index = self.P.artifact_admission.load_index(self.root)
+        root_id = next(iter(index.routes))
+        self.assertEqual({route: row["cycle_id"] for route, row in index.routes[root_id].items()},
+                         {a["route_id"]: first["cycle_id"], b["route_id"]: second["cycle_id"]})
+
+    def test_symlink_is_excluded_by_the_abandoned_seal(self):
+        route, route_file = self.route(slug="leftover-symlink", campaign_key="leftover-links")
+        begun = self.P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                             intensity="direct", campaign_key="leftover-links")
+        self.write_output(begun, "designs/mockup.html", b"<html></html>\n")
+        link = Path(begun["cycle_dir"]) / "artifacts" / "designs" / "mockup-dark.html"
+        link.symlink_to("mockup.html")
+        self.close(route, route_file)   # proven: the completed seal is tried first
+        summary = self._sweep()
+        self.assertEqual(self._results(summary), {begun["cycle_id"]: "cycle-abandoned"})
+        record = self._record(begun)
+        self.assertEqual(record["state"], "sealed")
+        self.assertEqual(record["excluded_symlinks"], ["artifacts/designs/mockup-dark.html"])
+        self.assertEqual(os.readlink(link), "mockup.html")
+        directory = self.P.cycle_dir(self.root, record["campaign_id"], begun["cycle_id"], record)
+        document = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([row["locator"]["path"] for row in document["artifact_revisions"]],
+                         ["artifacts/designs/mockup.html"])
+        self.assertEqual(document["cycle"]["state"], "abandoned")
+
+    def test_remembered_failure_retried_once_after_rule_change(self):
+        route, route_file = self.route(slug="leftover-memory", campaign_key="leftover-memory")
+        begun = self.P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                             intensity="direct", campaign_key="leftover-memory")
+        self.write_output(begun, "reports/note.md", b"note\n")
+        self._close_unproven(route)
+        record = self._record(begun)
+        self.P._write_cycle_record(self.root, dict(record, parent_cycle_id="cyc_" + "e" * 32), exclusive=False)
+        state = self.root / ".runtime/route-autoclose/state.json"
+        self.assertEqual(len(self._sweep()["cycles"]), 1)
+        self.assertEqual(json.loads(state.read_text())["unsealable"][begun["cycle_id"]]["rules"], 2)
+        self.assertEqual(self._sweep()["cycles"], [])   # remembered
+        memory = json.loads(state.read_text())
+        del memory["unsealable"][begun["cycle_id"]]["rules"]   # what an earlier version wrote
+        state.write_text(json.dumps(memory))
+        self.assertEqual(len(self._sweep()["cycles"]), 1)   # asked once more
+        self.assertEqual(self._sweep()["cycles"], [])
+
+    # -- empty workflow-group members ---------------------------------------
+    def _grouped(self, key, count):
+        """`count` open cycles in one campaign, each with a payload and an open manifest
+        the workflow-group evidence binds to (as artifact_workflow_groups.test.py does)."""
+        import artifact_workflow_groups as W
+        if not self.P.artifact_lifecycle.read_root_identity(self.root):
+            self.activate()
+        rows = []
+        for index in range(count):
+            route, route_file = self.route(slug=f"{key}-{index}", campaign_key=key)
+            begun = self.P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                                 intensity="direct", campaign_key=key)
+            payload = self.write_output(begun, f"plans/{key}-{index}.md", f"cycle {index}\n".encode())
+            artifact_id, revision_id = "art_" + f"{index + 1:032x}", "arev_" + f"{index + 1:032x}"
+            interim = {
+                "artifact_root_id": self.fixture.ROOT_ID, "repository_id": self.fixture.REPO_ID,
+                "campaign": {"campaign_id": begun["campaign_id"]},
+                "cycle": {"cycle_id": begun["cycle_id"], "campaign_id": begun["campaign_id"], "state": "open"},
+                "artifacts": [{"artifact_id": artifact_id, "cycle_id": begun["cycle_id"]}],
+                "artifact_revisions": [{"artifact_id": artifact_id, "artifact_revision_id": revision_id,
+                                        "content_digest": W._digest(payload.read_bytes()),
+                                        "locator": {"kind": "cycle-relative",
+                                                    "path": f"artifacts/plans/{key}-{index}.md"}}],
+            }
+            manifest = self.P.producer_dir(self.root) / "open-manifests" / f"{begun['cycle_id']}.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(json.dumps(interim), encoding="utf-8")
+            rows.append({"id": begun["cycle_id"], "campaign": begun["campaign_id"], "route": route,
+                         "route_file": route_file, "file": payload,
+                         "path": payload.relative_to(self.root).as_posix()})
+        return rows
+
+    @staticmethod
+    def _group(title, rows, relations=()):
+        return {"title": title,
+                "members": [{"cycle_id": row["id"], "stage_label": f"Stage {n}"} for n, row in enumerate(rows)],
+                "relations": [{"from_cycle_id": a["id"], "to_cycle_id": b["id"], "kind": "precedes",
+                               "rationale": "The second cycle uses the first cycle's evidence.",
+                               "evidence_refs": [{"path": a["path"]}, {"path": b["path"]}]}
+                              for a, b in relations]}
+
+    def _declare(self, campaign, *groups):
+        import artifact_workflow_groups as W
+        W.apply(self.root, W.prepare(self.root, campaign, {"groups": list(groups)}))
+        return W
+
+    def _empty_and_close(self, row):
+        row["file"].unlink()
+        row["file"].parent.rmdir()
+        self._close_unproven(row["route"])
+
+    def test_empty_member_withdrawn_and_recorded(self):
+        import artifact_workflow_group_review as review
+        rows = self._grouped("leftover-wg", 6)
+        campaign = rows[0]["campaign"]
+        W = self._declare(campaign,
+                          self._group("Chain", rows[:3], [(rows[0], rows[1]), (rows[1], rows[2])]),
+                          self._group("Alone", rows[3:4]),
+                          self._group("Kept", rows[4:6], [(rows[4], rows[5])]))
+        path = W.declaration_path(self.root, campaign)
+        kept_bytes = W._bytes(W._load_existing(path)["groups"][2])
+        self._empty_and_close(rows[1])    # ended empty inside this sweep
+        self._empty_and_close(rows[3])
+        started = time.monotonic()
+        summary = self._sweep()
+        print(f"route_autoclose_test withdrawal-sweep seconds={time.monotonic() - started:.3f}", file=sys.stderr)
+        self.assertEqual(self._results(summary),
+                         {rows[1]["id"]: "cycle-abandoned-empty", rows[3]["id"]: "cycle-abandoned-empty"})
+        self.assertEqual([(row["campaign_id"], sorted(row["cycle_ids"]), row["groups_removed"])
+                          for row in summary["withdrawn"]],
+                         [(campaign, sorted([rows[1]["id"], rows[3]["id"]]), 1)])
+        after = W._load_existing(path)
+        self.assertEqual([group["title"] for group in after["groups"]], ["Chain", "Kept"])
+        chain = after["groups"][0]
+        self.assertEqual([item["cycle_id"] for item in chain["members"]], [rows[0]["id"], rows[2]["id"]])
+        self.assertEqual(chain["relations"], [])
+        self.assertEqual(W._bytes(after["groups"][1]), kept_bytes)
+        self.assertEqual(W.verify(self.root, campaign)["groups"], 2)
+        status, doc = review.read_record(self.root)
+        self.assertEqual(status, "ok")
+        entry = doc["cycles"][rows[1]["id"]]
+        self.assertEqual((entry["verdict"], entry["mode"], entry["profile"], entry["cycle_state"]),
+                         ("withdrawn-empty", "autoclose", None, "abandoned"))
+        self.assertIn("no durable output", entry["reason"])
+        self.assertEqual(entry["group_id"], chain["group_id"])
+        self.assertEqual(entry["declaration_sha256"], W._digest(path.read_bytes()))
+        # The second sweep changes nothing.
+        before = (path.read_bytes(), path.stat().st_mtime_ns, json.dumps(doc, sort_keys=True))
+        again = self._sweep()
+        self.assertNotIn("withdrawn", again)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns,
+                          json.dumps(review.read_record(self.root)[1], sort_keys=True)), before)
+        # A member that already ended before the sweep, and a completed request that
+        # found nothing (`no-lineage`), are taken on a later sweep.
+        rows[2]["file"].unlink()
+        rows[2]["file"].parent.rmdir()
+        self.P.finalize(self.root, cycle_id=rows[2]["id"], state="abandoned", abandon_reason="route-unrecoverable")
+        rows[5]["file"].unlink()
+        rows[5]["file"].parent.rmdir()
+        self.assertEqual(self.P.finalize(self.root, cycle_id=rows[5]["id"], state="completed")["status"],
+                         "no-lineage")
+        later = self._sweep()
+        self.assertEqual(sorted(sum((row["cycle_ids"] for row in later["withdrawn"]), [])),
+                         sorted([rows[2]["id"], rows[5]["id"]]))
+        after = W._load_existing(path)
+        self.assertEqual([group["title"] for group in after["groups"]], ["Chain", "Kept"])
+        self.assertEqual([item["cycle_id"] for item in after["groups"][0]["members"]], [rows[0]["id"]])
+        self.assertEqual([item["cycle_id"] for item in after["groups"][1]["members"]], [rows[4]["id"]])
+        entry = review.read_record(self.root)[1]["cycles"][rows[5]["id"]]
+        self.assertEqual((entry["verdict"], entry["cycle_state"]), ("withdrawn-empty", "no-lineage"))
+
+    def test_withdrawal_problems_never_change_the_seal(self):
+        import artifact_admission
+        import artifact_workflow_groups as W
+        plain = self._grouped("leftover-none", 2)         # no declaration at all
+        broken = self._grouped("leftover-bad", 2)         # a declaration that is not JSON
+        busy = self._grouped("leftover-busy", 2)          # the lock is held when it is due
+        self._declare(broken[0]["campaign"], self._group("Bad", broken))
+        self._declare(busy[0]["campaign"], self._group("Busy", busy))
+        broken_path = W.declaration_path(self.root, broken[0]["campaign"])
+        broken_path.write_bytes(b"{ not json")
+        busy_path = W.declaration_path(self.root, busy[0]["campaign"])
+        busy_before = busy_path.read_bytes()
+        for rows in (plain, broken, busy):
+            self._empty_and_close(rows[0])
+        with mock.patch.object(W, "apply", side_effect=artifact_admission.AdmissionBusy("busy")):
+            summary = self._sweep()
+        self.assertEqual(self._results(summary), {rows[0]["id"]: "cycle-abandoned-empty"
+                                                  for rows in (plain, broken, busy)})
+        self.assertNotIn("withdrawn", summary)
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(broken_path.read_bytes(), b"{ not json")
+        self.assertEqual(busy_path.read_bytes(), busy_before)
+        # The busy one was not remembered: the next sweep applies it. The broken one waits
+        # for its evidence to change.
+        later = self._sweep()
+        self.assertEqual([row["campaign_id"] for row in later["withdrawn"]], [busy[0]["campaign"]])
+        self.assertEqual(broken_path.read_bytes(), b"{ not json")
+        self.assertNotIn("withdrawn", self._sweep())
 
 
 if __name__ == "__main__":

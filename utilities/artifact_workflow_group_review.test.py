@@ -283,6 +283,28 @@ class SelectionTest(ReviewBase):
             R.sweep(self.root, auto=True, invoke=later)
             self.assertNotIn(cid, sum(later.targets, []))
 
+    def test_withdrawn_empty_is_recorded_without_a_model_and_never_reassessed(self):
+        cycle = self.seal(slug="withdrawn")
+        cid = cycle["cycle_id"]
+        item = R.Outcome(cycle_id=cid, campaign_id=cycle["campaign_id"], verdict="withdrawn-empty",
+                         group_id="wgrp_" + "a" * 32, reason="cycle ended with no durable output",
+                         cycle_state="abandoned", declaration_sha256="sha256:" + "b" * 64, profile=None)
+        self.assertTrue(R.record_outcomes(self.root, [item], mode="autoclose", now=None, lock_timeout=0))
+        entry = self.record()["cycles"][cid]
+        self.assertEqual((entry["verdict"], entry["mode"], entry["profile"], entry["cycle_state"]),
+                         ("withdrawn-empty", "autoclose", None, "abandoned"))
+        self.assertEqual(entry["group_id"], "wgrp_" + "a" * 32)
+        _status, doc = R.read_record(self.root)
+        picked = R.select_targets(self.root, doc, auto=True, cycles=[cid])
+        self.assertEqual(picked.by_campaign, {})
+        self.assertIn(cid, picked.considered)
+        # A held admission lock is a soft failure, not a wait.
+        lock = R.admission._acquire_lock(self.root, 5)
+        try:
+            self.assertFalse(R.record_outcomes(self.root, [item], mode="autoclose", now=None, lock_timeout=0))
+        finally:
+            R.admission._release_lock(self.root, lock)
+
     def test_limit_applies_before_the_campaign_split(self):
         ids = [self.seal(key=key, slug=f"{key}{i}", now=PAST + n)["cycle_id"]
                for n, (key, i) in enumerate([("one", 0), ("two", 0), ("one", 1)])]
@@ -327,7 +349,6 @@ class ValidationTest(ReviewBase):
     def test_invalid_responses_reject_the_campaign_and_keep_the_declaration(self):  # T4
         bad_member = [{"cycle_id": self.tid, "stage_label": "Start"},
                       {"cycle_id": self.other["cycle_id"], "stage_label": "Elsewhere"}]
-        single = [{"cycle_id": self.tid, "stage_label": "Start"}]
         duplicate = ('{"decisions":[{"cycle_id":"%s","verdict":"none","verdict":"none","reason":"r"}],'
                      '"new_groups":[],"relations":[]}' % self.tid)
         cases = {
@@ -337,7 +358,6 @@ class ValidationTest(ReviewBase):
                            "new_groups": [], "relations": []},
             "missing": {"decisions": [], "new_groups": [], "relations": []},
             "other-campaign": self.new_reply(members=bad_member),
-            "one-member": self.new_reply(members=single),
             "long-title": self.new_reply(title="t" * 121),
             "control-char": {"decisions": [self.decision(reason="bad\x01reason")], "new_groups": [], "relations": []},
             "duplicate-key": duplicate,
@@ -400,6 +420,27 @@ class ValidationTest(ReviewBase):
         self.assertEqual([(r["from_cycle_id"], r["to_cycle_id"]) for r in group["relations"]], [(x, y), (y, z)])
         self.assertEqual([ref["path"] for ref in group["relations"][0]["evidence_refs"]], [px, py])
         self.assertEqual(W.verify(self.root, trio[0]["campaign_id"])["stale_evidence"], [])
+
+    def test_a_new_subgoal_opens_a_one_cycle_group(self):
+        # 2026-09-30 SR report: a new outside request's first cycle is alone, and a
+        # two-member minimum left the reviewer only join or none. A cycle group may
+        # hold one cycle (user decision), so the first cycle of a new subgoal opens it.
+        before = self.declaration(self.camp)["groups"]
+        reply = {"decisions": [{"cycle_id": self.tid, "verdict": "new", "new_group": "g1",
+                                "stage_label": "Start", "reason": "A new outside request no group covers."}],
+                 "new_groups": [{"key": "g1", "title": "New request follow-up",
+                                 "members": [{"cycle_id": self.tid, "stage_label": "Start"}]}],
+                 "relations": []}
+        self.assertEqual(self.report(self.run_reply(reply))["status"], "applied")
+        groups = self.declaration(self.camp)["groups"]
+        self.assertEqual(groups[:len(before)], before)
+        self.assertEqual(groups[-1]["title"], "New request follow-up")
+        self.assertEqual(groups[-1]["members"], [{"cycle_id": self.tid, "stage_label": "Start"}])
+        self.assertEqual(W.verify(self.root, self.camp)["stale_evidence"], [])
+        self.assertEqual(self.record()["cycles"][self.tid]["group_id"], groups[-1]["group_id"])
+
+    def test_the_prompt_allows_a_one_cycle_new_group(self):
+        self.assertNotIn(">= 2 members", R.PROMPT_RULES if hasattr(R, "PROMPT_RULES") else Path(R.__file__).read_text(encoding="utf-8"))
 
     def test_merge_keeps_existing_declaration_and_bytes(self):  # T6
         existing = self.groups[0]

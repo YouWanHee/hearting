@@ -818,6 +818,55 @@ def provider_command(adapter, prompt, model=None, home=None, *, stdin_prompt=Fal
     return None
 
 
+# Every title refresh (one supervisor per running attempt, initial/periodic/final)
+# used to recompute the provider order: usage-check.sh plus attempt_counts read the
+# whole dispatch registry each time, which on 2026-09-30 made these scans the top
+# CPU consumers on the host. The order only needs minute-level freshness, so a
+# computed order is reused for PROVIDER_ORDER_TTL_SECONDS. The key names the
+# inputs a caller can change (profile, harness root, registry path, config path,
+# capacity override), never the registry's mtime, which moves every few seconds.
+PROVIDER_ORDER_TTL_SECONDS = 60
+
+
+def _provider_order_ttl():
+    try:
+        return max(0, int(os.environ.get("FLEET_PROVIDER_ORDER_TTL_SECONDS", PROVIDER_ORDER_TTL_SECONDS)))
+    except ValueError:
+        return PROVIDER_ORDER_TTL_SECONDS
+
+
+def _provider_order_cache(profile, home, jobs):
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    key = "\0".join((str(profile), str(home), str(jobs),
+                     os.environ.get("DISPATCH_DEFAULTS_CONFIG", ""),
+                     os.environ.get("HARNESS_CAPACITY_SCORES", "")))
+    return Path(base) / "agent-fleet" / "provider-order" / (
+        hashlib.sha256(key.encode("utf-8")).hexdigest()[:24] + ".json")
+
+
+def _cached_provider_order(path):
+    try:
+        ttl = _provider_order_ttl()
+        if not ttl or time.time() - path.stat().st_mtime > ttl:
+            return None
+        order = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(order, list) and order and all(name in PROVIDER_ORDER for name in order):
+        return tuple(order)
+    return None
+
+
+def _store_provider_order(path, order):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps(list(order)), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def selected_providers(profile="mini", pin_env="FLEET_TITLE_PROVIDER"):
     """Explicit choice wins; otherwise use the shared profile selector (default `mini`).
 
@@ -854,6 +903,10 @@ def selected_providers(profile="mini", pin_env="FLEET_TITLE_PROVIDER"):
         jobs = (Path(os.environ["AGENT_DISPATCH_JOBS"])
                 if os.environ.get("AGENT_DISPATCH_JOBS")
                 else dispatch_state_roots(home)[0] / "jobs.log")
+        cache = _provider_order_cache(profile, home, jobs)
+        cached = _cached_provider_order(cache)
+        if cached:
+            return cached
         states = {name: "ok" for name in PROVIDER_ORDER}
         usage = subprocess.run(
             [str(home / "utilities" / "usage-check.sh"), "--harness", "all", "--jobs", str(jobs)],
@@ -893,6 +946,8 @@ def selected_providers(profile="mini", pin_env="FLEET_TITLE_PROVIDER"):
         ordered = [name for band in band_order for name in ranks[band]]
         if selected in ordered:
             ordered = [selected] + [name for name in ordered if name != selected]
+        if ordered and _provider_order_ttl():
+            _store_provider_order(cache, ordered)
         return tuple(ordered) or PROVIDER_ORDER
     except Exception:
         return PROVIDER_ORDER
@@ -1344,9 +1399,6 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
             return False
     elif not transcript or not os.path.isfile(transcript):
         return False
-    probe_argv = worker_argv("probe")
-    if not _executable_available(probe_argv):
-        return False
     now = time.time() if now is None else now
     previous = titles.read(sid, harness=harness) or {}
     ts = previous.get("ts") if isinstance(previous.get("ts"), (int, float)) else 0
@@ -1362,6 +1414,18 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         return False
 
     lockdir = titles.lock_path(sid, harness=harness)
+    # Read-only early exit: a plainly fresh lock means another refresher owns this
+    # session, so skip the provider probe. Anything unclear (missing, stale, stat
+    # error) falls through; the atomic mkdir below stays the only authority.
+    try:
+        if now - os.path.getmtime(lockdir) <= WORKER_TIMEOUT * 2:
+            return False
+    except OSError:
+        pass
+    # The probe runs the provider cascade, so it goes after the cheap debounce checks.
+    probe_argv = worker_argv("probe")
+    if not _executable_available(probe_argv):
+        return False
     os.makedirs(os.path.dirname(lockdir), exist_ok=True)
     try:
         os.mkdir(lockdir)

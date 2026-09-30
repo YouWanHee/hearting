@@ -15,11 +15,15 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 
 HARNESSES = ("claude", "codex", "opencode")
 WINDOWS = {"five_hour": 6 * 3600, "seven_day": 8 * 86400,
            "seven_day_opus": 8 * 86400, "seven_day_sonnet": 8 * 86400}
+CACHE_SCHEMA = 1
+# Tests switch this off to compare the cached answer with a direct computation.
+_DISK_CACHE = True
 
 
 def digest(value):
@@ -152,45 +156,245 @@ def _native_rows(path):
     return result
 
 
-def observations(jobs, *, now=None, env=None, registry_lines=None):
-    now = time.time() if now is None else now
-    scopes = _scope_candidates("claude", env)
+def _stat_key(path):
+    """Identity of one file version, or None when it cannot be stat'ed (missing, unreadable)."""
     try:
-        lines = registry_lines if registry_lines is not None else Path(jobs).read_text().splitlines()
-    except (OSError, UnicodeError):
-        return []
-    found = []
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode]
+
+
+def _settled(stat):
+    """False for a file modified within the last 100ms.
+
+    Coarse filesystem timestamps can give a second same-size write the same mtime, so a
+    fresh file is not trusted as a cache key until a later read sees it settled.
+    """
+    return stat is None or time.time_ns() - stat[3] > 100_000_000
+
+
+def _cache_path(jobs):
+    return Path(f"{os.path.abspath(jobs)}.capacity-cache.json")
+
+
+def _build_snapshot(lines, now, previous=None):
+    """The time- and environment-independent candidates of a registry.
+
+    Only what the readers cannot cheaply rederive is kept: which rows can carry native
+    quota evidence or a legacy limit marker. Expiry, the 8-day cutoff, scope matching,
+    model selection and reset conversion stay per-call decisions. Native rows older than
+    eight days at `now` can never matter again, so they are not kept.
+    """
+    native, legacy = [], []
     for line in lines:
         fields = line.split("\t")
-        if len(fields) != 6 or fields[1] != "done":
+        if len(fields) != 6:
             continue
         meta = dict(cell.split("=", 1) for cell in fields[5].split(",") if "=" in cell)
-        if meta.get("harness") != "claude" or meta.get("failure_class") == "pass" or not meta.get("note", "").startswith("dead-"):
-            continue
-        attempt = meta.get("attempt_id", "")
-        log = meta.get("log_file", "")
-        if not re.fullmatch(r"att-[a-zA-Z0-9-]+", attempt) or attempt not in Path(log).name:
-            continue
+        note = meta.get("note", "")
+        attempt, log = meta.get("attempt_id", ""), meta.get("log_file", "")
+        if (fields[1] == "done" and meta.get("harness") == "claude" and meta.get("failure_class") != "pass"
+                and note.startswith("dead-") and re.fullmatch(r"att-[a-zA-Z0-9-]+", attempt)
+                and attempt in Path(log).name):
+            try:
+                observed = datetime.fromisoformat(fields[0].replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                observed = None
+            if observed is not None and now - observed <= 8 * 86400:
+                record = {"o": observed, "a": attempt, "l": log, "m": meta.get("model"),
+                          "s": meta.get("quota_scope"), "k": meta.get("quota_scope_kind"), "d": digest(line)}
+                earlier = (previous or {}).get(record["d"])
+                if earlier:  # same row: its extracted evidence stays valid while the log's stat does
+                    record.update(e=earlier["e"], ls=earlier["ls"])
+                native.append(record)
+        harness = meta.get("harness") or meta.get("owner_harness")
+        if harness in HARNESSES and (re.match(r"dead-[a-z-]*limit", note)
+                                     or (note == "dead-capacity" and meta.get("failure_class") != "pass")):
+            legacy.append({"t": fields[0], "h": harness, "a": meta.get("attempt_id"),
+                           "s": meta.get("quota_scope"), "k": meta.get("quota_scope_kind"),
+                           "n": note, "r": meta.get("reset", "-"), "l": meta.get("log_file")})
+    return {"native": native, "legacy": legacy}
+
+
+def _is_stat(value):
+    return value is None or (isinstance(value, list) and len(value) == 5
+                             and all(isinstance(v, int) and not isinstance(v, bool) for v in value))
+
+
+def _is_str(value, *, nullable=False):
+    return isinstance(value, str) or (nullable and value is None)
+
+
+def _valid_cache(data):
+    """Structural check only: a cache file that fails it is ignored, never repaired."""
+    if not isinstance(data, dict) or data.get("schema") != CACHE_SCHEMA:
+        return False
+    horizon = data.get("horizon")
+    if (not _is_str(data.get("jobs")) or isinstance(horizon, bool) or not isinstance(horizon, (int, float))
+            or not _is_stat(data.get("key")) or data.get("key") is None):
+        return False
+    if not isinstance(data.get("native"), list) or not isinstance(data.get("legacy"), list):
+        return False
+    for rec in data["native"]:
+        if not (isinstance(rec, dict) and isinstance(rec.get("o"), (int, float)) and not isinstance(rec["o"], bool)
+                and _is_str(rec.get("a")) and _is_str(rec.get("l")) and _is_str(rec.get("d"))
+                and all(_is_str(rec.get(k), nullable=True) for k in ("m", "s", "k"))):
+            return False
+        if ("e" in rec) != ("ls" in rec) or not _is_stat(rec.get("ls")):
+            return False
+        evidence = rec.get("e")
+        if evidence is not None and not (isinstance(evidence, list) and len(evidence) == 2
+                                         and all(isinstance(row, dict) for row in evidence)):
+            return False
+    for rec in data["legacy"]:
+        if not (isinstance(rec, dict) and _is_str(rec.get("t")) and rec.get("h") in HARNESSES
+                and _is_str(rec.get("n")) and _is_str(rec.get("r"))
+                and all(_is_str(rec.get(k), nullable=True) for k in ("a", "s", "k", "l"))):
+            return False
+        cached = rec.get("rr")
+        if cached is not None and not (isinstance(cached, list) and len(cached) == 3
+                                       and _is_str(cached[0]) and _is_str(cached[1], nullable=True)
+                                       and _is_stat(cached[2])):
+            return False
+    return True
+
+
+def _load_cache(path, now):
+    """`(snapshot | None, earlier native records by row digest)` from the cache file."""
+    key = _stat_key(path)
+    if key is None:
+        return None, {}
+    data = json.loads(_cache_path(path).read_text())
+    if not _valid_cache(data):
+        return None, {}
+    earlier = {rec["d"]: rec for rec in data["native"] if "e" in rec}
+    # A cache built at a later `now` dropped rows this reader may still need.
+    if data["jobs"] != os.path.abspath(path) or data["key"] != key or data["horizon"] > now \
+            or _stat_key(path) != key:
+        return None, earlier
+    return {"native": data["native"], "legacy": data["legacy"], "path": path, "key": key,
+            "horizon": data["horizon"], "cacheable": True, "dirty": False}, earlier
+
+
+def _snapshot(jobs, now, lines=None):
+    """Candidates for one call: from `lines` when given, else the disk cache or a fresh read.
+
+    None means the registry could not be read. Any cache trouble (missing, corrupt,
+    other schema, a file that changed under the read) silently becomes a fresh read.
+    """
+    if lines is not None:
+        return {**_build_snapshot(lines, now), "cacheable": False, "dirty": False}
+    path = Path(jobs)
+    earlier = {}
+    if _DISK_CACHE:
         try:
-            observed = datetime.fromisoformat(fields[0].replace("Z", "+00:00")).timestamp()
-        except ValueError:
+            snapshot, earlier = _load_cache(path, now)
+            if snapshot is not None:
+                return snapshot
+        except Exception:  # noqa: BLE001 - a broken cache must never change the answer
+            earlier = {}
+    key = _stat_key(path)
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeError):
+        return None
+    stable = key is not None and _stat_key(path) == key
+    return {**_build_snapshot(text.splitlines(), now, earlier), "path": path, "key": key,
+            "horizon": now, "cacheable": _DISK_CACHE and stable and _settled(key), "dirty": True}
+
+
+def _persist(snapshot):
+    """Publish the snapshot beside jobs.log: 0600, same-directory temp file, atomic replace."""
+    if not (snapshot and snapshot.get("cacheable") and snapshot.get("dirty")):
+        return
+    tmp = None
+    try:
+        path = snapshot["path"]
+        if _stat_key(path) != snapshot["key"]:
+            return
+        target = _cache_path(path)
+        payload = {"schema": CACHE_SCHEMA, "jobs": os.path.abspath(path), "key": snapshot["key"],
+                   "horizon": snapshot["horizon"], "native": snapshot["native"], "legacy": snapshot["legacy"]}
+        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        tmp = None
+        snapshot["dirty"] = False
+    except Exception:  # noqa: BLE001 - an unwritable directory just means no cache
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _evidence_pair(rows, observed, model):
+    """`[rate_limit_event, terminal result]` when `native_quota` can ever accept these rows.
+
+    `native_quota` reads nothing else from a log tail, so the pair reproduces its answer
+    at every `now`; None (no `now` accepts it) stores as "no evidence".
+    """
+    if not native_quota(rows, observed_at=observed, now=observed, requested_model=model):
+        return None
+    terminal_index = next(i for i in range(len(rows) - 1, -1, -1) if rows[i].get("type") == "result")
+    terminal = rows[terminal_index]
+    previous = next((i for i in range(terminal_index - 1, -1, -1) if rows[i].get("type") == "result"), -1)
+    event = next(r for r in reversed(rows[previous + 1:terminal_index])
+                 if r.get("type") == "rate_limit_event" and r.get("session_id") == terminal.get("session_id"))
+    return [event, terminal]
+
+
+def _native_evidence(snapshot, record):
+    """The record's evidence pair, re-extracted only when its log's stat moved."""
+    log = record["l"]
+    current = _stat_key(log)
+    if "e" in record and record["ls"] == current:
+        return record["e"]
+    evidence = _evidence_pair(_native_rows(log), record["o"], record["m"])
+    if _stat_key(log) == current and _settled(current):  # a moving log is used once, never kept
+        record["e"], record["ls"] = evidence, current
+        snapshot["dirty"] = True
+    return evidence
+
+
+def _native_observations(snapshot, env, now):
+    scopes = _scope_candidates("claude", env)
+    found = []
+    for record in snapshot["native"]:
+        if now - record["o"] > 8 * 86400:
             continue
-        if now - observed > 8 * 86400:
+        evidence = _native_evidence(snapshot, record)
+        if not evidence:
             continue
-        quota = native_quota(_native_rows(log), observed_at=observed, now=now,
-                             requested_model=meta.get("model"))
+        quota = native_quota(evidence, observed_at=record["o"], now=now, requested_model=record["m"])
         if not quota:
             continue
-        bound_scope = meta.get("quota_scope")
-        matches = bool(bound_scope and bound_scope == scopes.get(meta.get("quota_scope_kind")))
-        found.append({**quota, "harness": "claude", "attempt_id": attempt,
+        bound_scope = record["s"]
+        matches = bool(bound_scope and bound_scope == scopes.get(record["k"]))
+        found.append({**quota, "harness": "claude", "attempt_id": record["a"],
                       "quota_scope": bound_scope, "scope_authority": "launch-bound" if bound_scope else "unbound",
                       "scope_matches": matches,
-                      "row_digest": digest(line)})
+                      "row_digest": record["d"]})
     return found
 
 
-def active_limits(jobs, *, profile=None, models=None, now=None, env=None, registry_lines=None):
+def observations(jobs, *, now=None, env=None, registry_lines=None):
+    now = time.time() if now is None else now
+    snapshot = _snapshot(jobs, now, registry_lines)
+    if snapshot is None:
+        return []
+    found = _native_observations(snapshot, env, now)
+    _persist(snapshot)
+    return found
+
+
+def _limit_models(profile, models, env):
     models = dict(models or {})
     if profile and "claude" not in models:
         from model_profile import resolve_runtime_profile, ModelProfileError
@@ -198,8 +402,12 @@ def active_limits(jobs, *, profile=None, models=None, now=None, env=None, regist
             models["claude"] = resolve_runtime_profile("claude", profile, environ=env)[0]["model"]
         except (ModelProfileError, KeyError):
             pass
+    return models
+
+
+def _select_limits(native, models):
     result = {}
-    for observation in observations(jobs, now=now, env=env, registry_lines=registry_lines):
+    for observation in native:
         if observation["expired"] or not observation["scope_matches"]:
             continue
         model_scope = observation["model_scope"]
@@ -214,6 +422,11 @@ def active_limits(jobs, *, profile=None, models=None, now=None, env=None, regist
     return result
 
 
+def active_limits(jobs, *, profile=None, models=None, now=None, env=None, registry_lines=None):
+    models = _limit_models(profile, models, env)
+    return _select_limits(observations(jobs, now=now, env=env, registry_lines=registry_lines), models)
+
+
 def apply_limits(states, limits):
     states = dict(states)
     for harness, limit in limits.items():
@@ -222,63 +435,140 @@ def apply_limits(states, limits):
     return states
 
 
-def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
-    """One read contract for scoped native proof and legacy text compatibility."""
+_RESET_SENTENCE = re.compile(r"resets\s+([^()\n.·]+?)\s*(?:\(([^()]+)\)|[.·]|$)", re.I)
+_TZ_NAME = re.compile(r"[A-Za-z0-9_+/-]+")
+TAIL_BYTES = 64 * 1024
+
+
+def _text_reset_epoch(text, observed, env, tz=None):
+    """Epoch for a reset written as a clock or dated text; None when it cannot be anchored.
+
+    A timezone reaches `date` only through its environment, never through a shell.
+    """
+    if text in {"", "-", "unknown", "unknown-reset"}:
+        return None
+    if tz and _TZ_NAME.fullmatch(tz):
+        env = {**env, "TZ": tz}
+    normalized = re.sub("noon", "12pm", text, flags=re.I)
+    normalized = re.sub("midnight", "12am", normalized, flags=re.I)
+    try:
+        clock = bool(re.fullmatch(r"[0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?", normalized, re.I))
+        if clock:
+            day = subprocess.run(["date", "-d", f"@{int(observed)}", "+%Y-%m-%d"], capture_output=True, text=True, timeout=2, env=env)
+            normalized = day.stdout.strip() + " " + normalized
+        elif not re.search(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", normalized):
+            raise ValueError("unanchored-reset")
+        parsed = subprocess.run(["date", "-d", normalized, "+%s"], capture_output=True, text=True, timeout=2, env=env)
+        expires = int(parsed.stdout.strip()) if parsed.returncode == 0 else None
+        if expires is not None and expires < observed and clock:
+            expires += 86400
+        return expires
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _result_reset(meta):
+    """`(reset text, timezone)` from the last result line of the attempt's own log tail."""
+    attempt, log = meta.get("attempt_id", ""), meta.get("log_file", "")
+    if not re.fullmatch(r"att-[a-zA-Z0-9-]+", attempt) or attempt not in Path(log).name:
+        return "-", None
+    try:
+        with Path(log).open("rb") as f:
+            start = max(0, f.seek(0, 2) - TAIL_BYTES)
+            f.seek(start)
+            lines = f.read().splitlines()
+        if start:
+            lines = lines[1:]
+    except OSError:
+        return "-", None
+    for line in reversed(lines):
+        if b'"type"' not in line or b'"result"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(row, dict) and row.get("type") == "result":
+            found = _RESET_SENTENCE.search(row.get("result") if isinstance(row.get("result"), str) else "")
+            return (found.group(1).strip(), found.group(2)) if found else ("-", None)
+    return "-", None
+
+
+def _cached_result_reset(snapshot, record, meta):
+    """`_result_reset(meta)`, reused while the attempt log's stat is unchanged."""
+    current = _stat_key(meta.get("log_file", ""))
+    cached = record.get("rr")
+    if cached is not None and cached[2] == current:
+        return cached[0], cached[1]
+    value = _result_reset(meta)
+    if _stat_key(meta.get("log_file", "")) == current and _settled(current):
+        record["rr"] = [value[0], value[1], current]
+        snapshot["dirty"] = True
+    return value
+
+
+def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
+    """`(states, epochs)`: the usage state per harness and, when known, when it ends."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
-    try:
-        lines = Path(jobs).read_text().splitlines()
-    except (OSError, UnicodeError):
-        return dict.fromkeys(HARNESSES, "unknown")
+    snapshot = _snapshot(jobs, now)
+    if snapshot is None:
+        return dict.fromkeys(HARNESSES, "unknown"), {}
     states = dict.fromkeys(HARNESSES, "ok")
+    epochs = {}
     scopes = _scope_candidates("claude", env)
-    native = observations(jobs, now=now, env=env, registry_lines=lines)
+    native = _native_observations(snapshot, env, now)
     native_ids = {r["attempt_id"] for r in native}
     legacy = {}
-    for line in lines:
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
-        meta = dict(cell.split("=", 1) for cell in fields[5].split(",") if "=" in cell)
-        harness = meta.get("harness") or meta.get("owner_harness")
-        if harness not in HARNESSES or not re.match(r"dead-[a-z-]*limit", meta.get("note", "")):
-            continue
+    for record in snapshot["legacy"]:
+        harness = record["h"]
         # A native event owns its account/model/window even after reset or
         # account change. A lossy text marker cannot widen it back to global.
-        if meta.get("attempt_id") in native_ids:
+        if record["a"] in native_ids:
             continue
-        if meta.get("quota_scope") and (harness != "claude" or meta["quota_scope"] != scopes.get(meta.get("quota_scope_kind"))):
+        if record["s"] and (harness != "claude" or record["s"] != scopes.get(record["k"])):
             continue
-        if harness not in legacy or fields[0] > legacy[harness][0]:
-            legacy[harness] = (fields[0], meta.get("reset", "-"))
-    for harness, (stamp, reset) in legacy.items():
+        if harness not in legacy or record["t"] > legacy[harness]["t"]:
+            legacy[harness] = record
+    for harness, record in legacy.items():
         try:
-            observed = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            observed = datetime.fromisoformat(record["t"].replace("Z", "+00:00")).timestamp()
         except ValueError:
             continue
-        expires = None
-        if reset not in {"", "-", "unknown", "unknown-reset"}:
-            normalized = re.sub("noon", "12pm", reset, flags=re.I)
-            normalized = re.sub("midnight", "12am", normalized, flags=re.I)
-            try:
-                clock = bool(re.fullmatch(r"[0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?", normalized, re.I))
-                if clock:
-                    day = subprocess.run(["date", "-d", f"@{int(observed)}", "+%Y-%m-%d"], capture_output=True, text=True, timeout=2, env=env)
-                    normalized = day.stdout.strip() + " " + normalized
-                elif not re.search(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", normalized):
-                    raise ValueError("unanchored-reset")
-                parsed = subprocess.run(["date", "-d", normalized, "+%s"], capture_output=True, text=True, timeout=2, env=env)
-                expires = int(parsed.stdout.strip()) if parsed.returncode == 0 else None
-                if expires is not None and expires < observed and clock:
-                    expires += 86400
-            except (OSError, ValueError, subprocess.TimeoutExpired):
-                pass
+        reset, tz = record["r"], None
+        if reset in {"", "-", "unknown", "unknown-reset"} and record["n"] == "dead-capacity":
+            meta = {k: v for k, v in (("attempt_id", record["a"]), ("log_file", record["l"])) if v is not None}
+            reset, tz = _cached_result_reset(snapshot, record, meta)
+        expires = _text_reset_epoch(reset, observed, env, tz)
         if expires is not None:
             if now < expires:
-                states[harness] = f"limited({reset})"
+                # A sentence-derived reset has no row label of its own; name the moment instead.
+                label = reset if tz is None else datetime.fromtimestamp(expires, timezone.utc).isoformat().replace("+00:00", "Z")
+                states[harness] = f"limited({label})"
+                epochs[harness] = expires
         elif 0 <= now - observed < unknown_window_min * 60:
             states[harness] = "limited(unknown-reset)"
-    return apply_limits(states, active_limits(jobs, profile=profile, models=models, now=now, env=env, registry_lines=lines))
+            epochs[harness] = int(observed + unknown_window_min * 60)
+    limits = _select_limits(native, _limit_models(profile, models, env))
+    epochs.update({harness: limit["reset_epoch"] for harness, limit in limits.items()})
+    _persist(snapshot)
+    return apply_limits(states, limits), epochs
+
+
+def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
+    """One read contract for scoped native proof and legacy text compatibility."""
+    return _usage(jobs, profile=profile, models=models, unknown_window_min=unknown_window_min,
+                  now=now, env=env)[0]
+
+
+def harness_hold(jobs, harness, *, model=None, now=None, env=None, unknown_window_min=60):
+    """`{'until_epoch', 'label'}` while the usage gate reports this harness limited, else None."""
+    states, epochs = _usage(jobs, models={harness: model} if model else None,
+                            unknown_window_min=unknown_window_min, now=now, env=env)
+    state = states.get(harness, "ok")
+    if not state.startswith("limited("):
+        return None
+    return {"until_epoch": epochs.get(harness), "label": state[len("limited("):-1]}
 
 
 def main():
