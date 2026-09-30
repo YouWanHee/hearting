@@ -6539,9 +6539,13 @@ def owner_frame_launch_gate(binding, action: str, agent_home: Path,
         return  # Earlier route generations keep their original owner contract.
     entries = [n for n in route.get("nodes", [])
                if frames.issubset(set(n.get("depends_on", [])))]
-    if frames != {"frame", "frame-alternative"} or len(entries) != 1:
+    # A recipe may fan out after the frame pair (autopilot-spec standard+ starts
+    # research and research-alternative together); every entry waits on the
+    # same approved frames, so each is checked rather than requiring exactly one.
+    if frames != {"frame", "frame-alternative"} or not entries:
         raise DispatchContractError("frame-owner-entry-invalid", str(route.get("route_id")))
-    completion_marker_gate(binding.route_file, entries[0]["id"], action, agent_home, jobs)
+    for entry in entries:
+        completion_marker_gate(binding.route_file, entry["id"], action, agent_home, jobs)
 
 
 def _frame_capacity_failures(route: dict, lines: list[str], harnesses: set[str]) -> dict[str, str]:
