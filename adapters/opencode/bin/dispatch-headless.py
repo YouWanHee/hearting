@@ -27,7 +27,8 @@ sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
 from dispatch_contract import (
     _atomic_registry_replace,
-    workflow_completion_receipt,  # noqa: E402
+    STANDARD_PLUS_INTENSITIES,  # noqa: E402
+    workflow_completion_receipt,
     DispatchContractError,
     foreground_review_launch_identity,
     bytecode_cache_env,
@@ -844,9 +845,42 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         source,
     )
 
-def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
+def _supervised_owner(args: argparse.Namespace) -> bool:
+    """A sealed route binding supervises its owner; a registered depth-1 owner
+    without one (the quick and solo shape) is supervised too. Route identity
+    stays separate from the reason to supervise."""
     if getattr(args, "owner_route_binding", None):
-        binding = args.owner_route_binding
+        return True
+    return (getattr(args, "dispatch_depth", None) == 1
+            and getattr(args, "worker_type", None) == "owner"
+            and getattr(args, "intensity", None) not in STANDARD_PLUS_INTENSITIES)
+
+
+def _supervisor_route(args: argparse.Namespace) -> tuple[str, str, str] | None:
+    """The route a supervised owner is bound to: the standard+ owner binding, or a
+    quick owner's own one-shot tuple, never a partial one."""
+    binding = getattr(args, "owner_route_binding", None)
+    if binding:
+        return binding.route_file, binding.route_id, binding.route_hash
+    route = tuple(getattr(args, key, None) for key in ("route_file", "route_id", "route_hash"))
+    if all(route) and getattr(args, "route_node", None) == "one-shot":
+        return route
+    return None
+
+
+def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> None:
+    """Open correction admission at registration; without it `correct` stays unsupported."""
+    if not _supervised_owner(args):
+        return
+    try:
+        from dispatch_owner_input import initialize_owner_input
+        initialize_owner_input(jobs, args.attempt_id, "opencode-next-turn")
+    except Exception as exc:
+        sys.stderr.write(f"owner-input-init-skipped attempt_id={args.attempt_id} reason={type(exc).__name__}\n")
+
+
+def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
+    if _supervised_owner(args):
         lease = (supervisor_lease_path(args.jobs_path, args.attempt_id) if args.attempt_id
                  else dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease")
         cmd = [
@@ -854,9 +888,11 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "--runtime-harness", "opencode", "--worktree", args.worktree,
             "--jobs", str(args.jobs_path), "--parent-attempt-id", args.attempt_id or "unassigned",
             "--state-file", str(lease.with_suffix(".json")), "--lease-file", str(lease),
-            "--route-file", binding.route_file, "--route-id", binding.route_id,
-            "--route-hash", binding.route_hash, "--opencode-agent", args.agent,
         ]
+        route = _supervisor_route(args)
+        if route:
+            cmd += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
+        cmd += ["--opencode-agent", args.agent]
         if args.resolved_model_settings["source"] != "inherit":
             cmd += ["--model", args.resolved_model_settings["model"],
                     "--variant", args.resolved_model_settings["variant"]]
@@ -1093,6 +1129,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",owner_route_id={args.owner_route_binding.route_id}"
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
+    if _supervised_owner(args):
         pipe += (
             ",completion_delivery=session-resume-supervised,completion_delivery_reason=ok"
             f",supervisor_lease={SUPERVISOR_LEASE_KIND}"
@@ -1923,6 +1960,7 @@ def main(argv: list[str]) -> int:
             cancel_governor_reservation(governor, governor_root, reservation_token)
             return fail(str(e), 73, child_spawned="0")
         if args.attempt_claimed:
+            initialize_supervised_owner_input(args, jobs)
             try:
                 prompt_path.write_text(prompt_text, encoding="utf-8")
             except OSError as exc:
@@ -2019,7 +2057,7 @@ def main(argv: list[str]) -> int:
             "AGENT_DISPATCH_CURRENT_SANDBOX": "adapter-default",
             **stage_session_environment(args),
             "AGENT_DISPATCH_COMPLETION_MODE": (
-                "supervised" if args.owner_route_binding else "poll"
+                "supervised" if _supervised_owner(args) else "poll"
             ),
             "OPENCODE_CONFIG_CONTENT": args.opencode_config_content,
             **args.nested_runtime_env,
@@ -2030,7 +2068,7 @@ def main(argv: list[str]) -> int:
             # secondary alive signal independent of the OpenCode SQLite mtime.
             "OPENCODE_DISPATCH_SLUG": args.slug,
         }
-        if args.owner_route_binding:
+        if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
             dispatch_env["AGENT_DISPATCH_SUPERVISOR_LEASE_FILE"] = str(lease)
@@ -2419,7 +2457,7 @@ def main(argv: list[str]) -> int:
     print(f"parent_session_id={args.parent_session_id or '-'}")
     print(f"parent_attempt_id={args.parent_binding.attempt_id if getattr(args, 'parent_binding', None) else '-'}")
     print(f"parent_completion_delivery={args.parent_completion_delivery}")
-    print("completion_delivery=" + ("session-resume-supervised" if args.owner_route_binding else "one-shot"))
+    print("completion_delivery=" + ("session-resume-supervised" if _supervised_owner(args) else "one-shot"))
     print(f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}")
     for key in ("managed_sidecar_state", "managed_sidecar_reason", "managed_sidecar_pid",
                 "managed_sealed_batch_id", "managed_sidecar_log"):

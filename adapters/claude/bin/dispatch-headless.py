@@ -1107,12 +1107,12 @@ def _async_wait_policy(args: argparse.Namespace) -> str:
     return "deny-proven" if _async_deny_tools(args) else "unsupported"
 
 
+def _registered_owner(args: argparse.Namespace) -> bool:
+    return args.dispatch_depth == 1 and args.worker_type == "owner"
+
+
 def _completion_owner(args: argparse.Namespace) -> bool:
-    return (
-        args.dispatch_depth == 1
-        and args.worker_type == "owner"
-        and args.intensity in _STANDARD_PLUS_INTENSITY
-    )
+    return _registered_owner(args) and args.intensity in _STANDARD_PLUS_INTENSITY
 
 
 # SD-OPEN-63: `claude --help` piped through a PIPE truncates at a buffer boundary
@@ -1204,15 +1204,16 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
     complete negative probe (`unsupported`) or an explicit operator `poll`
     request produces `poll-fallback`."""
     requested = args.completion_delivery
-    if not _completion_owner(args):
+    if not _registered_owner(args):
         if requested == "supervised":
             raise DispatchContractError(
                 "completion-delivery-ineligible",
-                "supervised completion is scoped to registered standard+ dispatch-depth-1 owners",
+                "supervised completion is scoped to registered dispatch-depth-1 owners",
             )
         return "one-shot"
+    standard_plus = _completion_owner(args)
     if requested == "poll":
-        return "poll-fallback"
+        return "poll-fallback" if standard_plus else "one-shot"
     probe = getattr(args, "completion_probe", None)
     if probe is None:
         probe = probe_claude_session_resume()
@@ -1220,6 +1221,18 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
     if probe.status == "supported":
         args.completion_delivery_reason = "ok"
         return "session-resume-supervised"
+    if not standard_plus:
+        # A quick owner never loses a launch it had before: without a proven
+        # resume surface it runs one-shot, and only an explicit request refuses.
+        if requested == "supervised":
+            raise DispatchContractError(
+                "claude-session-resume-unavailable" if probe.status == "unsupported"
+                else "claude-session-resume-indeterminate",
+                "claude --help did not expose --session-id and --resume; no owner was launched"
+                if probe.status == "unsupported"
+                else f"claude --help probe was indeterminate ({probe.reason}); refusing to silently fall back",
+            )
+        return "one-shot"
     if probe.status == "unsupported":
         args.completion_delivery_reason = "claude-session-resume-unsupported"
         if requested == "supervised":
@@ -1232,6 +1245,17 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
         "claude-session-resume-indeterminate",
         f"claude --help probe was indeterminate ({probe.reason}); refusing to silently fall back",
     )
+
+
+def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> None:
+    """Open correction admission at registration; without it `correct` stays unsupported."""
+    if args.resolved_completion_delivery != "session-resume-supervised":
+        return
+    try:
+        from dispatch_owner_input import initialize_owner_input
+        initialize_owner_input(jobs, args.attempt_id, "claude-next-turn")
+    except Exception as exc:
+        sys.stderr.write(f"owner-input-init-skipped attempt_id={args.attempt_id} reason={type(exc).__name__}\n")
 
 
 def completion_state_path(args: argparse.Namespace) -> Path:
@@ -1261,6 +1285,18 @@ def _route_declares_terminal_commit_support(route_file: str) -> bool:
     return route.get("runtime_support", {}).get("terminal_commit") is True
 
 
+def _supervisor_route(args: argparse.Namespace) -> tuple[str, str, str] | None:
+    """The route a supervised owner is bound to: the standard+ owner binding, or a
+    quick owner's own one-shot tuple, never a partial one."""
+    binding = getattr(args, "owner_route_binding", None)
+    if binding:
+        return binding.route_file, binding.route_id, binding.route_hash
+    route = tuple(getattr(args, key, None) for key in ("route_file", "route_id", "route_hash"))
+    if all(route) and getattr(args, "route_node", None) == "one-shot":
+        return route
+    return None
+
+
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
     if getattr(args, "resolved_completion_delivery", "one-shot") == "session-resume-supervised":
         command = [
@@ -1278,13 +1314,10 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         if getattr(args, "execution_access_grant", None) is not None:
             for writable_dir in args.execution_access_grant.additional_writable_roots:
                 command += ["--add-dir", str(writable_dir)]
-        if getattr(args, "owner_route_binding", None):
-            command += [
-                "--route-file", args.owner_route_binding.route_file,
-                "--route-id", args.owner_route_binding.route_id,
-                "--route-hash", args.owner_route_binding.route_hash,
-            ]
-            if _route_declares_terminal_commit_support(args.owner_route_binding.route_file):
+        route = _supervisor_route(args)
+        if route:
+            command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
+            if _route_declares_terminal_commit_support(route[0]):
                 command += ["--enable-terminal-commit"]
         if getattr(args, "max_continuations", None) is not None:
             command += ["--max-continuations", str(args.max_continuations)]
@@ -2409,6 +2442,7 @@ def main(argv: list[str]) -> int:
             cancel_governor_reservation(governor, governor_root, reservation_token)
             return fail(str(e), 73, child_spawned="0")
         if args.attempt_claimed:
+            initialize_supervised_owner_input(args, jobs)
             try:
                 prompt_path.write_text(prompt_text, encoding="utf-8")
             except OSError as exc:
