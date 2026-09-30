@@ -222,15 +222,75 @@ def apply_limits(states, limits):
     return states
 
 
-def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
-    """One read contract for scoped native proof and legacy text compatibility."""
+_RESET_SENTENCE = re.compile(r"resets\s+([^()\n.·]+?)\s*(?:\(([^()]+)\)|[.·]|$)", re.I)
+_TZ_NAME = re.compile(r"[A-Za-z0-9_+/-]+")
+TAIL_BYTES = 64 * 1024
+
+
+def _text_reset_epoch(text, observed, env, tz=None):
+    """Epoch for a reset written as a clock or dated text; None when it cannot be anchored.
+
+    A timezone reaches `date` only through its environment, never through a shell.
+    """
+    if text in {"", "-", "unknown", "unknown-reset"}:
+        return None
+    if tz and _TZ_NAME.fullmatch(tz):
+        env = {**env, "TZ": tz}
+    normalized = re.sub("noon", "12pm", text, flags=re.I)
+    normalized = re.sub("midnight", "12am", normalized, flags=re.I)
+    try:
+        clock = bool(re.fullmatch(r"[0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?", normalized, re.I))
+        if clock:
+            day = subprocess.run(["date", "-d", f"@{int(observed)}", "+%Y-%m-%d"], capture_output=True, text=True, timeout=2, env=env)
+            normalized = day.stdout.strip() + " " + normalized
+        elif not re.search(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", normalized):
+            raise ValueError("unanchored-reset")
+        parsed = subprocess.run(["date", "-d", normalized, "+%s"], capture_output=True, text=True, timeout=2, env=env)
+        expires = int(parsed.stdout.strip()) if parsed.returncode == 0 else None
+        if expires is not None and expires < observed and clock:
+            expires += 86400
+        return expires
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _result_reset(meta):
+    """`(reset text, timezone)` from the last result line of the attempt's own log tail."""
+    attempt, log = meta.get("attempt_id", ""), meta.get("log_file", "")
+    if not re.fullmatch(r"att-[a-zA-Z0-9-]+", attempt) or attempt not in Path(log).name:
+        return "-", None
+    try:
+        with Path(log).open("rb") as f:
+            start = max(0, f.seek(0, 2) - TAIL_BYTES)
+            f.seek(start)
+            lines = f.read().splitlines()
+        if start:
+            lines = lines[1:]
+    except OSError:
+        return "-", None
+    for line in reversed(lines):
+        if b'"type"' not in line or b'"result"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(row, dict) and row.get("type") == "result":
+            found = _RESET_SENTENCE.search(row.get("result") if isinstance(row.get("result"), str) else "")
+            return (found.group(1).strip(), found.group(2)) if found else ("-", None)
+    return "-", None
+
+
+def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
+    """`(states, epochs)`: the usage state per harness and, when known, when it ends."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
     try:
         lines = Path(jobs).read_text().splitlines()
     except (OSError, UnicodeError):
-        return dict.fromkeys(HARNESSES, "unknown")
+        return dict.fromkeys(HARNESSES, "unknown"), {}
     states = dict.fromkeys(HARNESSES, "ok")
+    epochs = {}
     scopes = _scope_candidates("claude", env)
     native = observations(jobs, now=now, env=env, registry_lines=lines)
     native_ids = {r["attempt_id"] for r in native}
@@ -241,7 +301,9 @@ def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=
             continue
         meta = dict(cell.split("=", 1) for cell in fields[5].split(",") if "=" in cell)
         harness = meta.get("harness") or meta.get("owner_harness")
-        if harness not in HARNESSES or not re.match(r"dead-[a-z-]*limit", meta.get("note", "")):
+        note = meta.get("note", "")
+        if harness not in HARNESSES or not (re.match(r"dead-[a-z-]*limit", note)
+                                             or (note == "dead-capacity" and meta.get("failure_class") != "pass")):
             continue
         # A native event owns its account/model/window even after reset or
         # account change. A lossy text marker cannot widen it back to global.
@@ -250,35 +312,44 @@ def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=
         if meta.get("quota_scope") and (harness != "claude" or meta["quota_scope"] != scopes.get(meta.get("quota_scope_kind"))):
             continue
         if harness not in legacy or fields[0] > legacy[harness][0]:
-            legacy[harness] = (fields[0], meta.get("reset", "-"))
-    for harness, (stamp, reset) in legacy.items():
+            legacy[harness] = (fields[0], meta)
+    for harness, (stamp, meta) in legacy.items():
         try:
             observed = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
         except ValueError:
             continue
-        expires = None
-        if reset not in {"", "-", "unknown", "unknown-reset"}:
-            normalized = re.sub("noon", "12pm", reset, flags=re.I)
-            normalized = re.sub("midnight", "12am", normalized, flags=re.I)
-            try:
-                clock = bool(re.fullmatch(r"[0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?", normalized, re.I))
-                if clock:
-                    day = subprocess.run(["date", "-d", f"@{int(observed)}", "+%Y-%m-%d"], capture_output=True, text=True, timeout=2, env=env)
-                    normalized = day.stdout.strip() + " " + normalized
-                elif not re.search(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", normalized):
-                    raise ValueError("unanchored-reset")
-                parsed = subprocess.run(["date", "-d", normalized, "+%s"], capture_output=True, text=True, timeout=2, env=env)
-                expires = int(parsed.stdout.strip()) if parsed.returncode == 0 else None
-                if expires is not None and expires < observed and clock:
-                    expires += 86400
-            except (OSError, ValueError, subprocess.TimeoutExpired):
-                pass
+        reset, tz = meta.get("reset", "-"), None
+        if reset in {"", "-", "unknown", "unknown-reset"} and meta.get("note") == "dead-capacity":
+            reset, tz = _result_reset(meta)
+        expires = _text_reset_epoch(reset, observed, env, tz)
         if expires is not None:
             if now < expires:
-                states[harness] = f"limited({reset})"
+                # A sentence-derived reset has no row label of its own; name the moment instead.
+                label = reset if tz is None else datetime.fromtimestamp(expires, timezone.utc).isoformat().replace("+00:00", "Z")
+                states[harness] = f"limited({label})"
+                epochs[harness] = expires
         elif 0 <= now - observed < unknown_window_min * 60:
             states[harness] = "limited(unknown-reset)"
-    return apply_limits(states, active_limits(jobs, profile=profile, models=models, now=now, env=env, registry_lines=lines))
+            epochs[harness] = int(observed + unknown_window_min * 60)
+    limits = active_limits(jobs, profile=profile, models=models, now=now, env=env, registry_lines=lines)
+    epochs.update({harness: limit["reset_epoch"] for harness, limit in limits.items()})
+    return apply_limits(states, limits), epochs
+
+
+def usage_states(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, env=None):
+    """One read contract for scoped native proof and legacy text compatibility."""
+    return _usage(jobs, profile=profile, models=models, unknown_window_min=unknown_window_min,
+                  now=now, env=env)[0]
+
+
+def harness_hold(jobs, harness, *, model=None, now=None, env=None, unknown_window_min=60):
+    """`{'until_epoch', 'label'}` while the usage gate reports this harness limited, else None."""
+    states, epochs = _usage(jobs, models={harness: model} if model else None,
+                            unknown_window_min=unknown_window_min, now=now, env=env)
+    state = states.get(harness, "ok")
+    if not state.startswith("limited("):
+        return None
+    return {"until_epoch": epochs.get(harness), "label": state[len("limited("):-1]}
 
 
 def main():

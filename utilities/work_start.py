@@ -451,6 +451,23 @@ def _capacity_wait(result, aid, node, refusal, resume, clock):
     return waiting
 
 
+def _capacity_pause(result, attention, resume):
+    """A usage-limit stop is a pause, not a failure: nothing was started, one `start` resumes it."""
+    waiting = {**result, "state": "waiting-capacity", "reason": "owner-capacity-wait",
+               "required_action": "resume-after-capacity", "harness": attention.get("harness", ""),
+               "source_attempt_id": attention.get("source_attempt_id", ""),
+               "next_step": "The harness is at a usage limit; nothing failed and nothing was started. "
+                   "After retry_at run resume_command once from the session that owns the route; "
+                   "completed stages are kept."}
+    if attention.get("retry_at"):
+        waiting["retry_at"] = attention["retry_at"]
+    if attention.get("usage_state"):
+        waiting["usage_state"] = attention["usage_state"]
+    waiting.pop("parent_next", None)
+    waiting.pop("parent_next_command", None)
+    return waiting
+
+
 def _outcome(jobs, aid):
     state = current_delivery_state(jobs, aid, parent_attempt_id=aid, advance=False)
     action = delivery_required_action(state)
@@ -582,6 +599,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         if attention:
             result["replacement_attention"] = attention
             if joined["state"] == "ready":
+                if attention[0]["reason"] == "replacement-capacity-wait":
+                    return _capacity_pause(result, attention[0], resume)
                 return {**result, "state": "needs-attention", "reason": attention[0]["reason"],
                         "node": attention[0].get("node", "")}
         if joined["state"] != "ready":
@@ -669,7 +688,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
         recover=True)
     from dispatch_replacement import advance, effective_attempts
-    replacement = advance(jobs, aid, run=run)
+    # Only an explicit start resumes an owner that stopped at a usage limit.
+    replacement = advance(jobs, aid, run=run, resume_capacity=True)
     if replacement.get("state") in {"running", "reused"}:
         result["replacement_lineage"] = effective_attempts(jobs, {aid})[1]
         current_path = Path(replacement["record"]["route_file"])
@@ -678,6 +698,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                         answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
     if replacement.get("state") == "needs-attention":
         result["replacement_attention"] = [replacement]
+        if replacement["reason"] == "replacement-capacity-wait":
+            return _capacity_pause(result, replacement, resume)
         if joined["state"] == "ready":
             return {**result, "state": "needs-attention", "reason": replacement["reason"],
                     "node": replacement.get("node", "")}
@@ -762,7 +784,8 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                                                 "start", "--route", str(path), "--jobs", str(jobs)])
         result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
             "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
-            "failure, then use resume_command; it automatically replaces one proven silent death per logical node. "
+            "failure, then use resume_command; a usage-limit stop resumes after the limit resets, and a silent death "
+            "is replaced once per logical node. "
             "If the correction changes the requested work, ask the user before changing that work.")
     for launch in result.get("launches", []):
         for advisory in OWNER_WRITE_ADVISORY.receipt_advisories(launch.get("receipt", "")):

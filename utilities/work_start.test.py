@@ -460,6 +460,42 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(len(self.calls),3)
         self.assertEqual(result['owner_attempt_id'],'att-owner-replacement')
 
+    def _wait_attention(self,aid):
+        return {'state':'needs-attention','reason':'replacement-capacity-wait','source_attempt_id':aid,
+                'node':'__owner__','harness':'claude','retry_at':'2099-01-01T00:00:00Z','usage_state':'limited(x)'}
+
+    def test_owner_at_a_usage_limit_is_waiting_capacity_and_only_start_may_resume_it(self):
+        self.start();self.ready=self.released=True;self.start()
+        owner=W.attempt_id(self.route,'owner')
+        row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)
+        self.jobs.write_text(self.jobs.read_text().replace(
+            row,row.replace('\topen\t','\tdone\t')+',note=dead-capacity,failure_class=capacity'))
+        launches=len(self.calls);seen={}
+        def wait(jobs,aid,**kwargs):
+            seen.update(kwargs);return self._wait_attention(aid)
+        with mock.patch('dispatch_replacement.advance',side_effect=wait):
+            result=self.start()
+        self.assertTrue(seen['resume_capacity'])          # start is the one explicit resume
+        self.assertEqual((result['state'],result['reason'],result['required_action']),
+                         ('waiting-capacity','owner-capacity-wait','resume-after-capacity'))
+        self.assertEqual((result['retry_at'],result['harness'],result['source_attempt_id']),
+                         ('2099-01-01T00:00:00Z','claude',owner))
+        self.assertNotIn('parent_next',result);self.assertNotIn('parent_next_command',result)
+        self.assertIn('from the session that owns the route',result['next_step'])
+        self.assertEqual(len(self.calls),launches)
+
+    def test_frame_replacement_held_by_a_usage_limit_waits_instead_of_failing(self):
+        self.start();self.ready=True
+        frame=W.attempt_id(self.route,'frame')
+        seen={}
+        def held(jobs,attempts,**kwargs):
+            seen.update(kwargs);return set(attempts),[],[self._wait_attention(frame)]
+        with mock.patch('dispatch_replacement.advance_batch',side_effect=held):
+            result=self.start()
+        self.assertNotIn('resume_capacity',seen)          # a supervisor-shaped call never resumes
+        self.assertEqual((result['state'],result['reason']),('waiting-capacity','owner-capacity-wait'))
+        self.assertEqual(result['retry_at'],'2099-01-01T00:00:00Z')
+
     def _parked_owner_row(self):
         self.start();self.ready=self.released=True;self.start()
         owner=W.attempt_id(self.route,'owner')
