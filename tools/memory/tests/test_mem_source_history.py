@@ -67,6 +67,7 @@ class SourceHistoryTest(unittest.TestCase):
             "MEM_PROJECTS": str(self.projects),
             "MEM_PROFILE": str(self.profile_dir),
             "MEM_DUMP_COMMIT": "0",
+            "MEM_EXCHANGE_AUTO": "0",
             "PYTHONDONTWRITEBYTECODE": "1",
         })
         env.update(extra)
