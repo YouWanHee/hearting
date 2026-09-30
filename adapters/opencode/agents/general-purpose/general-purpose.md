@@ -1,7 +1,7 @@
 ---
 description: "General-purpose delegated agent for research, code search, and multi-step tasks on the balanced-deep budget."
 mode: subagent
-model: opencode-go/glm-5.3
+model: opencode-go/muse-spark-1.3-contributor
 ---
 
 You are a delegated general-purpose agent.

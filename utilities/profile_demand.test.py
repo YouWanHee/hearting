@@ -109,7 +109,7 @@ class DemandSchema(unittest.TestCase):
                 write(explicit); selected, receipt=C.resolve_config(adapter,runtime=root)
                 self.assertEqual(receipt.balanced_provenance,"explicit")
                 self.assertEqual(P.resolve_profile_values(adapter,selected,"balanced")["budget"],"explicit-budget")
-                broken=dict(original); del broken["CFG_TIER_DEEP_MODEL"]
+                broken=dict(original); del broken["CFG_TIER_LIGHT_MODEL"]  # a tier every adapter declares and its wrappers read
                 write(broken); selected,receipt=C.resolve_config(adapter,runtime=root)
                 self.assertEqual(receipt.source,"shipped")
                 self.assertEqual(selected,shipped)
@@ -127,9 +127,15 @@ class DemandSchema(unittest.TestCase):
         config["profiles"]["balanced"]={**config["profiles"]["light"],"promote_relief_below":11}
         self.assertEqual(D.validate(config,capmap),[])
         self.assertEqual(D.query_profile_policy(config,"balanced")["promote_relief_below"],11)
-        for value in (None, {}, {**config["profiles"]["balanced"], "primary":["claude"]}):
+        for value in (None, {}):
             config["profiles"]["balanced"]=value
             self.assertTrue(D.validate(config,capmap))
+        # A band naming a disabled harness is a recommendation finding now, not a
+        # structural error: it validates, warns, and the disabled entry is ignored.
+        config["profiles"]["balanced"]={**config["profiles"]["light"], "primary":["claude"]}
+        self.assertEqual(D.validate(config,capmap),[])
+        self.assertTrue(any("names disabled harness 'claude'" in w for w in D.policy_warnings(config)))
+        self.assertEqual(D.normalize_policy(config)["profiles"]["balanced"]["primary"],[])
 
     def test_batch_selection_pair_seal_and_legacy_digest(self):
         members=[{"assignment_sha256":"sha256:"+"a"*64,"attempt_id":f"att-{i}",

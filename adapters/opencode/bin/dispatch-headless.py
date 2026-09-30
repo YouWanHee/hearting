@@ -131,6 +131,7 @@ from model_profile import (  # noqa: E402
     ModelProfileError,
     require_top_route,
     resolve_runtime_profile,
+    route_selection_pin,
     validate_registered_profile,
 )
 from codex_managed_dispatch import (
@@ -477,14 +478,15 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         if (args.model or args.variant) and not args.capacity_retry:
             raise ModelSelectionError(
                 "model-profile-override-forbidden",
-                "a route-sealed model profile may use a concrete override only on a checked capacity retry",
+                "a route-sealed model profile may use a concrete override only on a checked capacity retry "
+                "(to choose a model, seal it at compose time: capability-route.py compose --pin <target>=<harness>:<model>[@<effort>])",
             )
         if args.model_profile == TOP_PROFILE and args.model:
             # No cascade in or out, on every adapter (combined review m5):
             # nothing runs under the `top` label but the top model itself,
-            # even where `top` collapses onto the deep tier. This adapter
+            # even where `top` collapses onto another tier. This adapter
             # must read the *requested* profile, not the resolved one:
-            # opencode resolves `top` to `collapsed-top-to-deep`, so a check
+            # opencode resolves `top` to `collapsed-top-to-balanced-deep`, so a check
             # on `resolved["profile"]` (what claude and codex use, where the
             # label survives) would never fire here (guard review m3).
             raise ModelSelectionError(
@@ -497,14 +499,35 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             )
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
+        # A route-sealed selection pin (`compose --pin`) beats the profile's
+        # own model; a checked capacity retry still replaces it, and the receipt
+        # then says `pin+capacity` with the pinned model so nothing is
+        # overwritten silently.
+        try:
+            pin = route_selection_pin(
+                getattr(args, "route_file", None)
+                or getattr(getattr(args, "owner_route_binding", None), "route_file", None),
+                worker_type=args.worker_type, adapter="opencode",
+            )
+        except ModelProfileError as exc:
+            raise ModelSelectionError(exc.reason, str(exc)) from exc
+        model = args.model or resolved["model"]
+        variant = args.variant or resolved["budget"]
+        source = "profile+capacity" if args.model else "profile"
+        if pin["status"] == "applied":
+            if not args.model:
+                model, variant = pin["model"], pin["effort"] or resolved["budget"]
+            source = "pin+capacity" if args.model else "pin"
         return {
-            "source": "profile+capacity" if args.model else "profile",
+            "source": source,
             "role": args.model_role or "_kernel/owner",
             "profile": resolved["profile"],
             "tier": resolved["tier"],
             "granularity": resolved["granularity"],
-            "model": args.model or resolved["model"],
-            "variant": args.variant or resolved["budget"],
+            "model": model,
+            "variant": variant,
+            "pin_status": pin["status"],
+            **({"pin_model": pin["model"]} if pin["status"] == "applied" else {}),
         }
     if args.model_role and args.model:
         raise ModelSelectionError(
@@ -1084,6 +1107,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
         f",profile_granularity={settings['granularity']}"
         f",model={settings['model']},variant={settings['variant']}"
+        f",model_pin_status={settings.get('pin_status', 'none')}"
+        + (f",model_pin={settings['pin_model']}" if settings.get("pin_model") else "")
     )
     pipe += (
         f",parent_completion_delivery={args.parent_completion_delivery}"
@@ -2407,6 +2432,9 @@ def main(argv: list[str]) -> int:
     print(f"agent={args.agent}")
     settings = args.resolved_model_settings
     print(f"model_source={settings['source']}")
+    print(f"model_pin_status={settings.get('pin_status', 'none')}")
+    if settings.get("pin_model"):
+        print(f"model_pin={settings['pin_model']}")
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")

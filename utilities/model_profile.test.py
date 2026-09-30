@@ -248,15 +248,15 @@ class ModelProfileTest(unittest.TestCase):
                 profile: self._declared_point(codex_config, profile)
                 for profile in ("deep", "balanced-deep", "balanced", "light", "mini")
             },
-            # OpenCode has five profiles and three shipped operating points:
-            # balanced/light/mini share one model and runtime-default budget,
-            # while deep and balanced-deep use distinct configured models.
+            # OpenCode declares three tiers (balanced-deep, light, mini) with a
+            # verified variant each (2026-09-30 사용자 결정): `deep` collapses onto
+            # balanced-deep (no deep tier) and `balanced` onto light.
             "opencode": {
-                "deep": ("opencode-go/qwen3.8-max", "runtime-default"),
-                "balanced-deep": ("opencode-go/glm-5.3", "runtime-default"),
-                "balanced": ("opencode-go/glm-5.3-flash", "runtime-default"),
-                "light": ("opencode-go/glm-5.3-flash", "runtime-default"),
-                "mini": ("opencode-go/glm-5.3-flash", "runtime-default"),
+                "deep": ("opencode-go/muse-spark-1.3-contributor", "xhigh"),
+                "balanced-deep": ("opencode-go/muse-spark-1.3-contributor", "xhigh"),
+                "balanced": ("opencode-go/deepseek-v4.1-flash", "max"),
+                "light": ("opencode-go/deepseek-v4.1-flash", "max"),
+                "mini": ("opencode-go/deepseek-v4.1-flash", "high"),
             },
         }
         for adapter, profiles in expected.items():
@@ -328,20 +328,21 @@ class ModelProfileTest(unittest.TestCase):
             self.assertEqual(resolved["source"], "profile+capacity")
             self.assertEqual(resolved["model"], concrete["model"])
 
-    def test_opencode_live_conf_resolves_deep_and_balanced_deep_distinctly(self):
-        # 66e38467 (2026-08-07 사용자 결정): deep=qwen3.8-max. 2026-09-03 tier
-        # refresh moved balanced-deep to glm-5.3 and light/mini to glm-5.3-flash
-        # (same-or-cheaper registry rows); only `mini` still collapses (into
-        # light), named by CFG_MODEL_PROFILE_GRANULARITY.
+    def test_opencode_live_conf_collapses_deep_onto_balanced_deep_and_names_it(self):
+        # 2026-09-30 사용자 결정: OpenCode declares no deep tier ("do not use it
+        # for deep work"), so `deep` resolves onto balanced-deep and the
+        # per-profile granularity key says so; balanced-deep itself is exact.
         conf = ROOT / "adapters" / "opencode" / "config" / "models.conf"
         balanced = PROFILE.resolve_profile("opencode", conf, "balanced-deep")
         self.assertEqual(balanced["tier"], "balanced-deep")
-        self.assertEqual(balanced["model"], "opencode-go/glm-5.3")
+        self.assertEqual(balanced["model"], "opencode-go/muse-spark-1.3-contributor")
+        self.assertEqual(balanced["granularity"], "full")
 
         deep = PROFILE.resolve_profile("opencode", conf, "deep")
-        self.assertEqual(deep["tier"], "deep")
-        self.assertEqual(deep["model"], "opencode-go/qwen3.8-max")
-        self.assertEqual(deep["granularity"], "collapsed-mini")
+        self.assertEqual(deep["tier"], "balanced-deep")
+        self.assertEqual(deep["model"], balanced["model"])
+        self.assertEqual(deep["granularity"], "collapsed-deep-to-balanced-deep")
+        self.assertNotIn("CFG_TIER_DEEP_MODEL", PROFILE.load_config(conf))
 
     def test_per_profile_granularity_key_supports_typed_demotion(self):
         # Mechanism guard for CFG_MODEL_PROFILE_GRANULARITY_<PROFILE>: an adapter
@@ -384,19 +385,27 @@ class ModelProfileTest(unittest.TestCase):
                     resolved = PROFILE.resolve_profile(adapter, conf, profile)
                     self.assertEqual(resolved["granularity"], expected)
 
-    def test_opencode_runtime_default_omits_unverified_variant_flag(self):
+    def test_opencode_passes_a_declared_variant_and_omits_runtime_default(self):
         wrapper = WRAPPERS["opencode"]
+
+        def command_for(resolved):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                return wrapper.shell_command(
+                    argparse.Namespace(
+                        resolved_model_settings=resolved,
+                        worktree=temp_dir,
+                        agent="build",
+                    ),
+                    Path(temp_dir) / "prompt.txt",
+                    Path(temp_dir) / "worker.log",
+                )
+
         resolved = wrapper.resolve_model_settings(args("opencode", "balanced-deep"))
-        with tempfile.TemporaryDirectory() as temp_dir:
-            command = wrapper.shell_command(
-                argparse.Namespace(
-                    resolved_model_settings=resolved,
-                    worktree=temp_dir,
-                    agent="build",
-                ),
-                Path(temp_dir) / "prompt.txt",
-                Path(temp_dir) / "worker.log",
-            )
+        command = command_for(resolved)
+        self.assertIn("--model", command)
+        self.assertIn("--variant xhigh", command)
+        # `runtime-default` (a user copy that declares no variant) is still omitted.
+        command = command_for({**resolved, "variant": "runtime-default"})
         self.assertIn("--model", command)
         self.assertNotIn("--variant", command)
 
@@ -417,7 +426,7 @@ class TopExceptionProfileTest(unittest.TestCase):
     def test_each_adapter_declares_top_and_opencode_collapses_typed(self):
         expected = {"claude": ("fable", "max", "top", "full"),
                     "codex": ("gpt-6-astra", "xhigh", "top", "full"),
-                    "opencode": ("opencode-go/qwen3.8-max", "runtime-default", "deep", "collapsed-top-to-deep")}
+                    "opencode": ("opencode-go/muse-spark-1.3-contributor", "xhigh", "balanced-deep", "collapsed-top-to-balanced-deep")}
         for adapter, point in expected.items():
             with self.subTest(adapter=adapter):
                 resolved = PROFILE.resolve_profile(

@@ -71,6 +71,8 @@ def _policy_fields(allocation) -> dict:
     fields = {key: allocation.get(key) for key in _POLICY_KEYS}
     affinity = allocation.get("depth_affinity")
     fields["depth_affinity"] = dict(affinity) if isinstance(affinity, dict) else None
+    weights = allocation.get("harness_weights")
+    fields["harness_weights"] = dict(weights) if isinstance(weights, dict) else None
     fields["inert_keys"] = inert_allocation_keys(allocation)
     return fields
 

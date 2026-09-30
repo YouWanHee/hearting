@@ -25,11 +25,13 @@ _STRATEGY_READS = {
     "balanced": frozenset({
         "usage_gate_used_percent", "depth_affinity",
         "depth_affinity_weight", "usage_headroom_exponent",
+        "harness_weights",
     }),
 }
 _OPTIONAL_ALLOCATION_KEYS = (
     "usage_gate_used_percent", "depth_affinity",
     "depth_affinity_weight", "usage_headroom_exponent",
+    "harness_weights",
 )
 _DEGRADED_UNDER = {
     # capacity-aware only hoists the preferred harness inside a headroom

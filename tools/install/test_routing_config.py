@@ -49,6 +49,23 @@ class RoutingConfigInstallTests(unittest.TestCase):
             self.assertEqual(second["status"], "preserved")
             self.assertTrue(path.read_text(encoding="utf-8").endswith("# user edit\n"))
 
+    def test_an_empty_target_list_leaves_no_file_behind(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False
+        ), mock.patch.object(routing_config.shutil, "which", return_value=None):
+            result = routing_config.ensure([])
+            self.assertEqual(result["status"], "skipped-no-runtime")
+            self.assertFalse(Path(result["path"]).exists())
+
+    def test_a_render_failure_never_leaves_an_empty_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False
+        ), mock.patch.object(routing_config.shutil, "which", return_value="/bin/runtime"), \
+                mock.patch.object(routing_config, "render", side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError):
+                routing_config.ensure(["claude"])
+            self.assertFalse(routing_config.config_path().exists())
+
     def test_validate_reports_drift_for_a_preserved_legacy_strategy(self):
         # DP-23: install never rewrites the user file, so a decision that only
         # reached the shipped template (balanced-first, 2026-08-13) stays
@@ -101,20 +118,40 @@ class RoutingConfigInstallTests(unittest.TestCase):
                 DEFAULTS.validate(DEFAULTS.parse_yaml_subset(text), capmap), []
             )
 
-    def test_single_opencode_install_skips_invalid_user_policy(self):
-        with self.assertRaisesRegex(ValueError, "quality-peer runtime"):
-            routing_config.render(["opencode"])
+    def test_single_opencode_install_renders_a_valid_policy_without_warnings(self):
+        text = routing_config.render(["opencode"])
+        capmap = DEFAULTS.load_topology_capabilities(DEFAULTS.default_topology_path())
+        config = DEFAULTS.parse_yaml_subset(text)
+        self.assertEqual(DEFAULTS.validate(config, capmap), [])
+        self.assertEqual(DEFAULTS.policy_warnings(config), [])
+        for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+            self.assertEqual(config["profiles"][profile]["primary"], ["opencode"])
+        self.assertNotIn("harness_weights", config["allocation"])
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False
         ), mock.patch.object(
             routing_config.shutil, "which",
             side_effect=lambda name: "/bin/opencode" if name == "opencode" else None,
         ):
+            os.environ.pop("DISPATCH_DEFAULTS_CONFIG", None)
             result = routing_config.ensure(["opencode"])
             path = Path(result["path"])
-            self.assertEqual(result["status"], "skipped-no-quality-peer")
+            self.assertEqual(result["status"], "created")
             self.assertEqual(result["enabled"], ["opencode"])
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
+            self.assertEqual(routing_config.validate()["status"], "valid")
+
+    def test_full_render_matches_the_shipped_bands_and_weights_opencode_low(self):
+        text = routing_config.render(["claude", "codex", "opencode"])
+        capmap = DEFAULTS.load_topology_capabilities(DEFAULTS.default_topology_path())
+        config = DEFAULTS.parse_yaml_subset(text)
+        self.assertEqual(DEFAULTS.validate(config, capmap), [])
+        self.assertEqual(DEFAULTS.policy_warnings(config), [])
+        self.assertEqual(config["profiles"]["deep"]["last_resort"], [])
+        self.assertEqual(config["profiles"]["balanced-deep"]["last_resort"], ["opencode"])
+        self.assertEqual(config["profiles"]["balanced"]["last_resort"], [])
+        self.assertEqual(config["profiles"]["light"]["primary"], ["claude", "codex", "opencode"])
+        self.assertEqual(config["allocation"]["harness_weights"], {"opencode": 0.3})
 
     def test_rendered_config_still_answers_the_shipped_capability_baseline(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
