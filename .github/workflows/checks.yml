@@ -20,6 +20,10 @@ jobs:
   adaptation-boundary:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # ci_scope.py asks the Actions API whether a PR run already passed this tree.
+      actions: read
     outputs:
       full_tests: ${{ steps.scope.outputs.full_tests }}
     steps:
@@ -35,6 +39,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/release/ci_scope.py >> "$GITHUB_OUTPUT"
+
+      - name: Record the scope decision
+        env:
+          FULL_TESTS: ${{ steps.scope.outputs.full_tests }}
+          SCOPE_REASON: ${{ steps.scope.outputs.reason }}
+        run: |
+          echo "Expensive suites: full_tests=$FULL_TESTS (reason: $SCOPE_REASON)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify generated projections
         run: python3 tools/generate.py --check
@@ -122,11 +133,16 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 utilities/dispatch_namespace_e2e.test.py -v
 
-  full-test-suite:
+  full-suite-shard:
     needs: adaptation-boundary
     if: needs.adaptation-boundary.outputs.full_tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      # Every shard reports even when a sibling fails, so one run shows all causes.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - name: Check out the source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -143,26 +159,118 @@ jobs:
           sudo timeout 300 apt-get -o Acquire::Retries=3 update
           sudo timeout 300 apt-get -o Acquire::Retries=3 install --yes ripgrep strace
 
-      - name: Run the full isolated test suite (C-3/C-4)
+      - name: Run shard ${{ matrix.shard }} of the full isolated test suite (C-3/C-4)
         # --seed-baseline uploads the proposed rows stamped with this runner's
         # fingerprint; adopting them is a human decision, never automatic.
         # A known failure that now passes is reported, not failed: a fix
         # should not turn the build red until its baseline row is dropped.
+        # The shard is split from tools/test-durations.tsv, so every runner
+        # computes the same partition; --suite-list is written before any
+        # suite runs and lets the aggregate job prove nothing was dropped.
         run: |
+          mkdir -p "${{ runner.temp }}/shard-out"
           python3 tools/run-tests.py --retries 1 \
+            --shard ${{ matrix.shard }}/4 \
+            --suite-list ${{ runner.temp }}/shard-out/suite-list.tsv \
             --xpass-nonfatal \
             --strict-leak-sweep \
-            --report ${{ runner.temp }}/run-tests-report.tsv \
-            --diagnostics-dir ${{ runner.temp }}/run-tests-diagnostics \
-            --seed-baseline ${{ runner.temp }}/run-tests-seed-baseline.tsv
+            --report ${{ runner.temp }}/shard-out/run-tests-report.tsv \
+            --diagnostics-dir ${{ runner.temp }}/shard-out/run-tests-diagnostics \
+            --seed-baseline ${{ runner.temp }}/shard-out/run-tests-seed-baseline.tsv
 
-      - name: Upload full-suite report and baseline seed
+      - name: Upload shard report, manifest and baseline seed
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: run-tests-report
-          path: |
-            ${{ runner.temp }}/run-tests-report.tsv
-            ${{ runner.temp }}/run-tests-seed-baseline.tsv
-            ${{ runner.temp }}/run-tests-diagnostics
+          name: run-tests-report-shard-${{ matrix.shard }}-of-4
+          path: ${{ runner.temp }}/shard-out
           if-no-files-found: ignore
+          # A re-run of a failed shard replaces the earlier attempt's artifact.
+          overwrite: true
+
+  # The required check keeps its historical name; it now means "every shard ran
+  # and together they cover the whole census".
+  full-test-suite:
+    name: full-test-suite
+    needs: [adaptation-boundary, full-suite-shard]
+    if: always() && needs.adaptation-boundary.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every shard to have succeeded
+        if: needs.adaptation-boundary.outputs.full_tests == 'true'
+        env:
+          SHARDS: ${{ needs.full-suite-shard.result }}
+        run: |
+          if [ "$SHARDS" != success ]; then
+            echo "full-suite-shard result is '$SHARDS'; shard reports are in the run artifacts" >&2
+            exit 1
+          fi
+
+      - name: Check out the source
+        if: needs.adaptation-boundary.outputs.full_tests == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the shard reports
+        if: needs.adaptation-boundary.outputs.full_tests == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: run-tests-report-shard-*-of-4
+          path: ${{ runner.temp }}/shards
+
+      - name: Verify the shards add up to the census
+        if: needs.adaptation-boundary.outputs.full_tests == 'true'
+        run: |
+          python3 tools/run-tests.py --census \
+            --suite-list "${{ runner.temp }}/shards/census-suite-list.tsv"
+          status=0
+          python3 tools/run-tests.py --verify-shards "${{ runner.temp }}/shards" \
+            > "${{ runner.temp }}/verify-shards.txt" || status=$?
+          cat "${{ runner.temp }}/verify-shards.txt"
+          {
+            echo '### Shard coverage'
+            echo '```'
+            cat "${{ runner.temp }}/verify-shards.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+  # Marks this merge-result tree as fully validated, for ci_scope.py on a later
+  # main push. Written only after every expensive job passed on a pull request;
+  # documentation-only, failed, cancelled and partial runs leave no marker.
+  validated-tree-marker:
+    needs: [adaptation-boundary, install-lifecycle, dispatch-pid-namespace, full-test-suite]
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.adaptation-boundary.outputs.full_tests == 'true' &&
+      needs.adaptation-boundary.result == 'success' &&
+      needs.install-lifecycle.result == 'success' &&
+      needs.dispatch-pid-namespace.result == 'success' &&
+      needs.full-test-suite.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the tested merge result
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Record the validated tree
+        id: tree
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          mkdir -p "${{ runner.temp }}/marker"
+          printf '{"tree":"%s","merge_sha":"%s","run_id":"%s"}\n' \
+            "$tree" "$GITHUB_SHA" "$GITHUB_RUN_ID" > "${{ runner.temp }}/marker/validated-tree.json"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the validated-tree marker
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: validated-tree-${{ steps.tree.outputs.tree }}
+          path: ${{ runner.temp }}/marker/validated-tree.json
+          overwrite: true

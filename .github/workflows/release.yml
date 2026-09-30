@@ -40,6 +40,11 @@ jobs:
     needs: admission
     if: needs.admission.outputs.validation_required == 'true'
     uses: ./.github/workflows/checks.yml
+    permissions:
+      contents: read
+      # The called Checks job looks up PR validation through the Actions API; a
+      # caller cannot grant a called job more than it holds itself.
+      actions: read
 
   release:
     needs: [admission, validation]

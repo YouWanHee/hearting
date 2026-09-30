@@ -47,7 +47,7 @@ import stat
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -728,6 +728,25 @@ def _routes_dir(root: Path) -> Path:
     return route_lineage.canonical_route_path(root, "x").parent
 
 
+def _qualified_continuation(entry_stem: str, candidate: Any, route_id: Optional[str] = None,
+                            route_hash_value: Optional[str] = None) -> bool:
+    """Whether a route file is a sealed continuation edge (of ``route_id`` when given).
+
+    The one qualification rule shared by `_lineage_children` and
+    `closed_lineage_handover`: not its own source, contract version 1, source id
+    and hash match, and the route hash recomputes -- a tampered sibling proves
+    nothing and is not part of any lineage.
+    """
+    if not isinstance(candidate, dict) or candidate.get("continuation_contract_version") != 1:
+        return False
+    source_id = candidate.get("source_route_id")
+    if entry_stem == source_id or (route_id is not None and source_id != route_id):
+        return False
+    if route_hash_value is not None and candidate.get("source_route_hash") != route_hash_value:
+        return False
+    return route_identity.route_hash(candidate) == candidate.get("route_hash")
+
+
 def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
     """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
 
@@ -746,14 +765,63 @@ def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[
         candidate = _read_json(entry)
         if not isinstance(candidate, dict):
             continue
-        if (candidate.get("continuation_contract_version") != 1
-                or candidate.get("source_route_id") != route_id
-                or candidate.get("source_route_hash") != route_hash_value):
-            continue
-        if route_identity.route_hash(candidate) != candidate.get("route_hash"):
-            continue  # a tampered sibling proves nothing; not part of any lineage
-        children.append(candidate)
+        if _qualified_continuation(entry.stem, candidate, route_id, route_hash_value):
+            children.append(candidate)
     return children
+
+
+class LineageHandover(NamedTuple):
+    """`closed`: the cycle's whole qualifying lineage tree has an outcome.
+    `handed_over`: routes of that tree that begin another cycle (empty unless closed)."""
+    closed: bool
+    handed_over: frozenset
+
+
+def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHandover:
+    """Whether ``record``'s lineage is closed, and which routes it handed to other cycles.
+
+    The tree is every material-input-qualifying continuation below the cycle's
+    begin route, read with one scan of the routes directory. It is closed only
+    when every route in it has an outcome; a live tree keeps D-120's "which cycle
+    continues" judgment untouched (`(False, frozenset())`). In a closed tree the
+    routes that begin a *different* cycle belong to that cycle, so this cycle
+    seals on its own stretch, up to just before them.
+    """
+    begin_route = load_route(root, Path(record["route_file"]))
+    if begin_route["route_hash"] != record["route_hash"]:
+        raise ProducerError("route-hash-drift", record["cycle_id"])
+    children_of: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    directory = _routes_dir(root)
+    if directory.is_dir():
+        for entry in sorted(directory.glob("*.json")):
+            candidate = _read_json(entry)
+            if _qualified_continuation(entry.stem, candidate):
+                key = (candidate["source_route_id"], candidate.get("source_route_hash"))
+                children_of.setdefault(key, []).append(candidate)
+    tree = {begin_route["route_id"]}
+    queue = [begin_route]
+    while queue:
+        node = queue.pop()
+        if not route_is_closed(root, node):
+            return LineageHandover(False, frozenset())
+        for child in children_of.get((node["route_id"], node["route_hash"]), []):
+            if (child.get("capability") != record.get("capability")
+                    or child.get("effective_intensity") != record.get("intensity")):
+                continue
+            if child["route_id"] in tree:
+                return LineageHandover(False, frozenset())  # a cycle in the lineage is never closed
+            tree.add(child["route_id"])
+            queue.append(child)
+    others = {rec.get("route_id") for rec in list_cycle_records(root)
+              if rec.get("cycle_id") != record.get("cycle_id")}
+    return LineageHandover(True, frozenset(tree & others) - {begin_route["route_id"]})
+
+
+def _handed_over_routes(root: Path, record: Mapping[str, Any]) -> frozenset:
+    try:
+        return closed_lineage_handover(root, record).handed_over
+    except (ProducerError, KeyError, OSError):
+        return frozenset()
 
 
 def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -815,6 +883,7 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
         if node.get("capability") != record.get("capability") or node.get("effective_intensity") != record.get("intensity"):
             reason = "cycle-route-binding-mismatch:material-input"
             return Admission(False, reason, f"route={node['route_id']}", path, _d120_next_action(reason))
+    handed_over: Optional[frozenset] = None  # computed only when a refusal is about to be issued
     for node in path[:-1]:
         siblings = _lineage_children(root, node["route_id"], node["route_hash"])
         qualifying = [s for s in siblings
@@ -822,6 +891,10 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
                       and s.get("effective_intensity") == record.get("intensity")]
         for sibling in qualifying:
             if sibling["route_id"] not in by_id:
+                if handed_over is None:
+                    handed_over = _handed_over_routes(root, record)
+                if sibling["route_id"] in handed_over:
+                    continue  # closed lineage: that branch belongs to another cycle
                 reason = "cycle-route-binding-mismatch:lineage-fork"
                 return Admission(False, reason, f"branch={node['route_id']} siblings={sibling['route_id']},{path[path.index(node)+1]['route_id']}",
                                  path, _d120_next_action(reason))
@@ -829,6 +902,10 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
         qualifying = [s for s in _lineage_children(root, route["route_id"], route["route_hash"])
                       if s.get("capability") == record.get("capability")
                       and s.get("effective_intensity") == record.get("intensity")]
+        if qualifying:
+            if handed_over is None:
+                handed_over = _handed_over_routes(root, record)
+            qualifying = [s for s in qualifying if s["route_id"] not in handed_over]
         if qualifying:
             reason = "cycle-route-binding-mismatch:superseded-route"
             return Admission(False, reason, route["route_id"], path, _d120_next_action(reason))
@@ -2269,12 +2346,17 @@ def _unmanifestable_reason(rel: str) -> Optional[str]:
 
 
 def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
-                      excluded: Optional[List[str]] = None) -> Tuple[List[Tuple[str, bytes]], List[str]]:
+                      excluded: Optional[List[str]] = None,
+                      exclude_symlinks: bool = False,
+                      excluded_symlinks: Optional[List[str]] = None) -> Tuple[List[Tuple[str, bytes]], List[str]]:
     """Regular files under `artifacts/`.  With `exclude_hidden`, files whose path
     cannot be a D-6 locator (a dot-component such as `.git/`/`.claude/` runtime
     residue, or a component longer than the locator limit) are left out of the
     manifest and reported through `excluded` instead of failing validation
-    (W7E retrospective seal of relocated legacy trees)."""
+    (W7E retrospective seal of relocated legacy trees).  With `exclude_symlinks`
+    (an abandoned seal, which claims no success), symbolic links are left out
+    and reported through `excluded_symlinks`; the link is only lstat-ed, never
+    followed or read.  Without it a link is a `symlink-forbidden` violation."""
     paths: List[Tuple[str, Path]] = []
     violations: List[str] = []
     artifacts = directory / "artifacts"
@@ -2286,6 +2368,10 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
             # Machine-owned locator binding, not user output or manifest data.
             continue
         if os.path.islink(str(entry)):
+            if exclude_symlinks:
+                if excluded_symlinks is not None:
+                    excluded_symlinks.append(rel)
+                continue
             violations.append(f"symlink-forbidden:{rel}")
             continue
         if not entry.is_file():
@@ -4188,7 +4274,9 @@ def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id
 
 def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
     """D-120 finalize: R is the unique T(C) leaf -- the route with no
-    material-input-qualifying continuation child. `--cycle`-only finalize has
+    material-input-qualifying continuation child. In a closed lineage the
+    children that begin another cycle are that cycle's, so R stops before them
+    (`closed_lineage_handover`). `--cycle`-only finalize has
     no other way to name R; a completion controller that already knows its
     exact route can seal it directly by checking `cycle_route_admission(...,
     finalize=True)` itself instead of calling this walk.
@@ -4198,10 +4286,20 @@ def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
         raise ProducerError("route-hash-drift", record["cycle_id"])
     current = begin_route
     visited = {current["route_id"]}
+    handed_over: Optional[frozenset] = None  # computed once, and only when a child begins another cycle
+    begin_ids: Optional[Set[Any]] = None
     while True:
         candidates = [c for c in _lineage_children(root, current["route_id"], current["route_hash"])
                       if c.get("capability") == record.get("capability")
                       and c.get("effective_intensity") == record.get("intensity")]
+        if candidates and handed_over is None:
+            if begin_ids is None:
+                begin_ids = {rec.get("route_id") for rec in list_cycle_records(root)
+                             if rec.get("cycle_id") != record.get("cycle_id")}
+            if any(c["route_id"] in begin_ids for c in candidates):
+                handed_over = _handed_over_routes(root, record)
+        if handed_over:
+            candidates = [c for c in candidates if c["route_id"] not in handed_over]
         if not candidates:
             return current
         if len(candidates) > 1:
@@ -4234,17 +4332,22 @@ def finalize(
     support_locators: Sequence[str] = (),
     expected_binding: Optional[Mapping[str, Any]] = None,
     lock_timeout: Optional[float] = None,
+    exclude_symlinks: bool = False,
     _admission_lock_fd: Optional[int] = None,
     _recovery_scope: str = "root",
 ) -> Dict[str, Any]:
     """`lock_timeout` bounds both lock waits (default: the admission and
-    checkpoint defaults); a background sweep passes 0 so a held lock defers it."""
+    checkpoint defaults); a background sweep passes 0 so a held lock defers it.
+    `exclude_symlinks` (abandoned only) leaves symbolic links out of the manifest
+    and records them as `excluded_symlinks` on the result and the cycle record."""
     root = Path(root).resolve()
     if _recovery_scope != "exact":
         dispatch_terminal_commit.require_current_cleanup("producer-finalize")
     _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
     if state not in {"completed", "abandoned"}:
         raise ProducerError("finalize-state-invalid", state)
+    if exclude_symlinks and state != "abandoned":
+        raise ProducerError("symlink-exclusion-requires-abandoned", state)
     if _admission_lock_fd is not None:
         raise ProducerError("finalize-reentry-forbidden", cycle_id)
     # PRD §13.53.4(3) names the producer admission mutex as the lock that must
@@ -4400,7 +4503,10 @@ def finalize(
         primary = _placed_locator(_cycle_relative_primary(primary, directory), placements)
         support_locators = tuple(_placed_locator(value, placements) for value in support_locators)
         excluded_hidden: List[str] = []
-        rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden)
+        excluded_symlinks: List[str] = []
+        rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden,
+                                             exclude_symlinks=exclude_symlinks,
+                                             excluded_symlinks=excluded_symlinks)
         if violations:
             raise ProducerError("output-invalid", ";".join(violations))
         if not rows:
@@ -4474,6 +4580,12 @@ def finalize(
         if manifest_path.exists():
             raise ProducerError("manifest-already-present", str(manifest_path))
         cycle_path = os.path.relpath(str(directory), str(root))
+        if excluded_symlinks:
+            # Written before the manifest is published so a crash after the commit
+            # point recovers from the on-disk record without losing the exclusion.
+            record = dict(record)
+            record["excluded_symlinks"] = excluded_symlinks
+            _write_cycle_record(root, record, exclusive=False)
         _write_journal(root, cycle_id, state="sealing", manifest_digest=digest, cycle_path=cycle_path)
         # COMMIT POINT: exclusive manifest creation.
         _write_exclusive(manifest_path, artifact_manifest.canonical_bytes(document))
@@ -4486,7 +4598,8 @@ def finalize(
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
             ) from exc
-        sealed_result = {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
+        sealed_result = {"excluded_hidden": excluded_hidden, "excluded_symlinks": excluded_symlinks,
+            "adopted_root_outputs": adopted_root_outputs,
             "moved_outputs": moved_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),

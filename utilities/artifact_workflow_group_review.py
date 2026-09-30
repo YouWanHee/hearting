@@ -121,12 +121,14 @@ RULES (the same criteria used for the 2026-09-29 full backfill):
 4. Stay inside this campaign. Do not force unrelated cycles together. For every
    target you leave ungrouped, give the real reason.
 5. For each TARGET choose exactly one: join (an existing group_id whose subgoal the
-   target shares or continues), new (a new group of >= 2 members; members may
-   include listed UNGROUPED cycles of this campaign), or none. Keep the granularity
+   target shares or continues), new (a new group; it may hold this target alone
+   or also listed UNGROUPED cycles of this campaign), or none. Keep the granularity
    of the existing groups: a target that carries an existing group's subgoal
    forward (its next step, handoff, deployment, or fix) joins that group even when
    several targets could also form a smaller group of their own; start a new group
-   only for a subgoal no existing group covers.
+   only for a subgoal no existing group covers. A target that starts such a subgoal
+   (for example a new outside request) opens its own new group even as the only
+   member; do not fold it into an existing group just to avoid a one-cycle group.
 6. Write titles, stage labels, reasons, and rationales in the language already
    used by this campaign's existing group titles, or otherwise by its documents.
    Title <= 120 chars, stage label <= 40, reason / rationale <= 280, one line each.
@@ -305,10 +307,13 @@ def read_record(root: Path) -> Tuple[str, Optional[Dict[str, Any]]]:
     return "ok", doc
 
 
-def _update_record(root: Path, mutate: Callable[[Dict[str, Any]], None]) -> bool:
-    """Read-merge-write under the producer admission lock; False when it cannot be done."""
+def _update_record(root: Path, mutate: Callable[[Dict[str, Any]], None],
+                   lock_timeout: Optional[float] = None) -> bool:
+    """Read-merge-write under the producer admission lock; False when it cannot be done.
+    `lock_timeout` bounds the wait (default: the admission default; 0 never waits)."""
     try:
-        lock = admission._acquire_lock(root, admission.LOCK_TIMEOUT_DEFAULT)
+        lock = admission._acquire_lock(
+            root, admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout)
     except Exception:  # noqa: BLE001 -- busy admission is a soft failure
         return False
     try:
@@ -357,9 +362,11 @@ class Outcome:
     harness: Optional[str] = None
     failure_class: Optional[str] = None
     dropped_relations: int = 0
+    profile: Optional[str] = PROFILE  # None: no model judged this outcome
 
 
-def record_outcomes(root: Path, outcomes: Sequence[Outcome], *, mode: str, now: Optional[float]) -> bool:
+def record_outcomes(root: Path, outcomes: Sequence[Outcome], *, mode: str, now: Optional[float],
+                    lock_timeout: Optional[float] = None) -> bool:
     reviewed_at = _now_iso(now)
 
     def mutate(doc: Dict[str, Any]) -> None:
@@ -377,13 +384,13 @@ def record_outcomes(root: Path, outcomes: Sequence[Outcome], *, mode: str, now: 
                 "campaign_id": item.campaign_id, "verdict": item.verdict, "group_id": item.group_id,
                 "stage_label": item.stage_label, "reason": item.reason, "reviewed_at": reviewed_at,
                 "cycle_state": item.cycle_state, "mode": mode,
-                "declaration_sha256": item.declaration_sha256, "profile": PROFILE,
+                "declaration_sha256": item.declaration_sha256, "profile": item.profile,
                 "harness": item.harness, "failure_class": item.failure_class,
                 "failures": failures, "hard_failures": hard,
                 "dropped_relations": item.dropped_relations,
             }
 
-    return _update_record(root, mutate)
+    return _update_record(root, mutate, lock_timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +886,7 @@ def validate_response(text: str, review_input: ReviewInput) -> ValidatedDecision
         if not isinstance(key, str) or not key or key in new_groups:
             raise ReviewError("invalid-response", "new-group-key")
         members = item["members"]
-        if not isinstance(members, list) or not 2 <= len(members) <= 64:
+        if not isinstance(members, list) or not 1 <= len(members) <= 64:
             raise ReviewError("invalid-response", "new-group-size")
         new_groups[key] = {"key": key, "title": _text(item["title"], 120, "group-title-invalid"),
                            "raw_members": [_closed(m, _MEMBER_KEYS, "member-keys") for m in members]}

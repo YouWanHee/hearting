@@ -2685,6 +2685,53 @@ class CompletionMarkerTest(unittest.TestCase):
         budget = dispatch.admit_round(route, node, self.jobs).budget
         self.assertEqual(budget.state, "admit")
 
+    def test_m4b_latest_round_closure_replaces_a_superseded_pass_marker(self):
+        """A correction added a review round after round 1 passed: the round 1
+        marker is no longer current, so closing the exhausted latest round must
+        not be refused as `node-already-complete`; closing an older round
+        while a later one exists still is."""
+        route = self.compile_route()          # strong -> cap 2
+        route_path = self.write_route(route)
+        directory = self.stable_dispatch / "completion" / route["route_id"]
+        self.write_row("running", "plan-check-r1", "att-stale-r1", "worker_type=review", node_id="plan-check")
+        self._reap_real_process("att-stale-r1")
+        passed = self.base / "plan-check-pass.md"
+        passed.write_text("round 1: PASS\n", encoding="utf-8")
+        first = self.complete(route_path, "plan-check", passed, jobs=self.jobs, attempt_id="att-stale-r1")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(json.loads((directory / "plan-check.json").read_text())["attempt_id"], "att-stale-r1")
+        r2 = self.review_blocking_row("att-stale-r2", 2)
+        memo = self.owner_closure(route, attempts=("att-stale-r2",), artifacts=(r2.name,))
+        closed = self.complete(route_path, "plan-check", memo, jobs=self.jobs, attempt_id="att-stale-r2")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        marker = json.loads((directory / "plan-check.json").read_text())
+        self.assertEqual(marker["attempt_id"], "att-stale-r2")
+        self.assertTrue((directory / "plan-check.1.json").is_file())   # round 1 history kept
+        status, meta = self.read_row("att-stale-r2")
+        self.assertEqual((meta.get("gate_closure"), meta.get("note")), ("owner-closure", "completed-marker"))
+
+    def test_m4c_superseded_marker_does_not_admit_closing_an_older_round(self):
+        route = self.compile_route()
+        route_path = self.write_route(route)
+        directory = self.stable_dispatch / "completion" / route["route_id"]
+        self.write_row("running", "plan-check-r1", "att-old-r1", "worker_type=review", node_id="plan-check")
+        self._reap_real_process("att-old-r1")
+        passed = self.base / "plan-check-pass.md"
+        passed.write_text("round 1: PASS\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan-check", passed, jobs=self.jobs,
+                                       attempt_id="att-old-r1").returncode, 0)
+        r2 = self.review_blocking_row("att-old-r2", 2)
+        r3 = self.review_blocking_row("att-old-r3", 3)
+        memo = self.owner_closure(route, attempts=("att-old-r2", "att-old-r3"), artifacts=(r2.name, r3.name))
+        before = (directory / "plan-check.json").read_text(encoding="utf-8")
+        older = self.complete(route_path, "plan-check", memo, jobs=self.jobs, attempt_id="att-old-r2")
+        self.assertNotEqual(older.returncode, 0)
+        self.assertIn("owner-closure-node-already-complete:attempt=att-old-r1", older.stderr)
+        self.assertEqual((directory / "plan-check.json").read_text(encoding="utf-8"), before)
+        latest = self.complete(route_path, "plan-check", memo, jobs=self.jobs, attempt_id="att-old-r3")
+        self.assertEqual(latest.returncode, 0, latest.stdout + latest.stderr)
+        self.assertEqual(json.loads((directory / "plan-check.json").read_text())["attempt_id"], "att-old-r3")
+
     def test_m4_second_closure_on_another_attempt_is_refused_and_keeps_the_canonical_marker(self):
         route = self.compile_route()
         route_path = self.write_route(route)

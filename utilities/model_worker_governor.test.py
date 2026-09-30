@@ -1232,7 +1232,7 @@ class StartBudgetClassPoolTest(unittest.TestCase):
     def test_each_background_class_has_its_own_pool(self):
         self.assertEqual(
             GOVERNOR.CLASS_START_BUDGETS,
-            {"dispatch": 20, "title": 12, "loop": 4},
+            {"dispatch": 40, "title": 12, "loop": 4},
         )
         with self._uncapped(), tempfile.TemporaryDirectory() as temp_dir:
             for worker_class in ("loop",):
