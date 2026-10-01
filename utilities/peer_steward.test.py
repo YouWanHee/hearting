@@ -1886,6 +1886,15 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                     rc, line = self.clear_cmd(world)
                 self.assertIn(expect, line)
                 self.assertEqual(len(world.typed()), 1, line)
+        # OpenCode's pane stays `done` through /new, so the pause between looks is a wait for the
+        # screen (event-driven), not the idle wait that would return at once.
+        self.book(harness="opencode", sid="ses_A")
+        world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
+                            home_after=OPENCODE_EMPTY)
+        with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 3):
+            rc, line = self.clear_cmd(world)
+        self.assertIn("cleared=unverified", line)
+        self.assertEqual(len([c for c in world.calls if c[:3] == ["herdr", "pane", "wait-output"]]), 2)
         for screen, reason in ((OPENCODE_DRAFT, "draft"), (NO_BOX, "draft-unknown")):
             self.book(harness="opencode", sid="ses_A")
             world = _ClearWorld(harness="opencode", sid="ses_A", screens=[screen], new_sid=None)

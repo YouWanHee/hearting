@@ -1720,7 +1720,7 @@ def cmd_prompt(args):
 _CLEAR_COMMAND = {"claude": "/clear", "codex": "/clear", "opencode": "/new"}
 _CLEAR_EXIT = {"true": 0, "skipped": 3, "failed": 1, "unverified": 5}
 _CLEAR_LEDGER_STATUS = {"true": "sent", "failed": "failed", "skipped": "unknown", "unverified": "unknown"}
-_CLEAR_OBSERVE_ROUNDS = 3             # bounded herdr waits between looks at the pane after the send
+_CLEAR_OBSERVE_ROUNDS = 8             # bounded waits between looks at the pane after the send (OpenCode repaints its home in ~5 s)
 _CLEAR_OBSERVE_SETTLE_MS = 1500
 _ANSI_TOKEN = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|(.)", re.S)
 _RULE_LINE = re.compile(r"^[\s\u2500-\u257f]*\u2500{8,}[\s\u2500-\u257f]*$")
@@ -1908,6 +1908,18 @@ def _clear_look(target, req):
     return None, agent
 
 
+def _wait_for_home(target, bound_ms):
+    """Event-driven pause for OpenCode: its pane is `done` before, during and after `/new`, so
+    `_settle` would return at once. Waits (bounded) for the home screen's placeholder to show;
+    the answer is not used -- the caller looks at the screen itself."""
+    try:
+        subprocess.run(["herdr", "pane", "wait-output", target, "--match", "Ask anything",
+                        "--source", "visible", "--timeout", str(int(bound_ms))],
+                       capture_output=True, text=True, timeout=bound_ms / 1000.0 + 5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _opencode_home(lines):
     """OpenCode's home screen: the placeholder box (older builds) or, as measured on 1.18.34,
     nothing at all but the working-directory line. A conversation view always carries the
@@ -1940,7 +1952,10 @@ def _clear_observe(target, req, request_path):
             if lines is not None and _opencode_home(lines):
                 return "-"
         if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
-            _settle(target, _CLEAR_OBSERVE_SETTLE_MS)
+            if req.get("harness") == "opencode":
+                _wait_for_home(target, _CLEAR_OBSERVE_SETTLE_MS)
+            else:
+                _settle(target, _CLEAR_OBSERVE_SETTLE_MS)
     return None
 
 
