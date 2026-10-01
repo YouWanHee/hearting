@@ -430,11 +430,31 @@ class RegisteredOwnerInputTest(unittest.TestCase):
         self.assertFalse(self.state_file().exists())
         self.setUp()
         I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
         self.jobs.write_text(self.jobs.read_text().replace('d' * 64, 'e' * 64))
         with self.assertRaisesRegex(I.InputError, 'target-changed'):
             I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
         with self.assertRaisesRegex(I.InputError, 'target-changed'):
             I.submit(self.jobs, self.attempt, 'wrong nonce')
+
+    def test_relaunched_row_keeps_input_queued_before_the_first_consumer(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        I.submit(self.jobs, self.attempt, 'before the relaunch', 'early')
+        # The next launcher of the same never-claimed attempt mints its own lease nonce.
+        self.jobs.write_text(self.jobs.read_text().replace('d' * 64, 'e' * 64))
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        observed = I.inspect(self.jobs, self.attempt)
+        self.assertTrue(observed['accepting'])
+        self.assertEqual([item['state'] for item in observed['requests']], ['queued'])
+        I.submit(self.jobs, self.attempt, 'after the relaunch', 'late')
+        # A consumer binding after the row changed again inherits the same queue.
+        self.jobs.write_text(self.jobs.read_text().replace('e' * 64, 'f' * 64))
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            consumer = I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+            self.assertTrue(consumer.pending())
+        states = {item['id']: item['state'] for item in I.inspect(self.jobs, self.attempt)['requests']}
+        self.assertEqual(states, {'early': 'queued', 'late': 'queued'})
 
     def test_unsupported_owner_creates_no_lock_or_state(self):
         for call in (lambda: I.inspect(self.jobs, self.attempt),

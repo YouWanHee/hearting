@@ -169,7 +169,9 @@ def submit(jobs, attempt, text, request_id=None):
 def initialize_owner_input(jobs, attempt, transport):
     """Open input admission for a registered owner before its consumer exists.
 
-    Idempotent: an existing state is only identity-checked, never rewritten.
+    Idempotent: an existing state is only identity-checked, never rewritten, except
+    that a state no consumer has bound follows a relaunched row (same attempt, new
+    lease nonce) so input queued before the relaunch is kept.
     """
     row, target = _target(jobs, attempt)
     if row.status not in {"open", "running"}:
@@ -177,7 +179,10 @@ def initialize_owner_input(jobs, attempt, transport):
     with _locked(jobs, attempt, create=True) as (path, value):
         if value is not None:
             if value["target"] != target:
-                raise InputError("owner-input-target-changed")
+                if not _preconsumer(value):
+                    raise InputError("owner-input-target-changed")
+                value["target"] = target
+                _write(path, value)
             return
         _write(path, {"schema_version": 1, "attempt_id": attempt, "target": target,
                       "requests": [], "thread_id": PLACEHOLDER_THREAD,
@@ -190,10 +195,11 @@ class OwnerInput:
         self.generation = uuid.uuid4().hex
         _, target = _target(jobs, attempt)
         with _locked(jobs, attempt, create=True) as (path, value):
-            if value is not None and value["target"] != target:
+            if value is not None and value["target"] != target and not _preconsumer(value):
                 raise InputError("owner-input-target-changed")
             value = value or {"schema_version": 1, "attempt_id": attempt,
                               "target": target, "requests": []}
+            value["target"] = target
             first_binding = _preconsumer(value)
             for item in value["requests"]:
                 if item["state"] == "sending":
