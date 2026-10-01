@@ -535,6 +535,27 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn('resume_command',result)
         self.assertEqual(len(self.calls),3)
 
+    def test_a_parked_receipt_points_at_the_owners_own_report_when_it_has_one(self):
+        import base64
+        self._parked_owner_row()
+        report=self.path.parent/'owner-report.md'
+        report.write_text('what the owner says it changed\n')
+        encoded=base64.urlsafe_b64encode(str(report).encode()).decode().rstrip('=')
+        readable={'state':'valid','verdict':'PASS','artifact_state':'readable','artifact_path_b64':encoded}
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('blocked')), \
+             mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',return_value=readable):
+            result=self.start()
+        self.assertEqual(result['state'],'waiting-human-gate')
+        self.assertEqual(result['owner_report'],str(report))
+        self.assertIn('owner_report',result['next_step'])
+        unreadable={'state':'invalid','verdict':'-','artifact_state':'missing','artifact_path_b64':''}
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('blocked')), \
+             mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',return_value=unreadable):
+            result=self.start()
+        self.assertEqual(result['state'],'waiting-human-gate')
+        self.assertNotIn('owner_report',result)
+        self.assertNotIn('owner_report',result['next_step'])
+
     def test_stopped_gate_reports_without_replacement(self):
         self._parked_owner_row()
         with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('stop')), \

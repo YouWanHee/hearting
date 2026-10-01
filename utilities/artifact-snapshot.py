@@ -40,6 +40,13 @@ def load_route(path: Path, route_id: str, node_id: str) -> tuple[dict,dict]:
         # node instead of letting `next()` raise StopIteration for a node id
         # that was never meant to exist.
         node=next(row for row in route["nodes"] if row["id"]==node_id) if node_id else {}
+        if not node_id:
+            # The owner executes the transaction itself, so it names no node. Resolve the
+            # route's one declared owner operation that mutates the target.
+            owned=[row for row in route["nodes"] if row.get("kind")=="capability-owner"
+                   and row.get("unit")=="_kernel/owner" and row.get("dispatch_depth")==1
+                   and "target-artifact" in (row.get("write_scope") or [])]
+            node=owned[0] if len(owned)==1 else {}
     except SnapshotError:
         raise
     except Exception as exc:
@@ -214,12 +221,13 @@ def prepare(args) -> int:
     if capability not in {"autopilot-refine","autopilot-draft"}:
         emit({"status":"skipped","reason":"capability-does-not-own-snapshots","target":str(target)})
         return 0
-    if capability == "autopilot-refine" and intensity == "quick":
+    if capability == "autopilot-refine":
         from artifact_producer import _quick_refine_write_gate, ProducerError
         try:
             _quick_refine_write_gate(artifact_root, target, route)
         except ProducerError as exc:
             raise SnapshotError(exc.code + ": " + exc.detail) from exc
+    if capability == "autopilot-refine" and intensity == "quick":
         # The preview is output of this same conductor, before approval. It is
         # not a target document and must not enter the target snapshot path.
         rel_parts = target.resolve().relative_to(artifact_root).parts

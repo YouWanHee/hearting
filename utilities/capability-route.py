@@ -28,6 +28,7 @@ from dispatch_contract import (
     row_is_subsession,
     CANONICAL_PARENT_TRANSPORTS,
     DispatchContractError,
+    owner_operation_fence,
     EXECUTION_SURFACES,
     FALLBACK_HOPS,
     PARENT_TRANSPORT_BY_DISPATCH_DEPTH,
@@ -4870,16 +4871,27 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         prerequisites=owner_terminal_prerequisites(route,node,jobs)
         if prerequisites:
             return absent("owner-prerequisite-unproven:"+json.dumps(prerequisites,sort_keys=True))
+        # The owner's own operation is a node entry like any other: a PASS does not stand in
+        # for a person's release of the gate sealed at its entry (refine's preview approval).
+        try:
+            owner_operation_fence(route,node,jobs=jobs)
+        except DispatchContractError as exc:
+            return {**absent(exc.reason),"gate_detail":exc.detail}
         terminal=inspect_terminal_attempt(meta.get("log_file"),worktree=route["cwd"],
                                           artifact_root_metadata=route["artifact_root"],worker_type="owner")
         if terminal.get("state")!="valid" or terminal.get("verdict")!="PASS" or terminal.get("artifact_state")!="readable":
             return absent("owner-terminal-evidence-unverified")
-        encoded=str(terminal["artifact_path_b64"])
-        evidence=Path(base64.urlsafe_b64decode(encoded+"="*(-len(encoded)%4)).decode())
+        def decoded(value):
+            return Path(base64.urlsafe_b64decode(value+"="*(-len(value)%4)).decode())
+        # Bytes are read where the report lives now; the identity is the locator the owner named.
+        # A bucket organizer that moves a loose report is recorded by the producer and
+        # surfaced as `artifact_origin_path_b64`, so placement never changes who the owner was.
+        evidence=decoded(str(terminal["artifact_path_b64"]))
+        origin=decoded(str(terminal["artifact_origin_path_b64"])) if terminal.get("artifact_origin_path_b64") else evidence
         digest=evidence_digest(evidence)
         identity={"route_id":route["route_id"],"route_hash":route["route_hash"],"node_id":node["id"],
                   "attempt_id":meta["attempt_id"],"completion_gate":node["terminal_gate"],
-                  "evidence":str(evidence),"evidence_digest":digest,"source":"owner-terminal"}
+                  "evidence":str(origin),"evidence_digest":digest,"source":"owner-terminal"}
         return {**identity,"passed":True,"current":True,"reason":"owner-terminal-verified",
                 "marker_digest":hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest(),
                 "attempt_readiness":"quiescent"}
@@ -6983,6 +6995,13 @@ def complete_node(
         marker=_complete_framed_terminal(route,node,evidence,jobs)
         _launch_open_cycle_checkpoint(route)
         return marker,None
+    if owner_executed_terminal(node):
+        # The owner completing its own operation by hand passes the same entry gate its
+        # settlement reads; no marker is written for an unreleased preview approval.
+        try:
+            owner_operation_fence(route,node,jobs=jobs)
+        except DispatchContractError as exc:
+            raise ValueError(f"{exc.reason}:{exc.detail}") from exc
     artifact_root=route.get("artifact_root")
     route_id=route.get("route_id")
     pending=None

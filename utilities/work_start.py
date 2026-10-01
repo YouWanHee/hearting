@@ -5,6 +5,7 @@ reuse the adapter's atomic claim; all completion decisions use the shared join.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -996,6 +997,48 @@ def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=su
                 "brief_files, decide the next route, and compose it yourself."}
 
 
+def _owner_report(route, metadata):
+    """The file the exited owner's own terminal result names, or None when it names no readable one."""
+    try:
+        from codex_dispatch_terminal import inspect_terminal_attempt
+        terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=route.get("cwd"),
+                                            artifact_root_metadata=route.get("artifact_root"), worker_type="owner")
+        if (terminal.get("state") != "valid" or terminal.get("artifact_state") != "readable"
+                or not terminal.get("artifact_path_b64")):
+            return None
+        encoded = str(terminal["artifact_path_b64"])
+        return str(Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _raise_owner_entry_gate(route, path, jobs, aid, metadata, result):
+    """An owner that exited PASS without ever raising the approval gate sealed on its own operation.
+
+    Its PASS is a proposal. Settlement already refuses to complete the route (the entry gate is
+    unreleased); this turns that into the one existing question: raise `preview-disposition` from
+    the completed preview, exactly as a refused child start does. Raised once -- a gate that is
+    already raised, released or stopped is left as it is. When the preview or the carrier cannot
+    back the raise, `unraised_gate` records why and the caller reports `human-gate-not-raised`.
+    A missing earlier stage keeps its own existing receipt, so it is not examined here."""
+    if not (verdict_pass(metadata) and metadata.get("workflow_completion") == "runtime-v1"):
+        return
+    from dispatch_contract import owner_operation_gates, raise_preview_gate_for_node
+    from dispatch_terminal_commit import owner_workflow_gaps
+    import workflow_state as WS
+    gates = owner_operation_gates(route)
+    if not gates or owner_workflow_gaps(jobs, metadata, route):
+        return
+    ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
+    for node, gate in gates:
+        if WS.human_gate_resolution(ledger.journal(), gate)["status"] != "not-raised":
+            continue
+        try:
+            raise_preview_gate_for_node(path, node["id"], jobs, ROOT)
+        except (OSError, ValueError, KeyError, StopIteration, DispatchContractError, subprocess.TimeoutExpired) as exc:
+            result["unraised_gate"] = {"gate": gate, "node": node["id"], "detail": str(exc)[:320]}
+
+
 def _owner_parked_response(result, jobs, aid):
     """The receipt for an owner that exited at a human gate, or None when it is not parked there
     (or the gate was answered `proceed`, which the continuation path handles)."""
@@ -1005,23 +1048,30 @@ def _owner_parked_response(result, jobs, aid):
         return None
     result["parked_gate"] = parked
     gate = parked["gate"]
+    try:
+        report = _owner_report(json.loads(Path(parked["route_file"]).read_text()), _rows(jobs)[aid][1])
+    except (OSError, ValueError, KeyError):
+        report = None
+    extra = {"owner_report": report} if report else {}
     release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
                           "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
                           "--decision", "proceed"])
     if parked["status"] == "blocked":
-        return {**result, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
+        return {**result, **extra, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
                 "required_action": "answer-human-gate", "gate": gate,
                 "gate_artifact": parked["artifact"], "release_command": release,
                 "next_step": f"The owner paused at human gate {gate} and exited; this is not a failure. "
                     "Show the person the gate artifact and ask for a decision. Record it with "
                     "release_command (replace proceed with revise or stop when chosen). "
-                    "A proceed starts the continuation automatically."}
+                    "A proceed starts the continuation automatically."
+                    + (" owner_report is the owner's own account of what it already changed; show it "
+                       "with the preview, because the edit was made before this answer." if report else "")}
     if parked["status"] == "stop":
-        return {**result, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
+        return {**result, **extra, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
                 "next_step": f"The person stopped this work at gate {gate}. Report that; "
                     "nothing is running and no replacement starts."}
     if parked["status"] == "revise":
-        return {**result, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
+        return {**result, **extra, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
                 "required_action": "report-gate-revision", "gate": gate,
                 "next_step": f"The person asked for a revision at gate {gate} while no owner is running. "
                     "Report the feedback and ask how to proceed; no automatic continuation starts "
@@ -1227,9 +1277,21 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         "--jobs", str(jobs), "--attempt-id", aid,
     ])
     if status == "done":
+        _raise_owner_entry_gate(route, path, jobs, aid, metadata, result)
         parked_response = _owner_parked_response(result, jobs, aid)
         if parked_response is not None:
             return parked_response
+        if result.get("unraised_gate"):
+            unraised = result["unraised_gate"]
+            report = _owner_report(route, metadata)
+            return {**result, "state": "needs-attention", "reason": "human-gate-not-raised",
+                    "required_action": "report-unapproved-apply", "gate": unraised["gate"],
+                    **({"owner_report": report} if report else {}),
+                    "next_step": f"The owner exited PASS on {unraised['node']} without ever raising human gate "
+                        f"{unraised['gate']}, and the runtime could not raise it from a completed preview "
+                        f"({unraised['detail']}). Its result is not accepted as approved work: nothing is "
+                        "settled and no next leg is offered. Tell the person what the owner says it changed "
+                        "(owner_report) and ask how to proceed; do not release the gate on their behalf."}
     if status == "done" and verdict_pass(metadata):
         from dispatch_terminal_commit import owner_workflow_gaps
         missing = owner_workflow_gaps(jobs, metadata, route)

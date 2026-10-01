@@ -677,9 +677,14 @@ def cmd_gate(args):
             if args.gate == "frame-review" and any(n.get("worker_type") == "frame" for n in route.get("nodes", [])):
                 release_authority = "depth-0"
             inline_gate = any(args.gate in n.get("inline_human_gates", []) for n in route.get("nodes", []))
+            preview_digest = None
             if inline_gate:
                 if not Path(args.artifact).is_file():
                     raise SupervisorError("inline-gate-preview-unreadable")
+                preview_digest = hashlib.sha256(Path(args.artifact).read_bytes()).hexdigest()
+            elif args.gate == "preview-disposition" and Path(args.artifact).is_file():
+                # A staged refine's preview is approved the same way: record which bytes the
+                # person was shown, so a later edit of the preview is not covered by the release.
                 preview_digest = hashlib.sha256(Path(args.artifact).read_bytes()).hexdigest()
             current_state = ledger.state()["workflow_state"]
             revised = (current_state == "FAILED_RETRYABLE"
@@ -711,7 +716,7 @@ def cmd_gate(args):
                                                     "questions": len(interview.get("questions") or [])
                                                     if interview is not None else 0,
                                                     "release_authority": release_authority,
-                                                    **({"artifact_sha256": preview_digest} if inline_gate else {})},
+                                                    **({"artifact_sha256": preview_digest} if preview_digest else {})},
                                           actor="gate")
             except BaseException:
                 if created:

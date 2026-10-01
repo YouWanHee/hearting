@@ -5982,6 +5982,7 @@ def _quick_refine_write_gate(root: Path, target: Path, route=None) -> None:
         if not isinstance(route, dict):
             raise ProducerError("inline-gate-route-unreadable")
     if route.get("capability") != "autopilot-refine" or route.get("effective_intensity") != "quick":
+        _owner_operation_write_gate(route)
         return
     node = next((n for n in route.get("nodes", []) if n.get("id") == "one-shot"), {})
     if node.get("inline_human_gates") != ["preview-disposition"]:
@@ -5991,6 +5992,29 @@ def _quick_refine_write_gate(root: Path, target: Path, route=None) -> None:
         WS.require_inline_gate_release(route, node, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
     except (WS.WorkflowStateError, OSError, ValueError) as exc:
         raise ProducerError("quick-preview-approval-required", str(exc)) from exc
+
+
+def _owner_operation_write_gate(route: dict) -> None:
+    """A standard+ owner applies its edit only after the person released the current preview.
+
+    The same existing approval the quick one-shot's inline gate holds, asked for the node the
+    owner executes itself (`transaction` behind `preview-disposition`); the entry fence that
+    refuses a child launch cannot see an operation the already-running owner performs. Only
+    the route's own binding decides, never the capability name. A write by a child stage
+    (its node is not the gated one) and the preview itself are not the owner's apply.
+    """
+    gated = [node for node, _gate in dispatch_contract.owner_operation_gates(route)
+             if "target-artifact" in (node.get("write_scope") or [])]
+    if not gated:
+        return
+    acting = os.environ.get("AGENT_ROUTE_NODE")
+    if acting and acting not in {node.get("id") for node in gated}:
+        return
+    try:
+        dispatch_contract.owner_operation_fence(
+            route, gated[0], jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
+    except dispatch_contract.DispatchContractError as exc:
+        raise ProducerError("preview-approval-required", f"{exc.reason}: {exc.detail}") from exc
 
 
 def require_cycle_output(

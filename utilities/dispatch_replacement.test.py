@@ -819,6 +819,43 @@ class ReplacementTest(unittest.TestCase):
                 self.assertEqual('Do not raise' in text,parked)
                 self.assertEqual(R.recovery_instructions(SimpleNamespace(**{**vars(args),'worker_type':'stage'})),'')
 
+    def _passed_owner(self,*journal,owner_executed=True,**changes):
+        """An owner whose terminal result was PASS while the gate it should have waited at is raised."""
+        self._parked_route()
+        if owner_executed:
+            self.route['nodes'][1].update(kind='capability-owner',unit='_kernel/owner',dispatch_depth=1,terminal=True)
+        self.owner={**self.meta,'worker_type':'owner','note':'completed-supervisor','failure_class':'pass',
+                    'workflow_completion':'runtime-v1',**changes}
+        self.write(self.owner,stamp=self.OWNER_STAMP)
+        self._journal(*journal)
+
+    def test_a_passed_owner_before_its_own_gated_operation_is_recognised_as_waiting_and_never_replaced(self):
+        for name,journal,status in (('raised-unreleased',(self._raise(),),'blocked'),
+                                    ('released',(self._raise(),self._proceed()),'proceed'),
+                                    ('revise',(self._raise(),('RUNNING',{'released_gate':self.GATE,'decision':'revise'},'2026-09-29T02:00:00Z')),'revise'),
+                                    ('stop',(self._raise(),('CANCELLED',{'gate':self.GATE,'abandon_reason':'operator-decision'},'2026-09-29T02:00:00Z')),'stop')):
+            with self.subTest(case=name):
+                self.tearDown_case()
+                self._passed_owner(*journal)
+                found=R.owner_parked_gate(self.jobs,'att-source')
+                self.assertEqual((found['gate'],found['status'],found['gated_nodes']),(self.GATE,status,['full-run']))
+                # a passed owner is never a death: no claim, no replacement, whatever the gate says
+                self.assertIsNone(R.death_kind(self.write_fields(),self.owner,jobs=self.jobs))
+                with self.assertRaises(D.DispatchContractError):self.claim()
+                self.assertEqual(R.advance(self.jobs,'att-source',authority_check=lambda *_:True)['state'],'not-applicable')
+                self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def write_fields(self):
+        return self.jobs.read_text().splitlines()[-1].split('\t')
+
+    def test_a_passed_owner_with_no_owner_executed_gated_node_is_not_a_park(self):
+        self._passed_owner(self._raise(),owner_executed=False)
+        self.assertIsNone(R.owner_parked_gate(self.jobs,'att-source'))
+
+    def test_a_passed_owner_whose_gate_was_never_raised_is_not_a_park(self):
+        self._passed_owner()
+        self.assertIsNone(R.owner_parked_gate(self.jobs,'att-source'))
+
     def test_owner_parked_gate_is_read_only(self):
         self._parked_owner(self._raise(),self._proceed())
         def snapshot():return (self.jobs.read_bytes(),sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob('*')))
