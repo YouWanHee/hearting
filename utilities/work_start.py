@@ -877,6 +877,45 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
     return decision_record, None
 
 
+def _first_leg_state(root, decision_record, jobs, receipt):
+    """The first leg's state as it is now, for a frame route read again after its first start.
+
+    The stored `start_receipt` is the launch's own history, so it answers only while the leg is
+    still what it describes. A closed leg, or one with an inline finish pending, is answered by
+    `start_work` (those branches only read); a registered owner that has exited is answered from
+    the registry. Nothing here launches, replaces, settles or closes anything.
+    """
+    first = decision_record["first_leg"]
+    bound = first["route"]
+    leg_path = Path(_route_module().canonical_route_path(str(root), bound["route_id"]))
+    if leg_path != root / bound["route_file"]:
+        raise ValueError("route-decision-conflict: the first leg's route file is not where the record bound it")
+    published = json.loads(leg_path.read_text(encoding="utf-8"))
+    if ((published.get("route_id"), published.get("route_hash")) != (bound["route_id"], bound["route_hash"])
+            or _route_module().route_hash(published) != bound["route_hash"]):
+        raise ValueError("route-decision-conflict: the published first leg differs from the one the record bound")
+    leg_route = _route_module().verify_route(published)
+    from dispatch_notice_state import closed_outcome
+    import inline_finish
+    pending = inline_finish.pending_state(root, leg_route["route_id"])
+    if closed_outcome(leg_path, leg_route) or (pending and pending.get("state") != "finished"):
+        return start_work(leg_route, leg_path, jobs)
+    aid = receipt.get("owner_attempt_id")
+    row = _rows(jobs).get(aid) if aid else None
+    if row is None or row[0] != "done":
+        return receipt
+    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
+                         "start", "--route", str(leg_path), "--jobs", str(Path(jobs).resolve())])
+    result = {**receipt, "resume_command": resume}
+    for key in ("parent_next", "parent_next_reason", "parent_next_command"):
+        result.pop(key, None)
+    try:
+        return _owner_parked_response(result, jobs, aid) or _exited_owner_response(leg_route, result, jobs, aid)
+    except RuntimeError as exc:         # the registry row could not be proved; say so instead of the stale receipt
+        return {**result, "state": "needs-attention", "reason": getattr(exc, "reason", type(exc).__name__),
+                "detail": str(exc), "required_action": "inspect-preparation"}
+
+
 def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=subprocess.run,
                    sleep=time.sleep, clock=time.time):
     """Fix the decision, start its first leg, complete the model-less terminal, close the route and
@@ -918,6 +957,7 @@ def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=su
                 _checkpoint("after-decision-write")
             decision = decision_record["decision"]
             started = decision["selected"] != RP.NONE
+            replayed = started and "start_receipt" in (decision_record.get("first_leg") or {})
             if started:
                 decision_record, response = _first_leg(
                     route, path, jobs, result, root, record, output, record_path, decision_record,
@@ -942,6 +982,8 @@ def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=su
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     if started:
         receipt = dict(decision_record["first_leg"]["start_receipt"])
+        if replayed:
+            receipt = dict(_first_leg_state(root, decision_record, jobs, receipt))
         receipt["route_decision"] = {"record_file": str(record_path), "selected": decision["selected"],
                                      "frame_route_id": route["route_id"]}
         return receipt
@@ -952,6 +994,54 @@ def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=su
             "brief_files": [str(root / row["path"]) for row in decision["briefs"]],
             "next_step": "No route was proposed, so nothing starts automatically. Read intent_file and "
                 "brief_files, decide the next route, and compose it yourself."}
+
+
+def _owner_parked_response(result, jobs, aid):
+    """The receipt for an owner that exited at a human gate, or None when it is not parked there
+    (or the gate was answered `proceed`, which the continuation path handles)."""
+    import dispatch_replacement
+    parked = dispatch_replacement.owner_parked_gate(jobs, aid)
+    if not parked:
+        return None
+    result["parked_gate"] = parked
+    gate = parked["gate"]
+    release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
+                          "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
+                          "--decision", "proceed"])
+    if parked["status"] == "blocked":
+        return {**result, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
+                "required_action": "answer-human-gate", "gate": gate,
+                "gate_artifact": parked["artifact"], "release_command": release,
+                "next_step": f"The owner paused at human gate {gate} and exited; this is not a failure. "
+                    "Show the person the gate artifact and ask for a decision. Record it with "
+                    "release_command (replace proceed with revise or stop when chosen). "
+                    "A proceed starts the continuation automatically."}
+    if parked["status"] == "stop":
+        return {**result, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
+                "next_step": f"The person stopped this work at gate {gate}. Report that; "
+                    "nothing is running and no replacement starts."}
+    if parked["status"] == "revise":
+        return {**result, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
+                "required_action": "report-gate-revision", "gate": gate,
+                "next_step": f"The person asked for a revision at gate {gate} while no owner is running. "
+                    "Report the feedback and ask how to proceed; no automatic continuation starts "
+                    "for a revise."}
+    return None
+
+
+def _exited_owner_response(route, result, jobs, aid, **extra):
+    """The receipt for an owner whose row is `done`: completed on a success outcome, else the
+    settlement still owed. Reads only; it never launches, replaces or settles anything."""
+    from dispatch_terminal_commit import inspect_owner_completion
+    status, metadata = _rows(jobs)[aid]
+    outcome = _outcome(jobs, aid)
+    if outcome["classification"] == "success":
+        return _with_next_leg(route, {**result, "state": "completed", "result": outcome})
+    return {**result, "state": "needs-attention", "reason": "owner-settlement-pending",
+            "required_action": outcome["required_action"], "result": outcome,
+            "closure": inspect_owner_completion(jobs, status, metadata), **extra,
+            "next_step": "The owner has exited. Preserve its result and inspect the exact closure "
+                "obligation; waiting for a model turn or starting a replacement cannot finish it."}
 
 
 def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=None,
@@ -1137,33 +1227,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         "--jobs", str(jobs), "--attempt-id", aid,
     ])
     if status == "done":
-        import dispatch_replacement
-        parked = dispatch_replacement.owner_parked_gate(jobs, aid)
-        if parked:
-            result["parked_gate"] = parked
-            gate = parked["gate"]
-            release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
-                                  "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
-                                  "--decision", "proceed"])
-            if parked["status"] == "blocked":
-                return {**result, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
-                        "required_action": "answer-human-gate", "gate": gate,
-                        "gate_artifact": parked["artifact"], "release_command": release,
-                        "next_step": f"The owner paused at human gate {gate} and exited; this is not a failure. "
-                            "Show the person the gate artifact and ask for a decision. Record it with "
-                            "release_command (replace proceed with revise or stop when chosen). "
-                            "A proceed starts the continuation automatically."}
-            if parked["status"] == "stop":
-                return {**result, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
-                        "next_step": f"The person stopped this work at gate {gate}. Report that; "
-                            "nothing is running and no replacement starts."}
-            if parked["status"] == "revise":
-                return {**result, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
-                        "required_action": "report-gate-revision", "gate": gate,
-                        "next_step": f"The person asked for a revision at gate {gate} while no owner is running. "
-                            "Report the feedback and ask how to proceed; no automatic continuation starts "
-                            "for a revise."}
-            # proceed: fall through to the replacement path below.
+        parked_response = _owner_parked_response(result, jobs, aid)
+        if parked_response is not None:
+            return parked_response
     if status == "done" and verdict_pass(metadata):
         from dispatch_terminal_commit import owner_workflow_gaps
         missing = owner_workflow_gaps(jobs, metadata, route)
@@ -1200,16 +1266,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             "result": outcome})
     status, metadata = _rows(jobs).get(aid, (status, metadata))
     if status == "done":
-        from dispatch_terminal_commit import inspect_owner_completion
-        outcome = _outcome(jobs, aid)
-        if outcome["classification"] == "success":
-            return _with_next_leg(route, {**result, "state": "completed", "result": outcome})
-        return {**result, "state": "needs-attention", "reason": "owner-settlement-pending",
-                "required_action": outcome["required_action"], "result": outcome,
-                "closure": inspect_owner_completion(jobs, status, metadata),
-                "observation": joined,
-                "next_step": "The owner has exited. Preserve its result and inspect the exact closure "
-                    "obligation; waiting for a model turn or starting a replacement cannot finish it."}
+        return _exited_owner_response(route, result, jobs, aid, observation=joined)
     if wait:
         return _wait_expired({**result, "observation": joined})
     directive, reason, _ = parent_next(metadata.get("parent_completion_delivery", ""), aid, agent_home=ROOT)

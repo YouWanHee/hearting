@@ -3335,6 +3335,17 @@ def _verify_selection_pins(route):
                 raise ValueError(f"invalid selection_pins.{target}.{key}")
 
 
+def _inherited_selection_pins(binding, artifact_root):
+    """The structurally valid pins of the frame a `--route-plan` binding names, else `{}`."""
+    import route_plan as RP
+    pins = RP.frame_selection_pins(binding["record"]["decision"], artifact_root)
+    try:
+        _verify_selection_pins({"selection_pins": {"contract_version": SELECTION_PIN_CONTRACT_VERSION, **pins}})
+    except ValueError:
+        return {}
+    return pins
+
+
 def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artifact_root,
                   intensity=None, signals=(), spec_read=None, drift_verdict=None,
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
@@ -3496,11 +3507,18 @@ def _frame_brief_finder(registry, capability, finder):
     return find
 
 
+def _frame_pin_rows(frame_route):
+    """A copy of the frame route's sealed pin rows (`{target: pin}`), without `contract_version`."""
+    pins = frame_route.get("selection_pins")
+    return {target: dict(pins[target]) for target in SELECTION_PIN_TARGETS
+            if isinstance(pins, dict) and isinstance(pins.get(target), dict)}
+
+
 def proposal_readiness(frame_route, jobs):
     """One read-only readiness probe shared by every proposal leg's memory compile."""
     from dispatch_parent_completion import default_parent_harness
     return _compose_readiness(frame_route["cwd"], jobs, default_parent_harness("claude"),
-                              _compose_default_children(None))
+                              _compose_default_children(_frame_pin_rows(frame_route) or None))
 
 
 def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
@@ -3510,7 +3528,8 @@ def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
         graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug, cwd=frame_route["cwd"],
         artifact_root=frame_route["artifact_root"],
         spec_read="auto" if str(spec).startswith("compose-auto:") else spec,
-        campaign_key=frame_route.get("campaign_key"), parent_cycle_id=frame_cycle_id)
+        campaign_key=frame_route.get("campaign_key"), parent_cycle_id=frame_cycle_id,
+        selection_pins=_frame_pin_rows(frame_route) or None)
 
 
 def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
@@ -3542,11 +3561,13 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     intensity, `--route-plan <record>#0`, the frame cycle as parent and the same campaign.
     """
     import route_plan as RP
-    return compose_route(
-        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
-                              slug=f"{context['slug']}-leg0"),
-        **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
-        parent_harness=context.get("owner") or "claude")
+    kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                                 slug=f"{context['slug']}-leg0")
+    owner = context.get("owner") or ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness")
+    if work_request is not None:
+        work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
+    return compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
+                         parent_harness=owner or "claude")
 
 
 def declared_start_approvals(leg, registry=None):
@@ -8833,6 +8854,9 @@ def main():
         a._route_chain_plan = _resolve_compose_plan(a, route_plan_binding)
         DISPATCH_DEFAULTS_WARNINGS.clear()
         pins=_parse_selection_pins(a.pin,a.owner)
+        if route_plan_binding is not None:
+            # A continuation leg keeps the pins its frame was composed with; a pin given here replaces only its own target.
+            pins={**_inherited_selection_pins(route_plan_binding,artifact_root),**pins}
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         route=compose_route(
