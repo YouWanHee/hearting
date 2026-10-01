@@ -53,6 +53,7 @@ OWNER_KIND = "dispatch-v1"
 DEFAULT_POLL = 2.0
 DEFAULT_INITIAL_DELAY = 3.0
 DEFAULT_PERIODIC_DEBOUNCE = 600
+PERIODIC_ATTEMPT_INTERVAL = 15.0
 DEFAULT_FINAL_GRACE = 75.0
 DEFAULT_LOG_QUIET = 1.0
 SESSION_ANNOUNCE_SCAN = 1 << 16
@@ -560,6 +561,7 @@ def supervise(
 
         first_eligible = time.monotonic() + max(0.0, initial_delay)
         initial_requested = False
+        next_periodic_at = 0.0
         source_cache: dict[str, Any] = {}
         model_cursor: dict[str, Any] = {}
         jobs_env = os.environ.get("AGENT_DISPATCH_JOBS")
@@ -585,12 +587,17 @@ def supervise(
                         state.update(last_refresh_phase="initial", last_refresh_at=time.time())
                         _atomic_write(state_path, state)
                 else:
-                    if _refresh(
-                        harness, sid, source, phase="periodic",
-                        debounce=periodic_debounce, priority=False, prompt_path=prompt,
-                    ):
-                        state.update(last_refresh_phase="periodic", last_refresh_at=time.time())
-                        _atomic_write(state_path, state)
+                    # The periodic refresh only changes anything after the 600s debounce,
+                    # so trying it on every 2s poll is wasted probing; space the attempts.
+                    now_m = time.monotonic()
+                    if now_m >= next_periodic_at:
+                        next_periodic_at = now_m + PERIODIC_ATTEMPT_INTERVAL
+                        if _refresh(
+                            harness, sid, source, phase="periodic",
+                            debounce=periodic_debounce, priority=False, prompt_path=prompt,
+                        ):
+                            state.update(last_refresh_phase="periodic", last_refresh_at=time.time())
+                            _atomic_write(state_path, state)
             if not live:
                 break
             time.sleep(max(0.05, poll))

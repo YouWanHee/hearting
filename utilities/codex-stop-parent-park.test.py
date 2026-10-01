@@ -55,7 +55,9 @@ class StopLifecycleTest(unittest.TestCase):
 
     def test_sessionend_has_no_stop_branch(self):
         source = SESSIONEND_PATH.read_text(encoding="utf-8")
-        self.assertIn('run_preflight("session-end"', source)
+        self.assertNotIn("session-end", source)
+        self.assertNotIn("run_preflight", source)
+        self.assertIn("clear_wait", source)
         self.assertNotIn("join_session_batch", source)
         self.assertNotIn('event == "stop"', source)
 

@@ -10,6 +10,7 @@ import argparse
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 WH_S = importlib.util.spec_from_file_location(
@@ -32,7 +33,9 @@ def _args(**overrides):
     )
     base.update(overrides)
     ns = argparse.Namespace(**base)
-    ns.resolved_completion_delivery = WH.resolve_completion_delivery(ns)
+    # The fixture pins the plain-exec builder; supervised delivery is set explicitly where it is under test.
+    with mock.patch.object(WH, "codex_app_server_available", return_value=False):
+        ns.resolved_completion_delivery = WH.resolve_completion_delivery(ns)
     ns.completion_delivery_reason = getattr(ns, "completion_delivery_reason", "not-applicable")
     return ns
 
@@ -110,6 +113,41 @@ class SD64GrantMatrix(unittest.TestCase):
         self.assertIn(_state_root_str(supervised_args), _grant_dirs(supervised_cmd))
         self.assertTrue(WH.registry_writable_launch(exec_args))
         self.assertTrue(WH.registry_writable_launch(supervised_args))
+
+    # (g2) a quick owner keeps the same grants, sandbox, network and model under the supervisor
+    def test_g2_quick_owner_command_is_the_same_under_the_supervisor(self):
+        settings = {"source": "profile", "model": "gpt-6-luna", "reasoning": "low"}
+        for extra in (dict(route_id="rt-fixtureG2"), dict(route_id=None, command_attempt_id=None),
+                      dict(nested_headless_network=True)):
+            with self.subTest(**extra):
+                exec_args = _args(intensity="quick", resolved_model_settings=settings, **extra)
+                self.assertEqual(exec_args.resolved_completion_delivery, "one-shot")
+                supervised_args = _args(intensity="quick", resolved_model_settings=settings, **extra)
+                supervised_args.resolved_completion_delivery = "app-server-supervised"
+                exec_cmd = WH.shell_command(exec_args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
+                supervised_cmd = WH.shell_command(supervised_args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
+                self.assertEqual(sorted(_grant_dirs(exec_cmd)), sorted(_grant_dirs(supervised_cmd)))
+                self.assertEqual(WH.effective_runtime_sandbox(exec_args), WH.effective_runtime_sandbox(supervised_args))
+                for command in (exec_cmd, supervised_cmd):
+                    self.assertIn("gpt-6-luna", command)
+                self.assertEqual("--network-access" in supervised_cmd.split(),
+                                 "sandbox_workspace_write.network_access=true" in exec_cmd)
+                self.assertNotIn("--route-file", supervised_cmd)
+
+    # (g3) the supervisor takes a quick owner's own one-shot route tuple, only whole
+    def test_g3_supervisor_route_tuple_is_complete_or_absent(self):
+        route = dict(route_file="/tmp/r.json", route_id="rt-1", route_hash="sha256:1", route_node="one-shot")
+        args = _args(intensity="quick", **route)
+        args.resolved_completion_delivery = "app-server-supervised"
+        command = WH.shell_command(args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
+        self.assertIn("--route-file /tmp/r.json --route-id rt-1 --route-hash sha256:1", command)
+        for key in ("route_file", "route_id", "route_hash"):
+            partial = _args(intensity="quick", **{**route, key: None})
+            partial.resolved_completion_delivery = "app-server-supervised"
+            self.assertNotIn("--route-", WH.shell_command(partial, Path("/tmp/p.txt"), Path("/tmp/l.log")))
+        other = _args(intensity="quick", **{**route, "route_node": "execute"})
+        other.resolved_completion_delivery = "app-server-supervised"
+        self.assertNotIn("--route-", WH.shell_command(other, Path("/tmp/p.txt"), Path("/tmp/l.log")))
 
     # (h) no branch ever grants /home wholesale, Path.home(), or danger-full-access
     def test_h_no_forbidden_broad_grant_anywhere(self):

@@ -92,31 +92,8 @@ is_worker_session() {
     || [ "${AGENT_DISPATCH_CHILD:-}" = "1" ] \
     || [ -n "${AGENT_DISPATCH_DEPTH:-}" ] \
     || [ -n "${OPENCODE_DISPATCH_SLUG:-}" ] \
-    || [ "${FLEET_TITLE_REFRESH:-}" = "1" ] \
-    || [ "${MEM_DISTILL:-}" = "1" ]
+    || [ "${FLEET_TITLE_REFRESH:-}" = "1" ]
 }
-
-# Memory lifecycle inside a hook, and a hook has a wall clock. Codex clamps the
-# SessionEnd hook to 3 seconds whatever hooks.json asks for, and it says so on
-# every session ("clamping SessionEnd hook timeout to 3s", measured 2026-09-09).
-# `mem sync` alone measured 54.8s on the real store, so the hook was killed
-# every time it ran synchronously.
-#
-# So the CALLER detaches, and it detaches the whole branch rather than its last
-# step: the hook returns in milliseconds and the work finishes outside the budget,
-# the same shape OpenCode (plugin `session.idle` → detached `preflight session-end`)
-# already uses. `detach_self` re-enters this script with the marker set; setsid +
-# nohup so the child outlives the reaped hook.
-#
-detach_self() {
-  # Re-run this same subcommand outside the hook's wall clock. `$CODEX_PREFLIGHT_DETACHED`
-  # is the recursion guard AND what the re-entered branch tests to know it may
-  # take its time.
-  CODEX_PREFLIGHT_DETACHED=1 setsid nohup "$ROOT/adapters/codex/bin/preflight.sh" "$@" \
-    >/dev/null 2>&1 &
-  return 0
-}
-
 
 usage() {
   cat <<'EOF'
@@ -126,7 +103,6 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh stages [--capability <name>] [--json]
        preflight.sh capability <name> [cwd] [session-id]
        preflight.sh skill <name> [cwd] [session-id]
-       preflight.sh session-end [cwd] [session-id]
        preflight.sh prompt-signal [cwd] [session-id]
        preflight.sh token-budget [cwd] [session-id] [kv|json|hook]
        preflight.sh memory [cwd]
@@ -406,28 +382,6 @@ case "$cmd" in
       printf 'check=failed\nreason=unknown-capability\ncapability=%s\n' "$name"
       exit 64
     fi
-    ;;
-  session-end)
-    cwd=${2:-$PWD}
-    sid=${3:-${CODEX_THREAD_ID:-codex}}
-    # D-42 defense in depth: worker exit owns no sync/curator lifecycle.
-    is_worker_session && exit 0
-    # Everything below is measured in tens of seconds against a 3-second hook (see
-    # `detach_self`), so the first thing this branch does is step outside the budget.
-    if [ "${CODEX_PREFLIGHT_DETACHED:-0}" != "1" ]; then
-      detach_self session-end "$cwd" "$sid"
-      exit 0
-    fi
-    # SessionEnd sync contract (core/MEMORY.md §7): local sync is the default.
-    # Pass the user's MEM_SYNC_REMOTE / deprecated MEM_DUMP_PUSH environment
-    # unchanged; the adapter never opts the session into remote exchange and
-    # the compatibility flag never means dump push.
-    sync_status=0
-    (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || sync_status=$?
-    if [ "$sync_status" -ne 0 ]; then
-      printf 'codex preflight: session-end memory sync status=%s\n' "$sync_status" >&2
-    fi
-    exit "$sync_status"
     ;;
   prompt-signal)
     cwd=${2:-$PWD}

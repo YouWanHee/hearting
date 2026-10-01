@@ -1,6 +1,8 @@
 """Runtime-neutral installer bootstrap helpers.
 
-``restore_memory`` imports ``dump.jsonl`` when ``memory.db`` is absent.
+``restore_memory`` imports ``dump.jsonl`` when ``memory.db`` is absent (and drops
+the retired distiller's leftover state files from the store, see
+``retired_memory_state``).
 ``install_launchers`` creates guarded
 ``~/.local/bin/{hearting,harness,fleet,mem,compute-hosts}`` symlinks.
 The helpers remain usable independently of installer command wiring.
@@ -12,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import paths
+import retired_memory_state
 import safe_fs
 
 
@@ -36,6 +39,7 @@ def restore_memory(mem_store=None):
             data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
             mem_store = data_home / "hearting" / "memory"
     mem_store = Path(mem_store)
+    retired_memory_state.retire(mem_store)  # distiller-era state files, once; silent
 
     db_path = mem_store / "memory.db"
     dump_path = mem_store / "dump.jsonl"

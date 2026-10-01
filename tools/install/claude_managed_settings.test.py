@@ -248,6 +248,96 @@ class RetiredHookMigrationTests(unittest.TestCase):
                 runtime_activation._merge_claude_settings(source, None)
             self.assertEqual(helper._read_user_settings(home)["hooks"]["PreToolUse"][0]["hooks"], [user_hook])
 
+OLD_MEM_SYNC = (
+    "sh -c 'if [ \"${AGENT_SESSION_ROLE:-}\" = worker ] || [ \"${AGENT_DISPATCH_CHILD:-}\" = 1 ] "
+    "|| [ -n \"${AGENT_DISPATCH_DEPTH:-}\" ] || [ -n \"${OPENCODE_DISPATCH_SLUG:-}\" ] "
+    "|| [ \"${FLEET_TITLE_REFRESH:-}\" = 1 ] || [ \"${MEM_DISTILL:-}\" = 1 ]; then exit 0; fi; "
+    "exec python3 \"$HOME/.claude/tools/memory/mem.py\" sync --json >/dev/null'"
+)
+FLEET_END = 'python3 "$HOME/.claude/hooks/fleet-interaction-state.py" clear'
+HERDR_END = 'bash "$HOME/.claude/hooks/herdr-agent-state.sh" release'
+
+
+class SessionEndMemorySyncRetirementTests(unittest.TestCase):
+    """D-82: the managed SessionEnd `mem.py sync` leaves installed settings, nothing else does."""
+
+    @staticmethod
+    def _group(command, timeout=10):
+        return {"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+
+    def _installed(self, extra=()):
+        return {"hooks": {"SessionEnd": [
+            self._group(FLEET_END), self._group(HERDR_END), self._group(OLD_MEM_SYNC, 120), *extra]}}
+
+    def _commands(self, data):
+        return [h["command"] for g in data["hooks"]["SessionEnd"] for h in g["hooks"]]
+
+    def _source(self, tmp):
+        helper = ClaudeManagedSettingsTests()
+        active_root, claude_home = helper._fixture(tmp)
+        settings_path = active_root / "adapters" / "claude" / "settings.json"
+        source = json.loads(settings_path.read_text(encoding="utf-8"))
+        source["hooks"] = {"SessionEnd": [self._group(FLEET_END), self._group(HERDR_END)]}
+        settings_path.write_text(json.dumps(source), encoding="utf-8")
+        return helper, active_root, claude_home
+
+    def test_install_with_an_old_manifest_retires_only_the_managed_sync(self):
+        user_end = {"matcher": "*", "hooks": [{"type": "command", "command": "echo user-end"}]}
+        user_sync = self._group('python3 "$HOME/bin/my-own-mem.py" sync')
+        with tempfile.TemporaryDirectory() as tmp:
+            helper, source, home = self._source(tmp)
+            helper._write_user_settings(home, self._installed([user_end, user_sync]))
+            previous = {"managed_config": {"claude_hooks": {"SessionEnd": [
+                self._group(FLEET_END), self._group(HERDR_END), self._group(OLD_MEM_SYNC, 120)]}}}
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+                runtime_activation._merge_claude_settings(source, previous)
+            self.assertCountEqual(
+                self._commands(helper._read_user_settings(home)),
+                [FLEET_END, HERDR_END, "echo user-end", 'python3 "$HOME/bin/my-own-mem.py" sync'],
+            )
+
+    def test_install_without_a_manifest_retires_only_the_managed_sync(self):
+        user_end = {"matcher": "*", "hooks": [{"type": "command", "command": "echo user-end"}]}
+        # A user's own hook that merely looks alike: other path, no worker guard, other verb.
+        lookalikes = [
+            self._group('python3 "$HOME/.claude/tools/memory/mem.py" sync --json'),
+            self._group("sh -c 'exec python3 \"$HOME/.claude/tools/memory/mem.py\" sync --json'"),
+            self._group(OLD_MEM_SYNC.replace("sync --json", "inject --hook")),
+            self._group(OLD_MEM_SYNC.replace("$HOME/.claude/tools", "$HOME/mine")),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            helper, source, home = self._source(tmp)
+            helper._write_user_settings(home, self._installed([user_end, *lookalikes]))
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+                runtime_activation._merge_claude_settings(source, None)
+            got = self._commands(helper._read_user_settings(home))
+            self.assertNotIn(OLD_MEM_SYNC, got)
+            self.assertEqual(got.count(FLEET_END), 1)
+            self.assertEqual(got.count(HERDR_END), 1)
+            self.assertEqual(len(got), 2 + 1 + len(lookalikes), got)
+            self.assertIn("echo user-end", got)
+            for group in lookalikes:
+                self.assertIn(group["hooks"][0]["command"], got)
+
+    def test_older_spellings_of_the_managed_sync_are_retired_too(self):
+        older = OLD_MEM_SYNC.replace(" >/dev/null", "").replace("exec python3", "exec env MEM_DUMP_PUSH=1 python3")
+        data = {"hooks": {"SessionEnd": [self._group(older)]}}
+        import claude_settings_config as settings
+        self.assertTrue(settings.remove_retired_hooks(data))
+        self.assertNotIn("SessionEnd", data["hooks"])
+
+    def test_the_sync_command_is_only_retired_under_session_end(self):
+        data = {"hooks": {"Stop": [self._group(OLD_MEM_SYNC)]}}
+        import claude_settings_config as settings
+        self.assertFalse(settings.remove_retired_hooks(data))
+        self.assertEqual(self._commands({"hooks": {"SessionEnd": data["hooks"]["Stop"]}}), [OLD_MEM_SYNC])
+
+    def test_the_shipped_template_has_no_session_end_memory_hook_but_keeps_fleet_and_herdr(self):
+        template = json.loads((HERE.parents[1] / "adapters/claude/settings.json").read_text(encoding="utf-8"))
+        commands = self._commands(template)
+        self.assertEqual(commands, [FLEET_END, HERDR_END])
+        self.assertFalse([c for c in commands if "mem.py" in c])
+
 
 if __name__ == "__main__":
     unittest.main()

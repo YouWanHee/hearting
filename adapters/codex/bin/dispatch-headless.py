@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
 from dispatch_contract import (
+    _atomic_registry_replace,
     workflow_completion_receipt,  # noqa: E402
     DispatchContractError,
     foreground_review_launch_identity,
@@ -1272,12 +1273,12 @@ def validate_nested_owner_registry_projection(args: argparse.Namespace) -> None:
         )
 
 
+def _registered_owner(args: argparse.Namespace) -> bool:
+    return args.dispatch_depth == 1 and args.worker_type == "owner"
+
+
 def _completion_owner(args: argparse.Namespace) -> bool:
-    return (
-        args.dispatch_depth == 1
-        and args.worker_type == "owner"
-        and args.intensity in _STANDARD_PLUS_INTENSITY
-    )
+    return _registered_owner(args) and args.intensity in _STANDARD_PLUS_INTENSITY
 
 
 def codex_app_server_available() -> bool:
@@ -1304,15 +1305,16 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
     `args.completion_delivery_reason` so an auto degrade to `poll-fallback`
     carries the same preserved-evidence contract as the Claude adapter."""
     requested = args.completion_delivery
-    if not _completion_owner(args):
+    if not _registered_owner(args):
         if requested == "supervised":
             raise DispatchContractError(
                 "completion-delivery-ineligible",
-                "supervised completion is scoped to registered standard+ dispatch-depth-1 owners",
+                "supervised completion is scoped to registered dispatch-depth-1 owners",
             )
         return "one-shot"
+    standard_plus = _completion_owner(args)
     if requested == "poll":
-        return "poll-fallback"
+        return "poll-fallback" if standard_plus else "one-shot"
     if codex_app_server_available():
         args.completion_delivery_reason = "ok"
         return "app-server-supervised"
@@ -1321,6 +1323,9 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
             "codex-app-server-unavailable",
             "codex app-server --help did not pass; no owner attempt was launched",
         )
+    if not standard_plus:
+        # A quick owner keeps the one-shot launch it had before.
+        return "one-shot"
     args.completion_delivery_reason = "codex-app-server-unavailable"
     return "poll-fallback"
 
@@ -1345,6 +1350,29 @@ def completion_lease_path(args: argparse.Namespace) -> Path:
     return supervisor_lease_path(args.jobs_path, attempt_id)
 
 
+def _supervisor_route(args: argparse.Namespace) -> tuple[str, str, str] | None:
+    """The route a supervised owner is bound to: the standard+ owner binding, or a
+    quick owner's own one-shot tuple, never a partial one."""
+    binding = getattr(args, "owner_route_binding", None)
+    if binding:
+        return binding.route_file, binding.route_id, binding.route_hash
+    route = tuple(getattr(args, key, None) for key in ("route_file", "route_id", "route_hash"))
+    if all(route) and getattr(args, "route_node", None) == "one-shot":
+        return route
+    return None
+
+
+def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> None:
+    """Open correction admission at registration; without it `correct` stays unsupported."""
+    if args.resolved_completion_delivery != "app-server-supervised":
+        return
+    try:
+        from dispatch_owner_input import initialize_owner_input
+        initialize_owner_input(jobs, args.attempt_id, "codex-active-turn")
+    except Exception as exc:
+        sys.stderr.write(f"owner-input-init-skipped attempt_id={args.attempt_id} reason={type(exc).__name__}\n")
+
+
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
     writer = [sys.executable, str(ROOT / "utilities" / "codex-jsonl-writer.py"),
               "--log", str(log_path), "--attempt", str(getattr(args, "command_attempt_id", "") or ""), "--"]
@@ -1363,12 +1391,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         ]
         if getattr(args, "report_bundle_root", None) is not None:
             command += ["--writable-root", str(args.report_bundle_root)]
-        if getattr(args, "owner_route_binding", None):
-            command += [
-                "--route-file", args.owner_route_binding.route_file,
-                "--route-id", args.owner_route_binding.route_id,
-                "--route-hash", args.owner_route_binding.route_hash,
-            ]
+        route = _supervisor_route(args)
+        if route:
+            command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
         if getattr(args, "max_continuations", None) is not None:
             command += ["--max-continuations", str(args.max_continuations)]
         if registry_writable_launch(args):
@@ -1934,7 +1959,8 @@ def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str,
             changed = True
             break
         if changed:
-            jobs.write_text("".join(lines), encoding="utf-8")
+            # Lock-free readers (join, owner input) must never see a truncated registry.
+            _atomic_registry_replace(jobs, "".join(lines).splitlines())
         return changed
 
 
@@ -1957,7 +1983,8 @@ def annotate_job_row(jobs: Path, slug: str, worktree: str, extra_kv: str, attemp
             if attempt_id and f"attempt_id={attempt_id}" not in pipe.split(","):
                 continue
             lines[i] = f"{ts}\t{status}\t{repo}\t{wt}\t{row_slug}\t{pipe},{extra_kv}\n"
-            jobs.write_text("".join(lines), encoding="utf-8")
+            # Lock-free readers (join, owner input) must never see a truncated registry.
+            _atomic_registry_replace(jobs, "".join(lines).splitlines())
             return True
     return False
 
@@ -2763,6 +2790,7 @@ def main(argv: list[str]) -> int:
             cancel_governor_reservation(governor, governor_root, reservation_token)
             return fail(str(e), 73, child_spawned="0")
         if args.attempt_claimed:
+            initialize_supervised_owner_input(args, jobs)
             try:
                 prompt_path.write_text(prompt_text, encoding="utf-8")
             except OSError as exc:

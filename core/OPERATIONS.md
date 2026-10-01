@@ -697,7 +697,7 @@ read. An ordinary detached process is never run invisibly on the user's behalf.
 ---
 # Governed workers and detached resources
 
-All repo-launched model-backed workers pass through `utilities/model-worker-governor.py`, which applies a global cap, per-class caps, a per-class rolling start budget, kill switch, and witness-proven abandoned-lease recovery. The start budget is per class rather than one shared pool (per 10 minutes: `dispatch` 20, `title` 12, `loop` 4; override one class with `AGENT_MODEL_WORKER_START_BUDGET_<CLASS>`, or `dispatch` alone with the legacy `AGENT_MODEL_WORKER_START_BUDGET`), so a background class's own periodic starts cannot exhaust the budget a new dispatch launch needs. Every start is recorded in `start_records` (class, label, pid); the shared `state.json` keeps `schema_version` 2 and its legacy `starts` float list as the `dispatch` pool alone, including any unattributed float a still-sealed old release writes there, so the file stays readable by both releases across an install. Its shared state lives under the canonical artifact root so the main checkout and linked workers use one writable governor. A registered dispatch launch reserves its slots atomically before any registry row or model process is created; a parallel batch reserves its exact declared N legs in one locked operation on first start, so insufficient total/class/start-budget capacity creates zero partial rows and zero model processes. An idempotent recovery may reserve one missing leg only after all other N-1 manifest-bound rows are proven active or completed. Each reserved dispatch runner claims one opaque reservation and releases it after its command exits; parallel-group provenance survives reservation-to-claim transfer and is copied into the immutable attempt row. Unused reservations are cancelled or pruned with their exact owner PID/start identity. Governor PID and group scans preserve `inaccessible`/`incomplete` as an occupied, unreleasable state instead of pruning a lease or reservation as dead; only a complete empty group releases descendant-held capacity. Other worker classes atomically acquire their lease in the governed runner. The legacy non-consuming `check` remains diagnostic only and is never a launch authorization. A launched worker inherits the same governor root before it can dispatch a child. This does not modify runtime-owned native subagent limits. A standard+ cycle's concurrent slot occupancy is dispatch-depth-1 owner 1 plus a parallel group's 2–4 legs, so its peak is 3 at `standard` and 4–5 at `strong+`; the `dispatch` class cap of 10 lets two strong+ cycles run at once (5×2=10; raised from 8 on 2026-09-30 when routes queued behind a full cap), and the global cap of 14 leaves 4 slots for the non-dispatch background classes (`title`, `loop`). The per-class cap sum (10+4+2=16) deliberately exceeds the global cap (14): each class keeps its own ceiling, but the global cap is meant to be the real bottleneck under load, and `AGENT_MODEL_WORKER_CLASS_LIMIT_<CLASS>` overrides one class's cap when that priority balance needs to shift.
+All repo-launched model-backed workers pass through `utilities/model-worker-governor.py`, which applies a global cap, per-class caps, a per-class rolling start budget, kill switch, and witness-proven abandoned-lease recovery. The start budget is per class rather than one shared pool (per 10 minutes: `dispatch` 40, `title` 12, `loop` 4; override one class with `AGENT_MODEL_WORKER_START_BUDGET_<CLASS>`, or `dispatch` alone with the legacy `AGENT_MODEL_WORKER_START_BUDGET`), so a background class's own periodic starts cannot exhaust the budget a new dispatch launch needs. Every start is recorded in `start_records` (class, label, pid); the shared `state.json` keeps `schema_version` 2 and its legacy `starts` float list as the `dispatch` pool alone, including any unattributed float a still-sealed old release writes there, so the file stays readable by both releases across an install. Its shared state lives under the canonical artifact root so the main checkout and linked workers use one writable governor. A registered dispatch launch reserves its slots atomically before any registry row or model process is created; a parallel batch reserves its exact declared N legs in one locked operation on first start, so insufficient total/class/start-budget capacity creates zero partial rows and zero model processes. An idempotent recovery may reserve one missing leg only after all other N-1 manifest-bound rows are proven active or completed. Each reserved dispatch runner claims one opaque reservation and releases it after its command exits; parallel-group provenance survives reservation-to-claim transfer and is copied into the immutable attempt row. Unused reservations are cancelled or pruned with their exact owner PID/start identity. Governor PID and group scans preserve `inaccessible`/`incomplete` as an occupied, unreleasable state instead of pruning a lease or reservation as dead; only a complete empty group releases descendant-held capacity. Other worker classes atomically acquire their lease in the governed runner. The legacy non-consuming `check` remains diagnostic only and is never a launch authorization. A launched worker inherits the same governor root before it can dispatch a child. This does not modify runtime-owned native subagent limits. A standard+ cycle's concurrent slot occupancy is dispatch-depth-1 owner 1 plus a parallel group's 2–4 legs, so its peak is 3 at `standard` and 4–5 at `strong+`; the `dispatch` class cap of 24 keeps several concurrent standard+ cycles moving: each owner holds its own slot while its workers run, so a tight cap deadlocked on 2026-09-30 with owners holding 8 of 10 slots and no room for their workers. Storm protection is the rolling start budget and the usage gates, not this cap. The global cap of 30 leaves 6 slots for the non-dispatch background classes (`title`, `loop`). The per-class cap sum (24+4+2=30) equals the global cap (30): each class keeps its own ceiling, but the global cap is meant to be the real bottleneck under load, and `AGENT_MODEL_WORKER_CLASS_LIMIT_<CLASS>` overrides one class's cap when that priority balance needs to shift.
 
 Registered model-backed jobs stay within the dispatching workflow. Its runtime
 owns admission, waiting, delivery acknowledgement, and exact process cleanup;
@@ -857,6 +857,14 @@ remain command-based. Multiple processes on one GPU share that GPU item, and
 registered jobs/runs keep their existing presentation. An expired probe sample
 loses its session GPU items. This read-only projection neither creates a
 resource-run registry entry nor changes the process lifecycle.
+A live GPU process that no working registered resource run (same pid and start,
+or same process group on the Fleet host) and no drawn GPU line (session or
+dispatch job row) shows appears once under its `project_of(cwd)` project card,
+tagged `미등록` (or the owner's `job:`/`run:` label when the probe found owner
+evidence), with its GPU, VRAM, and running time; a process whose cwd cannot be read goes to
+`(unknown)`. The cwd only places the card and is never ownership evidence. The
+row uses the same probe sample, is read-only, adds no registry entry, and
+disappears with an expired sample.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
@@ -892,14 +900,21 @@ both is a resource job whose payload is a `compute-hosts run` invocation.
 
 Registered owner corrections belong to the execution supervisor, through
 `capability-route.py correct --attempt-id <id> --message-file <file>` (omit the
-file to inspect). The exact attempt and its live supervisor lease bind one
-durable input receipt; repeating a request ID returns that receipt. Codex uses
-its existing App Server connection to steer an active turn. CLI transports
-retain the input for the next turn in the same owner. Pending input takes
-precedence over automatic stage advancement and terminal closure. A transport
-receipt proves delivery, not implementation; an interrupted send remains
-unknown and is handed back through the existing supervision notice carrier.
-Old supervisors without this input contract report unsupported before queueing.
+file to inspect). The exact attempt binds one durable input receipt; repeating
+a request ID returns that receipt. Every registered dispatch-depth-1 owner —
+quick and solo as well as standard+ — runs under its harness supervisor, so the
+same command reaches all of them. Registration opens the input channel: a
+correction sent after `--register` and before the first consumer attaches is
+queued and handed to the first turn (a relaunch of a never-claimed row keeps
+that queue). Codex uses its existing App Server connection to steer an active
+turn; Claude and OpenCode retain the input for the next turn of the same
+session. Pending input takes precedence over automatic stage advancement and
+terminal closure. A transport receipt proves delivery, not implementation; an
+interrupted send remains unknown (`delivery-unknown`) and is handed back through
+the existing supervision notice carrier. A host whose supervisor probe does not
+report support runs the owner as the existing one-shot, creates no input state,
+and `correct` reports `owner-input-unsupported` before queueing; an owner
+already running under an older supervisor behaves the same way.
 Corrections preserve route, completion and cleanup evidence; completed-prefix
 reuse uses the existing `continuation` compiler rather than a fresh recipe.
 

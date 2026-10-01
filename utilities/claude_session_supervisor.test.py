@@ -882,6 +882,29 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             0,
         )
 
+    def test_input_queued_before_the_first_turn_reaches_that_turn(self):
+        import dispatch_owner_input as owner_input
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "claude-next-turn")
+        owner_input.submit(self.jobs, PARENT, "early word", "early")
+        result = self.run_supervisor(FAKE_NO_CHILD="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(len(trace), 1)
+        self.assertFalse(trace[0]["resume"])
+        self.assertIn("early word", trace[0]["prompt"])
+        receipt = owner_input.inspect(self.jobs, PARENT)
+        self.assertEqual(receipt["requests"][0]["state"], "turn-completed")
+        self.assertEqual(receipt["requests"][0]["thread_id"], trace[0]["session"])
+        self.assertFalse(receipt["accepting"])
+
+    def test_runtime_v1_owner_without_route_arguments_finishes(self):
+        self.jobs.write_text(
+            owner_row(self.lease).replace("attempt_id=", "workflow_completion=runtime-v1,attempt_id="),
+            encoding="utf-8")
+        result = self.run_supervisor(FAKE_NO_CHILD="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
     def test_empty_runtime_wait_retries_start_in_same_session_before_join(self):
         self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
         result = self.run_supervisor(

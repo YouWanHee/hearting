@@ -531,6 +531,68 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertGreater(payload["memory_total_mib"], 0)
         self.assertGreaterEqual(payload["memory_used_mib"], 0)
 
+    def _probe_with_fake_smi(self, processes_rows, bin_name):
+        module = load_module()
+        fakebin = self.root / bin_name
+        fakebin.mkdir()
+        fake_smi = fakebin / "nvidia-smi"
+        fake_smi.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "if any(a.startswith('--query-gpu=') for a in sys.argv):\n"
+            " print('0, GPU-A, NVIDIA A100, 42, 40960, 12288')\n"
+            "else:\n"
+            " for row in json.loads(os.environ['FAKE_GPU_PROCESSES']): print(', '.join(map(str,row)))\n",
+            encoding="utf-8",
+        )
+        fake_smi.chmod(0o755)
+        env = {
+            **os.environ,
+            "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_GPU_PROCESSES": json.dumps(processes_rows),
+        }
+        result = subprocess.run(
+            ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
+            env=env, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_gpu_probe_reports_cwd_elapsed_and_process_group(self):
+        workdir = self.root / "work"
+        workdir.mkdir()
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"], cwd=workdir)
+        try:
+            payload = self._probe_with_fake_smi(
+                [["GPU-A", child.pid, "python", 512]], "cwd-bin")
+            child_pgid = os.getpgid(child.pid)
+        finally:
+            child.terminate()
+            child.wait(timeout=2)
+        (row,) = payload["gpus"][0]["processes"]
+        self.assertEqual(row["cwd"], os.path.realpath(workdir))
+        self.assertIsInstance(row["elapsed_s"], int)
+        self.assertTrue(0 <= row["elapsed_s"] < 60, row["elapsed_s"])
+        self.assertEqual(row["pgid"], child_pgid)
+
+    def test_gpu_probe_cwd_is_absent_when_unreadable_or_gone(self):
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait(timeout=5)
+        rows = [["GPU-A", gone.pid, "python", 64]]
+        if os.geteuid() != 0:
+            rows.append(["GPU-A", 1, "init", 32])
+        payload = self._probe_with_fake_smi(rows, "gone-bin")
+        by_pid = {row["pid"]: row for row in payload["gpus"][0]["processes"]}
+        ended = by_pid[gone.pid]
+        for key in ("proc_start", "pgid", "cwd", "elapsed_s"):
+            self.assertIsNone(ended[key], key)
+        if 1 in by_pid:
+            other = by_pid[1]
+            self.assertIsNone(other["cwd"])
+            self.assertIsInstance(other["pgid"], int)
+            self.assertIsInstance(other["proc_start"], int)
+
     def test_persistent_claim_reconnects_a_detached_root_to_its_session(self):
         module = load_module()
         fakebin = self.root / "claim-bin"

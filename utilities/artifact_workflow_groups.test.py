@@ -250,6 +250,104 @@ class WorkflowGroupsTest(fixture.ProducerTestBase):
         self.assertEqual(W.apply(self.root, withdrawn)["status"], "applied")
         self.assertEqual(W.verify(self.root, camp)["groups"], 0)
 
+    def _end_empty(self, row):
+        """End a cycle with no durable output, through the real finalize (`_remove_empty_cycle`)."""
+        record = P.read_cycle_record(self.root, row["id"])
+        directory = P.cycle_dir(self.root, record["campaign_id"], record["cycle_id"], record)
+        row["file"].unlink()
+        (directory / "artifacts" / "plans").rmdir()
+        result = P.finalize(self.root, cycle_id=row["id"], state="abandoned", abandon_reason="route-unrecoverable")
+        self.assertEqual(result["status"], "no-lineage")
+
+    def _declare(self, camp, *proposals):
+        for title, members, relations in proposals:
+            plan = W.prepare(self.root, camp, self._proposal(members, relations, title=title))
+            W.apply(self.root, plan)
+        return W._load_existing(W.declaration_path(self.root, camp))
+
+    def test_withdrawal_removes_member_relations_and_empty_group(self):
+        rows = self._cycles(6)
+        camp = rows[0]["campaign"]
+        declared = self._declare(
+            camp,
+            ("Chain", rows[:3], [self._relation(rows[0], rows[1]), self._relation(rows[1], rows[2])]),
+            ("Single", rows[3:4], []),
+            ("Solo", rows[4:5], []),
+            ("Pair", rows[5:6], []))
+        untouched = [W._bytes(group) for group in declared["groups"] if group["title"] in ("Single", "Pair")]
+        self._end_empty(rows[1])
+        self._end_empty(rows[4])
+        plan = W.prepare_withdrawal(self.root, camp, [rows[1]["id"], rows[4]["id"], "cyc_" + "0" * 32])
+        self.assertEqual(plan["mode"], "replace")
+        self.assertEqual(plan["new_evidence"], [])
+        self.assertEqual(W.apply(self.root, plan)["status"], "applied")
+        self.assertEqual(W.verify(self.root, camp, expected=plan["after_sha256"])["groups"], 3)
+        after = W._load_existing(W.declaration_path(self.root, camp))
+        titles = [group["title"] for group in after["groups"]]
+        self.assertEqual(titles, ["Chain", "Single", "Pair"])
+        chain = after["groups"][0]
+        self.assertEqual([item["cycle_id"] for item in chain["members"]], [rows[0]["id"], rows[2]["id"]])
+        self.assertEqual(chain["relations"], [])
+        self.assertEqual([W._bytes(group) for group in after["groups"][1:]], untouched)
+        self.assertEqual(W.declaration_path(self.root, camp).read_bytes(), W._bytes(plan["document"]))
+
+    def test_withdrawal_ignores_stale_historical_evidence(self):
+        rows = self._cycles(4)
+        camp = rows[0]["campaign"]
+        self._declare(camp, ("Kept", rows[:2], [self._relation(rows[0], rows[1])]),
+                      ("Leaving", rows[2:], [self._relation(rows[2], rows[3])]))
+        kept = W._load_existing(W.declaration_path(self.root, camp))["groups"][0]
+        rows[0]["file"].write_bytes(b"X" * len(rows[0]["file"].read_bytes()))
+        self._end_empty(rows[2])
+        self._end_empty(rows[3])
+        plan = W.prepare_withdrawal(self.root, camp, [rows[2]["id"], rows[3]["id"]])
+        self.assertEqual(plan["new_evidence"], [])
+        self.assertEqual(W.apply(self.root, plan)["status"], "applied")
+        after = W._load_existing(W.declaration_path(self.root, camp))
+        self.assertEqual(W._bytes(after["groups"][0]), W._bytes(kept))
+        self.assertEqual(len(after["groups"]), 1)
+        self.assertEqual(W.verify(self.root, camp)["stale_evidence"], [rows[0]["path"]])
+
+    def test_withdrawal_from_already_invalid_declaration(self):
+        rows = self._cycles(3)
+        camp = rows[0]["campaign"]
+        self._declare(camp, ("Chain", rows, [self._relation(rows[0], rows[1]), self._relation(rows[1], rows[2])]))
+        self._end_empty(rows[1])
+        # The cycle left the campaign, so the declaration on disk no longer validates.
+        with self.assertRaises(W.WorkflowGroupError) as caught:
+            W.verify(self.root, camp)
+        self.assertEqual(caught.exception.code, "cycle-not-member")
+        with self.assertRaises(W.WorkflowGroupError):
+            W.prepare(self.root, camp, {"groups": []})
+        plan = W.prepare_withdrawal(self.root, camp, [rows[1]["id"]])
+        self.assertEqual(W.apply(self.root, plan)["status"], "applied")
+        self.assertEqual(W.verify(self.root, camp, expected=plan["after_sha256"])["groups"], 1)
+        after = W._load_existing(W.declaration_path(self.root, camp))
+        self.assertEqual([item["cycle_id"] for item in after["groups"][0]["members"]], [rows[0]["id"], rows[2]["id"]])
+
+    def test_withdrawal_noop_and_conflicts(self):
+        rows = self._cycles(3)
+        camp = rows[0]["campaign"]
+        self.assertIsNone(W.prepare_withdrawal(self.root, camp, [rows[0]["id"]]))  # no declaration
+        self._declare(camp, ("Chain", rows[:2], [self._relation(rows[0], rows[1])]))
+        self.assertIsNone(W.prepare_withdrawal(self.root, camp, [rows[2]["id"]]))  # not a member
+        path = W.declaration_path(self.root, camp)
+        original = path.read_bytes()
+        plan = W.prepare_withdrawal(self.root, camp, [rows[1]["id"]])
+        self.assertEqual(path.read_bytes(), original)  # prepare is read-only
+        lock = P.artifact_admission._acquire_lock(self.root, 5)
+        try:
+            with self.assertRaises(P.artifact_admission.AdmissionBusy):
+                W.apply(self.root, plan, lock_timeout=0)
+        finally:
+            P.artifact_admission._release_lock(self.root, lock)
+        self.assertEqual(path.read_bytes(), original)
+        path.write_bytes(original + b"\n")
+        with self.assertRaises(W.WorkflowGroupError) as caught:
+            W.apply(self.root, plan, lock_timeout=0)
+        self.assertEqual(caught.exception.code, "declaration-preimage-conflict")
+        self.assertEqual(path.read_bytes(), original + b"\n")
+
     def test_duplicate_json_key_is_rejected(self):
         with self.assertRaises(W.WorkflowGroupError) as caught:
             W._json(b'{"groups":[],"groups":[]}')

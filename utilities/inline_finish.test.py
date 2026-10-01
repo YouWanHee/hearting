@@ -107,6 +107,8 @@ class PublicInlineFinishTest(unittest.TestCase):
             "--summary-file", str(self.summary),
         ]
         self.env = os.environ.copy()
+        # `complete` would start a detached checkpoint that outlives the fixture root.
+        self.env["AGENT_ARTIFACT_CHECKPOINT"] = "off"
 
     def extra_compose_arguments(self):
         return []

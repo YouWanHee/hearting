@@ -852,6 +852,62 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
             with self.assertRaises(WH.DispatchContractError):
                 WH.resolve_completion_delivery(args)
 
+    def test_quick_owner_is_supervised_only_when_the_app_server_is_available(self):
+        def owner(**overrides):
+            return argparse.Namespace(**{**dict(
+                completion_delivery="auto", dispatch_depth=1, worker_type="owner", intensity="quick",
+                completion_delivery_reason="not-applicable"), **overrides})
+        with mock.patch.object(WH, "codex_app_server_available", return_value=True):
+            args = owner()
+            self.assertEqual(WH.resolve_completion_delivery(args), "app-server-supervised")
+            self.assertEqual(args.completion_delivery_reason, "ok")
+            self.assertEqual(WH.resolve_completion_delivery(owner(completion_delivery="supervised")),
+                             "app-server-supervised")
+        with mock.patch.object(WH, "codex_app_server_available", return_value=False):
+            args = owner()
+            self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
+            self.assertEqual(args.completion_delivery_reason, "not-applicable")
+            with self.assertRaises(WH.DispatchContractError) as caught:
+                WH.resolve_completion_delivery(owner(completion_delivery="supervised"))
+            self.assertEqual(caught.exception.reason, "codex-app-server-unavailable")
+            # standard+ keeps its poll-fallback
+            args = owner(intensity="standard")
+            self.assertEqual(WH.resolve_completion_delivery(args), "poll-fallback")
+            self.assertEqual(args.completion_delivery_reason, "codex-app-server-unavailable")
+        with mock.patch.object(WH, "codex_app_server_available") as probe:
+            self.assertEqual(WH.resolve_completion_delivery(owner(completion_delivery="poll")), "one-shot")
+            self.assertEqual(WH.resolve_completion_delivery(owner(completion_delivery="poll", intensity="strong")),
+                             "poll-fallback")
+            probe.assert_not_called()
+
+    def test_non_owner_and_depth_two_never_probe_or_supervise(self):
+        for overrides in (dict(dispatch_depth=2), dict(worker_type="stage"),
+                          dict(worker_type="review", dispatch_depth=2)):
+            with self.subTest(**overrides):
+                args = argparse.Namespace(**{**dict(completion_delivery="auto", dispatch_depth=1,
+                                                    worker_type="owner", intensity="quick"), **overrides})
+                with mock.patch.object(WH, "codex_app_server_available") as probe:
+                    self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
+                    probe.assert_not_called()
+                args.completion_delivery = "supervised"
+                with self.assertRaises(WH.DispatchContractError) as caught:
+                    WH.resolve_completion_delivery(args)
+                self.assertEqual(caught.exception.reason, "completion-delivery-ineligible")
+
+    def test_registration_opens_input_only_for_a_supervised_delivery(self):
+        args = argparse.Namespace(attempt_id="att-quick", resolved_completion_delivery="app-server-supervised")
+        with mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+            WH.initialize_supervised_owner_input(args, Path("/tmp/jobs.log"))
+            init.assert_called_once_with(Path("/tmp/jobs.log"), "att-quick", "codex-active-turn")
+        for delivery in ("one-shot", "poll-fallback"):
+            args.resolved_completion_delivery = delivery
+            with mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+                WH.initialize_supervised_owner_input(args, Path("/tmp/jobs.log"))
+                init.assert_not_called()
+        args.resolved_completion_delivery = "app-server-supervised"
+        with mock.patch("dispatch_owner_input.initialize_owner_input", side_effect=OSError("disk")):
+            WH.initialize_supervised_owner_input(args, Path("/tmp/jobs.log"))
+
 
 class ForegroundReviewStartPathTest(unittest.TestCase):
     def setUp(self):

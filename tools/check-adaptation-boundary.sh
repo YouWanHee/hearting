@@ -909,7 +909,7 @@ check_codex_bin_wrappers() {
     fi
   done
 
-  for p in 'preflight.sh session-end' 'preflight.sh prompt-signal' 'preflight.sh token-budget' 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh ui-info' 'preflight.sh tui-config' 'preflight.sh subagent-info' 'preflight.sh loop-info' 'preflight.sh qa-policy'; do
+  for p in 'preflight.sh prompt-signal' 'preflight.sh token-budget' 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh ui-info' 'preflight.sh tui-config' 'preflight.sh subagent-info' 'preflight.sh loop-info' 'preflight.sh qa-policy'; do
     if ! grep -Fq "$p" adapters/codex/AGENTS.md; then
       fail_msg "adapters/codex/AGENTS.md must document manual Codex lifecycle wrapper $p"
     fi
@@ -982,7 +982,8 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'emit_context(' adapters/codex/hooks/sessionstart-lifecycle.py \
     || ! grep -Fq '"SessionStart"' adapters/codex/hooks/sessionstart-lifecycle.py \
     || ! grep -Fq 'hookSpecificOutput' adapters/codex/hooks/sessionstart-lifecycle.py \
-    || ! grep -Fq 'run_preflight("session-end"' adapters/codex/hooks/sessionend-lifecycle.py \
+    || grep -Fq 'session-end' adapters/codex/hooks/sessionend-lifecycle.py \
+    || ! grep -Fq 'launch_trigger("codex"' adapters/codex/hooks/sessionend-lifecycle.py \
     || grep -Fq 'subprocess' adapters/codex/hooks/stop-lifecycle.py \
     || grep -Fq 'session-end' adapters/codex/hooks/stop-lifecycle.py \
     || grep -Fq 'join_session_batch(' adapters/codex/hooks/stop-lifecycle.py \
@@ -1423,7 +1424,7 @@ check_codex_tool_projection() {
   # deferred-but-realized-as-visual-harness (a concrete launcher under a different name) — this
   # completeness check and the denylist above are separate assertions and must not be conflated.
   TOOL_PROJECTED="memory material figure-semantic-manifest.schema.json figure-semantic-verify.py"
-  TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
+  TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-durations.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
   TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh worktree-lock.sh argparse_abbrev_guard.test.py fixture_processes.py fixture_processes.test.py"
   tool_count=0
   for f in tools/*; do
@@ -1927,7 +1928,8 @@ check_codex_native_hook_projection() {
   if ! grep -Fq '"PostToolUse"' "$hook_json" || ! grep -Fq 'posttooluse-read-marker.py' "$hook_json"; then
     fail_msg "$hook_json must register the Codex PostToolUse read marker"
   fi
-  for bridge in "$session_bridge" "$sessionend_bridge" "$prompt_bridge" "$post_bridge" "$read_bridge"; do
+  # The SessionEnd bridge calls no preflight: memory has no session-end step (D-82).
+  for bridge in "$session_bridge" "$prompt_bridge" "$post_bridge" "$read_bridge"; do
     if ! grep -Fq 'adapters" / "codex" / "bin" / "preflight.sh' "$bridge"; then
       fail_msg "$bridge must call the Codex preflight wrapper"
     fi
@@ -1985,8 +1987,8 @@ PY
   if ! grep -Fq '"read"' "$read_bridge"; then
     fail_msg "$read_bridge must call the Codex read preflight"
   fi
-  if ! grep -Fq '"session-end"' "$sessionend_bridge"; then
-    fail_msg "$sessionend_bridge must call the Codex session-end preflight"
+  if grep -Fq '"session-end"' "$sessionend_bridge" || ! grep -Fq 'clear_wait' "$sessionend_bridge"; then
+    fail_msg "$sessionend_bridge must keep the Fleet cleanup and call no memory preflight"
   fi
   if ! grep -Fq 'PreToolUse' adapters/codex/README.md \
     || ! grep -Fq 'PostToolUse' adapters/codex/README.md \
@@ -2426,7 +2428,7 @@ check_opencode_tool_projection() {
   # deferred-but-realized-as-visual-harness (a concrete launcher under a different name) — this
   # completeness check and the denylist above are separate assertions and must not be conflated.
   TOOL_PROJECTED="memory material figure-semantic-manifest.schema.json figure-semantic-verify.py"
-  TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
+  TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-durations.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
   TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh worktree-lock.sh argparse_abbrev_guard.test.py fixture_processes.py fixture_processes.test.py"
   tool_count=0
   for f in tools/*; do

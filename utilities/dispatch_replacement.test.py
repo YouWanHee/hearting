@@ -172,6 +172,34 @@ class ReplacementTest(unittest.TestCase):
                          ',replacement_input_digest='+self.meta['replacement_input_digest'])
         with self.assertRaises(D.DispatchContractError):R.seal_launch_input(args,'codex','changed')
 
+    def test_a_never_started_attempt_reseals_its_input_from_a_newer_release(self):
+        # The first launcher sealed the input, registered the row and stopped before
+        # its claim. The next launcher runs from a newer release.
+        args=SimpleNamespace(**vars(self.args));args.attempt_id='att-next'
+        args.replacement_input_argv=['--start','--attempt-id','att-next','--prompt-text','the raw task']
+        # The launcher holds the allow-list as a tuple; the sealed file reads it back as a list.
+        args.resolved_permission_posture={'mode':'bypass','mode_flag':'bypassPermissions',
+                 'allowed_tools':('Bash(git status)','Read'),'inherited_default_mode':'default'}
+        first=R.seal_launch_input(args,'codex','the raw task')
+        self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'0',
+                    **D.parse_registry_metadata(first)},'open',append=True)
+        with mock.patch.object(R,'ROOT',Path('/newer/release')):
+            second=R.seal_launch_input(args,'codex','the raw task')
+        self.assertNotEqual(first,second)
+        saved=json.loads((R._directory(self.jobs)/'inputs'/'att-next.json').read_text())
+        self.assertEqual(saved['launch_home'],'/newer/release')
+        self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
+        # Different work, or an attempt that already started, still conflicts.
+        with mock.patch.object(R,'ROOT',Path('/third/release')):
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R.seal_launch_input(args,'codex','changed task')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+        self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'1'},'open',append=True)
+        with mock.patch.object(R,'ROOT',Path('/third/release')):
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R.seal_launch_input(args,'codex','the raw task')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+
     def test_claim_publication_crash_blocks_legacy_retry(self):
         for fail_before_record in [True,False]:
             with self.subTest(before_record=fail_before_record):
@@ -317,6 +345,28 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index('--attempt-id')+1],record['replacement_attempt_id'])
         self.assertEqual(result['reason'],'replacement-launch-pending')
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        seen=[]
+        def slow(command,**kwargs):
+            seen.append((command,kwargs['timeout']))
+            raise subprocess.TimeoutExpired(command,kwargs['timeout'],output='waiting on disk',stderr=b'')
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+            first=R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual(first['reason'],'replacement-launch-timeout')
+        self.assertIn('waiting on disk',first['launcher_diagnostic'])
+        self.assertEqual(seen[0][1],R.LAUNCHER_TIMEOUT_SECONDS)
+        self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
+                    'note':'registered','launch_claimed':'0'},'open',append=True)
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+            R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
+
+    def test_an_io_failure_keeps_its_cause(self):
+        with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
+            result=R.advance(self.jobs,'att-source',run=mock.Mock())
+        self.assertEqual(result['reason'],'replacement-observation-unavailable')
+        self.assertEqual(result['detail'],'OSError: disk gone')
 
     def test_concurrent_actual_spawn_releases_one_fenced_process(self):
         record=self.claim();aid=record['replacement_attempt_id']

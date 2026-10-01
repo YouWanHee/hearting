@@ -872,13 +872,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__-c__SessionEnd",
-      "name": "-c",
-      "mono": "-c",
-      "event": "SessionEnd",
-      "hard_block": false
-    },
-    {
       "slug": "hook__fleet-interaction-state.py__SessionEnd",
       "name": "fleet-interaction-state.py clear",
       "mono": "fleet-interaction-state.py",

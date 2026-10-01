@@ -128,9 +128,14 @@ delays, fails, or changes a seal, and a busy or failed run is retried by a later
   its group and members still apply.
 - **Record.** `.runtime/artifact-producer/v1/workflow-group-reviews.json` is
   producer-only and Cairn does not read it. Per cycle it keeps `verdict`
-  (`joined`, `new-group`, `unassigned`, `failed`), the model's reason, `profile`,
-  `harness`, and failure counters; it names no vendor model. A corrupt or foreign
-  record is never overwritten and pauses `--auto` sweeps.
+  (`joined`, `new-group`, `unassigned`, `failed`, `withdrawn-empty`), the model's
+  reason, `profile`, `harness`, and failure counters; it names no vendor model. A
+  corrupt or foreign record is never overwritten and pauses `--auto` sweeps.
+  When route auto-close ends a member cycle with no durable output (abandoned, no
+  manifest), the same sweep withdraws that member and the relations ending at it
+  through `prepare` → `apply` → `verify` (a group left empty is dropped) and records
+  verdict `withdrawn-empty`. A missing or invalid declaration or a concurrent change
+  only defers this to a later sweep; it never changes the seal.
 - **Switch.** `HEARTING_WORKFLOW_GROUP_REVIEW=off` disables the trigger and `--auto`
   only; an explicit `sweep`, including `--dry-run`, is unaffected.
 
