@@ -125,10 +125,10 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 4. **terminal evidence before shared admission.** The terminal node uses the
    verified cycle-local PRD as evidence, independent of any shared revision.
    For new registered owners the shared completion controller then completes
-   the workflow, closes the route and seals the exact cycle. Inline work and
+   the workflow, closes the route and finalizes the exact cycle (its completion record). Inline work and
    legacy recovery retain explicit complete/close/finalize. Shared admission
-   follows the sealed cycle; it cannot stand in for terminal evidence.
-5. **shared admission.** `spec` output is admitted to `shared/spec/` by `admit-shared --kind spec` after the cycle is sealed (canonical shared kind). Seed selects the unique reference keyed `spec` when older references coexist; an existing seed receipt keeps its original reference and revision. An ambiguous selection is refused without writing, and an older reference remains available through the existing reference selector. Shared admission retains its own selector and base-receipt checks; a `--key` that matches none of the existing references is refused (`shared-reference-exists`) and a second reference is only ever created with `--new-reference`.
+   follows the finalized cycle; it cannot stand in for terminal evidence.
+5. **shared admission.** `spec` output is admitted to `shared/spec/` by `admit-shared --kind spec` after the cycle is finalized (canonical shared kind). Seed selects the unique reference keyed `spec` when older references coexist; an existing seed receipt keeps its original reference and revision. An ambiguous selection is refused without writing, and an older reference remains available through the existing reference selector. Shared admission retains its own selector and base-receipt checks; a `--key` that matches none of the existing references is refused (`shared-reference-exists`) and a second reference is only ever created with `--new-reference`.
 
 ## Role Requirements
 

@@ -10,7 +10,7 @@ durable source of truth (that is the published manifest + its events). See
 
 import os.path
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Collection, Dict, Iterable, Mapping, Optional, Tuple
 
 from artifact_manifest import (
     ValidationReport,
@@ -206,7 +206,15 @@ def check(
     idempotency_key: str,
     manifest_digest: str,
     repository_id: Optional[str] = None,
+    known_parent_cycle_ids: Optional[Collection[str]] = None,
 ) -> ValidationReport:
+    """Judge ``document`` against the index.
+
+    ``known_parent_cycle_ids`` names cycles that exist as producer records of
+    the same root but are not (yet) in the index -- a parent still open, or
+    one deleted since.  A parent is a reference, not an ordering or campaign
+    constraint (§45 D-123): it only has to be a cycle of this root.
+    """
     violations = []
 
     if document.get("artifact_root_id") != index.artifact_root_id:
@@ -252,24 +260,14 @@ def check(
                     "cycle cannot be its own parent",
                 )
             )
-        elif parent_cycle_id not in index.cycles:
+        elif parent_cycle_id not in index.cycles and parent_cycle_id not in (known_parent_cycle_ids or ()):
             violations.append(
                 Violation(
                     "index-orphan-parent-cycle",
                     "$.cycle.parent_cycle_id",
-                    "parent cycle is not an admitted cycle in this root",
+                    "parent cycle is not a cycle of this root",
                 )
             )
-        else:
-            parent_campaign = index.cycles[parent_cycle_id].get("campaign_id")
-            if parent_campaign != cycle.get("campaign_id"):
-                violations.append(
-                    Violation(
-                        "index-parent-cycle-campaign-mismatch",
-                        "$.cycle.parent_cycle_id",
-                        "parent cycle belongs to a different campaign",
-                    )
-                )
 
     incoming_ids = declared_ids(document)
     for stable_id, kind in incoming_ids.items():
@@ -458,7 +456,9 @@ def apply(
 
 
 def build(
-    admitted: Iterable[Tuple[Mapping[str, Any], str, str, str]]
+    admitted: Iterable[Tuple[Mapping[str, Any], str, str, str]],
+    *,
+    known_parent_cycle_ids: Optional[Collection[str]] = None,
 ) -> IndexDocument:
     """Rebuild from published documents, refusing cross-manifest conflicts.
 
@@ -480,6 +480,7 @@ def build(
             document,
             idempotency_key=idempotency_key,
             manifest_digest=manifest_digest,
+            known_parent_cycle_ids=known_parent_cycle_ids,
         )
         conflict_codes = sorted(
             {
@@ -528,25 +529,17 @@ def build(
             )
     # Parent linkage is order-independent: verify against the fully folded set.
     parent_of: Dict[str, str] = {}
-    campaign_of: Dict[str, Any] = {}
     for document, _cycle_path, _digest, idempotency_key in items:
         cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
         cid = cycle.get("cycle_id")
-        campaign_of[cid] = cycle.get("campaign_id")
         parent_cycle_id = cycle.get("parent_cycle_id")
         if parent_cycle_id is None:
             continue
-        if parent_cycle_id not in index.cycles:
+        if parent_cycle_id not in index.cycles and parent_cycle_id not in (known_parent_cycle_ids or ()):
             raise ValueError(
                 "build-conflict for idempotency key {0!r}: orphan parent cycle {1!r}".format(
                     idempotency_key, parent_cycle_id
                 )
-            )
-        parent_row = index.cycles[parent_cycle_id]
-        if parent_row.get("campaign_id") != cycle.get("campaign_id"):
-            raise ValueError(
-                "build-conflict for idempotency key {0!r}: parent cycle {1!r} "
-                "belongs to a different campaign".format(idempotency_key, parent_cycle_id)
             )
         parent_of[cid] = parent_cycle_id
     # A parent chain from tampered on-disk input could be circular; incremental

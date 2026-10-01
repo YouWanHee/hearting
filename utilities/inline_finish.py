@@ -125,10 +125,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         record = artifact_producer.read_cycle_record(root, prior_state.get("intent", {}).get("cycle_id", ""))
     if not record:
         raise InlineFinishError("finish-route-cycle-missing")
-    if record.get("state") != "open" and not prior_state:
-        raise InlineFinishError("finish-route-cycle-missing")
-    admitted = artifact_producer.cycle_route_admission(
-        root, record, route, finalize=True, validation_only=record.get("state") == "sealed")
+    admitted = artifact_producer.cycle_route_admission(root, record, route, finalize=True)
     if not admitted.allow:
         raise InlineFinishError("finish-route-cycle-" + admitted.reason)
     campaign = artifact_producer.read_campaign(root, record["campaign_id"])
@@ -234,7 +231,8 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                     raise InlineFinishError("finish-scoped-tracked-dirt")
             latest = artifact_producer.read_cycle_record(root, record["cycle_id"])
             if (not latest or latest.get("state") not in {"open", "sealed"}
-                    or dispatch_terminal_commit.cycle_identity_digest(latest) != intent["cycle_record_digest"]):
+                    or not dispatch_terminal_commit.cycle_identity_matches(
+                        latest, intent["cycle_record_digest"], campaign_id=intent.get("campaign_id"))):
                 raise InlineFinishError("finish-cycle-drift")
             current_route = json.loads(route_file.read_text(encoding="utf-8"))
             if (current_route.get("route_id") != intent["route_id"]

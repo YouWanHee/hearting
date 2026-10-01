@@ -394,19 +394,37 @@ class TestIndex(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertIn("index-self-parent-cycle", {v.code for v in report.violations})
 
-    def test_check_rejects_cross_campaign_parent_cycle(self):
+    def test_check_allows_cross_campaign_parent_cycle(self):
+        # §45 D-123: a parent is a reference, not a campaign constraint.
         doc1 = _document(self.root_id, self.alloc)
         index, _digest1, _key1 = self._apply(ix.empty(self.root_id), doc1)
         doc2 = _document(self.root_id, self.alloc)
+        self.assertNotEqual(doc1["campaign"]["campaign_id"], doc2["campaign"]["campaign_id"])
         doc2["cycle"]["parent_cycle_id"] = doc1["cycle"]["cycle_id"]
         digest2 = m.manifest_digest(doc2)
         report = ix.check(
             index, doc2, idempotency_key=doc2["manifest_id"], manifest_digest=digest2
         )
-        self.assertFalse(report.ok)
-        self.assertIn(
-            "index-parent-cycle-campaign-mismatch", {v.code for v in report.violations}
-        )
+        self.assertTrue(report.ok, report.violations)
+
+    def test_check_resolves_a_parent_that_is_only_a_producer_record(self):
+        # A parent still open (or deleted since) is not in the index; the caller
+        # names the cycles it knows from the root's producer records.
+        doc = _document(self.root_id, self.alloc)
+        parent_id = self.alloc.allocate("cycle")
+        doc["cycle"]["parent_cycle_id"] = parent_id
+        digest = m.manifest_digest(doc)
+        empty = ix.empty(self.root_id)
+        refused = ix.check(empty, doc, idempotency_key=doc["manifest_id"], manifest_digest=digest)
+        self.assertIn("index-orphan-parent-cycle", {v.code for v in refused.violations})
+        accepted = ix.check(empty, doc, idempotency_key=doc["manifest_id"], manifest_digest=digest,
+                            known_parent_cycle_ids=frozenset({parent_id}))
+        self.assertTrue(accepted.ok, accepted.violations)
+        rebuilt = ix.build([(doc, "campaigns/c/cyc", digest, doc["manifest_id"])],
+                           known_parent_cycle_ids=frozenset({parent_id}))
+        self.assertIn(doc["cycle"]["cycle_id"], rebuilt.cycles)
+        with self.assertRaises(ValueError):
+            ix.build([(doc, "campaigns/c/cyc", digest, doc["manifest_id"])])
 
     def test_build_refuses_circular_parent_chain(self):
         doc1 = _document(self.root_id, self.alloc)

@@ -619,7 +619,8 @@ class ActivateAndBeginTest(ProducerTestBase):
         self.assertEqual(P.read_campaign(self.root, first["campaign_id"])["key"], "_unassigned")
         self.assertEqual(P.read_campaign(self.root, first["campaign_id"])["title"], "_unassigned")
 
-    def test_open_parent_child_seals_only_after_parent_admission(self):
+    def test_child_seals_before_its_open_parent(self):
+        # §45 D-123: the parent is a reference, not an ordering constraint.
         self.activate()
         parent_route, parent_file, parent = self.begin(campaign_key="causal-stream")
         child_route, child_file = self.route(slug="followup", parent_cycle_id=parent["cycle_id"])
@@ -627,14 +628,11 @@ class ActivateAndBeginTest(ProducerTestBase):
         self.write_output(parent)
         self.write_output(child)
         self.close(child_route, child_file)
-        with self.assertRaises(P.ProducerError) as ctx:
-            P.finalize(self.root, cycle_id=child["cycle_id"])
-        self.assertEqual(ctx.exception.code, "parent-cycle-not-sealed")
-        self.assertFalse((Path(child["cycle_dir"]) / "manifest.json").exists())
-        self.assertEqual(P.read_cycle_record(self.root, child["cycle_id"])["state"], "open")
+        self.assertEqual(P.finalize(self.root, cycle_id=child["cycle_id"])["status"], "sealed")
+        self.assertTrue((Path(child["cycle_dir"]) / "manifest.json").exists())
+        self.assertEqual(P.read_cycle_record(self.root, parent["cycle_id"])["state"], "open")
         self.close(parent_route, parent_file)
         self.assertEqual(P.finalize(self.root, cycle_id=parent["cycle_id"])["status"], "sealed")
-        self.assertEqual(P.finalize(self.root, cycle_id=child["cycle_id"])["status"], "sealed")
 
     def test_route_delivers_key_and_open_parent_across_capabilities(self):
         self.activate()
@@ -681,12 +679,13 @@ class ActivateAndBeginTest(ProducerTestBase):
         _, _, first = self.begin(campaign_key="stream-a")
         parent = P.read_cycle_record(self.root, first["cycle_id"])
         route_file = self.route(slug="lifecycle-child")[1]
-        for state in ("cancelled", "superseded"):
-            parent["state"] = state
-            P._write_cycle_record(self.root, parent, exclusive=False)
-            with self.assertRaises(P.ProducerError) as ctx:
-                P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct", parent_cycle_id=first["cycle_id"])
-            self.assertEqual(ctx.exception.code, "parent-cycle-not-joinable")
+        # §45 D-123: the parent's state never gates a child; only an unknown parent does.
+        parent["state"] = "superseded"
+        P._write_cycle_record(self.root, parent, exclusive=False)
+        with self.assertRaises(P.ProducerError) as ctx:
+            P.begin(self.root, route_file=self.route(slug="unknown-parent")[1], capability="autopilot-code",
+                    intensity="direct", parent_cycle_id="cyc_" + "9" * 32)
+        self.assertEqual(ctx.exception.code, "parent-cycle-not-joinable")
         parent["state"] = "open"
         P._write_cycle_record(self.root, parent, exclusive=False)
         campaign = P.read_campaign(self.root, first["campaign_id"])
@@ -1082,14 +1081,14 @@ class CheckWriteTest(ProducerTestBase):
             self.assertEqual(decision["verdict"], expected, relative)
         _CORPUS.apply_shared_path_corpus(self)
 
-    def test_sealed_cycle_denies_new_writes(self):
+    def test_sealed_cycle_allows_new_writes(self):
         self.activate()
         route, route_file, result = self.begin()
         target = self.write_output(result)
         self.close(route, route_file)
         P.finalize(self.root, cycle_id=result["cycle_id"])
         verdict = P.check_write(self.root, target)
-        self.assertEqual((verdict["verdict"], verdict["reason"]), ("deny", "cycle-not-open"))
+        self.assertEqual((verdict["verdict"], verdict["reason"]), ("allow", "open-cycle-artifacts"))
 
     def test_worker_write_is_bound_to_issued_cycle_and_returns_its_output_path(self):
         self.activate()
@@ -1179,7 +1178,15 @@ class FinalizeTest(ProducerTestBase):
                     target.symlink_to(outside)
                 else:
                     target.write_bytes(b"corpus payload\n")
-                collected, violations = P._enumerate_output(cycle_dir)
+                excluded, links = [], []
+                collected, violations = P._enumerate_output(cycle_dir, excluded=excluded, excluded_symlinks=links)
+                effective = os.path.normpath(cycle_relative)
+                if kind == "symlink" or (effective.startswith("artifacts/")
+                                         and P._outside_inclusion_rule(effective)):
+                    # §45 D-123: a link or a hidden/temporary path is left out, not refused.
+                    self.assertEqual((violations, collected), ([], []), relative)
+                    self.assertIn(effective, links if kind == "symlink" else excluded)
+                    continue
                 self.assertEqual(not violations, allowed, (relative, violations))
                 if allowed:
                     self.assertIn((cycle_relative, b"corpus payload\n"), collected)
@@ -1194,7 +1201,6 @@ class FinalizeTest(ProducerTestBase):
         data = b'{"ordinary":"payload"}\n'
         locators = (
             "artifacts/manifest.json",
-            "artifacts/.cache/manifest.json",
             "artifacts/_internal/candidate/round_1/manifest.json",
             "artifacts/plans/cycle/manifest.json",
         )
@@ -1208,6 +1214,7 @@ class FinalizeTest(ProducerTestBase):
             payload.write_bytes(data)
             payloads.append(payload)
         self.write_output(result, "plans/cycle/plan.md", b"plan\n")
+        self.write_output(result, ".cache/manifest.json", data)  # hidden: written, never listed
         self.close(route, route_file)
         sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
         document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text(encoding="utf-8"))
@@ -1222,6 +1229,7 @@ class FinalizeTest(ProducerTestBase):
             self.assertEqual(row["byte_size"], len(data))
             self.assertNotEqual(row["artifact_id"], document["manifest_id"])
         self.assertEqual(sealed["status"], "sealed")
+        self.assertNotIn("artifacts/.cache/manifest.json", rows)  # hidden: outside the inclusion rule
         buckets = reader.bucket_dirs(self.root, "plans", include_legacy=False)
         self.assertTrue(any((base / "cycle" / "manifest.json").read_bytes() == data
                             for base, _meta in buckets))
@@ -1446,15 +1454,15 @@ class FinalizeTest(ProducerTestBase):
         outside.write_text("not a payload")
         link = artifacts / ".link"
         link.symlink_to(outside)
-        rows, violations = P._enumerate_output(directory)
-        self.assertEqual(rows, [])
-        self.assertIn("symlink-forbidden:artifacts/.link", violations)
-        link.unlink()
         cache = artifacts / ".cache"
         cache.symlink_to(outside.parent, target_is_directory=True)
-        rows, violations = P._enumerate_output(directory)
-        self.assertEqual(rows, [])
-        self.assertIn("symlink-forbidden:artifacts/.cache", violations)
+        # §45 D-123: a link is lstat-ed and left out, never followed, read or refused.
+        links = []
+        with mock.patch.object(Path, "read_bytes", lambda path: (_ for _ in ()).throw(
+                AssertionError(f"link target read: {path}")) if path.name != "a.md" else b"valid output"):
+            rows, violations = P._enumerate_output(directory, excluded_symlinks=links)
+        self.assertEqual((rows, violations), ([("artifacts/a.md", b"valid output")], []))
+        self.assertEqual(sorted(links), ["artifacts/.cache", "artifacts/.link"])
 
 
 class RecoveryTest(ProducerTestBase):
@@ -1996,7 +2004,7 @@ class AbandonReasonTest(ProducerTestBase):
         self.assertEqual(abandoned_events[0]["payload"]["abandon_reason"], "operator-decision")
         self.assertNotIn(abandoned_events[0]["payload"]["abandon_reason"], review_verdicts)
 
-    def test_sealed_on_disk_write_verdicts_are_identical_to_prior_revision(self):
+    def test_sealed_on_disk_cycle_takes_further_writes(self):
         self.activate()
         route, route_file, result = self.begin()
         self.write_output(result)
@@ -2005,8 +2013,8 @@ class AbandonReasonTest(ProducerTestBase):
         self.assertEqual(outcome["status"], "sealed")
         target = Path(result["cycle_dir"]) / "artifacts" / "plans" / "cycle" / "extra.md"
         verdict = P.check_write(self.root, target)
-        self.assertEqual(verdict["verdict"], "deny")
-        self.assertEqual(verdict["reason"], "cycle-not-open")
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertEqual(verdict["reason"], "open-cycle-artifacts")
 
     def test_force_abandon_ignoring_lease_requires_operator_override_live_review_reason(self):
         self.activate()
@@ -3542,16 +3550,18 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
             artifact.write_text("post-seal corruption")
             self.assertNotEqual(terminal.settle_terminal_commit(request).result,"completed")
 
-    def test_hidden_payload_settlement_recovers_and_verifies_bytes_for_three_harnesses(self):
+    def test_payload_settlement_recovers_and_verifies_bytes_for_three_harnesses(self):
         import dispatch_terminal_commit as terminal
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
                 fixture = TerminalTransactionIntegrationTest(); fixture.setUp()
                 try:
                     route, path, jobs, owner, result, report, request = fixture._prepare_fixture(harness)
-                    rel = "evidence/visual/test-results/.last-run.json"
+                    rel = "evidence/visual/test-results/last-run.json"
                     payload = b'{"status":"passed","failedTests":[]}\n'
                     hidden = fixture.write_output(result, rel=rel, data=payload)
+                    # A hidden sibling (Playwright's own dot file) is outside the inclusion rule (§45 D-123).
+                    fixture.write_output(result, rel="evidence/visual/test-results/.last-run.json", data=payload)
                     fixture._closed_owner(jobs, owner)
                     registry = jobs.read_bytes()
                     marker = R.completion_dir(route["route_id"], jobs=jobs) / "report.json"
@@ -3565,6 +3575,8 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                         sealed = manifest.read_bytes()
                         doc = json.loads(sealed)
                         hidden = Path(result["cycle_dir"]) / "artifacts/plans" / rel
+                        self.assertNotIn("artifacts/plans/evidence/visual/test-results/.last-run.json",
+                                         [r["locator"]["path"] for r in doc["artifact_revisions"]])
                         revision = next(r for r in doc["artifact_revisions"]
                                         if r["locator"]["path"] == "artifacts/plans/" + rel)
                         self.assertEqual(revision["content_digest"], "sha256:" + hashlib.sha256(payload).hexdigest())
@@ -3837,7 +3849,7 @@ class OwnerLaunchBindingTest(ProducerTestBase):
     def test_resume_only_refusals_never_write_binding_or_open_another_cycle(self):
         import artifact_lifecycle
         scenarios = ("route-closed", "campaign-inactive", "resplit", "no-open-cycle",
-                     "sealed-only", "duplicate-open", "cycle-mismatch", "foreign-owner")
+                     "duplicate-open", "cycle-mismatch", "foreign-owner")
         for scenario in scenarios:
             with self.subTest(scenario=scenario):
                 fixture = OwnerLaunchBindingTest(); fixture.setUp()
@@ -3860,10 +3872,6 @@ class OwnerLaunchBindingTest(ProducerTestBase):
                         expected = "resplit-in-progress"
                     elif scenario == "no-open-cycle":
                         (P.producer_dir(fixture.root) / "cycles" / f"{record['cycle_id']}.json").unlink()
-                        expected = "producer-binding-required"
-                    elif scenario == "sealed-only":
-                        record["state"] = "sealed"
-                        (P.producer_dir(fixture.root) / "cycles" / f"{record['cycle_id']}.json").write_text(json.dumps(record))
                         expected = "producer-binding-required"
                     elif scenario == "duplicate-open":
                         duplicate = dict(record, cycle_id="cyc_" + "e" * 32)
@@ -3888,6 +3896,18 @@ class OwnerLaunchBindingTest(ProducerTestBase):
                     self.assertEqual(len(P.list_cycle_records(fixture.root)), expected_cycles)
                 finally:
                     fixture.doCleanups()
+
+    def test_resume_only_binds_a_closed_cycle_again(self):
+        # §45 D-123: a closed cycle is still the route's cycle; the launch binds it, it is not refused.
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        record = P.read_cycle_record(self.root, launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+        record["state"] = "sealed"
+        (P.producer_dir(self.root) / "cycles" / f"{record['cycle_id']}.json").write_text(json.dumps(record))
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}):
+            result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+        self.assertEqual(result["cycle_id"], record["cycle_id"])
+        self.assertTrue(P.dispatch_terminal_commit.producer_binding_path(self.root, route["route_id"], owner).exists())
+        self.assertEqual(len(P.list_cycle_records(self.root)), 1)
 
     def test_nonowner_or_missing_cycle_context_is_a_noop(self):
         route, route_file, launch_env, owner, args = self._prepared_owner()
@@ -4476,7 +4496,7 @@ class RouteLineageBindingTest(ProducerTestBase):
         finally:
             route_path.write_bytes(original)
 
-    def test_explicit_cycle_check_write_refuses_sealed_and_abandoned_cycles_without_mutation(self):
+    def test_explicit_cycle_check_write_binds_sealed_cycles_and_refuses_folderless_ones_without_mutation(self):
         for final_state in ("sealed", "abandoned"):
             with self.subTest(final_state=final_state):
                 fixture = RouteLineageBindingTest()
@@ -4488,20 +4508,31 @@ class RouteLineageBindingTest(ProducerTestBase):
                     begun = fixture._begin(route)
                     target = Path(begun["cycle_dir"]) / "artifacts" / "dev_logs" / "late.md"
                     if final_state == "sealed":
+                        existing = Path(begun["cycle_dir"]) / "artifacts" / "plans" / "first.md"
+                        existing.parent.mkdir(parents=True, exist_ok=True)
+                        existing.write_bytes(b"first\n")
                         fixture._close(route)
                         P.finalize(fixture.root, cycle_id=begun["cycle_id"])
                     else:
                         P.finalize(fixture.root, cycle_id=begun["cycle_id"], state="abandoned",
                                    abandon_reason="operator-decision")
                     before = fixture._tree_state()
-                    with self.assertRaises(P.ProducerError) as caught:
-                        P.require_cycle_output(fixture.root, target, cycle_id=begun["cycle_id"],
-                                               route_id=route["route_id"])
-                    self.assertEqual(caught.exception.code, "cycle-not-open")
-                    self.assertEqual(fixture._tree_state(), before)
-                    verdict = fixture._check_explicit_cycle(begun["cycle_id"], route["route_id"], target)
-                    self.assertEqual((verdict["verdict"], verdict["reason"]),
-                                     ("deny", "cycle-not-open"), verdict)
+                    if final_state == "sealed":
+                        # §45 D-123: a closed cycle with its folder takes the route's writes.
+                        output = P.require_cycle_output(fixture.root, target, cycle_id=begun["cycle_id"],
+                                                        route_id=route["route_id"])
+                        self.assertEqual(output, Path(begun["cycle_dir"]) / "artifacts")
+                        verdict = fixture._check_explicit_cycle(begun["cycle_id"], route["route_id"], target)
+                        self.assertEqual((verdict["verdict"], verdict["reason"]),
+                                         ("allow", "open-cycle-artifacts"), verdict)
+                    else:
+                        # A zero-output close removed the folder: nothing is left to bind to.
+                        with self.assertRaises(P.ProducerError) as caught:
+                            P.require_cycle_output(fixture.root, target, cycle_id=begun["cycle_id"],
+                                                   route_id=route["route_id"])
+                        self.assertEqual(caught.exception.code, "cycle-route-binding-mismatch")
+                        verdict = fixture._check_explicit_cycle(begun["cycle_id"], route["route_id"], target)
+                        self.assertEqual(verdict["verdict"], "deny", verdict)
                     self.assertEqual(fixture._tree_state(), before)
                 finally:
                     fixture.doCleanups()
@@ -4713,7 +4744,7 @@ class RouteLineageBindingTest(ProducerTestBase):
         self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"], d["route_id"]])
 
     # -- A-25.7 -----------------------------------------------------------
-    def test_a25_7_sealed_cycle_refused(self):
+    def test_a25_7_sealed_cycle_admits_its_lineage_again(self):
         a = self._root_route("lineage-a7")
         self._publish_root(a)
         begun = self._begin(a)
@@ -4724,7 +4755,8 @@ class RouteLineageBindingTest(ProducerTestBase):
         P.finalize(self.root, cycle_id=begun["cycle_id"])
         record = P.read_cycle_record(self.root, begun["cycle_id"])
         admission = P.cycle_route_admission(self.root, record, a)
-        self.assertEqual(admission.reason, "cycle-not-open")
+        self.assertTrue(admission.allow, admission)
+        self.assertEqual(P.route_cycle_for(self.root, a)["cycle_id"], begun["cycle_id"])
 
     # -- A-25.8 ----------------------------------------------------------
     def test_a25_8_material_input_change_refused(self):
@@ -5022,7 +5054,7 @@ class RouteLineageBindingTest(ProducerTestBase):
                 self._seal_abandoned(first)
         self.assertEqual(P.read_cycle_record(self.root, first["cycle_id"])["state"], "open")
 
-    def test_abandoned_seal_excludes_symlinks_and_completed_still_refuses(self):
+    def test_seal_excludes_symlinks_in_every_state_without_a_flag(self):
         a = self._root_route("handover-symlinks")
         self._publish_root(a)
         begun = self._begin(a)
@@ -5041,17 +5073,10 @@ class RouteLineageBindingTest(ProducerTestBase):
                  "artifacts/plans/links/locked.md": str(locked),
                  "artifacts/plans/links/dangling.md": "missing.md"}
         cycle_id = begun["cycle_id"]
-        with self.assertRaises(P.ProducerError) as caught:
-            P.finalize(self.root, cycle_id=cycle_id, state="completed", exclude_symlinks=True)
-        self.assertEqual(caught.exception.code, "symlink-exclusion-requires-abandoned")
-        with self.assertRaisesRegex(P.ProducerError, "output-invalid.*symlink-forbidden|symlink-forbidden"):
-            P.finalize(self.root, cycle_id=cycle_id, state="completed")
-        with self.assertRaisesRegex(P.ProducerError, "symlink-forbidden"):
-            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="route-unrecoverable")
-        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
-        self.assertNotIn("excluded_symlinks", P.read_cycle_record(self.root, cycle_id))
+        # §45 D-123: a link is left out of the manifest by the one inclusion rule;
+        # neither a completed nor an abandoned close needs a flag for it.
         sealed = P.finalize(self.root, cycle_id=cycle_id, state="abandoned",
-                            abandon_reason="route-unrecoverable", exclude_symlinks=True)
+                            abandon_reason="route-unrecoverable")
         self.assertEqual(sealed["status"], "sealed")
         self.assertEqual(sorted(sealed["excluded_symlinks"]), sorted(links))
         document = json.loads(Path(sealed["manifest_path"]).read_text(encoding="utf-8"))

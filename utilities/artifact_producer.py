@@ -97,11 +97,6 @@ OK, BLOCKED, USAGE = 0, 65, 64
 LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` first; if begin already ran, "
                      "export its --env-file output (AGENT_ARTIFACT_*) into this shell, then retry")
 
-# A cycle that is sealed, abandoned or closed automatically after it sat unused
-# (route_autoclose.py) takes no more writes; the way forward is a new route.
-CLOSED_CYCLE_HINT = ("this cycle takes no more writes (sealed, abandoned or closed automatically after it "
-                     "sat unused); compose the work again for an open cycle")
-
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
 
@@ -122,6 +117,11 @@ RUNTIME_OWNED_EXACT = ("_scratch",)          # `.`-prefix is a separate predicat
 COMPAT_OVERRIDE_FIELDS = ("schema_version", "contract", "canonical_root",
                           "reason", "issuer", "created_at", "expires_at")
 WAIVER_FIELDS = ("reason", "issuer", "created_at", "expires_at")
+
+# Record states a route can bind again once the cycle is closed (§45 D-123): the
+# cycle still has its folder and manifest.  Zero-row closes (`no-lineage`,
+# `abandoned`) removed the folder and `dropped` never had one.
+CLOSED_BINDABLE_STATES = frozenset({"sealed"})
 
 # SD-117 §13.34.5-(2): a cycle's abandonment sealing decision must always
 # name why -- a closed enum, disjoint from review verdict vocabulary
@@ -712,7 +712,6 @@ class Admission:
 
 
 _D120_NEXT_ACTION = {
-    "cycle-not-open": "start a new cycle (--parent-cycle to keep it linked)",
     "route-lineage-unverified": ("restore the sealed route file, or start a new route; a continuation that "
                                   "changed capability needs a new child cycle (--parent-cycle)"),
     "route-hash-drift": "restore the sealed route file",
@@ -828,43 +827,51 @@ def _handed_over_routes(root: Path, record: Mapping[str, Any]) -> frozenset:
 
 
 def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """The one open cycle begun by a route in ``route``'s verified lineage, if any.
+    """The one cycle begun by a route in ``route``'s verified lineage, if any.
 
     Shared by every "find the cycle for this route" call site (env resolution,
-    begin resume, checkpoint, `require_cycle_output`). Two or more open cycles
-    whose begin route sits in the same verified lineage is the existing
-    `route-cycle-binding-ambiguous` refusal.
+    begin resume, checkpoint, `require_cycle_output`). The cycle's state does not
+    decide whether it can be found (§45 D-123): a continuation binds a closed
+    cycle again and writes into it. An open cycle is the one the lineage is
+    working in now; two or more open cycles whose begin route sits in the same
+    verified lineage is the existing `route-cycle-binding-ambiguous` refusal.
+    With none open, the closed cycle begun nearest to ``route`` in the lineage
+    is the one, provided D-120's judgment still admits the route to it (a
+    continuation that changed capability or intensity does not bind it and
+    begins a child cycle instead).
     """
     try:
         lineage = route_lineage.verified_route_lineage(dict(route), artifact_root=root)
     except route_lineage.RouteLineageError as exc:
         raise ProducerError(exc.code, exc.detail) from exc
-    lineage_ids = {r.get("route_id") for r in lineage}
-    matches = [rec for rec in list_cycle_records(root)
-               if rec.get("state") == "open" and rec.get("route_id") in lineage_ids]
-    if len(matches) > 1:
+    nearness = {r.get("route_id"): index for index, r in enumerate(lineage)}  # [route, parent, ..., begin route]
+    matches = [rec for rec in list_cycle_records(root) if rec.get("route_id") in nearness]
+    opened = [rec for rec in matches if rec.get("state") == "open"]
+    if len(opened) > 1:
         raise ProducerError("route-cycle-binding-ambiguous", route.get("route_id", ""))
-    return matches[0] if matches else None
+    if opened:
+        return opened[0]
+    closed = sorted((rec for rec in matches if rec.get("state") in CLOSED_BINDABLE_STATES),
+                    key=lambda rec: nearness[rec.get("route_id")])
+    if closed and cycle_route_admission(root, closed[0], route).allow:
+        return closed[0]
+    return None
 
 
 def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[str, Any],
                           *, finalize: bool = False, validation_only: bool = False) -> Admission:
     """D-120's one lineage judgment for a cycle route.
 
-    Steps 0-4 exactly as spelled out in artifact-path-contract §42: cycle
-    open, ``route``'s hash-verified lineage, the begin route's membership and
-    hash in that lineage, material-input (capability/intensity) parity along
-    the path, and sibling-fork detection at every path node but ``route``
-    itself. ``finalize=True`` adds D-120's finalize-only rule: a route with a
+    Steps 0-4 as spelled out in artifact-path-contract §42: ``route``'s
+    hash-verified lineage, the begin route's membership and hash in that
+    lineage, material-input (capability/intensity) parity along the path, and
+    sibling-fork detection at every path node but ``route`` itself. The cycle's
+    state is not a step (§45 D-123): a closed cycle admits its lineage's routes
+    again. ``finalize=True`` adds D-120's finalize-only rule: a route with a
     still-attached T(C) continuation child cannot seal
-    (`...:superseded-route`). ``validation_only`` is read-only manifest
-    verification: it permits an already sealed record but never grants write
-    authority or changes the record.
+    (`...:superseded-route`). ``validation_only`` is kept for callers that
+    read a manifest back; it changes nothing here.
     """
-    state = record.get("state")
-    if state != "open" and not (validation_only and state == "sealed"):
-        reason = "cycle-not-open"
-        return Admission(False, reason, str(state), [], _d120_next_action(reason))
     try:
         lineage = route_lineage.verified_route_lineage(dict(route), artifact_root=root)
     except route_lineage.RouteLineageError as exc:
@@ -937,15 +944,17 @@ def _inline_producer_binding_check(root: Path, cycle_id: str,
     if not stat.S_ISREG(info.st_mode) or path.is_symlink() or path.resolve() != path:
         raise ProducerError("inline-producer-binding-mismatch", "route-kind")
     route = load_route(root, path)
+    # The binding's campaign id/key are the campaign the cycle belonged to when it
+    # was bound; a cycle moved since is the same cycle (§45 D-123), so identity
+    # is judged by cycle, producer, route and the stored identity digest.
     if (not record or not campaign or not identity
             or binding.get("kind") != "inline_producer_binding_v1"
             or binding.get("cycle_id") != cycle_id
-            or binding.get("campaign_id") != record.get("campaign_id")
-            or binding.get("campaign_key") != campaign.get("key")
             or binding.get("producer_id") != record.get("producer_id")
             or binding.get("artifact_root_id") != identity.artifact_root_id
             or binding.get("route_hash") != route.get("route_hash")
-            or binding.get("cycle_record_digest") != dispatch_terminal_commit.cycle_identity_digest(record)
+            or not dispatch_terminal_commit.cycle_identity_matches(
+                record, binding.get("cycle_record_digest"), campaign_id=binding.get("campaign_id"))
             or not binding.get("inline_finish_id")
             or not binding.get("terminal_marker_digest")
             or not binding.get("evidence_sha256")):
@@ -962,8 +971,6 @@ def _inline_producer_binding_check(root: Path, cycle_id: str,
             or intent.get("route_id") != route_id
             or intent.get("route_hash") != binding["route_hash"]
             or intent.get("cycle_id") != cycle_id
-            or intent.get("campaign_id") != record["campaign_id"]
-            or intent.get("campaign_key") != campaign["key"]
             or intent.get("producer_id") != record["producer_id"]
             or intent.get("artifact_root_id") != identity.artifact_root_id
             or intent.get("evidence_sha256") != binding["evidence_sha256"]):
@@ -2152,10 +2159,10 @@ def _begin_cycle_record(
             requested_selection = {"by": "campaign_key", "value": campaign_key}
         if parent_cycle_id:
             parent = read_cycle_record(root, parent_cycle_id)
-            if parent is None or parent.get("state") not in {"open", "sealed"}:
+            if parent is None:
                 raise ProducerError("parent-cycle-not-joinable", parent_cycle_id)
-            if campaign is not None and parent.get("campaign_id") != campaign["campaign_id"]:
-                raise ProducerError("parent-cycle-campaign-mismatch", parent_cycle_id)
+            # §45 D-123: a parent is a reference to any cycle of this root, in any
+            # state and any campaign; it selects a campaign only when none was named.
             if campaign is None:
                 campaign = read_campaign(root, parent["campaign_id"])
                 if campaign is None:
@@ -2212,6 +2219,15 @@ def _begin_cycle_record(
             if not admission.allow:
                 raise ProducerError(admission.reason, admission.detail)
             bound_campaign = read_campaign(root, record["campaign_id"])
+            if bound_campaign is not None and bound_campaign.get("state") == "satisfied" and owner_begin:
+                try:
+                    reopened = artifact_campaign._reopen_locked(
+                        root, _campaign_path(root, bound_campaign["campaign_id"], bound_campaign),
+                        route_id=route["route_id"])
+                except artifact_campaign.CampaignError as exc:
+                    raise ProducerError(exc.code, exc.detail) from exc
+                campaign_reopen_event_id = reopened.get("event_id")
+                bound_campaign = read_campaign(root, record["campaign_id"])
             if bound_campaign is None or bound_campaign.get("state") != "active":
                 raise ProducerError("campaign-not-active", record["campaign_id"])
             if ((campaign is not None and campaign["campaign_id"] != record["campaign_id"])
@@ -2258,6 +2274,8 @@ def _begin_cycle_record(
                 "env": _env_for(root, record, route),
                 **({"rebound": True} if rebound else {}),
                 **({"title_updated": True} if title_updated else {}),
+                **({"campaign_reopened": True, "campaign_reopen_event_id": campaign_reopen_event_id}
+                   if campaign_reopen_event_id else {}),
                 **_campaign_degradation(bound_campaign),
             }
         if campaign is not None:
@@ -2446,18 +2464,38 @@ def _unmanifestable_reason(rel: str) -> Optional[str]:
     return None
 
 
+_TEMPORARY_FILE_SUFFIXES = (".pyc", ".swp", "~", ".tmp", ".part")
+
+
+def _outside_inclusion_rule(rel: str) -> bool:
+    """§45 D-123's one inclusion rule: what a cycle's manifest never lists.
+
+    A hidden component (a dot-prefixed one, which covers `.git/`, `.pytest_cache/`
+    and Emacs `.#*` locks), `__pycache__/`, `*.pyc`, editor temporaries (`*.swp`,
+    `*~`) and `*.tmp`/`*.part` are runtime residue, not output.  `_internal/` and
+    other support paths, binary files and large files are output.  Symbolic links
+    are the other half of the rule and are judged by `lstat`, not by name.
+    """
+    parts = rel.split("/")
+    return (any(part.startswith(".") or part == "__pycache__" for part in parts)
+            or parts[-1].endswith(_TEMPORARY_FILE_SUFFIXES))
+
+
 def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
                       excluded: Optional[List[str]] = None,
                       exclude_symlinks: bool = False,
                       excluded_symlinks: Optional[List[str]] = None) -> Tuple[List[Tuple[str, bytes]], List[str]]:
-    """Regular files under `artifacts/`.  With `exclude_hidden`, files whose path
-    cannot be a D-6 locator (a dot-component such as `.git/`/`.claude/` runtime
-    residue, or a component longer than the locator limit) are left out of the
-    manifest and reported through `excluded` instead of failing validation
-    (W7E retrospective seal of relocated legacy trees).  With `exclude_symlinks`
-    (an abandoned seal, which claims no success), symbolic links are left out
-    and reported through `excluded_symlinks`; the link is only lstat-ed, never
-    followed or read.  Without it a link is a `symlink-forbidden` violation."""
+    """Regular files under `artifacts/` that the inclusion rule keeps.
+
+    Finalize and the later refreshes share one rule (`_outside_inclusion_rule`
+    plus symbolic links): a path outside it is left out of the manifest and
+    reported through `excluded`, a link through `excluded_symlinks`; it never
+    fails the close and needs no flag.  A link is only lstat-ed, never followed
+    or read.  `exclude_symlinks` is accepted for old callers and changes
+    nothing.  `exclude_hidden` additionally leaves out files whose path cannot
+    be a D-6 locator (a component longer than the locator limit or outside its
+    alphabet), reported through `excluded` (W7E retrospective seal of relocated
+    legacy trees)."""
     paths: List[Tuple[str, Path]] = []
     violations: List[str] = []
     artifacts = directory / "artifacts"
@@ -2469,11 +2507,12 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
             # Machine-owned locator binding, not user output or manifest data.
             continue
         if os.path.islink(str(entry)):
-            if exclude_symlinks:
-                if excluded_symlinks is not None:
-                    excluded_symlinks.append(rel)
-                continue
-            violations.append(f"symlink-forbidden:{rel}")
+            if excluded_symlinks is not None:
+                excluded_symlinks.append(rel)
+            continue
+        if rel.startswith("artifacts/") and _outside_inclusion_rule(rel):
+            if excluded is not None:
+                excluded.append(rel)
             continue
         if not entry.is_file():
             violations.append(f"non-regular-file:{rel}")
@@ -3878,13 +3917,16 @@ def prepare_review_output_binding(
     ):
         raise ProducerError("review-binding-root-not-canonical", str(root))
     record = read_cycle_record(canonical_root, cycle_id)
-    if record is None or record.get("state") != "open":
-        raise ProducerError("cycle-not-open", cycle_id)
+    if record is None:
+        raise ProducerError("cycle-unknown", cycle_id)
     if record.get("producer_id") != producer_id:
         raise ProducerError("review-binding-producer-mismatch", producer_id)
     # Fast preclaim refusal.  review_lease_acquire repeats this check while it
     # owns the canonical admission lock, closing publication after prepare.
-    _raise_if_review_publication_started(canonical_root, record)
+    # Only a publication still in flight (cycle not yet closed) is refused: a
+    # finished close does not stop a later review (§45 D-123).
+    if record.get("state") == "open":
+        _raise_if_review_publication_started(canonical_root, record)
     route = load_route(canonical_root, Path(str(record.get("route_file", ""))))
     expected_capability = str(record.get("capability", ""))
     if (
@@ -3950,7 +3992,7 @@ def review_output_write_authorized_from_cycle(
         return False
     try:
         record = read_cycle_record(canonical_root, cycle_id)
-        if record is None or record.get("state") != "open":
+        if record is None:
             return False
         route = load_route(
             canonical_root, Path(str(record.get("route_file", "")))
@@ -4439,16 +4481,15 @@ def finalize(
 ) -> Dict[str, Any]:
     """`lock_timeout` bounds both lock waits (default: the admission and
     checkpoint defaults); a background sweep passes 0 so a held lock defers it.
-    `exclude_symlinks` (abandoned only) leaves symbolic links out of the manifest
-    and records them as `excluded_symlinks` on the result and the cycle record."""
+    Symbolic links are always left out of the manifest and recorded as
+    `excluded_symlinks` on the result and the cycle record (`exclude_symlinks`
+    is accepted for old callers and changes nothing)."""
     root = Path(root).resolve()
     if _recovery_scope != "exact":
         dispatch_terminal_commit.require_current_cleanup("producer-finalize")
     _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
     if state not in {"completed", "abandoned"}:
         raise ProducerError("finalize-state-invalid", state)
-    if exclude_symlinks and state != "abandoned":
-        raise ProducerError("symlink-exclusion-requires-abandoned", state)
     if _admission_lock_fd is not None:
         raise ProducerError("finalize-reentry-forbidden", cycle_id)
     # PRD §13.53.4(3) names the producer admission mutex as the lock that must
@@ -4606,7 +4647,6 @@ def finalize(
         excluded_hidden: List[str] = []
         excluded_symlinks: List[str] = []
         rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden,
-                                             exclude_symlinks=exclude_symlinks,
                                              excluded_symlinks=excluded_symlinks)
         if violations:
             raise ProducerError("output-invalid", ";".join(violations))
@@ -4624,14 +4664,13 @@ def finalize(
             _write_cycle_record(root, record, exclusive=False)
             remove_interim(root, cycle_id)
             return _finish({"status": "no-lineage", "cycle_id": cycle_id, "lineage_committed": False})
-        # An open predecessor may be linked at begin; the existing manifest
-        # index still requires that predecessor to be admitted before its child.
-        # Refuse before staging a manifest so the owner can seal the parent and
-        # retry without a dangling-parent recovery journal.
-        if record.get("parent_cycle_id"):
-            parent = read_cycle_record(root, record["parent_cycle_id"])
-            if parent is None or parent.get("state") != "sealed":
-                raise ProducerError("parent-cycle-not-sealed", record["parent_cycle_id"])
+        # §45 D-123: a parent is a reference to a cycle of this root, not an
+        # ordering constraint; the child closes whether the parent is open,
+        # closed, or already deleted. The index only needs to know it is a cycle
+        # of this root.
+        parent_ids = (frozenset({record["parent_cycle_id"]})
+                      if record.get("parent_cycle_id") and read_cycle_record(root, record["parent_cycle_id"])
+                      else frozenset())
         reserved, reservation = read_interim_reservation(root, record)
         identity = artifact_lifecycle.read_root_identity(root)
         index = artifact_admission.load_index(root)
@@ -4656,6 +4695,7 @@ def finalize(
             index_report = artifact_index.check(
                 index, document, idempotency_key=cycle_id, manifest_digest=digest,
                 repository_id=identity.repository_id if identity else None,
+                known_parent_cycle_ids=parent_ids,
             )
             if not index_report.ok:
                 failure = ProducerError("index-rejected", ";".join(v.code for v in index_report.violations))
@@ -6170,14 +6210,10 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
             reason = classification.reason or "outside-cycle-artifacts"
             return {**base, "verdict": "deny", "reason": reason,
                     "layout": "cycle", "cycle_id": cycle_id}
-        sealed_on_disk = manifest is not None
         if record is None:
-            reason = "cycle-sealed" if sealed_on_disk else "cycle-unknown"
-            return {**base, "verdict": "deny", "reason": reason, "layout": "cycle", "cycle_id": cycle_id,
-                    "hint": CLOSED_CYCLE_HINT}
-        if record.get("state") != "open" or record.get("campaign_id") != campaign_id or sealed_on_disk:
-            return {**base, "verdict": "deny", "reason": "cycle-not-open", "layout": "cycle", "cycle_id": cycle_id,
-                    "hint": CLOSED_CYCLE_HINT}
+            return {**base, "verdict": "deny", "reason": "cycle-unknown", "layout": "cycle", "cycle_id": cycle_id}
+        # §45 D-123: a closed cycle takes writes like an open one; only where the
+        # path is (above) and which cycle owns it (here) decide.
         bucket = parts[artifacts_index + 1] if len(parts) > artifacts_index + 2 else None
         return {**base, "verdict": "allow", "reason": "open-cycle-artifacts", "layout": "cycle",
                 "cycle_id": cycle_id, "campaign_id": campaign_id, "bucket": bucket,
@@ -6233,8 +6269,7 @@ def cycle_bucket(root: Path, target: Path) -> Optional[Tuple[str, str]]:
     for cycle_id, path in mapping.items():
         if path != relative:
             continue
-        record = read_cycle_record(root, cycle_id)
-        if record and record.get("state") == "open":
+        if read_cycle_record(root, cycle_id):
             return parts[bucket_index], cycle_id
     return None
 

@@ -47,7 +47,6 @@ _DETAIL_REASON_MAP = {
     "child-not-terminal": "child-not-quiescent",
     "active-retry": "child-not-quiescent",
     "active-review-lease": "producer-finalize-failed",
-    "binding-cycle-not-open": "producer-binding-mismatch",
 }
 
 
@@ -539,7 +538,7 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         record = json.loads(record_raw.decode())
     except (OSError, UnicodeError, ValueError) as exc:
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}") from exc
-    if not isinstance(record, dict) or record.get("cycle_id") != cycle_id or record.get("state") != "open":
+    if not isinstance(record, dict) or record.get("cycle_id") != cycle_id:
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}")
     producer = __import__("artifact_producer")
     admission = producer.cycle_route_admission(root, record, route)
@@ -555,14 +554,14 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         "root_identity": {"repository_id": identity.repository_id, "artifact_root_id": identity.artifact_root_id},
         "campaign_id": record.get("campaign_id"), "cycle_id": cycle_id,
         "producer_id": record.get("producer_id"),
-        "cycle_record_digest": cycle_identity_digest(record), "observed_state": "open",
+        "cycle_record_digest": cycle_identity_digest(record), "observed_state": record.get("state"),
     }
     path = producer_binding_path(root, owner.route_id, owner_attempt_id)
     data = _canonical(binding) + b"\n"
     if not owner_begin:
         existing = load_producer_binding(artifact_root=root, route_id=owner.route_id,
                                          owner_attempt_id=owner_attempt_id)
-        if existing.path.read_bytes() != data:
+        if not _binding_replays(existing, data, binding, record):
             raise TerminalCommitError("transaction-conflict", str(path))
         return ProducerBindingResult("replayed", path, existing.binding, existing.digest, True)
     try:
@@ -570,9 +569,27 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         return ProducerBindingResult("published", path, binding, _digest(data), False)
     except FileExistsError:
         existing = load_producer_binding(artifact_root=root, route_id=owner.route_id, owner_attempt_id=owner_attempt_id)
-        if existing.binding is not None and existing.path.read_bytes() == data:
+        if existing.binding is not None and _binding_replays(existing, data, binding, record):
             return ProducerBindingResult("replayed", path, existing.binding, existing.digest, True)
         raise TerminalCommitError("transaction-conflict", str(path))
+
+
+def _binding_replays(existing, data, fresh, record) -> bool:
+    """Whether a binding published earlier is this same binding read again.
+
+    The stored bytes are never rewritten.  A cycle that has since been closed
+    or moved to another campaign is still the same cycle: the state it was
+    observed in and its campaign are a snapshot of that moment, so only the
+    cycle/producer/route identity and the owner/route fields must agree.
+    """
+    if existing.path.read_bytes() == data:
+        return True
+    stored = existing.binding or {}
+    projection = ("campaign_id", "cycle_record_digest", "observed_state")
+    if ({k: v for k, v in stored.items() if k not in projection}
+            != {k: v for k, v in fresh.items() if k not in projection}):
+        return False
+    return cycle_identity_matches(record, stored.get("cycle_record_digest"), campaign_id=stored.get("campaign_id"))
 
 
 def producer_binding_digest(binding_path: Path) -> str:
@@ -586,6 +603,22 @@ def cycle_identity_digest(record):
     """Only immutable cycle identity; state/mtime/projection updates are not identity."""
     return _digest(_canonical({key: record.get(key) for key in (
         "campaign_id", "cycle_id", "producer_id", "route_id", "route_hash", "route_file")}))
+
+
+def cycle_identity_matches(record, expected_digest, *, campaign_id=None) -> bool:
+    """Whether ``record`` is the cycle whose identity digest was stored as ``expected_digest``.
+
+    A cycle moved to another campaign is the same cycle (§45 D-123): the stored
+    campaign (``campaign_id``) stands in for the record's current one, while the
+    cycle, producer and begin-route identity stay exact.
+    """
+    if not expected_digest:
+        return False
+    if cycle_identity_digest(record) == expected_digest:
+        return True
+    if campaign_id and record.get("campaign_id") != campaign_id:
+        return cycle_identity_digest({**record, "campaign_id": campaign_id}) == expected_digest
+    return False
 
 
 def _route_module():
@@ -756,7 +789,8 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
         if children.status != "proved":
             return children
         if producer_lifecycle_applies(route):
-            # Binding is immutable and must still point at an open, matching cycle.
+            # Binding is immutable and must still point at the same cycle; the
+            # cycle's state and campaign are not part of that identity.
             binding = load_producer_binding(artifact_root=request.artifact_root,
                                             route_id=route["route_id"],
                                             owner_attempt_id=request.owner_attempt_id)
@@ -764,9 +798,8 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
                 return _proof_failure("producer-binding-mismatch")
             cycle_path = Path(request.artifact_root).resolve() / ".runtime/artifact-producer/v1/cycles" / f"{binding.binding['cycle_id']}.json"
             cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
-            if cycle.get("state") != "open":
-                return _proof_failure("binding-cycle-not-open")
-            if cycle_identity_digest(cycle) != binding.binding.get("cycle_record_digest"):
+            if not cycle_identity_matches(cycle, binding.binding.get("cycle_record_digest"),
+                                          campaign_id=binding.binding.get("campaign_id")):
                 return _proof_failure("producer-binding-mismatch", "cycle-identity-drift")
             producer = __import__("artifact_producer")
             admission = producer.cycle_route_admission(Path(request.artifact_root).resolve(), cycle, route)
