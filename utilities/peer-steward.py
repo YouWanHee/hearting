@@ -1840,6 +1840,39 @@ def _read_screen(target):
     return _screen_lines(proc.stdout)
 
 
+def _process_session(pane, harness):
+    """The session the pane's foreground Claude/Codex process is on now, or None.
+
+    Read from the process the way the Fleet board does (Claude's `sessions/<pid>.json`,
+    which is rewritten on `/clear`; Codex's open rollout). herdr's own `agent_session`
+    follows a `/clear` only when its integration reports it, and has been seen to keep
+    the previous session for good (live panes 2026-10-01), so a second tidy in the same
+    window would otherwise never clear it."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=_herdr_get_timeout())
+        payload = json.loads(proc.stdout or "")
+        processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+        tools_dir = Path(__file__).resolve().parent.parent / "tools"
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet.collectors import claude as claude_collector, codex as codex_collector
+    except Exception:
+        return None
+    for process in processes:
+        try:
+            pid = int(process.get("pid"))
+            if harness == "claude":
+                sid = claude_collector.session_id_of_process(pid)
+            else:
+                sid = codex_collector.session_id_of_process(pid)
+        except Exception:
+            continue
+        if sid:
+            return sid
+    return None
+
+
 def _clear_look(target, req):
     """One judgement of the target: `(None, agent)` when it may be cleared, else `(reason, agent)`.
 
@@ -1854,7 +1887,9 @@ def _clear_look(target, req):
     if agent.get("harness") != req.get("harness"):
         return "target-changed", agent
     if req.get("harness") in ("claude", "codex") and agent.get("session_id") not in (req.get("sid"), "-"):
-        return "target-changed", agent
+        # herdr's pane record can lag a /clear; the process itself is the proof, never a guess.
+        if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid"):
+            return "target-changed", agent
     if state == "blocked":
         return "form-open", agent
     if state not in ("idle", "done"):

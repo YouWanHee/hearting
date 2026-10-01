@@ -1784,6 +1784,9 @@ class _ClearWorld:
                 self.reads += 1
             return subprocess.CompletedProcess(argv, 0 if screen is not None else 1,
                                                stdout=screen or "", stderr="")
+        if argv[:3] == ["herdr", "pane", "process-info"]:
+            return _herdr_json({"id": "x", "result": {"process_info": {"foreground_processes": [
+                {"name": self.harness, "pid": 4242}]}, "type": "pane_process_info"}})
         if argv[:3] == ["herdr", "agent", "prompt"]:
             if self.prompt_rc == 0:
                 self.sent = True
@@ -1927,6 +1930,19 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         world.pane = "w9:pZ"
         rc, line = self.clear_cmd(world)
         self.assertEqual((rc, "reason=target-changed" in line), (3, True))
+
+    def test_a_pane_record_that_lags_a_clear_is_settled_by_the_process_not_guessed(self):
+        # herdr still reports the session before the previous /clear; the process knows better.
+        for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
+            with self.subTest(process_says=proof):
+                self.book()
+                world = _ClearWorld(sid="sid-before-the-last-clear", new_sid="sid-B")
+                with mock.patch("fleet.collectors.claude.session_id_of_process", return_value=proof):
+                    rc, line = self.clear_cmd(world)
+                self.assertEqual(len(world.typed()), expect_typed, line)
+                self.assertEqual("cleared=true" in line, bool(expect_typed), line)
+                if not expect_typed:
+                    self.assertIn("reason=target-changed", line)
 
     # -- after the send: never a second one -------------------------------------------------
 
