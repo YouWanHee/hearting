@@ -146,7 +146,8 @@ def golden_payload(case):
                  "nodes": {n["id"]: _digest(n) for n in route["nodes"]},
                  "input_sources": {n["id"]: n["input_sources"] for n in route["nodes"] if "input_sources" in n},
                  "card": R.compose_card(route),
-                 "briefs": {n["id"]: ADVANCE.render_stage_brief(route, n)[1] for n in route["nodes"]
+                 # The brief names the prior cycle's dated folder; pin its normalized text, not the raw digest.
+                 "briefs": {n["id"]: _digest(ADVANCE.render_stage_brief(route, n)[0]) for n in route["nodes"]
                             if n.get("kind") != "runtime-terminal"}}
         entry.update({key: _digest(route[key]) for key in GOLDEN_KEYS if key in route})
         scenarios[name] = entry
