@@ -274,6 +274,27 @@ class SourceHistoryTest(unittest.TestCase):
         self.assertIn("body number 14", listing)
         self.assertIn("body number 0", listing)
 
+    def test_concurrent_overwrites_lose_no_previous_body(self):
+        rid = self.written_id(self.add("body number 0 " + "x" * 60, "test:race"))
+        small = {"MEM_SOURCE_HISTORY_MAX_BYTES": "700"}
+        procs = []
+        for n in range(1, 13):
+            procs.append(subprocess.Popen(
+                [sys.executable, str(MEM), "add", "durable", "decision",
+                 f"body number {n} " + "x" * 60, "--source", "test:race"],
+                cwd=self.project, env=self.env(**small), text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+        for proc in procs:
+            out, err = proc.communicate(timeout=120)
+            self.assertEqual(proc.returncode, 0, err + out)
+        final = self.row(rid)[0]
+        kept = {json.loads(line)["prev_body"].split()[2] for line in self.history_lines()}
+        written = {str(n) for n in range(0, 13)}
+        # Every body but the one still in the record was replaced, and each is kept.
+        self.assertEqual(kept, written - {final.split()[2]})
+        self.assertGreater(len(self.history_files()), 1)
+        self.assertEqual(len(self.history_lines()), 12)
+
     def test_history_stays_out_of_the_dump(self):
         rid = self.written_id(self.add(FIRST, "test:dump"))
         self.add(SECOND, "test:dump")

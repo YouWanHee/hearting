@@ -1787,33 +1787,72 @@ def _source_history_files():
     return rotated + ([SOURCE_HISTORY] if SOURCE_HISTORY.is_file() else [])
 
 
+SOURCE_HISTORY_LOCK_WAIT_SECONDS = 2.0
+
+
+@contextlib.contextmanager
+def _source_history_lock(wait=SOURCE_HISTORY_LOCK_WAIT_SECONDS):
+    """Short flock on the history file; yields False (never raises) when unavailable."""
+    fd = None
+    held = False
+    try:
+        SOURCE_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(SOURCE_HISTORY.parent / ".source-history.lock",
+                     os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+    except OSError:
+        held = False
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            if held:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
 def _source_history_append(entry):
     """Keep a replaced body after its overwrite committed; never fail the write.
 
     The local, append-only file is a recovery aid: it is not part of the dump
     or of the v2 exchange.  When it grows past the size cap it is renamed to a
-    timestamped generation, so no body is ever dropped.  Returns True when the
-    entry is on disk.
+    timestamped generation, so no body is ever dropped.  The size check, the
+    rotation and the append happen under one short file lock so two writers
+    cannot rotate over each other; if the lock cannot be taken the body is still
+    appended without it.  Returns True when the entry is on disk.
     """
     line = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
     try:
         SOURCE_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            size = SOURCE_HISTORY.stat().st_size if SOURCE_HISTORY.is_file() else 0
-        except OSError:
-            size = 0
-        if size and size + len(line.encode("utf-8")) > _source_history_max_bytes():
-            stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
-            SOURCE_HISTORY.rename(
-                SOURCE_HISTORY.with_name(f"source-history.{stamp}.jsonl"))
-        fd = os.open(SOURCE_HISTORY,
-                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                     0o600)
-        try:
-            os.write(fd, line.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        with _source_history_lock():
+            try:
+                size = SOURCE_HISTORY.stat().st_size if SOURCE_HISTORY.is_file() else 0
+            except OSError:
+                size = 0
+            if size and size + len(line.encode("utf-8")) > _source_history_max_bytes():
+                stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+                SOURCE_HISTORY.rename(
+                    SOURCE_HISTORY.with_name(f"source-history.{stamp}.jsonl"))
+            fd = os.open(SOURCE_HISTORY,
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                         0o600)
+            try:
+                os.write(fd, line.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         return True
     except OSError as e:
         sys.stderr.write(
