@@ -812,6 +812,7 @@ class CiLikeProfileFixture(unittest.TestCase):
         for env in (self.mod.build_isolated_env(self.root / "iso"),
                     self.mod.build_ci_like_env(self.root / "ci", self.root)):
             self.assertEqual(env["HEARTING_WORKFLOW_GROUP_REVIEW"], "off")
+            self.assertEqual(env["HEARTING_CAMPAIGN_TITLE_AUTO"], "off")
 
     def test_ci_like_reuses_the_isolated_trust_entry(self):
         env = self.mod.build_ci_like_env(self.root / "ci", self.root)

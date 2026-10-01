@@ -44,11 +44,11 @@ INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR
 
 
 def isolated_env(**explicit) -> dict:
-    # The group-review switch is pinned last: a sealed cycle would otherwise start
+    # The group-review and campaign-title switches are pinned last: a sealed cycle would otherwise start
     # a detached sweep that keeps writing into the fixture root while teardown
-    # removes it (the runner sets the switch, but INHERITED drops it).
+    # removes it (the runner sets the switches, but INHERITED drops them).
     return {**{key: os.environ[key] for key in INHERITED if key in os.environ}, **explicit,
-            "HEARTING_WORKFLOW_GROUP_REVIEW": "off"}
+            "HEARTING_WORKFLOW_GROUP_REVIEW": "off", "HEARTING_CAMPAIGN_TITLE_AUTO": "off"}
 
 
 def _proc_start(pid: int) -> str:
