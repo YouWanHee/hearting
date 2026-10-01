@@ -1908,6 +1908,18 @@ def _clear_look(target, req):
     return None, agent
 
 
+def _opencode_home(lines):
+    """OpenCode's home screen: the placeholder box (older builds) or, as measured on 1.18.34,
+    nothing at all but the working-directory line. A conversation view always carries the
+    `┃` input bars and a model line, so those never read as home."""
+    plain = [_plain(line).strip() for line in lines]
+    shown = [text for text in plain if text]
+    if any(text.startswith("\u2503") for text in shown):
+        return any(_OPENCODE_HOME_PLACEHOLDER in "".join(text.split()).lower() for text in shown) \
+            and _draft_state("opencode", lines) == "empty"
+    return 0 < len(shown) <= 2 and shown[-1][:1] in ("/", "~")
+
+
 def _clear_observe(target, req, request_path):
     """The new conversation, seen: its session id (`-` when the harness has none yet), or None.
 
@@ -1925,8 +1937,7 @@ def _clear_observe(target, req, request_path):
             return str(sid)
         if not unavailable and req.get("harness") == "opencode" and state in ("idle", "done"):
             lines = _read_screen(target)
-            if lines is not None and _draft_state("opencode", lines) == "empty" and any(
-                    _OPENCODE_HOME_PLACEHOLDER in "".join(_plain(c).split()).lower() for c in lines):
+            if lines is not None and _opencode_home(lines):
                 return "-"
         if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
             _settle(target, _CLEAR_OBSERVE_SETTLE_MS)

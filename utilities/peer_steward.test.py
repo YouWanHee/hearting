@@ -1749,6 +1749,7 @@ CODEX_POPUP = "recap line\n\x1b[1m›\x1b[0m \n  /clear   start a new chat\n  /c
 OPENCODE_EMPTY = "     ▣  Build · Model · 46m\n\n  ┃\n  ┃\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n   /path/to/project\n"
 OPENCODE_WIDE_EMPTY = "     \u25a3  Build \u00b7 Model\n\n  \u2503" + " " * 60 + "\n  \u2503" + " " * 60 + "\n  \u2503" + " " * 120 + "/path/to/project:\n  \u2503  Build \u00b7 Model OpenCode Go" + " " * 80 + "main\n  \u2579\u2580\u2580\u2580\u2580\u2580\n"
 OPENCODE_DRAFT = "     ▣  Build · Model\n\n  ┃  hello there\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
+OPENCODE_HOME_BLANK = "\n" * 12 + "  /path/to/project:main\n\n"     # 1.18.34: nothing but the cwd line
 OPENCODE_HOME = "\n\n  ┃  Ask anything... \"Fix broken tests\"\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
 NO_BOX = "just some output\nwith no prompt box at all\n"
 
@@ -1875,6 +1876,16 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         rc, line = self.clear_cmd(world)
         self.assertEqual((rc, "cleared=true" in line), (0, True), line)
         self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "/new"]])
+        for after, expect in ((OPENCODE_HOME_BLANK, "cleared=true"), (OPENCODE_EMPTY, "cleared=unverified"),
+                              ("\n\n", "cleared=unverified")):
+            with self.subTest(after=after[:20]):
+                self.book(harness="opencode", sid="ses_A")
+                world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
+                                    home_after=after)
+                with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                self.assertEqual(len(world.typed()), 1, line)
         for screen, reason in ((OPENCODE_DRAFT, "draft"), (NO_BOX, "draft-unknown")):
             self.book(harness="opencode", sid="ses_A")
             world = _ClearWorld(harness="opencode", sid="ses_A", screens=[screen], new_sid=None)
