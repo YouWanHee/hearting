@@ -283,6 +283,35 @@ def runtime_progress_prompt() -> str:
             "and return its final artifact and verdict.\n\n")
 
 
+def owner_gate_prompt(args) -> str:
+    """Name the approval gate sealed on a node the owner executes itself, with the existing commands.
+
+    Text only; the runtime enforces the gate whatever the owner does. Without it the owner reaches
+    its own operation with no launch to be refused at, and the wait is a sentence it never read.
+    """
+    if getattr(args, "worker_type", None) != "owner":
+        return ""
+    route_file = getattr(args, "route_file", None) or getattr(getattr(args, "owner_route_binding", None), "route_file", None)
+    if not route_file:
+        return ""
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        import dispatch_contract
+        held = dispatch_contract.owner_operation_gates(route)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return ""
+    lines = []
+    for node, gate in held:
+        jobs = getattr(args, "jobs", None)
+        command = (f"python3 {Path(__file__).resolve().with_name('workflow-supervisor.py')} gate --route {route_file} "
+                   f"--gate {gate} --block --artifact <preview>" + (f" --jobs {jobs}" if jobs else ""))
+        lines.append(
+            f"Human gate {gate} holds your own node {node.get('id')}: write the preview first, then run "
+            f"`{command}` and end your turn; do not apply the edit before a person releases it. "
+            "If the gate command is refused, do not apply either: finish with verdict BLOCKED and the reason.\n")
+    return "".join(lines) + ("\n" if lines else "")
+
+
 def assignment_prompt(args, task: str, environ) -> str:
     """Project the route's input/output boundary, rather than ask a caller to copy it.
 
@@ -293,13 +322,13 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
-            return f"Assignment:\n{task.rstrip()}\n\n"
+            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}"
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         scope = resolve_node_scope(
             route, getattr(args, "route_node", None), environ,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
         )
-        return f"Assignment:\n{task.rstrip()}\n\n{node_scope_prompt(scope)}\n"
+        return f"Assignment:\n{task.rstrip()}\n\n{node_scope_prompt(scope)}\n{owner_gate_prompt(args)}"
     outputs = []
     route_file = getattr(args, "route_file", None)
     if route_file:

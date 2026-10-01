@@ -87,6 +87,58 @@ class WorkflowGroupsTest(fixture.ProducerTestBase):
         self.assertEqual(verified["stale_evidence"], [rows[0]["path"]])
         self.assertEqual(verified["groups"], 1)
 
+    def _locked(self):
+        import artifact_admission as adm
+        outer = self
+
+        class Lock:
+            def __enter__(self):
+                self.fd = adm._acquire_lock(outer.root.resolve(), 5)
+
+            def __exit__(self, *exc):
+                adm._release_lock(outer.root.resolve(), self.fd)
+
+        return Lock()
+
+    def test_held_lock_helper_runs_every_check_but_never_writes_and_needs_the_lock(self):
+        rows = self._cycles(2)
+        camp = rows[0]["campaign"]
+        plan = W.prepare(self.root, camp, self._proposal(rows, [self._relation(rows[0], rows[1])]))
+        declaration = W.declaration_path(self.root, camp)
+        with self.assertRaises(W.WorkflowGroupError) as caught:  # a caller without the lock is refused
+            W._validated_apply_locked(self.root, plan)
+        self.assertEqual(caught.exception.code, "admission-lock-required")
+        with self._locked():
+            ready = W._validated_apply_locked(self.root, plan)
+        self.assertFalse(declaration.exists())  # the helper stops right before the replacement
+        self.assertEqual((ready["status"], ready["path"], ready["before_raw"]), ("ready", declaration, None))
+        self.assertEqual(ready["sha256"], plan["after_sha256"])
+        # the public apply does exactly the helper's replacement, so both paths write the same bytes
+        self.assertEqual(W.apply(self.root, plan)["status"], "applied")
+        self.assertEqual(declaration.read_bytes(), ready["after_raw"])
+        with self._locked():
+            again = W._validated_apply_locked(self.root, plan)
+        self.assertEqual((again["status"], again["before_raw"], again["after_raw"]),
+                         ("already-applied", declaration.read_bytes(), declaration.read_bytes()))
+        self.assertEqual(W.apply(self.root, plan)["status"], "already-applied")  # idempotence is unchanged
+
+    def test_held_lock_helper_keeps_the_preimage_and_evidence_checks(self):
+        rows = self._cycles(4)
+        camp = rows[0]["campaign"]
+        first = W.prepare(self.root, camp, self._proposal(rows[:2], [self._relation(rows[0], rows[1])]))
+        stale = W.prepare(self.root, camp, self._proposal(rows[:2], [self._relation(rows[0], rows[1])], title="Other"))
+        W.apply(self.root, first)
+        with self._locked(), self.assertRaises(W.WorkflowGroupError) as caught:
+            W._validated_apply_locked(self.root, stale)  # prepared before another writer landed
+        self.assertEqual(caught.exception.code, "declaration-preimage-conflict")
+        merge = W.prepare(self.root, camp, self._proposal(rows[2:], [self._relation(rows[2], rows[3])],
+                                                          title="Second"))
+        rows[2]["file"].write_text("changed after prepare\n", encoding="utf-8")  # new evidence moved on
+        with self._locked(), self.assertRaises(W.WorkflowGroupError) as caught:
+            W._validated_apply_locked(self.root, merge)
+        self.assertIn(caught.exception.code, {"evidence-not-current-manifest", "evidence-binding-stale"})
+        self.assertEqual(len(W._load_existing(W.declaration_path(self.root, camp))["groups"]), 1)
+
     def test_merge_preserves_existing_and_stale_plan_conflicts(self):
         rows = self._cycles(3)
         camp = rows[0]["campaign"]

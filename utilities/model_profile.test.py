@@ -633,5 +633,66 @@ class FrameTierLadder(unittest.TestCase):
         self.assertEqual(selection["reason"], "explicit-top-exception")
 
 
+class PriorFrameProfilePolicyTest(unittest.TestCase):
+    """The one prior frame policy (v2.167.1-v2.169.0) a verifier still accepts for a sealed route.
+
+    The literals below are the values read from `git show v2.169.0:utilities/model_profile.py`; they
+    are spelled out here on purpose, so a later edit of the production table cannot move them."""
+
+    LADDER = {
+        "top": {"anchor": "top", "others": "deep"},
+        "deep": {"anchor": "top", "others": "deep"},
+        "balanced-deep": {"anchor": "deep", "others": "deep"},
+        "balanced": {"anchor": "balanced-deep", "others": "balanced-deep"},
+        "light": {"anchor": "balanced", "others": "balanced"},
+    }
+    EXECUTION_REASON = ("one direction brief, written once, with no multi-step execution of "
+                        "its own")
+
+    def test_the_prior_ladder_is_the_one_released_before_the_top_top_default(self):
+        for owner, rungs in self.LADDER.items():
+            with self.subTest(owner=owner):
+                self.assertEqual(PROFILE.frame_profile_for_owner(owner, prior=True), rungs)
+
+    def test_the_default_policy_is_unchanged_and_differs_from_the_prior_one(self):
+        for owner in self.LADDER:
+            with self.subTest(owner=owner):
+                self.assertEqual(PROFILE.frame_profile_for_owner(owner),
+                                 {"anchor": "top", "others": "top"})
+        self.assertNotEqual(PROFILE.frame_profile_for_owner("deep"),
+                            PROFILE.frame_profile_for_owner("deep", prior=True))
+
+    def test_an_unknown_or_absent_owner_profile_takes_the_prior_light_rung(self):
+        for value in (None, "", "not-a-profile"):
+            with self.subTest(value=value):
+                self.assertEqual(PROFILE.frame_profile_for_owner(value, prior=True),
+                                 self.LADDER["light"])
+
+    def test_the_returned_prior_mapping_cannot_mutate_the_table(self):
+        rungs = PROFILE.frame_profile_for_owner("deep", prior=True)
+        rungs["others"] = "mini"
+        self.assertEqual(PROFILE.PRIOR_FRAME_PROFILE_LADDER["deep"]["others"], "deep")
+
+    def test_the_prior_intrinsic_demand_differs_only_in_the_execution_reason(self):
+        prior = PROFILE.frame_anchor_shape_demand(prior=True)
+        current = PROFILE.frame_anchor_shape_demand()
+        self.assertEqual(current, PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
+        self.assertEqual(prior["execution_reason"], self.EXECUTION_REASON)
+        self.assertNotEqual(prior["execution_reason"], current["execution_reason"])
+        self.assertEqual({k: v for k, v in prior.items() if k != "execution_reason"},
+                         {k: v for k, v in current.items() if k != "execution_reason"})
+        prior["evidence_refs"].append("x")
+        self.assertEqual(PROFILE.frame_anchor_shape_demand(prior=True)["evidence_refs"],
+                         ["roles/units/plan/frame.md"])
+
+    def test_the_prior_demand_resolves_top_and_hashes_differently(self):
+        prior = PROFILE.frame_anchor_shape_demand(prior=True)
+        selection = PROFILE.resolve_profile_demand(prior, explicit_profile="top")
+        self.assertEqual(selection["resolved_profile"], "top")
+        self.assertNotEqual(
+            PROFILE.normalize_profile_demand(prior),
+            PROFILE.normalize_profile_demand(PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
+
+
 if __name__ == "__main__":
     unittest.main()

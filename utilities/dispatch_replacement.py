@@ -33,6 +33,10 @@ SCHEMA = 'automatic-dead-replacement-v1'
 # D2: a frame leg whose `top` the frame rule assigned is replaced once, one profile lower, when it
 # stops at a usage limit. The claim carries exactly this value; nothing else may.
 FRAME_CAPACITY = 'frame-capacity'
+# Stops that are pauses, not the one silent replacement: a usage limit, or an owner its launcher
+# closed before spawning. Each pause opens its own family (`after_capacity` keeps the digests of
+# existing capacity families unchanged).
+PAUSE_KINDS = frozenset({'capacity', 'unlaunched'})
 FRAME_TRANSITION = {'from': 'top', 'to': 'deep', 'reason': 'capacity', 'ordinal': 1, 'origin': 'frame-rule'}
 CONTINUATION_WAIT_NOTE = (
     'This route has already used its one automatic continuation. If you raise a human gate later, '
@@ -262,6 +266,7 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     """The one place that says why a terminal row may be replaced.
 
     'parked' is a released human gate, 'capacity' an owner stopped at a usage limit,
+    'unlaunched' an owner its launcher closed before spawning,
     'silent' a proven silent death, 'frame-capacity' a frame leg at its frame-rule `top` stopped at
     a usage limit (replaced once at `deep`). Anything else, including a user cancel, is None.
     Only a route owner pauses on capacity: a stage worker's limit stays with its owner's
@@ -279,6 +284,10 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     if (meta.get('worker_type') == 'owner' and fields[1] == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
         return 'capacity'
+    if (meta.get('worker_type') == 'owner' and fields[1] == 'done'
+            and meta.get('launch_outcome') == 'never-launched' and meta.get('launch_claimed') == '0'
+            and meta.get('launch_started') != '1' and not meta.get('pid')):
+        return 'unlaunched'  # nothing ran: the log never existed and no process was ever bound
     if meta.get('worker_type') == 'owner' and fields[1] == 'done' and meta.get('note') == 'dead-runtime-exit':
         return 'runtime'  # the owner's process crashed; only an explicit `start` replaces it
     if (jobs is not None and meta.get('worker_type') == 'frame' and fields[1] == 'done'
@@ -300,7 +309,7 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
     proof = DC.attempt_process_quiescence(meta, terminal_receipt=True)
     if proof.state != 'quiescent':
         raise _process_error(proof, meta)
-    if kind != 'parked' and not _terminal_absent(fields, meta, capacity=kind in {'capacity', FRAME_CAPACITY}):
+    if kind not in {'parked', 'unlaunched'} and not _terminal_absent(fields, meta, capacity=kind in {'capacity', FRAME_CAPACITY}):
         raise DC.DispatchContractError('replacement-result-settlement-required')
     result = {'state': proof.state, 'reason': proof.reason, 'death_kind': kind,
               'note': meta.get('note', ''), 'cleanup_receipt_digest': meta.get('cleanup_receipt_digest', ''),
@@ -394,13 +403,18 @@ def owner_parked_gate(jobs, aid, *, lines=None):
 
     A typed BLOCKED owner handoff is a pause, not a failure, when this owner raised
     a human gate after it started and the nodes the gate holds back have not begun.
+    So is a PASS owner whose gate still holds the operation it executed itself (refine's
+    `transaction` behind `preview-disposition`): its result is a proposal until the person
+    answers. That recognition only describes the wait; a passed owner is never replaced.
     Never raises; every unproven condition answers None.
     """
     try:
         rows = _rows(lines if lines is not None else Path(jobs).read_text().splitlines())
         fields, meta = rows[aid]
+        blocked = meta.get('note') == 'dead-worker-blocked'
+        proposal = (not blocked and DC.verdict_pass(meta) and meta.get('workflow_completion') == 'runtime-v1')
         if (fields[1] != 'done' or meta.get('worker_type') != 'owner'
-                or meta.get('note') != 'dead-worker-blocked' or DC.terminal_conflict_pending(meta)):
+                or not (blocked or proposal) or DC.terminal_conflict_pending(meta)):
             return None
         path, route = _route(jobs, aid, meta)
         import workflow_state as WS
@@ -427,6 +441,9 @@ def owner_parked_gate(jobs, aid, *, lines=None):
             return None
         _, gate, res, raisers = chosen
         gated = sorted({s for n in raisers for s in WS.route_successors(route, str(n['id']))})
+        if proposal and not any(DC._route_module().owner_executed_terminal(n) for n in route['nodes']
+                                if n.get('id') in gated):
+            return None
         inline = [str(n['id']) for n in raisers if gate in n.get('inline_human_gates', [])]
         completion = DC.dispatch_state_root(jobs)/'completion'/route['route_id']
         if any((completion/(node+'.json')).exists() for node in gated+inline):
@@ -786,7 +803,7 @@ def claim(jobs: Path, aid: str) -> dict:
             _no_competing_successor(rows, aid, record['replacement_attempt_id'])
             return record
         proof = death_proof(fields, meta, jobs=jobs, lines=lines)
-        capacity = proof.get('death_kind') == 'capacity'
+        capacity = proof.get('death_kind') in PAUSE_KINDS
         path, route = _route(jobs, aid, meta)
         logical = _logical_key(route, meta)
         if capacity:
@@ -1234,7 +1251,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
     # A usage-limit resume is a pause, not the node's one silent replacement: when that
     # resumed attempt dies silently, claim() still judges the node's silent budget.
     if (source.get('replacement_original_attempt_id') and fields[1] not in {'open','running'}
-            and not DC.verdict_pass(source) and kind != 'capacity'
+            and not DC.verdict_pass(source) and kind not in PAUSE_KINDS
             and not _in_capacity_family(jobs, source)):
         return exhausted_attention(jobs, aid, source)
     # Avoid side effects or errors on ordinary success/live observations.
@@ -1243,7 +1260,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return {'state': 'not-applicable', 'parked_gate': parked} if parked else {'state':'not-applicable'}
     if kind == 'capacity' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return _capacity_wait(jobs, aid, source)
-    if kind == 'runtime' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
+    if kind in {'runtime', 'unlaunched'} and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return {'state': 'not-applicable'}  # never a supervisor tick: no loop of relaunches
     try:
         if authority_check is None:
@@ -1268,7 +1285,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
                     next_kind = death_kind(replacement_fields, replacement_meta)
-                    if next_kind == 'capacity' or (next_kind and _is_capacity_record(record)):
+                    if next_kind in PAUSE_KINDS or (next_kind and _is_capacity_record(record)):
                         # The replacement stopped at a limit too, or a limit resume died on its
                         # own: it is the next source, and claim() judges the node's budget.
                         return advance(jobs, replacement, run=run, authority_check=authority_check,
@@ -1323,10 +1340,10 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         reason = getattr(exc,'reason','replacement-observation-unavailable')
         if reason == 'automatic-replacement-exhausted':
             family_record = None
-            if not _budget_exhausted(jobs, source, capacity=kind == 'capacity'):
+            if not _budget_exhausted(jobs, source, capacity=kind in PAUSE_KINDS):
                 _, route = _route(jobs, aid, source)
                 logical = _logical_key(route, source)
-                if kind == 'capacity':
+                if kind in PAUSE_KINDS:
                     logical = {**logical, 'after_capacity': aid}
                 family_record = _check_record(_read(_record_path(jobs,_digest(logical))),_digest(logical))
             return exhausted_attention(jobs, aid, source, family_record=family_record)
@@ -1488,8 +1505,11 @@ def recovery_instructions(args):
     if record['replacement_attempt_id'] != args.attempt_id:
         raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
     completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
-    if (record.get('proof') or {}).get('death_kind') == 'capacity':
+    kind = (record.get('proof') or {}).get('death_kind')
+    if kind == 'capacity':
         opening = f'The previous attempt {prior} stopped at a usage limit; this resumes it on the existing route {record["route_id"]}.\n'
+    elif kind == 'unlaunched':
+        opening = f'The previous attempt {prior} never started (its launcher stopped before spawning); this starts the same work on the existing route {record["route_id"]}.\n'
     else:
         opening = f'You replace exact-dead attempt {prior} once, on the existing route {record["route_id"]}.\n'
     text = ('\n\n## Verified recovery context\n'

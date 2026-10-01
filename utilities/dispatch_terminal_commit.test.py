@@ -1,6 +1,8 @@
+import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,12 +11,23 @@ from unittest import mock
 
 import dispatch_terminal_commit as T
 import owner_route_binding
+import artifact_admission
 import artifact_producer
 
 # The one already-loaded handle on capability-route.py; the quick-branch tests
 # below compile a real quick route rather than hand-rolling one, so the route
 # they verify against is the route the compiler actually emits.
 ROUTE = owner_route_binding.ROUTE
+
+
+import importlib.util
+import sys
+
+_PRODUCER_SPEC = importlib.util.spec_from_file_location(
+    "producer_fixture_for_terminal_commit", Path(__file__).with_name("artifact_producer.test.py"))
+PRODUCER_FIXTURE = importlib.util.module_from_spec(_PRODUCER_SPEC)
+_PRODUCER_SPEC.loader.exec_module(PRODUCER_FIXTURE)
+
 
 
 def seal_fixture_route(route, route_file, root, jobs, owner):
@@ -864,6 +877,45 @@ class ForwardRecoveryTest(_TerminalCommitFixture):
         self.assertEqual(calls.count("finalize"), 0)
 
 
+class HeldAdmissionLockTest(unittest.TestCase):
+    """A producer step that meets a busy admission lock is a recoverable finalize failure.
+
+    The settle path turns `producer-finalize-failed` into `recoverable` (the replay tests above),
+    so the reaper, join or an explicit `finish` try again; this pins the lock side with a real flock.
+    """
+
+    HOLDER = ("import fcntl, os, sys, time\n"
+              "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+              "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+              "print('held', flush=True)\n"
+              "time.sleep(30)\n")
+
+    def test_finalize_under_a_held_admission_lock_is_recoverable_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = artifact_admission._lock_file_path(root)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            holder = subprocess.Popen([sys.executable, "-c", self.HOLDER, str(lock_path)],
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                probe = os.open(str(lock_path), os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(probe)
+                with self.assertRaises(T.TerminalCommitError) as caught:
+                    T._producer_operation(artifact_admission._acquire_lock, root, 0.3)
+                self.assertEqual(caught.exception.code, "producer-finalize-failed")
+            finally:
+                holder.kill()
+                holder.wait()
+                holder.stdout.close()
+            fd = T._producer_operation(artifact_admission._acquire_lock, root, 0.3)  # the retry succeeds
+            artifact_admission._release_lock(root, fd)
+
+
 class ForwardRecoveryIdentityMismatchTest(_TerminalCommitFixture):
     """A82-7/§13.53.5: forward recovery re-entry recomputes the exact
     terminal identity instead of trusting a stored state string. If the
@@ -1440,6 +1492,82 @@ class ProveRouteChildrenDeferredTest(unittest.TestCase):
             proof = T._prove_route_children(self._request(jobs), route, gates)
         self.assertEqual(proof.status, "rejected")
         self.assertEqual(proof.detail, "terminal-attempt-not-pass")
+
+
+class OwnerTerminalPlacementReplayTest(unittest.TestCase):
+    """A loose owner report that the bucket organizer moves keeps one terminal identity."""
+
+    NATIVE = {
+        "claude": lambda text: [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
+        "codex": lambda text: [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+                               {"type": "turn.completed"}],
+        "opencode": lambda text: [{"type": "text", "sessionID": "ses_test", "part": {"type": "text", "text": text}},
+                                  {"type": "step_finish", "sessionID": "ses_test",
+                                   "part": {"type": "step-finish", "reason": "stop"}}],
+    }
+
+    def _settled(self, harness, rel):
+        terminal = T
+        from dispatch_completion_join import exact_attempt_row
+        fixture = PRODUCER_FIXTURE.TerminalTransactionIntegrationTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        route, path, jobs, owner, cycle, review, request = fixture._prepare_fixture(harness, "autopilot-spec")
+        report = fixture.write_output(cycle, rel=rel, data=b"verified transaction report\n")
+        text = f"artifact: {report}\nverdict: PASS\nblocker: none"
+        log = jobs.parent / "owner.jsonl"
+        log.write_text("\n".join(json.dumps(r) for r in self.NATIVE[harness](text)) + "\n")
+        jobs.write_text(jobs.read_text().replace(
+            "worker_type=owner", f"attempt_schema_version=2,worker_type=owner,log_file={log},workflow_completion=runtime-v1"))
+        fixture._closed_owner(jobs, owner)
+        meta = exact_attempt_row(jobs, owner).metadata
+        return fixture, terminal, route, path, jobs, owner, report, meta
+
+    def test_a_replayed_settlement_after_placement_completes_for_every_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                    first = terminal.settle_owner_completion(jobs, "done", meta)
+                    self.assertEqual(first.result, "completed", first)
+                    placed = Path(fixture.root).rglob("owner-report.md")
+                    moved = [p for p in placed if p != report]
+                    self.assertEqual(len(moved), 1, "the organizer must have placed the loose report")
+                    self.assertFalse(report.exists())
+                    request = terminal.TerminalCommitRequest(path, owner, jobs, fixture.root)
+                    state_path = terminal._commit_state_path(request)
+                    stored = json.loads(state_path.read_text())
+                    self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                    second = terminal.settle_owner_completion(jobs, "done", meta)
+                    self.assertEqual(second.result, "completed", second)
+                    self.assertEqual(json.loads(state_path.read_text())["terminal_commit_id"], stored["terminal_commit_id"])
+                    row = ROUTE.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)["prd-transaction"]
+                    self.assertTrue(row["passed"], row)
+                    self.assertEqual(row["evidence"], str(report))  # identity stays the worker's own locator
+                    self.assertEqual(row["evidence_digest"], ROUTE.evidence_digest(moved[0]))
+                    self.assertFalse((ROUTE.completion_dir(route["route_id"], jobs=jobs) / "prd-transaction.json").exists())
+
+    def test_a_report_already_in_its_bucket_is_unchanged(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "spec/_internal/owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+
+    def test_a_changed_or_missing_placed_report_still_fails_the_replay(self):
+        for harness in ("claude",):   # the damage is to the placed file, whatever shape the native result had
+            for damage in ("bytes", "missing"):
+                with self.subTest(harness=harness, damage=damage):
+                    fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                        self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+                        moved = next(p for p in Path(fixture.root).rglob("owner-report.md"))
+                        if damage == "bytes":
+                            moved.write_text("tampered after settlement")
+                        else:
+                            moved.unlink()
+                        self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                        self.assertNotEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
 
 
 if __name__ == "__main__":

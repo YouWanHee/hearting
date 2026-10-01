@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -38,6 +39,8 @@ import route_plan as RP  # noqa: E402
 import work_start as W  # noqa: E402
 import frame_interview as FI  # noqa: E402
 
+# `StartBase` replaces `R.proposal_readiness` with a fixture; the real function stays reachable here.
+REAL_PROPOSAL_READINESS = R.proposal_readiness
 DIRECT = {"capability": "autopilot-code", "shape": "direct", "why": "one small edit"}
 CODE_STAGED = {"capability": "autopilot-code", "mode": "dev", "shape": "staged",
                "graph": ["plan", "execute", "test", "report"], "why": "a bug with a test"}
@@ -144,6 +147,18 @@ class StartBase(F.EndingBase):
     def registry_rows(self):
         return [line for line in self.jobs.read_text().splitlines() if line.strip()]
 
+    def finish_leg(self, route, route_file):
+        """What a finished leg leaves behind: its proven-closed route and its sealed producer cycle."""
+        if not any(r.get("route_id") == route["route_id"] for r in P.list_cycle_records(self.root)):
+            self.begin_cycle(route_file)           # a registered owner opens its own cycle when it starts
+        self.close(route, route_file)
+        record = next(r for r in P.list_cycle_records(self.root) if r.get("route_id") == route["route_id"])
+        output = Path(P.cycle_dir(self.root, record["campaign_id"], record["cycle_id"], record)) / "artifacts/documents/done.md"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("done\n", encoding="utf-8")
+        P.finalize(self.root, cycle_id=record["cycle_id"], state="completed")
+        return record["cycle_id"]
+
 
 class SelectedLegTest(StartBase):
     def test_a164_2_a_direct_proposal_starts_one_first_leg_and_closes_the_frame_route(self):
@@ -215,7 +230,8 @@ class SelectedLegTest(StartBase):
         self.assertNotIn("--route-node", self.leg_calls[0])           # no frame launch, only the owner
         self.assertEqual(self.cli_calls, ["complete", "close"])
 
-    def test_a_repeated_start_after_the_ending_returns_the_stored_receipt_and_starts_nothing(self):
+    def test_a_repeated_start_after_the_ending_returns_the_legs_current_state_and_starts_nothing(self):
+        # The owner still runs, so its current state is the receipt the first start stored.
         self.set_briefs(CODE_STAGED, CODE_STAGED)
         self.set_interview({"legs": [CODE_STAGED]})
         first = self.settle()
@@ -447,6 +463,269 @@ class FailureTableTest(StartBase):
         self.assertEqual(len(results), 2)
         self.assertEqual((len(self.leg_routes()), len(self.registry_rows()), len(self.leg_calls)), (1, 1, 1))
         self.assertEqual(self.cli_calls.count("complete"), 1)
+
+
+class FirstLegStateReplayTest(StartBase):
+    """Re-reading the frame route answers with the first leg's state now, never its old launch receipt (defect 4)."""
+
+    SECOND = {"capability": "autopilot-code", "shape": "direct", "why": "then the second"}
+
+    def replay(self):
+        from dispatch_notice_state import closed_outcome
+        return self.settle(closed=closed_outcome(Path(self.path), self.route))
+
+    def leg(self):
+        (leg_path,) = self.leg_routes()
+        return json.loads(leg_path.read_text(encoding="utf-8")), leg_path
+
+    def staged_leg(self, legs=(CODE_STAGED,)):
+        self.set_briefs(list(legs), list(legs))
+        self.set_interview({"legs": list(legs)})
+        return self.settle()
+
+    def end_owner_row(self):
+        """The owner's registry row, as a finished attempt's row reads (schema 2, status done)."""
+        row = self.jobs.read_text(encoding="utf-8").replace("\topen\t", "\tdone\t", 1)
+        self.jobs.write_text(row.rstrip("\n") + ",attempt_schema_version=2\n", encoding="utf-8")
+
+    def untouched(self, before):
+        self.assertEqual((len(self.leg_routes()), len(self.registry_rows()), len(self.leg_calls), self.cli_calls),
+                         before)
+        self.assertEqual(self.record_path().read_bytes(), self.record_bytes)
+
+    def snapshot(self):
+        self.record_bytes = self.record_path().read_bytes()
+        return (len(self.leg_routes()), len(self.registry_rows()), len(self.leg_calls), list(self.cli_calls))
+
+    def test_a_finished_direct_leg_answers_completed_not_its_old_execute_inline_receipt(self):
+        first = self.settle()
+        self.assertEqual((first["state"], first["required_action"]), ("inline", "execute-inline"))
+        route, leg_path = self.leg()
+        self.finish_leg(route, leg_path)
+        before = self.snapshot()
+        for _ in range(2):
+            again = self.replay()
+            self.assertEqual((again["state"], again["required_action"]), ("completed", "advance-completed"), again)
+            self.assertEqual(again["route_id"], route["route_id"])
+            self.assertEqual(again["route_decision"]["frame_route_id"], self.route["route_id"])
+            self.assertNotIn("task", again)
+            self.assertNotIn("artifact_env", again)
+            self.assertNotIn("next_leg", again)               # the only leg of its plan
+        self.untouched(before)
+
+    def test_a_finished_leg_that_is_not_the_last_names_the_next_leg_and_starts_nothing(self):
+        self.set_briefs([DIRECT, self.SECOND], [DIRECT, self.SECOND])
+        self.set_interview({"legs": [DIRECT, self.SECOND]})
+        self.settle()
+        route, leg_path = self.leg()
+        cycle = self.finish_leg(route, leg_path)
+        before = self.snapshot()
+        again = self.replay()
+        self.assertEqual(again["state"], "completed", again)
+        self.assertEqual(again["next_leg"]["index"], 1)
+        self.assertEqual(shlex.split(again["next_leg"]["compose_command"])[shlex.split(again["next_leg"]["compose_command"]).index("--parent-cycle") + 1], cycle)
+        self.untouched(before)
+
+    def test_a_finished_staged_owner_leg_answers_completed(self):
+        first = self.staged_leg()
+        self.assertEqual(first["state"], "running")
+        route, leg_path = self.leg()
+        self.finish_leg(route, leg_path)
+        before = self.snapshot()
+        again = self.replay()
+        self.assertEqual(again["state"], "completed", again)
+        self.assertEqual(again["required_action"], "advance-completed")
+        self.assertNotEqual(again.get("parent_next"), "end-turn")
+        self.untouched(before)
+
+    def test_a_staged_leg_whose_owner_still_runs_answers_running_without_a_second_launch(self):
+        first = self.staged_leg()
+        before = self.snapshot()
+        again = self.replay()
+        self.assertEqual(again["state"], "running", again)
+        self.assertEqual(again["owner_attempt_id"], first["owner_attempt_id"])
+        self.assertEqual(again["resume_command"], first["resume_command"])      # the leg's, not the frame's
+        self.untouched(before)
+
+    def test_a_staged_leg_whose_owner_died_is_reported_and_not_relaunched_by_the_replay(self):
+        first = self.staged_leg()
+        self.end_owner_row()
+        before = self.snapshot()
+        with mock.patch("dispatch_replacement.advance", side_effect=AssertionError("a replay never launches")), \
+                mock.patch.object(W, "_launch_admitted", side_effect=AssertionError("a replay never launches")):
+            again = self.replay()
+        self.assertEqual(again["state"], "needs-attention", again)
+        self.assertEqual(again["owner_attempt_id"], first["owner_attempt_id"])
+        self.assertEqual(again["resume_command"], first["resume_command"])
+        self.untouched(before)
+
+    def test_a_staged_leg_parked_at_a_human_gate_answers_the_gate_not_running(self):
+        first = self.staged_leg()
+        parked = {"gate": "preview-disposition", "status": "blocked", "artifact": "/tmp/preview.md",
+                  "route_file": str(self.leg()[1])}
+        self.end_owner_row()
+        before = self.snapshot()
+        with mock.patch("dispatch_replacement.owner_parked_gate", return_value=parked):
+            again = self.replay()
+        self.assertEqual((again["state"], again["required_action"], again["gate"]),
+                         ("waiting-human-gate", "answer-human-gate", "preview-disposition"), again)
+        self.assertIn("release_command", again)
+        self.untouched(before)
+
+    def test_a_replay_of_an_exited_leg_owner_asks_the_approval_question_it_never_raised(self):
+        # The frame route's own resume is a parent `start` too: an exited owner that never raised the gate
+        # sealed on its own operation is asked about here as well, and still nothing launches or settles.
+        first = self.staged_leg()
+        self.end_owner_row()
+        before = self.snapshot()
+        parked = {"gate": "preview-disposition", "status": "blocked", "artifact": "/tmp/preview.md",
+                  "route_file": str(self.leg()[1])}
+        with mock.patch.object(W, "_raise_owner_entry_gate") as raised, \
+                mock.patch("dispatch_replacement.owner_parked_gate",
+                           side_effect=lambda *a, **k: parked if raised.called else None), \
+                mock.patch("dispatch_replacement.advance", side_effect=AssertionError("a replay never launches")), \
+                mock.patch.object(W, "_launch_admitted", side_effect=AssertionError("a replay never launches")):
+            again = self.replay()
+        raised.assert_called_once()
+        self.assertEqual(raised.call_args.args[3], first["owner_attempt_id"])
+        self.assertEqual((again["state"], again["required_action"], again["gate"]),
+                         ("waiting-human-gate", "answer-human-gate", "preview-disposition"), again)
+        self.assertEqual(again["resume_command"], first["resume_command"])
+        self.untouched(before)
+
+    def test_a_replay_of_a_leg_whose_owner_still_runs_asks_nothing(self):
+        self.staged_leg()
+        with mock.patch.object(W, "_raise_owner_entry_gate", side_effect=AssertionError("owner is live")):
+            self.assertEqual(self.replay()["state"], "running")
+
+    def test_an_inline_finish_still_pending_on_the_leg_is_reported_as_such(self):
+        self.settle()
+        route, _ = self.leg()
+        state = self.root / ".runtime" / "inline-finish" / "v1" / route["route_id"] / "finish.json"
+        state.parent.mkdir(parents=True)
+        state.write_text(json.dumps({"schema": "inline_finish_v1", "state": "node-completed"}), encoding="utf-8")
+        before = self.snapshot()
+        again = self.replay()
+        self.assertEqual((again["state"], again["reason"]), ("needs-attention", "finish-pending"), again)
+        self.untouched(before)
+
+    def test_a_direct_leg_that_is_still_to_be_done_keeps_answering_execute_inline(self):
+        first = self.settle()
+        before = self.snapshot()
+        again = self.replay()
+        self.assertEqual({k: v for k, v in again.items() if k != "route_decision"},
+                         {k: v for k, v in first.items() if k != "route_decision"})
+        self.untouched(before)
+
+    def test_a_first_leg_that_is_not_the_one_the_record_binds_is_a_conflict_not_a_state(self):
+        self.settle()
+        route, leg_path = self.leg()
+        forged = {**route, "cwd": str(self.root)}
+        leg_path.write_text(json.dumps(forged, indent=2) + "\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.replay()
+
+
+class PinnedStartBase(StartBase):
+    """A framed route composed with the pins the CLI would seal (`--pin` after `_filter_top_pins`)."""
+
+    PINS = ["owner=claude", "worker=claude:sonnet@high", "frame=claude"]
+    OWNER_HARNESS = "claude"
+
+    def compose(self, **kw):
+        pins, _ = R._filter_top_pins(R._parse_selection_pins(self.PINS))
+        kw.setdefault("selection_pins", pins)
+        kw.setdefault("work_request", {"text": "Decide how to do this", "owner_harness": self.OWNER_HARNESS})
+        return super().compose(**kw)
+
+    def pins_sealed_on_frame(self):
+        return {k: v for k, v in self.route["selection_pins"].items() if k != "contract_version"}
+
+
+class SelectionPinInheritanceTest(PinnedStartBase):
+    """The compose-time pins reach the leg the frame proposes and starts (defect 1)."""
+
+    def first_leg(self):
+        (leg_path,) = self.leg_routes()
+        return json.loads(leg_path.read_text(encoding="utf-8"))
+
+    def test_the_first_staged_leg_seals_the_frames_pins_and_every_worker_follows_the_worker_pin(self):
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+        self.settle()
+        leg = self.first_leg()
+        self.assertEqual(leg["selection_pins"], self.route["selection_pins"])
+        workers = [n for n in leg["nodes"] if n.get("dispatch_depth") == 2]
+        self.assertTrue(workers)
+        self.assertEqual({n["harness_affinity"] for n in workers}, {"claude"})
+        for node in workers:
+            self.assertEqual(node["harness_policy"]["primary"][0], "claude", node["id"])
+        self.assertEqual(leg["work_request"]["owner_harness"], "claude")
+        R.verify_route(json.loads(json.dumps(leg)), R.ROOT)
+
+    def test_a_direct_first_leg_and_a_solo_first_leg_carry_the_pins_too(self):
+        for leg_arguments in (DIRECT, {"capability": "autopilot-code", "shape": "solo", "why": "one worker"}):
+            with self.subTest(shape=leg_arguments["shape"]):
+                self.tearDown()
+                self.setUp()
+                self.set_briefs(leg_arguments, leg_arguments)
+                self.set_interview({"legs": [leg_arguments]})
+                self.settle()
+                self.assertEqual(self.first_leg()["selection_pins"], self.route["selection_pins"])
+
+    def test_a_pin_the_user_never_gave_adds_no_field_to_the_leg(self):
+        self.tearDown()
+        self.PINS, self.OWNER_HARNESS = [], None
+        self.setUp()
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+        self.settle()
+        self.assertNotIn("selection_pins", self.route)
+        leg = self.first_leg()
+        self.assertNotIn("selection_pins", leg)
+        self.assertEqual({n.get("harness_affinity") for n in leg["nodes"] if n.get("dispatch_depth") == 2}, {"diverse"})
+
+    def test_a_frame_only_pin_is_sealed_on_the_leg_without_touching_worker_affinity(self):
+        self.tearDown()
+        self.PINS, self.OWNER_HARNESS = ["frame=claude"], None
+        self.setUp()
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+        self.settle()
+        leg = self.first_leg()
+        self.assertEqual(leg["selection_pins"], self.route["selection_pins"])
+        self.assertEqual({n["harness_affinity"] for n in leg["nodes"] if n.get("dispatch_depth") == 2}, {"diverse"})
+
+    def test_the_owner_pin_reaches_the_first_legs_work_request_even_when_the_frames_request_did_not_name_it(self):
+        self.tearDown()
+        self.OWNER_HARNESS = None
+        self.setUp()
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+        self.settle()
+        self.assertEqual(self.first_leg()["work_request"]["owner_harness"], "claude")
+
+    def test_the_leg_gets_its_own_copy_of_the_pins_and_the_frame_route_is_not_changed(self):
+        before = json.dumps(self.route["selection_pins"], sort_keys=True)
+        compiled = R._leg_compose_kwargs(RP.leg_arguments(CODE_STAGED), frame_route=self.route,
+                                         frame_cycle_id="cyc_" + "a" * 32, slug="x")
+        pins = compiled["selection_pins"]
+        self.assertEqual(pins, self.pins_sealed_on_frame())
+        self.assertNotIn("contract_version", pins)
+        pins["worker"]["harness"] = "codex"
+        self.assertEqual(json.dumps(self.route["selection_pins"], sort_keys=True), before)
+
+    def test_the_readiness_probe_asks_about_a_pinned_harness_even_if_the_user_policy_left_it_out(self):
+        seen = []
+        with mock.patch.object(R, "_compose_default_children", return_value=("codex",)), \
+                mock.patch.object(R, "_compose_readiness",
+                                  side_effect=lambda *a: seen.append(a[3]) or {"tuples": [], "candidates": []}):
+            REAL_PROPOSAL_READINESS(self.route, self.jobs)
+        self.assertEqual(len(seen), 1)
+        with mock.patch.object(R, "_compose_default_children", wraps=R._compose_default_children) as children, \
+                mock.patch.object(R, "_compose_readiness", return_value={"tuples": [], "candidates": []}):
+            REAL_PROPOSAL_READINESS(self.route, self.jobs)
+        self.assertEqual(children.call_args.args[0], self.pins_sealed_on_frame())
 
 
 class CatalogueInputTest(F.FramedBase):

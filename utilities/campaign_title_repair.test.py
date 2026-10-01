@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import artifact_admission as adm
+import artifact_meta as M
 import artifact_producer as P
 import artifact_workflow_group_review as R
 import campaign_title_repair as repair
@@ -215,6 +215,7 @@ fixture = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fixture)
 
 PAST = 1_700_000_000.0
+NOW = 1_790_000_000.0
 START = "=== CAMPAIGN DATA ===\n"
 END = "\n=== END DATA ==="
 
@@ -223,13 +224,24 @@ def data_of(prompt):
     return json.loads(prompt.split(START, 1)[1].rsplit(END, 1)[0])
 
 
-def fake(title, reason="근거 한 문장", harness="claude"):
-    """An `invoke` that records prompts and answers with one title; the model is never called."""
+def unified(title, summary="한 일과 결과를 한 줄로 적음", harness="claude", **over):
+    """An `invoke` that records prompts and answers the unified v2 reply (groups: none; one title for
+    the campaign); the model is never called."""
     calls = []
 
     def invoke(prompt):
         calls.append(prompt)
-        return json.dumps({"display_title": title, "reason": reason}, ensure_ascii=False), harness
+        data = data_of(prompt)
+        vocab = [item["code"] for item in data["project_meta"]["branches"]]
+        entity = {"title": title, "summary": summary, "branches": [vocab[0] if vocab else "GEN"], "kinds": ["평가"]}
+        reply = {"decisions": [{"cycle_id": cid, "verdict": "none", "reason": "근거 한 문장"}
+                               for cid in data["group_target_ids"]],
+                 "new_groups": [], "relations": [],
+                 "metadata": {"campaign": dict(entity), "cycles": {cid: dict(entity, title=f"{title} 사이클")
+                                                                     for cid in data["metadata_target_ids"]}},
+                 "new_branches": [] if vocab else [{"code": "GEN", "label": "일반", "note": "기본 갈래"}]}
+        reply.update(over)
+        return json.dumps(reply, ensure_ascii=False), harness
     invoke.calls = calls
     return invoke
 
@@ -255,7 +267,8 @@ class AutoBase(fixture.ProducerTestBase):
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop(repair.AUTO_DISABLE_ENV, None)
+        for name in (repair.AUTO_DISABLE_ENV, R.DISABLE_ENV):
+            os.environ.pop(name, None)
         self.activate()
 
     def _restore_attempt(self):
@@ -294,12 +307,6 @@ class AutoBase(fixture.ProducerTestBase):
         record["title"] = title
         repair.write_atomic(cdir / "campaign.json", record)
 
-    def set_manifest_title(self, cdir, title):
-        for path in cdir.rglob("manifest.json"):
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-            manifest["campaign"]["title"] = title
-            path.write_text(json.dumps(manifest), encoding="utf-8")
-
     @property
     def declaration_path(self):
         return self.root / repair.DISPLAY_TITLE_REL
@@ -320,9 +327,14 @@ class AutoBase(fixture.ProducerTestBase):
         repair.write_atomic(self.declaration_path, doc)
         return doc
 
-    def log_rows(self):
-        path = self.root / repair.AUTO_LOG_REL
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    def meta(self, begun):
+        read = M.read_campaign_meta(self.root, begun["campaign_id"])
+        return read.doc if read.status == "ok" else None
+
+    def record(self):
+        status, doc = R.read_record(self.root)
+        self.assertEqual(status, "ok")
+        return doc
 
     def human_apply(self, cdir, title):
         roots = Path(self._tmp.name) / "human-roots.json"
@@ -340,164 +352,159 @@ class AutoBase(fixture.ProducerTestBase):
 
 
 class AutoSelectionAndWriteTest(AutoBase):
-    def test_untitled_campaign_seal_writes_korean_title(self):  # A1
+    def test_untitled_campaign_seal_writes_the_title_to_meta_json_in_one_call(self):  # A1
         begun = self.seal(key="ax-train", slug="train")
         cdir = self.cdir(begun)
         campaign_before = (cdir / "campaign.json").read_bytes()
         manifests_before = {path: path.read_bytes() for path in cdir.rglob("manifest.json")}
-        invoke = fake("AX 명령어 모델 학습")
+        invoke = unified("AX 명령어 모델 학습")
         result = self.auto(begun, invoke)
         self.assertEqual(result["status"], "ok")
         self.assertEqual([row["status"] for row in result["targets"]], ["written"])
-        self.assertEqual(result["targets"][0]["reason"], "missing")
-        document = self.declaration()
-        self.assertEqual(document["schema"], repair.DECLARATION_SCHEMA)
-        self.assertEqual(document["ruleset"], repair.DEFAULT_RULESET)
-        (entry,) = document["entries"]
-        self.assertEqual(entry["display_title"], "AX 명령어 모델 학습")
-        rows = repair.manifest_rows(cdir)
-        self.assertEqual(entry["manifest_bindings"], [{"manifest_revision_id": rows[0]["manifest_revision_id"],
-                                                        "manifest_digest": rows[0]["manifest_digest"]}])
-        self.assertEqual(entry["manifest_revision_ids"], [rows[0]["manifest_revision_id"]])
-        self.assertEqual(entry["manifest_digests"], [rows[0]["manifest_digest"]])
-        repair.check_cairn_declaration(document, fixture.ROOT_ID)
+        self.assertEqual(result["targets"][0]["display_title"], "AX 명령어 모델 학습")
+        self.assertEqual(len(invoke.calls), 1)  # one judgement decides groups, titles, summaries, and tags
+        doc = self.meta(begun)
+        self.assertEqual((doc["campaign"]["title"], doc["campaign"]["source"]["title"]["by"]), ("AX 명령어 모델 학습", "model"))
+        self.assertEqual((doc["campaign"]["short_id"], doc["campaign"]["branches"]), ("GEN-01", ["GEN"]))
+        self.assertEqual(doc["cycles"][begun["cycle_id"]]["title"], "AX 명령어 모델 학습 사이클")
+        self.assertFalse(self.declaration_path.exists())  # the old declaration is never written
         self.assertEqual((cdir / "campaign.json").read_bytes(), campaign_before)
         self.assertEqual({path: path.read_bytes() for path in cdir.rglob("manifest.json")}, manifests_before)
-        (line,) = self.log_rows()
-        self.assertEqual((line["status"], line["campaign_id"], line["harness"]), ("written", begun["campaign_id"], "claude"))
-        data = data_of(invoke.calls[0])
-        self.assertEqual(data["campaign"]["current_title"], "ax-train")
-        self.assertEqual(len(data["documents"]), 1)
+        self.assertTrue(any(e["field"] == "campaign.title" for e in M.H.iter_events(self.root)))
+        self.assertEqual(data_of(invoke.calls[0])["campaign"]["campaign_id"], begun["campaign_id"])
 
-    def test_human_korean_title_is_never_touched(self):  # A2
-        with_entry = self.seal(key="human-a", slug="a")
-        without_entry = self.seal(key="human-b", slug="b")
-        entry_dir, record_dir = self.cdir(with_entry), self.cdir(without_entry)
-        self.write_declaration([self.entry(entry_dir, "사람이 정한 한글 제목")])
-        self.set_campaign_title(record_dir, "기록에 있는 한글 제목")
+    def test_declaration_titles_are_a_persons_and_stay(self):  # A2, A3, A4
+        titled = self.seal(key="human-a", slug="a")
+        ascii_title = self.seal(key="asciiproj", slug="b")
+        slug_equal = self.seal(key="slug-eq", slug="c")
+        record_only = self.seal(key="human-d", slug="d")
+        self.write_declaration([self.entry(self.cdir(titled), "사람이 정한 한글 제목"),
+                                self.entry(self.cdir(ascii_title), "Human Chosen Name"),
+                                self.entry(self.cdir(slug_equal), "slug-eq")], custom="preserved")
+        self.set_campaign_title(self.cdir(record_only), "기록에 있는 한글 제목")
         before = self.declaration_path.read_bytes()
-        invoke = fake("자동 제목이다")
-        result = repair.auto_title(self.root, mode="explicit", invoke=invoke)
-        self.assertEqual((invoke.calls, result["targets"], result["protected"]), ([], [], 2))
+        campaign_json = (self.cdir(record_only) / "campaign.json").read_bytes()
+        invoke = unified("자동 제목이다")
+        result = repair.auto_title(self.root, mode="backfill", invoke=invoke)
+        self.assertEqual(len(invoke.calls), 4)
+        by_id = {row["campaign_id"]: row for row in result["targets"]}
+        for begun, title in ((titled, "사람이 정한 한글 제목"), (ascii_title, "Human Chosen Name"), (slug_equal, "slug-eq")):
+            doc = self.meta(begun)
+            self.assertEqual((doc["campaign"]["title"], doc["campaign"]["source"]["title"]["by"]), (title, "human"))
+            self.assertEqual(by_id[begun["campaign_id"]]["status"], "skipped")
+            self.assertEqual(doc["campaign"]["summary"], "한 일과 결과를 한 줄로 적음")  # only the title is held
+        self.assertEqual(self.meta(record_only)["campaign"]["title"], "자동 제목이다")  # campaign.json is no declaration
+        self.assertEqual(by_id[record_only["campaign_id"]]["status"], "written")
         self.assertEqual(self.declaration_path.read_bytes(), before)
-        self.assertEqual(self.log_rows(), [])
+        self.assertEqual((self.cdir(record_only) / "campaign.json").read_bytes(), campaign_json)
+        # a person can hand any of them back to the model, and the next run fills it
+        M.run_write(self.root, lambda ws: M.op_release(ws, titled["campaign_id"], None, ["title"]), now=NOW)
+        repair.auto_title(self.root, mode="explicit", campaign_ids=[titled["campaign_id"]], invoke=unified("다시 맡긴 제목"))
+        self.assertEqual(self.meta(titled)["campaign"]["title"], "사람이 정한 한글 제목")  # filled only by a new judgement
+        self.seal(key="human-a", slug="a2")  # the next seal's judgement refills the released field
+        self.auto(titled, unified("다시 맡긴 제목"))
+        self.assertEqual(self.meta(titled)["campaign"]["title"], "다시 맡긴 제목")
+        self.assertEqual(self.declaration_path.read_bytes(), before)
 
-    def test_human_ascii_title_differing_from_key_is_protected(self):  # A3
-        begun = self.seal(key="asciiproj", slug="a")
-        cdir = self.cdir(begun)
-        self.write_declaration([self.entry(cdir, "Human Chosen Name")])
-        selection = repair.select_auto_targets(self.root)
-        self.assertEqual(selection.targets, [])
-        self.assertEqual([row["code"] for row in selection.protected], ["human"])
-        invoke = fake("자동 제목이다")
-        self.auto(begun, invoke)
-        self.assertEqual(invoke.calls, [])
-
-    def test_slug_equal_entry_is_a_target_and_others_stay(self):  # A4
-        slug_case = self.seal(key="slug-eq", slug="a")
-        first_title_case = self.seal(key="first-title", slug="b")
-        kept = self.seal(key="kept-one", slug="c")
-        slug_dir, title_dir, kept_dir = self.cdir(slug_case), self.cdir(first_title_case), self.cdir(kept)
-        self.set_manifest_title(title_dir, "Original English Title")
-        kept_entry = self.entry(kept_dir, "그대로 두는 제목")
-        self.write_declaration([self.entry(slug_dir, "slug-eq"), self.entry(title_dir, "Original English Title"), kept_entry],
-                               ruleset="convention-x", custom="preserved")
-        selection = repair.select_auto_targets(self.root)
-        self.assertEqual(sorted((t.locator, t.reason) for t in selection.targets),
-                         sorted([(slug_dir.name, "entry-key"), (title_dir.name, "entry-key")]))
-        titles = iter(["슬러그 대신 쓰는 제목", "영문 제목 대신 쓰는 제목"])
-        result = repair.auto_title(self.root, mode="backfill",
-                                   invoke=lambda prompt: (json.dumps({"display_title": next(titles)}, ensure_ascii=False), "codex"))
-        self.assertEqual([row["status"] for row in result["targets"]], ["written", "written"])
-        document = self.declaration()
-        self.assertEqual((document["ruleset"], document["custom"]), ("convention-x", "preserved"))
-        by_id = {row["campaign_id"]: row for row in document["entries"]}
-        self.assertEqual(by_id[kept["campaign_id"]], kept_entry)
-        self.assertEqual([row["campaign_id"] for row in document["entries"]], sorted(by_id))
-        self.assertTrue(all(repair.HANGUL_RE.search(by_id[cid]["display_title"])
-                            for cid in (slug_case["campaign_id"], first_title_case["campaign_id"])))
-        repair.check_cairn_declaration(document, fixture.ROOT_ID)
-
-    def test_model_failure_keeps_seal_and_declaration(self):  # A5
+    def test_model_failure_and_trigger_failures_keep_the_seal_and_write_nothing(self):  # A5
         begun = self.seal(key="fails", slug="a")
+        before = {row[0]: row[3] for row in tree_snapshot(self.root) if "workflow-group-review" not in row[0] and row[3]}
         result = self.auto(begun, raw(""))
-        self.assertEqual(result["targets"][0]["status"], "failed")
-        self.assertEqual(result["targets"][0]["failure_class"], "unavailable")
-        self.assertFalse(self.declaration_path.exists())
-        (line,) = self.log_rows()
-        self.assertEqual((line["status"], line["failure_class"]), ("failed", "unavailable"))
+        self.assertEqual((result["targets"][0]["status"], result["targets"][0]["failure_class"]), ("failed", "unavailable"))
+        after = {row[0]: row[3] for row in tree_snapshot(self.root) if "workflow-group-review" not in row[0] and row[3]}
+        self.assertEqual(after, before)
+        self.assertIsNone(self.meta(begun))
+        self.assertEqual(self.record()["cycles"][begun["cycle_id"]]["failure_class"], "unavailable")
         raising = self.ready(key="hook", slug="hook-raises")
-        with patch.object(repair, "launch_after_seal", side_effect=RuntimeError("boom")):
+        with patch.object(R, "launch_after_seal", side_effect=RuntimeError("boom")):
             self.finalize(raising)
         self.assertEqual(P.read_cycle_record(self.root, raising["cycle_id"])["state"], "sealed")
         spawning = self.ready(key="spawn", slug="spawn-fails")
         with patch.object(R, "in_test_process", return_value=False), \
-                patch.object(repair.subprocess, "Popen", side_effect=OSError("no fork")) as popen:
+                patch.object(R.subprocess, "Popen", side_effect=OSError("no fork")) as popen:
             self.finalize(spawning)
-        self.assertTrue(any("auto" in call.args[0] for call in popen.call_args_list))
+        self.assertTrue(any("--auto" in call.args[0] for call in popen.call_args_list))
         self.assertEqual(P.read_cycle_record(self.root, spawning["cycle_id"])["state"], "sealed")
         self.assertTrue(list(self.cdir(spawning).rglob("manifest.json")))
 
-    def test_invalid_responses_are_rejected(self):  # A6
+    def test_invalid_responses_are_rejected_and_the_title_rules_are_the_public_limits(self):  # A6
         begun = self.seal(key="invalid", slug="a")
-        other = self.seal(key="other", slug="b")
-        cdir = self.cdir(begun)
-        self.set_manifest_title(cdir, "원래 제목 그대로")
-        self.set_campaign_title(self.cdir(other), "겹치는 제목")
-        cases = {
-            "no-korean": "Train Model",
-            "too-long": "가" * 35,
-            "generic": "요약",
-            "key-equal": "원래 제목 그대로",
-            "duplicate": "겹치는 제목",
-            "keys": '{"display_title": "한글 제목", "extra": 1}',
-            "control": '{"display_title": "가나\\n다라"}',
-            "parse": "not json at all",
-            "empty": '{"display_title": "  "}',
-        }
-        for code, reply in cases.items():
+        entity = lambda **o: {"title": "정상 제목", "summary": "요약", "branches": ["GEN"], "kinds": ["평가"], **o}  # noqa: E731
+
+        def reply(title="정상 제목", extra=None):
+            def invoke(prompt):
+                data = data_of(prompt)
+                vocab = [item["code"] for item in data["project_meta"]["branches"]]
+                body = {"decisions": [{"cycle_id": c, "verdict": "none", "reason": "r"} for c in data["group_target_ids"]],
+                        "new_groups": [], "relations": [],
+                        "metadata": {"campaign": entity(title=title, branches=[vocab[0] if vocab else "GEN"]),
+                                     "cycles": {c: entity(branches=[vocab[0] if vocab else "GEN"])
+                                                for c in data["metadata_target_ids"]}},
+                        "new_branches": [] if vocab else [{"code": "GEN", "label": "일반", "note": ""}]}
+                body.update(extra or {})
+                return json.dumps(body, ensure_ascii=False), "claude"
+            return invoke
+
+        rejected = {"too-long": reply("가" * 121), "empty": reply("  "), "control": reply("가나\x01다라"),
+                    "extra-key": reply(extra={"display_title": "x"}), "parse": raw("not json at all")}
+        for code, invoke in rejected.items():
             with self.subTest(code):
-                text = reply if reply.startswith("{") or code == "parse" else json.dumps({"display_title": reply}, ensure_ascii=False)
-                result = self.auto(begun, raw(text))
-                self.assertEqual((result["targets"][0]["status"], result["targets"][0]["code"]), ("failed", code))
-                self.assertEqual(result["targets"][0]["failure_class"], "invalid-response")
+                self.seal(key="invalid", slug=f"bad-{code}")  # a fresh cycle: failed ones stop after three hard failures
+                result = self.auto(begun, invoke)
+                self.assertEqual((result["targets"][0]["status"], result["targets"][0]["failure_class"]),
+                                 ("failed", "invalid-response"))
+                self.assertIsNone(self.meta(begun))
                 self.assertFalse(self.declaration_path.exists())
-                self.assertEqual(self.log_rows()[-1]["code"], code)
+        # the old 34-character, Hangul-minimum, and generic-label rules are not copied: the model judges meaning
+        for ok, title in (("long", "가" * 120), ("ascii", "Train Model v8"), ("generic", "요약")):
+            with self.subTest(ok):
+                self.seal(key="invalid", slug=f"again-{ok}")
+                result = self.auto(begun, reply(title))
+                self.assertEqual(result["targets"][0]["status"], "written", result)
+                self.assertEqual(self.meta(begun)["campaign"]["title"], title)
         with self.subTest("fenced"):
-            fenced = "```json\n" + json.dumps({"display_title": "펜스로 감싼 정상 제목", "reason": "ok"}, ensure_ascii=False) + "\n```\n끝."
-            self.assertEqual(self.auto(begun, raw(fenced))["targets"][0]["status"], "written")
+            self.seal(key="invalid", slug="again-fenced")
+
+            def fenced(prompt):
+                text, harness = reply("펜스로 감싼 정상 제목")(prompt)
+                return "```json\n" + text + "\n```\n끝.", harness
+
+            self.assertEqual(self.auto(begun, fenced)["targets"][0]["status"], "written")
 
     def test_failure_is_retried_at_next_seal(self):  # A7
         begun = self.seal(key="retry", slug="first", now=PAST)
         self.assertEqual(self.auto(begun, raw(""))["targets"][0]["status"], "failed")
         self.seal(key="retry", slug="second", now=PAST + 100)
-        result = self.auto(begun, fake("다시 시도해서 얻은 제목"))
+        result = self.auto(begun, unified("다시 시도해서 얻은 제목"))
         self.assertEqual(result["targets"][0]["status"], "written")
-        self.assertEqual([row["status"] for row in self.log_rows()], ["failed", "written"])
+        self.assertEqual(self.meta(begun)["campaign"]["title"], "다시 시도해서 얻은 제목")
+        self.assertEqual({self.record()["cycles"][cid]["verdict"] for cid in self.meta(begun)["cycles"]}, {"unassigned"})
 
-    def test_later_sealed_cycle_needs_no_new_entry(self):  # A8
+    def test_a_later_sealed_cycle_gets_its_own_metadata_and_refreshes_the_campaign_summary(self):  # A8
         begun = self.seal(key="later", slug="first", now=PAST)
-        self.assertEqual(self.auto(begun, fake("처음 봉인에서 얻은 제목"))["targets"][0]["status"], "written")
-        entry_before = self.declaration()["entries"][0]
-        self.seal(key="later", slug="second", now=PAST + 100)
-        invoke = fake("두 번째 제목이다")
-        result = self.auto(begun, invoke)
-        self.assertEqual((invoke.calls, result["targets"], result["protected"]), ([], [], 1))
-        self.assertEqual(self.declaration()["entries"][0], entry_before)
-        cdir = self.cdir(begun)
-        self.assertEqual(len(repair.manifest_rows(cdir)), 2)
-        self.assertTrue(repair.manifest_bindings_contain(
-            repair.manifest_binding_fields(repair.manifest_rows(cdir))[0], repair.entry_manifest_bindings(entry_before)))
+        self.assertEqual(self.auto(begun, unified("처음 봉인에서 얻은 제목", "첫 요약"))["targets"][0]["status"], "written")
+        declaration_exists = self.declaration_path.exists()
+        second = self.seal(key="later", slug="second", now=PAST + 100)
+        invoke = unified("두 번째 제목이다", "갱신한 요약")
+        result = self.auto(second, invoke)
+        self.assertEqual(len(invoke.calls), 1)
+        self.assertEqual(data_of(invoke.calls[0])["metadata_target_ids"], [second["cycle_id"]])  # the first cycle is not re-sent
+        doc = self.meta(second)
+        self.assertEqual(set(doc["cycles"]), {begun["cycle_id"], second["cycle_id"]})
+        self.assertEqual((doc["campaign"]["summary"], doc["campaign"]["title"]), ("갱신한 요약", "두 번째 제목이다"))
+        self.assertEqual(result["targets"][0]["status"], "written")
+        self.assertEqual(self.declaration_path.exists(), declaration_exists)  # still no declaration written
+        self.assertEqual(doc["cycles"][begun["cycle_id"]]["title"], "처음 봉인에서 얻은 제목 사이클")
 
-    def test_no_sealed_manifest_waits(self):  # A9
+    def test_a_campaign_without_a_sealed_cycle_is_not_sent(self):  # A9
         route, route_file = self.route(slug="open", campaign_key="open-camp")
         P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct",
                 campaign_key="open-camp")
-        invoke = fake("열린 캠페인 제목")
+        invoke = unified("열린 캠페인 제목")
         result = repair.auto_title(self.root, mode="explicit", invoke=invoke)
-        self.assertEqual((invoke.calls, result["targets"], result["waiting"]), ([], [], 1))
+        self.assertEqual((invoke.calls, result["targets"]), ([], []))
 
-    def test_unreadable_declaration_is_never_overwritten(self):  # A10
+    def test_an_unreadable_or_foreign_declaration_is_kept_and_protects_the_title(self):  # A10
         begun = self.seal(key="unreadable", slug="a")
         for label, payload in (("broken", b"{not json"),
                                ("other-root", json.dumps({"schema": repair.DECLARATION_SCHEMA,
@@ -505,16 +512,19 @@ class AutoSelectionAndWriteTest(AutoBase):
                                                           "entries": []}).encode())):
             with self.subTest(label):
                 self.declaration_path.write_bytes(payload)
-                invoke = fake("덮어쓰면 안 되는 제목")
+                self.seal(key="unreadable", slug=f"again-{label}")
+                invoke = unified("덮어쓰면 안 되는 제목")
                 result = self.auto(begun, invoke)
-                self.assertEqual(result["status"], "declaration-unreadable")
-                self.assertEqual(invoke.calls, [])
+                self.assertEqual(len(invoke.calls), 1)  # the rest of the judgement is not held back
+                self.assertEqual(result["targets"][0]["status"], "skipped")
+                self.assertNotIn("title", self.meta(begun)["campaign"])
+                self.assertEqual(self.meta(begun)["campaign"]["summary"], "한 일과 결과를 한 줄로 적음")
                 self.assertEqual(self.declaration_path.read_bytes(), payload)
 
     def test_dry_run_writes_nothing(self):  # A11
         begun = self.seal(key="dry", slug="a")
         before = tree_snapshot(self.root)
-        result = self.auto(begun, fake("미리 보는 제목이다"), dry_run=True)
+        result = self.auto(begun, unified("미리 보는 제목이다"), dry_run=True)
         self.assertEqual(result["status"], "dry-run")
         self.assertEqual((result["targets"][0]["status"], result["targets"][0]["display_title"]),
                          ("proposed", "미리 보는 제목이다"))
@@ -522,33 +532,32 @@ class AutoSelectionAndWriteTest(AutoBase):
         self.assertEqual(failed["targets"][0]["failure_class"], "unavailable")
         self.assertEqual(tree_snapshot(self.root), before)
 
-    def test_busy_lock_returns_busy(self):  # A14
+    def test_busy_review_lock_returns_busy_and_leaves_a_pending_marker(self):  # A14
         begun = self.seal(key="busy", slug="a")
-        held = R._try_flock(self.root, self.root / repair.AUTO_LOCK_REL)
+        held = R._try_flock(self.root)
         self.assertIsNotNone(held)
         try:
-            invoke = fake("바쁠 때 제목")
+            invoke = unified("바쁠 때 제목")
             result = self.auto(begun, invoke)
         finally:
             R._unlock(held)
         self.assertEqual((result["status"], result["targets"], invoke.calls), ("busy", [], []))
         self.assertEqual(result["queued"], [begun["campaign_id"]])
-        self.assertEqual(repair._pending_ids(self.root), [begun["campaign_id"]])
-        self.assertEqual(self.auto(begun, fake("이제는 쓰는 제목"))["targets"][0]["status"], "written")
-        self.assertEqual(repair._pending_ids(self.root), [])
+        self.assertEqual(R._pending_ids(self.root), [begun["cycle_id"]])
+        self.assertEqual(self.auto(begun, unified("이제는 쓰는 제목"))["targets"][0]["status"], "written")
+        self.assertEqual(R._pending_ids(self.root), [])
 
-    def test_campaign_sealed_while_another_run_holds_the_lock_is_titled(self):  # A14b
+    def test_campaign_sealed_while_another_run_holds_the_lock_is_judged_by_that_run(self):  # A14b
         first = self.seal(key="race-first", slug="a")
         paused, resume = threading.Event(), threading.Event()
-        titles = iter(["첫 번째 캠페인 제목", "두 번째 캠페인 제목"])
         seen = []
 
         def invoke(prompt):
-            seen.append(data_of(prompt)["campaign"]["current_title"])
+            seen.append(data_of(prompt)["campaign"]["campaign_id"])
             if len(seen) == 1:
                 paused.set()  # the first run has selected its targets and holds the lock
                 self.assertTrue(resume.wait(30))
-            return json.dumps({"display_title": next(titles), "reason": "근거 한 문장"}, ensure_ascii=False), "claude"
+            return unified(f"{len(seen)}번째 캠페인 제목")(prompt)
 
         outcome = {}
         worker = threading.Thread(target=lambda: outcome.update(repair.auto_title(
@@ -557,69 +566,57 @@ class AutoSelectionAndWriteTest(AutoBase):
         try:
             self.assertTrue(paused.wait(30))
             second = self.seal(key="race-second", slug="b")
-            busy = self.auto(second, fake("호출되면 안 되는 제목"))
+            busy = self.auto(second, unified("호출되면 안 되는 제목"))
             self.assertEqual((busy["status"], busy["targets"]), ("busy", []))
-            self.assertEqual(repair._pending_ids(self.root), [second["campaign_id"]])
-            self.assertIn(("queued", "busy-pending"), [(row["status"], row.get("code")) for row in self.log_rows()])
+            self.assertEqual(R._pending_ids(self.root), [second["cycle_id"]])
         finally:
             resume.set()
             worker.join(60)
         self.assertFalse(worker.is_alive())
         self.assertEqual(outcome["status"], "ok")
-        self.assertEqual([row["campaign_id"] for row in outcome["targets"]],
-                         [first["campaign_id"], second["campaign_id"]])
+        self.assertEqual([row["campaign_id"] for row in outcome["targets"]], [first["campaign_id"], second["campaign_id"]])
         self.assertEqual([row["status"] for row in outcome["targets"]], ["written", "written"])
-        titled = {entry["campaign_id"] for entry in self.declaration()["entries"]}
-        self.assertEqual(titled, {first["campaign_id"], second["campaign_id"]})
-        self.assertEqual(repair._pending_ids(self.root), [])
-        self.assertEqual([row["status"] for row in self.log_rows()], ["queued", "written", "written"])
-        self.assertEqual(self.log_rows()[2]["mode"], "pending")
+        self.assertEqual(R._pending_ids(self.root), [])
+        self.assertEqual({self.record()["cycles"][c]["mode"] for c in (first["cycle_id"], second["cycle_id"])}, {"auto"})
 
-    def test_seal_queued_during_the_final_pass_is_handed_off_once(self):
+    def test_a_seal_queued_during_the_final_pass_waits_for_the_next_seal_without_a_second_job(self):
         first = self.seal(key="cap-first", slug="a")
-        late = self.seal(key="cap-late", slug="b")
+        late = self.seal(key="cap-late", slug="b", now=PAST)  # sealed before enrollment: reached only as a pending trigger
         calls = []
 
         def invoke(prompt):
             calls.append(prompt)
-            repair._touch_pending(self.root, late["campaign_id"])  # queued while the final pass runs
-            return json.dumps({"display_title": "마지막 패스 제목", "reason": "근거 한 문장"}, ensure_ascii=False), "claude"
+            R._touch_pending(self.root, late["cycle_id"])  # queued while the final pass runs
+            return unified("마지막 패스 제목")(prompt)
 
         with patch.object(R, "MAX_PASSES", 1), patch.object(R, "in_test_process", return_value=False), \
-                patch.object(repair.subprocess, "Popen") as popen:
+                patch.object(R.subprocess, "Popen") as popen:
             result = repair.auto_title(self.root, campaign_ids=[first["campaign_id"]], mode="seal", invoke=invoke)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual([row["status"] for row in result["targets"]], ["written"])
-        popen.assert_called_once()
-        argv = popen.call_args.args[0]
-        self.assertEqual(argv[2:], ["auto", "--artifact-root", str(self.root), "--campaign", late["campaign_id"],
-                                    "--mode", "seal"])
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertEqual(repair._pending_ids(self.root), [late["campaign_id"]])  # left for the follow-up run
-        with patch.object(R, "in_test_process", return_value=False), patch.object(repair.subprocess, "Popen") as popen:
-            repair.auto_title(self.root, campaign_ids=[late["campaign_id"]], mode="seal", invoke=fake("따라온 제목"))
-        popen.assert_not_called()  # a run that drains everything hands nothing off
-        self.assertEqual(repair._pending_ids(self.root), [])
+        self.assertEqual((len(calls), [row["status"] for row in result["targets"]]), (1, ["written"]))
+        popen.assert_not_called()  # no title-only follow-up child exists any more
+        self.assertEqual(R._pending_ids(self.root), [late["cycle_id"]])  # kept for the next sweep
+        repair.auto_title(self.root, campaign_ids=[late["campaign_id"]], mode="seal", invoke=unified("따라온 제목"))
+        self.assertEqual(R._pending_ids(self.root), [])
+        self.assertEqual(self.meta(late)["campaign"]["title"], "따라온 제목")
 
-    def test_pending_marker_for_an_already_titled_campaign_is_cleared(self):
+    def test_pending_marker_for_an_already_judged_cycle_is_cleared_and_junk_is_ignored(self):
         begun = self.seal(key="stale", slug="a")
-        self.assertEqual(self.auto(begun, fake("이미 제목이 있는 캠페인"))["targets"][0]["status"], "written")
-        repair._touch_pending(self.root, begun["campaign_id"])
-        repair._touch_pending(self.root, "not-a-campaign")
-        self.assertEqual(repair._pending_ids(self.root), [begun["campaign_id"]])
-        invoke = fake("다시 쓰면 안 되는 제목")
+        self.assertEqual(self.auto(begun, unified("이미 제목이 있는 캠페인"))["targets"][0]["status"], "written")
+        R._touch_pending(self.root, begun["cycle_id"])
+        R.pending_dir(self.root).joinpath("not-a-cycle").touch()
+        self.assertEqual(R._pending_ids(self.root), [begun["cycle_id"]])
+        invoke = unified("다시 쓰면 안 되는 제목")
         repair.auto_title(self.root, campaign_ids=[begun["campaign_id"]], mode="seal", invoke=invoke)
-        self.assertEqual((invoke.calls, repair._pending_ids(self.root)), ([], []))
-
+        self.assertEqual((invoke.calls, R._pending_ids(self.root)), ([], []))
 
 
 class AutoTriggerAndCliTest(AutoBase):
     def spawned(self):
-        return patch.object(repair.subprocess, "Popen")
+        return patch.object(R.subprocess, "Popen")
 
-    def test_trigger_rules(self):  # A12
+    def test_trigger_is_the_one_review_launch(self):  # A12
         begun = self.seal(key="trigger", slug="a")
-        record = {"campaign_id": begun["campaign_id"]}
+        record = {"campaign_id": begun["campaign_id"], "cycle_id": begun["cycle_id"]}
         with self.spawned() as popen:
             self.assertFalse(repair.launch_after_seal(self.root, record))  # test process
         popen.assert_not_called()
@@ -628,15 +625,16 @@ class AutoTriggerAndCliTest(AutoBase):
                 self.assertTrue(repair.launch_after_seal(self.root, record))
             popen.assert_called_once()
             argv = popen.call_args.args[0]
-            self.assertEqual(argv[1], str(Path(repair.__file__).resolve()))
-            self.assertEqual(argv[2:], ["auto", "--artifact-root", str(self.root), "--campaign",
-                                        begun["campaign_id"], "--mode", "seal"])
+            self.assertEqual(argv[1], str(Path(R.__file__).resolve()))  # the review, never a title child
+            self.assertEqual(argv[2:], ["sweep", "--artifact-root", str(self.root), "--auto", "--cycle", begun["cycle_id"]])
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            with self.spawned() as popen, patch.dict(os.environ, {R.DISABLE_ENV: "off"}):
+                self.assertFalse(repair.launch_after_seal(self.root, record))  # the review switch stops it
             with self.spawned() as popen, patch.dict(os.environ, {repair.AUTO_DISABLE_ENV: "off"}):
-                self.assertFalse(repair.launch_after_seal(self.root, record))
+                self.assertTrue(repair.launch_after_seal(self.root, record))  # the title switch does not
             with self.spawned() as popen:
                 self.assertFalse(repair.launch_after_seal(self.root / "nowhere", record))
-                self.assertFalse(repair.launch_after_seal(self.root, {"campaign_id": "not-a-campaign"}))
+                self.assertFalse(repair.launch_after_seal(self.root, {"cycle_id": "not-a-cycle"}))
                 self.assertFalse(repair.launch_after_seal(self.root, {}))
             popen.assert_not_called()
 
@@ -650,14 +648,25 @@ class AutoTriggerAndCliTest(AutoBase):
             {"artifact_root_id": "root_" + "c" * 32, "artifact_root_path": str(copy)},
             {"artifact_root_id": "root_" + "d" * 32, "artifact_root_path": str(copy / "missing")},
         ]}), encoding="utf-8")
-        result = repair.backfill_roots(roots, invoke=fake("소급 적용한 제목"))
+        result = repair.backfill_roots(roots, invoke=unified("소급 적용한 제목"))
         first, mismatch, missing = result["roots"]
         self.assertEqual((first["status"], first["targets"], first["written"], first["display_name"]), ("ok", 1, 1, "main"))
         self.assertEqual([(row["status"], row["code"]) for row in (mismatch, missing)],
                          [("skipped", "root-identity-mismatch")] * 2)
         self.assertEqual((result["totals"]["targets"], result["totals"]["written"], result["totals"]["failed"]), (1, 1, 0))
+        self.assertIsNone(M.read_campaign_meta(copy, begun["campaign_id"]).doc)  # the mismatched root is untouched
         self.assertFalse((copy / repair.DISPLAY_TITLE_REL).exists())
-        self.assertEqual(self.log_rows()[0]["campaign_id"], begun["campaign_id"])
+        self.assertEqual(self.record()["cycles"][begun["cycle_id"]]["mode"], "explicit")
+        again = repair.backfill_roots(roots, invoke=unified("두 번째 소급은 비어 있음"))
+        self.assertEqual(again["totals"]["targets"], 0)  # a fill-in run skips what already has metadata
+
+    def test_auto_backfill_and_the_review_sweep_are_one_job(self):
+        begun = self.seal(key="one-job", slug="a")
+        invoke = unified("같은 일을 하는 제목")
+        with patch.object(R, "_invoke_model", side_effect=AssertionError("no second model path")):
+            repair.auto_title(self.root, campaign_ids=[begun["campaign_id"]], mode="explicit", invoke=invoke)
+        self.assertEqual(len(invoke.calls), 1)  # the wrapper adds no model call of its own
+        self.assertEqual(self.meta(begun)["campaign"]["title"], "같은 일을 하는 제목")
 
     def test_cli_auto_and_backfill(self):  # A15
         begun = self.seal(key="cli", slug="a")
@@ -670,10 +679,11 @@ class AutoTriggerAndCliTest(AutoBase):
             self.assertEqual(len(lines), 1)
             return code, json.loads(lines[0])
 
-        with patch.object(repair, "_default_invoke", return_value=(json.dumps({"display_title": "명령줄로 만든 제목"}, ensure_ascii=False), "claude")):
+        answer = unified("명령줄로 만든 제목")
+        with patch.object(repair, "_default_invoke", side_effect=lambda prompt: answer(prompt)):
             code, result = run("auto", "--artifact-root", str(self.root), "--campaign", begun["campaign_id"], "--dry-run")
             self.assertEqual((code, result["status"], result["targets"][0]["status"]), (0, "dry-run", "proposed"))
-            self.assertFalse(self.declaration_path.exists())
+            self.assertIsNone(self.meta(begun))
             roots = Path(self._tmp.name) / "cli-roots.json"
             roots.write_text(json.dumps({"roots": [{"artifact_root_id": fixture.ROOT_ID,
                                                     "artifact_root_path": str(self.root)}]}), encoding="utf-8")
@@ -692,42 +702,44 @@ class AutoTriggerAndCliTest(AutoBase):
 
 
 class HumanRaceAndContractTest(AutoBase):
-    def test_human_apply_between_select_and_write_wins(self):  # A16
+    def test_a_declaration_applied_during_the_model_call_is_a_persons_title_and_wins(self):  # A16
         begun = self.seal(key="race-a", slug="a")
         cdir = self.cdir(begun)
 
         def invoke(prompt):
             self.human_apply(cdir, "사람이 그사이 정한 제목")
-            return json.dumps({"display_title": "자동으로 만든 제목"}, ensure_ascii=False), "claude"
+            return unified("자동으로 만든 제목")(prompt)
 
         result = self.auto(begun, invoke)
-        self.assertEqual((result["targets"][0]["status"], result["targets"][0]["code"]), ("skipped", "raced-human"))
+        self.assertEqual((result["targets"][0]["status"], result["targets"][0]["code"]),
+                         ("skipped", "title-protected-or-unchanged"))
+        campaign = self.meta(begun)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("사람이 그사이 정한 제목", "human"))
         (entry,) = self.declaration()["entries"]
-        self.assertEqual(entry["display_title"], "사람이 그사이 정한 제목")
+        self.assertEqual(entry["display_title"], "사람이 그사이 정한 제목")  # the declaration stays as the person left it
         self.assertEqual(repair.read_json(cdir / "campaign.json")["title"], "사람이 그사이 정한 제목")
-        (line,) = self.log_rows()
-        self.assertEqual((line["status"], line["code"]), ("skipped", "raced-human"))
 
-    def test_human_apply_after_auto_write_wins(self):  # A17
-        first = self.seal(key="race-b", slug="a", now=PAST)
-        second = self.seal(key="race-c", slug="b", now=PAST + 10)
-        self.assertEqual(self.auto(first, fake("자동으로 먼저 쓴 제목"))["targets"][0]["status"], "written")
-        self.assertEqual(self.auto(second, fake("다른 캠페인 자동 제목"))["targets"][0]["status"], "written")
-        other_entry = next(row for row in self.declaration()["entries"] if row["campaign_id"] == second["campaign_id"])
-        package, _ = self.human_apply(self.cdir(first), "사람이 나중에 정한 제목")
-        by_id = {row["campaign_id"]: row for row in self.declaration()["entries"]}
-        self.assertEqual(by_id[first["campaign_id"]]["display_title"], "사람이 나중에 정한 제목")
-        self.assertEqual(by_id[second["campaign_id"]], other_entry)
-        self.seal(key="race-b", slug="c", now=PAST + 20)
-        invoke = fake("무시되어야 하는 제목")
+    def test_a_person_setting_the_meta_title_after_the_auto_write_wins_and_stays(self):  # A17
+        first = self.seal(key="race-b", slug="a")
+        self.assertEqual(self.auto(first, unified("자동으로 먼저 쓴 제목"))["targets"][0]["status"], "written")
+        second = self.seal(key="race-c", slug="b")
+        self.assertEqual(self.auto(second, unified("다른 캠페인 자동 제목"))["targets"][0]["status"], "written")
+        M.run_write(self.root, lambda ws: M.op_set(ws, first["campaign_id"], None, {"title": "사람이 나중에 정한 제목"}),
+                    now=NOW)
+        self.assertEqual(self.meta(second)["campaign"]["title"], "다른 캠페인 자동 제목")
+        self.seal(key="race-b", slug="c")
+        invoke = unified("무시되어야 하는 제목")
         result = self.auto(first, invoke)
-        self.assertEqual((invoke.calls, result["targets"]), ([], []))
+        self.assertEqual(self.meta(first)["campaign"]["title"], "사람이 나중에 정한 제목")
+        self.assertEqual(result["targets"][0]["status"], "skipped")
+        # the old repair tool still writes its declaration, but meta.json is the canonical title now
+        self.human_apply(self.cdir(first), "옛 선언 도구로 정한 제목")
+        self.assertEqual(self.meta(first)["campaign"]["title"], "사람이 나중에 정한 제목")
+        self.assertEqual(M.effective_title(self.root, second["campaign_id"]), "다른 캠페인 자동 제목")
 
-    def test_busy_declaration_lock_fails_auto_and_restores_apply(self):  # A17
+    def test_busy_declaration_lock_still_restores_the_manual_repair(self):  # A17 (manual repair only)
         begun = self.seal(key="race-d", slug="a")
         cdir = self.cdir(begun)
-        selection = repair.select_auto_targets(self.root)
-        (target,) = selection.targets
         roots = Path(self._tmp.name) / "busy-roots.json"
         roots.write_text(json.dumps({"roots": [{"artifact_root_id": fixture.ROOT_ID,
                                                 "artifact_root_path": str(self.root)}]}), encoding="utf-8")
@@ -739,9 +751,6 @@ class HumanRaceAndContractTest(AutoBase):
         package["transaction_journal_path"] = str(Path(self._tmp.name) / "journal.json")
         campaign_before = (cdir / "campaign.json").read_bytes()
         with repair._declaration_lock(self.root):
-            with self.assertRaises(repair.AutoTitleError) as auto_error:
-                repair.write_auto_entry(self.root, target, "잠겨서 못 쓰는 제목", lock_timeout=0.05)
-            self.assertEqual((auto_error.exception.failure_class, auto_error.exception.code), ("write-failed", "busy"))
             with patch.object(repair, "REPAIR_LOCK_TIMEOUT", 0.05):
                 with self.assertRaisesRegex(repair.RepairError, "declaration-lock-busy"):
                     repair.apply(package)
@@ -756,7 +765,7 @@ class HumanRaceAndContractTest(AutoBase):
         self.assertEqual(self.declaration_path.read_bytes(), applied_declaration)
         self.assertEqual(repair.rollback(package)["status"], "rolled-back")
 
-    def test_written_declaration_passes_cairn_contract(self):  # A18
+    def test_the_cairn_declaration_reader_port_is_kept_and_auto_leaves_declarations_alone(self):  # A18
         single = self.seal(key="c-single", slug="a", now=PAST)
         multi = self.seal(key="c-multi", slug="b", now=PAST + 10)
         self.seal(key="c-multi", slug="c", now=PAST + 20)
@@ -766,10 +775,12 @@ class HumanRaceAndContractTest(AutoBase):
         for entry in (single_entry, multi_entry):
             self.assertTrue(all(re.fullmatch(r"mrev_[0-9a-f]{32}", rev) for rev in entry["manifest_revision_ids"]))
         self.write_declaration([single_entry, multi_entry])
-        self.assertEqual(self.auto(target, fake("계약을 통과하는 제목"))["targets"][0]["status"], "written")
+        before = self.declaration_path.read_bytes()
+        self.assertEqual(self.auto(target, unified("계약을 통과하는 제목"))["targets"][0]["status"], "written")
+        self.assertEqual(self.declaration_path.read_bytes(), before)  # auto never edits the declaration now
         document = self.declaration()
         repair.check_cairn_declaration(document, fixture.ROOT_ID)
-        self.assertEqual(len(document["entries"]), 3)
+        self.assertEqual(len(document["entries"]), 2)
 
         def broken(mutate):
             copy = json.loads(json.dumps(document))
@@ -799,48 +810,23 @@ class HumanRaceAndContractTest(AutoBase):
             with self.assertRaises(repair.AutoTitleError) as ctx:
                 repair.check_cairn_declaration(broken(bad_digest), fixture.ROOT_ID)
             self.assertEqual(ctx.exception.code, "cairn-contract:bindings-invalid")
-        with self.subTest("existing-row-already-wrong"):
-            wrong = json.loads(json.dumps(document))
-            wrong["entries"] = [row for row in wrong["entries"] if row["campaign_id"] != target["campaign_id"]]
-            wrong["entries"][0].update(manifest_bindings=[], manifest_revision_ids=[], manifest_digests=[])
-            self.declaration_path.write_text(json.dumps(wrong), encoding="utf-8")
-            before = self.declaration_path.read_bytes()
-            other = self.seal(key="c-other", slug="e", now=PAST + 40)
-            result = self.auto(other, fake("기존 행이 틀려서 못 쓰는 제목"))
-            self.assertEqual((result["targets"][0]["status"], result["targets"][0]["failure_class"]), ("failed", "write-failed"))
-            self.assertTrue(result["targets"][0]["code"].startswith("cairn-contract:"))
-            self.assertEqual(self.declaration_path.read_bytes(), before)
 
-    def test_anchor_change_before_write_skips(self):  # A19
-        for label in ("deleted", "changed"):
-            with self.subTest(label):
-                key = f"anchor-{label}"
-                first = self.seal(key=key, slug="first", now=PAST)
-                self.seal(key=key, slug="second", now=PAST + 100)
-                cdir = self.cdir(first)
-                anchor = min(cdir.rglob("manifest.json"), key=lambda path: json.loads(path.read_text())["cycle"]["cycle_id"] != first["cycle_id"])
-                self.assertEqual(json.loads(anchor.read_text())["cycle"]["cycle_id"], first["cycle_id"])
+    def test_membership_that_changes_during_the_call_is_refused_and_nothing_is_written(self):  # A19
+        first = self.seal(key="anchor-a", slug="first", now=PAST)
+        other = self.seal(key="anchor-b", slug="other", now=PAST + 5)
 
-                def invoke(prompt, anchor=anchor, label=label):
-                    if label == "deleted":
-                        anchor.unlink()
-                    else:
-                        manifest = json.loads(anchor.read_text())
-                        manifest["note"] = "changed after selection"
-                        anchor.write_text(json.dumps(manifest), encoding="utf-8")
-                    return json.dumps({"display_title": "앵커가 바뀐 제목"}, ensure_ascii=False), "claude"
+        def invoke(prompt):
+            path = P.cycle_record_path(self.root, first["cycle_id"])
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["campaign_id"] = other["campaign_id"]  # the producer's membership moved after selection
+            path.write_text(json.dumps(record), encoding="utf-8")
+            return unified("소속이 바뀐 제목")(prompt)
 
-                before = self.declaration_path.read_bytes() if self.declaration_path.exists() else None
-                result = self.auto(first, invoke)
-                self.assertEqual((result["targets"][0]["status"], result["targets"][0]["code"]), ("skipped", "anchor-changed"))
-                self.assertEqual(self.declaration_path.read_bytes() if self.declaration_path.exists() else None, before)
-                self.assertEqual(self.log_rows()[-1]["code"], "anchor-changed")
-                retry = self.auto(first, fake("새 앵커로 쓰는 제목 " + ("가" if label == "deleted" else "나")))
-                self.assertEqual(retry["targets"][0]["status"], "written", retry)
-                rows = repair.manifest_rows(cdir)
-                entry = next(row for row in self.declaration()["entries"] if row["campaign_id"] == first["campaign_id"])
-                self.assertTrue(repair.manifest_bindings_contain(rows, repair.entry_manifest_bindings(entry)))
-                repair.check_cairn_declaration(self.declaration(), fixture.ROOT_ID)
+        result = self.auto(first, invoke)
+        self.assertEqual((result["targets"][0]["status"], result["targets"][0]["failure_class"], result["targets"][0]["code"]),
+                         ("failed", "apply-failed", "cycle-not-member"))
+        self.assertIsNone(self.meta(first))
+        self.assertEqual([e for e in M.H.iter_events(self.root) if e["target"]["id"] in (first["campaign_id"], first["cycle_id"])], [])
 
 
 if __name__ == "__main__":

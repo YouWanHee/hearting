@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import fcntl, hashlib, importlib.util, json, os, stat, subprocess, sys, tempfile, time, threading, unittest
+import contextlib, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, unittest
 from unittest import mock
 from pathlib import Path
 
@@ -3231,6 +3231,100 @@ class DispatchContractTest(unittest.TestCase):
     foreign=WS.WorkflowLedger(route["route_id"],route["route_hash"],
                               root=base/"release-ambient")
     self.assertEqual(foreign.read_only_state()["workflow_state"],"CREATED")
+
+
+ def _owner_operation_route(self):
+  """`review` raises preview-disposition; `transaction` is the owner's own entry-bound operation."""
+  return {"dispatch_contract_version":3,"route_id":"rt-owner-op0000001","route_hash":"sha256:"+"8"*64,
+          "human_gates":["preview-disposition"],
+          "human_gate_bindings":[{"gate":"preview-disposition","node":"transaction","position":"entry"}],
+          "nodes":[{"id":"review","depends_on":[],"dispatch_depth":2,
+                    "continuation":{"kind":"human-gate","gate":"preview-disposition"}},
+                   {"id":"transaction","depends_on":["review"],"kind":"capability-owner",
+                    "unit":"_kernel/owner","dispatch_depth":1,"terminal":True,
+                    "write_scope":["target-artifact"]}]}
+
+ def _gate_journal(self,base,route,*events):
+  ledger=self._gate_ledger(base,route)
+  ledger.journal_path.parent.mkdir(parents=True,exist_ok=True)
+  with ledger.journal_path.open("a") as stream:
+   for state,evidence in events:
+    stream.write(json.dumps({"workflow_state":state,"evidence":evidence,"at":"2026-10-01T00:00:00Z"})+"\n")
+
+ def test_the_owner_operation_fence_wants_a_persons_release_of_the_current_preview(self):
+  """The same entry-fence rule the launch path uses, asked for the node the owner executes itself.
+
+  With `release_proof` a `proceed` must also be a person's (not a registered owner's) and the
+  released preview must be unchanged; without it the child-launch semantics are untouched."""
+  import hashlib
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route=self._owner_operation_route(); node=route["nodes"][1]
+   preview=base/"preview.md"; preview.write_text("the edit")
+   digest=hashlib.sha256(preview.read_bytes()).hexdigest()
+   raised=("BLOCKED_HUMAN_GATE",{"gate":"preview-disposition","artifact":str(preview),"artifact_sha256":digest})
+   proceed=lambda actor:("RUNNING",{"released_gate":"preview-disposition","decision":"proceed","actor_kind":actor})
+   jobs=base/"jobs.log"; jobs.write_text("")
+   def verdict(**kw):
+    try:
+     D.human_gate_entry_fence(route,node,jobs=jobs,**kw)
+    except D.DispatchContractError as exc:
+     return exc.reason
+    return "ok"
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    self.assertEqual(verdict(release_proof=True),"human-gate-not-raised")
+    self._gate_journal(base,route,raised)
+    self.assertEqual(verdict(release_proof=True),"human-gate-unreleased")
+    self._gate_journal(base,route,proceed("headless-owner"))
+    self.assertEqual(verdict(),"ok")                      # launch semantics unchanged
+    self.assertEqual(verdict(release_proof=True),"human-gate-unreleased")
+    self._gate_journal(base,route,raised,proceed("user"))
+    self.assertEqual(verdict(release_proof=True),"ok")
+    preview.write_text("a different edit")
+    with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):   # the opt-in same-work identity check
+     self.assertEqual(verdict(release_proof=True),"human-gate-unreleased")
+    with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()):
+     self.assertEqual(verdict(release_proof=True),"ok")           # off (the default): only reported, as everywhere else
+     preview.unlink()
+     self.assertEqual(verdict(release_proof=True),"human-gate-unreleased")   # a preview that is gone is unbound either way
+    preview.write_text("the edit")
+    self.assertEqual(verdict(release_proof=True),"ok")
+    for decision,event in (("revise",("RUNNING",{"released_gate":"preview-disposition","decision":"revise","actor_kind":"user"})),
+                           ("stop",("CANCELLED",{"gate":"preview-disposition","abandon_reason":"operator-decision","actor_kind":"user"}))):
+     self._gate_journal(base,route,raised,event)
+     self.assertEqual(verdict(release_proof=True),"human-gate-unreleased",decision)
+
+ def test_the_local_owner_operation_predicate_is_the_route_modules_own(self):
+  """Kept local so a write check never loads capability-route.py; it must not drift from the original."""
+  module=D._route_module()
+  base={"id":"transaction","kind":"capability-owner","unit":"_kernel/owner","dispatch_depth":1,"terminal":True}
+  for change in ({},{"terminal":False},{"terminal":None},{"kind":"map-worker"},{"unit":"editorial/review"},
+                 {"dispatch_depth":2},{"dispatch_depth":"1"},{"dispatch_depth":0}):
+   node={**base,**change}
+   self.assertEqual(D._owner_executed_node(node),module.owner_executed_terminal(node),change)
+  self.assertTrue(D._owner_executed_node(base))
+
+ def test_the_owner_operation_fence_ignores_nodes_and_gates_it_does_not_hold(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route=self._owner_operation_route()
+   jobs=base/"jobs.log"; jobs.write_text("")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    D.human_gate_entry_fence(route,route["nodes"][0],jobs=jobs,release_proof=True)   # the preview node itself
+    route["human_gate_bindings"]=[]
+    D.human_gate_entry_fence(route,route["nodes"][1],jobs=jobs,release_proof=True)   # no binding
+    # frame-review on an owner-executed node (a quick one-shot) is settled before the owner launches
+    route["human_gates"]=["frame-review"]
+    route["human_gate_bindings"]=[{"gate":"frame-review","node":"transaction","position":"entry"}]
+    route["nodes"][0]["continuation"]={"kind":"human-gate","gate":"frame-review"}
+    D.owner_operation_fence(route,route["nodes"][1],jobs=jobs)
+    self.assertEqual(D.owner_operation_gates(route),[])
+    with self.assertRaises(D.DispatchContractError):
+     D.human_gate_entry_fence(route,route["nodes"][1],jobs=jobs)          # the launch-side fence still asks
+   route=self._owner_operation_route()
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow2")}):
+    self.assertEqual([(n["id"],g) for n,g in D.owner_operation_gates(route)],[("transaction","preview-disposition")])
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.owner_operation_fence(route,route["nodes"][1],jobs=jobs)
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
 
  def test_a_binding_no_node_raises_is_not_fenced(self):
   """Historical routes may carry bindings that no node's continuation raises;

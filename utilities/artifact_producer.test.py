@@ -3808,6 +3808,16 @@ class RouteLaunchContextTest(ProducerTestBase):
         self.assertEqual(Path(env["AGENT_ARTIFACT_OUTPUT_DIR"]), Path(env["AGENT_ARTIFACT_CYCLE_DIR"]) / "artifacts")
 
 
+_ADMISSION_HOLDER = """
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+stat = os.fstat(fd)
+print("held", stat.st_dev, stat.st_ino, flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
 class OwnerLaunchBindingTest(ProducerTestBase):
     def _prepared_owner(self):
         from types import SimpleNamespace
@@ -3827,6 +3837,89 @@ class OwnerLaunchBindingTest(ProducerTestBase):
         args = SimpleNamespace(worker_type="owner", dispatch_depth=1, route_file=str(route_file),
                                owner_route_binding=None, attempt_id=owner)
         return route, route_file, launch_env, owner, args
+
+    def _hold_admission_lock(self, root, seconds):
+        """Hold the root's real admission flock from another process; return once it holds."""
+        lock_path = P.artifact_admission._lock_file_path(root)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen([sys.executable, "-c", _ADMISSION_HOLDER, str(lock_path), str(seconds)],
+                                  stdout=subprocess.PIPE, text=True)
+
+        def reap():
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        self.addCleanup(reap)
+        held = holder.stdout.readline().split()
+        self.assertEqual(held[0], "held")
+        stat = os.stat(P.artifact_admission._lock_file_path(root))
+        self.assertEqual((int(held[1]), int(held[2])), (stat.st_dev, stat.st_ino))
+        probe = os.open(str(lock_path), os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        return holder
+
+    def test_owner_launch_waits_out_a_briefly_held_admission_lock(self):
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        root = Path(route["artifact_root"]).resolve()
+        self._hold_admission_lock(root, 1.5)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}), \
+                mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 5.0, create=True):
+            result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+        self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+
+    def test_owner_launch_at_the_wait_bound_reports_admission_busy(self):
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        root = Path(route["artifact_root"]).resolve()
+        binding = P.dispatch_terminal_commit.producer_binding_path(self.root, route["route_id"], owner)
+        holder = self._hold_admission_lock(root, 30)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}), \
+                mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 1.0, create=True):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.bind_owner_launch(args, self.jobs, environ=launch_env)
+            self.assertEqual(caught.exception.code, "admission-busy")
+            self.assertIn("run start again later", caught.exception.detail)
+            self.assertFalse(binding.exists())
+            holder.kill()
+            holder.wait()
+            result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+        self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+
+    def _unbegun_route(self):
+        self.activate()
+        route, route_file = self.route()
+        root = Path(route["artifact_root"]).resolve()
+        self.assertEqual(list(P.list_cycle_records(root)), [])
+        return route, route_file, root
+
+    def test_owner_preparation_waits_out_a_briefly_held_admission_lock(self):
+        route, route_file, root = self._unbegun_route()
+        self._hold_admission_lock(root, 1.5)
+        with mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 5.0):
+            env = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+        self.assertTrue(env["AGENT_ARTIFACT_CYCLE_ID"])
+        self.assertEqual(len(list(P.list_cycle_records(root))), 1)
+
+    def test_owner_preparation_at_the_wait_bound_reports_admission_busy(self):
+        route, route_file, root = self._unbegun_route()
+        holder = self._hold_admission_lock(root, 30)
+        with mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 1.0):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+            self.assertEqual(caught.exception.code, "admission-busy")
+            self.assertIn("run start again later", caught.exception.detail)
+            self.assertEqual(list(P.list_cycle_records(root)), [])   # nothing was written
+            holder.kill()
+            holder.wait()
+            env = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+        self.assertTrue(env["AGENT_ARTIFACT_CYCLE_ID"])
 
     def test_resume_only_owner_launch_publishes_and_replays_binding(self):
         route, route_file, launch_env, owner, args = self._prepared_owner()
@@ -5467,6 +5560,66 @@ class SharedSpecMergeTest(SharedBaseGuardTest):
                 child.join(3)
             queue.close()
             queue.join_thread()
+
+
+class SealBackgroundJobTest(ProducerTestBase):
+    """Sealing starts exactly one background judgement (the unified review); no title job exists any more,
+    and no failure of the trigger changes the seal."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("HEARTING_WORKFLOW_GROUP_REVIEW", "HEARTING_CAMPAIGN_TITLE_AUTO"):
+            os.environ.pop(name, None)  # the runner switches both background jobs off
+
+    def _seal(self, slug="seal-job"):
+        route, route_file = self.route(slug=slug)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.write_output(result)
+        self.close(route, route_file)
+        return result
+
+    def test_a_seal_launches_the_review_once_and_never_a_title_job(self):
+        import artifact_workflow_group_review as review
+        import campaign_title_repair as title_repair
+        self.activate()
+        result = self._seal()
+        with mock.patch.object(review, "launch_after_seal", return_value=True) as launched, \
+                mock.patch.object(title_repair, "launch_after_seal", return_value=True) as titled, \
+                mock.patch.object(title_repair, "auto_title") as auto_title:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(launched.call_count, 1)
+        self.assertEqual(launched.call_args.args[1]["cycle_id"], result["cycle_id"])
+        self.assertEqual(launched.call_args.args[1]["state"], "sealed")
+        titled.assert_not_called()
+        auto_title.assert_not_called()
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "sealed")
+
+    def test_a_failing_or_spawn_failing_trigger_never_changes_the_seal(self):
+        import artifact_workflow_group_review as review
+        self.activate()
+        first = self._seal("first")
+        with mock.patch.object(review, "launch_after_seal", side_effect=RuntimeError("boom")):
+            self.assertEqual(P.finalize(self.root, cycle_id=first["cycle_id"])["status"], "sealed")
+        second = self._seal("second")
+        with mock.patch.object(review, "in_test_process", return_value=False), \
+                mock.patch.object(review.subprocess, "Popen", side_effect=OSError("no fork")) as popen:
+            self.assertEqual(P.finalize(self.root, cycle_id=second["cycle_id"])["status"], "sealed")
+        self.assertEqual(popen.call_count, 1)  # one launch attempt, from the review alone
+        self.assertIn("artifact_workflow_group_review.py", popen.call_args.args[0][1])
+        self.assertEqual(P.read_cycle_record(self.root, second["cycle_id"])["state"], "sealed")
+
+    def test_the_title_switch_alone_does_not_stop_the_review_launch(self):
+        import artifact_workflow_group_review as review
+        self.activate()
+        result = self._seal()
+        with mock.patch.dict(os.environ, {"HEARTING_CAMPAIGN_TITLE_AUTO": "off"}), \
+                mock.patch.object(review, "in_test_process", return_value=False), \
+                mock.patch.object(review.subprocess, "Popen") as popen:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        popen.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -677,9 +677,14 @@ def cmd_gate(args):
             if args.gate == "frame-review" and any(n.get("worker_type") == "frame" for n in route.get("nodes", [])):
                 release_authority = "depth-0"
             inline_gate = any(args.gate in n.get("inline_human_gates", []) for n in route.get("nodes", []))
+            preview_digest = None
             if inline_gate:
                 if not Path(args.artifact).is_file():
                     raise SupervisorError("inline-gate-preview-unreadable")
+                preview_digest = hashlib.sha256(Path(args.artifact).read_bytes()).hexdigest()
+            elif args.gate == "preview-disposition" and Path(args.artifact).is_file():
+                # A staged refine's preview is approved the same way: record which bytes the
+                # person was shown, so a later edit of the preview is not covered by the release.
                 preview_digest = hashlib.sha256(Path(args.artifact).read_bytes()).hexdigest()
             current_state = ledger.state()["workflow_state"]
             revised = (current_state == "FAILED_RETRYABLE"
@@ -705,19 +710,19 @@ def cmd_gate(args):
                 ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
                                           evidence={"gate": args.gate,
                                                     "binding": gates[args.gate],
-                                                    "delivery": str(record_path),
+                                                    "delivery": str(record_path) if record_path else None,
                                                     "artifact": str(args.artifact),
                                                     "interview": interview is not None,
                                                     "questions": len(interview.get("questions") or [])
                                                     if interview is not None else 0,
                                                     "release_authority": release_authority,
-                                                    **({"artifact_sha256": preview_digest} if inline_gate else {})},
+                                                    **({"artifact_sha256": preview_digest} if preview_digest else {})},
                                           actor="gate")
             except BaseException:
                 if created:
                     _rollback_gate_delivery(record_path)
                 raise
-            payload.update({"delivery": str(record_path), "delivery_created": created,
+            payload.update({"delivery": str(record_path) if record_path else None, "delivery_created": created,
                             "interview": interview is not None,
                             "questions": len(interview.get("questions") or []) if interview is not None else 0,
                             "release_authority": release_authority,
@@ -807,8 +812,36 @@ def _owner_row(rows, route_id):
     return None
 
 
-def gate_recipient(route, jobs_path):
+def gate_delivered_in_receipt():
+    """True for the runtime's own raise inside the parent's `start`; never for an owner's `gate --block`.
+
+    That call is made by the parent session itself and reads the receipt it returns, so the receipt is
+    the delivery: a parent kind with no push carrier needs no pending record. A registered worker
+    (an owner) never qualifies, so SD-OPEN-33 still refuses its raise for an unsupported kind.
+    """
+    from dispatch_contract import GATE_RECEIPT_DELIVERY_ENV
+    return os.environ.get(GATE_RECEIPT_DELIVERY_ENV) == "1" and release_actor_kind() == "user"
+
+
+def gate_carrier_holds(recipient_kind, route, jobs_path):
+    """Whether the recipient's push carrier can hold a record for this raise right now.
+
+    `claude-parent-runtime` always can (its sweep and rewake read the record). The Codex kinds need a
+    live sealed owner: after the owner exited there is no carrier, only the parent's own receipt.
+    """
+    if recipient_kind == "claude-parent-runtime":
+        return True
+    if recipient_kind not in GATE_CARRIER_KINDS:
+        return False
+    row = _owner_row(_registry_rows(jobs_path), route["route_id"])
+    return row is not None and row["status"] in {"open", "running"}
+
+
+def gate_recipient(route, jobs_path, *, receipt_delivery=False):
     """`(recipient_key, recipient_kind, owner_attempt_id, harness)` for one gate.
+
+    `receipt_delivery` (see `gate_delivered_in_receipt`) lets a kind without a carrier through:
+    the caller then writes no record and the parent's receipt is the delivery.
 
     The recipient is not in the route record: `owner_attempt_id` there is
     `AGENT_DISPATCH_ATTEMPT_ID or "-"`, and a standard+ route is compiled by the
@@ -827,7 +860,7 @@ def gate_recipient(route, jobs_path):
         raise SupervisorError("gate-recipient-unresolved: owner row names no parent session")
     if recipient_kind not in PENDING.RECIPIENT_KINDS:
         raise SupervisorError(f"gate-recipient-unresolved: recipient kind {recipient_kind!r}")
-    if recipient_kind not in GATE_CARRIER_KINDS:
+    if recipient_kind not in GATE_CARRIER_KINDS and not receipt_delivery:
         # A carrier may be selected only after its receipt vocabulary and live
         # recipient proof exist. OpenCode and the legacy Codex stop hook still do
         # not carry this contract and therefore fail closed here.
@@ -1042,14 +1075,19 @@ def create_gate_delivery(
 
     Returns `(record_path, created)`. Raises `SupervisorError` on any refusal --
     the caller must not take the transition if this fails, so a gate never exists
-    without a way to reach a person.
+    without a way to reach a person. `(None, False)` only when the raise is the
+    parent's own and its receipt carries the question (`gate_delivered_in_receipt`).
     """
     local = create_local_frame_gate_delivery(
         route, gate, artifact, jobs_path, epoch, route_path=route_path,
         release_authority=release_authority, interview=interview, questions=questions)
     if local is not None:
         return local
-    recipient_key, recipient_kind, attempt_id, harness = gate_recipient(route, jobs_path)
+    in_receipt = gate_delivered_in_receipt()
+    recipient_key, recipient_kind, attempt_id, harness = gate_recipient(
+        route, jobs_path, receipt_delivery=in_receipt)
+    if in_receipt and not gate_carrier_holds(recipient_kind, route, jobs_path):
+        return None, False  # the parent that raised it reads the question in its own receipt
     delivery_id = gate_delivery_id(
         recipient_key, route["route_id"], gate, attempt_id, epoch
     )

@@ -612,7 +612,8 @@ closure without a model turn and sends a recovery notice while closure remains
 pending. The owner and parent have no separate close/finalize procedure.
 
 The runtime closes a route once nobody works on it; no session has to
-remember to. `compose` and `campaign-status` close an open route whose Claude
+remember to. `compose` (within the composed route's own campaign) and `campaign-status` (across the
+artifact root) close an open route whose Claude
 session this host saw end and that then stayed quiet for an hour, or that saw
 no writes for a week; `campaign-close` also closes its campaign's member routes
 that belong to the closing session or stayed quiet for an hour. Routes of the
