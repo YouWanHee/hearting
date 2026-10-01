@@ -720,6 +720,10 @@ class UnifiedReviewTest(ReviewBase):
         self.b1 = self.seal(key="other", slug="b1")
         self.camp, self.other = self.a1["campaign_id"], self.b1["campaign_id"]
 
+    def review_events(self):
+        """What the review wrote to the recorder; the close lines of the fixtures' own cycles are not its."""
+        return [e for e in H.iter_events(self.root) if e["kind"] in ("meta", "group")]
+
     def meta_doc(self, begun):
         read = M.read_campaign_meta(self.root, begun["campaign_id"])
         self.assertEqual(read.status, "ok", read.code)
@@ -843,7 +847,7 @@ class UnifiedReviewTest(ReviewBase):
                 self.assertEqual(M.read_campaign_meta(self.root, self.camp).status, "missing")
                 self.assertFalse((self.root / M.PROJECT_REL).exists())
                 self.assertFalse((self.root / M.STATE_REL).exists())
-                self.assertFalse((self.root / H.HISTORY_REL).exists())
+                self.assertEqual(self.review_events(), [])
         self.assertEqual(self.record()["cycles"][self.a1["cycle_id"]]["failure_class"], "invalid-response")
 
     def test_a_decision_for_a_cycle_that_already_has_a_group_is_rejected(self):
@@ -1063,7 +1067,7 @@ class UnifiedReviewTest(ReviewBase):
         self.assertEqual(len(M.pending_intents(self.root)), 1)
         self.assertEqual(len(self.declaration(self.camp)["groups"]), 1)  # both files were already replaced
         self.assertEqual(M.read_campaign_meta(self.root, self.camp).status, "ok")
-        self.assertEqual(list(H.iter_events(self.root)), [])  # the lines wait for the recovery
+        self.assertEqual(self.review_events(), [])  # the lines wait for the recovery
         M.run_write(self.root, lambda ws: M.op_set(ws, self.other, None, {"summary": "다음 쓰기"}), now=1_790_000_000.0)
         self.assertEqual(M.pending_intents(self.root), [])
         events = list(H.iter_events(self.root))

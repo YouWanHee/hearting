@@ -5850,25 +5850,33 @@ def _history_id(prefix: str, *parts: str) -> str:
     return prefix + "_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
-def _history_token(name: str) -> Optional[str]:
-    value = os.environ.get(name)
-    return value if isinstance(value, str) and _HISTORY_TOKEN.match(value) else None
+def _history_actor(default_by: str) -> Dict[str, Any]:
+    """`make_event` actor keyword, from the recorder's own rules: a person or an agent session through
+    `actor_from_env(default_by)`, a runtime that observed a change without seeing who wrote it
+    (`rule`) with the session markers it carries.  Without a recorder the line keeps only `actor_by`."""
+    module = _history_module()
+    if module is None:
+        return {"actor_by": default_by}
+    try:
+        if default_by != "rule":
+            return {"actor": module.actor_from_env(default_by)}
+
+        def marker(name: str) -> Optional[str]:
+            value = os.environ.get(name)
+            return value if isinstance(value, str) and _HISTORY_TOKEN.match(value) else None
+
+        attempt = marker("AGENT_DISPATCH_ATTEMPT_ID")
+        return {"actor": module.make_actor(
+            "rule", session=attempt, harness=marker("AGENT_DISPATCH_CURRENT_HARNESS"),
+            route=marker("AGENT_ROUTE_ID"), attempt=attempt)}
+    except Exception:  # noqa: BLE001 -- an actor the recorder cannot build is recorded as the default
+        return {"actor_by": default_by}
 
 
-def _history_actor(default_by: str) -> Dict[str, str]:
-    """`make_event` actor keywords: the agent session's markers when the environment has them,
-    else `default_by`.  A runtime that observed a change without seeing who wrote it passes `rule`."""
-    session = _history_token("AGENT_DISPATCH_ATTEMPT_ID")
-    harness = _history_token("AGENT_DISPATCH_CURRENT_HARNESS")
-    route = _history_token("AGENT_ROUTE_ID")
-    actor = {"actor_by": default_by}
-    if default_by != "rule" and any(os.environ.get(name) for name in (
-            "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_CURRENT_HARNESS", "AGENT_ROUTE_ID")):
-        actor["actor_by"] = "agent"
-    for key, value in (("session", session), ("harness", harness), ("route", route), ("attempt", session)):
-        if value:
-            actor[key] = value
-    return actor
+def _history_by(default_by: str) -> str:
+    """Who the recorder says is acting (`human`, `agent`, `rule`), for a record field that names it."""
+    actor = _history_actor(default_by)
+    return str((actor.get("actor") or {}).get("by") or actor.get("actor_by") or default_by)
 
 
 def _history_file_ref(row: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -7716,7 +7724,7 @@ def record_campaign_state_line(root: Path, campaign_id: str, *, before: str, aft
         path = campaign_dir(root, campaign_id)
     except ProducerError:
         pass
-    rel = Path(os.path.relpath(str(path), str(Path(root)))).as_posix() if path is not None else ""
+    rel = Path(os.path.relpath(str(path), str(Path(root)))).as_posix() if path is not None else f"campaigns/{campaign_id}"
     line = _command_line(command=command, stamp=event_id or _command_stamp(), target_type="campaign",
                          target_id=campaign_id, target_path=rel, operation="update", field="state",
                          before={"value": before}, after={"value": after}, reason=reason, now=None)
@@ -7788,6 +7796,26 @@ def _cycle_rel(root: Path, directory: Path) -> str:
     return Path(os.path.relpath(str(directory), str(Path(root)))).as_posix()
 
 
+def _last_known_path(root: Path, record: Mapping[str, Any], where: Optional[str] = None) -> str:
+    """Where a cycle (or, with no `locator`, a campaign) last sat, for a line that needs a path when the
+    folder is already gone: the path it was found at, else what the locator map still says, else what
+    its record names."""
+    if where:
+        return where
+    try:
+        published = artifact_locator._load_index(root) or {}
+    except Exception:  # noqa: BLE001 -- an unreadable map only means the record's own words are used
+        published = {}
+    campaign_id, locator = record.get("campaign_id"), record.get("locator")
+    last = published.get(record.get("cycle_id"))
+    if isinstance(last, str) and last:
+        return last
+    if locator:
+        base = published.get(campaign_id)
+        return f"{base if isinstance(base, str) and base else f'campaigns/{campaign_id}'}/{locator}"
+    return f"campaigns/{campaign_id or record.get('cycle_id')}"
+
+
 def _locator_suffix(base: str, locator: str) -> str:
     return locator[len(base):] if locator.startswith(base) and re.fullmatch(r"(-\d+)?", locator[len(base):]) else ""
 
@@ -7848,13 +7876,13 @@ def cycle_mark(root: Path, cycle_id: str, *, discard: bool = False, superseded_b
         except (ProducerError, artifact_locator.LocatorError):
             pass
         before = cycle_disposition(record)
-        marked_by = _history_actor("human")["actor_by"]
+        marked_by = _history_by("human")
         when = _rfc3339(now)
         if clear:
             if "disposition" not in record:
                 return {"status": "unchanged", "cycle_id": cycle_id}
             updated = {key: value for key, value in record.items() if key != "disposition"}
-            after_mark, operation = None, "delete"
+            after_mark, operation = None, "update"  # the recorder deletes only a `state`; a taken-off mark is an update to nothing
         else:
             if discard:
                 mark: Dict[str, Any] = {"kind": "discarded"}
@@ -7876,7 +7904,8 @@ def cycle_mark(root: Path, cycle_id: str, *, discard: bool = False, superseded_b
             _preserve_current_manifest(root, record, directory)
         line = _command_line(
             command="cycle-mark", stamp=stamp, target_type="cycle", target_id=cycle_id,
-            target_path=_cycle_rel(root, directory) if directory is not None else "", operation=operation,
+            target_path=_last_known_path(root, record, _cycle_rel(root, directory) if directory is not None else ""),
+            operation=operation,
             field="disposition", before=_disposition_value(before), after=_disposition_value(after_mark),
             reason=reason, now=now)
         _write_cycle_record(root, _with_cycle_lines(updated, [line]), exclusive=False)
@@ -8250,7 +8279,7 @@ def cycle_move(root: Path, cycle_id: str, *, campaign: Optional[str] = None, par
                     "cycle_dir": str(source)}
         written, stale = _adopt_location_locked(
             root, record, destination, command="cycle-move", stamp=stamp, reason=reason, now=now,
-            by=_history_actor("human")["actor_by"], parent=new_parent, old_campaign_folder=source.parent)
+            by="human", parent=new_parent, old_campaign_folder=source.parent)
         stale = list(dict.fromkeys(stale + [old_campaign_id, written["campaign_id"]]))
         artifact_locator.update_indexes(root, stale)
         _flush_cycle_pending_locked(root, cycle_id)
@@ -8331,7 +8360,7 @@ def delete_cycle(root: Path, cycle_id: str, *, reason: Optional[str] = None, now
             return {"status": "already-deleted", "cycle_id": cycle_id}
         campaign_id = record["campaign_id"]
         if not finishing:
-            where = _cycle_rel(root, directory) if directory is not None else ""
+            where = _last_known_path(root, record, _cycle_rel(root, directory) if directory is not None else "")
             digest = record.get("manifest_digest")
             if directory is not None:
                 _preserve_current_manifest(root, record, directory)
@@ -8339,7 +8368,7 @@ def delete_cycle(root: Path, cycle_id: str, *, reason: Optional[str] = None, now
                 if found is not None:
                     digest = artifact_manifest.manifest_digest(found[1])
             _tombstone_cycle_locked(root, record, where=where, command="delete", stamp=stamp, reason=reason,
-                                    now=now, by=_history_actor("human")["actor_by"], digest=digest)
+                                    now=now, by="human", digest=digest)
         if directory is not None:
             _remove_folder(root, directory)
         campaign = read_campaign(root, campaign_id)
@@ -8372,7 +8401,7 @@ def delete_campaign(root: Path, campaign: str, *, reason: Optional[str] = None,
         campaign_id = found["campaign_id"]
         folder = campaign_dir(root, campaign_id, found)
         last_path = _cycle_rel(root, folder)
-        by = _history_actor("human")["actor_by"]
+        by = "human"
         members, _detached = artifact_campaign.campaign_records(root, campaign_id)
         gone: List[str] = []
         for member in members:
@@ -8653,7 +8682,7 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             record = read_cycle_record(root, cycle_id)
             if record is None or record.get("deleted_at"):
                 continue
-            where = published.get(cycle_id, "")
+            where = _last_known_path(root, record, published.get(cycle_id, ""))
             _tombstone_cycle_locked(root, record, where=where, command="reconcile", stamp=stamp,
                                     reason="reconcile", now=now, by=by, digest=record.get("manifest_digest"))
             _edit_campaign_members(root, scan.campaigns.get(record["campaign_id"]), cycle_id, joining=False)
@@ -8661,12 +8690,12 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             gone_cycles.append(cycle_id)
             result["cycle_gone"].append(cycle_id)
         for campaign_id in changes["campaign_gone"]:
-            last_path = published.get(campaign_id, "")
+            last_path = published.get(campaign_id, "") or f"campaigns/{campaign_id}"
             members = [r for r in list_cycle_records(root) if r.get("campaign_id") == campaign_id]
             for member in members:
                 if member.get("deleted_at") or not _closed_record(member):
                     continue
-                _tombstone_cycle_locked(root, member, where=published.get(member["cycle_id"], ""),
+                _tombstone_cycle_locked(root, member, where=_last_known_path(root, member, published.get(member["cycle_id"], "")),
                                         command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
                                         digest=member.get("manifest_digest"))
                 gone_cycles.append(member["cycle_id"])

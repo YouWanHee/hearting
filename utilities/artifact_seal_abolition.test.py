@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission as adm  # noqa: E402
 import artifact_campaign as CAMP  # noqa: E402
+import artifact_history as H  # noqa: E402 -- the real recorder; a fake in sys.modules stands in for it per test
 import artifact_checkpoint_trigger as TRIG  # noqa: E402
 import artifact_index  # noqa: E402
 import artifact_manifest as M  # noqa: E402
@@ -1064,16 +1065,25 @@ class FakeHistoryModule(types.ModuleType):
     def __init__(self):
         super().__init__("artifact_history")
         self.made = []
+        self.rejected = []
         self.published = []
         self.fail_publish = False
         self.on_publish = None
 
+    def make_actor(self, *args, **kwargs):
+        return H.make_actor(*args, **kwargs)
+
+    def actor_from_env(self, *args, **kwargs):
+        return H.actor_from_env(*args, **kwargs)
+
     def make_event(self, **kwargs):
+        """The real recorder's shape check, so a line it would refuse fails the test instead of being dropped."""
         self.made.append(dict(kwargs))
-        for key in ("kind", "target_type", "target_id", "target_path", "operation", "field", "before",
-                    "after", "reason", "transaction_id"):
-            if key not in kwargs:
-                raise self.HistoryError("event-invalid:" + key)
+        try:
+            H.make_event(**kwargs)
+        except H.HistoryError as exc:
+            self.rejected.append((dict(kwargs), str(exc)))
+            raise self.HistoryError(f"event-invalid:{exc}") from exc
         return {"event_id": kwargs.get("event_id") or "hevt_" + "0" * 32, **kwargs}
 
     def publish_events_locked(self, root, events):
@@ -1116,6 +1126,8 @@ class B1RefreshBase(SealAbolitionBase):
         patcher = mock.patch.dict(sys.modules, {"artifact_history": self.history})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # A line the recorder would refuse is dropped by the producer without a sound; here it fails the test.
+        self.addCleanup(lambda: self.assertEqual(self.history.rejected, []))
         # The per-cycle interval has its own test; the others observe a cycle again at once.
         interval = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "0"})
         interval.start()
@@ -1187,7 +1199,7 @@ class B1RefreshTest(B1RefreshBase):
         self.assertEqual(len(self.history.published), 30)
         self.assertEqual(sorted(e["operation"] for e in self.history.published),
                          ["add"] * 26 + ["update"] * 4)
-        kinds = {(e["kind"], e["target_type"], e["actor_by"]) for e in self.history.published}
+        kinds = {(e["kind"], e["target_type"], e["actor"]["by"]) for e in self.history.published}
         self.assertEqual(kinds, {("artifact", "artifact", "rule")})
         sample = next(e for e in self.history.published if e["operation"] == "update")
         self.assertTrue(sample["field"].startswith("artifacts/plans/cycle/declared_"))
@@ -1692,18 +1704,7 @@ class B1RefreshTest(B1RefreshBase):
         self.assertNotIn("history_pending", P.read_cycle_record(self.root, result["cycle_id"]))
 
     def test_b1_real_history_recorder_takes_the_same_lines(self):
-        real = Path(__file__).resolve().parents[2] / "artifact-meta-1001/utilities/artifact_history.py"
-        if not real.is_file():
-            self.skipTest("the f0 recorder worktree is not present")
-        saved_path = list(sys.path)
-        try:
-            spec = importlib.util.spec_from_file_location("artifact_history", real)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-        except Exception as exc:  # noqa: BLE001
-            self.skipTest(f"the f0 recorder does not import here: {exc}")
-        finally:
-            sys.path[:] = saved_path
+        module = H
         with mock.patch.dict(sys.modules, {"artifact_history": module}):
             result = self.closed("b1-real-recorder", {"plans/cycle/a.md": b"a\n"})
             self.edit(result, "plans/cycle/a.md", b"a, edited\n")
@@ -2082,7 +2083,7 @@ class C1MarkTest(C1ChangesBase):
             P.cycle_mark(self.root, cycle_id, clear=True)
             self.assertNotIn("disposition", self.record(target))
             (line,) = self.lines(field="disposition")
-            self.assertEqual((line["operation"], line["after"]), ("delete", {"value": None}))
+            self.assertEqual((line["operation"], line["after"]), ("update", {"value": None}))  # the recorder deletes only `state`
             # Clearing what is not there still says so, once.
             self.history.made.clear()
             P.cycle_mark(self.root, cycle_id, clear=True)
@@ -2380,7 +2381,7 @@ class C1MoveTest(C1ChangesBase):
         self.assertEqual(P.read_campaign(self.root, src_id)["cycles"], [])
         self.assertEqual(P.read_campaign(self.root, dst_id)["cycles"], [peer["cycle_id"], mover["cycle_id"]])
         (line,) = self.lines(field="campaign")
-        self.assertEqual((line["operation"], line["actor_by"], line["before"]["value"], line["after"]["value"]),
+        self.assertEqual((line["operation"], line["actor"]["by"], line["before"]["value"], line["after"]["value"]),
                          ("move", "rule", src_id, dst_id))
         # Looking again changes nothing.
         before = (self.record(mover), self.locator_map(), adm.load_index(self.root))
@@ -2399,7 +2400,7 @@ class C1MoveTest(C1ChangesBase):
         self.assertEqual(P.read_campaign(self.root, dst_id)["locator"], "renamed-by-hand")
         self.assertEqual(P.campaign_dir(self.root, dst_id), renamed)
         (line,) = self.lines(field="path", target_type="campaign")
-        self.assertEqual((line["target_id"], line["actor_by"]), (dst_id, "rule"))
+        self.assertEqual((line["target_id"], line["actor"]["by"]), (dst_id, "rule"))
         self.assertEqual(Path(self.locator_map()[mover["cycle_id"]]).parts[1], "renamed-by-hand")
         cycle_row, _ = self.index_row(mover)
         self.assertEqual(Path(cycle_row["cycle_path"]).parts[1], "renamed-by-hand")
@@ -2579,7 +2580,7 @@ class C1DeleteTest(C1ChangesBase):
         # Nothing could be copied from a folder that was already gone: none is made up.
         self.assertEqual(self.snapshot_names(result), [])
         (line,) = self.lines(target_type="cycle", operation="delete")
-        self.assertEqual((line["target_id"], line["actor_by"]), (result["cycle_id"], "rule"))
+        self.assertEqual((line["target_id"], line["actor"]["by"]), (result["cycle_id"], "rule"))
         # The campaign still closes and a replay still finds the cycle (deleted).
         self.assertEqual(CAMP.close(self.root, other["campaign_id"])["status"], "satisfied")
         verdict = P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding={
@@ -2848,18 +2849,7 @@ class C1LockedReadTest(C1ChangesBase):
 
 class C1RealRecorderTest(C1ChangesBase):
     def test_c1_real_history_recorder_takes_the_command_lines(self):
-        real = Path(__file__).resolve().parents[2] / "artifact-meta-1001/utilities/artifact_history.py"
-        if not real.is_file():
-            self.skipTest("the f0 recorder worktree is not present")
-        saved_path = list(sys.path)
-        try:
-            spec = importlib.util.spec_from_file_location("artifact_history", real)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-        except Exception as exc:  # noqa: BLE001
-            self.skipTest(f"the f0 recorder does not import here: {exc}")
-        finally:
-            sys.path[:] = saved_path
+        module = H
         with mock.patch.dict(sys.modules, {"artifact_history": module}):
             mover = self.closed_with("real-move", "c1-real-a", {"plans/cycle/a.md": b"a\n"}, activate=True)
             peer = self.closed_with("real-peer", "c1-real-b")
@@ -3215,6 +3205,249 @@ class Gap2LocksTest(C1ChangesBase):
         self.assertEqual(order, [(True, "lock")])  # history first, with the section still open ...
         self.assertEqual(events, ["lock", "unlock"])  # ... and the manifest in that same section
         self.assertNotEqual((Path(result["cycle_dir"]) / "manifest.json").read_bytes(), raw)
+
+
+class E1RecorderLinesTest(C1ChangesBase):
+    """The merged recorder (#90): every line this branch makes is one it takes, and it is published."""
+
+    def keep(self, slug, campaign_key, files=None, *, activate=False):
+        """A closed cycle; unlike `closed_with` the lines of its close stay counted."""
+        if activate:
+            self.activate()
+        route, route_file = self.route(slug=slug, campaign_key=campaign_key)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        for rel, data in (files or {"plans/cycle/plan.md": b"plan body\n"}).items():
+            self.write_output(result, rel, data)
+        self.close(route, route_file)
+        self.assertEqual(P.finalize(self.root, cycle_id=result["cycle_id"])["status"], "sealed")
+        return result
+
+    def pending(self):
+        """(owner, lines) of every record that still holds lines for the recorder."""
+        found = []
+        for record in P.list_cycle_records(self.root):
+            if record.get("history_pending"):
+                found.append(record["cycle_id"])
+        runtime = self.root / ".runtime/artifact-producer/v1/campaigns"
+        for path in sorted(runtime.glob("*.json")) if runtime.is_dir() else []:
+            if json.loads(path.read_text(encoding="utf-8")).get("history_pending"):
+                found.append(path.stem)
+        return found
+
+    def scenario(self):
+        """Every kind of lifecycle line: close, refresh, move, parent, marks, primary, deletes, hand-made changes."""
+        mover = self.keep("e1-mover", "e1-a", {"plans/cycle/a.md": b"a\n", "plans/cycle/b.md": b"b\n"},
+                          activate=True)
+        peer = self.keep("e1-peer", "e1-b", {"plans/cycle/p.md": b"p\n"})
+        third = self.keep("e1-third", "e1-c", {"plans/cycle/t.md": b"t\n"})
+        fourth = self.keep("e1-fourth", "e1-d", {"plans/cycle/f.md": b"f\n"})
+        fifth = self.keep("e1-fifth", "e1-e", {"plans/cycle/g.md": b"g\n"})
+        self.edit(mover, "plans/cycle/a.md", b"a, edited\n")
+        self.write_output(mover, "plans/cycle/c.md", b"c\n")
+        (Path(mover["cycle_dir"]) / "artifacts/plans/cycle/b.md").unlink()
+        self.assertEqual(self.refresh(mover)["status"], "emitted")
+        self.assertEqual(P.cycle_move(self.root, mover["cycle_id"], campaign=peer["campaign_id"],
+                                      parent=peer["cycle_id"], reason="regroup")["status"], "moved")
+        P.cycle_move(self.root, mover["cycle_id"], no_parent=True)
+        P.cycle_mark(self.root, mover["cycle_id"], discard=True)
+        P.cycle_mark(self.root, mover["cycle_id"], superseded_by=[peer["cycle_id"]], reason="redone")
+        P.cycle_mark(self.root, mover["cycle_id"], clear=True)
+        roles = self.roles(mover)
+        other = next(rel for rel, role in roles.items() if role != "primary")
+        P.cycle_mark(self.root, mover["cycle_id"], primary=other)
+        # The campaign folder of `third` goes by hand before any command looks: delete and mark still name a path.
+        shutil.rmtree(str(P.campaign_dir(self.root, third["campaign_id"])))
+        P.cycle_mark(self.root, third["cycle_id"], discard=True)
+        P.delete_cycle(self.root, third["cycle_id"])
+        # Hand-made changes found by the next look: a campaign rename, a cycle carried over, a cycle removed.
+        folder = P.campaign_dir(self.root, peer["campaign_id"])
+        peer_cycle, carried = Path(self.cycle_path(peer)), Path(self.cycle_path(fourth))
+        renamed = folder.with_name("e1-renamed")
+        os.rename(str(folder), str(renamed))
+        os.rename(str(carried), str(renamed / carried.name))
+        shutil.rmtree(str(renamed / peer_cycle.name))
+        self.assertEqual(P.reconcile_root(self.root)["status"], "reconciled")
+        P.delete_campaign(self.root, fifth["campaign_id"], reason="done with it")
+        # A whole campaign removed by hand.
+        sixth = self.keep("e1-sixth", "e1-f", {"plans/cycle/s.md": b"s\n"})
+        shutil.rmtree(str(P.campaign_dir(self.root, sixth["campaign_id"])))
+        self.assertEqual(P.reconcile_root(self.root)["status"], "reconciled")
+        fd = adm._acquire_lock(self.root, 5.0)  # the caller of this one holds the admission lock
+        try:
+            P.record_campaign_state_line(self.root, mover["campaign_id"], before="active", after="closed",
+                                         reason=None, event_id=None, command="campaign-close")
+        finally:
+            adm._release_lock(self.root, fd)
+        return mover, peer, third, fourth, fifth, sixth
+
+    def roles(self, result):
+        document = json.loads((self.cycle_path(result) / "manifest.json").read_text(encoding="utf-8"))
+        by_id = {row["artifact_id"]: row for row in document["artifacts"]}
+        return {row["locator"]["path"]: by_id[row["artifact_id"]]["role"] for row in document["artifact_revisions"]}
+
+    def test_e1_every_line_the_branch_makes_is_one_the_recorder_takes(self):
+        self.scenario()
+        kinds = {(m["target_type"], m["field"], m["operation"]) for m in self.history.made}
+        for wanted in [("cycle", "state", "update"), ("cycle", "state", "delete"), ("campaign", "state", "delete"),
+                       ("campaign", "state", "update"), ("campaign", "path", "update"),
+                       ("cycle", "campaign", "move"), ("cycle", "parent", "update"),
+                       ("cycle", "disposition", "add"), ("cycle", "disposition", "update"),
+                       ("cycle", "primary", "update"), ("artifact", "artifacts/plans/cycle/a.md", "update")]:
+            self.assertIn(wanted, kinds)
+        self.assertEqual(self.history.rejected, [])
+        for line in self.history.made:
+            H.make_event(**line)  # raises on a line the recorder would drop
+            self.assertTrue(line["target_path"], line)
+        self.assertEqual(self.pending(), [])
+
+    def test_e1_the_real_recorder_publishes_every_line_and_nothing_stays_pending(self):
+        made, refused = [], []
+        real_make = H.make_event
+
+        def spy(**kwargs):
+            try:
+                event = real_make(**kwargs)
+            except Exception:
+                refused.append(kwargs)
+                raise
+            made.append(event["event_id"])
+            return event
+
+        with mock.patch.dict(sys.modules, {"artifact_history": H}), mock.patch.object(H, "make_event", spy):
+            mover, peer, third, fourth, fifth, sixth = self.scenario()
+            self.assertEqual(refused, [])
+            self.assertEqual(self.pending(), [])
+            for result in (mover, peer, third, fourth, fifth, sixth):
+                self.assertNotIn("history_pending", self.record(result))
+            events = list(H.iter_events(self.root))
+            self.assertGreater(len(events), 20)
+            self.assertEqual(sorted(e["event_id"] for e in events), sorted(set(made)))
+            files = sorted((self.root / ".runtime/artifact-producer/v1/history").glob("*/*.jsonl"))
+            self.assertEqual(len(files), len(events))
+            # One close line for each first close, however many commands came after.
+            closes = [e for e in events if e["target"]["type"] == "cycle" and e["field"] == "state"
+                      and e["operation"] == "update"]
+            self.assertEqual(sorted(e["target"]["id"] for e in closes),
+                             sorted(r["cycle_id"] for r in (mover, peer, third, fourth, fifth, sixth)))
+
+    def test_e1_a_cycle_whose_folder_was_never_found_leaves_a_valid_line_at_its_last_place(self):
+        result = self.keep("e1-lost", "e1-lost", activate=True)
+        record = self.record(result)
+        expected = P._cycle_rel(self.root, Path(result["cycle_dir"]))
+        self.assertEqual(P._last_known_path(self.root, record, ""), expected)
+        self.assertEqual(P._last_known_path(self.root, record, "campaigns/x/y"), "campaigns/x/y")
+        shutil.rmtree(str(P.campaign_dir(self.root, result["campaign_id"])))
+        self.assertEqual(P._last_known_path(self.root, record, ""), expected)  # from the record alone
+        fd = adm._acquire_lock(self.root, 5.0)
+        try:
+            P._tombstone_cycle_locked(self.root, record, where=P._last_known_path(self.root, record, ""),
+                                      command="reconcile", stamp="1", reason="reconcile", now=None, by="rule",
+                                      digest=record.get("manifest_digest"))
+            P._flush_cycle_pending_locked(self.root, result["cycle_id"])
+        finally:
+            adm._release_lock(self.root, fd)
+        (line,) = self.lines(target_id=result["cycle_id"], operation="delete")
+        H.make_event(**line)
+        self.assertEqual(line["target_path"], expected)
+        self.assertEqual(self.history.rejected, [])
+
+    def test_e1_without_a_recorder_lines_wait_and_the_recorder_takes_them_later(self):
+        with mock.patch.dict(sys.modules, {"artifact_history": H}):
+            with mock.patch.object(P, "_history_module", return_value=None):
+                result = self.keep("e1-wait", "e1-wait", activate=True)
+                P.cycle_mark(self.root, result["cycle_id"], discard=True)
+                waiting = self.record(result)["history_pending"]
+                self.assertEqual([m["field"] for m in waiting], ["state", "disposition"])
+                self.assertEqual(self.pending(), [result["cycle_id"]])
+            self.assertEqual(P.deliver_pending_history(self.root), 2)
+            self.assertEqual(self.pending(), [])
+            self.assertEqual(len(list(H.iter_events(self.root))), 2)
+
+    def test_e1_no_op_refresh_writes_nothing_with_the_real_recorder(self):
+        with mock.patch.dict(sys.modules, {"artifact_history": H}):
+            result = self.keep("e1-noop", "e1-noop", {"plans/cycle/a.md": b"a\n"}, activate=True)
+            self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+            self.assertEqual(self.refresh(result)["status"], "emitted")
+            state = self.tree_state(result)
+            for trigger in ("turn-end", "explicit", "supervisor-poll"):
+                self.assertEqual(self.refresh(result, trigger=trigger)["status"], "unchanged")
+            self.assertEqual(state, self.tree_state(result))
+
+    def test_e1_actor_follows_the_recorder_rules(self):
+        with mock.patch.dict(sys.modules, {"artifact_history": H}):
+            self.assertEqual(P._history_actor("human"), {"actor": H.actor_from_env("human")})
+            self.assertEqual(P._history_actor("rule")["actor"]["by"], "rule")
+            env = {"AGENT_DISPATCH_ATTEMPT_ID": "att-1", "AGENT_DISPATCH_CURRENT_HARNESS": "claude",
+                   "AGENT_ROUTE_ID": "rt-1"}
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(P._history_actor("human")["actor"],
+                                 {"by": "agent", "session": "att-1", "harness": "claude", "route": "rt-1",
+                                  "attempt": "att-1"})
+                self.assertEqual(P._history_actor("rule")["actor"],
+                                 {"by": "rule", "session": "att-1", "harness": "claude", "route": "rt-1",
+                                  "attempt": "att-1"})
+                self.assertEqual(P._history_by("human"), "agent")
+            self.assertEqual(P._history_by("human"), "human")
+
+
+class E2BeginWaitsForAdmissionTest(B1RefreshBase):
+    """#89 waits for the admission lock by asking `begin` again; the §45 rules still hold on the way."""
+
+    def setUp(self):
+        super().setUp()
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": state.name})
+        env.start()
+        self.addCleanup(env.stop)
+        in_test = mock.patch.object(TRIG, "in_test_process", return_value=False)
+        fake = mock.patch.object(TRIG, "subprocess")
+        in_test.start()
+        self.addCleanup(in_test.stop)
+        self.popen = fake.start().Popen
+        self.addCleanup(fake.stop)
+
+    def test_e2_busy_then_free_is_one_begin_with_one_locked_read_and_no_double_writes(self):
+        parent = self.closed("e2-parent", {"plans/cycle/plan.md": b"plan\n"})
+        self.edit(parent, "plans/cycle/plan.md", b"plan, edited after the close\n")
+        route, route_file = self.route(slug="e2-child", parent_cycle_id=parent["cycle_id"])
+        real_acquire, calls = adm._acquire_lock, []
+
+        def acquire(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise adm.AdmissionBusy("busy")
+            return real_acquire(*args, **kwargs)
+
+        locked_reads, real_load = [], adm.load_index
+
+        def counting(root):
+            if adm.holds_lock(Path(root)):
+                locked_reads.append(1)
+            return real_load(root)
+
+        before = (self.tree_state(parent), len(self.history.made))
+        with mock.patch.object(adm, "_acquire_lock", acquire), mock.patch.object(adm, "load_index", counting), \
+                mock.patch.object(time, "sleep"):
+            result = P._begin_waiting_for_admission(
+                self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual((result["status"], result["layout"]), ("begun", "cycle"))
+        self.assertGreaterEqual(len(calls), 2)  # the first try was busy, a later one took the lock
+        self.assertEqual(len(locked_reads), 1, locked_reads)
+        # The parent is looked at once, after the successful attempt and outside the lock; nothing is written twice.
+        argvs = [" ".join(call.args[0]) for call in self.popen.call_args_list]
+        self.assertEqual([a for a in argvs if parent["cycle_id"] in a and "checkpoint" in a].__len__(), 1, argvs)
+        self.assertEqual(before[0], self.tree_state(parent))
+        self.assertEqual(len(self.history.made), before[1])
+        self.assertEqual(len(P.list_cycle_records(self.root)), 2)
+        self.assertFalse(P.read_cycle_record(self.root, result["cycle_id"]).get("history_pending"))
+
+    def test_e2_an_observation_that_fails_never_leaves_begin(self):
+        parent = self.closed("e2-quiet", {"plans/cycle/plan.md": b"plan\n"})
+        route, route_file = self.route(slug="e2-quiet-child", parent_cycle_id=parent["cycle_id"])
+        with mock.patch.object(TRIG, "launch", side_effect=adm.AdmissionBusy("busy")):
+            result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(result["layout"], "cycle")
 
 
 def m_digest(document):
