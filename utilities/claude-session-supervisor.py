@@ -1927,7 +1927,8 @@ def main(argv: list[str] | None = None) -> int:
             terminal = classify_runtime_result(args, result, process_rc)
             if terminal.failure_class == "pass":
                 from dispatch_terminal_commit import owner_workflow_continuation
-                correction = owner_workflow_continuation(args.jobs, args.parent_attempt_id, args.route_file)
+                correction = (owner_workflow_continuation(args.jobs, args.parent_attempt_id, args.route_file)
+                              if args.route_file else None)
                 if correction:
                     verdict, notice = _admit_continuation(
                         ledger, budget_state_root, parent_attempt_id=args.parent_attempt_id,

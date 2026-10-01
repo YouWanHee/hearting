@@ -480,6 +480,12 @@ owns the live lease, exact child join, completion commit, receipt consumption,
 and next model turn. A registered parent without that live lease receives the
 printed bounded-wait fallback; registration alone never promises a wake.
 
+Every registered dispatch-depth-1 owner, including quick and solo, uses this
+controller (no probe; route binding and execution supervision are separate), so
+`capability-route.py correct` is accepted from registration and a correction is
+delivered as the next `--session` turn of the same native session. The first
+turn runs under a placeholder session that binds to the observed `sessionID`.
+
 Ordinary same-session continuation does not enable SD-110 deterministic
 advance or SD-119 serial-chain owner support. The adapter exposes neither
 `--enable-stage-advance` nor stage-advance receipt negotiation. Those surfaces

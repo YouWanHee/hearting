@@ -202,19 +202,59 @@ class SD63TruncationProbe(unittest.TestCase):
             self.assertEqual(WH.resolve_completion_delivery(args), "poll-fallback")
         probe_fn.assert_not_called()
 
-    # H: quick / non-owner -> one-shot, probe never run
+    # H: non-owner -> one-shot, probe never run
     def test_h_non_owner_is_one_shot_without_probing(self):
         _write_fake_claude(self.bindir, _truncated_help_source())
         for overrides in (
             dict(dispatch_depth=2),
             dict(worker_type="stage"),
-            dict(intensity="quick"),
+            dict(dispatch_depth=2, intensity="quick"),
+            dict(worker_type="stage", intensity="quick"),
         ):
             with self.subTest(**overrides):
                 args = _owner_args(**overrides)
                 with unittest.mock.patch.object(WH, "probe_claude_session_resume") as probe_fn:
                     self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
                 probe_fn.assert_not_called()
+        with self.assertRaises(WH.DispatchContractError) as caught:
+            WH.resolve_completion_delivery(_owner_args(worker_type="stage", completion_delivery="supervised"))
+        self.assertEqual(caught.exception.reason, "completion-delivery-ineligible")
+
+    # H2: a quick owner is supervised only on a proven resume surface and otherwise
+    # keeps the one-shot launch it always had
+    def test_h2_quick_owner_is_supervised_only_when_resume_is_proven(self):
+        _write_fake_claude(self.bindir, _complete_help_source(True, True))
+        args = _owner_args(intensity="quick")
+        self.assertEqual(WH.resolve_completion_delivery(args), "session-resume-supervised")
+        self.assertEqual(args.completion_delivery_reason, "ok")
+        for label, source in (("indeterminate", _truncated_help_source()),
+                              ("unsupported", _complete_help_source(False, False))):
+            with self.subTest(probe=label):
+                _write_fake_claude(self.bindir, source)
+                args = _owner_args(intensity="quick")
+                args.completion_delivery_reason = "not-applicable"
+                self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
+                self.assertEqual(args.completion_delivery_reason, "not-applicable")
+                args = _owner_args(intensity="quick", completion_delivery="supervised")
+                with self.assertRaises(WH.DispatchContractError) as caught:
+                    WH.resolve_completion_delivery(args)
+                self.assertEqual(caught.exception.reason, "claude-session-resume-unavailable"
+                                 if label == "unsupported" else "claude-session-resume-indeterminate")
+        args = _owner_args(intensity="quick", completion_delivery="poll")
+        with unittest.mock.patch.object(WH, "probe_claude_session_resume") as probe_fn:
+            self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
+        probe_fn.assert_not_called()
+
+    # H3: standard+ keeps its refusal and poll-fallback rules
+    def test_h3_standard_owner_rules_are_unchanged(self):
+        _write_fake_claude(self.bindir, _complete_help_source(False, False))
+        self.assertEqual(WH.resolve_completion_delivery(_owner_args(intensity="standard")), "poll-fallback")
+        _write_fake_claude(self.bindir, _truncated_help_source())
+        with self.assertRaises(WH.DispatchContractError) as caught:
+            WH.resolve_completion_delivery(_owner_args(intensity="standard"))
+        self.assertEqual(caught.exception.reason, "claude-session-resume-indeterminate")
+        self.assertEqual(WH.resolve_completion_delivery(_owner_args(intensity="standard", completion_delivery="poll")),
+                         "poll-fallback")
 
     # I: probe computed once, dry-run and start (same args instance) agree
     def test_i_probe_computed_once_and_cached_on_args(self):
@@ -227,6 +267,60 @@ class SD63TruncationProbe(unittest.TestCase):
             second = WH.resolve_completion_delivery(args)
         self.assertEqual(first, second)
         self.assertEqual(probe_fn.call_count, 1)
+
+
+class QuickSupervisedCommand(unittest.TestCase):
+    """The supervisor command a quick owner gets differs from a standard+ owner's only in its route source."""
+
+    def args(self, **overrides):
+        base = dict(
+            worker_type="owner", intensity="quick", dispatch_depth=1, artifact_root="/tmp/fixture-artifacts",
+            worktree="/tmp/fixture-worktree", agent_home=Path("/tmp/fixture-agent-home"),
+            jobs_path=Path("/tmp/jobs.log"), attempt_id="att-quick", capability_mode="dev",
+            resolved_completion_delivery="session-resume-supervised",
+            resolved_model_settings={"source": "profile", "role": "r", "model": "m", "effort": "low"},
+            route_file=None, route_id=None, route_hash=None, route_node=None,
+            owner_route_binding=None, permission_mode=None,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def command(self, **overrides):
+        return WH.shell_command(self.args(**overrides), Path("/tmp/p.txt"), Path("/tmp/l.log"))
+
+    def test_quick_owner_runs_under_the_session_supervisor_with_its_own_model(self):
+        command = self.command()
+        self.assertIn("claude-session-supervisor.py", command)
+        self.assertIn("--parent-attempt-id att-quick", command)
+        self.assertIn("--model m --effort low", command)
+        self.assertIn("--permission-mode", command)
+        self.assertNotIn("--route-file", command)
+
+    def test_route_arguments_travel_only_as_a_complete_one_shot_tuple(self):
+        full = dict(route_file="/tmp/route.json", route_id="rt-1", route_hash="sha256:a", route_node="one-shot")
+        command = self.command(**full)
+        self.assertIn("--route-file /tmp/route.json --route-id rt-1 --route-hash sha256:a", command)
+        for missing in ("route_file", "route_id", "route_hash"):
+            with self.subTest(missing=missing):
+                self.assertNotIn("--route-", self.command(**{**full, missing: None}))
+        self.assertNotIn("--route-", self.command(**{**full, "route_node": "execute"}))
+
+    def test_standard_owner_binding_still_supplies_the_route(self):
+        binding = argparse.Namespace(route_file="/tmp/bound.json", route_id="rt-b", route_hash="sha256:b")
+        command = self.command(intensity="standard", owner_route_binding=binding,
+                               route_file="/tmp/other.json", route_id="rt-o", route_hash="sha256:o", route_node="one-shot")
+        self.assertIn("--route-file /tmp/bound.json --route-id rt-b --route-hash sha256:b", command)
+
+    def test_registration_opens_input_only_for_a_supervised_delivery(self):
+        with unittest.mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+            WH.initialize_supervised_owner_input(self.args(), Path("/tmp/jobs.log"))
+            init.assert_called_once_with(Path("/tmp/jobs.log"), "att-quick", "claude-next-turn")
+        for delivery in ("one-shot", "poll-fallback"):
+            with unittest.mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+                WH.initialize_supervised_owner_input(self.args(resolved_completion_delivery=delivery), Path("/tmp/jobs.log"))
+                init.assert_not_called()
+        with unittest.mock.patch("dispatch_owner_input.initialize_owner_input", side_effect=OSError("disk")):
+            WH.initialize_supervised_owner_input(self.args(), Path("/tmp/jobs.log"))
 
 
 class SD63CodexParity(unittest.TestCase):
@@ -264,9 +358,9 @@ class SD63CodexParity(unittest.TestCase):
 
 
 class SD63OpenCodeParityLock(unittest.TestCase):
-    """Only a sealed capability owner may stamp supervised delivery."""
+    """Only a bound or quick depth-1 owner may stamp supervised delivery."""
 
-    def test_opencode_supervised_delivery_requires_owner_route_binding(self):
+    def test_opencode_supervised_delivery_requires_a_supervised_owner(self):
         opencode_path = ROOT / "adapters/opencode/bin/dispatch-headless.py"
         tree = ast.parse(opencode_path.read_text())
         stamps = [node for node in ast.walk(tree)
@@ -277,8 +371,7 @@ class SD63OpenCodeParityLock(unittest.TestCase):
                          ",completion_delivery=session-resume-supervised,completion_delivery_reason=ok,supervisor_lease=")
         guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
                   and stamps[0] in set(ast.walk(ast.Module(body=node.body, type_ignores=[])))]
-        self.assertTrue(any(ast.unparse(node.test) == "getattr(args, 'owner_route_binding', None)"
-                            for node in guards))
+        self.assertTrue(any(ast.unparse(node.test) == "_supervised_owner(args)" for node in guards))
 
 
 if __name__ == "__main__":
