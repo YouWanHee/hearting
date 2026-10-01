@@ -3050,6 +3050,173 @@ class D1LegacyConsumersTest(C1ChangesBase):
         self.assertIn('raise RecoveryError("recovery-source-manifest-digest-mismatch")', recovery)
 
 
+class Gap2LocksTest(C1ChangesBase):
+    """§45 D-124/D-125 after the impl review: nothing is walked or hashed under the admission lock,
+    and a refresh's history lines and its manifest go out in one admission section."""
+
+    def probe(self, seen, real):
+        """Wrap `real` so each call notes whether the admission lock is held and whether another
+        writer could take it right now."""
+        def watching(*args, **kwargs):
+            held = adm.holds_lock(self.root)
+            fd = adm.try_acquire_lock(self.root)
+            seen.append((held, fd is not None))
+            if fd is not None:
+                adm._release_lock(self.root, fd)
+            return real(*args, **kwargs)
+        return watching
+
+    def test_gap2_refinalize_scans_outside_admission(self):
+        files = {f"plans/cycle/f{i}.md": f"f{i}\n".encode() for i in range(6)}
+        result = self.closed_with("gap2-reclose", "gap2-reclose", files, activate=True)
+        for i in range(3):
+            self.edit(result, f"plans/cycle/f{i}.md", f"edited {i}\n".encode())
+        seen = []
+        with mock.patch.object(P, "_scan_cycle_facts", self.probe(seen, P._scan_cycle_facts)), \
+                mock.patch.object(P, "_stream_file_facts", self.probe(seen, P._stream_file_facts)), \
+                mock.patch.object(P, "_walk_files", self.probe(seen, P._walk_files)):
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(out["refreshed"], out)
+        self.assertGreaterEqual(len(seen), 4)
+        self.assertEqual(set(seen), {(False, True)})  # every walk and every hash ran with the lock free
+
+    def test_gap2_refinalize_rescans_once_when_a_file_moves_under_the_scan(self):
+        result = self.closed_with("gap2-rescan", "gap2-rescan", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        real = P._prescan_cycle
+        calls = []
+
+        def prescan(*args, **kwargs):
+            out = real(*args, **kwargs)
+            calls.append(adm.holds_lock(self.root))
+            if len(calls) == 1:
+                self.edit(result, "plans/cycle/a.md", b"a, edited again, longer\n")
+            return out
+
+        with mock.patch.object(P, "_prescan_cycle", prescan):
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(calls, [False, False])
+        self.assertTrue(out["refreshed"], out)
+        (row,) = [r for r in self.manifest(result)["artifact_revisions"] if r["locator"]["path"].endswith("a.md")]
+        self.assertEqual(row["content_digest"], "sha256:" + hashlib.sha256(b"a, edited again, longer\n").hexdigest())
+
+    def test_gap2_refinalize_leaves_it_for_the_next_look_after_two_misses(self):
+        result = self.closed_with("gap2-giveup", "gap2-giveup", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        raw = (Path(result["cycle_dir"]) / "manifest.json").read_bytes()
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        real = P._prescan_cycle
+        calls = []
+
+        def prescan(*args, **kwargs):
+            out = real(*args, **kwargs)
+            calls.append(1)
+            self.edit(result, "plans/cycle/a.md", b"a" * (len(calls) + 5) + b"\n")
+            return out
+
+        with mock.patch.object(P, "_prescan_cycle", prescan):
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((out["status"], out["refreshed"]), ("already-sealed", False), out)
+        self.assertEqual((Path(result["cycle_dir"]) / "manifest.json").read_bytes(), raw)
+        self.assertEqual(self.refresh(result)["status"], "emitted")  # the next look finds the same change
+
+    def test_gap2_recover_reconcile_scans_outside_admission(self):
+        mover = self.closed_with("gap2-recover", "gap2-recover", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        self.closed_with("gap2-recover-peer", "gap2-recover-peer")
+        folder = self.cycle_path(mover)
+        os.rename(str(folder), str(folder.with_name("hand-renamed")))
+        seen = []
+        with mock.patch.object(P, "_scan_layout", self.probe(seen, P._scan_layout)):
+            out = P.recover(self.root)
+        self.assertIn(out["status"], {"recovered", "recovered-with-problems"})
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {(False, True)})
+        self.assertEqual(self.record(mover)["locator"], "hand-renamed")  # the hand-made move was still found
+
+    def test_gap2_reconcile_skips_a_change_that_is_gone_when_the_lock_is_taken(self):
+        mover = self.closed_with("gap2-undo", "gap2-undo", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        folder = self.cycle_path(mover)
+        renamed = folder.with_name("hand-renamed")
+        os.rename(str(folder), str(renamed))
+        real = P._scan_layout
+        calls = []
+
+        def scan(root):
+            out = real(root)
+            calls.append(1)
+            if len(calls) == 1:
+                os.rename(str(renamed), str(folder))  # put back before the lock is taken
+            return out
+
+        with mock.patch.object(P, "_scan_layout", scan):
+            P.reconcile_root(self.root)
+        self.assertEqual(self.record(mover)["locator"], folder.name)
+        self.assertEqual(self.lines(field="path"), [])
+
+    def test_gap2_concurrent_move_between_check_and_publish_writes_no_history(self):
+        moved = self.closed_with("gap2-move", "gap2-move-a", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        peer = self.closed_with("gap2-move-peer", "gap2-move-b")
+        self.edit(moved, "plans/cycle/a.md", b"a, edited\n")
+        real_recheck, real_acquire = P._recheck_candidate, adm._acquire_lock
+        state = {"checked": False, "moved": False}
+
+        def checking(*args, **kwargs):
+            ok = real_recheck(*args, **kwargs)
+            state["checked"] = True
+            return ok
+
+        def acquire(root, timeout, now=None):
+            if state["checked"] and not state["moved"]:
+                state["moved"] = True  # the files were checked; the publication's lock is not yet taken
+                P.cycle_move(self.root, moved["cycle_id"], campaign=peer["campaign_id"])
+            return real_acquire(root, timeout, now)
+
+        def file_lines():
+            return [e for e in self.history.published if e.get("kind") == "artifact"]
+
+        with mock.patch.object(P, "_recheck_candidate", checking), mock.patch.object(adm, "_acquire_lock", acquire):
+            out = self.refresh(moved)
+        self.assertTrue(state["moved"])
+        self.assertEqual((out["status"], out["reason"]), ("skipped", "superseded"), out)
+        self.assertEqual(file_lines(), [])  # a refresh that was not published leaves no history
+        self.assertEqual([m for m in self.history.made if m.get("kind") == "artifact"], [])
+        new_dir = self.cycle_path(moved)
+        self.assertNotEqual(new_dir, Path(moved["cycle_dir"]))
+        before = (new_dir / "manifest.json").read_bytes()
+        self.assertEqual(self.refresh(moved)["status"], "emitted")  # the next one, from the new place
+        self.assertNotEqual((new_dir / "manifest.json").read_bytes(), before)
+        (line,) = file_lines()
+        self.assertEqual((line["operation"], line["field"]), ("update", "artifacts/plans/cycle/a.md"))
+        self.assertTrue(line["target_path"].startswith(new_dir.relative_to(self.root).as_posix()))
+
+    def test_gap2_history_and_manifest_share_one_admission_section(self):
+        result = self.closed_with("gap2-one", "gap2-one", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        sections = []
+        real_acquire, real_release = adm._acquire_lock, adm._release_lock
+        events = []
+
+        def acquire(root, timeout, now=None):
+            fd = real_acquire(root, timeout, now)
+            sections.append(len(events))
+            events.append("lock")
+            return fd
+
+        def release(root, fd):
+            events.append("unlock")
+            return real_release(root, fd)
+
+        raw = (Path(result["cycle_dir"]) / "manifest.json").read_bytes()
+        order = []
+        self.history.on_publish = lambda root, lines: order.append(
+            ((Path(result["cycle_dir"]) / "manifest.json").read_bytes() == raw, events[-1]))
+        with mock.patch.object(adm, "_acquire_lock", acquire), mock.patch.object(adm, "_release_lock", release):
+            self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.assertEqual(order, [(True, "lock")])  # history first, with the section still open ...
+        self.assertEqual(events, ["lock", "unlock"])  # ... and the manifest in that same section
+        self.assertNotEqual((Path(result["cycle_dir"]) / "manifest.json").read_bytes(), raw)
+
+
 def m_digest(document):
     return M.manifest_digest(document)
 

@@ -4580,6 +4580,8 @@ def finalize(
     exclude_symlinks: bool = False,
     _admission_lock_fd: Optional[int] = None,
     _recovery_scope: str = "root",
+    _prescan: Optional[_Prescan] = None,
+    _last_try: bool = False,
 ) -> Dict[str, Any]:
     """`lock_timeout` bounds both lock waits (default: the admission and
     checkpoint defaults); a background sweep passes 0 so a held lock defers it.
@@ -4605,8 +4607,9 @@ def finalize(
         raise ProducerError("finalize-reentry-forbidden", error.detail or cycle_id) from error
     alloc = allocator or artifact_identity.IdAllocator()
     # A closed cycle closed again is compared with its files by reading them here, before the
-    # admission lock: under the lock only `lstat` has to confirm what was read (§45 D-124).
-    known = _prescan_known(root, cycle_id) if expected_binding is None else {}
+    # admission lock: under the lock only `lstat` has to confirm what was read (§45 D-124).  A
+    # scan the lock then finds out of date is read once more (`_prescan` on that second call).
+    prescan = _prescan if _last_try else _prescan_cycle(root, cycle_id, unless_recorded=expected_binding)
     lock_fd = _admission_lock_fd
     owns_lock = lock_fd is None
     if owns_lock:
@@ -4677,7 +4680,8 @@ def finalize(
                 if _binding_route_unrecorded(manifest_path, expected_binding):
                     # A route continuing this closed cycle finishes it again (§45 D-127): the
                     # document gets that route's own terminal record before it is proved.
-                    _refresh_cycle_locked(root, record, now=now, allocator=alloc)
+                    _refresh_cycle_locked(root, record, now=now, allocator=alloc, prescan=prescan,
+                                          last_try=_last_try)
                     record = read_cycle_record(root, cycle_id)
                 verified = _verify_sealed_cycle_locked(root, record, expected_binding)
                 return _finish({**verified, "storage_state": "sealed", "cycle_state": published})
@@ -4686,7 +4690,8 @@ def finalize(
                 # cycle's files are compared with its manifest and the next
                 # document is published when they differ.
                 refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
-                                                  crash_after_manifest=crash_after_manifest, known=known)
+                                                  crash_after_manifest=crash_after_manifest,
+                                                  prescan=prescan, last_try=_last_try)
                 return _finish({**refreshed, "storage_state": "sealed", "cycle_state": published})
             return _finish({"status": "already-sealed", "cycle_id": cycle_id,
                     "manifest_digest": record.get("manifest_digest"),
@@ -4888,10 +4893,20 @@ def finalize(
             sealed_result["provisional"] = True
             sealed_result["warning"] = PROVISIONAL_SEAL_WARNING
         return _finish(sealed_result)
+    except _StaleScan:
+        pass  # read again below, with the lock released
     finally:
         interim_guard.close()
         if owns_lock:
             artifact_admission._release_lock(root, lock_fd)
+    return finalize(
+        root, cycle_id=cycle_id, state=state, primary=primary, publication=publication,
+        allow_open_route=allow_open_route, allocator=alloc, now=now, crash_after_manifest=crash_after_manifest,
+        exclude_hidden=exclude_hidden, adopt_root_outputs=adopt_root_outputs, abandon_reason=abandon_reason,
+        force_abandon_ignoring_lease=force_abandon_ignoring_lease, support_locators=support_locators,
+        expected_binding=expected_binding, lock_timeout=lock_timeout, exclude_symlinks=exclude_symlinks,
+        _recovery_scope=_recovery_scope, _last_try=True,
+        _prescan=_prescan_cycle(root, cycle_id, unless_recorded=expected_binding))
 
 
 def _finalize_deleted_locked(root: Path, record: Mapping[str, Any], *, state: str, now: Optional[float],
@@ -5106,7 +5121,8 @@ def _stream_file_facts(path: Path) -> Tuple[str, int]:
 
 def _scan_cycle_facts(directory: Path, *, excluded: List[str],
                       excluded_symlinks: List[str],
-                      known: Optional[Mapping[str, Sequence[Any]]] = None) -> List[Tuple[str, str, int]]:
+                      known: Optional[Mapping[str, Sequence[Any]]] = None,
+                      fingerprints: Optional[Dict[str, List[int]]] = None) -> List[Tuple[str, str, int]]:
     """The manifest's file facts `(path, digest, size)` under the one inclusion rule.
 
     Same rule as `_enumerate_output`, read in chunks.  A path a manifest cannot
@@ -5114,7 +5130,8 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
     excluded: a refresh never turns such a file into a failure.  `known` maps a
     path to `(size, mtime_ns, inode, digest)` from a scan made before the lock was
     taken: a file whose fingerprint still matches keeps that digest instead of
-    being read again under the lock."""
+    being read again.  `fingerprints`, when given, receives each file's fingerprint as it was
+    before its bytes were read, so a later `lstat` tells whether the digest still stands."""
     facts: List[Tuple[str, str, int]] = []
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
@@ -5130,16 +5147,19 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
             excluded.append(rel)
             continue
         remembered = (known or {}).get(rel)
-        if remembered is not None:
-            try:
-                st = os.lstat(str(entry))
-            except OSError:
-                st = None
-            if st is not None and list(remembered[:3]) == _fingerprint(st):
-                facts.append((rel, remembered[3], st.st_size))
-                continue
+        try:
+            st = os.lstat(str(entry))
+        except OSError:
+            st = None
+        if remembered is not None and st is not None and list(remembered[:3]) == _fingerprint(st):
+            facts.append((rel, remembered[3], st.st_size))
+            if fingerprints is not None:
+                fingerprints[rel] = _fingerprint(st)
+            continue
         digest, size = _stream_file_facts(entry)
         facts.append((rel, digest, size))
+        if fingerprints is not None and st is not None:
+            fingerprints[rel] = _fingerprint(st)
     return facts
 
 
@@ -5327,17 +5347,83 @@ def _refresh_journal_resume(root: Path, record: Mapping[str, Any], journal: Mapp
     return True
 
 
+class _StaleScan(Exception):
+    """What a closed cycle's files were read as before the lock no longer holds under it."""
+
+
+@dataclass
+class _Prescan:
+    """A closed cycle's files as they were read with no lock held: the manifest digest they were
+    compared with, the `(path, digest, size)` facts, and each file's fingerprint."""
+    manifest_digest: str
+    facts: List[Tuple[str, str, int]]
+    fingerprints: Dict[str, List[int]]
+    excluded: List[str]
+    excluded_symlinks: List[str]
+
+
+def _prescan_cycle(root: Path, cycle_id: str, *,
+                   unless_recorded: Optional[Mapping[str, Any]] = None) -> Optional[_Prescan]:
+    """Walk and hash a closed cycle's files before any lock is taken (§45 D-124).
+
+    An explicit `finalize` or `admit-shared` of a closed cycle compares its files with the manifest;
+    reading them here means the admission lock only has to `lstat` what changed.  `None` when
+    there is nothing to read (the cycle is not closed, has no manifest, or `unless_recorded` names
+    a route the manifest already holds) or the read could not be made: an optimisation, never an
+    error."""
+    try:
+        record = read_cycle_record(root, cycle_id)
+        if record is None or record.get("state") != "sealed" or record.get("deleted_at"):
+            return None
+        manifest_path = _record_cycle_manifest_path(root, record)
+        if not _path_entry_present(manifest_path):
+            return None
+        if unless_recorded is not None and not _binding_route_unrecorded(manifest_path, unless_recorded):
+            return None
+        if not stat.S_ISREG(os.lstat(str(manifest_path)).st_mode):
+            return None  # a link or a pipe is for the locked command to refuse, never to be read here
+        document = json.loads(manifest_path.read_bytes().decode("utf-8"))
+        scan = _Prescan(artifact_manifest.manifest_digest(document), [], {}, [], [])
+        scan.facts = _scan_cycle_facts(
+            manifest_path.parent, excluded=scan.excluded, excluded_symlinks=scan.excluded_symlinks,
+            known=_read_refresh_state(root, cycle_id).get("files", {}), fingerprints=scan.fingerprints)
+        return scan
+    except Exception:  # noqa: BLE001 -- only an optimisation
+        return None
+
+
+def _prescan_holds(directory: Path, prescan: _Prescan, changes: Mapping[str, Sequence[str]]) -> bool:
+    """Under the lock, with `lstat` only: is what the scan saw of the changed files still true?"""
+    try:
+        for rel in list(changes.get("added", [])) + list(changes.get("modified", [])):
+            if _fingerprint(os.lstat(str(directory / rel))) != prescan.fingerprints.get(rel):
+                return False
+        for rel in changes.get("removed", []):
+            try:
+                os.lstat(str(directory / rel))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optional[float] = None,
                           allocator: Optional[artifact_identity.IdAllocator] = None,
                           crash_after_manifest: bool = False,
-                          known: Optional[Mapping[str, Sequence[Any]]] = None,
+                          prescan: Optional[_Prescan] = None, last_try: bool = True,
                           trigger: str = "finalize") -> Dict[str, Any]:
     """Re-finalize a closed cycle: publish its next manifest document if any file changed.
 
-    The admission lock is held.  Order, so that a crash anywhere resumes by
-    itself (`_refresh_journal_resume`): the earlier document is preserved (a
-    cycle closed before copies existed is first seen here), the journal names
-    the new document, the new document is preserved before it is published,
+    The admission lock is held and no folder is walked or hashed under it: `prescan` is the
+    files as they were read before the lock, and only the changed files' fingerprints, the removed
+    files' absence and the manifest digest are looked at again here (§45 D-124).  A scan that no
+    longer holds raises `_StaleScan` for the caller to release the lock and read again; with
+    `last_try` it publishes no file change this time instead (the next look finds the same one).
+    Order, so that a crash anywhere resumes by itself (`_refresh_journal_resume`): the earlier
+    document is preserved (a cycle closed before copies existed is first seen here), the journal
+    names the new document, the new document is preserved before it is published,
     `manifest.json` is replaced atomically, then the index row is swapped on its earlier digest and
     the record follows.  Nothing changed means nothing is written."""
     cycle_id = record["cycle_id"]
@@ -5355,11 +5441,24 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     row = index.manifests.get(cycle_id)
     if not isinstance(row, dict) or row.get("manifest_digest") != digest:
         raise ProducerError("already-sealed-mismatch", "index")
-    excluded: List[str] = []
-    excluded_symlinks: List[str] = []
-    facts = _scan_cycle_facts(directory, excluded=excluded, excluded_symlinks=excluded_symlinks, known=known)
     alloc = allocator or artifact_identity.IdAllocator()
-    refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=now)
+    deferred = False
+    refreshed: Optional[Dict[str, Any]] = None
+    if prescan is not None and prescan.manifest_digest == digest:
+        excluded, excluded_symlinks = list(prescan.excluded), list(prescan.excluded_symlinks)
+        facts = prescan.facts
+        refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=now)
+        deferred = refreshed is not None and not _prescan_holds(directory, prescan, changes)
+    else:
+        deferred = True
+    if deferred:
+        if not last_try:
+            raise _StaleScan(cycle_id)
+        # The document as it is: no file change is published this time, a terminal record still can be.
+        excluded, excluded_symlinks, refreshed = [], [], None
+        facts = [(r["locator"]["path"], r["content_digest"], r["byte_size"])
+                 for r in document.get("artifact_revisions", []) or [] if isinstance(r, dict)]
+        changes = {"added": [], "modified": [], "removed": []}
     revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
     additions = _leaf_terminal_additions(root, record, document, facts, allocator=alloc,
                                          revision_id=revision_id, now=now)
@@ -5375,6 +5474,8 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     result = {"status": "already-sealed", "cycle_id": cycle_id, "refreshed": refreshed is not None,
               "changes": changes, "excluded_hidden": excluded, "excluded_symlinks": excluded_symlinks,
               "manifest_digest": digest}
+    if deferred:
+        result["deferred"] = "files-changed-during-read"
     if additions is not None:
         result["terminal_added"] = additions["row"]["route_id"]
     if refreshed is None:
@@ -6013,34 +6114,23 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
                      now: float, crash_after_manifest: bool) -> Optional[str]:
     """Publish a prepared next document; `None` on success, else why this run skipped.
 
-    The refresh lock is held and the admission lock is not.  Order: re-check with `lstat`,
-    history lines (a short admission section), then manifest, index row and record (a second
-    one).  Both sections hold the admission lock for file writes only."""
+    The refresh lock is held and the admission lock is not.  The files are re-checked with
+    `lstat`, then one admission section does the rest in the D-125 order: the record, the
+    current document and the index row are read again, the history lines go to the recorder, the
+    document is replaced, the index row is swapped and the record follows.  Anything that no
+    longer holds writes nothing, history included, so a refresh that was not published leaves no
+    line behind.  A recorder that is not there leaves the lines in the record; one that fails
+    leaves the manifest as it was."""
     directory = manifest_path.parent
     if not _recheck_candidate(directory, manifest_path, raw, scan, changes):
         return "superseded"
-    record = read_cycle_record(root, cycle_id)
-    if record is None or record.get("state") != "sealed" or record.get("manifest_digest") != digest:
-        return "superseded"
-    carried = list(record.get("history_pending") or [])
-    pending = _merge_pending(carried, lines)
-    if _history_module() is not None:
-        fd = artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS)
-        try:
-            delivered = _history_deliver_locked(root, pending)
-            if delivered and carried:
-                _write_history_pending(root, record, [])
-        finally:
-            artifact_admission._release_lock(root, fd)
-        if not delivered:
-            return "history-unavailable"  # history first, manifest second: the same change is found again
-        pending = []
     fd = artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS)
     try:
         record = read_cycle_record(root, cycle_id)
-        if record is None or record.get("state") != "sealed" or record.get("manifest_digest") != digest:
+        if (record is None or record.get("state") != "sealed" or record.get("manifest_digest") != digest
+                or _record_cycle_manifest_path(root, record) != manifest_path):
             return "superseded"
-        if manifest_path.read_bytes() != raw:
+        if not _recheck_candidate(directory, manifest_path, raw, scan, changes):
             return "superseded"
         index = artifact_admission.load_index(root)  # the one read of this locked section
         row = index.manifests.get(cycle_id)
@@ -6054,7 +6144,12 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
             return "index-rejected"
         new_raw = artifact_manifest.canonical_bytes(refreshed)
         cycle_path = os.path.relpath(str(directory), str(root))
+        pending = _merge_pending(record.get("history_pending") or [], lines)
         artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, raw)
+        if _history_module() is not None:
+            if not _history_deliver_locked(root, pending):
+                return "history-unavailable"  # history first, manifest second: the same change is found again
+            pending = []
         _write_journal(root, cycle_id, state="refreshing", manifest_digest=new_digest,
                        previous_manifest_digest=digest, cycle_path=cycle_path,
                        manifest_revision_id=refreshed["manifest_revision_id"], history_pending=pending)
@@ -6156,26 +6251,6 @@ def refresh_sweep(
         except (OSError, ProducerError):
             pass
     return out
-
-
-def _prescan_known(root: Path, cycle_id: str) -> Dict[str, List[Any]]:
-    """Fingerprints and digests of a closed cycle's files, read before any lock is taken.
-
-    An explicit `finalize` or `admit-shared` of a closed cycle compares its files with the
-    manifest under the admission lock; reading them here means the lock only has to `lstat`."""
-    try:
-        record = read_cycle_record(root, cycle_id)
-        if record is None or record.get("state") != "sealed":
-            return {}
-        manifest_path = _record_cycle_manifest_path(root, record)
-        if not _path_entry_present(manifest_path):
-            return {}
-        scan = _bounded_scan(manifest_path.parent, cursor=None,
-                             known=_read_refresh_state(root, cycle_id).get("files", {}),
-                             budget=RefreshBudget.unlimited())
-        return {rel: [*fp, digest] for rel, (digest, _size, fp) in scan.facts.items()}
-    except Exception:  # noqa: BLE001 -- only an optimisation
-        return {}
 
 
 def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
@@ -6456,9 +6531,11 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
 def recover(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]:
     dispatch_terminal_commit.require_current_cleanup("root-recover")
     root = Path(root).resolve()
+    # §45 D-126: what was moved or removed by hand is found first, and the folders are read before
+    # the lock is taken (D-124).
+    reconcile_root(root, now=now)
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
-        reconcile_root(root, now=now)  # §45 D-126: what was moved or removed by hand is found first
         step1 = artifact_admission._recover_locked(root, now=now)
         producer = _recover_locked(root, now=now)
         locator_index = artifact_locator.verify_indexes(root, repair=True)
@@ -7132,7 +7209,7 @@ def admit_shared(
     if key and not _KEY_RE.match(key):
         raise ProducerError("reference-key-invalid", key)
     alloc = allocator or artifact_identity.IdAllocator()
-    known = _prescan_known(root, cycle_id)  # the cycle's own files, read before the lock (§45 D-124)
+    prescan = _prescan_cycle(root, cycle_id)  # the cycle's own files, read before the lock (§45 D-124)
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
         pre = read_cycle_record(root, cycle_id)
@@ -7215,7 +7292,7 @@ def admit_shared(
         # §45 D-123/D-124: a new publication takes the files as they are now, so the
         # cycle's manifest is brought up to them first (it may have changed since the close).
         if _path_entry_present(_record_cycle_manifest_path(root, record)):
-            if _refresh_cycle_locked(root, record, now=now, known=known, trigger="admit-shared")["refreshed"]:
+            if _refresh_cycle_locked(root, record, now=now, prescan=prescan, trigger="admit-shared")["refreshed"]:
                 record = read_cycle_record(root, cycle_id)
         # An unresolved publication intent for this exact source cannot be
         # replaced by a second publication. Preserve it for checked recovery.
@@ -8452,30 +8529,67 @@ def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]
         root = Path(root).resolve()
         if not is_active(root) or not (root / "campaigns").is_dir():
             return {"status": "inactive"}
-        published = artifact_locator._load_index(root)
-        if published is None:
-            return {"status": "unchanged"}
-        scan = _scan_layout(root)
-        if scan.mapping(root) == published:
-            return {"status": "unchanged"}
-        if not any(_hand_changes(root, scan, published).values()):
-            return {"status": "unchanged"}
-        return _reconcile_locked_run(root, now)
+        # The folders are read with no lock held (§45 D-124); the lock only confirms what was found.
+        # A change that no longer holds when the lock is taken is looked for once more.
+        for _attempt in range(2):
+            published = artifact_locator._load_index(root)
+            if published is None:
+                return {"status": "unchanged"}
+            scan = _scan_layout(root)
+            if scan.mapping(root) == published:
+                return {"status": "unchanged"}
+            changes = _hand_changes(root, scan, published)
+            if not any(changes.values()):
+                return {"status": "unchanged"}
+            result = _reconcile_locked_run(root, now, scan, published, changes)
+            if result is not None:
+                return result
+        return {"status": "skipped", "reason": "layout-changed-during-scan"}
     except Exception as exc:  # noqa: BLE001 -- finding a hand-made change never fails the command that asked
         return {"status": "skipped", "reason": type(exc).__name__, "detail": str(exc)}
 
 
-def _reconcile_locked_run(root: Path, now: Optional[float]) -> Dict[str, Any]:
+def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mapping[str, str]) -> bool:
+    """Under the lock, with `lstat` and the small files that name an ID: is each change the scan found still there?"""
+    def gone(relative: str) -> bool:
+        try:
+            os.lstat(str(Path(root) / relative))
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        return False
+
+    def folder_is(path: Path) -> bool:
+        try:
+            return stat.S_ISDIR(os.lstat(str(path)).st_mode)
+        except OSError:
+            return False
+
+    for campaign_id, folder in changes["campaign_paths"]:
+        campaign = _read_json(folder / "campaign.json") if folder_is(folder) else None
+        if not campaign or campaign.get("campaign_id") != campaign_id or campaign.get("locator") == folder.name:
+            return False
+    for cycle_id, folder in changes["cycle_moves"]:
+        try:
+            binding = artifact_locator.read_cycle_binding(folder) if folder_is(folder) else None
+        except artifact_locator.LocatorError:
+            binding = None
+        if binding is None or binding.get("cycle_id") != cycle_id:
+            return False
+    for identifier in list(changes["cycle_gone"]) + list(changes["campaign_gone"]):
+        if identifier not in published or not gone(published[identifier]):
+            return False
+    return True
+
+
+def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, published: Mapping[str, str],
+                          changes: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Apply what `reconcile_root` found, under the admission lock.  `None` when what was found
+    no longer holds, for the caller to look again."""
     held = artifact_admission.holds_lock(root)
     lock_fd = None if held else artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS, now=now)
     try:
-        published = artifact_locator._load_index(root)
-        if published is None:
-            return {"status": "unchanged"}
-        scan = _scan_layout(root)
-        changes = _hand_changes(root, scan, published)
-        if not any(changes.values()):
-            return {"status": "unchanged"}
+        if artifact_locator._load_index(root) != published or not _hand_changes_hold(root, changes, published):
+            return None
         stamp = _command_stamp()
         by = _HAND_ACTOR
         stale: List[str] = []
