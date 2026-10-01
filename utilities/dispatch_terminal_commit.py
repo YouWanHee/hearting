@@ -818,6 +818,40 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
     return TerminalProof("proved", None)
 
 
+# A settled transaction (the envelope is sealed) is replayed from what it recorded
+# (§45 D-127).  The route's live gate observation judges a completion marker's evidence
+# file by today's bytes, so a report edited, moved or deleted after the settlement reads as
+# "evidence moved on".  For these two reasons only, the row is rebuilt from the marker
+# itself: its own bytes and the evidence digest it recorded, which is what the claim bound.
+_EVIDENCE_MOVED_ON = frozenset({"completion-evidence-revised-unrecorded", "completion-evidence-unreadable"})
+
+
+def _settled_gate_rows(route_module, route, request, gates):
+    nodes = {node.get("id"): node for node in route.get("nodes", []) if isinstance(node, dict)}
+    rows = {}
+    for node_id, row in gates.items():
+        rebuilt = None
+        if (isinstance(row, Mapping) and row.get("passed") is False
+                and row.get("reason") in _EVIDENCE_MOVED_ON and node_id in nodes):
+            try:
+                path = route_module.completion_dir(route["route_id"], jobs=request.jobs) / f"{node_id}.json"
+                raw = path.read_bytes()
+                marker = json.loads(raw)
+                evidence = marker.get("evidence") or {}
+                if (marker.get("route_id") == route["route_id"] and marker.get("route_hash") == route["route_hash"]
+                        and marker.get("node_id") == node_id
+                        and marker.get("completion_gate") == nodes[node_id].get("terminal_gate")
+                        and isinstance(marker.get("attempt_id"), str) and isinstance(evidence.get("sha256"), str)):
+                    rebuilt = {"passed": True, "node_id": node_id, "attempt_id": marker["attempt_id"],
+                               "completion_gate": marker["completion_gate"],
+                               "marker_digest": hashlib.sha256(raw).hexdigest(),
+                               "evidence_digest": evidence["sha256"], "evidence": evidence.get("path")}
+            except (OSError, ValueError, TypeError, AttributeError):
+                rebuilt = None
+        rows[node_id] = rebuilt or row
+    return rows
+
+
 def _reverify_forward_recovery(
     request: TerminalCommitRequest, existing_state_value: Mapping[str, Any]
 ) -> TerminalProof:
@@ -847,6 +881,8 @@ def _reverify_forward_recovery(
         )
         route_module = _route_module()
         gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+        if existing_state_value.get("state") == "owner-envelope-sealed":
+            gates = _settled_gate_rows(route_module, route, request, gates)
         marker_digest = terminal_marker_digest(list(gates.values()))
         if producer_lifecycle_applies(route):
             binding = load_producer_binding(
@@ -920,6 +956,9 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         route = json.loads(Path(request.route_file).read_text(encoding="utf-8"))
         route_module = _route_module()
         gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+        settled = existing_state_value is not None and existing_state_value.get("state") == "owner-envelope-sealed"
+        if settled:
+            gates = _settled_gate_rows(route_module, route, request, gates)
         markers = list(gates.values())
         terminal_nodes = tuple((route.get("workflow_contract") or {}).get("terminal_nodes") or ())
         marker_digest = terminal_marker_digest(markers)
@@ -953,6 +992,8 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             if fresh.status != "proved":
                 raise TerminalCommitError(fresh.reason or "transaction-conflict", fresh.detail or "claim-proof-changed")
             fresh_gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+            if settled:
+                fresh_gates = _settled_gate_rows(route_module, route, request, fresh_gates)
             if terminal_marker_digest(list(fresh_gates.values())) != marker_digest:
                 raise TerminalCommitError("transaction-conflict", "claim-markers-changed")
             dispatch_contract.claim_terminal_route_locked(
@@ -1010,11 +1051,13 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             if production_services:
                 _verify_settled_outputs(request, route, commit_id, binding_value)
             try:
-                envelope_text = _read_sealed_owner_envelope(request, commit_id)
+                envelope_text, after_seal = _sealed_owner_envelope(request, commit_id)
             except TerminalCommitError as exc:
                 _record_attempt(request, exc.code, exc.detail)
                 return TerminalCommitResult("recoverable", exc.code, exc.detail, terminal_nodes)
-            return TerminalCommitResult("completed", None, None, terminal_nodes, envelope_text)
+            # §45 D-127: the stored envelope is delivered as it was; a report that
+            # changed or went away afterwards is information beside it, not a failure.
+            return TerminalCommitResult("completed", None, after_seal, terminal_nodes, envelope_text)
         return TerminalCommitResult("recoverable", "recovery-unavailable", "partial-state", terminal_nodes)
     except TerminalCommitError as exc:
         _record_attempt(request, exc.code, exc.detail)
@@ -1027,8 +1070,14 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         return TerminalCommitResult("recoverable", "recovery-unavailable", str(exc))
 
 
-def _read_sealed_owner_envelope(request, commit_id):
-    """One read-only envelope proof for settlement replay and delivery."""
+def _sealed_owner_envelope(request, commit_id):
+    """The stored envelope text and what became of its primary report afterwards.
+
+    The envelope and its content digest, and the commit identity they were sealed
+    under, are proved.  The report the envelope names is judged only as news
+    (§45 D-127): `None` when it still holds the sealed bytes, else
+    `primary-changed-after-seal` or `primary-missing-after-seal` (edited, moved,
+    or removed).  Nothing here fails because the report moved on."""
     slot = _commit_state_path(request).parent
     try:
         meta = json.loads((slot / "owner-envelope.json").read_text())
@@ -1040,11 +1089,22 @@ def _read_sealed_owner_envelope(request, commit_id):
     if _digest(text.encode()) != meta.get("content_digest"):
         raise TerminalCommitError("transaction-conflict", "envelope-content-mismatch")
     primary = Path(meta.get("primary_path") or "")
-    if not primary.is_absolute() or not _in_root_regular(primary, request.artifact_root.resolve()):
+    if not primary.is_absolute():
         raise TerminalCommitError("recovery-unavailable", "primary-no-longer-in-root")
-    if _digest(primary.read_bytes()) != meta.get("primary_digest"):
-        raise TerminalCommitError("transaction-conflict", "primary-content-drifted-after-seal")
-    return text
+    if not _in_root_regular(primary, request.artifact_root.resolve()):
+        return text, "primary-missing-after-seal"
+    try:
+        sealed_bytes = primary.read_bytes()
+    except OSError:
+        return text, "primary-missing-after-seal"
+    if _digest(sealed_bytes) != meta.get("primary_digest"):
+        return text, "primary-changed-after-seal"
+    return text, None
+
+
+def _read_sealed_owner_envelope(request, commit_id):
+    """One read-only envelope proof for settlement replay and delivery."""
+    return _sealed_owner_envelope(request, commit_id)[0]
 
 
 def _verify_settled_outputs(request, route, commit_id, binding):

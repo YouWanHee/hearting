@@ -207,6 +207,7 @@ def check(
     manifest_digest: str,
     repository_id: Optional[str] = None,
     known_parent_cycle_ids: Optional[Collection[str]] = None,
+    replaces_manifest_digest: Optional[str] = None,
 ) -> ValidationReport:
     """Judge ``document`` against the index.
 
@@ -214,6 +215,12 @@ def check(
     the same root but are not (yet) in the index -- a parent still open, or
     one deleted since.  A parent is a reference, not an ordering or campaign
     constraint (§45 D-123): it only has to be a cycle of this root.
+
+    ``replaces_manifest_digest`` makes ``document`` the same cycle's next
+    manifest (§45 D-124): the cycle's current index row must still carry that
+    digest (the compare-and-swap), IDs, routes and events the cycle already owns
+    are references to what it has, and only its new events advance a stream
+    cursor.  Every ID another cycle owns is still refused.
     """
     violations = []
 
@@ -241,7 +248,12 @@ def check(
         index, document, idempotency_key=idempotency_key, manifest_digest=manifest_digest
     )
 
-    if not is_idempotent_retry and cycle_id in index.cycles:
+    replacing = replaces_manifest_digest is not None and not is_idempotent_retry
+
+    def owned_by_this_cycle(row: Any) -> bool:
+        return replacing and isinstance(row, dict) and row.get("cycle_id") == cycle_id
+
+    if not is_idempotent_retry and cycle_id in index.cycles and not replacing:
         violations.append(
             Violation(
                 "index-cycle-id-duplicate",
@@ -251,7 +263,7 @@ def check(
         )
 
     parent_cycle_id = cycle.get("parent_cycle_id")
-    if parent_cycle_id is not None and not is_idempotent_retry:
+    if parent_cycle_id is not None and not is_idempotent_retry and not replacing:
         if parent_cycle_id == cycle_id:
             violations.append(
                 Violation(
@@ -283,7 +295,7 @@ def check(
                     "stable id already present with kind {0!r}".format(existing_kind),
                 )
             )
-        elif kind not in _REUSABLE_SAME_KIND:
+        elif kind not in _REUSABLE_SAME_KIND and not owned_by_this_cycle(existing):
             violations.append(
                 Violation(
                     "index-stable-id-duplicate",
@@ -294,7 +306,7 @@ def check(
 
     for root_id, route_id in declared_routes(document):
         existing = index.routes.get(root_id, {}).get(route_id)
-        if existing is not None and not is_idempotent_retry:
+        if existing is not None and not is_idempotent_retry and not owned_by_this_cycle(existing):
             violations.append(
                 Violation(
                     "index-route-composite-duplicate",
@@ -309,7 +321,7 @@ def check(
         if isinstance(row, dict)
     ]:
         existing = index.event_ids.get(event_id)
-        if existing is not None and not is_idempotent_retry:
+        if existing is not None and not is_idempotent_retry and not owned_by_this_cycle(existing):
             violations.append(
                 Violation(
                     "index-event-id-reused",
@@ -319,7 +331,12 @@ def check(
             )
 
     if not is_idempotent_retry:
-        for stream_id, (min_seq, max_seq) in declared_streams(document).items():
+        incoming = document
+        if replacing:
+            # A re-referenced event is the cycle's own; only a new one moves a cursor.
+            incoming = {"events": [row for row in document.get("events", []) or []
+                                   if isinstance(row, dict) and row.get("event_id") not in index.event_ids]}
+        for stream_id, (min_seq, max_seq) in declared_streams(incoming).items():
             existing_stream = index.streams.get(stream_id)
             if existing_stream is None:
                 if min_seq != 1:
@@ -342,8 +359,20 @@ def check(
                     )
 
     existing_manifest = index.manifests.get(idempotency_key)
+    if replacing and existing_manifest is None:
+        violations.append(
+            Violation(
+                "manifest-revision-append-out-of-scope",
+                "$.manifest_id",
+                "no current index row to replace for this idempotency key",
+            )
+        )
     if existing_manifest is not None and not is_idempotent_retry:
-        if existing_manifest.get("manifest_digest") != manifest_digest:
+        if replacing:
+            expected_digest = replaces_manifest_digest
+        else:
+            expected_digest = manifest_digest
+        if existing_manifest.get("manifest_digest") != expected_digest:
             violations.append(
                 Violation(
                     "manifest-revision-append-out-of-scope",
@@ -459,8 +488,15 @@ def build(
     admitted: Iterable[Tuple[Mapping[str, Any], str, str, str]],
     *,
     known_parent_cycle_ids: Optional[Collection[str]] = None,
+    preserved: Optional[Mapping[str, Iterable[Mapping[str, Any]]]] = None,
 ) -> IndexDocument:
     """Rebuild from published documents, refusing cross-manifest conflicts.
+
+    ``preserved`` maps a cycle ID to that cycle's earlier documents (§45 D-124).
+    They never replace the current row: the current document is folded last and
+    carries every earlier event, while an ID only an earlier document declared
+    (a removed artifact or revision) stays owned by its cycle, so a rebuilt
+    index refuses to reuse it just as the incrementally updated one does.
 
     Rebuild input order is directory order, not admission order, so per-item
     stream-continuity cursors cannot be enforced here; instead the union of
@@ -496,6 +532,11 @@ def build(
                     idempotency_key, ", ".join(conflict_codes)
                 )
             )
+        earlier_documents = [
+            old for old in (preserved or {}).get(
+                (document.get("cycle") or {}).get("cycle_id") if isinstance(document.get("cycle"), dict) else None, ())
+            if old.get("manifest_revision_id") != document.get("manifest_revision_id")
+        ]
         for stream_id, (min_seq, max_seq) in declared_streams(document).items():
             bucket = stream_sequences.setdefault(stream_id, {})
             for row in document.get("events", []) or []:
@@ -504,6 +545,14 @@ def build(
                 seq = row.get("stream_sequence")
                 if isinstance(seq, int) and not isinstance(seq, bool):
                     bucket[seq] = bucket.get(seq, 0) + 1
+        for old in earlier_documents:
+            index = apply(
+                index,
+                old,
+                cycle_path=cycle_path,
+                manifest_digest=manifest_digest,
+                idempotency_key=idempotency_key,
+            )
         index = apply(
             index,
             document,

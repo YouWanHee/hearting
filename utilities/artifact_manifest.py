@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from artifact_identity import is_well_formed, kind_of
 
@@ -988,7 +988,17 @@ def _dup_check(
             seen[v] = i
 
 
-def validate_lineage(document: Mapping[str, Any]) -> ValidationReport:
+def validate_lineage(
+    document: Mapping[str, Any],
+    *,
+    resolvable_ids: Optional[Collection[str]] = None,
+    first_close: bool = True,
+) -> ValidationReport:
+    """`resolvable_ids` are IDs declared by this cycle's earlier documents: a
+    refreshed document (§45 D-124) keeps its earlier events, which may name an
+    artifact or revision that is no longer a current row, and reads those names
+    from the preserved copies.  `first_close=False` skips the checks that only
+    the first closing document answers to (the required artifact roles)."""
     violations: List[Violation] = []
     if not isinstance(document, dict):
         return _ok()
@@ -1079,7 +1089,7 @@ def validate_lineage(document: Mapping[str, Any]) -> ValidationReport:
                 )
             )
 
-    all_ids = set(declared_ids(document).keys())
+    all_ids = set(declared_ids(document).keys()) | set(resolvable_ids or ())
     for i, row in enumerate(events):
         target_id = row.get("target_id")
         if target_id is not None and target_id not in all_ids:
@@ -1229,7 +1239,7 @@ def validate_lineage(document: Mapping[str, Any]) -> ValidationReport:
                 )
                 if art is not None:
                     roles_present.add(art.get("role"))
-            for role in required_roles:
+            for role in required_roles if first_close else ():
                 if role not in roles_present:
                     violations.append(
                         Violation(
@@ -1519,6 +1529,71 @@ def validate(document: Any) -> ValidationReport:
 # It claims no lineage commit and no completion, so it has no cycle.* or
 # route.terminal.recorded event; every other rule is the sealed rule.
 INTERIM_CYCLE_STATE = "open"
+
+
+def validate_update(
+    document: Any,
+    *,
+    preserved: Sequence[Mapping[str, Any]] = (),
+    previous: Optional[Mapping[str, Any]] = None,
+    published: bool = False,
+) -> ValidationReport:
+    """§45 D-124: a document the runtime published after the cycle closed.
+
+    It is the first-close document's own D-6 check with two differences: a
+    reference to an artifact or revision that is no longer a current row is
+    resolved from `preserved` (the cycle's earlier documents; an ID declared
+    nowhere in them stays a violation), and the required artifact roles are not
+    asked again, so removing a required or every file leaves a valid document.
+    With `previous` the document must also keep that document's events, and
+    its routes, exactly as they were: only a revision record (or the terminal
+    record of a later route) may follow.  `published=True` reads a document
+    that is already out (a rebuild, a proof): a reference no preserved copy
+    resolves any more is then accepted, because losing a copy must not turn a
+    finished cycle into a broken one -- only publishing a new document asks for
+    every reference to resolve."""
+    shape = validate_shape(document)
+    locators = validate_locators(document)
+    earlier: set = set()
+    for old in preserved:
+        earlier |= set(declared_ids(old).keys())
+    lineage = validate_lineage(document, resolvable_ids=earlier, first_close=False)
+    events = validate_events(document)
+    report = shape.merged(locators).merged(lineage).merged(events)
+    if published:
+        kept = tuple(v for v in report.violations
+                     if v.code not in ("event-target-id-not-declared", "unresolvable-evidence-id"))
+        report = ValidationReport(ok=not kept, violations=kept)
+    if previous is None or not isinstance(document, dict):
+        return report
+    violations: List[Violation] = []
+    for key in ("events", "routes"):
+        before = [r for r in previous.get(key, []) or []]
+        after = [r for r in document.get(key, []) or []]
+        if after[: len(before)] != before:
+            violations.append(Violation(
+                "update-earlier-%s-changed" % key, "$.%s" % key,
+                "a refreshed document keeps every earlier %s exactly" % key))
+        elif key == "events":
+            for row in after[len(before):]:
+                if not isinstance(row, dict) or row.get("event_type") not in (
+                        "artifact.revision.recorded", "route.terminal.recorded"):
+                    violations.append(Violation(
+                        "update-event-type-not-allowed", "$.events",
+                        "only a revision record or a later route's terminal record may follow"))
+    before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
+    after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
+    for key in ("cycle_id", "campaign_id", "state", "parent_cycle_id", "started_on", "input_digest"):
+        if before_cycle.get(key) != after_cycle.get(key):
+            violations.append(Violation(
+                "update-cycle-field-changed", "$.cycle.%s" % key, "a refresh does not change the cycle"))
+    for key in ("manifest_id", "artifact_root_id", "repository_id"):
+        if previous.get(key) != document.get(key):
+            violations.append(Violation(
+                "update-identity-changed", "$.%s" % key, "a refresh keeps the manifest identity"))
+    if violations:
+        return report.merged(_report(violations))
+    return report
 
 
 def validate_interim(document: Any) -> ValidationReport:

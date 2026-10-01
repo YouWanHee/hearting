@@ -697,6 +697,9 @@ class _TerminalCommitFixture(unittest.TestCase):
     def request(self):
         return T.TerminalCommitRequest(self.route_file, "att-a3fixture", self.jobs, self.root)
 
+    def _slot(self):
+        return T._commit_state_path(self.request()).parent
+
     def patch_settle(self, *, producer=False):
         proof = T.TerminalProof("proved")
         topology = mock.patch.object(T, "producer_lifecycle_applies", return_value=producer)
@@ -943,19 +946,36 @@ class EnvelopeReplayReverificationTest(_TerminalCommitFixture):
             second = T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
         self.assertEqual(second.result, "completed")
 
-    def test_primary_content_drift_after_seal_is_transaction_conflict_not_replay(self):
-        owner = self._seal_once()
-        # Mutate the sealed primary artifact's bytes after sealing.
-        self.artifact.write_text("tampered after seal\n", encoding="utf-8")
+    def _replay(self, owner):
         with mock.patch.object(T, "prove_terminal_authority", return_value=T.TerminalProof("proved")), \
              mock.patch.object(T, "validate_owner_route", return_value=owner), \
              mock.patch.object(T, "producer_lifecycle_applies", return_value=False), \
              mock.patch.object(T, "_route_module") as route_module:
             route_module.return_value.terminal_gate_observation.return_value = self.gates
-            second = T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
-        self.assertEqual(second.result, "recoverable")
-        self.assertEqual(second.reason, "transaction-conflict")
-        self.assertEqual(second.detail, "primary-content-drifted-after-seal")
+            return T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
+
+    def test_primary_content_change_after_seal_is_news_beside_the_stored_envelope(self):
+        """§45 D-127: the sealed envelope is delivered as stored; an edited report is information."""
+        owner = self._seal_once()
+        stored = (self._slot() / "owner-envelope.txt").read_text()
+        # Mutate the sealed primary artifact's bytes after sealing.
+        self.artifact.write_text("tampered after seal\n", encoding="utf-8")
+        second = self._replay(owner)
+        self.assertEqual((second.result, second.reason), ("completed", None))
+        self.assertEqual(second.detail, "primary-changed-after-seal")
+        self.assertEqual(second.envelope_text, stored)
+        # A report that went away is the other piece of news.
+        self.artifact.unlink()
+        third = self._replay(owner)
+        self.assertEqual((third.result, third.detail), ("completed", "primary-missing-after-seal"))
+        self.assertEqual(third.envelope_text, stored)
+
+    def test_a_tampered_stored_envelope_is_still_a_conflict(self):
+        owner = self._seal_once()
+        (self._slot() / "owner-envelope.txt").write_text("artifact: elsewhere\nverdict: PASS\nblocker: none\n")
+        second = self._replay(owner)
+        self.assertEqual((second.result, second.reason, second.detail),
+                         ("recoverable", "transaction-conflict", "envelope-content-mismatch"))
 
 
 class CleanupScopeDurabilityTest(_TerminalCommitFixture):

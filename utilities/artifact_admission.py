@@ -27,8 +27,9 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import artifact_identity
 import artifact_index
 import artifact_locator
 import artifact_manifest
@@ -757,6 +758,50 @@ def _known_idempotency_keys(root: Path) -> Tuple[Dict[str, str], Dict[str, str]]
     return by_cycle, by_path
 
 
+_CYCLE_RECORD_REL = Path(".runtime/artifact-producer/v1/cycles")
+# The location `artifact_lifecycle.MANIFEST_SNAPSHOT_REL` names; that module
+# imports this one, so the path is repeated here rather than imported back.
+_MANIFEST_SNAPSHOT_REL = Path(".runtime/artifact-producer/v1/manifests")
+_CYCLE_ID_FILE_RE = re.compile(r"^cyc_[0-9a-f]{32}$")
+
+
+def _producer_cycle_ids(root: Path) -> frozenset:
+    """Cycle IDs the root's producer has a record for (open, closed, or since deleted).
+
+    A cycle's parent is a reference to one of these, not an ordering rule
+    (§45 D-123), so a parent that is still open or already deleted is a known
+    parent even when the index has no row for it."""
+    try:
+        names = os.listdir(str(Path(root) / _CYCLE_RECORD_REL))
+    except OSError:
+        return frozenset()
+    return frozenset(name[:-5] for name in names
+                     if name.endswith(".json") and _CYCLE_ID_FILE_RE.match(name[:-5]))
+
+
+def _preserved_documents(root: Path, cycle_id: Any) -> List[Mapping[str, Any]]:
+    """The cycle's earlier published documents (§45 D-124), read-only."""
+    if not isinstance(cycle_id, str) or not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        return []
+    try:
+        directory = Path(root) / _MANIFEST_SNAPSHOT_REL / cycle_id
+        names = sorted(os.listdir(str(directory)))
+    except OSError:
+        return []
+    documents = []
+    for name in names:
+        path = directory / name
+        if not name.endswith(".json") or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            document = json.loads(path.read_bytes().decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(document, dict) and document.get("manifest_revision_id") == name[:-5]:
+            documents.append(document)
+    return documents
+
+
 def _compute_rebuilt_index(
     root: Path,
 ) -> Tuple[artifact_index.IndexDocument, List[str]]:
@@ -766,6 +811,7 @@ def _compute_rebuilt_index(
     known_by_cycle, known_by_path = _known_idempotency_keys(root)
     fallback_keys: List[str] = []
     items = []
+    preserved: Dict[str, List[Mapping[str, Any]]] = {}
     if campaigns_dir.exists():
         for campaign_dir in sorted(campaigns_dir.iterdir(), key=lambda path: path.name):
             if campaign_dir.name.startswith(".") or campaign_dir.is_symlink() or not campaign_dir.is_dir():
@@ -775,7 +821,15 @@ def _compute_rebuilt_index(
                 if not manifest_path.is_file():
                     continue
                 document = json.loads(manifest_path.read_bytes().decode("utf-8"))
+                earlier = [old for old in _preserved_documents(
+                               root, (document.get("cycle") or {}).get("cycle_id")
+                               if isinstance(document.get("cycle"), dict) else None)
+                           if old.get("manifest_revision_id") != document.get("manifest_revision_id")]
                 report = artifact_manifest.validate(document)
+                if not report.ok and earlier:
+                    # A document the runtime refreshed after the close names
+                    # things only its earlier documents still declare.
+                    report = artifact_manifest.validate_update(document, preserved=earlier, published=True)
                 if not report.ok:
                     raise AdmissionRecoveryRequired(
                         "published manifest at {0} fails validation during rebuild".format(
@@ -807,9 +861,12 @@ def _compute_rebuilt_index(
                     idempotency_key = document.get("manifest_id")
                     fallback_keys.append(idempotency_key)
                 items.append((document, cycle_path, digest, idempotency_key))
+                if earlier:
+                    preserved[cycle_id] = earlier
     if not items:
         return artifact_index.empty(identity.artifact_root_id), fallback_keys
-    return artifact_index.build(items), fallback_keys
+    return artifact_index.build(
+        items, known_parent_cycle_ids=_producer_cycle_ids(root), preserved=preserved), fallback_keys
 
 
 def rebuild_index(root: Path) -> artifact_index.IndexDocument:
@@ -1100,6 +1157,7 @@ def admit(
             idempotency_key=request.idempotency_key,
             manifest_digest=digest,
             repository_id=identity.repository_id,
+            known_parent_cycle_ids=_producer_cycle_ids(root),
         )
         if not index_report.ok:
             return AdmissionOutcome(

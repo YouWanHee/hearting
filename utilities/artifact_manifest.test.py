@@ -991,5 +991,49 @@ class TestDeclaredHelpers(unittest.TestCase):
         self.assertEqual(streams[doc["events"][0]["stream_id"]], (1, 2))
 
 
+class TestUpdateDocument(unittest.TestCase):
+    """§45 D-124: the document a closed cycle publishes after its files changed."""
+
+    def _pair(self):
+        import copy
+        before = _valid_document()
+        after = copy.deepcopy(before)
+        after["manifest_revision_id"] = "mrev_" + "d" * 32
+        return before, after
+
+    def test_removed_artifacts_leave_references_that_earlier_copies_resolve(self):
+        before, after = self._pair()
+        after["artifacts"], after["artifact_revisions"] = [], []
+        self.assertFalse(m.validate(after).ok)
+        self.assertFalse(m.validate_update(after, previous=before).ok)
+        self.assertTrue(m.validate_update(after, preserved=[before], previous=before).ok)
+        # An already-published document is read without its copies (a copy may be lost).
+        self.assertTrue(m.validate_update(after, published=True).ok)
+
+    def test_earlier_events_and_routes_are_kept_exactly(self):
+        before, after = self._pair()
+        self.assertTrue(m.validate_update(after, preserved=[before], previous=before).ok)
+        dropped = json.loads(json.dumps(after))
+        dropped["events"] = dropped["events"][1:]
+        self.assertIn("update-earlier-events-changed",
+                      _codes(m.validate_update(dropped, preserved=[before], previous=before)))
+        changed = json.loads(json.dumps(after))
+        changed["events"][0]["payload"] = {"edited": True}
+        self.assertIn("update-earlier-events-changed",
+                      _codes(m.validate_update(changed, preserved=[before], previous=before)))
+        moved = json.loads(json.dumps(after))
+        moved["routes"][0]["terminal_marker"] = "other"
+        self.assertIn("update-earlier-routes-changed",
+                      _codes(m.validate_update(moved, preserved=[before], previous=before)))
+
+    def test_only_revision_or_later_terminal_records_may_follow(self):
+        before, after = self._pair()
+        stray = json.loads(json.dumps(before["events"][0]))
+        stray.update(event_id="evt_" + "e" * 32, stream_id="strm_" + "e" * 32, event_type="decision.recorded")
+        after["events"].append(stray)
+        self.assertIn("update-event-type-not-allowed",
+                      _codes(m.validate_update(after, preserved=[before], previous=before)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

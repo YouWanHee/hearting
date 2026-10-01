@@ -978,19 +978,30 @@ def _inline_producer_binding_check(root: Path, cycle_id: str,
 
 
 def resolve_cycle_manifest_route(root: Path, record: Mapping[str, Any],
-                                 document: Mapping[str, Any]) -> Tuple[Path, Dict[str, Any]]:
-    """Resolve and read-only admit the one route sealed by a cycle manifest.
+                                 document: Mapping[str, Any],
+                                 route_id: Optional[str] = None) -> Tuple[Path, Dict[str, Any]]:
+    """Resolve and read-only admit the route a cycle manifest sealed.
 
     The cycle record's route tuple remains the begin identity.  A manifest may
-    name its verified continuation leaf, so its sole route row is resolved
+    name its verified continuation leaf, so its route row is resolved
     through the canonical route directory and admitted against that begin
-    identity.  This helper is safe for both pre-seal recovery and sealed replay;
-    it never changes cycle state or consults ``route_bindings``.
+    identity.  A closed cycle a later route closed again carries one row per
+    closing route (§45 D-127); `route_id` names the one a caller finished
+    with, and the latest is meant when none is named.  This helper is safe for
+    both pre-seal recovery and sealed replay; it never changes cycle state or
+    consults ``route_bindings``.
     """
     rows = document.get("routes") if isinstance(document, Mapping) else None
-    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+    if (not isinstance(rows, list) or not rows or not all(isinstance(r, Mapping) for r in rows)
+            or (len(rows) != 1 and not record.get("sealed_on") and record.get("state") != "sealed")):
         raise ProducerError("completion-route-composite-mismatch", str(record.get("cycle_id", "")))
-    row = rows[0]
+    if route_id is not None:
+        named = [r for r in rows if r.get("route_id") == route_id]
+        if len(named) != 1:
+            raise ProducerError("completion-route-composite-mismatch", str(record.get("cycle_id", "")))
+        row = named[0]
+    else:
+        row = rows[-1]
     identity = artifact_lifecycle.read_root_identity(Path(root))
     if (identity is None or row.get("artifact_root_id") != identity.artifact_root_id
             or document.get("artifact_root_id") != identity.artifact_root_id
@@ -1011,7 +1022,9 @@ def resolve_cycle_manifest_route(root: Path, record: Mapping[str, Any],
         reason = target_check.reasons[0]
         raise ProducerError(reason.code, reason.detail)
     route = load_route(Path(root), route_path, expected_identity=row)
-    admission = cycle_route_admission(Path(root), record, route, finalize=True, validation_only=True)
+    # Only the latest row has to be the lineage's leaf; an earlier closing route is
+    # judged by its place in the lineage, not by being the last one.
+    admission = cycle_route_admission(Path(root), record, route, finalize=row is rows[-1], validation_only=True)
     if not admission.allow:
         raise ProducerError(admission.reason or "route-lineage-unverified", admission.detail)
     return route_path, route
@@ -4565,9 +4578,21 @@ def finalize(
             # from its state cache. Terminal exact callers still require every
             # durable proof; an already-sealed status is never that proof.
             manifest_path = _record_cycle_manifest_path(root, record)
-            if expected_binding is not None or _path_entry_present(manifest_path):
+            if expected_binding is not None:
+                if _binding_route_unrecorded(manifest_path, expected_binding):
+                    # A route continuing this closed cycle finishes it again (§45 D-127): the
+                    # document gets that route's own terminal record before it is proved.
+                    _refresh_cycle_locked(root, record, now=now, allocator=alloc)
+                    record = read_cycle_record(root, cycle_id)
                 verified = _verify_sealed_cycle_locked(root, record, expected_binding)
                 return _finish({**verified, "storage_state": "sealed", "cycle_state": published})
+            if _path_entry_present(manifest_path):
+                # §45 D-123/D-124: closing again is the refresh -- the closed
+                # cycle's files are compared with its manifest and the next
+                # document is published when they differ.
+                refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
+                                                  crash_after_manifest=crash_after_manifest)
+                return _finish({**refreshed, "storage_state": "sealed", "cycle_state": published})
             return _finish({"status": "already-sealed", "cycle_id": cycle_id,
                     "manifest_digest": record.get("manifest_digest"),
                     "storage_state": "sealed", "cycle_state": published})
@@ -4727,14 +4752,19 @@ def finalize(
             record = dict(record)
             record["excluded_symlinks"] = excluded_symlinks
             _write_cycle_record(root, record, exclusive=False)
-        _write_journal(root, cycle_id, state="sealing", manifest_digest=digest, cycle_path=cycle_path)
+        manifest_bytes = artifact_manifest.canonical_bytes(document)
+        _write_journal(root, cycle_id, state="sealing", manifest_digest=digest, cycle_path=cycle_path,
+                       manifest_revision_id=document["manifest_revision_id"])
+        # §45 D-124: the document is kept as published before it is published.
+        artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, manifest_bytes)
         # COMMIT POINT: exclusive manifest creation.
-        _write_exclusive(manifest_path, artifact_manifest.canonical_bytes(document))
+        _write_exclusive(manifest_path, manifest_bytes)
         if crash_after_manifest:  # test hook: simulate a crash after the commit point
             raise artifact_admission.AdmissionRecoveryRequired("simulated crash after manifest publish")
         try:
             _write_journal(root, cycle_id, state="published", manifest_digest=digest, cycle_path=cycle_path)
-            _commit_sealed(root, record, document, digest, now=now)
+            # The admission lock has been held since `index` was read, so it is still current.
+            _commit_sealed(root, record, document, digest, now=now, index=index)
         except BaseException as exc:
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
@@ -4791,6 +4821,12 @@ def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Opt
     if _live_review_lease(root, cycle_id, now=now) is not None:
         raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
     if record.get("state") == "sealed":
+        if journal is not None and _refresh_journal_resume(root, record, journal, now=now):
+            record = read_cycle_record(root, cycle_id)
+        if expected_binding and _binding_route_unrecorded(_record_cycle_manifest_path(root, record), expected_binding):
+            # A route that continues this closed cycle has no record in it yet; there is
+            # nothing to recover, and `finalize` writes that record before it proves it.
+            return {"status": "already-sealed", "cycle_id": cycle_id}
         return _verify_sealed_cycle_locked(root, record, expected_binding)
     if record.get("state") != "open":
         raise ProducerError("cycle-not-open", cycle_id)
@@ -4815,22 +4851,42 @@ def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Opt
     if journal is not None:
         # Nothing crossed the manifest commit point; the same cycle can
         # re-enter finalize. No other journal or cycle is read or changed.
+        _drop_unpublished_snapshot(root, cycle_id, journal)
         _remove_journal(root, cycle_id)
     return {"status": "open", "cycle_id": cycle_id}
 
 
+def _earlier_documents(root: Path, cycle_id: str, document: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The cycle's preserved documents other than `document` itself."""
+    return [old for _raw, old in artifact_lifecycle.read_manifest_snapshots(root, cycle_id)
+            if old.get("manifest_revision_id") != document.get("manifest_revision_id")]
+
+
 def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
-                                expected_binding: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Verify every immutable component before accepting an already-sealed replay."""
+                                expected_binding: Optional[Mapping[str, Any]] = None,
+                                expected_manifest_digest: Optional[str] = None) -> Dict[str, Any]:
+    """Prove a closed cycle's record, current manifest and index agree (§45 D-127).
+
+    What is checked is identity and consistency: the cycle record, the current
+    `manifest.json` and the index row all describe the same document, and the
+    terminal record that closed the cycle is in it.  Whether the files still
+    hold those bytes is not asked here -- a later edit is the next refresh's
+    business, never a reason to call a finished cycle unfinished.
+    `expected_manifest_digest` is the revision a caller recorded when it
+    finished; it may be an earlier one, and the result then says the cycle was
+    updated since (`updated_since`) while still returning that recorded digest.
+    """
     if record.get("state") != "sealed" or not record.get("sealed_on"):
         raise ProducerError("already-sealed-mismatch", "cycle-record")
     if expected_binding is not None:
-        for key in ("campaign_id", "cycle_id", "producer_id"):
+        for key in ("cycle_id", "producer_id"):
             expected = expected_binding.get(key)
             if expected is not None and record.get(key) != expected:
                 raise ProducerError("already-sealed-mismatch", key)
         if (expected_binding.get("cycle_record_digest")
-                and dispatch_terminal_commit.cycle_identity_digest(record) != expected_binding["cycle_record_digest"]):
+                and not dispatch_terminal_commit.cycle_identity_matches(
+                    record, expected_binding["cycle_record_digest"],
+                    campaign_id=expected_binding.get("campaign_id"))):
             raise ProducerError("already-sealed-mismatch", "cycle-identity")
     manifest_path = _record_cycle_manifest_path(root, record)
     directory = manifest_path.parent
@@ -4868,16 +4924,346 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
         if (row != expected_index.manifests[cycle_id]
                 or index.cycles.get(cycle_id) != expected_index.cycles[cycle_id]):
             raise ProducerError("already-sealed-mismatch", "index-projection")
-    manifest_route_file, _manifest_route = resolve_cycle_manifest_route(root, record, document)
+    updated_since = False
+    if expected_manifest_digest is not None and expected_manifest_digest != digest:
+        # The caller finished at an earlier revision of this cycle.  A preserved
+        # copy proves it existed; with none (the cycle changed before it was
+        # first observed), the caller's own terminal record is the proof.
+        updated_since = True
+    manifest_route_file, _manifest_route = resolve_cycle_manifest_route(
+        root, record, document, route_id=(expected_binding or {}).get("route_id"))
     if document.get("cycle", {}).get("state") == "completed":
         completion = artifact_lifecycle.evaluate_cycle_completion(
             document, content_root=directory, route_file=manifest_route_file,
             expected_root_id=identity.artifact_root_id if identity else None,
             inline_finish_id=(expected_binding.get("inline_finish_id")
-                              if isinstance(expected_binding, Mapping) else None))
+                              if isinstance(expected_binding, Mapping) else None),
+            preserved=_earlier_documents(root, record["cycle_id"], document))
         if not completion.ok:
             raise ProducerError("already-sealed-mismatch", "completion-evidence")
-    return {"status": "already-sealed", "cycle_id": record["cycle_id"], "manifest_digest": digest}
+    result = {"status": "already-sealed", "cycle_id": record["cycle_id"],
+              "manifest_digest": expected_manifest_digest or digest}
+    if updated_since:
+        result["current_manifest_digest"] = digest
+        result["updated_since"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# refresh: the next manifest document of a closed cycle (§45 D-124)
+# ---------------------------------------------------------------------------
+
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _stream_file_facts(path: Path) -> Tuple[str, int]:
+    """`(digest, size)` of one regular file read in chunks, never as one buffer.
+
+    The file is opened without following a link, and a size or mtime that moves
+    while it is read discards the answer (a write in flight is not a revision)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ProducerError("non-regular-file", str(path))
+        hasher = hashlib.sha256()
+        size = 0
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            while True:
+                chunk = handle.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                size += len(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or size != after.st_size:
+        raise ProducerError("output-changed-while-reading", str(path))
+    return "sha256:" + hasher.hexdigest(), size
+
+
+def _scan_cycle_facts(directory: Path, *, excluded: List[str],
+                      excluded_symlinks: List[str]) -> List[Tuple[str, str, int]]:
+    """The manifest's file facts `(path, digest, size)` under the one inclusion rule.
+
+    Same rule as `_enumerate_output`, read in chunks.  A path a manifest cannot
+    name (not a regular file, not a valid locator) is left out and listed as
+    excluded: a refresh never turns such a file into a failure."""
+    facts: List[Tuple[str, str, int]] = []
+    artifacts = directory / "artifacts"
+    if not artifacts.is_dir() or artifacts.is_symlink():
+        raise ProducerError("artifacts-dir-missing", str(artifacts))
+    for entry in _walk_files(directory):
+        rel = entry.relative_to(directory).as_posix()
+        if rel == artifact_locator.CYCLE_BINDING or not rel.startswith("artifacts/"):
+            continue
+        if os.path.islink(str(entry)):
+            excluded_symlinks.append(rel)
+            continue
+        if _outside_inclusion_rule(rel) or not entry.is_file() or not artifact_manifest.validate_locator_path(rel).ok:
+            excluded.append(rel)
+            continue
+        digest, size = _stream_file_facts(entry)
+        facts.append((rel, digest, size))
+    return facts
+
+
+def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
+                        facts: Sequence[Tuple[str, str, int]], *, allocator: artifact_identity.IdAllocator,
+                        now: Optional[float]) -> Tuple[Optional[Dict[str, Any]], Dict[str, List[str]]]:
+    """The cycle's next document, or `None` when no file differs from `document`.
+
+    Unchanged rows are carried over untouched; a changed file keeps its
+    `artifact_id` and gets a new revision; a new file gets a new artifact; a file
+    that is gone leaves the rows (its events stay).  A row the inclusion rule
+    would not list today is neither changed nor removed.  `cycle`, `routes[]` and
+    the terminal fields are never touched."""
+    declared = {row.get("locator", {}).get("path"): row
+                for row in document.get("artifact_revisions", []) or [] if isinstance(row, dict)}
+    present = {rel: (digest, size) for rel, digest, size in facts}
+    changes: Dict[str, List[str]] = {"added": [], "modified": [], "removed": []}
+    for rel, (digest, size) in sorted(present.items()):
+        row = declared.get(rel)
+        if row is None:
+            changes["added"].append(rel)
+        elif row.get("content_digest") != digest or row.get("byte_size") != size:
+            changes["modified"].append(rel)
+    for rel in sorted(declared):
+        if rel not in present and not _outside_inclusion_rule(rel):
+            changes["removed"].append(rel)
+    if not any(changes.values()):
+        return None, changes
+    revision_id = allocator.allocate("manifest_revision")
+    when = _rfc3339(now)
+    routes = [row for row in document.get("routes", []) or [] if isinstance(row, dict)]
+    route_id = routes[-1]["route_id"] if routes else record.get("route_id")
+
+    def provenance(digest: str) -> Dict[str, Any]:
+        return {"source_manifest_id": document["manifest_id"], "source_revision_id": revision_id,
+                "producer_route_id": route_id, "algorithm_version": ALGORITHM_VERSION,
+                "schema_version": 1, "source_digest": digest}
+
+    removed = set(changes["removed"])
+    gone_artifacts = {row["artifact_id"] for rel, row in declared.items() if rel in removed}
+    modified = set(changes["modified"])
+    artifacts = [dict(row) for row in document.get("artifacts", []) or []
+                 if isinstance(row, dict) and row.get("artifact_id") not in gone_artifacts]
+    revisions: List[Dict[str, Any]] = []
+    events = [dict(row) for row in document.get("events", []) or []]
+    for row in document.get("artifact_revisions", []) or []:
+        rel = row.get("locator", {}).get("path")
+        if rel in removed:
+            continue
+        if rel in modified:
+            digest, size = present[rel]
+            row = dict(row, artifact_revision_id=allocator.allocate("artifact_revision"),
+                       content_digest=digest, byte_size=size, media_type=_media_type(rel),
+                       provenance=provenance(digest))
+            events.append({
+                "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+                "stream_sequence": 1, "event_type": "artifact.revision.recorded", "target_id": row["artifact_id"],
+                "actor": {"kind": "producer", "id": record["producer_id"]}, "recorded_at": when,
+                "provenance": row["provenance"], "evidence_ids": [], "payload": {"locator": rel}})
+        revisions.append(dict(row))
+    for rel in changes["added"]:
+        digest, size = present[rel]
+        artifact_id = allocator.allocate("artifact")
+        inner = rel[len("artifacts/"):]
+        artifacts.append({"artifact_id": artifact_id, "cycle_id": record["cycle_id"], "role": "output",
+                          "type": _bucket_type(inner), "capability": record["capability"], "title": inner})
+        revisions.append({
+            "artifact_revision_id": allocator.allocate("artifact_revision"), "artifact_id": artifact_id,
+            "revision_sequence": 1, "content_digest": digest, "byte_size": size, "media_type": _media_type(rel),
+            "locator": {"kind": "cycle-relative", "path": rel}, "provenance": provenance(digest)})
+        events.append({
+            "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+            "stream_sequence": 1, "event_type": "artifact.revision.recorded", "target_id": artifact_id,
+            "actor": {"kind": "producer", "id": record["producer_id"]}, "recorded_at": when,
+            "provenance": provenance(digest), "evidence_ids": [], "payload": {"locator": rel}})
+    refreshed = dict(document)
+    refreshed.update(manifest_revision_id=revision_id, artifacts=artifacts, artifact_revisions=revisions,
+                     events=events)
+    return refreshed, changes
+
+
+def _drop_unpublished_snapshot(root: Path, cycle_id: str, journal: Optional[Mapping[str, Any]]) -> None:
+    """A journal that never reached its commit point leaves no copy behind: a
+    preserved document is a published one."""
+    revision_id = (journal or {}).get("manifest_revision_id")
+    if not isinstance(revision_id, str) or not artifact_identity.is_well_formed(revision_id, "manifest_revision"):
+        return
+    try:
+        artifact_lifecycle.manifest_snapshot_path(root, cycle_id, revision_id).unlink()
+    except (OSError, artifact_lifecycle.LifecycleError):
+        pass
+
+
+def _leaf_terminal_additions(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
+                             facts: Sequence[Tuple[str, str, int]], *,
+                             allocator: artifact_identity.IdAllocator, revision_id: str,
+                             now: Optional[float]) -> Optional[Dict[str, Any]]:
+    """The route row and terminal record a lineage leaf adds when it closes a closed cycle again.
+
+    §45 D-127: a route that continues a closed cycle and closes leaves one more completion
+    record; the earlier route's row and record stay as they were.  A route already in the
+    document, one still open, one the lineage does not admit, or one whose terminal proof
+    does not verify adds nothing -- a refresh never fails for want of one."""
+    try:
+        leaf = _finalize_route(root, record)
+    except ProducerError:
+        return None
+    if (artifact_lifecycle.manifest_route_row(document, route_id=leaf["route_id"]) is not None
+            or not route_is_closed(root, leaf)):
+        return None
+    identity = artifact_lifecycle.read_root_identity(root)
+    if identity is None or not cycle_route_admission(root, record, leaf, finalize=True).allow:
+        return None
+    try:
+        binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
+            root, route_lineage.canonical_route_path(root, leaf["route_id"]),
+            expected_root_id=identity.artifact_root_id)
+    except artifact_lifecycle.LifecycleError:
+        return None
+    if sealed_route.get("route_hash") != leaf["route_hash"]:
+        return None
+    event_id = allocator.allocate("event")
+    cycle_digest = _digest(_canonical([[rel, digest] for rel, digest, _size in facts]))
+    event = {
+        "event_id": event_id, "stream_id": allocator.allocate("stream"), "stream_sequence": 1,
+        "event_type": "route.terminal.recorded", "target_id": record["cycle_id"],
+        "actor": {"kind": "system", "id": "capability-route"}, "recorded_at": _rfc3339(now),
+        "provenance": {"source_manifest_id": document["manifest_id"], "source_revision_id": revision_id,
+                       "producer_route_id": leaf["route_id"], "algorithm_version": ALGORITHM_VERSION,
+                       "schema_version": 1, "source_digest": cycle_digest},
+        "evidence_ids": [], "payload": {}}
+    row = {"artifact_root_id": identity.artifact_root_id, "route_id": leaf["route_id"],
+           "route_hash": leaf["route_hash"], "terminal_marker": "pending", "terminal_evidence_id": event_id}
+    return {"row": row, "event": event, "binding": binding, "route": sealed_route}
+
+
+def _binding_route_unrecorded(manifest_path: Path, binding: Mapping[str, Any]) -> bool:
+    """Whether the binding names a route (by id, or by hash) the current manifest has no row for."""
+    document = _read_json(manifest_path) if _path_entry_present(manifest_path) else None
+    if document is None or not (binding.get("route_id") or binding.get("route_hash")):
+        return False
+    return artifact_lifecycle.manifest_route_row(
+        document, route_id=binding.get("route_id"), route_hash=binding.get("route_hash")) is None
+
+
+def _refresh_journal_resume(root: Path, record: Mapping[str, Any], journal: Mapping[str, Any],
+                            *, now: Optional[float] = None) -> bool:
+    """Finish a refresh that stopped between its first durable step and its last.
+
+    The journal names the document the refresh meant to publish; its preserved
+    copy holds the same bytes.  When `manifest.json` is still the earlier
+    document, the copy is published as it was; when it already is the new one,
+    only the record and index remain.  A manifest that is neither is not this
+    refresh's to settle.  Returns whether the journal was a refresh."""
+    if journal.get("state") != "refreshing":
+        return False
+    cycle_id = record["cycle_id"]
+    manifest_path = _record_cycle_manifest_path(root, record)
+    new_digest = journal.get("manifest_digest")
+    previous_digest = journal.get("previous_manifest_digest")
+    current = _read_json(manifest_path)
+    current_digest = artifact_manifest.manifest_digest(current) if current is not None else None
+    if current_digest == previous_digest and current_digest != new_digest:
+        copy = artifact_lifecycle.find_manifest_snapshot(root, cycle_id, manifest_digest=new_digest)
+        if copy is None:
+            # Nothing was published and the copy never became durable: drop the journal.
+            _remove_journal(root, cycle_id)
+            return True
+        _write_atomic(manifest_path, artifact_manifest.canonical_bytes(copy))
+        current, current_digest = copy, new_digest
+    if current_digest != new_digest:
+        raise artifact_admission.AdmissionRecoveryRequired(
+            f"manifest digest mismatch for {cycle_id}; manual inspection required")
+    _commit_sealed(root, record, current, new_digest, now=now, previous_digest=previous_digest)
+    return True
+
+
+def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optional[float] = None,
+                          allocator: Optional[artifact_identity.IdAllocator] = None,
+                          crash_after_manifest: bool = False) -> Dict[str, Any]:
+    """Re-finalize a closed cycle: publish its next manifest document if any file changed.
+
+    The admission lock is held.  Order, so that a crash anywhere resumes by
+    itself (`_refresh_journal_resume`): the earlier document is preserved (a
+    cycle closed before copies existed is first seen here), the journal names
+    the new document, the new document is preserved before it is published,
+    `manifest.json` is replaced atomically, then the index row is swapped on its earlier digest and
+    the record follows.  Nothing changed means nothing is written."""
+    cycle_id = record["cycle_id"]
+    manifest_path = _record_cycle_manifest_path(root, record)
+    directory = manifest_path.parent
+    try:
+        raw = manifest_path.read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ProducerError("already-sealed-mismatch", str(manifest_path)) from exc
+    digest = artifact_manifest.manifest_digest(document)
+    # The index row is read once, here, and answers for the whole refresh: a manifest the
+    # index does not carry is not something to publish a next document over.
+    index = artifact_admission.load_index(root)
+    row = index.manifests.get(cycle_id)
+    if not isinstance(row, dict) or row.get("manifest_digest") != digest:
+        raise ProducerError("already-sealed-mismatch", "index")
+    excluded: List[str] = []
+    excluded_symlinks: List[str] = []
+    facts = _scan_cycle_facts(directory, excluded=excluded, excluded_symlinks=excluded_symlinks)
+    alloc = allocator or artifact_identity.IdAllocator()
+    refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=now)
+    revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
+    additions = _leaf_terminal_additions(root, record, document, facts, allocator=alloc,
+                                         revision_id=revision_id, now=now)
+    if additions is not None:
+        base = json.loads(json.dumps(refreshed if refreshed is not None
+                                     else dict(document, manifest_revision_id=revision_id)))
+        base["routes"] = list(base.get("routes", [])) + [additions["row"]]
+        base["events"] = list(base.get("events", [])) + [additions["event"]]
+        try:
+            refreshed = artifact_lifecycle._derive_terminal_evidence(base, additions["binding"], additions["route"])
+        except artifact_lifecycle.LifecycleError:
+            additions = None
+    result = {"status": "already-sealed", "cycle_id": cycle_id, "refreshed": refreshed is not None,
+              "changes": changes, "excluded_hidden": excluded, "excluded_symlinks": excluded_symlinks,
+              "manifest_digest": digest}
+    if additions is not None:
+        result["terminal_added"] = additions["row"]["route_id"]
+    if refreshed is None:
+        return result
+    artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, raw)
+    earlier = _earlier_documents(root, cycle_id, refreshed)
+    report = artifact_manifest.validate_update(refreshed, preserved=earlier, previous=document)
+    if not report.ok:
+        raise ProducerError("manifest-invalid", ";".join(v.code for v in report.violations))
+    new_digest = artifact_manifest.manifest_digest(refreshed)
+    new_raw = artifact_manifest.canonical_bytes(refreshed)
+    identity = artifact_lifecycle.read_root_identity(root)
+    index_report = artifact_index.check(
+        index, refreshed, idempotency_key=cycle_id, manifest_digest=new_digest,
+        repository_id=identity.repository_id if identity else None,
+        replaces_manifest_digest=digest)
+    if not index_report.ok:
+        raise ProducerError("index-rejected", ";".join(v.code for v in index_report.violations))
+    cycle_path = os.path.relpath(str(directory), str(root))
+    _write_journal(root, cycle_id, state="refreshing", manifest_digest=new_digest,
+                   previous_manifest_digest=digest, cycle_path=cycle_path,
+                   manifest_revision_id=refreshed["manifest_revision_id"])
+    artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, new_raw)
+    # COMMIT POINT: atomic replacement of the current document.
+    _write_atomic(manifest_path, new_raw)
+    if crash_after_manifest:  # test hook: simulate a crash after the commit point
+        raise artifact_admission.AdmissionRecoveryRequired("simulated crash after manifest refresh")
+    try:
+        _commit_sealed(root, record, refreshed, new_digest, now=now, index=index, previous_digest=digest)
+    except BaseException as exc:
+        raise artifact_admission.AdmissionRecoveryRequired(
+            f"cycle {cycle_id} manifest refreshed but post-publish update failed; run recover") from exc
+    result.update(manifest_digest=new_digest, manifest_path=str(manifest_path))
+    return result
 
 
 def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
@@ -4895,8 +5281,14 @@ def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping
                     expected_binding=expected_binding, _recovery_scope="exact", **kwargs)
 
 
-def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any]):
-    """Read-only proof under admission lock; never repairs an unsealed cycle."""
+def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
+                           expected_manifest_digest: Optional[str] = None):
+    """Read-only proof under admission lock; never repairs an unsealed cycle.
+
+    A cycle edited or refreshed after it closed is still finalized (§45 D-127):
+    the proof is the record, the current manifest and the index agreeing, not the
+    files keeping their bytes.  `expected_manifest_digest` names the revision the
+    caller recorded when it finished (see `_verify_sealed_cycle_locked`)."""
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
     try:
@@ -4907,17 +5299,37 @@ def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mappi
         record = read_cycle_record(root, cycle_id)
         if record is None:
             raise ProducerError("cycle-unknown", cycle_id)
-        return _verify_sealed_cycle_locked(root, record, expected_binding)
+        return _verify_sealed_cycle_locked(root, record, expected_binding,
+                                           expected_manifest_digest=expected_manifest_digest)
     finally:
         artifact_admission._release_lock(root, lock_fd)
 
 
 def _commit_sealed(
-    root: Path, record: Mapping[str, Any], document: Mapping[str, Any], digest: str, *, now: Optional[float]
+    root: Path, record: Mapping[str, Any], document: Mapping[str, Any], digest: str, *, now: Optional[float],
+    index: Optional[artifact_index.IndexDocument] = None, previous_digest: Optional[str] = None,
 ) -> None:
+    """Apply a published manifest to the index and the cycle record.
+
+    The first close admits the cycle to the index.  A later document of an
+    already closed cycle (`previous_digest` names the one it replaces) swaps the
+    cycle's row instead, on that digest (§45 D-124), keeps `sealed_on`, and does
+    not announce a close again.  `index`, when given, is the one read the caller
+    already made under the admission lock."""
     directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
-    index = artifact_admission.load_index(root)
-    if record["cycle_id"] not in index.manifests:
+    if index is None:
+        index = artifact_admission.load_index(root)
+    row = index.manifests.get(record["cycle_id"])
+    already_closed = record.get("state") == "sealed"
+    if row is None:
+        index = artifact_index.apply(
+            index, document, cycle_path=os.path.relpath(str(directory), str(root)),
+            manifest_digest=digest, idempotency_key=record["cycle_id"],
+        )
+        artifact_admission._write_index(root, index)
+    elif row.get("manifest_digest") != digest:
+        if previous_digest is None or row.get("manifest_digest") != previous_digest:
+            raise ProducerError("already-sealed-mismatch", "index")
         index = artifact_index.apply(
             index, document, cycle_path=os.path.relpath(str(directory), str(root)),
             manifest_digest=digest, idempotency_key=record["cycle_id"],
@@ -4925,7 +5337,8 @@ def _commit_sealed(
         artifact_admission._write_index(root, index)
     sealed = dict(record)
     sealed["state"] = "sealed"
-    sealed["sealed_on"] = _rfc3339(now)
+    if not (already_closed and record.get("sealed_on")):
+        sealed["sealed_on"] = _rfc3339(now)
     sealed["manifest_digest"] = digest
     sealed["cycle_state"] = document["cycle"]["state"]
     _write_cycle_record(root, sealed, exclusive=False)
@@ -4934,6 +5347,8 @@ def _commit_sealed(
     _remove_journal(root, record["cycle_id"])
     remove_interim(root, record["cycle_id"])
     artifact_locator.update_indexes(root, [record["campaign_id"]])
+    if already_closed:
+        return
     artifact_cycle_titles.emit_after_seal_locked(root, sealed, document, directory / "manifest.json")
     try:
         import artifact_workflow_group_review  # lazy: it imports this module
@@ -4993,6 +5408,12 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                 continue
             manifest_path = root / str(journal.get("cycle_path", "")) / "manifest.json"
             document = _read_json(manifest_path)
+            if journal.get("state") == "refreshing" and record.get("state") == "sealed":
+                # A refresh of a closed cycle stopped part-way; finish it as it was meant.
+                _raise_if_recovery_fenced(root, cycle_id, now=now)
+                _refresh_journal_resume(root, record, journal, now=now)
+                result["rolled_forward"].append(cycle_id)
+                continue
             if document is not None and artifact_manifest.manifest_digest(document) == journal.get("manifest_digest"):
                 _raise_if_recovery_fenced(root, cycle_id, now=now)
                 try:
@@ -5009,6 +5430,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                 result["rolled_forward"].append(cycle_id)
             elif document is None:
                 # Crash before the commit point: cycle stays open.
+                _drop_unpublished_snapshot(root, cycle_id, journal)
                 entry.unlink()
                 result["rolled_back"].append(cycle_id)
             else:
@@ -5321,6 +5743,83 @@ def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel:
     return [(rel, digest, size) for rel, (digest, size) in sorted(actual.items())]
 
 
+def _cycle_document_for_digest(root: Path, cycle_id: str, record: Optional[Mapping[str, Any]],
+                               digest: Optional[str]) -> Optional[Mapping[str, Any]]:
+    """The cycle's manifest document carrying `digest`: the current one, else a preserved copy."""
+    if not digest:
+        return None
+    if record is not None:
+        try:
+            current = _read_json(_record_cycle_manifest_path(root, record))
+        except ProducerError:
+            current = None
+        if current is not None and artifact_manifest.manifest_digest(current) == digest:
+            return current
+    try:
+        return artifact_lifecycle.find_manifest_snapshot(root, cycle_id, manifest_digest=digest)
+    except artifact_lifecycle.LifecycleError:
+        return None
+
+
+def _published_source_rows(document: Mapping[str, Any], source_rel: str) -> List[Tuple[str, str, int]]:
+    """The files a manifest document declares under `source_rel`, as `_sealed_source_files` lists them."""
+    rows = []
+    for row in document.get("artifact_revisions", []) or []:
+        path = row.get("locator", {}).get("path", "")
+        if path == source_rel or path.startswith(source_rel + "/"):
+            rel = path[len(source_rel) + 1:] if path != source_rel else Path(source_rel).name
+            rows.append((rel, row["content_digest"], row["byte_size"]))
+    return sorted(rows)
+
+
+def _check_published_provenance(root: Path, revision: Mapping[str, Any], expected_rows: Sequence[Mapping[str, Any]],
+                                *, code: str) -> None:
+    """A finished publication is judged by what it recorded (§45 D-127): the source
+    manifest document it was published from, found as the current one or a
+    preserved copy, must still declare the files the publication took.  A source
+    that was edited, moved or deleted since changes nothing; a cycle that left no
+    copy and is gone is taken on the publication's own record."""
+    source = revision.get("source", {})
+    cycle_id = source.get("cycle_id", "")
+    record = read_cycle_record(root, cycle_id) if artifact_identity.is_well_formed(cycle_id, "cycle") else None
+    document = _cycle_document_for_digest(root, cycle_id, record, source.get("manifest_digest"))
+    if document is None:
+        return
+    rel = source.get("path", "")
+    if not rel.startswith("artifacts/") or ".." in rel.split("/"):
+        raise ProducerError(code, "source path")
+    if _published_source_rows(document, rel) != sorted((r["path"], r["sha256"], r["byte_size"]) for r in expected_rows):
+        raise ProducerError(code, "source identity")
+
+
+def _verify_completed_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any]) -> None:
+    """A finished spec publication: its immutable shared bytes and its own recorded proof.
+
+    The merge is not recomputed (the source it read may have changed since).
+    What was recorded must agree with itself and with the immutable revisions it
+    names: the output holds the digest the proof claims, the proof's source
+    inventory hashes to its own digest, and the base and latest revisions the
+    merge read still carry the digests the proof recorded."""
+    proof = revision.get("spec_merge")
+    if not isinstance(proof, dict):
+        raise ProducerError("shared-merge-proof-invalid", "missing merge proof")
+    ref_id = reference["shared_reference_id"]
+    output, _record = _verified_shared_spec(root, ref_id, revision["shared_reference_revision_id"])
+    try:
+        files = proof["source_files"]
+        valid = (proof["source_content_digest"] == _spec_inventory_digest(files)
+                 and proof["output_content_digest"] == _spec_inventory_digest(_spec_inventory(output)))
+        for revision_key, digest_key in (("base_revision_id", "base_content_digest"),
+                                         ("latest_revision_id", "latest_content_digest")):
+            _tree, shared = _verified_shared_spec(root, ref_id, proof[revision_key])
+            valid = valid and shared["content_digest"] == proof[digest_key]
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ProducerError("shared-merge-proof-invalid", revision["shared_reference_revision_id"])
+    _check_published_provenance(root, revision, files, code="shared-merge-proof-invalid")
+
+
 def _spec_admission_base(root: Path, source_path: Path, reference_id: str,
                          base_revision: Optional[str]) -> Optional[str]:
     receipt_path = source_path / SPEC_BASE_RECEIPT
@@ -5440,8 +5939,16 @@ def _merge_spec_publication(root: Path, reference: Mapping[str, Any], base_id: s
     return merged, proof
 
 
-def _verify_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any]):
-    """Recompute a derived publication for recovery and exact retry; never rebase it."""
+def _verify_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any],
+                             *, completed: bool = False):
+    """Recompute a derived publication for recovery and exact retry; never rebase it.
+
+    `completed` is a publication already in the reference's revision list: it is
+    judged by its record and its immutable bytes (§45 D-127), not by the source
+    as it is today.  A publication still waiting to be committed keeps the strict
+    check that its source is the input it took."""
+    if completed:
+        return _verify_completed_spec_publication(root, reference, revision)
     proof = revision.get("spec_merge")
     if not isinstance(proof, dict):
         raise ProducerError("shared-merge-proof-invalid", "missing merge proof")
@@ -5467,8 +5974,12 @@ def _verify_spec_publication(root: Path, reference: Mapping[str, Any], revision:
         raise ProducerError("shared-merge-proof-invalid", revision["shared_reference_revision_id"])
 
 
-def _verify_exact_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any]):
-    """Absence of a merge proof must mean an exact source copy, not lost proof."""
+def _verify_exact_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any],
+                                   *, completed: bool = False):
+    """Absence of a merge proof must mean an exact source copy, not lost proof.
+
+    `completed` judges a finished publication by its own record: the shared bytes
+    are the files the source manifest it names declared (§45 D-127)."""
     ids = reference.get("revisions", [])
     revision_id = revision["shared_reference_revision_id"]
     if revision_id in ids:
@@ -5480,6 +5991,10 @@ def _verify_exact_spec_publication(root: Path, reference: Mapping[str, Any], rev
         raise ProducerError("shared-journal-mismatch", "publication ancestry")
     if base_id and not _legacy_adopted_spec_base(root, reference, base_id):
         _verified_shared_spec(root, reference["shared_reference_id"], base_id)
+    if completed:
+        output, _record = _verified_shared_spec(root, reference["shared_reference_id"], revision_id)
+        _check_published_provenance(root, revision, _spec_inventory(output), code="shared-merge-proof-invalid")
+        return
     source = revision.get("source", {})
     record = read_cycle_record(root, source.get("cycle_id", ""))
     if record is None or record.get("manifest_digest") != source.get("manifest_digest"):
@@ -5530,9 +6045,20 @@ def _validate_shared_journal(root: Path, entry: Path, journal) -> None:
                 raise ProducerError("shared-journal-mismatch", "symlink recovery path")
     source = journal.get("source_path", "")
     record = read_cycle_record(root, journal.get("cycle_id", ""))
-    if (record is None or record.get("manifest_digest") != journal.get("source_manifest_digest")
-            or not isinstance(source, str) or not source.startswith("artifacts/")
-            or ".." in source.split("/")):
+    if not isinstance(source, str) or not source.startswith("artifacts/") or ".." in source.split("/"):
+        raise ProducerError("shared-journal-mismatch", "source identity")
+    if journal.get("state") == "published" or (root / target).is_dir():
+        # The immutable revision is in place: the journal only waits to be
+        # committed.  It names the source manifest document it was published
+        # from, found as the current one or a preserved copy (§45 D-127); the
+        # cycle may have been refreshed, edited or deleted since.
+        digest = journal.get("source_manifest_digest")
+        if record is not None and record.get("manifest_digest") != digest:
+            copies = artifact_lifecycle.read_manifest_snapshots(root, journal.get("cycle_id", ""))
+            if copies and not any(artifact_manifest.manifest_digest(doc) == digest for _raw, doc in copies):
+                raise ProducerError("shared-journal-mismatch", "source identity")
+        return
+    if record is None or record.get("manifest_digest") != journal.get("source_manifest_digest"):
         raise ProducerError("shared-journal-mismatch", "source identity")
     if kind == "spec":
         directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
@@ -5560,14 +6086,15 @@ def _commit_shared(root: Path, journal: Mapping[str, Any]) -> None:
         if "expected_previous_revision_id" not in journal:
             raise ProducerError("shared-base-required", "recovery journal lacks base revision")
         _check_shared_base(journal["expected_previous_revision_id"], reference.get("latest_revision_id"))
+    completed = journal["revision_id"] in reference["revisions"]
     if "spec_merge" in journal or "spec_merge" in revision:
         if journal.get("spec_merge") != revision.get("spec_merge"):
             raise ProducerError("shared-journal-mismatch", "merge proof")
-        _verify_spec_publication(root, reference, revision)
+        _verify_spec_publication(root, reference, revision, completed=completed)
         if journal.get("expected_previous_revision_id") != revision["spec_merge"]["latest_revision_id"]:
             raise ProducerError("shared-journal-mismatch", "merge parent")
     elif kind == "spec":
-        _verify_exact_spec_publication(root, reference, revision)
+        _verify_exact_spec_publication(root, reference, revision, completed=completed)
         if "spec_base_revision_id" in revision and revision["spec_base_revision_id"] != journal.get("expected_previous_revision_id"):
             raise ProducerError("shared-journal-mismatch", "source base")
     if journal["revision_id"] not in reference["revisions"]:
@@ -5585,6 +6112,45 @@ def _commit_shared(root: Path, journal: Mapping[str, Any]) -> None:
         shared_journal_path(root, journal["revision_id"]).unlink()
     except FileNotFoundError:
         pass
+
+
+_UNKNOWN_BASE = object()
+
+
+def _finished_spec_publication(root: Path, reference: Mapping[str, Any], cycle_id: str, source_rel: str,
+                               record: Mapping[str, Any], source_path: Path,
+                               base_revision: Optional[str]):
+    """The earlier publication this `admit-shared` call repeats, if any.
+
+    It is a retry when a revision of this reference was published from this
+    cycle's `source_rel` out of one of the cycle's manifest documents (the
+    current one or a preserved earlier one) and the call names the same base
+    the publication was made from.  A call that names a newer base is a new
+    publication of whatever the source holds now, and is not a retry.  When the
+    call names no base and the source is gone or unseeded, it can only be the
+    retry."""
+    digests = {record.get("manifest_digest")}
+    digests.update(artifact_manifest.manifest_digest(doc)
+                   for _raw, doc in artifact_lifecycle.read_manifest_snapshots(root, cycle_id))
+    if base_revision is not None:
+        caller_base: Any = None if base_revision == "none" else base_revision
+    else:
+        receipt = _read_json(source_path / SPEC_BASE_RECEIPT) if source_path.is_dir() else None
+        caller_base = receipt.get("revision_id") if isinstance(receipt, dict) and "revision_id" in receipt \
+            else _UNKNOWN_BASE
+    for prior_id in reversed(list(reference.get("revisions", []))):
+        prior = _read_json(root / "shared" / "spec" / reference["shared_reference_id"] / "revisions" / prior_id
+                           / REVISION_RECORD_NAME) or {}
+        provenance = prior.get("source", {})
+        if (provenance.get("cycle_id") != cycle_id or provenance.get("path") != source_rel
+                or provenance.get("manifest_digest") not in digests):
+            continue
+        prior_base = (prior["spec_merge"].get("base_revision_id") if isinstance(prior.get("spec_merge"), dict)
+                      else prior.get("spec_base_revision_id"))
+        if caller_base is not _UNKNOWN_BASE and caller_base != prior_base:
+            continue
+        return prior_id, prior
+    return None, None
 
 
 def admit_shared(
@@ -5635,18 +6201,6 @@ def admit_shared(
             raise ProducerError("source-unsafe", source)
         source_rel = _placed_locator(source_rel, _output_placements(root, record))
         source_path = directory / source_rel
-        if os.path.islink(str(source_path)) or not source_path.exists():
-            raise ProducerError("source-missing", source_rel)
-        evidence_rel: Optional[str] = None
-        evidence_digest: Optional[str] = None
-        if kind == "research":
-            assert promotion_evidence is not None
-            evidence_rel = promotion_evidence if promotion_evidence.startswith("artifacts/") else "artifacts/" + promotion_evidence
-            evidence_rel = _placed_locator(evidence_rel, _output_placements(root, record))
-            evidence_path = directory / evidence_rel
-            if os.path.islink(str(evidence_path)) or not evidence_path.is_file():
-                raise ProducerError("research-promotion-evidence-missing", evidence_rel)
-            evidence_digest = _digest(evidence_path.read_bytes())
         reference: Optional[Dict[str, Any]] = None
         if reference_id:
             reference = _read_json(_reference_path(root, kind, reference_id))
@@ -5680,6 +6234,41 @@ def admit_shared(
         else:
             reference_id = reference["shared_reference_id"]
             created = False
+        if kind == "spec" and reference is not None:
+            # A publication that already finished is returned as it is (§45 D-127),
+            # before the source is read: the report may have been edited, moved or
+            # deleted since, and none of that makes the finished publication unfinished.
+            finished_id, finished = _finished_spec_publication(
+                root, reference, cycle_id, source_rel, record, source_path, base_revision)
+            if finished is not None:
+                if "spec_merge" in finished:
+                    _verify_spec_publication(root, reference, finished, completed=True)
+                else:
+                    _verify_exact_spec_publication(root, reference, finished, completed=True)
+                prior_dir = root / "shared" / kind / reference_id / "revisions" / finished_id
+                return {"status": "reused", "kind": SHARED_KINDS[kind],
+                        "shared_reference_id": reference_id, "shared_reference_revision_id": finished_id,
+                        "reference_created": False, "revision_dir": str(prior_dir),
+                        "content_digest": finished.get("content_digest"), "file_count": finished["file_count"],
+                        "promotion": finished["promotion"],
+                        **({"spec_merge": finished["spec_merge"]} if "spec_merge" in finished else {})}
+        if os.path.islink(str(source_path)) or not source_path.exists():
+            raise ProducerError("source-missing", source_rel)
+        evidence_rel: Optional[str] = None
+        evidence_digest: Optional[str] = None
+        if kind == "research":
+            assert promotion_evidence is not None
+            evidence_rel = promotion_evidence if promotion_evidence.startswith("artifacts/") else "artifacts/" + promotion_evidence
+            evidence_rel = _placed_locator(evidence_rel, _output_placements(root, record))
+            evidence_path = directory / evidence_rel
+            if os.path.islink(str(evidence_path)) or not evidence_path.is_file():
+                raise ProducerError("research-promotion-evidence-missing", evidence_rel)
+            evidence_digest = _digest(evidence_path.read_bytes())
+        # §45 D-123/D-124: a new publication takes the files as they are now, so the
+        # cycle's manifest is brought up to them first (it may have changed since the close).
+        if _path_entry_present(_record_cycle_manifest_path(root, record)):
+            if _refresh_cycle_locked(root, record, now=now)["refreshed"]:
+                record = read_cycle_record(root, cycle_id)
         # An unresolved publication intent for this exact source cannot be
         # replaced by a second publication. Preserve it for checked recovery.
         for issue in sweep_unresolved:
@@ -5698,26 +6287,6 @@ def admit_shared(
         merged_tree = None
         merge_proof = None
         if kind == "spec":
-            # Exact publication retry is idempotent, even after another cycle won.
-            for prior_id in (reference or {}).get("revisions", []):
-                prior_dir = root / "shared" / kind / reference_id / "revisions" / prior_id
-                prior = _read_json(prior_dir / REVISION_RECORD_NAME) or {}
-                provenance = prior.get("source", {})
-                if (provenance.get("cycle_id") == cycle_id and provenance.get("path") == source_rel
-                        and provenance.get("manifest_digest") == record.get("manifest_digest")):
-                    digest = prior.get("content_digest")
-                    comparison = prior.get("spec_merge", {}).get("source_files", prior.get("files", []))
-                    if source_rows != sorted((r["path"], r["sha256"], r["byte_size"]) for r in comparison):
-                        raise ProducerError("source-manifest-mismatch", source_rel)
-                    if "spec_merge" in prior:
-                        _verify_spec_publication(root, reference, prior)
-                    else:
-                        _verify_exact_spec_publication(root, reference, prior)
-                    return {"status": "reused", "kind": SHARED_KINDS[kind],
-                            "shared_reference_id": reference_id, "shared_reference_revision_id": prior_id,
-                            "reference_created": False, "revision_dir": str(prior_dir),
-                            "content_digest": digest, "file_count": prior["file_count"], "promotion": prior["promotion"],
-                            **({"spec_merge": prior["spec_merge"]} if "spec_merge" in prior else {})}
             # Initial unseeded publications have no predecessor to overwrite.
             expected = (_spec_admission_base(root, source_path, reference_id, base_revision)
                         if reference is not None or base_revision is not None or (source_path / SPEC_BASE_RECEIPT).exists()

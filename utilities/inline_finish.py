@@ -120,6 +120,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             return {"schema": "finish_receipt_v1", "route_id": route["route_id"], "route_hash": route["route_hash"],
                     "state": "already-closed-automatically", "autoclose": closure["autoclose"]}
         raise InlineFinishError("finish-route-already-closed")
+    # A finish that already completed is replayed from what it recorded (§45 D-127):
+    # the evidence file, the summary, or a manifest revision may have changed since.
+    finished = bool(prior_state and prior_state.get("state") == "finished")
     record = artifact_producer.route_cycle_for(root, route)
     if record is None and prior_state:
         record = artifact_producer.read_cycle_record(root, prior_state.get("intent", {}).get("cycle_id", ""))
@@ -147,20 +150,29 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             evidence = output.parent / placed
     except ValueError:
         pass
+    recorded_intent = (prior_state.get("intent") or {}) if finished else {}
     try:
         if evidence.is_symlink() or not stat.S_ISREG(evidence.lstat().st_mode):
             raise InlineFinishError("finish-evidence-not-regular")
         evidence.resolve(strict=True).relative_to(output.resolve(strict=True))
         evidence_raw = evidence.read_bytes()
-    except InlineFinishError: raise
-    except (OSError, ValueError) as exc: raise InlineFinishError("finish-evidence-outside-cycle-or-unreadable") from exc
-    if not evidence_raw: raise InlineFinishError("finish-evidence-empty")
+    except InlineFinishError:
+        if not finished: raise
+        evidence_raw = None
+    except (OSError, ValueError) as exc:
+        if not finished: raise InlineFinishError("finish-evidence-outside-cycle-or-unreadable") from exc
+        evidence_raw = None
+    if evidence_raw is not None and not evidence_raw: raise InlineFinishError("finish-evidence-empty")
     try: summary_raw = Path(args.summary_file).read_bytes()
-    except OSError as exc: raise InlineFinishError("finish-summary-unreadable") from exc
-    if not summary_raw or b"\0" in summary_raw: raise InlineFinishError("finish-summary-invalid")
-    try: summary_text = summary_raw.decode("utf-8").strip()
-    except UnicodeError as exc: raise InlineFinishError("finish-summary-invalid") from exc
-    if not summary_text: raise InlineFinishError("finish-summary-invalid")
+    except OSError as exc:
+        if not finished: raise InlineFinishError("finish-summary-unreadable") from exc
+        summary_raw = None
+    if summary_raw is not None and (not summary_raw or b"\0" in summary_raw): raise InlineFinishError("finish-summary-invalid")
+    summary_text = ""
+    if summary_raw is not None:
+        try: summary_text = summary_raw.decode("utf-8").strip()
+        except UnicodeError as exc: raise InlineFinishError("finish-summary-invalid") from exc
+        if not summary_text: raise InlineFinishError("finish-summary-invalid")
     source = str(route.get("source_commit") or "")
     commit = str(args.commit or api._head_commit(route["cwd"]) or "").lower()
     if not api._COMMIT_SHA.fullmatch(source) or not api._COMMIT_SHA.fullmatch(commit):
@@ -183,13 +195,23 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             raise InlineFinishError("finish-scoped-tracked-dirt")
     identity = artifact_lifecycle.read_root_identity(root)
     if not identity: raise InlineFinishError("finish-artifact-root-identity-missing")
-    evidence_rel = evidence.resolve().relative_to(output.resolve()).as_posix()
+    try:
+        evidence_rel = evidence.resolve().relative_to(output.resolve()).as_posix()
+    except (OSError, ValueError):
+        if not finished: raise InlineFinishError("finish-evidence-outside-cycle-or-unreadable")
+        evidence_rel = recorded_intent.get("evidence_path")
     intent = {"route_id":route["route_id"], "route_hash":route["route_hash"],
               "artifact_root_id":identity.artifact_root_id, "campaign_key":campaign.get("key"),
               "campaign_id":record["campaign_id"], "cycle_id":record["cycle_id"], "producer_id":record["producer_id"],
-              "terminal_node":node["id"], "evidence_path":evidence_rel, "evidence_sha256":_digest(evidence_raw),
-              "summary_sha256":_digest(summary_raw), "commit":commit,
-              "cycle_record_digest":dispatch_terminal_commit.cycle_identity_digest(record)}
+              "terminal_node":node["id"], "evidence_path":evidence_rel,
+              "evidence_sha256":_digest(evidence_raw) if evidence_raw is not None else recorded_intent.get("evidence_sha256"),
+              "summary_sha256":_digest(summary_raw) if summary_raw is not None else recorded_intent.get("summary_sha256"),
+              "commit":commit, "cycle_record_digest":dispatch_terminal_commit.cycle_identity_digest(record)}
+    if finished and all(recorded_intent.get(key) == value for key, value in intent.items()
+                        if key not in {"evidence_sha256", "summary_sha256", "campaign_id", "cycle_record_digest"}):
+        # The same finish, asked again after its files or its cycle's campaign moved on:
+        # what it recorded stands (the receipt is not rewritten, nor is it cancelled).
+        intent = dict(recorded_intent)
     intent_id = _digest(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode())
     base.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock:
@@ -205,8 +227,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 locked_evidence = evidence.read_bytes()
                 locked_summary = Path(args.summary_file).read_bytes()
             except OSError as exc:
-                raise InlineFinishError("finish-evidence-drift") from exc
-            if locked_evidence != evidence_raw or locked_summary != summary_raw:
+                if not finished: raise InlineFinishError("finish-evidence-drift") from exc
+                locked_evidence, locked_summary = evidence_raw, summary_raw
+            if not finished and (locked_evidence != evidence_raw or locked_summary != summary_raw):
                 raise InlineFinishError("finish-evidence-drift")
             try:
                 for line in _registry_lines(jobs, bool(inherited_jobs)):
@@ -345,7 +368,11 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 _fault("after-finalize")
             if state["state"] == "producer-sealed":
                 _fault("before-receipt")
-                verified = artifact_producer.verify_finalized_cycle(root, cycle_id=record["cycle_id"], expected_binding=binding)
+                # The close this finish made is judged by the revision it recorded; a later
+                # document of the cycle (§45 D-124) does not undo it.
+                verified = artifact_producer.verify_finalized_cycle(
+                    root, cycle_id=record["cycle_id"], expected_binding=binding,
+                    expected_manifest_digest=state.get("manifest_digest"))
                 if verified.get("manifest_digest") != state.get("manifest_digest"): raise InlineFinishError("finish-seal-drift")
                 receipt = {"schema":"finish_receipt_v1", "inline_finish_id":intent_id, "route_id":route["route_id"],
                            "route_hash":route["route_hash"], "cycle_id":record["cycle_id"],
@@ -374,11 +401,15 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                         or outcome.get("terminal_gate_proven") is not True):
                     raise InlineFinishError("finish-outcome-conflict")
                 verified = artifact_producer.verify_finalized_cycle(
-                    root, cycle_id=record["cycle_id"], expected_binding=binding)
+                    root, cycle_id=record["cycle_id"], expected_binding=binding,
+                    expected_manifest_digest=state.get("manifest_digest"))
                 if (verified.get("manifest_digest") != state.get("manifest_digest")
                         or state.get("receipt", {}).get("terminal_marker_digest") != marker_digest):
                     raise InlineFinishError("finish-seal-drift")
             result = dict(state["receipt"]); result["replay"] = replayed_at_entry
+            if finished and verified.get("updated_since"):
+                # Information only: the stored receipt keeps the revision it finished at.
+                result["manifest_updated_since"] = verified["current_manifest_digest"]
             # Information only, projected fresh on the first finish and on every replay; the stored
             # receipt and its identity are untouched, and nothing here starts the next leg.
             import route_plan

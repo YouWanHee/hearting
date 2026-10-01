@@ -32,7 +32,10 @@ CONTRACT_V1 = "artifact-campaign-closure/v1"
 CONTRACT = "artifact-campaign-closure/v2"
 LEGACY_EVENT_NAME = "campaign.satisfied.json"
 EVENTS_DIR = locator.CAMPAIGN_EVENTS_DIR
-DEFAULT_COMPLETION_CRITERION = "every cycle sealed with a manifest"
+# The sentence a new campaign records when its begin names none.  The earlier
+# fixed sentence is still read as an ordinary criterion; neither needs a reason to close.
+DEFAULT_COMPLETION_CRITERION = "에이전트가 스트림 목표 충족을 판단해 닫는다"
+LEGACY_DEFAULT_COMPLETION_CRITERION = "every cycle sealed with a manifest"
 
 
 def _exact_cycle_control(root: Path, campaign_dir: Path, cycle_dir: Path, name: str) -> bool:
@@ -475,8 +478,7 @@ def _cycle_rows(root, path, campaign):
     root_id = lifecycle.read_root_identity(root)
     if root_id is None:
         raise CampaignError("root-identity-missing")
-    index = admission.load_index(root)
-    if index.artifact_root_id != root_id.artifact_root_id:
+    if admission.load_index(root).artifact_root_id != root_id.artifact_root_id:
         raise CampaignError("campaign-index-root-mismatch")
     # A campaign list alone cannot hide an open member or an unregistered tree.
     # Detached records (see `is_member_record`) are reported, never counted.
@@ -519,48 +521,45 @@ def _cycle_rows(root, path, campaign):
         if not identity.is_well_formed(cid, "cycle"):
             raise CampaignError("campaign-cycle-id-invalid", cid)
         record, _ = read_json(root, records / (cid + ".json"))
-        if record.get("state") not in {"sealed", "superseded"} or not record.get("sealed_on"):
-            raise CampaignError("campaign-cycle-not-sealed", {
-                "cycle_id": cid, "next_step": "seal-or-abandon-cycle-before-closing-campaign",
-            })
         directory = directories[cid]
         _safe(path.parent, directory)
         expected_directory = (path.parent / str(record["locator"]) if record.get("locator")
                               else path.parent / "cycles" / cid)
         if directory != expected_directory:
             raise CampaignError("campaign-cycle-locator-invalid", cid)
-        if not _exact_cycle_control(root, path.parent, directory, "manifest.json"):
-            raise CampaignError("campaign-manifest-invalid", cid + ": exact-control-path-required")
+        if (record.get("state") not in {"sealed", "superseded"} or not record.get("sealed_on")
+                or not _exact_cycle_control(root, path.parent, directory, "manifest.json")):
+            # §45 D-127: a cycle that never closed does not stop the campaign from
+            # closing; only a route that is still open does.  Its row says what is
+            # there: no manifest.
+            outcome_path = lifecycle.canonical_outcome_path(root, record["route_id"])
+            if not os.path.lexists(outcome_path):
+                pending_open.append((cid, record["route_id"]))
+                continue
+            rows.append({"cycle_id": cid, "state": "open", "manifest_digest": None, "index_digest": None,
+                         "route_id": record["route_id"], "manifest_id": None, "manifest_revision_id": None,
+                         "route_closed": True})
+            continue
         document, raw = read_json(root, directory / "manifest.json")
+        earlier = [old for _old_raw, old in lifecycle.read_manifest_snapshots(root, cid)
+                   if old.get("manifest_revision_id") != document.get("manifest_revision_id")]
         report = manifest.validate(document)
+        if not report.ok and earlier:
+            # The next document of a cycle the runtime refreshed after it closed.
+            report = manifest.validate_update(document, preserved=earlier, published=True)
         if not report.ok:
             raise CampaignError("campaign-manifest-invalid", cid + ": " + str(report.violations[:3]))
-        # The stored/indexed seal binds bytes. Legacy approved merges retained
-        # noncanonical JSON formatting; never rewrite them to today's encoder.
+        # The row records the manifest as it is now.  Legacy approved merges kept
+        # noncanonical JSON formatting; their bytes are never rewritten, so the
+        # digest is of the bytes on disk.  Whether the record, the index and the
+        # files still agree with it is the refresh's business, not the close's.
         mdigest = "sha256:" + hashlib.sha256(raw).hexdigest()
         cycle = document["cycle"]
-        if (record.get("manifest_digest") != mdigest
-                or cycle.get("cycle_id") != cid or cycle.get("campaign_id") != campaign["campaign_id"]
+        if (cycle.get("cycle_id") != cid or cycle.get("campaign_id") != campaign["campaign_id"]
                 or document["campaign"]["campaign_id"] != campaign["campaign_id"]
                 or document["artifact_root_id"] != root_id.artifact_root_id
-                or document["producer"]["producer_id"] != record.get("producer_id")
-                or cycle["state"] not in {"completed", "abandoned", "active"}
-                or cycle["state"] != record.get("cycle_state")
-                or (cycle["state"] == "active" and record.get("state") != "sealed")):
+                or document["producer"]["producer_id"] != record.get("producer_id")):
             raise CampaignError("campaign-seal-mismatch", cid)
-        expected = index_module.apply(index_module.empty(root_id.artifact_root_id), document,
-                                      cycle_path=str(directory.relative_to(root)),
-                                      manifest_digest=manifest.manifest_digest(document), idempotency_key=cid)
-        if (index.manifests.get(cid) != expected.manifests[cid]
-                or index.cycles.get(cid) != expected.cycles[cid]):
-            raise CampaignError("campaign-index-mismatch", {
-                "cycle_id": cid, "next_step": "inspect-manifest-cycle-record-and-index-before-retry",
-            })
-        for revision in document["artifact_revisions"]:
-            _safe(directory, directory / revision["locator"]["path"])
-        failures = lifecycle.verify_artifact_revisions(document, directory)
-        if failures:
-            raise CampaignError("campaign-artifact-mismatch", cid + ": " + ";".join(failures[:5]))
         row = {"cycle_id": cid, "state": cycle["state"], "manifest_digest": mdigest,
                "index_digest": manifest.manifest_digest(document),
                "route_id": record["route_id"],
@@ -630,16 +629,13 @@ def status(root, selection):
                 "close_refusal": {"reason": "campaign-not-active"}, "events": event_rows}
     try:
         snapshot = _snapshot(root, path)
-        criterion = record.get("completion_criterion", {}).get("statement")
-        required = criterion == DEFAULT_COMPLETION_CRITERION
         result = {"status": "active", "state": "active", "campaign_id": record["campaign_id"],
                   "goal": record.get("goal"), "completion_criterion": record.get("completion_criterion"),
                   "cycles": [{**row, "disposition": disposition(row)} for row in snapshot["cycles"]],
                   "detached_cycles": detached_rows(campaign_records(root, record["campaign_id"])[1]),
-                  "satisfied": False, "closable": True, "reason_required": required,
+                  "satisfied": False, "closable": True, "reason_required": False,
                   "close_command": ["python3", str(Path(__file__).with_name("artifact_producer.py")),
-                                    "campaign-close", "--artifact-root", str(root), "--campaign", str(path)]
-                                   + (["--reason", "<one-sentence completion condition>"] if required else []),
+                                    "campaign-close", "--artifact-root", str(root), "--campaign", str(path)],
                   "events": event_rows, "projection_pending": folded.projection_pending}
         unproven = [row for row in result["cycles"] if row["disposition"] == PROVISIONAL_DISPOSITION]
         if unproven:
@@ -772,11 +768,16 @@ def _close_locked(root, path, *, reason=None):
         raise CampaignError("campaign-not-active", state.state)
     snapshot = _snapshot(root, path)
     criterion = snapshot["campaign"].get("completion_criterion", {}).get("statement")
-    if criterion == DEFAULT_COMPLETION_CRITERION and (not isinstance(reason, str) or not reason.strip()):
-        raise CampaignError("campaign-close-reason-required")
-    closure_reason = reason.strip() if isinstance(reason, str) and reason.strip() else criterion
+    # §45 D-127: the reason records why the campaign was judged done; it is never a
+    # condition.  Without one the criterion sentence (or `campaign-close`) stands in.
+    closure_reason = (reason.strip() if isinstance(reason, str) and reason.strip()
+                      else criterion if isinstance(criterion, str) and criterion.strip() else "campaign-close")
     actor_id, closed_by = _agent_actor()
-    first = snapshot["cycles"][0]
+    first = next((row for row in snapshot["cycles"] if row.get("manifest_id")), None)
+    if first is None:
+        raise CampaignError("campaign-cycle-not-sealed", {
+            "cycle_id": snapshot["cycles"][0]["cycle_id"],
+            "next_step": "close-one-cycle-of-the-campaign-first"})
     payload = {"contract": CONTRACT, "root": str(root), "snapshot": snapshot,
                "closure": {"reason": closure_reason, "closed_by": closed_by}}
     provenance = {"source_manifest_id": first["manifest_id"],

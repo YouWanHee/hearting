@@ -2881,22 +2881,28 @@ class SharedBaseGuardTest(ProducerTestBase):
             self._admit(cycle, 1, base_revision="none")
         self.assertEqual(ctx.exception.code, "shared-base-mismatch")
 
-    def test_payload_or_receipt_cannot_be_added_or_changed_after_sealing(self):
+    def test_payload_edit_after_sealing_is_published_as_it_is_now_and_receipt_must_stay_valid(self):
+        # §45 D-123/D-124: a publication takes the files as they are now; the cycle's
+        # manifest is brought up to them first, so an edit is no longer "source mismatch".
         cycle = self._cycle([["a"], ["a"]])
         first = self._admit(cycle, 0)
         base = Path(cycle["cycle_dir"]) / "artifacts/spec/gen1"
-        for relative in ("a/prd.md", P.SPEC_BASE_RECEIPT):
-            path = base / relative
-            original = path.read_bytes() if path.exists() else None
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("tampered")
-            with self.assertRaises(P.ProducerError) as ctx:
-                self._admit(cycle, 1, base_revision=first["shared_reference_revision_id"])
-            self.assertEqual(ctx.exception.code, "source-manifest-mismatch")
-            if original is None:
-                path.unlink()
-            else:
-                path.write_bytes(original)
+        digest_before = P.read_cycle_record(self.root, cycle["cycle_id"])["manifest_digest"]
+        (base / "a/prd.md").write_text("edited after sealing")
+        second = self._admit(cycle, 1, base_revision=first["shared_reference_revision_id"])
+        self.assertEqual(second["status"], "admitted")
+        self.assertEqual((Path(second["revision_dir"]) / "a/prd.md").read_text(), "edited after sealing")
+        record = P.read_cycle_record(self.root, cycle["cycle_id"])
+        self.assertNotEqual(record["manifest_digest"], digest_before)
+        revision = json.loads((Path(second["revision_dir"]) / P.REVISION_RECORD_NAME).read_text())
+        self.assertEqual(revision["source"]["manifest_digest"], record["manifest_digest"])
+        # A malformed base receipt is still refused.
+        receipt = base / P.SPEC_BASE_RECEIPT
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text("tampered")
+        with self.assertRaises(P.ProducerError) as ctx:
+            self._admit(cycle, 1, base_revision=second["shared_reference_revision_id"])
+        self.assertEqual(ctx.exception.code, "shared-base-invalid")
 
     def test_sealed_receipt_cannot_be_overridden_and_matches_actual_base(self):
         first_cycle = self._cycle([["a"]])
@@ -3128,9 +3134,14 @@ class TerminalExactRecoveryTest(ProducerTestBase):
             P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
         self.assertEqual(manifest.read_bytes(), before)
         self.assertEqual(P.read_cycle_record(self.root, other["cycle_id"]), other_before)
+        # §45 D-127: the proof is record, manifest and index agreeing; edited files are the refresh's.
         output.write_bytes(b"drift after sealing\n")
-        with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
-            P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        verified = P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        self.assertEqual(verified["status"], "already-sealed")
+        self.assertEqual(manifest.read_bytes(), before)
+        replay = P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        self.assertEqual(replay["status"], "already-sealed")
+        self.assertEqual(manifest.read_bytes(), before)
 
     def test_completed_finalize_live_lease_and_reentry_make_no_manifest(self):
         result, output, binding = self.prepared()
@@ -3319,6 +3330,10 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                         self.assertFalse((R.completion_dir(route["route_id"],jobs=jobs)/"prd-transaction.json").exists())
                         self.assertEqual(P.read_cycle_record(fixture.root,cycle["cycle_id"])["state"],"sealed")
                         report.write_text("changed after settlement")
+                        # An owner-executed terminal node has no marker file: the route's own
+                        # observation of the owner's handoff still reads the report's bytes, so a
+                        # report edited after the settlement is still pending here.  (A worker-marker
+                        # terminal replays after an edit: see test_runtime_completion_finishes_and_replays...)
                         self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
                 finally: fixture.doCleanups()
 
@@ -3461,8 +3476,10 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                     self.assertEqual(terminal.settle_owner_completion(jobs,"done",meta).result,"completed")
                     self.assertEqual(manifest.read_bytes(),sealed)
                     self.assertEqual(jobs.read_bytes(),before)
+                    # §45 D-127: a settled completion stays complete when its report is edited afterwards.
                     artifact.write_text("changed after sealing")
-                    self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+                    self.assertFalse(terminal.owner_completion_pending(jobs,"done",meta))
+                    self.assertEqual(terminal.completed_owner_handoff(jobs,"done",meta).count(str(artifact)),1)
                 finally: fixture.doCleanups()
 
     def test_runtime_completion_failure_keeps_pass_notice_and_recovers_without_a_model(self):
@@ -3547,8 +3564,17 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
             replay=terminal.settle_terminal_commit(request)
             self.assertEqual(replay.result,"completed",replay)
             self.assertEqual(before,{str(path):path.read_bytes() for path in paths})
-            artifact.write_text("post-seal corruption")
-            self.assertNotEqual(terminal.settle_terminal_commit(request).result,"completed")
+            # §45 D-127: the stored envelope is replayed as it was; a report edited or removed
+            # after the settlement is news beside it, not a failure.
+            stored=slot/"owner-envelope.txt"
+            artifact.write_text("post-seal edit")
+            edited=terminal.settle_terminal_commit(request)
+            self.assertEqual((edited.result,edited.detail),("completed","primary-changed-after-seal"),edited)
+            self.assertEqual(edited.envelope_text,stored.read_text())
+            artifact.unlink()
+            removed=terminal.settle_terminal_commit(request)
+            self.assertEqual((removed.result,removed.detail),("completed","primary-missing-after-seal"),removed)
+            self.assertEqual(before,{str(path):path.read_bytes() for path in paths})
 
     def test_payload_settlement_recovers_and_verifies_bytes_for_three_harnesses(self):
         import dispatch_terminal_commit as terminal
@@ -3586,8 +3612,9 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                             self.assertEqual(settled.result, "completed", settled)
                             self.assertEqual(manifest.read_bytes(), sealed)
                             self.assertEqual(hidden.read_bytes(), payload)
+                        # §45 D-127: a payload edited after the settlement is not a failed settlement.
                         hidden.write_bytes(payload + b"drift")
-                        self.assertNotEqual(terminal.settle_terminal_commit(request).result, "completed")
+                        self.assertEqual(terminal.settle_terminal_commit(request).result, "completed")
                         self.assertEqual(manifest.read_bytes(), sealed)
                         self.assertEqual(marker.read_bytes(), marker_bytes)
                         self.assertEqual(jobs.read_bytes(), registry)

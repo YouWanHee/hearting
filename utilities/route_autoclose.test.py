@@ -543,14 +543,15 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertTrue(receipt["route_file"].startswith(str(self.root)), receipt["route_file"])
         self.assertEqual(sorted(decoy.rglob("*")), [])
 
-    def test_review3_write_into_an_automatically_closed_cycle_names_the_way_forward(self):
+    def test_review3_write_into_an_automatically_closed_cycle_is_allowed(self):
         route_file, route, record = self.autoclosed()
         target = self.cycle_dir(record) / "artifacts" / "documents" / "late.md"
         done = self.run_as("codex", "session-b", "check-write", "--artifact-root", self.root,
                            "--file", target, program=PRODUCER)
         verdict = json.loads(done.stdout)
-        self.assertEqual(verdict["verdict"], "deny")
-        self.assertIn("compose the work again", verdict["hint"])
+        # §45 D-123: the automatic close is a record of the cycle, not a lock on its folder.
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertEqual(verdict["cycle_id"], record["cycle_id"])
 
     def test_review3_a_cycle_that_cannot_seal_is_not_retried_until_its_evidence_changes(self):
         route_file, route = self.compose("stuck", "codex", "session-1")
@@ -621,7 +622,8 @@ class RouteAutocloseTest(unittest.TestCase):
         route_file, route = self.compose("member", "codex", "session-1", campaign="k2")
         campaign = self.write_artifact(route)["campaign_id"]
         status = json.loads(self.campaign("campaign-status", campaign).stdout)
-        self.assertEqual(status["close_refusal"]["reason"], "campaign-cycle-not-sealed")
+        # §45 D-127: what refuses a close is a route that is still open, not an unclosed cycle.
+        self.assertEqual(status["close_refusal"]["reason"], "campaign-cycle-provisional-active")
         closed = self.run_as("codex", "session-1", "campaign-close", "--artifact-root", self.root,
                              "--campaign", campaign, "--reason", "report shipped", program=PRODUCER)
         self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
@@ -844,7 +846,7 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.assertEqual({route: row["cycle_id"] for route, row in index.routes[root_id].items()},
                          {a["route_id"]: first["cycle_id"], b["route_id"]: second["cycle_id"]})
 
-    def test_symlink_is_excluded_by_the_abandoned_seal(self):
+    def test_symlink_is_left_out_and_the_cycle_closes_as_completed(self):
         route, route_file = self.route(slug="leftover-symlink", campaign_key="leftover-links")
         begun = self.P.begin(self.root, route_file=route_file, capability="autopilot-code",
                              intensity="direct", campaign_key="leftover-links")
@@ -853,7 +855,9 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         link.symlink_to("mockup.html")
         self.close(route, route_file)   # proven: the completed seal is tried first
         summary = self._sweep()
-        self.assertEqual(self._results(summary), {begun["cycle_id"]: "cycle-abandoned"})
+        # §45 D-123: a link is not output, it never stopped a close; the proven route
+        # closes as completed with the link on the exclusion list.
+        self.assertEqual(self._results(summary), {begun["cycle_id"]: "cycle-completed"})
         record = self._record(begun)
         self.assertEqual(record["state"], "sealed")
         self.assertEqual(record["excluded_symlinks"], ["artifacts/designs/mockup-dark.html"])
@@ -862,7 +866,7 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         document = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual([row["locator"]["path"] for row in document["artifact_revisions"]],
                          ["artifacts/designs/mockup.html"])
-        self.assertEqual(document["cycle"]["state"], "abandoned")
+        self.assertEqual(document["cycle"]["state"], "completed")
 
     def test_remembered_failure_retried_once_after_rule_change(self):
         route, route_file = self.route(slug="leftover-memory", campaign_key="leftover-memory")

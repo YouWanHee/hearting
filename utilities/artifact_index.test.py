@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import unittest
@@ -151,6 +152,63 @@ class TestIndex(unittest.TestCase):
         digest2 = m.manifest_digest(doc1_mutated)
         report = ix.check(index, doc1_mutated, idempotency_key=key1, manifest_digest=digest2)
         self.assertIn("manifest-revision-append-out-of-scope", {v.code for v in report.violations})
+
+    def _next_document(self, doc, *, drop_artifact=False):
+        """The same cycle's next document: a new revision of its file (or none), a new event, the old events kept."""
+        nxt = copy.deepcopy(doc)
+        nxt["manifest_revision_id"] = self.alloc.allocate("manifest_revision")
+        art_id = nxt["artifacts"][0]["artifact_id"]
+        if drop_artifact:
+            nxt["artifacts"], nxt["artifact_revisions"] = [], []
+            return nxt
+        nxt["artifact_revisions"][0]["artifact_revision_id"] = self.alloc.allocate("artifact_revision")
+        nxt["artifact_revisions"][0]["content_digest"] = _sha(3)
+        event = copy.deepcopy(nxt["events"][0])
+        event.update(event_id=self.alloc.allocate("event"), stream_id=self.alloc.allocate("stream"), target_id=art_id)
+        nxt["events"].append(event)
+        return nxt
+
+    def test_same_cycle_replacement_is_a_compare_and_swap_on_the_earlier_digest(self):
+        """§45 D-124: the cycle's next document swaps its row; nothing another cycle owns is ever taken."""
+        doc1 = _document(self.root_id, self.alloc)
+        index, digest1, key = self._apply(ix.empty(self.root_id), doc1)
+        doc2 = self._next_document(doc1)
+        digest2 = m.manifest_digest(doc2)
+        plain = ix.check(index, doc2, idempotency_key=key, manifest_digest=digest2)
+        self.assertIn("index-cycle-id-duplicate", {v.code for v in plain.violations})
+        wrong = ix.check(index, doc2, idempotency_key=key, manifest_digest=digest2,
+                         replaces_manifest_digest=_sha(9))
+        self.assertIn("manifest-revision-append-out-of-scope", {v.code for v in wrong.violations})
+        right = ix.check(index, doc2, idempotency_key=key, manifest_digest=digest2,
+                         replaces_manifest_digest=digest1)
+        self.assertTrue(right.ok, right.violations)
+        swapped = ix.apply(index, doc2, cycle_path="p/" + doc2["cycle"]["cycle_id"],
+                           manifest_digest=digest2, idempotency_key=key)
+        self.assertEqual(swapped.manifests[key]["manifest_digest"], digest2)
+        # The earlier document's IDs stay taken: a revision that was replaced is never reusable.
+        self.assertIn(doc1["artifact_revisions"][0]["artifact_revision_id"], swapped.stable_ids)
+        self.assertEqual(set(index.stable_ids) - set(swapped.stable_ids), set())
+        # Another cycle's IDs stay refused in a swap, and a second swap on the old digest is stale.
+        other = _document(self.root_id, self.alloc)
+        other["artifact_revisions"][0]["artifact_revision_id"] = doc1["artifact_revisions"][0]["artifact_revision_id"]
+        refused = ix.check(swapped, other, idempotency_key=other["manifest_id"],
+                           manifest_digest=m.manifest_digest(other),
+                           replaces_manifest_digest=_sha(9))
+        self.assertFalse(refused.ok)
+        stale = ix.check(swapped, doc2, idempotency_key=key, manifest_digest=_sha(8),
+                         replaces_manifest_digest=digest1)
+        self.assertIn("manifest-revision-append-out-of-scope", {v.code for v in stale.violations})
+
+    def test_build_keeps_ids_only_an_earlier_document_declared(self):
+        doc1 = _document(self.root_id, self.alloc)
+        doc2 = self._next_document(doc1, drop_artifact=True)
+        path = "p/" + doc1["cycle"]["cycle_id"]
+        rebuilt = ix.build([(doc2, path, m.manifest_digest(doc2), "key")], preserved={doc1["cycle"]["cycle_id"]: [doc1]})
+        self.assertIn(doc1["artifacts"][0]["artifact_id"], rebuilt.stable_ids)
+        self.assertIn(doc1["artifact_revisions"][0]["artifact_revision_id"], rebuilt.stable_ids)
+        self.assertEqual(rebuilt.manifests["key"]["manifest_digest"], m.manifest_digest(doc2))
+        bare = ix.build([(doc2, path, m.manifest_digest(doc2), "key")])
+        self.assertNotIn(doc1["artifacts"][0]["artifact_id"], bare.stable_ids)
 
     def test_rejects_cycle_id_duplicate(self):
         doc1 = _document(self.root_id, self.alloc)
