@@ -1029,6 +1029,10 @@ class ClaudeStreamSession:
         self.closed = False
         # Origins of results skipped as answers to turns Claude started itself.
         self.skipped_result_origins: list[str] = []
+        # A general owner turn treats its timeout as a no-progress window (any
+        # output from the live process restarts it); a sealed handoff keeps the
+        # fixed deadline its lease is sized for.
+        self.idle_reset = False
 
     def run_turn(self, prompt: str, timeout: float) -> tuple[dict[str, Any], int]:
         if self.closed or self.process.stdin is None or self.process.stdout is None:
@@ -1071,6 +1075,8 @@ class ClaudeStreamSession:
                 raise SupervisorError("claude-stream-read-failed") from exc
             if not chunk:
                 raise SupervisorError("claude-result-missing")
+            if self.idle_reset:
+                deadline = time.monotonic() + timeout
             self.output_buffer += chunk
             if len(self.output_buffer) > 16_777_216:
                 raise SupervisorError("claude-stream-message-oversized")
@@ -1143,7 +1149,7 @@ def run_turn(
     if getattr(args, "runtime_harness", "claude") == "opencode":
         from opencode_session_runtime import run_turn as native_turn, OpenCodeTransportError
         try:
-            return native_turn(args, prompt, emit=emit)
+            return native_turn(args, prompt, emit=emit, idle_reset=handoff_intent is None)
         except OpenCodeTransportError as exc:
             raise SupervisorError(str(exc)) from exc
     def submit(transport):
@@ -1171,6 +1177,7 @@ def run_turn(
                   "effective_reserved_charge": budget_record.read_effective_charge(state_root, handoff_intent)})
         return submission
     if stream_session is not None:
+        stream_session.idle_reset = handoff_intent is None
         submission = submit(stream_session)
         if submission.status != "submitted":
             raise SupervisorError(f"turn-{submission.status}")

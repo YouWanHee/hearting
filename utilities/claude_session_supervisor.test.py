@@ -2578,6 +2578,11 @@ class DurableHandoffTransportTest(unittest.TestCase):
             self.send(stream_session=stream)
         self.assertEqual(stream.submit.call_count, 1)
 
+    def test_handoff_submission_never_asks_for_the_no_progress_window(self):
+        stream = SimpleNamespace(submit=mock.Mock(return_value=({"type": "result"}, 0)), idle_reset=True)
+        self.send(stream_session=stream)
+        self.assertIs(stream.idle_reset, False)   # fixed deadline: the lease outlives no live handoff
+
     def test_prompt_drift_never_calls_transport(self):
         stream = SimpleNamespace(submit=mock.Mock())
         with self.assertRaisesRegex(supervisor.SupervisorError, "prompt-conflict"):
@@ -2586,6 +2591,88 @@ class DurableHandoffTransportTest(unittest.TestCase):
         stream.submit.assert_not_called()
         self.assertIsNone(self.charge())
 
+
+
+class ActiveTurnDeadlineTest(unittest.TestCase):
+    """`--turn-timeout` is a no-progress window for the live stream turn: any
+    output from the live process restarts it, silence for the whole window
+    still fails with the existing reason, and a sealed handoff keeps its fixed
+    deadline."""
+
+    WINDOW = 0.6
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.args = SimpleNamespace(worktree=str(self.root), state_file=None, turn_timeout=self.WINDOW)
+
+    def session(self, body):
+        script = self.root / "live.py"
+        script.write_text(
+            "import json,sys,time\n"
+            "turn=json.loads(sys.stdin.readline())['uuid']\n"
+            "def emit(**v):\n"
+            "    print(json.dumps(v),flush=True)\n"
+            + textwrap.dedent(body))
+        patch = mock.patch.object(supervisor, "claude_command",
+                                  return_value=[sys.executable, str(script)])
+        patch.start()
+        self.addCleanup(patch.stop)
+        session = supervisor.ClaudeStreamSession(self.args, "sess")
+        self.addCleanup(session.process.stdout.close)
+        self.addCleanup(session.close)
+        return session
+
+    CHATTY = """
+        for _ in range(6):
+            time.sleep(0.3)
+            emit(type='assistant', n=1)
+        emit(type='result', subtype='success', result='ok', user_message_uuids=[turn])
+        sys.stdin.read()
+    """
+
+    def test_stream_live_turn_with_output_survives_past_the_window(self):
+        session = self.session(self.CHATTY)
+        pid = session.process.pid
+        started = time.monotonic()
+        result, rc = supervisor.run_turn(
+            self.args, "sess", "hi", resume=False, stream_session=session)
+        self.assertGreater(time.monotonic() - started, self.WINDOW)   # the turn outlived the window
+        self.assertEqual(result["result"], "ok")
+        self.assertIsNone(session.process.poll())                     # same live process, not killed
+        self.assertEqual(session.process.pid, pid)
+
+    def test_stream_silence_for_the_whole_window_still_fails_with_the_existing_reason(self):
+        session = self.session("sys.stdin.read()\n")
+        started = time.monotonic()
+        with self.assertRaisesRegex(supervisor.SupervisorError, "claude-turn-process-failed"):
+            supervisor.run_turn(self.args, "sess", "hi", resume=False, stream_session=session)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_stream_silence_after_early_output_fails_one_window_after_the_last_chunk(self):
+        session = self.session("emit(type='assistant', n=1)\nsys.stdin.read()\n")
+        session.idle_reset = True
+        started = time.monotonic()
+        with self.assertRaisesRegex(supervisor.SupervisorError, "claude-turn-process-failed"):
+            session.run_turn("hi", 0.4)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_real_exit_after_output_still_fails_as_result_missing(self):
+        session = self.session("emit(type='assistant', n=1)\n")
+        session.idle_reset = True
+        with self.assertRaisesRegex(supervisor.SupervisorError, "claude-result-missing"):
+            session.run_turn("hi", 5)
+
+    def test_a_direct_bounded_turn_keeps_its_fixed_deadline_even_with_output(self):
+        session = self.session(self.CHATTY)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "claude-turn-process-failed"):
+            session.run_turn("hi", self.WINDOW)   # idle_reset defaults to off
+
+    def test_only_a_general_owner_turn_asks_for_the_no_progress_window(self):
+        stream = SimpleNamespace(submit=mock.Mock(return_value=({"type": "result"}, 0)))
+        supervisor.run_turn(self.args, "sess", "hi", resume=False, stream_session=stream)
+        self.assertIs(stream.idle_reset, True)
 
 
 class TerminalCommitActivationTests(unittest.TestCase):
