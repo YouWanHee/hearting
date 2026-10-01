@@ -139,6 +139,124 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
                         record.assert_not_called()
                 self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], first)
 
+class FrameTopDeclarationTest(unittest.TestCase):
+    """Automatic frame-leg assignment chooses only harnesses whose runtime config declares `top`."""
+
+    HARNESSES = ("claude", "codex", "opencode")
+
+    def run_selector(self, *, declared, explicit=None, profile="top", scores=None):
+        import artifact_producer
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            jobs = base / "jobs.log"
+            route_file = base / "route.json"
+            route = {"route_id": "rt-frame-top", "route_hash": "sha256:frame-top",
+                     "effective_intensity": "standard",
+                     "dispatch_evidence": {"tuples": [{"status": "supported", "child_harness": h}
+                                                      for h in self.HARNESSES]},
+                     "nodes": [{"id": n, "model_profile": profile} for n in ("frame", "frame-alternative")]}
+            route_file.write_text(json.dumps(route))
+            jobs.write_text("")
+            policy = {"primary": list(self.HARNESSES), "relief": [], "last_resort": [],
+                      "promote_relief_below": 0}
+            allocation = {"strategy": "capacity-aware", "window": 30, "harness_order": list(self.HARNESSES)}
+            values = {"--model-profile": profile, "--worker-type": "frame", "--route-node": "frame",
+                      "--worktree": str(base), "--capability": "autopilot-code",
+                      "--capability-mode": "dev", "--intensity": "standard"}
+            binding = SimpleNamespace(route_file=str(route_file), route_id=route["route_id"],
+                route_hash=route["route_hash"], route_node="frame", registry_digest="sha256:test",
+                write_scope=str(base), completion_gate="test")
+            scores = scores or {"claude": 90, "codex": 80, "opencode": 70}
+            probe = mock.Mock(side_effect=lambda harness: harness in declared)
+            out = io.StringIO()
+            with mock.patch.object(OWNER, "_parse", return_value=(explicit, values, ["--start"], str(route_file), [])), \
+                 mock.patch.object(OWNER, "_authoritative_jobs", return_value=str(jobs)), \
+                 mock.patch.object(OWNER, "_sealed_owner_context", return_value={
+                     "harnesses": set(self.HARNESSES), "policy": None, "allocation": allocation}), \
+                 mock.patch.object(OWNER, "_load_defaults", return_value={"schema_version": 3}), \
+                 mock.patch.object(OWNER._defaults, "query_profile_policy", return_value=policy), \
+                 mock.patch.object(OWNER, "_usage", return_value={h: "ok" for h in self.HARNESSES}), \
+                 mock.patch.object(OWNER._allocation, "attempt_counts", return_value={h: 0 for h in self.HARNESSES}), \
+                 mock.patch.object(OWNER._capacity, "capacity_report", return_value={"scores": scores, "sources": {}}), \
+                 mock.patch.object(OWNER, "derive_frame_route_binding", return_value=binding), \
+                 mock.patch.object(OWNER, "_declares_top", probe), \
+                 mock.patch.object(artifact_producer, "prepare_route_artifact_env", return_value={}), \
+                 mock.patch.object(OWNER.os, "access", return_value=True), \
+                 mock.patch.object(OWNER.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as launch, \
+                 contextlib.redirect_stdout(out):
+                code = OWNER.main([])
+            return code, out.getvalue(), launch, probe
+
+    def test_a_harness_without_a_top_declaration_is_never_chosen_even_with_the_most_headroom(self):
+        code, out, launch, _probe = self.run_selector(declared={"codex", "opencode"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "codex")
+        self.assertIn("top_undeclared=claude", out)
+
+    def test_every_harness_declaring_top_keeps_the_capacity_choice(self):
+        code, out, launch, _probe = self.run_selector(declared=set(self.HARNESSES))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "claude")
+        self.assertNotIn("top_undeclared", out)
+
+    def test_no_declaring_harness_ends_as_frame_harness_unavailable_before_any_spawn(self):
+        code, out, launch, _probe = self.run_selector(declared=set())
+        self.assertEqual(code, 65, out)
+        self.assertIn("reason=frame-harness-unavailable", out)
+        self.assertIn("child_spawned=0", out)
+        self.assertIn("top_undeclared=claude,codex,opencode", out)
+        self.assertRegex(out, r"(?m)^hint=no candidate harness declares the top profile")
+        launch.assert_not_called()
+
+    def test_a_named_harness_keeps_the_wrappers_own_typed_diagnostic(self):
+        code, out, launch, probe = self.run_selector(declared=set(), explicit="claude")
+        self.assertEqual(code, 0, out)
+        probe.assert_not_called()
+        self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "claude")
+        self.assertNotIn("frame-harness-unavailable", out)
+
+    def test_a_frame_leg_below_top_does_not_ask(self):
+        code, out, launch, probe = self.run_selector(declared=set(), profile="deep")
+        self.assertEqual(code, 0, out)
+        probe.assert_not_called()
+        self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "claude")
+
+    def test_the_shipped_configs_declare_top_and_opencode_keeps_its_collapse_record(self):
+        for adapter in self.HARNESSES:
+            with self.subTest(adapter=adapter):
+                resolved = resolve_profile(adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "top")
+                self.assertEqual(resolved["profile"], "top")
+        opencode = resolve_profile("opencode", ROOT / "adapters/opencode/config/models.conf", "top")
+        self.assertEqual(opencode["granularity"], "collapsed-top-to-balanced-deep")
+
+    def test_a_config_without_a_top_declaration_is_what_the_filter_leaves_out(self):
+        import model_profile
+        with tempfile.TemporaryDirectory() as tmp:
+            source = (ROOT / "adapters/codex/config/models.conf").read_text(encoding="utf-8")
+            config = Path(tmp) / "models.conf"
+            config.write_text("\n".join(line for line in source.splitlines()
+                                        if not line.lstrip().startswith("CFG_MODEL_PROFILE_TOP")) + "\n",
+                              encoding="utf-8")
+            with self.assertRaises(model_profile.ModelProfileError) as refused:
+                resolve_profile("codex", config, "top")
+            self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+            with mock.patch.object(model_profile, "resolve_runtime_profile",
+                                   side_effect=lambda adapter, profile: (resolve_profile(adapter, config, profile), None)):
+                self.assertFalse(OWNER._declares_top("codex"))
+
+    def test_the_declaration_is_read_from_the_selected_runtime_config(self):
+        import model_profile
+        missing = model_profile.ModelProfileError("not declared", "profile-top-undeclared")
+        with mock.patch.object(model_profile, "resolve_runtime_profile", side_effect=missing) as resolve:
+            self.assertFalse(OWNER._declares_top("codex"))
+        resolve.assert_called_once_with("codex", "top")
+        with mock.patch.object(model_profile, "resolve_runtime_profile", return_value=({"profile": "top"}, None)):
+            self.assertTrue(OWNER._declares_top("opencode"))
+        with mock.patch.object(model_profile, "resolve_runtime_profile", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                OWNER._declares_top("claude")
+
+
 class DispatchOwnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

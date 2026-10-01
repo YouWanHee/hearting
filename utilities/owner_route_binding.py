@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,7 +134,31 @@ def _jobs_lock(jobs: str | Path):
         raise OwnerRouteBindingError("owner-route-jobs-unreadable") from exc
 
 
+# One-entry, process-local memo of the last parsed registry: (key, rows). The key is
+# the resolved path plus the file's (dev, ino, size, mtime_ns), so an append changes
+# the size, an atomic replace changes the inode, and a rewrite changes the mtime.
+_SNAPSHOT_MEMO: tuple[tuple[Any, ...], list[tuple[list[str], dict[str, str]]]] | None = None
+
+
+def _registry_key(jobs: Path) -> tuple[Any, ...] | None:
+    try:
+        st = jobs.stat()
+    except OSError:
+        return None
+    return (os.path.realpath(jobs), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def _registry_snapshot(jobs: Path) -> list[tuple[list[str], dict[str, str]]]:
+    """Parsed registry rows; every call returns rows it owns, so callers may edit them.
+
+    No lock is taken (some callers already hold the jobs lock). A parse is memoized
+    only when the file's stat is identical before and after the read.
+    """
+    global _SNAPSHOT_MEMO
+    before = _registry_key(jobs)
+    memo = _SNAPSHOT_MEMO
+    if before is not None and memo is not None and memo[0] == before:
+        return [(list(fields), dict(meta)) for fields, meta in memo[1]]
     try:
         lines = jobs.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
@@ -145,6 +170,8 @@ def _registry_snapshot(jobs: Path) -> list[tuple[list[str], dict[str, str]]]:
             continue
         meta = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
         rows.append((fields, meta))
+    if before is not None and _registry_key(jobs) == before:
+        _SNAPSHOT_MEMO = (before, [(list(fields), dict(meta)) for fields, meta in rows])
     return rows
 
 

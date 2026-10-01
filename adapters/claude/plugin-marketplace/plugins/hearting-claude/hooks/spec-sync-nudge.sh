@@ -6,7 +6,6 @@
 # corresponding synchronization is part of the change.
 #
 #   Guards (all clean no-op status 0; never blocking):
-#     - MEM_DISTILL=1 → prevent recursion in distiller sessions
 #     - SPEC_SYNC_NUDGE=0 → per-shell opt-out
 #     - hook_event_name ≠ PostToolUse → no-op
 #     - not spec-backed → no-op
@@ -36,8 +35,6 @@ Without arguments, reads Claude PostToolUse hook JSON from stdin and emits Claud
 EOF
 }
 
-# Recursion guard: in a distiller session, drain stdin and exit 0.
-[ "${MEM_DISTILL:-}" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
 # per-shell opt-out.
 [ "${SPEC_SYNC_NUDGE:-1}" = "0" ] && { cat >/dev/null 2>&1; exit 0; }
 

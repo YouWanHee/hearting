@@ -1,6 +1,6 @@
 ---
 name: audit
-description: "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification."
+description: "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Owns audit report; default preset. Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification."
 ---
 
 # audit

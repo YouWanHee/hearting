@@ -109,10 +109,16 @@ once per session instead of once per turn.
 
 There is no automatic distiller (D-78). Claude's built-in file memory is
 disabled via the top-level `"autoMemoryEnabled": false` setting in
-`adapters/claude/settings.json`; SessionEnd keeps running `mem sync` through
-`adapters/claude/settings.json` hook registration and concrete hook scripts
-under `adapters/claude/hooks/`. `MEM_DISTILL=1` remains a recognized D-42
-worker marker for compatibility, even though nothing sets it anymore.
+`adapters/claude/settings.json`. SessionEnd runs no memory command (D-82): it
+keeps only the Fleet and herdr state hooks, and an install removes the managed
+`mem.py sync` SessionEnd entry an older release registered (user-written
+SessionEnd and `mem sync` hooks stay). Memory exchanges in the background after
+writes and stale reads (`tools/memory/README.md`). `SessionStart` runs
+`mem.py inject --hook`, which also reads the hook JSON on stdin: `source` of
+`compact` or `clear` empties that session's candidate display history. Hook
+registration lives in `adapters/claude/settings.json`, with concrete hook
+scripts under `adapters/claude/hooks/`. `MEM_DISTILL=1` is now only an actor
+label in `mem.py` and a Fleet/peer classification; no hook tests it.
 
 ## Dispatch And Statusline Realization
 
@@ -125,8 +131,11 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   the first print turn uses one generated `--session-id`, exact child batches are
   joined outside the model, and each batch resumes once with `--resume`. The
   wrapper suppresses intermediate `result` rows and exposes only the final result
-  to the attempt-specific `.claude.jsonl`. Quick and dispatch-depth-2 one-shot workers keep
-  `--no-session-persistence`. `--completion-delivery auto` probes both CLI flags;
+  to the attempt-specific `.claude.jsonl`. A registered quick/solo dispatch-depth-1 owner uses the same
+  supervisor when the probe reports support (an explicit `poll`, `unsupported` or `indeterminate` probe keeps
+  the one-shot launch without refusal); non-owner and dispatch-depth-2 one-shot workers keep
+  `--no-session-persistence`. Owner corrections (`capability-route.py correct`) are accepted from
+  registration and delivered as the next turn of the same `--resume` session. `--completion-delivery auto` probes both CLI flags;
   forced supervised mode fails before registration, and the checked legacy path
   is reported as `poll-fallback`. Before each supervised turn the bridge writes
   an atomic attempt-scoped delivered-set state and supplies a command-scoped

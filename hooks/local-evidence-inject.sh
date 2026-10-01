@@ -31,8 +31,7 @@ is_worker() {
     || [ "${AGENT_DISPATCH_CHILD:-}" = 1 ] \
     || [ -n "${AGENT_DISPATCH_DEPTH:-}" ] \
     || [ -n "${OPENCODE_DISPATCH_SLUG:-}" ] \
-    || [ "${FLEET_TITLE_REFRESH:-}" = 1 ] \
-    || [ "${MEM_DISTILL:-}" = 1 ]
+    || [ "${FLEET_TITLE_REFRESH:-}" = 1 ]
 }
 
 if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then

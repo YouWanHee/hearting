@@ -7,7 +7,7 @@
 #   for long-lived sessions where SessionStart does not run each morning.
 #
 #   Guards:
-#     - MEM_DISTILL=1 → exit 0 (prevent recursion in distiller sessions)
+#     - worker/dispatch session markers → exit 0
 #     - hook_event_name ≠ UserPromptSubmit → exit 0
 #     - cwd ≠ ${MEM_BRIEFING_DESK:-$HOME/.claude} → exit 0
 #     - no report for today → exit 0
@@ -35,8 +35,7 @@ if [ "${AGENT_SESSION_ROLE:-}" = "worker" ] \
   || [ "${AGENT_DISPATCH_CHILD:-}" = "1" ] \
   || [ -n "${AGENT_DISPATCH_DEPTH:-}" ] \
   || [ -n "${OPENCODE_DISPATCH_SLUG:-}" ] \
-  || [ "${FLEET_TITLE_REFRESH:-}" = "1" ] \
-  || [ "${MEM_DISTILL:-}" = "1" ]; then
+  || [ "${FLEET_TITLE_REFRESH:-}" = "1" ]; then
   cat >/dev/null 2>&1
   exit 0
 fi

@@ -44,7 +44,7 @@ keeps its own generation's gate name, binding and node shape and is **never
 retro-fitted** — the entry fence in `utilities/dispatch_contract.py` reads
 only the route object it was handed.
 
-Depth-0 launches the frame pair, joins both direction briefs, and builds
+Depth-0 launches the frame pair (both legs `top`, a pin or explicit profile wins; a route composed from an approved proposal via `--route-plan` has no frame nodes), joins both direction briefs, and builds
 `spec/_internal/research/frame/frame-summary.json` (five fields —
 방향/대안/위험/범위 변경/비용, ≤1KB) plus the **frame interview**
 `spec/_internal/research/frame/interview.json` (SD-129: a one-sentence
@@ -82,7 +82,9 @@ Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude
 
 Spec work writes to `$AGENT_ARTIFACT_OUTPUT_DIR/spec/`. The canonical current blueprint is always `$AGENT_ARTIFACT_OUTPUT_DIR/spec/prd.md`.
 
-`prd.md` opens with a bounded blueprint-summary block — exact `<!-- BLUEPRINT-SUMMARY:BEGIN -->` / `<!-- BLUEPRINT-SUMMARY:END -->` markers right after the H1 title, at most 40 lines between markers — refreshed in the same transaction as every body update. The block is the concise user-facing blueprint (vision, current shape, active decisions, in-flight cycles); downstream consumers such as note-app spec mirrors extract it by exact marker matching, so the markers are a stable contract. A legacy PRD without the block gains it on its next update.
+`prd.md` opens with a bounded blueprint-summary block — exact `<!-- BLUEPRINT-SUMMARY:BEGIN -->` / `<!-- BLUEPRINT-SUMMARY:END -->` markers right after the H1 title, at most 40 lines, 160 characters per item, and 2,500 characters between markers — refreshed in the same transaction as every body update. The block is the concise user-facing blueprint (vision, current shape, active decisions, what is in progress and what comes next) in plain words, without `§N` references, internal abbreviations, or identifiers; downstream consumers such as note-app spec mirrors extract it by exact marker matching, so the markers are a stable contract. A legacy PRD without the block gains it on its next update.
+
+The body holds only the current contract: a revision rewrites the affected section in place and deletes superseded content, which survives in the version snapshot. Revision history (reasons, quoted user wording, triggers, supersede tables, per-version narrative) and internal tracking IDs (commit hashes, route, revision, cycle, and attempt IDs, session or pane names) go to `pipeline_summary.md`; the summary heading carries the only version tag. `utilities/spec-transaction.py` reports violations as warnings in its receipt and never fails the write. The one-time current-contract rewrite of a legacy PRD is defined in `skills/autopilot-spec/references/prd-authoring.md`.
 
 Required public artifacts:
 
@@ -140,7 +142,7 @@ Minimum role mapping:
 - research or reference import: research role;
 - final consistency pass: QA role.
 
-Pipeline intensity follows `core/CONVENTIONS.md §1`: `direct` has no plan stage or durable plan artifact; `quick` is one registered-headless dispatch-depth-1 one-shot conductor with its inline micro-plan plus plan-check-lite; `standard+` uses the capability's durable work-cycle plan when applicable. `plan-check` is required for every non-`direct` graph, but independent QA is not repeated after every stage by default. Verification rigor for plan-check, selected independent reviews, and final verify is derived from intensity; it does not name a model or introduce a separate stage graph.
+Pipeline intensity follows `core/CONVENTIONS.md §1`: `direct` has no plan stage or durable plan artifact; `quick` is one registered-headless dispatch-depth-1 one-shot conductor with its inline micro-plan plus plan-check-lite; `standard+` uses the capability's durable work-cycle plan when applicable. This recipe has no separate `plan-check` node (only `autopilot-code` declares one): `quick` checks its micro-plan inline (plan-check-lite), and `standard+` reviews through the recipe's own review stages — `review` — rather than after every stage. Verification rigor for those reviews and final verify is derived from intensity; it does not name a model or introduce a separate stage graph. `capabilities/topologies.json` (recipe plus `part_catalog`) is the one stage list; `capability-route.py stages --capability autopilot-spec` prints it.
 
 ## Guard Requirements
 
@@ -209,7 +211,7 @@ legitimately reshape the remaining ladder. Grounded in live usage
 
 - **Step ladder**: ordered steps, each with status (done/active/planned),
   objective, configuration, decision criteria, and follow-on work. A closed
-  step keeps its one-line verdict with evidence links.
+  step keeps only its one-line verdict with evidence links.
 - **Decision protocols**: operating targets and judgment axes recorded with
   their user-confirmation dates; changing a protocol is a blueprint change.
 - **Premises and measured constants**: task context and empirically measured
@@ -218,7 +220,7 @@ legitimately reshape the remaining ladder. Grounded in live usage
   sections; `pipeline_state.yaml` records `source_analysis` (evidence read)
   and `next` (the follow-on lab/code handoff).
 - **Rejected tracks**: rejected directions stay in the PRD with the rejection
-  basis and revival cues instead of being deleted.
+  basis and revival cues, kept short, instead of being deleted.
 - **Execution order and completion criteria**: resource-aware run order and
   per-step deliverables, including experiment `_RUNLOG` lineage.
 

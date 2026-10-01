@@ -158,6 +158,9 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     env["HEARTING_GATES"] = "on"
     # A suite that seals a cycle must not start the background workflow-group review.
     env["HEARTING_WORKFLOW_GROUP_REVIEW"] = "off"
+    # Same for the memory exchange: no detached worker races the temp-dir cleanup;
+    # the scheduler's own suite turns it back on.
+    env["MEM_EXCHANGE_AUTO"] = "0"
     env["HOME"] = str(home)
     env["XDG_STATE_HOME"] = str(xdg_state)
     env["XDG_DATA_HOME"] = str(xdg_data)
@@ -1228,6 +1231,189 @@ def compare_baseline(base_report: Path, head_report: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Sharding (--shard / --suite-list / --verify-shards)
+# ---------------------------------------------------------------------------
+
+DURATION_COLUMNS = ["suite_path", "duration_s"]
+DEFAULT_SHARD_WEIGHT_S = 1.0
+CENSUS_MANIFEST = "census-suite-list.tsv"
+SHARD_DIR_RE = re.compile(r"^run-tests-report-shard-(\d+)-of-(\d+)$")
+SHARD_HEADER_RE = re.compile(r"^# shard=(?:(\d+)/(\d+)|all)$")
+# Report rows that name a suite without being that suite's own verdict.
+NON_VERDICT_ROWS = frozenset({"STALE", "UNDECLARED-ISOLATION-OPTOUT", "ISOLATION-OPTOUT-UNNEEDED"})
+
+
+def parse_shard(spec: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d+)/(\d+)", spec)
+    if not m:
+        raise ValueError(f"--shard must look like I/N, got {spec!r}")
+    index, count = int(m.group(1)), int(m.group(2))
+    if count < 1 or not 1 <= index <= count:
+        raise ValueError(f"--shard needs 1 <= I <= N, got {spec!r}")
+    return index, count
+
+
+def shard_usage_errors(args: argparse.Namespace) -> list[str]:
+    if not args.shard:
+        return []
+    if len(args.shard) > 1:
+        return ["--shard may be given only once"]
+    try:
+        parse_shard(args.shard[0])
+    except ValueError as exc:
+        return [str(exc)]
+    return []
+
+
+def load_durations(path: Path) -> dict[str, float]:
+    if not path.is_file():
+        raise BaselineError(f"{path}: duration table not found")
+    durations: dict[str, float] = {}
+    header_seen = False
+    with path.open(encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if not header_seen:
+                header_seen = True
+                if cols != DURATION_COLUMNS:
+                    raise BaselineError(f"{path}:{lineno}: expected header {DURATION_COLUMNS}, got {cols}")
+                continue
+            if len(cols) != len(DURATION_COLUMNS):
+                raise BaselineError(f"{path}:{lineno}: expected {len(DURATION_COLUMNS)} columns, got {len(cols)}")
+            suite_path, raw = cols
+            try:
+                value = float(raw)
+            except ValueError:
+                raise BaselineError(f"{path}:{lineno}: duration_s {raw!r} is not a number") from None
+            if not 0 <= value < float("inf"):
+                raise BaselineError(f"{path}:{lineno}: duration_s {raw!r} must be finite and non-negative")
+            if suite_path in durations:
+                raise BaselineError(f"{path}:{lineno}: duplicate row for {suite_path}")
+            durations[suite_path] = value
+    if not header_seen:
+        raise BaselineError(f"{path}: missing header {DURATION_COLUMNS}")
+    return durations
+
+
+def shard_weights(relpaths: list[str], durations: dict[str, float]) -> dict[str, float]:
+    known = sorted(durations[r] for r in relpaths if r in durations)
+    if known:
+        mid = len(known) // 2
+        fallback = known[mid] if len(known) % 2 else (known[mid - 1] + known[mid]) / 2
+    else:
+        fallback = DEFAULT_SHARD_WEIGHT_S
+    return {r: durations.get(r, fallback) for r in relpaths}
+
+
+def partition_shards(relpaths: list[str], durations: dict[str, float], count: int) -> list[list[str]]:
+    """Greedy longest-first split. The input is only the sorted suite paths and
+    the committed table, so every runner computes the same shards."""
+    weights = shard_weights(relpaths, durations)
+    shards: list[list[str]] = [[] for _ in range(count)]
+    totals = [0.0] * count
+    for rel in sorted(relpaths, key=lambda r: (-weights[r], r)):
+        target = min(range(count), key=lambda i: (totals[i], i))
+        shards[target].append(rel)
+        totals[target] += weights[rel]
+    return [sorted(shard) for shard in shards]
+
+
+def write_suite_list(path: Path, label: str, relpaths: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(f"# shard={label}\n")
+        fh.write("suite_path\n")
+        for rel in sorted(relpaths):
+            fh.write(rel + "\n")
+
+
+def read_suite_list(path: Path) -> tuple[str, list[str]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2 or not SHARD_HEADER_RE.match(lines[0]) or lines[1] != "suite_path":
+        raise BaselineError(f"{path}: not a suite manifest (expected '# shard=' and 'suite_path' lines)")
+    return lines[0][len("# shard="):], [line for line in lines[2:] if line]
+
+
+def verify_shards(directory: Path) -> int:
+    """Fail unless the shard manifests partition the census exactly and every
+    manifest suite has a verdict in its own shard's report."""
+    problems: list[str] = []
+    try:
+        label, census = read_suite_list(directory / CENSUS_MANIFEST)
+    except (OSError, BaselineError) as exc:
+        print(f"verify-shards: {exc}", file=sys.stderr)
+        return 1
+    if label != "all":
+        problems.append(f"{CENSUS_MANIFEST}: expected '# shard=all', got '# shard={label}'")
+    census_set = set(census)
+    if len(census_set) != len(census):
+        problems.append(f"{CENSUS_MANIFEST}: repeats a suite path")
+
+    shard_dirs = sorted(d for d in directory.iterdir() if d.is_dir() and SHARD_DIR_RE.match(d.name))
+    counts: set[int] = set()
+    seen_index: dict[int, str] = {}
+    assigned: dict[str, list[int]] = {}
+    report_missing: list[str] = []
+    report_extra: list[str] = []
+    for shard_dir in shard_dirs:
+        dir_index, dir_count = (int(x) for x in SHARD_DIR_RE.match(shard_dir.name).groups())
+        try:
+            shard_label, suites = read_suite_list(shard_dir / "suite-list.tsv")
+        except (OSError, BaselineError) as exc:
+            problems.append(f"{shard_dir.name}: {exc}")
+            continue
+        m = SHARD_HEADER_RE.match(f"# shard={shard_label}")
+        if shard_label == "all" or (int(m.group(1)), int(m.group(2))) != (dir_index, dir_count):
+            problems.append(f"{shard_dir.name}: manifest says '# shard={shard_label}'")
+            continue
+        counts.add(dir_count)
+        if dir_index in seen_index:
+            problems.append(f"shard {dir_index} appears twice ({seen_index[dir_index]}, {shard_dir.name})")
+        seen_index[dir_index] = shard_dir.name
+        for rel in suites:
+            assigned.setdefault(rel, []).append(dir_index)
+        try:
+            rows = read_report(shard_dir / "run-tests-report.tsv")
+        except (OSError, BaselineError) as exc:
+            problems.append(f"{shard_dir.name}: run-tests-report.tsv unreadable: {exc}")
+            continue
+        judged = {row["suite_path"] for row in rows if row["verdict"] not in NON_VERDICT_ROWS}
+        report_missing += [f"{rel} (shard {dir_index})" for rel in sorted(set(suites) - judged)]
+        report_extra += [f"{rel} (shard {dir_index})" for rel in sorted(judged - set(suites))]
+
+    if len(counts) > 1:
+        problems.append(f"manifests disagree on the shard count: {sorted(counts)}")
+    total = min(counts) if len(counts) == 1 else 0
+    if total and sorted(seen_index) != list(range(1, total + 1)):
+        problems.append(f"shard numbers {sorted(seen_index)} are not exactly 1..{total}")
+    if not shard_dirs:
+        problems.append(f"no run-tests-report-shard-I-of-N directory under {directory}")
+
+    missing = sorted(census_set - set(assigned))
+    extra = sorted(set(assigned) - census_set)
+    duplicate = sorted(rel for rel, owners in assigned.items() if len(owners) > 1)
+    if missing or duplicate or extra or report_missing or report_extra:
+        problems.append("suite coverage differs from the census")
+    print(
+        f"census={len(census_set)} assigned={len(assigned)} shards={len(seen_index)}/{total} "
+        f"missing={len(missing)} duplicate={len(duplicate)} extra={len(extra)} "
+        f"report-missing={len(report_missing)} report-extra={len(report_extra)}"
+    )
+    for title, items in (("missing", missing), ("duplicate", duplicate), ("extra", extra),
+                         ("report-missing", report_missing), ("report-extra", report_extra)):
+        for item in items[:25]:
+            print(f"{title}: {item}")
+        if len(items) > 25:
+            print(f"{title}: ... {len(items) - 25} more")
+    for problem in problems:
+        print(f"verify-shards: {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--census", action="store_true")
@@ -1280,6 +1466,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "concurrent session's fast write cannot fail a local run.",
     )
     p.add_argument("--compare-baseline", action="store_true")
+    p.add_argument(
+        "--shard", action="append", default=[], metavar="I/N",
+        help="run only shard I of N (1-based) of the selected suites, split by the "
+             "committed duration table; works with every --isolation profile and "
+             "keeps the full-run policy for a whole-repository run",
+    )
+    p.add_argument(
+        "--suite-list", type=Path, default=None,
+        help="write the selected suite manifest (before running) for --verify-shards",
+    )
+    p.add_argument(
+        "--verify-shards", type=Path, default=None, metavar="DIR",
+        help="check that the shard manifests under DIR add up to census-suite-list.tsv "
+             "with no missing or duplicate suite, then exit",
+    )
+    p.add_argument("--durations", type=Path, default=ROOT / "tools" / "test-durations.tsv",
+                   help="suite duration table used to balance --shard")
     p.add_argument("--fingerprint", action="store_true",
                    help="print the current environment fingerprint and exit")
     p.add_argument("--fingerprint-explain", action="store_true",
@@ -1401,6 +1604,9 @@ def main(argv: list[str]) -> int:
             return 64
         return compare_baseline(args.base_report, args.head_report)
 
+    if args.verify_shards:
+        return verify_shards(args.verify_shards)
+
     # The fingerprint describes the environment suites will actually run in, so
     # it is computed from a representative profile env rather than the caller's.
     with tempfile.TemporaryDirectory(prefix="fingerprint-") as fp_tmp:
@@ -1421,7 +1627,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     root = args.root.resolve()
-    policy_errors = execution_policy_errors(args, root)
+    policy_errors = shard_usage_errors(args) + execution_policy_errors(args, root)
     if policy_errors:
         for error in policy_errors:
             print(error, file=sys.stderr)
@@ -1441,6 +1647,24 @@ def main(argv: list[str]) -> int:
     if args.exclude:
         rel_selected = [suite_relpath(root, s) for s in selected]
         selected = [s for s, r in zip(selected, rel_selected) if not any(glob_match(r, g) for g in args.exclude)]
+
+    # Sharding splits what --select/--exclude left. STALE below is still judged
+    # against the whole corpus, so it needs the pre-split view.
+    shard_index = shard_count = 0
+    if args.shard:
+        shard_index, shard_count = parse_shard(args.shard[0])
+        try:
+            durations = load_durations(args.durations)
+        except BaselineError as exc:
+            print(f"duration table error: {exc}", file=sys.stderr)
+            return 65
+        selected_rel = [suite_relpath(root, s) for s in selected]
+        mine = set(partition_shards(selected_rel, durations, shard_count)[shard_index - 1])
+        selected = [s for s, r in zip(selected, selected_rel) if r in mine]
+
+    if args.suite_list:
+        label = f"{shard_index}/{shard_count}" if args.shard else "all"
+        write_suite_list(args.suite_list, label, [suite_relpath(root, s) for s in selected])
 
     if args.census:
         return cmd_census(selected, root)
@@ -1478,6 +1702,8 @@ def main(argv: list[str]) -> int:
     for (suite_path, test_id) in baseline:
         if args.select and not any(glob_match(suite_path, g) for g in args.select):
             continue
+        if args.shard and shard_index != 1:
+            continue  # shard 1 alone reports a stale row, so the merged report has it once
         if suite_path not in full_corpus_relpaths:
             stale_rows.append(
                 {

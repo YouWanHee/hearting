@@ -105,8 +105,8 @@ This skill treats initial creation and existing-spec updates as equally first-cl
 Update mode performs three operations as one helper-owned transaction:
 
 1. Enter `utilities/spec-transaction.py run`; it re-reads the latest version under `.pipeline-lock` and prepares the exact current `prd.md` bytes before the child command.
-2. Update `spec/prd.md`, the always-current T1 file. If it changed, the helper retains and byte-verifies `spec/_internal/versions/v{N}/prd.md`; initial creation and no-op updates create no snapshot. Do not create or check the snapshot manually.
-3. Record the change narrative in `pipeline_summary.md`. Synchronize affected adjacent files (`data_model.md`, `api_contract.md`, `ui_flow.md`, `stack.md`) and Architecture Diagrams inside the same transaction using the Step 3.5 coupled-update logic.
+2. Update `spec/prd.md`, the always-current T1 file. If it changed, the helper retains and byte-verifies `spec/_internal/versions/v{N}/prd.md`; initial creation and no-op updates create no snapshot. Do not create or check the snapshot manually. Rewrite the affected sections in place; delete superseded content instead of annotating it.
+3. Record the change narrative (reasons, quoted user wording, triggers, supersede tables) in `pipeline_summary.md`, never in the PRD body. Synchronize affected adjacent files (`data_model.md`, `api_contract.md`, `ui_flow.md`, `stack.md`) and Architecture Diagrams inside the same transaction using the Step 3.5 coupled-update logic.
 
 > Update mode is not a separate mode label. It activates automatically on re-entry when `pipeline_state.yaml` exists. The five modes (`app`, `library`, `api`, `cli`, `research`) describe the spec type; update describes an operation. They are orthogonal, so update the existing spec's original mode sections. In `research` mode the typical update is a roadmap advance: close a step with its verdict and evidence links, then re-plan the remaining ladder in the same transaction.
 

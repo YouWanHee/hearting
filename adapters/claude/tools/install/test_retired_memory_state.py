@@ -1,0 +1,1 @@
+../../../../tools/install/test_retired_memory_state.py

@@ -39,6 +39,99 @@ MAX_NODES = 16
 SWEEP_MAX_AGE = 14 * 86400
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _LEDGER_EVENTS = frozenset(("compose", "compile", "continuation", "start"))
+# The events that say "this session composed the route" (a `start` line only says it started one).
+COMPOSING_EVENTS = frozenset(("compose", "compile", "continuation"))
+
+
+def writer_identity(environ=None):
+    """Return the depth-0 ledger anchor as ``(harness, session_id)`` when known.
+
+    This is the identity used by route-chain writers. Nested stage workers are
+    deliberately not treated as the interactive composing session.
+    """
+    env = os.environ if environ is None else environ
+    try:
+        depth = int(env.get("AGENT_DISPATCH_DEPTH") or 0)
+    except (TypeError, ValueError):
+        return None
+    if depth != 0:
+        return None
+    sessions = {
+        "codex": env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID") or "",
+        "claude": env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_SESSION_ID") or "",
+        "opencode": env.get("OPENCODE_SESSION_ID") or "",
+    }
+    explicit = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
+    if explicit:
+        if explicit not in sessions:
+            return None
+        harness, session_id = explicit, sessions[explicit]
+    else:
+        found = [(harness, sid) for harness, sid in sessions.items() if sid]
+        if len(found) != 1:
+            return None
+        harness, session_id = found[0]
+    if harness not in HARNESSES or WRITER_SUPPORT.get(harness) != "env":
+        return None
+    try:
+        ledger_path(harness, session_id)
+    except ValueError:
+        return None
+    return harness, session_id
+
+
+# Without the route's creation time the lookup keeps to this many of the newest ledgers.
+ANCHOR_SCAN_FILES = 64
+# A ledger that composed a route was appended to at or after the route was written; this absorbs
+# the timestamp granularity and small clock differences between the route and the state volumes.
+ANCHOR_MTIME_SLACK = 5.0
+
+
+def _composes(harness, session_id, route_id):
+    return any(line.get("route_id") == route_id and line.get("event") in COMPOSING_EVENTS
+               for line in read_tail(harness, session_id, max_bytes=1024 * 1024))
+
+
+def composing_anchor(route_id, environ=None, not_before=None):
+    """``(harness, session_id)`` of the depth-0 session whose ledger says it composed ``route_id``.
+
+    The answer comes from ledger evidence, never from the asking process: a worker, a
+    supervisor, or a session that only started the route is not the composing session. Its
+    own ledger is tried first; otherwise exactly one other ledger must carry a composing line
+    for the route. No evidence, or more than one session, is None.
+
+    ``not_before`` is the route's creation time (its file's mtime): a ledger last modified
+    before it cannot hold the route's compose line, so every later ledger is scanned. Without
+    it only the ``ANCHOR_SCAN_FILES`` most recently modified ledgers are.
+    """
+    if not isinstance(route_id, str) or not route_id:
+        return None
+    own = writer_identity(environ)
+    if own and _composes(own[0], own[1], route_id):
+        return own
+    recent = []
+    for harness in HARNESSES:
+        directory = os.path.join(state_root(), harness)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                recent.append((os.stat(os.path.join(directory, name)).st_mtime, harness, name[:-len(".jsonl")]))
+            except OSError:
+                continue
+    if isinstance(not_before, (int, float)) and not isinstance(not_before, bool):
+        candidates = [row for row in recent if row[0] >= not_before - ANCHOR_MTIME_SLACK]
+    else:
+        candidates = sorted(recent, reverse=True)[:ANCHOR_SCAN_FILES]
+    found = set()
+    for _mtime, harness, session_id in candidates:
+        if (harness, session_id) != own and _composes(harness, session_id, route_id):
+            found.add((harness, session_id))
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def state_root():

@@ -14,6 +14,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 PREFLIGHT = ROOT / "adapters" / "codex" / "bin" / "preflight.sh"
 LOCAL_EVIDENCE_HOOK = ROOT / "hooks" / "local-evidence-inject.sh"
+MEM_PY = ROOT / "tools" / "memory" / "mem.py"
+SESSION_TIDY = ROOT / "utilities" / "session_tidy.py"
 
 
 def first_string(mapping: dict[str, Any], *keys: str) -> str:
@@ -96,6 +98,49 @@ def local_evidence_context(current_cwd: str) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+def forget_shown_candidates(payload: dict[str, Any]) -> None:
+    """After compact or clear the model no longer holds what memory showed it.
+
+    The same ``mem.py`` helper the other harnesses call empties this session's
+    candidate display history; every failure is silent.
+    """
+    source = nested_string(payload, "source").lower()
+    sid = session_id(payload)
+    if source not in {"compact", "clear"} or not sid or not MEM_PY.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(MEM_PY), "_seen-reset", "--session-id", sid],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def card_context(payload: dict[str, Any], current_cwd: str) -> str:
+    """Session card / tidy notice due at this start; independent of the memory opt-in."""
+    sid = session_id(payload)
+    if not sid or not SESSION_TIDY.is_file():
+        return ""
+    command = [sys.executable, str(SESSION_TIDY), "hook", "--harness", "codex",
+               "--event", "start", "--session-id", sid, "--cwd", current_cwd]
+    source = nested_string(payload, "source")
+    if source:
+        command += ["--source", source]
+    transcript = nested_string(payload, "transcript_path", "transcriptPath")
+    if transcript:
+        command += ["--transcript", transcript]
+    try:
+        result = subprocess.run(
+            command, cwd=str(ROOT), env=os.environ.copy(), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
 def env_truthy(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
@@ -107,7 +152,6 @@ def is_worker_session() -> bool:
         or bool(os.environ.get("AGENT_DISPATCH_DEPTH"))
         or bool(os.environ.get("OPENCODE_DISPATCH_SLUG"))
         or os.environ.get("FLEET_TITLE_REFRESH") == "1"
-        or os.environ.get("MEM_DISTILL") == "1"
     )
 
 
@@ -130,6 +174,8 @@ def main() -> int:
 
     parts = []
     if not is_worker_session():
+        forget_shown_candidates(payload)
+        parts.append(card_context(payload, current_cwd))
         if env_truthy("CODEX_SESSION_MEMORY_INJECT"):
             parts.append(run_preflight("memory", current_cwd))
         parts.append(local_evidence_context(current_cwd))

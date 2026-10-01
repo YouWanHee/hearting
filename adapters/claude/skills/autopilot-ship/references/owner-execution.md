@@ -54,7 +54,7 @@ autopilot-spec --mode app
   ↻ autopilot-ship for environment, domain, or migration updates
 ```
 
-This capability prepares files, records decisions, and explains commands. The user executes production deployment, DNS, billing, secret entry, and production database migration unless they explicitly place those systems and actions in scope under an applicable approval contract.
+The route-start card obtains approval for the selected `deploy` part. Within that approved system and action scope, the owner may execute deployment and verify the result. DNS changes, billing, secret entry, and production database migrations remain outside scope unless the approval names those systems and actions.
 
 ## Invocation
 
@@ -114,7 +114,7 @@ If the request remains materially ambiguous, ask the user to choose. Otherwise i
 2. **Create or update `.env.example`.** Include keys only, never secret values. Tell the user where the real values must be entered.
 3. **Prepare CI/CD when needed.** Create `.github/workflows/deploy.yml` only after the chosen deployment model requires an explicit workflow. Do not duplicate a provider-managed Git integration.
 4. **Describe optional domain setup.** Give the required DNS records; the user changes the registrar or DNS dashboard.
-5. **Provide the deployment commands without executing them.** Preserve provider-specific commands such as:
+5. **Run deployment only when the selected route includes the start-approved `deploy` part and the approved scope names the system and action.** Otherwise provide the deployment commands for a later compose. Preserve provider-specific commands such as:
 
    ```text
    vercel login
@@ -158,9 +158,9 @@ Keep `ship.md` as one current-state file. On every update, append to frontmatter
 | Domain | Explain the required DNS records | Refresh Domain; append `{type: domain}` |
 | Migration | Explain destructive risk, rollout, and rollback; leave commands such as `prisma migrate deploy` to the user | Record migration evidence in Notes; append `{type: migration}` |
 
-### Step 5: Confirmation Gate
+### Step 5: Verify and Record
 
-Present the target, selected path, and 3–5 major decisions. Accept Continue, Revise, Back-jump, or Stop in the conversation language. A revision writes `_internal/refine_v{N}.md`; a back-jump reruns the chosen prior step; Stop preserves current state.
+Review the prepared record and its decisions with the user. They may Continue, Revise (write `_internal/refine_v{N}.md`), Back-jump (rerun the chosen prior step), or Stop (preserve current state). This review does not ask for a second approval of the `deploy` part.
 
 ## Forbidden Without Explicit Scope
 

@@ -21,7 +21,7 @@ from . import procscan
 # `Path(__file__)`, which is a governor-CLI concern, not something fleet should import machinery
 # for). The env var name is the SAME one the governor itself honors, so an operator's override
 # of the real cap is picked up here too.
-DEFAULT_TOTAL_LIMIT = 12
+DEFAULT_TOTAL_LIMIT = 30
 
 _CACHE = {}   # {abspath: (mtime, size, result)}
 _ROOT_CACHE = {}  # {cwd: canonical governor root}

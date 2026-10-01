@@ -16,12 +16,23 @@ hearting_test_isolate() {
   export HOME="$_hti_root/home"
   export XDG_DATA_HOME="$_hti_root/data"
   export XDG_STATE_HOME="$_hti_root/state"
+  export XDG_CONFIG_HOME="$_hti_root/config"
+  export TMPDIR="$_hti_root/tmp"
   export MEM_STORE="$_hti_root/store"
   export MEM_PROJECTS="$_hti_root/projects"
   export GIT_CONFIG_GLOBAL="$_hti_root/gitconfig"
-  mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$MEM_STORE" "$MEM_PROJECTS" || return 1
+  mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/hearting" \
+    "$TMPDIR" "$MEM_STORE" "$MEM_PROJECTS" || return 1
+  # The shared exchange policy lives in $XDG_CONFIG_HOME/hearting/memory-sync.json
+  # and an ambient MEM_SYNC_*/MEM_DUMP_PUSH variable overrides it: pin the remote off so no
+  # test can reach a real remote unless it names a local bare repository itself.
+  printf '%s\n' '{"enabled": false}' >"$XDG_CONFIG_HOME/hearting/memory-sync.json" || return 1
+  unset MEM_SYNC_REMOTE MEM_SYNC_REMOTE_URL MEM_SYNC_DIR MEM_SYNC_REF MEM_DUMP_PUSH
+  # No detached exchange worker unless a test turns the scheduler on itself: the
+  # hundreds of `mem add` calls in the suites must not race temp-dir cleanup.
+  export MEM_EXCHANGE_AUTO=0
   git config --global --add safe.directory "$PWD" >/dev/null 2>&1 || return 1
-  for _hti_var in HOME XDG_DATA_HOME XDG_STATE_HOME MEM_STORE; do
+  for _hti_var in HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CONFIG_HOME TMPDIR MEM_STORE; do
     eval "_hti_path=\${$_hti_var}"
     case "$_hti_path" in
       "$_hti_root"/*) ;;

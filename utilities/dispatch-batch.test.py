@@ -3065,7 +3065,10 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                     self.assertNotIn("parallel_group", node)
                     self.assertNotIn("replica_group", node)
                     self.assertEqual(node.get("dispatch_depth"), 1)
-        self.assertEqual(frame_legs, 10)  # five recipes x two sibling legs
+        # Five entry recipes x two sibling legs, plus the compiler-internal
+        # route-frame recipe's own frame pair (framed shape): its legs are
+        # separate depth-1 launches and carry no parallel group either.
+        self.assertEqual(frame_legs, 12)
 
     @unittest.skip(
         "Frame is no longer a dispatch-batch parallel group, and this test's "

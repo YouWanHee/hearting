@@ -1,6 +1,6 @@
 ---
 name: autopilot-apply
-description: "Use when an approved cheatsheet or patching guide must be applied to the real source artifact and the applied result verified. Not for drafting or refining the cheatsheet, or for unrelated source implementation."
+description: "Use when an approved cheatsheet or patching guide must be applied to the real source artifact and the applied result verified. Owns applied artifact; default preset. Not for drafting or refining the cheatsheet, or for unrelated source implementation."
 ---
 
 # autopilot-apply

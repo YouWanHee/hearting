@@ -1139,8 +1139,9 @@ class TestGraphContract(unittest.TestCase):
         ids = [node["id"] for node in recipe["standard_plus"]["nodes"]]
         self.assertEqual(ids, ["scaffold", "smoke", "full-run", "run-verify", "handoff"])
         by_id = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
-        self.assertEqual(by_id["smoke"]["continuation"],
-                         {"kind": "human-gate", "gate": "full-run-authorization"})
+        self.assertEqual(by_id["smoke"]["continuation"], {"kind": "inline-next"})
+        self.assertEqual(recipe["human_gates"], [])
+        self.assertEqual(recipe["human_gate_bindings"], [])
         self.assertEqual(by_id["full-run"]["continuation"], {"kind": "supervised"})
         self.assertTrue(by_id["handoff"]["terminal"])
         self.assertEqual(recipe["conditional_extensions"][0]["after"], ["handoff"])
@@ -1151,18 +1152,25 @@ class TestGraphContract(unittest.TestCase):
         self.assertEqual(by_id["eval-run"]["continuation"], {"kind": "supervised"})
         self.assertTrue(by_id["sync"]["terminal"])
 
-    def test_ship_realizes_its_declared_deploy_authorization(self):
+    def test_ship_default_has_start_approval_and_no_entry_gate(self):
         recipe = self.recipe("autopilot-ship", "default")
         by_id = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
         self.assertIn("deploy", by_id)
         self.assertIn("post-deploy-verify", by_id)
-        self.assertEqual(recipe["human_gate_bindings"],
-                         [{"gate": "deploy-authorization", "node": "deploy",
-                           "position": "entry"}])
+        self.assertEqual(recipe["human_gates"], [])
+        self.assertEqual(recipe["human_gate_bindings"], [])
+        self.assertEqual(TOPO.part_row(TOPO.load_registry(), "autopilot-ship:deploy")["start_approval"], "deploy")
         for reviewer in ("security-review", "release-review"):
-            self.assertEqual(by_id[reviewer]["continuation"],
-                             {"kind": "human-gate", "gate": "deploy-authorization"})
+            self.assertEqual(by_id[reviewer]["continuation"], {"kind": "inline-next"})
         self.assertTrue(by_id["post-deploy-verify"]["terminal"])
+
+    def test_apply_default_has_start_approval_and_inline_verify(self):
+        recipe = self.recipe("autopilot-apply", "default")
+        by_id = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
+        self.assertEqual(recipe["human_gates"], [])
+        self.assertEqual(recipe["human_gate_bindings"], [])
+        self.assertEqual(by_id["verify"]["continuation"], {"kind": "inline-next"})
+        self.assertEqual(TOPO.part_row(TOPO.load_registry(), "autopilot-apply:handback")["start_approval"], "handback")
 
     def test_code_route_terminal_is_the_report(self):
         recipe = self.recipe("autopilot-code", "dev")
@@ -1183,10 +1191,9 @@ class TestSealedRoutes(unittest.TestCase):
         contract = route["workflow_contract"]
         self.assertEqual(contract["terminal_nodes"], ["handoff"])
         self.assertEqual(contract["continuations"]["full-run"], "supervised")
-        self.assertEqual(contract["continuations"]["smoke"], "human-gate")
-        self.assertEqual(route["human_gate_bindings"],
-                         [{"gate": "full-run-authorization", "node": "full-run",
-                           "position": "entry"}])
+        self.assertEqual(contract["continuations"]["smoke"], "inline-next")
+        self.assertEqual(route["human_gates"], [])
+        self.assertEqual(route["human_gate_bindings"], [])
         ROUTE.verify_route(route, route["cwd"])
 
     def test_ship_route_seals_post_deploy_verification(self):
@@ -1230,6 +1237,44 @@ class TestCapabilityIntegration(WorkflowFixture):
         path = self.base / f"{route['route_id']}.json"
         path.write_text(json.dumps(route, indent=2), encoding="utf-8")
         return route, path
+
+    def test_old_lab_route_is_read_without_rewriting_its_sealed_gate(self):
+        """A route sealed before the topology change keeps its original gate binding."""
+        route = {
+            "route_id": "rt-a73c20eda0f0f01e",
+            "route_hash": "sha256:a73c20eda0f0f01ed5fda2c8bbc9acb3f469c2698ad0203ab1c458c567b4e98c",
+            "human_gates": ["full-run-authorization"],
+            "human_gate_bindings": [
+                {"gate": "full-run-authorization", "node": "full-run", "position": "entry"}
+            ],
+            "nodes": [
+                {"id": "smoke", "continuation": {
+                    "kind": "human-gate", "gate": "full-run-authorization"}},
+                {"id": "full-run", "continuation": {"kind": "supervised"}},
+            ],
+        }
+        path = self.base / "old-lab-route.json"
+        sealed_bytes = (json.dumps(route, indent=2) + "\n").encode("utf-8")
+        path.write_bytes(sealed_bytes)
+        sealed_hash = route["route_hash"]
+
+        loaded = SUP.load_route(path)
+
+        self.assertEqual(path.read_bytes(), sealed_bytes)
+        self.assertEqual(loaded["route_hash"], sealed_hash)
+        self.assertEqual(loaded["human_gate_bindings"], route["human_gate_bindings"])
+        self.assertEqual(loaded["nodes"][0]["continuation"], {
+            "kind": "human-gate", "gate": "full-run-authorization"})
+        ledger = WS.WorkflowLedger(loaded["route_id"], loaded["route_hash"],
+                                   root=self.workflow_root)
+        ledger.set_workflow_state("READY", evidence={}, actor="fixture")
+        ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+                                  evidence={"gate": "full-run-authorization"}, actor="fixture")
+        resolution = WS.human_gate_resolution(ledger.journal(), "full-run-authorization")
+        self.assertEqual(resolution["status"], "blocked")
+        self.assertEqual(resolution["epoch"], 1)
+        self.assertEqual(path.read_bytes(), sealed_bytes)
+
 
     def test_lab_setup_run_advances_to_verification_exactly_once(self):
         """BC_ResNet_tf pilot: the finished training run now carries itself forward.
@@ -1295,15 +1340,49 @@ class TestCapabilityIntegration(WorkflowFixture):
         self.assertFalse(SUP.registered_evidence(
             {"predecessor_id": "att-code", "jobs": str(jobs)})["terminal"])
 
-    def test_ship_readiness_stops_at_the_deploy_authorization(self):
-        route, path = self.compiled("autopilot-ship", "default", ["human-gate"])
-        registry = self.resource_registry(exit_code=0)
-        with self.assertRaisesRegex(SUP.SupervisorError, "supervisor governs only"):
-            self.arm(path, registry, node="release-review")
-        self.block_gate(path, "deploy-authorization", route_id=route["route_id"])
+    def test_ship_readiness_does_not_raise_a_deploy_authorization_gate(self):
+        route, _path = self.compiled("autopilot-ship", "default", [])
+        self.assertEqual(route["human_gates"], [])
+        self.assertEqual(route["human_gate_bindings"], [])
         ledger = SUP.ledger_for(route)
-        self.assertEqual(ledger.state()["workflow_state"], "BLOCKED_HUMAN_GATE")
-        self.assertEqual(ledger.claims(), {})
+
+        def complete_ancestors(target):
+            by_id = {node["id"]: node for node in route["nodes"]}
+            pending = list(by_id[target].get("depends_on") or [])
+            ancestors = set()
+            while pending:
+                node_id = pending.pop()
+                if node_id in ancestors:
+                    continue
+                ancestors.add(node_id)
+                pending.extend(by_id[node_id].get("depends_on") or [])
+            for node in route["nodes"]:
+                if node["id"] in ancestors:
+                    ledger.record(node["id"], "STAGE_SUCCEEDED", actor="fixture-readiness")
+            return by_id[target]
+
+        deploy = complete_ancestors("deploy")
+        _running, next_stage = SUP._stage_projection(route, ledger.state()["nodes"])
+        self.assertEqual(next_stage, ["deploy"])
+        DC._human_gate_entry_fence(route, deploy, self.base / "jobs.log")
+
+        lab, _ = self.compiled("autopilot-lab", "setup", [])
+        lab_ledger = SUP.ledger_for(lab)
+        lab_ledger.record("smoke", "STAGE_SUCCEEDED", actor="fixture-readiness")
+        _running, next_stage = SUP._stage_projection(lab, lab_ledger.state()["nodes"])
+        self.assertEqual(next_stage, ["full-run"])
+        DC._human_gate_entry_fence(
+            lab, next(node for node in lab["nodes"] if node["id"] == "full-run"),
+            self.base / "jobs.log")
+
+        apply, _ = self.compiled("autopilot-apply", "default", [])
+        apply_ledger = SUP.ledger_for(apply)
+        apply_ledger.record("verify", "STAGE_SUCCEEDED", actor="fixture-readiness")
+        _running, next_stage = SUP._stage_projection(apply, apply_ledger.state()["nodes"])
+        self.assertEqual(next_stage, ["handback"])
+        DC._human_gate_entry_fence(
+            apply, next(node for node in apply["nodes"] if node["id"] == "handback"),
+            self.base / "jobs.log")
 
     def test_generic_monitor_workflow_advances_only_on_a_matched_condition(self):
         """A composed observe → condition → approved-action → verify graph."""

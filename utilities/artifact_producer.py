@@ -47,7 +47,7 @@ import stat
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -145,6 +145,9 @@ STAGE_CAPABILITIES = (
     "design-init", "design-refs", "design-tokens", "design-components",
     "design-review", "design-handoff", "draft-strategy", "draft-refine",
 )
+# Compiler-internal capabilities: no Skill and no person invokes them, but the route
+# compiler seals routes for them and a producer cycle must be issuable for that route.
+INTERNAL_CAPABILITIES = ("route-frame",)
 CANONICAL_ROOTS = ("campaigns", "shared")
 # Legacy capability buckets (CORE.md §3 C-DUR) plus the undeclared containers.
 LEGACY_TOP_LEVEL = (
@@ -728,6 +731,25 @@ def _routes_dir(root: Path) -> Path:
     return route_lineage.canonical_route_path(root, "x").parent
 
 
+def _qualified_continuation(entry_stem: str, candidate: Any, route_id: Optional[str] = None,
+                            route_hash_value: Optional[str] = None) -> bool:
+    """Whether a route file is a sealed continuation edge (of ``route_id`` when given).
+
+    The one qualification rule shared by `_lineage_children` and
+    `closed_lineage_handover`: not its own source, contract version 1, source id
+    and hash match, and the route hash recomputes -- a tampered sibling proves
+    nothing and is not part of any lineage.
+    """
+    if not isinstance(candidate, dict) or candidate.get("continuation_contract_version") != 1:
+        return False
+    source_id = candidate.get("source_route_id")
+    if entry_stem == source_id or (route_id is not None and source_id != route_id):
+        return False
+    if route_hash_value is not None and candidate.get("source_route_hash") != route_hash_value:
+        return False
+    return route_identity.route_hash(candidate) == candidate.get("route_hash")
+
+
 def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
     """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
 
@@ -746,14 +768,63 @@ def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[
         candidate = _read_json(entry)
         if not isinstance(candidate, dict):
             continue
-        if (candidate.get("continuation_contract_version") != 1
-                or candidate.get("source_route_id") != route_id
-                or candidate.get("source_route_hash") != route_hash_value):
-            continue
-        if route_identity.route_hash(candidate) != candidate.get("route_hash"):
-            continue  # a tampered sibling proves nothing; not part of any lineage
-        children.append(candidate)
+        if _qualified_continuation(entry.stem, candidate, route_id, route_hash_value):
+            children.append(candidate)
     return children
+
+
+class LineageHandover(NamedTuple):
+    """`closed`: the cycle's whole qualifying lineage tree has an outcome.
+    `handed_over`: routes of that tree that begin another cycle (empty unless closed)."""
+    closed: bool
+    handed_over: frozenset
+
+
+def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHandover:
+    """Whether ``record``'s lineage is closed, and which routes it handed to other cycles.
+
+    The tree is every material-input-qualifying continuation below the cycle's
+    begin route, read with one scan of the routes directory. It is closed only
+    when every route in it has an outcome; a live tree keeps D-120's "which cycle
+    continues" judgment untouched (`(False, frozenset())`). In a closed tree the
+    routes that begin a *different* cycle belong to that cycle, so this cycle
+    seals on its own stretch, up to just before them.
+    """
+    begin_route = load_route(root, Path(record["route_file"]))
+    if begin_route["route_hash"] != record["route_hash"]:
+        raise ProducerError("route-hash-drift", record["cycle_id"])
+    children_of: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    directory = _routes_dir(root)
+    if directory.is_dir():
+        for entry in sorted(directory.glob("*.json")):
+            candidate = _read_json(entry)
+            if _qualified_continuation(entry.stem, candidate):
+                key = (candidate["source_route_id"], candidate.get("source_route_hash"))
+                children_of.setdefault(key, []).append(candidate)
+    tree = {begin_route["route_id"]}
+    queue = [begin_route]
+    while queue:
+        node = queue.pop()
+        if not route_is_closed(root, node):
+            return LineageHandover(False, frozenset())
+        for child in children_of.get((node["route_id"], node["route_hash"]), []):
+            if (child.get("capability") != record.get("capability")
+                    or child.get("effective_intensity") != record.get("intensity")):
+                continue
+            if child["route_id"] in tree:
+                return LineageHandover(False, frozenset())  # a cycle in the lineage is never closed
+            tree.add(child["route_id"])
+            queue.append(child)
+    others = {rec.get("route_id") for rec in list_cycle_records(root)
+              if rec.get("cycle_id") != record.get("cycle_id")}
+    return LineageHandover(True, frozenset(tree & others) - {begin_route["route_id"]})
+
+
+def _handed_over_routes(root: Path, record: Mapping[str, Any]) -> frozenset:
+    try:
+        return closed_lineage_handover(root, record).handed_over
+    except (ProducerError, KeyError, OSError):
+        return frozenset()
 
 
 def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -815,6 +886,7 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
         if node.get("capability") != record.get("capability") or node.get("effective_intensity") != record.get("intensity"):
             reason = "cycle-route-binding-mismatch:material-input"
             return Admission(False, reason, f"route={node['route_id']}", path, _d120_next_action(reason))
+    handed_over: Optional[frozenset] = None  # computed only when a refusal is about to be issued
     for node in path[:-1]:
         siblings = _lineage_children(root, node["route_id"], node["route_hash"])
         qualifying = [s for s in siblings
@@ -822,6 +894,10 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
                       and s.get("effective_intensity") == record.get("intensity")]
         for sibling in qualifying:
             if sibling["route_id"] not in by_id:
+                if handed_over is None:
+                    handed_over = _handed_over_routes(root, record)
+                if sibling["route_id"] in handed_over:
+                    continue  # closed lineage: that branch belongs to another cycle
                 reason = "cycle-route-binding-mismatch:lineage-fork"
                 return Admission(False, reason, f"branch={node['route_id']} siblings={sibling['route_id']},{path[path.index(node)+1]['route_id']}",
                                  path, _d120_next_action(reason))
@@ -829,6 +905,10 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
         qualifying = [s for s in _lineage_children(root, route["route_id"], route["route_hash"])
                       if s.get("capability") == record.get("capability")
                       and s.get("effective_intensity") == record.get("intensity")]
+        if qualifying:
+            if handed_over is None:
+                handed_over = _handed_over_routes(root, record)
+            qualifying = [s for s in qualifying if s["route_id"] not in handed_over]
         if qualifying:
             reason = "cycle-route-binding-mismatch:superseded-route"
             return Admission(False, reason, route["route_id"], path, _d120_next_action(reason))
@@ -1290,7 +1370,238 @@ def status(root: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
+# SD-163: read-only lookup of a prior cycle's same-named output. Every failure
+# below is "not found"; nothing here refuses, gates, or writes.
+INPUT_SOURCE_MAX_DEPTH = 6
+INPUT_SOURCE_MAX_ENTRIES = 4096
+INPUT_SOURCE_MAX_CANDIDATES = 16
+
+
+def _input_target(name: Any) -> Optional[Tuple[Tuple[str, ...], bool]]:
+    """Return (path components, is_dir) for a declared input, or None when it is not a plain path."""
+    if not isinstance(name, str):
+        return None
+    is_dir = name.endswith("/**")
+    parts = tuple((name[:-3] if is_dir else name).split("/"))
+    if any(part in ("", ".", "..") or any(char in part for char in "*?[<>") for part in parts):
+        return None
+    return parts, is_dir
+
+
+def _cycle_artifacts_dir(root: Path, cycle_id: str) -> Optional[Path]:
+    record = read_cycle_record(root, cycle_id)
+    if record is None:
+        return None
+    artifacts = cycle_dir(root, record["campaign_id"], cycle_id, record) / "artifacts"
+    if artifacts.is_symlink() or not artifacts.is_dir():
+        return None
+    resolved = artifacts.resolve(strict=True)
+    return resolved if resolved.is_relative_to(Path(root).resolve()) else None
+
+
+def _scan_cycle_artifacts(artifacts: Path) -> Optional[List[Tuple[str, bool]]]:
+    """List (relative posix path, is_dir) below artifacts/; symlinks are skipped, caps give None."""
+    found: List[Tuple[str, bool]] = []
+    stack = [(artifacts, 0)]
+    visited = 0
+    while stack:
+        directory, depth = stack.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                visited += 1
+                if visited > INPUT_SOURCE_MAX_ENTRIES:
+                    return None
+                if entry.is_symlink():
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                if not is_dir and not entry.is_file(follow_symlinks=False):
+                    continue
+                found.append((Path(entry.path).relative_to(artifacts).as_posix(), is_dir))
+                if is_dir and depth < INPUT_SOURCE_MAX_DEPTH:
+                    stack.append((Path(entry.path), depth + 1))
+    return found
+
+
+def _session_cycle_ids(root: Path, campaign: Mapping[str, Any], route_chain_identity,
+                       begin_cycle: Mapping[str, str]) -> set:
+    """Cycles of the routes this session composed for the campaign, read from its route-chain ledger.
+
+    A ledger line names a route, never a cycle. A cycle record names its begin route, so a line
+    maps to a cycle directly when that route began one, and through its verified lineage when it is
+    a continuation of a route that did. The cycle's own audit copy of rebound routes is not read.
+    """
+    try:
+        harness, session_id = route_chain_identity[:2]
+        tools_dir = Path(__file__).resolve().parents[1] / "tools"
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import route_chain
+        if route_chain.WRITER_SUPPORT.get(harness) != "env":
+            return set()
+        resolved = Path(root).resolve()
+        composed = {line["route_id"]
+                    for line in route_chain.read_tail(harness, session_id, max_bytes=1024 * 1024)
+                    if line.get("event") in route_chain.COMPOSING_EVENTS
+                    and line.get("campaign_key") == campaign.get("key")
+                    and Path(str(line.get("artifact_root") or "")).resolve() == resolved}
+    except Exception:
+        return set()
+    cycles = set()
+    for route_id in composed:
+        found = begin_cycle.get(route_id)
+        if found is None:
+            try:
+                route = load_route(root, route_lineage.canonical_route_path(root, route_id))
+                for ancestor in route_lineage.verified_route_lineage(route, artifact_root=root):
+                    found = found or begin_cycle.get(ancestor["route_id"])
+            except Exception:
+                continue
+        if found is not None:
+            cycles.add(found)
+    return cycles
+
+
+def same_flow_source_cycle(root: Path, campaign_id: str, *, capability: str,
+                           route_chain_identity=None, before: Optional[str] = None) -> Optional[str]:
+    """The most recent cycle of the same flow, or None; never another flow's cycle.
+
+    Order: the composing session's own route cycle in this campaign, then the
+    latest cycle whose route capability is ``capability``. ``before`` keeps only
+    cycles that started earlier than that cycle.
+    """
+    campaign = read_campaign(root, campaign_id)
+    cycles = (campaign or {}).get("cycles")
+    if (not campaign or campaign.get("degraded") is True or campaign.get("key") == UNASSIGNED_KEY
+            or not isinstance(cycles, list) or not cycles):
+        return None
+    if before is not None:
+        if before not in cycles:
+            return None
+        cycles = cycles[:cycles.index(before)]
+    records = {row.get("cycle_id"): row for row in list_cycle_records(root)
+               if row.get("campaign_id") == campaign_id and row.get("cycle_id") in cycles}
+    begin_cycle = {rec["route_id"]: cycle_id for cycle_id, rec in records.items() if rec.get("route_id")}
+    session_cycles = (_session_cycle_ids(root, campaign, route_chain_identity, begin_cycle)
+                      if route_chain_identity else set())
+    for cycle_id in reversed(cycles):
+        if cycle_id in session_cycles:
+            return cycle_id
+    for cycle_id in reversed(cycles):
+        rec = records.get(cycle_id)
+        route_capability = rec.get("route_capability") if rec else None
+        if not route_capability and rec and rec.get("route_file"):
+            try:
+                route_file = Path(rec["route_file"]).resolve(strict=True)
+                if route_file.is_relative_to(Path(root).resolve()):
+                    route_capability = (_read_json(route_file) or {}).get("capability")
+            except Exception:
+                pass
+        if route_capability == capability:
+            return cycle_id
+    return None
+
+
+def input_source_cycle(root: Path, *, parent_cycle_id: Optional[str] = None,
+                       campaign_key: Optional[str] = None, capability: Optional[str] = None,
+                       route_chain_identity=None) -> Optional[str]:
+    """The one source cycle: the parent, else the joined campaign's most recent cycle."""
+    if parent_cycle_id:
+        return parent_cycle_id
+    if not campaign_key or campaign_key == UNASSIGNED_KEY:
+        return None
+    decision = classify_campaign_key(list_campaign_summaries(root, active_only=False), campaign_key)
+    if decision.get("mode") not in ("join", "reopen"):
+        return None
+    return (same_flow_source_cycle(root, decision["campaign_id"], capability=capability,
+                                   route_chain_identity=route_chain_identity)
+            if capability else None)
+
+
+def input_source_finder(root: Path, *, parent_cycle_id: Optional[str] = None,
+                        campaign_key: Optional[str] = None, capability: Optional[str] = None,
+                        route_chain_identity=None):
+    """Return find(name) -> {"cycle_id", "path"} | None, resolving the source lazily and once."""
+    root = Path(root)
+    memo: Dict[str, Optional[Dict[str, str]]] = {}
+    loaded: Dict[str, Any] = {}
+
+    def lookup(name: str) -> Optional[Dict[str, str]]:
+        if not loaded:
+            loaded["entries"] = None
+            cycle_id = input_source_cycle(root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key,
+                                          capability=capability, route_chain_identity=route_chain_identity)
+            artifacts = _cycle_artifacts_dir(root, cycle_id) if cycle_id else None
+            if artifacts is not None:
+                loaded.update(cycle_id=cycle_id, artifacts=artifacts,
+                              entries=_scan_cycle_artifacts(artifacts))
+        target = _input_target(name)
+        if target is None or loaded["entries"] is None:
+            return None
+        parts, is_dir = target
+        rels = [rel for rel, entry_dir in loaded["entries"]
+                if entry_dir == is_dir and tuple(rel.split("/"))[-len(parts):] == parts]
+        if not rels or len(rels) > INPUT_SOURCE_MAX_CANDIDATES:
+            return None
+        # Shortest cycle-relative path by character length, then lexicographic; never by recency.
+        chosen = loaded["artifacts"] / min(rels, key=lambda rel: (len(rel), rel))
+        resolved = chosen.resolve(strict=True)
+        if not resolved.is_relative_to(loaded["artifacts"]):
+            return None
+        return {"cycle_id": loaded["cycle_id"], "path": resolved.relative_to(root.resolve()).as_posix()}
+
+    def find(name: str) -> Optional[Dict[str, str]]:
+        if name not in memo:
+            try:
+                memo[name] = lookup(name)
+            except Exception:  # SD-163: every lookup failure is "not found"
+                memo[name] = None
+        return dict(memo[name]) if memo[name] else None
+
+    return find
+
+
+def _composing_anchor(route_id, root=None):
+    """The depth-0 session whose route-chain ledger says it composed ``route_id``, else None.
+
+    A route file is written once, so its mtime bounds the ledgers that can hold the compose line.
+    """
+    try:
+        created = None
+        try:
+            created = (Path(root) / ".runtime" / "routes" / f"{route_id}.json").stat().st_mtime if root else None
+        except OSError:
+            pass
+        tools_dir = Path(__file__).resolve().parents[1] / "tools"
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import route_chain
+        return route_chain.composing_anchor(route_id, not_before=created)
+    except Exception:
+        return None
+
+
+def _parent_output_dir(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]],
+                       route_chain_identity=None) -> Optional[str]:
+    """Absolute artifacts/ of the source cycle: parent, else sealed input_sources, else the campaign's previous cycle."""
+    try:
+        cycle_id = record.get("parent_cycle_id")
+        for node in (route or {}).get("nodes") or []:
+            if cycle_id:
+                break
+            sources = node.get("input_sources") if isinstance(node, Mapping) else None
+            for source in (sources.values() if isinstance(sources, Mapping) else ()):
+                cycle_id = cycle_id or (source.get("cycle_id") if isinstance(source, Mapping) else None)
+        cycle_id = cycle_id or same_flow_source_cycle(
+            root, record["campaign_id"], capability=(route or {}).get("capability") or record.get("route_capability"),
+            route_chain_identity=route_chain_identity, before=record["cycle_id"])
+        directory = _cycle_artifacts_dir(root, cycle_id) if cycle_id and cycle_id != record["cycle_id"] else None
+        return str(directory) if directory else None
+    except Exception:  # SD-163: every lookup failure is "not found"
+        return None
+
+
+def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]] = None,
+             route_chain_identity=None) -> Dict[str, str]:
     directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
     env = {
         "AGENT_ARTIFACT_ROOT": str(root),
@@ -1307,6 +1618,11 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
     group_id = artifact_workflow_groups.group_for_cycle(root, record["campaign_id"], record["cycle_id"])
     if group_id:
         env["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"] = group_id
+    if route_chain_identity is None and route:
+        route_chain_identity = _composing_anchor(route.get("route_id"), root)
+    parent_output = _parent_output_dir(root, record, route, route_chain_identity)
+    if parent_output:
+        env["AGENT_ARTIFACT_PARENT_OUTPUT_DIR"] = parent_output
     return env
 
 
@@ -1375,7 +1691,7 @@ def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> 
         return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (
             "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
             "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR")}}
-    return _env_for(root, record)
+    return _env_for(root, record, route)
 
 
 def _route_naming(
@@ -1721,7 +2037,7 @@ def _begin_cycle_record(
 ) -> Dict[str, Any]:
     dispatch_terminal_commit.require_current_cleanup("producer-begin", jobs=jobs)
     root = Path(root).resolve()
-    if capability not in ENTRY_CAPABILITIES + STAGE_CAPABILITIES:
+    if capability not in ENTRY_CAPABILITIES + STAGE_CAPABILITIES + INTERNAL_CAPABILITIES:
         raise ProducerError("capability-unknown", capability)
     if intensity not in INTENSITIES:
         raise ProducerError("intensity-unknown", intensity)
@@ -1738,7 +2054,7 @@ def _begin_cycle_record(
     if parent_cycle_id is not None and not artifact_identity.is_well_formed(parent_cycle_id, "cycle"):
         raise ProducerError("parent-cycle-invalid", str(parent_cycle_id))
     route_capability = route["capability"]
-    if capability in ENTRY_CAPABILITIES and route_capability != capability:
+    if capability in ENTRY_CAPABILITIES + INTERNAL_CAPABILITIES and route_capability != capability:
         raise ProducerError("route-capability-mismatch", f"{route_capability}!={capability}")
     if route["effective_intensity"] != intensity:
         raise ProducerError("route-intensity-mismatch", f"{route['effective_intensity']}!={intensity}")
@@ -1939,7 +2255,7 @@ def _begin_cycle_record(
                 "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
                 "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
                 "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
-                "env": _env_for(root, record),
+                "env": _env_for(root, record, route),
                 **({"rebound": True} if rebound else {}),
                 **({"title_updated": True} if title_updated else {}),
                 **_campaign_degradation(bound_campaign),
@@ -2075,7 +2391,7 @@ def _begin_cycle_record(
         return {
             "status": "begun", "layout": "cycle", "campaign_id": campaign["campaign_id"],
             "cycle_id": new_cycle_id, "producer_id": producer_id, "cycle_dir": str(target),
-            "campaign_created": campaign_created, "env": _env_for(root, record),
+            "campaign_created": campaign_created, "env": _env_for(root, record, route),
             **({"campaign_reopened": True, "campaign_reopen_event_id": campaign_reopen_event_id}
                if campaign_reopen_event_id else {}),
             **_campaign_degradation(campaign),
@@ -2131,12 +2447,17 @@ def _unmanifestable_reason(rel: str) -> Optional[str]:
 
 
 def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
-                      excluded: Optional[List[str]] = None) -> Tuple[List[Tuple[str, bytes]], List[str]]:
+                      excluded: Optional[List[str]] = None,
+                      exclude_symlinks: bool = False,
+                      excluded_symlinks: Optional[List[str]] = None) -> Tuple[List[Tuple[str, bytes]], List[str]]:
     """Regular files under `artifacts/`.  With `exclude_hidden`, files whose path
     cannot be a D-6 locator (a dot-component such as `.git/`/`.claude/` runtime
     residue, or a component longer than the locator limit) are left out of the
     manifest and reported through `excluded` instead of failing validation
-    (W7E retrospective seal of relocated legacy trees)."""
+    (W7E retrospective seal of relocated legacy trees).  With `exclude_symlinks`
+    (an abandoned seal, which claims no success), symbolic links are left out
+    and reported through `excluded_symlinks`; the link is only lstat-ed, never
+    followed or read.  Without it a link is a `symlink-forbidden` violation."""
     paths: List[Tuple[str, Path]] = []
     violations: List[str] = []
     artifacts = directory / "artifacts"
@@ -2148,6 +2469,10 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
             # Machine-owned locator binding, not user output or manifest data.
             continue
         if os.path.islink(str(entry)):
+            if exclude_symlinks:
+                if excluded_symlinks is not None:
+                    excluded_symlinks.append(rel)
+                continue
             violations.append(f"symlink-forbidden:{rel}")
             continue
         if not entry.is_file():
@@ -4050,7 +4375,9 @@ def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id
 
 def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
     """D-120 finalize: R is the unique T(C) leaf -- the route with no
-    material-input-qualifying continuation child. `--cycle`-only finalize has
+    material-input-qualifying continuation child. In a closed lineage the
+    children that begin another cycle are that cycle's, so R stops before them
+    (`closed_lineage_handover`). `--cycle`-only finalize has
     no other way to name R; a completion controller that already knows its
     exact route can seal it directly by checking `cycle_route_admission(...,
     finalize=True)` itself instead of calling this walk.
@@ -4060,10 +4387,20 @@ def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
         raise ProducerError("route-hash-drift", record["cycle_id"])
     current = begin_route
     visited = {current["route_id"]}
+    handed_over: Optional[frozenset] = None  # computed once, and only when a child begins another cycle
+    begin_ids: Optional[Set[Any]] = None
     while True:
         candidates = [c for c in _lineage_children(root, current["route_id"], current["route_hash"])
                       if c.get("capability") == record.get("capability")
                       and c.get("effective_intensity") == record.get("intensity")]
+        if candidates and handed_over is None:
+            if begin_ids is None:
+                begin_ids = {rec.get("route_id") for rec in list_cycle_records(root)
+                             if rec.get("cycle_id") != record.get("cycle_id")}
+            if any(c["route_id"] in begin_ids for c in candidates):
+                handed_over = _handed_over_routes(root, record)
+        if handed_over:
+            candidates = [c for c in candidates if c["route_id"] not in handed_over]
         if not candidates:
             return current
         if len(candidates) > 1:
@@ -4096,17 +4433,22 @@ def finalize(
     support_locators: Sequence[str] = (),
     expected_binding: Optional[Mapping[str, Any]] = None,
     lock_timeout: Optional[float] = None,
+    exclude_symlinks: bool = False,
     _admission_lock_fd: Optional[int] = None,
     _recovery_scope: str = "root",
 ) -> Dict[str, Any]:
     """`lock_timeout` bounds both lock waits (default: the admission and
-    checkpoint defaults); a background sweep passes 0 so a held lock defers it."""
+    checkpoint defaults); a background sweep passes 0 so a held lock defers it.
+    `exclude_symlinks` (abandoned only) leaves symbolic links out of the manifest
+    and records them as `excluded_symlinks` on the result and the cycle record."""
     root = Path(root).resolve()
     if _recovery_scope != "exact":
         dispatch_terminal_commit.require_current_cleanup("producer-finalize")
     _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
     if state not in {"completed", "abandoned"}:
         raise ProducerError("finalize-state-invalid", state)
+    if exclude_symlinks and state != "abandoned":
+        raise ProducerError("symlink-exclusion-requires-abandoned", state)
     if _admission_lock_fd is not None:
         raise ProducerError("finalize-reentry-forbidden", cycle_id)
     # PRD §13.53.4(3) names the producer admission mutex as the lock that must
@@ -4262,7 +4604,10 @@ def finalize(
         primary = _placed_locator(_cycle_relative_primary(primary, directory), placements)
         support_locators = tuple(_placed_locator(value, placements) for value in support_locators)
         excluded_hidden: List[str] = []
-        rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden)
+        excluded_symlinks: List[str] = []
+        rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden,
+                                             exclude_symlinks=exclude_symlinks,
+                                             excluded_symlinks=excluded_symlinks)
         if violations:
             raise ProducerError("output-invalid", ";".join(violations))
         if not rows:
@@ -4336,6 +4681,12 @@ def finalize(
         if manifest_path.exists():
             raise ProducerError("manifest-already-present", str(manifest_path))
         cycle_path = os.path.relpath(str(directory), str(root))
+        if excluded_symlinks:
+            # Written before the manifest is published so a crash after the commit
+            # point recovers from the on-disk record without losing the exclusion.
+            record = dict(record)
+            record["excluded_symlinks"] = excluded_symlinks
+            _write_cycle_record(root, record, exclusive=False)
         _write_journal(root, cycle_id, state="sealing", manifest_digest=digest, cycle_path=cycle_path)
         # COMMIT POINT: exclusive manifest creation.
         _write_exclusive(manifest_path, artifact_manifest.canonical_bytes(document))
@@ -4348,7 +4699,8 @@ def finalize(
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
             ) from exc
-        sealed_result = {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
+        sealed_result = {"excluded_hidden": excluded_hidden, "excluded_symlinks": excluded_symlinks,
+            "adopted_root_outputs": adopted_root_outputs,
             "moved_outputs": moved_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),

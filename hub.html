@@ -449,9 +449,9 @@
   "manifest_version": "2.0.0",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:c34241beee25396e50996c2f96932cd50eebf35772459b8f3bc96de7722e67a5",
-    "capabilities": 12,
-    "recipes": 28
+    "digest": "sha256:645ff3cf19a3c187a5150b6a7617c8226ed14561abbccd10d5a8f0807f08a1ac",
+    "capabilities": 13,
+    "recipes": 29
   },
   "skills": [
     {
@@ -466,7 +466,7 @@
       ],
       "blurb": "Creates persistent analysis of existing code, papers, or documents; initial analysis defaults here unless read-only/no-file or another primary applies.",
       "invocation_class": "entry-router",
-      "use_when": "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output.",
+      "use_when": "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output. Owns analysis; default preset.",
       "not_for": "Not for conversational, read-only, or no-file analysis; orientation, context recovery, status, experiments, external research, source changes, or completed-work audits.",
       "argument_hint": "[--mode code|paper|doc] [<scope/target/input-folder>] [--skip-qa]"
     },
@@ -481,7 +481,7 @@
       ],
       "blurb": "Create or update a cross-project user-preference profile from coding, writing, and analysis patterns.",
       "invocation_class": "entry-router",
-      "use_when": "Use when durable cross-project user preferences must be inferred from coding, writing, or analysis evidence and stored as a profile.",
+      "use_when": "Use when durable cross-project user preferences must be inferred from coding, writing, or analysis evidence and stored as a profile. Owns profile; default preset.",
       "not_for": "Not for one-project context recovery, casual preference acknowledgment, or ordinary task execution.",
       "argument_hint": "<aspect> [--source <path>] [--mode init|update] [--from discover|analyze|verify|qa|output|summary] [--user-refine]"
     },
@@ -505,7 +505,7 @@
       "modes": [],
       "blurb": "Read-oriented post-run inspection for artifact drift, inconsistency, and omissions.",
       "invocation_class": "entry-router",
-      "use_when": "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims.",
+      "use_when": "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Owns audit report; default preset.",
       "not_for": "Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification.",
       "argument_hint": "<artifact_path> [--scope auto|facts|style|structure|cross-ref|coverage|all] [--read-only] [--report-only] [--no-fact-check]"
     },
@@ -517,7 +517,7 @@
       "modes": [],
       "blurb": "Apply a cheatsheet draft to the real source artifact and verify the result.",
       "invocation_class": "entry-router",
-      "use_when": "Use when an approved cheatsheet or patching guide must be applied to the real source artifact and the applied result verified.",
+      "use_when": "Use when an approved cheatsheet or patching guide must be applied to the real source artifact and the applied result verified. Owns applied artifact; default preset.",
       "not_for": "Not for drafting or refining the cheatsheet, or for unrelated source implementation.",
       "argument_hint": "\"<cheatsheet hint / task>\" [--target latex] [--source <path-to-real-source>] [--isolation branch|worktree] [--from preflight|apply|verify|handback]"
     },
@@ -533,7 +533,7 @@
       ],
       "blurb": "Code-work entrypoint that detects spec context and closes the plan→execute→test→report loop.",
       "invocation_class": "entry-router",
-      "use_when": "Use when source code must be implemented, debugged, refactored, or code-audited through a plan, execution, test, and report loop.",
+      "use_when": "Use when source code must be implemented, debugged, refactored, or code-audited through a plan, execution, test, and report loop. Owns source changes; default preset.",
       "not_for": "Not for requirements-only changes, new empirical experiments, or document-only editing.",
       "argument_hint": "--mode dev|debug <task/plan/error description> [--from <step>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine]"
     },
@@ -545,7 +545,7 @@
       "modes": [],
       "blurb": "Visual-design pipeline coordinating references→tokens→components→review→handoff.",
       "invocation_class": "entry-router",
-      "use_when": "Use when a visual product surface needs references, design tokens, components or mockups, review, and development handoff.",
+      "use_when": "Use when a visual product surface needs references, design tokens, components or mockups, review, and development handoff. Owns design; default preset.",
       "not_for": "Not for implementing an already-approved design in code or for document prose work.",
       "argument_hint": "<design task or app path> [--scope ui|webapp|slide|icon|diagram|mixed] [--artifact standalone|project] [--from <phase>] [--intensity direct|quick|standard|strong|thorough|adversarial]"
     },
@@ -561,7 +561,7 @@
       ],
       "blurb": "Draft independent documents through strategy, verification, and editing.",
       "invocation_class": "entry-router",
-      "use_when": "Use when a new document has an independent audience and document goal.",
+      "use_when": "Use when a new document has an independent audience and document goal. Owns document; default preset.",
       "not_for": "Not for experiment reports (lab), existing-document edits, or code.",
       "argument_hint": "<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]"
     },
@@ -576,7 +576,7 @@
       ],
       "blurb": "Set up experiments, evaluate, and report results, including fixed results.",
       "invocation_class": "entry-router",
-      "use_when": "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements.",
+      "use_when": "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements. Owns experiments; default preset.",
       "not_for": "Not for reusable evaluation code, independent documents, or fixed-data document layout/caption edits.",
       "argument_hint": "<task description> [--mode setup|eval|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--report] [--from spec|scaffold|run|eval|summary]"
     },
@@ -588,7 +588,7 @@
       "modes": [],
       "blurb": "Correct existing documents with snapshots and change history.",
       "invocation_class": "entry-router",
-      "use_when": "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history.",
+      "use_when": "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history. Owns revision; default preset.",
       "not_for": "Not for new documents, empirical work, or evaluation/result reporting (lab).",
       "argument_hint": "\"<prompt>\" [--intensity direct|quick|standard|strong|thorough|adversarial] [--review-only | --memo <file>] [--confirm] [--no-fact-check] [--no-style-audit]"
     },
@@ -604,7 +604,7 @@
       ],
       "blurb": "Shared upfront research that surveys academic, technology, or market sources before downstream routing.",
       "invocation_class": "entry-router",
-      "use_when": "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production.",
+      "use_when": "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Owns research; default preset.",
       "not_for": "Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence.",
       "argument_hint": "<query> [--mode academic|technology|market] [--depth shallow|medium|deep] [--intensity direct|quick|standard|strong|thorough|adversarial] [--no-clarify] [--no-figures] [--from search|analyze|report]"
     },
@@ -619,7 +619,7 @@
       ],
       "blurb": "Prepare deployment/release setup or package existing artifacts.",
       "invocation_class": "entry-router",
-      "use_when": "Use when preparing deployment/release or a delivery archive (package mode).",
+      "use_when": "Use when preparing deployment/release or a delivery archive (package mode). Owns release; default preset.",
       "not_for": "Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop.",
       "argument_hint": "<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]"
     },
@@ -638,7 +638,7 @@
       ],
       "blurb": "Create or update requirements/blueprints while keeping `prd.md` as the only spec-change path.",
       "invocation_class": "entry-router",
-      "use_when": "Use when product requirements, architecture, evaluation policy, or another blueprint must be created or materially updated before implementation.",
+      "use_when": "Use when product requirements, architecture, evaluation policy, or another blueprint must be created or materially updated before implementation. Owns specification; default preset.",
       "not_for": "Not for implementing an already-approved specification or for editing unrelated documents.",
       "argument_hint": "<task description> [--mode auto|app|library|api|cli|research|update (comma-separated for multiple)] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine]"
     },
@@ -816,6 +816,18 @@
       "use_when": "Use when the acting agent needs to store, retrieve, resolve, hand off, or promote a scoped working-memory item in support of current work.",
       "not_for": "Not for primary task routing, broad artifact triage, or replacing the capability that owns the current work.",
       "argument_hint": "[show] | add <category> <text> | resolve <hint> | decide <text> | handoff [--no-confirm] | sweep [--no-confirm] | promote [<hint>] [--scope project|user [<aspect>]]"
+    },
+    {
+      "slug": "skill__session-tidy",
+      "name": "session-tidy",
+      "group": "ops",
+      "fam": "ops",
+      "modes": [],
+      "blurb": "Write a handoff card; tidy memory.",
+      "invocation_class": "model-support",
+      "use_when": "Use when context fills, before compact, on handoff to another session, after a large task, or on request.",
+      "not_for": "Not for primary routing or memory writes.",
+      "argument_hint": "[정리] | 인계 <받을 세션>"
     }
   ],
   "agents": [
@@ -955,13 +967,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__-c__SessionEnd",
-      "name": "-c",
-      "mono": "-c",
-      "event": "SessionEnd",
-      "hard_block": false
-    },
-    {
       "slug": "hook__fleet-interaction-state.py__SessionEnd",
       "name": "fleet-interaction-state.py clear",
       "mono": "fleet-interaction-state.py",
@@ -1007,6 +1012,13 @@
       "slug": "hook__local-evidence-inject__SessionStart",
       "name": "local-evidence-inject",
       "mono": "local-evidence-inject",
+      "event": "SessionStart",
+      "hard_block": false
+    },
+    {
+      "slug": "hook__session-card-inject__SessionStart",
+      "name": "session-card-inject",
+      "mono": "session-card-inject",
       "event": "SessionStart",
       "hard_block": false
     },
@@ -1084,6 +1096,13 @@
       "slug": "hook__peer-message-record.py__UserPromptSubmit",
       "name": "peer-message-record.py prompt",
       "mono": "peer-message-record.py",
+      "event": "UserPromptSubmit",
+      "hard_block": false
+    },
+    {
+      "slug": "hook__session-card-inject__UserPromptSubmit",
+      "name": "session-card-inject",
+      "mono": "session-card-inject",
       "event": "UserPromptSubmit",
       "hard_block": false
     }

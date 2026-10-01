@@ -23,6 +23,7 @@ UNIT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*$")
 UNIT_WORKER_TYPES = {"owner", "stage", "review", "support", "frame"}
 UNIT_FLOORS = {"near-zero", "low", "moderate", "high", "highest"}
 INVOCATION_CLASSES = {
+    "compiler-internal",
     "entry-router",
     "model-support",
     "parent-invoked",
@@ -46,6 +47,16 @@ UNIT_FIELDS = ("family", "role", "worker_type", "floor")
 
 class ManifestError(ValueError):
     """The canonical product manifest is missing or internally inconsistent."""
+
+
+def skill_capabilities(manifest: dict) -> dict:
+    """The capabilities that project as Skills and native commands: every class except compiler-internal.
+
+    A compiler-internal capability keeps its portable contract and its manifest row, but no Skill,
+    no native command and no persona is generated for it. Generators filter by this class, never by name.
+    """
+    return {name: spec for name, spec in manifest["capabilities"].items()
+            if spec["invocation"]["class"] != "compiler-internal"}
 
 
 def _expect(condition: bool, message: str) -> None:

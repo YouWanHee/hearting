@@ -336,6 +336,80 @@ class RouteDemand(unittest.TestCase):
 
 
 
+class FrameLegsTopByDefault(unittest.TestCase):
+    """Both frame legs are `top` by default on every shape and owner profile; an explicit
+    profile, a node-specific explicit profile and a pin still win; `direct` has no frame."""
+
+    args = F.TestRoute.args
+    registered_headless = F.TestRoute.registered_headless
+    dispatch = F.TestRoute.dispatch
+    nested = F.TestRoute.nested
+    FRAMES = ("frame", "frame-alternative")
+
+    def quick(self, **kw):
+        return R.compile_route(**self.args(predicates=[], transport=None, inline_reason=None,
+            registered_headless_evidence=self.registered_headless(), **kw))
+
+    def staged(self, **kw):
+        return R.compile_route(**self.args(requested_intensity="standard", predicates=[],
+            signals=["shared-contract"], transport="headless", inline_reason=None,
+            dispatch_evidence=self.dispatch(self.nested()), **kw))
+
+    def frames(self, route):
+        return {n["id"]: n for n in route["nodes"] if n["id"] in self.FRAMES}
+
+    def test_every_owner_profile_and_both_shapes_seal_two_top_legs_with_their_own_selection(self):
+        for shape in (self.quick, self.staged):
+            for judgment, scope, owner in (("predetermined", "short-local", "light"),
+                                           ("important", "short-local", "balanced-deep"),
+                                           ("difficult-uncertain", "short-local", "deep")):
+                with self.subTest(shape=shape.__name__, owner=owner):
+                    route = shape(profile_demands={"__owner__": demand(judgment, scope)})
+                    self.assertEqual(route["owner_model_profile"], owner)
+                    frames = self.frames(route)
+                    self.assertEqual(set(frames), set(self.FRAMES))
+                    for node in frames.values():
+                        self.assertEqual(node["model_profile"], "top")
+                        self.assertEqual(node["profile_selection"]["resolved_profile"], "top")
+                        self.assertEqual(node["profile_selection"]["source"], "explicit")
+                        self.assertIsNotNone(node["profile_demand"])
+                    R.verify_route(route, R.ROOT)
+
+    def test_no_owner_demand_uses_the_frame_shape_demand_on_both_legs(self):
+        for shape in (self.quick, self.staged):
+            with self.subTest(shape=shape.__name__):
+                for node in self.frames(shape()).values():
+                    self.assertEqual(node["model_profile"], "top")
+                    self.assertEqual(node["profile_demand"], R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
+
+    def test_an_explicit_profile_reaches_both_frame_legs_as_before(self):
+        for shape in (self.quick, self.staged):
+            with self.subTest(shape=shape.__name__):
+                route = shape(profile="light")
+                self.assertEqual({n["model_profile"] for n in route["nodes"]}, {"light"})
+                R.verify_route(route, R.ROOT)
+
+    def test_a_node_specific_explicit_profile_beats_the_default_on_that_leg_only(self):
+        route = self.staged(explicit_profiles={"frame-alternative": "balanced"})
+        frames = self.frames(route)
+        self.assertEqual(frames["frame-alternative"]["model_profile"], "balanced")
+        self.assertEqual(frames["frame"]["model_profile"], "top")
+        R.verify_route(route, R.ROOT)
+
+    def test_the_two_top_frame_legs_are_separate_launches_never_a_batch_group(self):
+        for shape in (self.quick, self.staged):
+            with self.subTest(shape=shape.__name__):
+                route = shape()
+                frames = self.frames(route)
+                self.assertEqual(sum(1 for n in route["nodes"] if n["model_profile"] == "top"
+                                     and n["id"] in self.FRAMES), 2)
+                grouped = {nid for group in route.get("parallel_groups", []) for nid in group.get("nodes", [])}
+                self.assertFalse(set(frames) & grouped)
+                # the batch contract still admits one `top` leg only; it never sees the pair
+                import replica_batch_contract
+                self.assertEqual(replica_batch_contract.MAX_TOP_LEGS, 1)
+
+
 class TopExceptionRoute(unittest.TestCase):
     """The `top` exception profile at the route layer, on real routes: the same
     compile -> verify_route -> compose -> verify_route round trip the portable
@@ -364,7 +438,7 @@ class TopExceptionRoute(unittest.TestCase):
                                 self.assertEqual(node["model_profile"], profile)
                         if profile == "light":
                             self.assertEqual({n["model_profile"] for n in route["nodes"]
-                                              if n["unit"] == "plan/frame"}, {"balanced"})
+                                              if n["unit"] == "plan/frame"}, {"top"})
 
     def test_light_compose_owner_and_semantic_stages_round_trip(self):
         for shape, graph in (("solo", None), ("staged", "plan,plan-check,test,report")):
@@ -460,24 +534,22 @@ class TopExceptionRoute(unittest.TestCase):
         self.assert_top_owner(route)
         # The invariant is that a `top` OWNER does not spread `top` onto the
         # recipe's stage nodes. The frame anchor is the one deliberate
-        # exception and is not an instance of that spreading at all: it is
-        # raised by the frame tier ladder, which keys on the owner's resolved
-        # profile rather than copying it. Everything else must still be off
-        # `top`.
+        # exception and is not an instance of that spreading at all: both frame
+        # legs are `top` by the frame tier ladder, whatever the owner's profile.
+        # Everything else must still be off `top`.
         self.assertNotIn("top", {n["model_profile"] for n in route["nodes"]
-                                 if n["id"] != "frame"})
+                                 if n["id"] not in {"frame", "frame-alternative"}})
         plain = self.staged()
         self.assertEqual(plain["owner_model_profile"], "deep")
         R.verify_route(plain, R.ROOT)
-        # Proof the anchor's `top` comes from the ladder and not from the
+        # Proof the frame legs' `top` comes from the ladder and not from the
         # owner: a plain staged route asked for no `top` anywhere, its owner is
-        # `deep`, and the anchor is `top` regardless -- while the alternative
-        # leg stays at the owner's own working tier.
+        # `deep`, and both frame legs are `top` regardless.
         by_id = {n["id"]: n for n in plain["nodes"]}
         self.assertEqual(by_id["frame"]["model_profile"], "top")
-        self.assertEqual(by_id["frame-alternative"]["model_profile"], "deep")
+        self.assertEqual(by_id["frame-alternative"]["model_profile"], "top")
         self.assertNotIn("top", {n["model_profile"] for n in plain["nodes"]
-                                 if n["id"] != "frame"})
+                                 if n["id"] not in {"frame", "frame-alternative"}})
 
     def test_a_recipe_with_depth_one_stage_nodes_keeps_them_off_top(self):
         # Review R2 B1: autopilot-spec's `prd-transaction` (and refine's

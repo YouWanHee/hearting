@@ -49,12 +49,32 @@ class MemTwoServerSyncTest(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith("MEM_")
         }
+        # Never inherit the ambient HOME or XDG_CONFIG_HOME: the shared exchange
+        # policy file lives there and may name a real remote. The remote is off
+        # here unless this test asks for its own local bare repository below.
+        home = self.root / "home"
+        config = self.root / "config"
+        (config / "hearting").mkdir(parents=True, exist_ok=True)
+        home.mkdir(exist_ok=True)
+        (config / "hearting" / "memory-sync.json").write_text(
+            '{"enabled": false}\n', encoding="utf-8")
+        gitconfig = self.root / "gitconfig"
+        gitconfig.write_text(
+            "[user]\n\tname = v2 tests\n\temail = v2-tests@example.invalid\n",
+            encoding="utf-8")
+        for key in ("MEM_SYNC_REMOTE", "MEM_SYNC_REMOTE_URL", "MEM_SYNC_DIR",
+                    "MEM_SYNC_REF", "MEM_DUMP_PUSH"):
+            env.pop(key, None)
         env.update({
             "AGENT_HOME": str(self.root / "agent-home"),
             "CODEX_SESSIONS": str(self.root / "codex-sessions"),
+            "GIT_CONFIG_GLOBAL": str(gitconfig),
+            "HOME": str(home),
             "MEM_DUMP_COMMIT": "0",
+            "MEM_EXCHANGE_AUTO": "0",
             "MEM_PROJECTS": str(self.projects_source),
             "MEM_STORE": str(self.stores[name]),
+            "XDG_CONFIG_HOME": str(config),
             "XDG_STATE_HOME": str(self.root / f"state-{name}"),
         })
         if remote:

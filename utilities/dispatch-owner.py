@@ -108,6 +108,9 @@ _HINTS = {
     "no-eligible-route-evidence-candidate": "no sealed candidate is usable: it is usage-limited, gated, or has no positive capacity score "
                                             "(see eligibility.* and capacity_headroom.* above). Resume the same route after the reported reset, "
                                             "or select an available candidate already sealed in this profile; changing the candidate set requires recomposition",
+    "frame-harness-unavailable": "no candidate harness declares the top profile in its runtime model config "
+                                 "(CFG_MODEL_PROFILE_TOP in the selected models.conf; top_undeclared= above names the ones "
+                                 "left out). Declare it for a harness the route sealed, or name a harness with --pin frame=<harness>",
     "no-eligible-candidate": "no configured owner harness is usable: usage-limited, gated, or no positive capacity score "
                              "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
     "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
@@ -541,6 +544,20 @@ def _eligible(state):
     return state != "limited" and not state.startswith("limited(")
 
 
+def _declares_top(harness):
+    """Whether the harness's selected runtime model config declares the `top` profile.
+
+    Only an automatic frame-leg assignment asks: a harness the user named keeps the
+    wrapper's own typed `profile-top-undeclared`, and a config that cannot be read
+    is not a place a `top` leg could run."""
+    from model_profile import ModelProfileError, resolve_runtime_profile
+    try:
+        resolve_runtime_profile(harness, "top")
+    except ModelProfileError:
+        return False
+    return True
+
+
 def _usage(jobs, profile=None):
     cmd = [str(ROOT / "utilities" / "usage-check.sh"), "--harness", "all"]
     if profile:
@@ -643,7 +660,7 @@ def _canonical_jobs():
 def _audit(
     status, adapter, source, configured, explicit, states, *, allocation=None,
     counts=None, rejected=(), fallback=None, reason="none", capacity=None,
-    quality_band=None, relief_promoted=False, capacity_sources=None,
+    quality_band=None, relief_promoted=False, capacity_sources=None, top_excluded=(),
 ):
     lines = [
         f"status={status}", f"adapter={adapter or '-'}", f"selection_source={source}",
@@ -676,6 +693,8 @@ def _audit(
                 lines.append(f"capacity_source.{harness}={capacity_sources[harness]}")
     if quality_band:
         lines.append(f"quality_band={quality_band}")
+    if top_excluded:
+        lines.append(f"top_undeclared={','.join(top_excluded)}")
     warning = _explicit_capacity_warning(source, adapter, capacity, allocation)
     if warning:
         # Explicit targets bypass the capacity cascade by design (the user
@@ -778,6 +797,19 @@ def main(argv):
                     for band in _defaults.QUALITY_BANDS
                 },
             }
+        top_excluded = []
+        if profile == "top" and values["--worker-type"] == "frame" and explicit is None:
+            top_excluded = sorted(h for h in _defaults.DISPATCHABLE_HARNESSES if not _declares_top(h))
+            dropped = [h for h in configured if h in top_excluded]
+            if dropped:
+                configured = [h for h in configured if h not in top_excluded]
+                policy = {
+                    **policy,
+                    **{band: [h for h in policy[band] if h not in top_excluded]
+                       for band in _defaults.QUALITY_BANDS},
+                }
+        else:
+            dropped = []
         states = _usage(jobs, profile)
         allocation = (
             sealed_context.get("allocation")
@@ -807,7 +839,8 @@ def main(argv):
 
         def automatically_available(harness):
             score = capacity.get(harness)
-            return _eligible(states[harness]) and score is not None and score > 0
+            return (harness not in top_excluded and _eligible(states[harness])
+                    and score is not None and score > 0)
 
         selected = None
         source = "none"
@@ -860,9 +893,14 @@ def main(argv):
             print("\n".join(_audit(
                 "unavailable", None, "none", configured, explicit, states,
                 allocation=allocation, counts=counts, rejected=rejected,
-                capacity=capacity, relief_promoted=relief_promoted,
+                capacity=capacity, relief_promoted=relief_promoted, top_excluded=top_excluded,
             )))
-            if sealed is not None and not configured:
+            if dropped and not configured:
+                # Every candidate was left out for not declaring `top`; say that
+                # rather than blaming usage or capacity.
+                reason = "frame-harness-unavailable"
+                detail = hint_for(reason)
+            elif sealed is not None and not configured:
                 # Nothing was even a candidate: every harness the route sealed
                 # sits outside this user's enabled set and quality bands. The
                 # old answer here was `no-eligible-route-evidence-candidate`,
@@ -905,7 +943,7 @@ def main(argv):
                                       fallback=selected if source == "eligibility-fallback" else None,
                                       reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                       quality_band=quality_band,
-                                      relief_promoted=relief_promoted)))
+                                      relief_promoted=relief_promoted, top_excluded=top_excluded)))
             print("check=failed\nreason=wrapper-unavailable\nchild_spawned=0")
             return 65
         print("\n".join(_audit("eligible", selected, source, configured, explicit, states,
@@ -914,7 +952,7 @@ def main(argv):
                                   fallback=selected if source == "eligibility-fallback" else None,
                                   reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                   quality_band=quality_band,
-                                  relief_promoted=relief_promoted)), flush=True)
+                                  relief_promoted=relief_promoted, top_excluded=top_excluded)), flush=True)
         if explicit_policy and source == "explicit":
             print(f"explicit_policy={explicit_policy}", flush=True)
         print(f"route_defaults={','.join(derived) or 'none'}", flush=True)
@@ -956,6 +994,7 @@ def main(argv):
                 if values["--worker-type"] == "frame":
                     from artifact_producer import prepare_route_artifact_env, ProducerError
                     try:
+                        child_env.pop("AGENT_ARTIFACT_PARENT_OUTPUT_DIR", None)  # SD-163: no stale source
                         child_env.update(prepare_route_artifact_env(
                             Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
                     except ProducerError as exc:
@@ -980,6 +1019,7 @@ def main(argv):
             if values["--worker-type"] == "owner":
                 from artifact_producer import prepare_route_artifact_env, ProducerError
                 try:
+                    child_env.pop("AGENT_ARTIFACT_PARENT_OUTPUT_DIR", None)  # SD-163: no stale source
                     child_env.update(prepare_route_artifact_env(
                         Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
                 except ProducerError as exc:

@@ -13,6 +13,7 @@ const isHarnessRoot = (candidate) =>
 const root = isHarnessRoot(envRoot) ? envRoot : pluginRoot
 const preflight = path.join(root, "adapters", "opencode", "bin", "preflight.sh")
 const summaryTrigger = path.join(root, "utilities", "session_summary_trigger.py")
+const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
@@ -39,6 +40,11 @@ const turnBySession = new Map()
 const memoryBySession = new Map()
 const localEvidenceBySession = new Map()
 const turnContextBySession = new Map()
+//   * cardBySession — { turn, text } for the session card / tidy notice. The
+//     card is consumed once per user turn in chat.message (independent of the
+//     candidate probe) and the kept text is re-emitted on every model call of
+//     that turn, so a tool-loop continuation never consumes a second card.
+const cardBySession = new Map()
 
 function baseDir(ctx) {
   return ctx.worktree || ctx.directory || process.cwd()
@@ -67,8 +73,7 @@ function isWorkerSession() {
     process.env.AGENT_DISPATCH_CHILD === "1" ||
     Boolean(process.env.AGENT_DISPATCH_DEPTH) ||
     Boolean(process.env.OPENCODE_DISPATCH_SLUG) ||
-    process.env.FLEET_TITLE_REFRESH === "1" ||
-    process.env.MEM_DISTILL === "1"
+    process.env.FLEET_TITLE_REFRESH === "1"
   )
 }
 
@@ -163,22 +168,6 @@ function runWorkerState(action, payload = {}) {
   return (result.stdout || "").trim()
 }
 
-function spawnDetached(command, args) {
-  // Fire-and-forget: must not block the user's turn. The child runs the
-  // preflight session-end → no-tools distiller worker independently.
-  try {
-    const child = spawn(preflight, [command, ...args], {
-      cwd: root,
-      env: { ...process.env, AGENT_HOME: root },
-      detached: true,
-      stdio: "ignore",
-    })
-    child.unref()
-  } catch {
-    // best-effort; distillation is non-critical
-  }
-}
-
 function spawnSummary(sid, phase) {
   if (!sid || isWorkerSession()) return
   try {
@@ -223,6 +212,23 @@ function collectPreflight(command, args) {
   })
 
   return [result.stdout, result.stderr].filter(Boolean).join("\n").trim()
+}
+
+// A compacted session no longer holds the candidates memory showed it, so its
+// display history is emptied through the one shared mem.py helper (fail-open).
+// A brand-new session ID starts with an empty history on its own.
+function forgetShownCandidates(sessionID) {
+  if (!sessionID || isWorkerSession()) return
+  try {
+    spawnSync("python3", [path.join(root, "tools", "memory", "mem.py"),
+      "_seen-reset", "--session-id", sessionID], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      stdio: "ignore",
+      timeout: 3000,
+      killSignal: "SIGKILL",
+    })
+  } catch {}
 }
 
 function collectCandidates(args) {
@@ -276,6 +282,22 @@ function sd111SessionSweep(sid) {
   }
 }
 
+// Session card / tidy notice: `session_tidy.py hook` records the event and prints
+// what this session is due, once. Every failure is empty (no card, no throw).
+function collectCard(event, sid, cwd) {
+  if (!sid || isWorkerSession()) return ""
+  const result = spawnSync("python3", [sessionTidy, "hook", "--harness", "opencode",
+    "--event", event, "--session-id", sid, "--cwd", cwd], {
+    cwd: root,
+    env: { ...process.env, AGENT_HOME: root },
+    encoding: "utf8",
+    timeout: 4000,
+    killSignal: "SIGKILL",
+  })
+  if (result.error || result.status !== 0) return ""
+  return (result.stdout || "").trim()
+}
+
 function appendContext(output, text) {
   if (!text) return
   if (!Array.isArray(output.system)) output.system = []
@@ -324,16 +346,16 @@ export const AgentHarnessGuards = async (ctx) => {
   return ({
   event: async ({ event }) => {
     if (event && event.type === "session.compacted") {
+      collectCard("compact", (event.properties && event.properties.sessionID) || "", baseDir(ctx))
       runWorkerState("compact-after", event)
+      forgetShownCandidates(event.properties && event.properties.sessionID)
     }
     // session.idle fires after each turn (the session is waiting for the user).
-    // Use it as the memory-sync trigger; preflight session-end debounces per
-    // session. Mirrors the Claude SessionEnd and Codex session-end detached sync.
+    // It refreshes the summary and pane and touches the heartbeat; memory has no
+    // idle or session-end step (it exchanges after writes and reads, D-82/D-83).
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
-      const sid = eventSid || "opencode-plugin"
       if (!isWorkerSession()) {
-        spawnDetached("session-end", [baseDir(ctx), sid])
         spawnSummary(eventSid, "final")
         projectPane(eventSid)
       }
@@ -351,6 +373,7 @@ export const AgentHarnessGuards = async (ctx) => {
         memoryBySession.delete(sid)
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
+        cardBySession.delete(sid)
       }
     }
   },
@@ -366,6 +389,10 @@ export const AgentHarnessGuards = async (ctx) => {
     if (prompt) promptBySession.set(sid, prompt)
     if (prompt && eventSid) spawnPeerNotice(eventSid, prompt, baseDir(ctx))
     if (turn) turnBySession.set(sid, turn)
+    const cardTurn = turn || prompt
+    if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
+      cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx)) })
+    }
   },
   "experimental.chat.system.transform": async (input, output) => {
     const sid = input.sessionID || "opencode-plugin"
@@ -389,6 +416,7 @@ export const AgentHarnessGuards = async (ctx) => {
       localEvidenceBySession.set(sid, collectPreflight("local-evidence", [cwd]))
     }
     appendContext(output, localEvidenceBySession.get(sid))
+    appendContext(output, cardBySession.get(sid)?.text)
 
     const prompt = promptBySession.get(sid) || ""
     const turn = turnBySession.get(sid) || ""

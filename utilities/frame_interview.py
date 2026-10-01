@@ -119,6 +119,12 @@ MAX_ANSWERS_BYTES = (
 NONE_SENTINEL = "none"
 
 
+# An approval question marks its approving option with `"approves": true` (exactly one of its two
+# options); choosing the other option declines. Position carries no meaning.
+ROUTE_PROPOSAL_KEYS = frozenset({"question", "by_option"})
+APPROVAL_FIELDS = frozenset({"key", "leg", "question"})
+
+
 class InterviewError(ValueError):
     def __init__(self, reason: str, detail: str = ""):
         super().__init__(f"{reason}: {detail}" if detail else reason)
@@ -273,10 +279,140 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
             errors.append(f"{where}.why: {len(why)} chars > {MAX_WHY_CHARS}")
         for hit in jargon_hits(why):
             errors.append(f"{where}.why: harness word {hit!r}")
+    if "route_proposals" in interview:
+        errors += _route_proposal_errors(interview, questions)
     round_no = interview.get("round", 1)
     if not isinstance(round_no, int) or isinstance(round_no, bool) or not (1 <= round_no <= MAX_ROUNDS):
         errors.append(f"round: must be 1..{MAX_ROUNDS}")
     return errors
+
+
+def _question_table(questions) -> dict:
+    return {_text(q.get("id")): q for q in questions if isinstance(q, dict) and _text(q.get("id"))}
+
+
+def _labels(question) -> list:
+    options = question.get("options") if isinstance(question.get("options"), list) else []
+    return [_text(o.get("label")) for o in options if isinstance(o, dict)]
+
+
+def _route_proposal_errors(interview: dict, questions: list) -> list[str]:
+    """Reference checks only: the question id, the option labels and the approval questions a
+    proposal names must exist. What the answers mean for the route stays with the runtime."""
+    field = interview["route_proposals"]
+    if not isinstance(field, dict) or set(field) != ROUTE_PROPOSAL_KEYS:
+        return ["route_proposals: expected exactly {question, by_option}"]
+    table = _question_table(questions)
+    qid, by_option = field["question"], field["by_option"]
+    if not isinstance(qid, str) or qid not in table:
+        return [f"route_proposals.question: no such question {qid!r}"]
+    if not isinstance(by_option, dict) or not by_option:
+        return ["route_proposals.by_option: must map at least one option label to a proposal"]
+    errors: list[str] = []
+    approval_ids: set[str] = set()
+    labels = _labels(table[qid])
+    for label, proposal in by_option.items():
+        where = f"route_proposals.by_option[{label!r}]"
+        if labels.count(label) != 1:
+            errors.append(f"{where}: {'ambiguous' if label in labels else 'not an option of'} question {qid!r}")
+        if not isinstance(proposal, dict) or not isinstance(proposal.get("legs"), list) or not proposal["legs"]:
+            errors.append(f"{where}: not a route proposal")
+            continue
+        approvals = proposal.get("entry_approvals") or []
+        if not isinstance(approvals, list):
+            errors.append(f"{where}.entry_approvals: must be a list")
+            continue
+        for index, approval in enumerate(approvals):
+            at = f"{where}.entry_approvals[{index}]"
+            if not isinstance(approval, dict) or set(approval) != APPROVAL_FIELDS:
+                errors.append(f"{at}: expected exactly {sorted(APPROVAL_FIELDS)}")
+                continue
+            leg = approval["leg"]
+            if isinstance(leg, bool) or not isinstance(leg, int) or not 0 <= leg < len(proposal["legs"]):
+                errors.append(f"{at}.leg: outside the proposal's legs")
+            asked = table.get(approval["question"]) if isinstance(approval["question"], str) else None
+            if asked is None or approval["question"] == qid:
+                errors.append(f"{at}.question: no such approval question {approval['question']!r}")
+            elif _text(asked.get("kind")) != "yes-no":
+                errors.append(f"{at}.question: an approval question is yes-no")
+            else:
+                approval_ids.add(approval["question"])
+    for asked_id in sorted(approval_ids):
+        errors += _approves_errors(asked_id, table[asked_id])
+    return errors
+
+
+def _approves_errors(qid: str, question: dict) -> list[str]:
+    """An approval question marks the one option that approves with `"approves": true`."""
+    options = [o for o in question.get("options", []) if isinstance(o, dict)] \
+        if isinstance(question.get("options"), list) else []
+    errors = [f"approval question {qid!r}: option {_text(o.get('label'))!r} has a non-boolean `approves`"
+              for o in options if "approves" in o and not isinstance(o["approves"], bool)]
+    marked = sum(1 for o in options if o.get("approves") is True)
+    if marked != 1:
+        errors.append(f"approval question {qid!r}: mark exactly one option `\"approves\": true` "
+                      f"(found {marked})")
+    return errors
+
+
+def resolve_answer(question: dict, entry) -> dict:
+    """What one answer chose: `{state: chosen|off-menu|unanswered, label, index}`."""
+    labels = _labels(question)
+    choice = entry.get("choice") if isinstance(entry, dict) else None
+    if choice == NONE_SENTINEL and NONE_SENTINEL not in labels:
+        return {"state": "off-menu", "label": None, "index": None}
+    if isinstance(choice, str) and choice in labels:
+        choice = labels.index(choice)
+    if isinstance(choice, int) and not isinstance(choice, bool) and 0 <= choice < len(labels):
+        return {"state": "chosen", "label": labels[choice], "index": choice}
+    return {"state": "unanswered", "label": None, "index": None}
+
+
+def route_choice(interview: dict, answers: dict):
+    """The route question's answer against `route_proposals`; None when the field is absent.
+
+    `{state: selected|declined|off-menu|unanswered, label, proposal|None}`. A declined option or an
+    off-menu answer is a valid answer that selects no proposal.
+    """
+    field = interview.get("route_proposals") if isinstance(interview, dict) else None
+    if not isinstance(field, dict):
+        return None
+    table = _question_table(interview.get("questions") or [])
+    question = table.get(field.get("question"))
+    given = answers.get("answers") if isinstance(answers, dict) and isinstance(answers.get("answers"), dict) else {}
+    if question is None:
+        return {"state": "unanswered", "label": None, "proposal": None}
+    chosen = resolve_answer(question, given.get(field["question"]))
+    if chosen["state"] == "chosen":
+        proposal = (field.get("by_option") or {}).get(chosen["label"])
+        return {"state": "selected" if proposal is not None else "declined", "label": chosen["label"],
+                "proposal": proposal}
+    return {"state": chosen["state"], "label": None, "proposal": None}
+
+
+def _approves(question, index) -> bool:
+    """True only for the one option marked `approves: true`; a question with no mark or two marks approves nothing."""
+    options = question.get("options") if isinstance(question, dict) else None
+    if not isinstance(options, list) or not isinstance(index, int) or not 0 <= index < len(options):
+        return False
+    marked = [at for at, option in enumerate(options) if isinstance(option, dict) and option.get("approves") is True]
+    return marked == [index]
+
+
+def approvals_given(interview: dict, answers: dict, proposal) -> list:
+    """Each `entry_approvals` row of the selected proposal with the answer to its question:
+    `{key, leg, question, label, accepted}`. Only the option marked `approves: true` accepts."""
+    if not isinstance(proposal, dict):
+        return []
+    table = _question_table(interview.get("questions") or [])
+    given = answers.get("answers") if isinstance(answers.get("answers"), dict) else {}
+    rows = []
+    for approval in proposal.get("entry_approvals") or []:
+        question = table.get(approval.get("question"))
+        chosen = resolve_answer(question, given.get(approval.get("question"))) if question else {"state": "unanswered", "label": None, "index": None}
+        rows.append({"key": approval.get("key"), "leg": approval.get("leg"), "question": approval.get("question"),
+                     "label": chosen["label"], "accepted": chosen["state"] == "chosen" and _approves(question, chosen["index"])})
+    return rows
 
 
 def answers_template(interview: dict) -> dict:
@@ -379,7 +515,7 @@ def _inline(text: str) -> str:
     return " ".join(_text(text).split())
 
 
-def render_intent(interview: dict, answers: dict, *, now: str | None = None) -> str:
+def render_intent(interview: dict, answers: dict, *, now: str | None = None, approval_scope=None) -> str:
     """The agreed intent document `plan` reads first. Plain sections in the
     order intent.md uses (Problem, Proposed Outcome, Affected, Constraints,
     Decisions, Open Questions), every decision traceable to its question."""
@@ -439,10 +575,37 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None) -> 
         note = _inline(entry.get("note"))
         if note:
             lines.append(f"  - User's note: {note}")
+    if "route_proposals" in interview:
+        lines += _route_lines(interview, answers, approval_scope or {})
     lines += ["", "## Open Questions", "", _inline(brief.get("open")) or "None recorded."]
     lines += ["", "## Sources", "", f"- interview: {interview.get('self_path', 'shards/frame/interview.json')}",
               f"- summary: {_text(interview.get('summary')) or '-'}", ""]
     return "\n".join(lines)
+
+
+def _route_lines(interview: dict, answers: dict, scope: dict) -> list[str]:
+    """The selected route and the approvals actually given, written only for an interview that
+    carries `route_proposals`. `scope` maps `(key, leg)` to the part ids shown for that approval."""
+    choice = route_choice(interview, answers) or {"state": "unanswered", "proposal": None}
+    lines = ["", "## Route", ""]
+    proposal = choice["proposal"]
+    if proposal is None:
+        reason = {"declined": "the proposed route was declined", "off-menu": "a different direction was chosen",
+                  "unanswered": "the route question was not answered"}.get(choice["state"], "no route was proposed")
+        return lines + [f"No route was selected ({reason}); no step starts automatically and the next route is chosen separately."]
+    lines.append(f"Selected route: {_inline(proposal.get('summary')) or '-'}")
+    for index, leg in enumerate(proposal.get("legs") or []):
+        graph = ",".join(leg.get("graph") or []) or "whole recipe"
+        lines.append(f"- Leg {index}: {leg.get('capability')} / {leg.get('mode') or 'default mode'} / "
+                     f"{leg.get('shape')} / {graph}" + ("  (starts now)" if index == 0 else "  (next step, decided separately)"))
+    given = approvals_given(interview, answers, proposal)
+    if given:
+        lines += ["", "Start approvals:"]
+    for row in given:
+        parts = ", ".join(scope.get((row["key"], row["leg"])) or []) or "the steps named in the question"
+        verdict = "approved" if row["accepted"] else ("declined" if row["label"] is not None else "not answered")
+        lines.append(f"- {row['key']} for leg {row['leg']} ({parts}) — question `{row['question']}`: {verdict}")
+    return lines
 
 
 def _load(path: str) -> dict:

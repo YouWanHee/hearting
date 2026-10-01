@@ -24,7 +24,6 @@
 #         · else                         → HARD DENY + dispatch-headless guidance
 #     · intensity unknown/empty          → soft reminder (old wrapper without the env; cannot
 #                                          confirm standard+, so never deny — no false positive)
-#   Recursion guard: MEM_DISTILL=1 → drain stdin, exit 0 (mirror memory hooks).
 #
 #   Deny mechanism mirrors worktree-path-guard.sh (drill g3/g6 precedent):
 #     hook(stdin) mode → JSON permissionDecision=deny, exit 0
@@ -33,9 +32,6 @@
 #   Portable CLI (conformance): stage-dispatch-reminder.sh --skill <name>
 #     [--cwd <dir>] [--session <id>] [--dispatch-depth <n>] [--intensity <i>]
 #   Without args, reads Claude PreToolUse hook JSON from stdin.
-
-# Recursion guard: never trigger in a distiller session.
-[ "${MEM_DISTILL:-}" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
 
 CODE_STAGES="code-plan code-execute code-test code-report"
 HOOK_MODE=1  # 0 = CLI (argv present), 1 = stdin hook JSON

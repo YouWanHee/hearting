@@ -1510,6 +1510,7 @@ def cmd_release(args):
         if inline_gate and args.decision == "proceed":
             WS.require_gate_artifact_current(WS.human_gate_resolution(ledger.journal(), args.gate))
         answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
+        answered_interview = interview_of_gate(ledger, args.gate) if answers else None
         if args.decision == "proceed":
             ledger.set_workflow_state(
                 "RUNNING",
@@ -1582,6 +1583,7 @@ def cmd_release(args):
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
                             released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
+    record_answered_decisions(route, answered_interview, answers)
     if args.decision == "proceed" and actor_kind == "user":
         jobs = args.jobs or (None if payload.get("ledger_root_source") == "AGENT_WORKFLOW_ROOT"
                              else default_jobs_path())
@@ -1594,6 +1596,36 @@ def cmd_release(args):
                 payload["owner_continuation"] = continuation
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def interview_of_gate(ledger, gate):
+    """The interview the gate was raised with, or None; never raises."""
+    try:
+        return load_interview_artifact(WS.human_gate_resolution(ledger.journal(), gate).get("artifact"))
+    except Exception:  # noqa: BLE001 - only the decision record needs it
+        return None
+
+
+def record_answered_decisions(route, interview, answers):
+    """D-87: the answers this release just accepted become decision records.
+
+    `cmd_release` is the one place a frame-review answer is accepted (both
+    `release --answers` and `capability-route.py start --answers` reach it), so
+    the record is made here and nowhere else. A short bounded child writes the
+    records; any failure leaves the original text in the waiting folder and one
+    stderr line. The release result, exit code and stdout are never affected.
+    """
+    if not answers or not interview:
+        return
+    try:
+        import tidy_decisions
+        tidy_decisions.record_interview_answers(
+            interview, answers, route_id=route.get("route_id", ""),
+            cwd=route.get("cwd") or os.getcwd())
+    except BaseException as exc:  # noqa: BLE001 - never change the accepted release
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        sys.stderr.write(f"[decision] 방향 확인 답의 기억 기록을 건너뜁니다: {type(exc).__name__}\n")
 
 
 def load_interview_artifact(artifact):

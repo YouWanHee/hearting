@@ -1697,6 +1697,365 @@ class SeedingGateFixture(unittest.TestCase):
             self.assertTrue(payload["regression"])
 
 
+class ShardPartitionTest(unittest.TestCase):
+    """--shard: a deterministic, duration-balanced split of the selected suites."""
+
+    def setUp(self):
+        self.mod = load_runner_module()
+        self.paths = [f"s{n:02d}.test.py" for n in range(23)]
+        self.durations = {p: float((n * 7) % 11 + 1) for n, p in enumerate(self.paths)}
+
+    def test_every_suite_lands_in_exactly_one_shard(self):
+        shards = self.mod.partition_shards(self.paths, self.durations, 4)
+        flat = [p for shard in shards for p in shard]
+        self.assertEqual(sorted(flat), sorted(self.paths))
+        self.assertEqual(len(flat), len(set(flat)))
+
+    def test_split_is_deterministic_and_input_order_independent(self):
+        first = self.mod.partition_shards(self.paths, self.durations, 4)
+        again = self.mod.partition_shards(list(reversed(self.paths)), dict(self.durations), 4)
+        self.assertEqual(first, again)
+
+    def test_shards_are_balanced_by_duration(self):
+        shards = self.mod.partition_shards(self.paths, self.durations, 4)
+        totals = [sum(self.durations[p] for p in shard) for shard in shards]
+        self.assertLessEqual(max(totals) - min(totals), max(self.durations.values()))
+
+    def test_equal_weights_tie_break_by_path_then_lowest_shard(self):
+        shards = self.mod.partition_shards(["b.test.py", "a.test.py", "c.test.py"], {}, 2)
+        self.assertEqual(shards, [["a.test.py", "c.test.py"], ["b.test.py"]])
+
+    def test_unknown_suite_takes_the_median_of_known_durations(self):
+        weights = self.mod.shard_weights(["a", "b", "new"], {"a": 2.0, "b": 8.0})
+        self.assertEqual(weights["new"], 5.0)
+        self.assertEqual(self.mod.shard_weights(["new"], {})["new"], 1.0)
+
+    def test_more_shards_than_suites_leaves_empty_shards(self):
+        shards = self.mod.partition_shards(["a.test.py"], {}, 3)
+        self.assertEqual(shards, [["a.test.py"], [], []])
+
+    def test_shard_spec_grammar(self):
+        self.assertEqual(self.mod.parse_shard("2/4"), (2, 4))
+        self.assertEqual(self.mod.parse_shard("1/1"), (1, 1))
+        for bad in ("0/4", "5/4", "1/0", "a/b", "1", "1/2/3", "-1/4", ""):
+            with self.assertRaises(ValueError, msg=bad):
+                self.mod.parse_shard(bad)
+
+    def write_table(self, root: Path, body: str) -> Path:
+        path = root / "durations.tsv"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_duration_table_errors_are_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = self.write_table(root, "# c\nsuite_path\tduration_s\na.test.py\t1.5\n")
+            self.assertEqual(self.mod.load_durations(good), {"a.test.py": 1.5})
+            cases = {
+                "missing header": "a.test.py\t1.5\n",
+                "bad number": "suite_path\tduration_s\na.test.py\tfast\n",
+                "negative": "suite_path\tduration_s\na.test.py\t-1\n",
+                "nan": "suite_path\tduration_s\na.test.py\tnan\n",
+                "short row": "suite_path\tduration_s\na.test.py\n",
+                "duplicate": "suite_path\tduration_s\na.test.py\t1\na.test.py\t2\n",
+                "empty": "# only a comment\n",
+            }
+            for name, body in cases.items():
+                with self.assertRaises(self.mod.BaselineError, msg=name):
+                    self.mod.load_durations(self.write_table(root, body))
+            with self.assertRaises(self.mod.BaselineError):
+                self.mod.load_durations(root / "absent.tsv")
+
+    def test_committed_table_is_well_formed(self):
+        # The table only balances shards: a suite without a row is weighed at the
+        # median (shard_weights) and a row for a removed suite is ignored, so a PR
+        # that adds or removes a test file must not have to edit this table.
+        durations = self.mod.load_durations(ROOT / "tools" / "test-durations.tsv")
+        self.assertTrue(durations)
+        self.assertTrue(all(value > 0 for value in durations.values()))
+        corpus = sorted(self.mod.suite_relpath(ROOT, s) for s in self.mod.collect_suites(ROOT))
+        weights = self.mod.shard_weights(corpus, durations)
+        self.assertEqual(set(weights), set(corpus))
+
+
+class ShardCliFixture(RunTestsFixtureBase):
+    """--shard / --suite-list / --verify-shards through the real CLI."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("a", "b", "c", "d", "e"):
+            write_suite(self.root, f"{name}.test.py", "import sys\nsys.exit(0)\n")
+        write_suite(self.root, "sub/f.test.py", "import sys\nsys.exit(0)\n")
+        self.table = self.root / "durations.tsv"
+        self.table.write_text(
+            "suite_path\tduration_s\na.test.py\t9\nb.test.py\t5\nc.test.py\t4\n"
+            "d.test.py\t3\ne.test.py\t2\nsub/f.test.py\t1\n",
+            encoding="utf-8",
+        )
+
+    def base_args(self, baseline_rows=None, isolation_rows=None):
+        return [
+            "--root", str(self.root),
+            "--baseline", str(write_baseline(self.root, baseline_rows or [])),
+            "--isolation-tsv", str(write_isolation_tsv(self.root, isolation_rows)),
+            "--durations", str(self.table),
+            "--isolation=isolated", "--jobs", "2", "--timeout", "5", "--no-leak-sweep",
+        ]
+
+    def run_shard(self, index: int, count: int, extra=None, listing=True):
+        out = self.root / "out" / f"run-tests-report-shard-{index}-of-{count}"
+        out.mkdir(parents=True, exist_ok=True)
+        args = self.base_args() + ["--shard", f"{index}/{count}", "--report", str(out / "run-tests-report.tsv")]
+        if listing:
+            args += ["--suite-list", str(out / "suite-list.tsv")]
+        result = run_runner(args + (extra or []))
+        return result, out
+
+    def write_census(self, extra=None):
+        census = self.root / "out" / "census-suite-list.tsv"
+        census.parent.mkdir(parents=True, exist_ok=True)
+        result = run_runner(self.base_args() + ["--census", "--suite-list", str(census)] + (extra or []))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return census
+
+    def manifest(self, path: Path) -> list[str]:
+        return path.read_text(encoding="utf-8").splitlines()
+
+    def run_all_shards(self, count=3):
+        self.write_census()
+        for index in range(1, count + 1):
+            result, _ = self.run_shard(index, count)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def verify(self):
+        return run_runner(["--verify-shards", str(self.root / "out")])
+
+    def test_shard_census_sums_to_the_unsharded_census(self):
+        total = 0
+        for index in range(1, 4):
+            result = run_runner(self.base_args() + ["--census", "--shard", f"{index}/3"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            total += int(re.search(r"collected=(\d+)", result.stdout).group(1))
+        whole = run_runner(self.base_args() + ["--census"])
+        self.assertEqual(total, int(re.search(r"collected=(\d+)", whole.stdout).group(1)))
+        self.assertEqual(total, 6)
+
+    def test_manifest_is_written_before_the_run_and_has_the_agreed_shape(self):
+        result, out = self.run_shard(1, 3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.manifest(out / "suite-list.tsv")
+        self.assertEqual(lines[:2], ["# shard=1/3", "suite_path"])
+        self.assertEqual(lines[2:], sorted(lines[2:]))
+        census = self.manifest(self.write_census())
+        self.assertEqual(census[:2], ["# shard=all", "suite_path"])
+        self.assertEqual(len(census) - 2, 6)
+
+    def test_a_shard_reports_only_its_own_suites(self):
+        result, out = self.run_shard(2, 3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mine = set(self.manifest(out / "suite-list.tsv")[2:])
+        reported = {
+            line.split("\t")[0]
+            for line in (out / "run-tests-report.tsv").read_text(encoding="utf-8").splitlines()[2:]
+        }
+        self.assertEqual(reported, mine)
+        self.assertTrue(mine)
+
+    def test_all_shards_together_verify_against_the_census(self):
+        self.run_all_shards()
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("missing=0 duplicate=0", result.stdout)
+        self.assertIn("shards=3/3", result.stdout)
+
+    def test_select_and_exclude_apply_before_the_split(self):
+        census = self.write_census(["--exclude", "sub/*", "--exclude", "e.test.py"])
+        self.assertEqual(len(self.manifest(census)) - 2, 4)
+        result, out = self.run_shard(1, 2, ["--select", "*.test.py", "--exclude", "a.test.py"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listed = set(self.manifest(out / "suite-list.tsv")[2:])
+        self.assertNotIn("a.test.py", listed)
+        self.assertLessEqual(listed, {"b.test.py", "c.test.py", "d.test.py", "e.test.py", "sub/f.test.py"})
+
+    def test_invalid_shard_specs_and_duplicates_are_usage_errors_before_any_run(self):
+        for spec in ("0/4", "5/4", "a/b", "2/0"):
+            result = run_runner(self.base_args() + ["--shard", spec, "--report", str(self.root / "r.tsv")])
+            self.assertEqual(result.returncode, 64, spec + result.stderr)
+            self.assertFalse((self.root / "r.tsv").exists(), spec)
+        result = run_runner(self.base_args() + ["--shard", "1/2", "--shard", "2/2"])
+        self.assertEqual(result.returncode, 64, result.stderr)
+
+    def test_missing_or_broken_duration_table_is_an_error_not_a_guess(self):
+        self.table.write_text("suite_path\tduration_s\na.test.py\tsoon\n", encoding="utf-8")
+        result, _ = self.run_shard(1, 2)
+        self.assertEqual(result.returncode, 65)
+        self.assertIn("duration table error", result.stderr)
+        self.table.unlink()
+        result, _ = self.run_shard(1, 2)
+        self.assertEqual(result.returncode, 65)
+
+    def test_a_suite_missing_from_the_table_still_gets_exactly_one_shard(self):
+        write_suite(self.root, "brand_new.test.py", "import sys\nsys.exit(0)\n")
+        self.run_all_shards()
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("census=7", result.stdout)
+
+    def test_verifier_rejects_a_dropped_suite(self):
+        self.run_all_shards()
+        target = self.root / "out" / "run-tests-report-shard-1-of-3" / "suite-list.tsv"
+        lines = self.manifest(target)
+        dropped = lines.pop()
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"missing: {dropped}", result.stdout)
+
+    def test_verifier_rejects_a_duplicated_suite(self):
+        self.run_all_shards()
+        first = self.manifest(self.root / "out" / "run-tests-report-shard-1-of-3" / "suite-list.tsv")[2]
+        other = self.root / "out" / "run-tests-report-shard-2-of-3" / "suite-list.tsv"
+        other.write_text(other.read_text(encoding="utf-8") + first + "\n", encoding="utf-8")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"duplicate: {first}", result.stdout)
+
+    def test_verifier_rejects_a_missing_shard_number(self):
+        self.run_all_shards()
+        import shutil
+        shutil.rmtree(self.root / "out" / "run-tests-report-shard-3-of-3")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not exactly 1..3", result.stderr)
+
+    def test_verifier_rejects_disagreeing_shard_counts(self):
+        self.run_all_shards()
+        (self.root / "out" / "run-tests-report-shard-3-of-3").rename(self.root / "out" / "run-tests-report-shard-3-of-4")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+
+    def test_verifier_rejects_a_manifest_without_a_report(self):
+        self.run_all_shards()
+        (self.root / "out" / "run-tests-report-shard-2-of-3" / "run-tests-report.tsv").unlink()
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run-tests-report.tsv unreadable", result.stderr)
+
+    def test_verifier_rejects_a_suite_with_no_verdict_in_its_report(self):
+        self.run_all_shards()
+        report = self.root / "out" / "run-tests-report-shard-1-of-3" / "run-tests-report.tsv"
+        lines = report.read_text(encoding="utf-8").splitlines()
+        victim = lines[2].split("\t")[0]
+        report.write_text("\n".join(lines[:2] + lines[3:]) + "\n", encoding="utf-8")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"report-missing: {victim} (shard 1)", result.stdout)
+
+    def test_verifier_needs_a_census_and_at_least_one_shard(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        self.assertEqual(run_runner(["--verify-shards", str(empty)]).returncode, 1)
+        self.write_census()
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no run-tests-report-shard", result.stderr)
+
+    def test_stale_baseline_row_is_reported_by_shard_one_only(self):
+        args = self.base_args(
+            [f"gone.test.py\t-\texit-nonzero\tisolated\tgone\tMA-TEST-900\t{TOMORROW}"]
+        )
+        results = {}
+        for index in (1, 2, 3):
+            out = self.root / f"s{index}.tsv"
+            results[index] = (run_runner(args + ["--shard", f"{index}/3", "--report", str(out)]), out)
+        self.assertNotEqual(results[1][0].returncode, 0)
+        self.assertIn("STALE", results[1][1].read_text(encoding="utf-8"))
+        for index in (2, 3):
+            self.assertEqual(results[index][0].returncode, 0, results[index][0].stderr)
+            self.assertNotIn("STALE", results[index][1].read_text(encoding="utf-8"))
+
+    def test_another_shards_baseline_and_isolation_rows_are_not_stale_here(self):
+        # Rows for real suites that live in another shard must be invisible to
+        # this shard: not STALE, not ISOLATION-OPTOUT-UNNEEDED, not failing.
+        owner = {}
+        for index in (1, 2):
+            self.run_shard(index, 2)
+            for rel in self.manifest(self.root / "out" / f"run-tests-report-shard-{index}-of-2" / "suite-list.tsv")[2:]:
+                owner[rel] = index
+        other = next(rel for rel, index in owner.items() if index == 2)
+        args = self.base_args(
+            [f"{other}\t-\texit-nonzero\tisolated\tsibling\tMA-TEST-901\t{TOMORROW}"],
+            [f"{other}\tinstalled-layout\tsibling\tMA-TEST-902\t{TOMORROW}"],
+        )
+        out = self.root / "x.tsv"
+        result = run_runner(args + ["--shard", "1/2", "--report", str(out)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = out.read_text(encoding="utf-8")
+        self.assertNotIn("STALE", text)
+        self.assertNotIn("ISOLATION-OPTOUT-UNNEEDED", text)
+
+    def test_known_fail_xpass_and_seed_keep_their_meaning_inside_a_shard(self):
+        write_suite(self.root, "kf.test.py", "import sys\nsys.exit(1)\n")
+        write_suite(self.root, "xp.test.py", "import sys\nsys.exit(0)\n")
+        self.table.write_text(self.table.read_text(encoding="utf-8") + "kf.test.py\t1\nxp.test.py\t1\n", encoding="utf-8")
+        args = self.base_args([
+            f"kf.test.py\t-\texit-nonzero\tisolated\tknown\tMA-TEST-903\t{TOMORROW}",
+            f"xp.test.py\t-\texit-nonzero\tisolated\tknown\tMA-TEST-904\t{TOMORROW}",
+        ])
+        seen = {}
+        for index in (1, 2):
+            out = self.root / f"kx{index}.tsv"
+            seed = self.root / f"seed{index}.tsv"
+            result = run_runner(args + ["--shard", f"{index}/2", "--xpass-nonfatal", "--seed-baseline", str(seed),
+                                        "--report", str(out)])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(seed.exists())
+            for line in out.read_text(encoding="utf-8").splitlines()[2:]:
+                cols = line.split("\t")
+                seen[cols[0]] = cols[2]
+        self.assertEqual(seen["kf.test.py"], "KNOWN-FAIL")
+        self.assertEqual(seen["xp.test.py"], "XPASS")
+
+    def test_a_failing_suite_fails_only_its_own_shard(self):
+        write_suite(self.root, "bad.test.py", "import sys\nsys.exit(1)\n")
+        self.table.write_text(self.table.read_text(encoding="utf-8") + "bad.test.py\t1\n", encoding="utf-8")
+        codes = [self.run_shard(index, 2)[0].returncode for index in (1, 2)]
+        self.assertEqual(sorted(codes), [0, 1])
+
+    def test_leak_sweep_stays_on_inside_a_shard(self):
+        args = [a for a in self.base_args() if a != "--no-leak-sweep"]
+        result = run_runner(args + ["--shard", "1/2", "--strict-leak-sweep"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_help_says_shard_works_with_every_isolation_profile(self):
+        result = run_runner(["--help"])
+        self.assertIn("every --isolation profile", " ".join(result.stdout.split()))
+
+
+class ShardExecutionPolicyFixture(unittest.TestCase):
+    """A sharded run of the real repository keeps the full-run limits."""
+
+    def setUp(self):
+        self.mod = load_runner_module()
+
+    def args(self, *extra):
+        return self.mod.build_arg_parser().parse_args(list(extra))
+
+    def test_whole_repository_shard_requires_retry_and_caps_jobs(self):
+        errors = self.mod.execution_policy_errors(
+            self.args("--shard", "1/4", "--jobs", "5"), self.mod.ROOT.resolve()
+        )
+        self.assertIn("full repository runs require --retries 1 or greater", errors)
+        self.assertTrue(any("--jobs <= 4" in error for error in errors), errors)
+
+    def test_selected_shard_keeps_narrow_diagnostic_freedom(self):
+        errors = self.mod.execution_policy_errors(
+            self.args("--shard", "1/4", "--select", "tools/*.test.py", "--jobs", "8"),
+            self.mod.ROOT.resolve(),
+        )
+        self.assertEqual(errors, [])
+
+
 class NoAmbientExecutionPathFixture(unittest.TestCase):
     """Required regression 9 (owner addendum A): no subcommand or flag hands a
     suite subprocess the caller's ambient environment."""

@@ -172,6 +172,34 @@ class ReplacementTest(unittest.TestCase):
                          ',replacement_input_digest='+self.meta['replacement_input_digest'])
         with self.assertRaises(D.DispatchContractError):R.seal_launch_input(args,'codex','changed')
 
+    def test_a_never_started_attempt_reseals_its_input_from_a_newer_release(self):
+        # The first launcher sealed the input, registered the row and stopped before
+        # its claim. The next launcher runs from a newer release.
+        args=SimpleNamespace(**vars(self.args));args.attempt_id='att-next'
+        args.replacement_input_argv=['--start','--attempt-id','att-next','--prompt-text','the raw task']
+        # The launcher holds the allow-list as a tuple; the sealed file reads it back as a list.
+        args.resolved_permission_posture={'mode':'bypass','mode_flag':'bypassPermissions',
+                 'allowed_tools':('Bash(git status)','Read'),'inherited_default_mode':'default'}
+        first=R.seal_launch_input(args,'codex','the raw task')
+        self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'0',
+                    **D.parse_registry_metadata(first)},'open',append=True)
+        with mock.patch.object(R,'ROOT',Path('/newer/release')):
+            second=R.seal_launch_input(args,'codex','the raw task')
+        self.assertNotEqual(first,second)
+        saved=json.loads((R._directory(self.jobs)/'inputs'/'att-next.json').read_text())
+        self.assertEqual(saved['launch_home'],'/newer/release')
+        self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
+        # Different work, or an attempt that already started, still conflicts.
+        with mock.patch.object(R,'ROOT',Path('/third/release')):
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R.seal_launch_input(args,'codex','changed task')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+        self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'1'},'open',append=True)
+        with mock.patch.object(R,'ROOT',Path('/third/release')):
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R.seal_launch_input(args,'codex','the raw task')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+
     def test_claim_publication_crash_blocks_legacy_retry(self):
         for fail_before_record in [True,False]:
             with self.subTest(before_record=fail_before_record):
@@ -243,6 +271,15 @@ class ReplacementTest(unittest.TestCase):
             env,_=self._launch_env('owner',mock.Mock(side_effect=error))
             self.assertEqual(env['AGENT_ARTIFACT_CYCLE_ID'],'cyc-stale')
 
+    def test_owner_replacement_launch_drops_a_stale_parent_output_dir(self):
+        stale={'AGENT_ARTIFACT_PARENT_OUTPUT_DIR':'/stale/parent'}
+        with mock.patch.dict(os.environ,stale):
+            env,_=self._launch_env('owner',lambda *a,**k:{'AGENT_ARTIFACT_CYCLE_ID':'cyc-route'})
+        self.assertNotIn('AGENT_ARTIFACT_PARENT_OUTPUT_DIR',env)
+        with mock.patch.dict(os.environ,stale):
+            env,_=self._launch_env('owner',lambda *a,**k:{'AGENT_ARTIFACT_PARENT_OUTPUT_DIR':'/route/parent'})
+        self.assertEqual(env['AGENT_ARTIFACT_PARENT_OUTPUT_DIR'],'/route/parent')
+
     def test_stage_replacement_launch_env_is_not_touched_by_the_route_cycle(self):
         env,prep=self._launch_env('frame',lambda *a,**k:{'AGENT_ARTIFACT_CYCLE_ID':'cyc-route'})
         prep.assert_not_called()
@@ -308,6 +345,28 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index('--attempt-id')+1],record['replacement_attempt_id'])
         self.assertEqual(result['reason'],'replacement-launch-pending')
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        seen=[]
+        def slow(command,**kwargs):
+            seen.append((command,kwargs['timeout']))
+            raise subprocess.TimeoutExpired(command,kwargs['timeout'],output='waiting on disk',stderr=b'')
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+            first=R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual(first['reason'],'replacement-launch-timeout')
+        self.assertIn('waiting on disk',first['launcher_diagnostic'])
+        self.assertEqual(seen[0][1],R.LAUNCHER_TIMEOUT_SECONDS)
+        self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
+                    'note':'registered','launch_claimed':'0'},'open',append=True)
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+            R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
+
+    def test_an_io_failure_keeps_its_cause(self):
+        with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
+            result=R.advance(self.jobs,'att-source',run=mock.Mock())
+        self.assertEqual(result['reason'],'replacement-observation-unavailable')
+        self.assertEqual(result['detail'],'OSError: disk gone')
 
     def test_concurrent_actual_spawn_releases_one_fenced_process(self):
         record=self.claim();aid=record['replacement_attempt_id']
@@ -780,5 +839,556 @@ class ReplacementTest(unittest.TestCase):
         second={**retry,'attempt_id':'att-f-second'}
         with self.assertRaises(D.DispatchContractError) as caught:R.admission(self.jobs,spawned,second)
         self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+
+    # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
+    def _owner(self,**changes):
+        self.write({**self.meta,'worker_type':'owner',**changes})
+
+    def _capacity_owner(self):
+        self._owner(note='dead-capacity',failure_class='capacity')
+
+    def _successor(self,record,parent,status='done',**changes):
+        """The registered replacement row of `record`, sealed like the adapter seals it."""
+        aid=record['replacement_attempt_id']
+        source=R._rows(self.jobs.read_text().splitlines())[record['original_attempt_id']][1]
+        replay=R.launch_input(self.jobs,record['original_attempt_id'],source)
+        args=SimpleNamespace(**vars(self.args));args.attempt_id=aid
+        args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        meta={k:v for k,v in parent.items() if k not in ('note','failure_class','launch_outcome','replacement_input_digest')}
+        meta.update(attempt_id=aid,automatic_retry_of=record['original_attempt_id'],launch_claimed='1',
+                    replacement_family_id=record['family_id'],replacement_original_attempt_id=record['original_attempt_id'],
+                    replacement_ordinal='1',replacement_claim_digest=R._digest(record),**changes)
+        meta.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
+        self.write(meta,status,append=True)
+        return meta
+
+    def _die(self,meta,**changes):
+        """Rewrite a successor row as terminal with the given death."""
+        rows=[l for l in self.jobs.read_text().splitlines()
+              if not D.row_has_attempt(l.split('\t')[5],meta['attempt_id'])]
+        self.jobs.write_text('\n'.join(rows)+'\n')
+        meta={**meta,**changes};self.write(meta,append=True);return meta
+
+    def test_death_kind_names_why_a_row_may_be_replaced(self):
+        row=lambda note='',status='done',**m:([ 'now',status],{**self.meta,'worker_type':'owner','note':note,**m})
+        self.assertEqual(R.death_kind(*row('dead-exact-pid')),'silent')
+        self.assertEqual(R.death_kind(*row('dead-capacity',failure_class='capacity')),'capacity')
+        self.assertEqual(R.death_kind(*row('dead-worker-fail',failure_class='capacity')),'capacity')
+        for case in (row('dead-capacity',status='cancelled'),row('dead-capacity',status='killed'),
+                     row('cancelled-by-user'),row('dead-worker-fail'),
+                     (['now','done'],{**self.meta,'worker_type':'frame','note':'dead-capacity'}),
+                     (['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity'})):
+            self.assertIsNone(R.death_kind(*case),case)
+
+    def test_capacity_death_with_invalid_capacity_terminal_is_settled_absent(self):
+        self.absent.stop()
+        def settle(state,failure_class):
+            return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
+                              return_value={'state':state,'failure_class':failure_class})
+        self._capacity_owner()
+        with settle('invalid','capacity'):
+            self.assertEqual(self.claim()['proof']['death_kind'],'capacity')
+        for state,failure in (('invalid','contract-violation'),('valid','pass')):
+            with self.subTest(state=state),settle(state,failure):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.death_proof(*R._rows(self.jobs.read_text().splitlines())['att-source'])
+                self.assertEqual(caught.exception.reason,'replacement-result-settlement-required')
+        # a silent death is settled only by an absent result, capacity evidence does not help it
+        self._owner(note='dead-exact-pid')
+        with settle('invalid','capacity'),self.assertRaises(D.DispatchContractError) as caught:
+            self.claim()
+        self.assertEqual(caught.exception.reason,'replacement-result-settlement-required')
+
+    def test_capacity_replacement_death_opens_a_new_capacity_family_not_exhaustion(self):
+        self._capacity_owner()
+        first=self.claim()
+        self.assertIn('after_capacity',first['logical_node'])
+        one=self._successor(first,self.meta|{'worker_type':'owner'})
+        # the replacement stops at a limit too: a new family for a new pause
+        one=self._die(one,note='dead-capacity',failure_class='capacity')
+        second=R.claim(self.jobs,one['attempt_id'])
+        self.assertNotEqual(second['family_id'],first['family_id'])
+        self.assertEqual(second['logical_node']['after_capacity'],one['attempt_id'])
+        self.assertEqual(second['original_attempt_id'],one['attempt_id'])
+        self.assertEqual(R.claim(self.jobs,one['attempt_id']),second)  # replay, not a third claim
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),2)
+
+    def test_silent_budget_is_one_even_after_capacity_generations(self):
+        self._capacity_owner()
+        first=self.claim()
+        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
+        second=R.claim(self.jobs,one['attempt_id'])
+        two=self._die(self._successor(second,one),note='dead-exact-pid',failure_class='contract')
+        silent=R.claim(self.jobs,two['attempt_id'])     # the one silent replacement is still there
+        self.assertNotIn('after_capacity',silent['logical_node'])
+        three=self._die(self._successor(silent,two),note='dead-exact-pid',failure_class='contract')
+        with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,three['attempt_id'])
+        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        # and the reverse order: the silent budget used first is not refilled by a later pause
+        self.jobs.write_text('');import shutil;shutil.rmtree(R._directory(self.jobs)/'claims');shutil.rmtree(R._directory(self.jobs)/'by-source')
+        self._owner(note='dead-exact-pid')
+        silent=self.claim()
+        one=self._die(self._successor(silent,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
+        pause=R.claim(self.jobs,one['attempt_id'])
+        self.assertIn('after_capacity',pause['logical_node'])
+        two=self._die(self._successor(pause,one),note='dead-exact-pid',failure_class='contract')
+        with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,two['attempt_id'])
+        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+
+    def test_replacement_row_as_source_binds_through_index_not_row(self):
+        self._capacity_owner()
+        first=self.claim()
+        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
+        second=R.claim(self.jobs,one['attempt_id'])
+        row=R._rows(self.jobs.read_text().splitlines())[one['attempt_id']][1]
+        self.assertEqual(row['replacement_family_id'],first['family_id'])       # its own creation, untouched
+        self.assertEqual(R.source_reservation(self.jobs,one['attempt_id'])['family_id'],second['family_id'])
+        self.assertEqual(R.source_binding(self.jobs,row),
+                         (second['family_id'],second['replacement_attempt_id'],R._digest(second)))
+        source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        self.assertEqual(R.source_binding(self.jobs,source),
+                         (first['family_id'],first['replacement_attempt_id'],R._digest(first)))
+        self.assertIsNone(R.source_binding(self.jobs,{**row,'attempt_id':'att-never-a-source'}))
+
+    def test_capacity_wait_writes_nothing(self):
+        self._capacity_owner()
+        def files():return sorted(str(p.relative_to(R._directory(self.jobs))) for p in R._directory(self.jobs).rglob('*') if p.is_file())
+        before=(files(),self.jobs.read_bytes())
+        result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual((result['state'],result['reason'],result['source_attempt_id']),
+                         ('needs-attention','replacement-capacity-wait','att-source'))
+        hold={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True)
+        self.assertEqual((result['reason'],result['retry_at']),('replacement-capacity-wait','2100-01-01T00:00:00Z'))
+        # the hold also stops an ordinary silent replacement before any claim
+        self._owner(note='dead-exact-pid');before=(files(),self.jobs.read_bytes())
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual(result['reason'],'replacement-capacity-wait')
+        self.assertEqual((files(),self.jobs.read_bytes()),before)
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+        # the wait stays a valid supervisor attention item
+        self.assertEqual(R.validate_attention(self.jobs,[result])[0]['reason'],'replacement-capacity-wait')
+
+    def test_a_launched_replacement_is_not_disturbed_by_a_later_hold_or_release_change(self):
+        self._owner(note='dead-exact-pid')
+        record=self.claim()
+        self._successor(record,self.meta|{'worker_type':'owner'},'open')
+        hold={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold), \
+             mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}), mock.patch.object(R,'ROOT',self.root/'newer-release'):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
+        self.assertEqual(result.get('state'),'running',result)
+        self.assertEqual(result['attempt_id'],record['replacement_attempt_id'])
+
+    def test_stage_worker_capacity_death_is_not_a_replacement_source(self):
+        self.write({**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity','failure_class':'capacity'})
+        self.assertIsNone(R.death_kind(['now','done'],R._rows(self.jobs.read_text().splitlines())['att-source'][1]))
+        self.assertEqual(R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True)['state'],'not-applicable')
+        _,_,attention=R.advance_batch(self.jobs,{'att-source'},authority_check=lambda *_:True)
+        self.assertEqual(attention,[])
+        with self.assertRaises(D.DispatchContractError):self.claim()
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def test_capacity_recovery_text_says_resume_not_replace(self):
+        self._capacity_owner()
+        record=self.claim()
+        text=R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',
+                                     jobs_path=self.jobs,attempt_id=record['replacement_attempt_id']))
+        self.assertIn('stopped at a usage limit; this resumes it',text)
+        self.assertNotIn('You replace exact-dead attempt',text)
+        self.assertIn(R.CONTINUATION_WAIT_NOTE,text)
+
+    def test_cleanup_pending_owner_is_settled_only_when_the_runtime_can_prove_it(self):
+        self._owner()
+        calls=[]
+        for state,expected in (('unverifiable',[('att-source',True)]),('live',[]),('quiescent',[])):
+            calls.clear()
+            rows=R._rows(self.jobs.read_text().splitlines())
+            with mock.patch.object(D,'attempt_process_quiescence',return_value=SimpleNamespace(state=state,reason='r')), \
+                 mock.patch.object(D,'resolve_attempt_cleanup',side_effect=lambda j,a,apply=False:calls.append((a,apply))):
+                R._settle_terminal_cleanup(self.jobs,rows,'att-source',rows['att-source'][1])
+            self.assertEqual(calls,expected,state)
+
+    def test_release_drift_is_a_diagnostic_and_identity_stays_strict(self):
+        replay=R.launch_input(self.jobs,'att-source',R._rows(self.jobs.read_text().splitlines())['att-source'][1])
+        old={**replay,'launch_home':'/releases/v-old','resolved':{'model':'m1','permission_mode':'default'}}
+        R._check_tuple(old,old)
+        newer={**old,'launch_home':replay['launch_home'],'resolved':{'model':'m2','permission_mode':'default'}}
+        with mock.patch.dict(os.environ,{'HEARTING_GATES':'off'}):
+            R._check_tuple(newer,old)
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R._check_tuple({**newer,'resolved':{'model':'m2','permission_mode':'config'}},old)
+            self.assertEqual((caught.exception.reason,caught.exception.detail),('replacement-input-tuple-mismatch','resolved'))
+            with self.assertRaises(D.DispatchContractError):R._check_tuple({**newer,'harness':'claude'},old)
+        with mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}),self.assertRaises(D.DispatchContractError) as caught:
+            R._check_tuple(newer,old)
+        self.assertEqual(caught.exception.reason,'replacement-runtime-drift')
+        same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
+        with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
+
+
+class FrameTopCapacityTest(unittest.TestCase):
+    """D2: a frame leg at the `top` the frame rule assigned is replaced once, at `deep`, when it stops
+    at a usage limit. Nothing else lowers a profile, and a second limit is the existing exhaustion."""
+    write=ReplacementTest.write
+    claim=ReplacementTest.claim
+    _successor=ReplacementTest._successor
+    _die=ReplacementTest._die
+
+    harness='claude'
+
+    def setUp(self):
+        ReplacementTest.setUp(self)
+        import model_profile
+        self.node={'id':'frame','worker_type':'frame','model_profile':'top','dispatch_depth':1,'profile_demand':None,
+                   'profile_selection':model_profile.resolve_profile_demand(None,explicit_profile='top')}
+        self.set_route()
+        self.args.model_profile='top';self.args.model='m-top'
+        self.args.resolved_model_settings={'profile':'top','model':'m-top','effort':'max'}
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(note='dead-capacity',failure_class='capacity',model_profile='top',harness=self.harness,
+                         route_file=str(self.path),model='m-top',
+                         **D.parse_registry_metadata(R.seal_launch_input(self.args,self.harness,'the raw task')))
+        self.write(self.meta)
+
+    def set_route(self,**changes):
+        self.route.update(effective_intensity='standard',nodes=[self.node],profile_selection_contract_version=1,**changes)
+        self.path.write_text(json.dumps(self.route))
+
+    def rows(self):return R._rows(self.jobs.read_text().splitlines())
+
+    def kind(self,**changes):
+        self.write({**self.meta,**changes})
+        fields,meta=self.rows()['att-source']
+        return R.death_kind(fields,meta,jobs=self.jobs)
+
+    def candidate(self,record,profile='deep'):
+        """The replacement row as a wrapper registers it, launched at `profile`."""
+        source=self.rows()['att-source'][1]
+        replay=R.launch_input(self.jobs,'att-source',source)
+        args=SimpleNamespace(**vars(self.args));args.attempt_id=record['replacement_attempt_id']
+        args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        args.model_profile=profile;args.model='m-'+profile
+        args.resolved_model_settings={'profile':profile,'model':'m-'+profile,'effort':'high'}
+        meta={**self.meta,'attempt_id':record['replacement_attempt_id'],'automatic_retry_of':'att-source',
+              'model_profile':profile,'model':'m-'+profile}
+        for key in ('note','failure_class'):meta.pop(key)
+        meta.update(D.parse_registry_metadata(R.seal_launch_input(args,self.harness,'the raw task')))
+        return meta
+
+    def test_a_frame_rule_top_capacity_death_is_its_own_kind(self):
+        self.assertEqual(self.kind(),R.FRAME_CAPACITY)
+        self.assertEqual(self.kind(note='dead-worker-fail',failure_class='capacity'),R.FRAME_CAPACITY)
+
+    def test_nothing_but_a_frame_rule_top_capacity_death_is_a_downgrade_kind(self):
+        for label,changes in {
+            'auth':{'note':'dead-worker-fail','failure_class':'auth'},
+            'valid fail':{'note':'dead-worker-fail','failure_class':'contract'},
+            'cancelled':{'note':'cancelled-by-user','failure_class':''},
+            'unverifiable death':{'note':'dead-unverifiable','failure_class':''},
+            'not at top':{'model_profile':'deep'},
+            'a replacement row':{'replacement_original_attempt_id':'att-earlier'},
+            'a stage worker':{'worker_type':'stage','dispatch_depth':'2'},
+        }.items():
+            with self.subTest(label):self.assertNotEqual(self.kind(**changes),R.FRAME_CAPACITY)
+        self.assertIsNone(self.kind(note='dead-worker-fail',failure_class='auth'))
+        fields,meta=self.rows()['att-source']
+        self.assertIsNone(R.death_kind(['now','cancelled'],{**self.meta,'model_profile':'top'},jobs=self.jobs))
+        self.assertIsNone(R.death_kind(fields,{**self.meta},lines=None))  # no registry in hand: no reading of the route
+
+    def test_a_top_the_person_chose_is_never_lowered(self):
+        for label,changes in {
+            'pin with effort':{'selection_pins':{'contract_version':1,'frame':{'harness':'claude','model':None,'effort':'max'}}},
+            'pin with model':{'selection_pins':{'contract_version':1,'owner':{'harness':'claude','model':'opus','effort':None}}},
+            'explicit node profile':{'explicit_profiles':{'frame':'top'}},
+        }.items():
+            with self.subTest(label):
+                self.set_route(**changes)
+                self.assertIsNone(self.kind())
+                with self.assertRaises(D.DispatchContractError) as caught:self.claim()
+                self.assertEqual(caught.exception.reason,'replacement-not-silent-death')
+        self.set_route(selection_pins={'contract_version':1,'frame':{'harness':'claude','model':None,'effort':None}},
+                       explicit_profiles={'__owner__':'deep'})
+        self.assertEqual(self.kind(),R.FRAME_CAPACITY)  # a harness-only pin and an owner profile choose no frame profile
+        self.set_route();self.node['model_profile']='deep'
+        self.set_route();self.assertIsNone(self.kind())
+
+    def test_the_claim_carries_the_one_transition_and_stays_a_single_logical_family(self):
+        record=self.claim()
+        self.assertEqual(record['profile_transition'],
+                         {'from':'top','to':'deep','reason':'capacity','ordinal':1,'origin':'frame-rule'})
+        self.assertNotIn('after_capacity',record['logical_node'])
+        self.assertEqual(record['logical_node']['node'],'frame')
+        self.assertEqual(record['proof']['death_kind'],R.FRAME_CAPACITY)
+        self.assertEqual(self.claim(),record)
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_an_ordinary_silent_death_claim_has_no_transition(self):
+        self.write({**self.meta,'note':'dead-exact-pid','failure_class':'contract'})
+        record=self.claim()
+        self.assertNotIn('profile_transition',record)
+        source=self.rows()['att-source'][1]
+        argv=R._replacement_argv(record,source,R.launch_input(self.jobs,'att-source',source))
+        self.assertEqual(argv[argv.index('--model-profile')+1] if '--model-profile' in argv else None,None)
+
+    def test_the_replacement_argv_resolves_deep_only_with_the_transition(self):
+        record=self.claim();source=self.rows()['att-source'][1]
+        replay=R.launch_input(self.jobs,'att-source',source)
+        replay['argv']=['--model-profile','top','--route-node','frame']
+        argv=R._replacement_argv(record,source,replay)
+        self.assertEqual(argv[argv.index('--model-profile')+1],'deep')
+        bare={k:v for k,v in record.items() if k!='profile_transition'}
+        with self.assertRaises(D.DispatchContractError) as caught:R._replacement_argv(bare,source,replay)
+        self.assertEqual(caught.exception.reason,'replacement-profile-transition-invalid')
+
+    def test_admission_accepts_the_verified_deep_launch_and_refuses_every_other_one(self):
+        record=self.claim();lines=self.jobs.read_text().splitlines()
+        self.assertEqual(R.admission(self.jobs,lines,self.candidate(record)),record)
+
+    def test_a_launch_at_any_profile_but_the_transition_target_is_refused(self):
+        record=self.claim();lines=self.jobs.read_text().splitlines()
+        self.assertEqual(self.claim(),record)
+        for profile in ('top','balanced-deep','light'):
+            with self.subTest(profile):
+                self.args.attempt_id='att-source'
+                (R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).unlink(missing_ok=True)
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.admission(self.jobs,lines,self.candidate(record,profile))
+                self.assertIn(caught.exception.reason,{'replacement-input-tuple-mismatch','replacement-argv-mismatch'})
+
+    def test_a_claim_less_deep_launch_is_refused(self):
+        # a silent-death claim on the same frame leg: deep without a transition is a tuple mismatch
+        self.write({**self.meta,'note':'dead-exact-pid','failure_class':'contract'})
+        record=self.claim();lines=self.jobs.read_text().splitlines()
+        self.assertNotIn('profile_transition',record)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.admission(self.jobs,lines,self.candidate(record))
+        self.assertEqual(caught.exception.reason,'replacement-input-tuple-mismatch')
+
+    def test_a_claim_that_says_more_or_less_than_the_frame_rule_is_refused(self):
+        record=self.claim();path=R._record_path(self.jobs,record['family_id'])
+        for label,change in {'other target':{'to':'balanced-deep'},'other reason':{'reason':'auth'},
+                             'other origin':{'origin':'user-pin'},'second ordinal':{'ordinal':2}}.items():
+            with self.subTest(label):
+                forged={**record,'profile_transition':{**record['profile_transition'],**change}}
+                with self.assertRaises(D.DispatchContractError) as caught:R._transition_of(forged)
+                self.assertEqual(caught.exception.reason,'replacement-profile-transition-invalid')
+        stripped={k:v for k,v in record.items() if k!='profile_transition'}
+        with self.assertRaises(D.DispatchContractError):R._transition_of(stripped)
+        added={**record,'proof':{**record['proof'],'death_kind':'silent'}}
+        with self.assertRaises(D.DispatchContractError):R._transition_of(added)
+
+    def test_the_one_reader_verifies_the_claim_against_route_node_and_attempt(self):
+        record=self.claim();aid=record['replacement_attempt_id']
+        read=lambda **kw:R.read_profile_transition(self.jobs,**{'route':self.route,'node':'frame','attempt_id':aid,**kw})
+        self.assertEqual(read(),record['profile_transition'])
+        self.assertIsNone(read(attempt_id='att-invented'))
+        with self.assertRaises(D.DispatchContractError) as caught:read(node='frame-alternative')
+        self.assertEqual(caught.exception.reason,'replacement-profile-transition-mismatch')
+        with self.assertRaises(D.DispatchContractError):read(route={**self.route,'route_hash':'sha256:other'})
+        # a source that is no longer a proven capacity death stops the claim from counting
+        self.write({**self.rows()['att-source'][1],'note':'dead-worker-fail','failure_class':'contract'})
+        with self.assertRaises(D.DispatchContractError) as caught:read()
+        self.assertEqual(caught.exception.reason,'replacement-not-silent-death')
+
+    def test_the_reader_has_nothing_to_say_about_an_ordinary_replacement(self):
+        self.write({**self.meta,'note':'dead-exact-pid','failure_class':'contract'})
+        record=self.claim()
+        self.assertIsNone(R.read_profile_transition(self.jobs,route=self.route,node='frame',
+                                                    attempt_id=record['replacement_attempt_id']))
+
+    def test_spawn_admission_runs_deep_only_with_the_claim_and_a_second_limit_spawns_nothing(self):
+        record=self.claim();aid=record['replacement_attempt_id']
+        candidate=self.candidate(record)
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\tframe\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs,aid,row,launch=False))
+        class Spawned(Exception):pass
+        def spawn(_fd):raise Spawned()
+        with self.assertRaises(Spawned):   # admission passed; only the fake spawn stopped it
+            D.spawn_claimed_attempt(self.jobs,aid,parent_binding=None,spawn=spawn)
+        self.assertEqual(self.rows()[aid][1]['model_profile'],'deep')
+        self.assertEqual(self.rows()[aid][1]['replacement_claim_digest'],R._digest(record))
+        # the replacement stops at a limit too: no third attempt, the existing exhaustion
+        self._die(self.rows()[aid][1],note='dead-capacity',failure_class='capacity',launch_claimed='1')
+        with self.assertRaises(D.DispatchContractError):R.claim(self.jobs,aid)   # no kind: the replacement is nobody's source
+        spawned=[]
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.admission(self.jobs,self.jobs.read_text().splitlines(),
+                        {**self.candidate(record),'attempt_id':'att-third','automatic_retry_of':aid})
+        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        self.assertEqual(spawned,[])
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_the_actual_spawn_verifies_the_transition_again(self):
+        record=self.claim();aid=record['replacement_attempt_id'];candidate=self.candidate(record)
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\tframe\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs,aid,row,launch=False))   # registered at deep with the claim
+        # before the spawn the source stops being a proven capacity death: the registered deep row may not run
+        self._die(self.rows()['att-source'][1],note='dead-worker-fail',failure_class='contract')
+        spawned=[]
+        with self.assertRaises(D.DispatchContractError) as caught:
+            D.spawn_claimed_attempt(self.jobs,aid,parent_binding=None,spawn=lambda _fd:spawned.append(aid))
+        self.assertEqual(caught.exception.reason,'replacement-not-silent-death')
+        self.assertEqual(spawned,[])
+
+    def test_advance_replaces_once_at_deep_and_a_second_capacity_death_needs_attention(self):
+        commands=[]
+        def run(command,**kw):commands.append(command);return SimpleNamespace(returncode=0)
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None),\
+                mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None) as hold,\
+                mock.patch.object(R,'_retry_model',return_value='m-deep') as retry:
+            result=R.advance(self.jobs,'att-source',run=run)
+        self.assertEqual(result['reason'],'replacement-launch-pending')  # the fake launcher registered nothing
+        retry.assert_called_once_with(mock.ANY,R.FRAME_CAPACITY)
+        self.assertEqual(len(commands),1)
+        argv=commands[0]
+        self.assertEqual(argv[argv.index('--model-profile')+1],'deep') if '--model-profile' in argv else None
+        record=result['record'];aid=record['replacement_attempt_id']
+        self._die(self._successor(record,self.meta,'open'),note='dead-capacity',failure_class='capacity')
+        _,_,attention=R.advance_batch(self.jobs,{'att-source'},authority_check=lambda *_:True)
+        self.assertEqual([a['reason'] for a in attention],['automatic-replacement-exhausted'])
+        self.assertEqual(attention[0]['source_attempt_id'],aid)
+        self.assertEqual(len(commands),1)   # nothing was launched for the second death
+
+    def test_advance_asks_for_the_hold_of_the_model_it_would_run(self):
+        seen=[]
+        def hold(jobs,harness,*,model=None,**kw):seen.append((harness,model));return None
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None),\
+                mock.patch('dispatch_capacity_evidence.harness_hold',side_effect=hold),\
+                mock.patch('model_profile.resolve_runtime_profile',return_value=({'model':'m-deep'},None)):
+            R.advance(self.jobs,'att-source',run=lambda *a,**k:SimpleNamespace(returncode=0))
+        self.assertEqual(seen,[('claude','m-deep')])
+
+    def test_a_waiting_hold_is_not_a_death_and_writes_nothing(self):
+        hold={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_capacity_evidence.harness_hold',return_value=hold),\
+                mock.patch.object(R,'_retry_model',return_value='m-deep'):
+            result=R.advance(self.jobs,'att-source',run=lambda *a,**k:self.fail('launched'))
+        self.assertEqual(result['reason'],'replacement-capacity-wait')
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def test_the_summary_names_node_profiles_cause_and_attempt(self):
+        import work_start as W
+        self.assertIsNone(W._frame_downgrade_summary(self.route,self.jobs))
+        record=self.claim()
+        self.assertIsNone(W._frame_downgrade_summary(self.route,self.jobs))   # a claim alone ran nothing
+        meta=self._successor(record,self.meta,'done',model_profile='deep',route_node='frame',route_id='rt-test')
+        self.assertEqual(W._frame_downgrade_summary(self.route,self.jobs),
+                         [{'node':'frame','original_profile':'top','actual_profile':'deep','cause':'capacity',
+                           'attempt_id':record['replacement_attempt_id'],'original_attempt_id':'att-source'}])
+        # an ordinary silent replacement is not a downgrade
+        self.write({**self.meta,'note':'dead-exact-pid','failure_class':'contract'})
+        self.assertIsNone(W._frame_downgrade_summary(self.route,self.jobs))
+
+
+
+class FrameCapacityFlow:
+    """argv -> profile -> register -> spawn claim for one adapter, with the real wrapper parser and
+    profile binding, the real transition reader and the real registration/spawn admission. Only the
+    process spawn is a stand-in. Each adapter's `dispatch-headless.sd45.test.py` runs this once."""
+
+    def __init__(self, wrapper, harness, case):
+        self.wrapper, self.harness, self.case = wrapper, harness, case
+
+    def fixture(self, death):
+        fx = FrameTopCapacityTest('test_a_frame_rule_top_capacity_death_is_its_own_kind')
+        fx.harness = self.harness
+        fx.setUp()
+        self.case.addCleanup(fx.doCleanups)
+        self.case.addCleanup(fx.tmp.cleanup)
+        (R._directory(fx.jobs)/'inputs/att-source.json').unlink()
+        args = self.args(fx, self.cli(fx, 'att-source', 'top'))
+        fx.meta.update(death, model=args.resolved_model_settings['model'],
+                       **D.parse_registry_metadata(R.seal_launch_input(args, self.harness, 'the raw task')))
+        fx.write(fx.meta)
+        return fx
+
+    def cli(self, fx, attempt, profile, *extra):
+        return ['--start', '--attempt-id', attempt, '--jobs', str(fx.jobs), '--worktree', str(fx.root),
+                '--prompt-text', 'the raw task', '--slug', 'frame-x', '--capability', 'autopilot-code',
+                '--capability-mode', 'dev', '--worker-type', 'frame', '--unit', 'plan/frame',
+                '--dispatch-depth', '1', '--registered-worker', '1', '--route-file', str(fx.path),
+                '--route-id', fx.route['route_id'], '--route-hash', fx.route['route_hash'],
+                '--route-node', 'frame', '--model-role', 'deep maker', '--model-profile', profile, *extra]
+
+    def args(self, fx, argv):
+        args = self.wrapper.parser().parse_args(argv)
+        args.replacement_input_argv = list(argv)
+        args.jobs_path = Path(args.jobs)
+        args.worktree = str(Path(args.worktree).resolve())
+        args.resolved_model_settings = self.wrapper.resolve_model_settings(args)
+        return args
+
+    def register(self, fx, args):
+        """The row the wrapper would register for these parsed args (its own sealed input included)."""
+        meta = {k: v for k, v in fx.meta.items() if k not in ('note', 'failure_class', 'replacement_input_digest')}
+        settings = args.resolved_model_settings
+        meta.update(attempt_id=args.attempt_id, automatic_retry_of='att-source',
+                    model_profile=settings['profile'], model=settings['model'])
+        meta.update(D.parse_registry_metadata(R.seal_launch_input(args, self.harness, 'the raw task')))
+        row = 'now\topen\t'+str(fx.root)+'\t'+str(fx.root)+'\tframe\t'+','.join(k+'='+v for k, v in meta.items())
+        return D.claim_attempt_row(fx.jobs, args.attempt_id, row, launch=False)
+
+    def spawn(self, fx, attempt):
+        spawned = []
+        class Spawned(Exception): pass
+        def stand_in(_fd):
+            spawned.append(attempt); raise Spawned()
+        try:
+            D.spawn_claimed_attempt(fx.jobs, attempt, parent_binding=None, spawn=stand_in)
+        except Spawned:
+            pass
+        return spawned
+
+    def run(self):
+        case = self.case
+        fx = self.fixture({'note': 'dead-capacity', 'failure_class': 'capacity'})
+        record = fx.claim()
+        source = fx.rows()['att-source'][1]
+        cmd = R._command(fx.jobs, record, source, R.launch_input(fx.jobs, 'att-source', source))
+        case.assertTrue(cmd[1].endswith(f'adapters/{self.harness}/bin/dispatch-headless.py'), cmd[1])
+        argv = cmd[2:]
+        case.assertEqual(argv[argv.index('--model-profile')+1], 'deep')
+        args = self.args(fx, argv)
+        case.assertEqual(args.resolved_model_settings['profile'], 'deep')
+        import model_profile
+        case.assertEqual(model_profile.selection_receipt(args)['profile_selection_source'], 'explicit')
+        case.assertTrue(self.register(fx, args))
+        row = fx.rows()[args.attempt_id][1]
+        case.assertEqual((row['model_profile'], row['replacement_claim_digest']), ('deep', R._digest(record)))
+        case.assertEqual(self.spawn(fx, args.attempt_id), [args.attempt_id])   # admitted at spawn, at deep
+        # the replacement stops at a limit too: nothing registers, nothing spawns
+        fx._die(fx.rows()[args.attempt_id][1], note='dead-capacity', failure_class='capacity', launch_claimed='1')
+        _, _, attention = R.advance_batch(fx.jobs, {'att-source'}, authority_check=lambda *_: True)
+        case.assertEqual([a['reason'] for a in attention], ['automatic-replacement-exhausted'])
+        third = self.args(fx, self.cli(fx, 'att-third', 'deep', '--automatic-retry-of', args.attempt_id))
+        with case.assertRaises(D.DispatchContractError) as refused:
+            self.register(fx, third)
+        case.assertEqual(refused.exception.reason, 'automatic-replacement-exhausted')
+        case.assertNotIn('att-third', fx.rows())
+        with case.assertRaises(D.DispatchContractError) as nothing:   # no row to claim, so no spawn either
+            self.spawn(fx, 'att-third')
+        case.assertEqual(nothing.exception.reason, 'attempt-row-not-unique')
+        case.assertEqual(len(list((R._directory(fx.jobs)/'claims').glob('*.json'))), 1)
+
+    def run_claimless(self):
+        """`deep` with no claim: refused by the profile binding, and again by registration."""
+        case = self.case
+        fx = self.fixture({'note': 'dead-exact-pid', 'failure_class': 'contract'})   # a silent death: no transition
+        record = fx.claim()
+        case.assertNotIn('profile_transition', record)
+        forged = self.cli(fx, record['replacement_attempt_id'], 'deep', '--automatic-retry-of', 'att-source')
+        args = self.args(fx, forged)
+        import model_profile
+        with case.assertRaises(model_profile.ModelProfileError) as refused:
+            model_profile.selection_receipt(args)
+        case.assertEqual(refused.exception.reason, 'profile-selection-mismatch')
+        with case.assertRaises(D.DispatchContractError) as refused:   # even past the wrapper, the registry says no
+            self.register(fx, args)
+        case.assertEqual(refused.exception.reason, 'replacement-input-tuple-mismatch')
+        case.assertNotIn(record['replacement_attempt_id'], fx.rows())
+
 
 if __name__=='__main__':unittest.main()

@@ -330,6 +330,64 @@ class OpenCodeParentBindingDryRun(unittest.TestCase):
         self.assertIn("parent_attempt_id=-", result.stdout)
 
 
+class OpenCodeSupervisedOwner(unittest.TestCase):
+    """Every registered depth-1 owner runs under the session supervisor, with or without a sealed route binding."""
+
+    def args(self, **overrides):
+        base = dict(
+            dispatch_depth=1, worker_type="owner", intensity="quick", attempt_id="att-quick", owner_route_binding=None,
+            worktree="/tmp/fixture-worktree", jobs_path=Path("/tmp/jobs.log"), agent="build",
+            route_file=None, route_id=None, route_hash=None, route_node=None,
+            resolved_model_settings={"source": "profile", "model": "opencode-go/glm-5.3-flash", "variant": "runtime-default"},
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def command(self, **overrides):
+        return WH.shell_command(self.args(**overrides), Path("/tmp/p.txt"), Path("/tmp/l.log"))
+
+    def test_selection_covers_bound_and_quick_depth_one_owners_only(self):
+        binding = types.SimpleNamespace(route_file="/tmp/b.json", route_id="rt-b", route_hash="sha256:b")
+        self.assertTrue(WH._supervised_owner(self.args()))
+        self.assertTrue(WH._supervised_owner(self.args(owner_route_binding=binding)))
+        self.assertTrue(WH._supervised_owner(self.args(owner_route_binding=binding, intensity="strong")))
+        self.assertTrue(WH._supervised_owner(self.args(attempt_id=None)))
+        # A standard+ owner without a sealed binding keeps its one-shot launch.
+        for overrides in (dict(dispatch_depth=2), dict(worker_type="stage"), dict(worker_type="review", dispatch_depth=2),
+                          dict(intensity="standard"), dict(intensity="strong")):
+            with self.subTest(**overrides):
+                self.assertFalse(WH._supervised_owner(self.args(**overrides)))
+                self.assertTrue(self.command(**overrides).startswith("opencode run"))
+
+    def test_quick_owner_command_is_the_session_supervisor_on_the_same_model(self):
+        command = self.command()
+        self.assertIn("claude-session-supervisor.py --runtime-harness opencode", command)
+        self.assertIn("--parent-attempt-id att-quick", command)
+        self.assertIn("--opencode-agent build --model opencode-go/glm-5.3-flash --variant runtime-default", command)
+        self.assertNotIn("--route-file", command)
+        self.assertNotIn("--enable-terminal-commit", command)
+
+    def test_route_arguments_are_the_binding_or_a_whole_one_shot_tuple(self):
+        route = dict(route_file="/tmp/r.json", route_id="rt-1", route_hash="sha256:1", route_node="one-shot")
+        self.assertIn("--route-file /tmp/r.json --route-id rt-1 --route-hash sha256:1", self.command(**route))
+        for missing in ("route_file", "route_id", "route_hash"):
+            self.assertNotIn("--route-", self.command(**{**route, missing: None}))
+        self.assertNotIn("--route-", self.command(**{**route, "route_node": "execute"}))
+        binding = types.SimpleNamespace(route_file="/tmp/b.json", route_id="rt-b", route_hash="sha256:b")
+        self.assertIn("--route-file /tmp/b.json --route-id rt-b --route-hash sha256:b",
+                      self.command(owner_route_binding=binding, **route))
+
+    def test_registration_opens_input_only_for_a_supervised_owner(self):
+        with mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+            WH.initialize_supervised_owner_input(self.args(), Path("/tmp/jobs.log"))
+            init.assert_called_once_with(Path("/tmp/jobs.log"), "att-quick", "opencode-next-turn")
+        with mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+            WH.initialize_supervised_owner_input(self.args(dispatch_depth=2), Path("/tmp/jobs.log"))
+            init.assert_not_called()
+        with mock.patch("dispatch_owner_input.initialize_owner_input", side_effect=OSError("disk")):
+            WH.initialize_supervised_owner_input(self.args(), Path("/tmp/jobs.log"))
+
+
 class OpenCodePermissionDefault(unittest.TestCase):
     # Item 1(b): headless "ask" auto-rejects and truncates the session; "deny"
     # returns a structured tool error instead. Measured 2026-08-07
@@ -717,6 +775,22 @@ class OpenCodeLaunchFenceFailure(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         os.close(write_fd)
         self.assertEqual(WH.read_launch_fence_failure(read_fd), (None, True))
+
+
+class OpenCodeFrameCapacityDowngrade(unittest.TestCase):
+    """D2 end to end on this adapter: argv -> profile -> register -> spawn claim. The flow itself lives
+    in utilities/dispatch_replacement.test.py (`FrameCapacityFlow`); here the real wrapper binds it."""
+    @staticmethod
+    def flow(case):
+        spec = importlib.util.spec_from_file_location("frame_capacity_flow", ROOT / "utilities/dispatch_replacement.test.py")
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module.FrameCapacityFlow(WH, "opencode", case)
+
+    def test_verified_transition_runs_deep_and_a_second_capacity_death_spawns_nothing(self):
+        self.flow(self).run()
+
+    def test_deep_without_a_claim_is_refused_by_the_profile_binding_and_by_registration(self):
+        self.flow(self).run_claimless()
 
 
 if __name__=="__main__": unittest.main()
