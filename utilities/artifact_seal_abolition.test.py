@@ -4,14 +4,21 @@
 One file for the whole §45 loop, one slice prefix per implementation step:
 `test_a1_*` covers D-123 (writes, parents, one inclusion rule, binding);
 `test_a2_*` covers the preserved copies, the next-document publisher and the
-D-127 proofs (a finished cycle stays finished after its files change).  Every
+D-127 proofs (a finished cycle stays finished after its files change);
+`test_b1_*` covers the bounded, lock-free scan of D-124 and the history calls of
+D-125 (a refresh is one short publication, never a long lock).  Every
 fixture runs on an isolated temporary artifact root; the real canonical root,
 registry, and routes directory are never touched.
 """
+import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
+import time
+import tracemalloc
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +31,7 @@ import artifact_index  # noqa: E402
 import artifact_manifest as M  # noqa: E402
 import artifact_producer as P  # noqa: E402
 import artifact_receipt as RCPT  # noqa: E402
+import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit as T  # noqa: E402
 
 _FX_SPEC = importlib.util.spec_from_file_location(
@@ -1032,6 +1040,693 @@ class A2CampaignCloseTest(SealAbolitionBase):
         self.assertEqual(rows[member["cycle_id"]]["state"], "open")
         self.assertIsNone(rows[member["cycle_id"]]["manifest_digest"])
         self.assertEqual(CAMP.close(self.root, campaign)["status"], "satisfied")
+
+
+class FakeHistoryModule(types.ModuleType):
+    """Same API shape as `artifact_history` (f0): make_event / publish_events_locked / publish_events."""
+
+    class HistoryError(Exception):
+        pass
+
+    class HistoryPublishError(HistoryError):
+        pass
+
+    def __init__(self):
+        super().__init__("artifact_history")
+        self.made = []
+        self.published = []
+        self.fail_publish = False
+        self.on_publish = None
+
+    def make_event(self, **kwargs):
+        self.made.append(dict(kwargs))
+        for key in ("kind", "target_type", "target_id", "target_path", "operation", "field", "before",
+                    "after", "reason", "transaction_id"):
+            if key not in kwargs:
+                raise self.HistoryError("event-invalid:" + key)
+        return {"event_id": kwargs.get("event_id") or "hevt_" + "0" * 32, **kwargs}
+
+    def publish_events_locked(self, root, events):
+        if not adm.holds_lock(Path(root)):
+            raise self.HistoryError("admission-lock-required")
+        if self.on_publish is not None:
+            self.on_publish(root, events)
+        if self.fail_publish:
+            raise self.HistoryPublishError("simulated publish failure")
+        directory = Path(root) / ".runtime/artifact-producer/v1/history/2026-10"
+        directory.mkdir(parents=True, exist_ok=True)
+        for event in events:
+            path = directory / (event["event_id"] + ".jsonl")
+            raw = (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
+            if path.exists():
+                if path.read_bytes() != raw:
+                    raise self.HistoryPublishError("conflict")
+                continue
+            path.write_bytes(raw)
+            self.published.append(event)
+        if events:
+            (directory.parent / "LATEST.json").write_text(
+                json.dumps({"event_id": events[-1]["event_id"], "count": len(self.published)}), encoding="utf-8")
+        return [event["event_id"] for event in events]
+
+    def publish_events(self, root, events, **_kwargs):
+        fd = adm._acquire_lock(Path(root), 5.0)
+        try:
+            return self.publish_events_locked(root, events)
+        finally:
+            adm._release_lock(Path(root), fd)
+
+
+class B1RefreshBase(SealAbolitionBase):
+    """§45 D-124/D-125: the bounded refresh of a closed cycle."""
+
+    def setUp(self):
+        super().setUp()
+        self.history = FakeHistoryModule()
+        patcher = mock.patch.dict(sys.modules, {"artifact_history": self.history})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The per-cycle interval has its own test; the others observe a cycle again at once.
+        interval = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "0"})
+        interval.start()
+        self.addCleanup(interval.stop)
+
+    def closed(self, campaign_key="b1-stream", files=None, activate=True):
+        if activate:
+            self.activate()
+        route, route_file = self.route(slug=campaign_key, campaign_key=campaign_key)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        for rel, data in (files or {"plans/cycle/plan.md": b"plan body\n"}).items():
+            self.write_output(result, rel, data)
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        # The close line has its own test; the refresh tests count only what a refresh sends.
+        self.history.made.clear()
+        self.history.published.clear()
+        return result
+
+    def edit(self, result, rel, data):
+        (Path(result["cycle_dir"]) / "artifacts" / rel).write_bytes(data)
+
+    def refresh(self, result, **kwargs):
+        kwargs.setdefault("trigger", "turn-end")
+        return P.refresh_cycle(self.root, result["cycle_id"], **kwargs)
+
+    def manifest_path(self, result):
+        return Path(result["cycle_dir"]) / "manifest.json"
+
+    def snapshot_names(self, result):
+        directory = L.manifest_snapshot_dir(self.root, result["cycle_id"])
+        return sorted(p.name for p in directory.iterdir()) if directory.is_dir() else []
+
+    def tree_state(self, result):
+        """(path -> (size, mtime_ns)) of everything a quiet refresh must leave alone."""
+        cycle_id = result["cycle_id"]
+        watched = [self.manifest_path(result), P.cycle_record_path(self.root, cycle_id), adm._index_path(self.root),
+                   self.root / ".runtime/artifact-producer/v1/history",
+                   L.manifest_snapshot_dir(self.root, cycle_id),
+                   self.root / ".runtime/artifact-producer/v1/checkpoints"]
+        state = {}
+        for path in watched:
+            for item in ([path] if path.is_file() else sorted(path.rglob("*")) if path.is_dir() else []):
+                if item.is_file():
+                    stat = item.stat()
+                    state[str(item.relative_to(self.root))] = (stat.st_size, stat.st_mtime_ns)
+        return state
+
+
+class B1RefreshTest(B1RefreshBase):
+    # -- A28-3 -----------------------------------------------------------
+    def test_b1_taslp_25_plus26_modified4_and_noop(self):
+        files = {f"plans/cycle/declared_{i:02d}.md": f"declared {i}\n".encode() for i in range(25)}
+        result = self.closed("b1-taslp", files)
+        cycle_id = result["cycle_id"]
+        before = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        raw_before = self.manifest_path(result).read_bytes()
+        record_before = P.read_cycle_record(self.root, cycle_id)
+        for i in range(4):
+            self.edit(result, f"plans/cycle/declared_{i:02d}.md", f"declared {i}, edited\n".encode())
+        for i in range(26):
+            self.write_output(result, f"plans/cycle/added_{i:02d}.md", f"added {i}\n".encode())
+        out = self.refresh(result)
+        self.assertEqual(out["status"], "emitted", out)
+        after = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        self.assertEqual(len(after["artifact_revisions"]), 51)
+        self.assertEqual(len(self.history.made), 30)
+        self.assertEqual(len(self.history.published), 30)
+        self.assertEqual(sorted(e["operation"] for e in self.history.published),
+                         ["add"] * 26 + ["update"] * 4)
+        kinds = {(e["kind"], e["target_type"], e["actor_by"]) for e in self.history.published}
+        self.assertEqual(kinds, {("artifact", "artifact", "rule")})
+        sample = next(e for e in self.history.published if e["operation"] == "update")
+        self.assertTrue(sample["field"].startswith("artifacts/plans/cycle/declared_"))
+        self.assertEqual(set(sample["before"]), {"digest", "bytes"})
+        self.assertEqual(set(sample["after"]), {"digest", "bytes"})
+        self.assertEqual(sample["reason"], "turn-end")
+        # Rows that did not change are byte for byte the same; the close itself is not rewritten.
+        old_rows = {r["locator"]["path"]: r for r in before["artifact_revisions"]}
+        new_rows = {r["locator"]["path"]: r for r in after["artifact_revisions"]}
+        for i in range(4, 25):
+            rel = f"artifacts/plans/cycle/declared_{i:02d}.md"
+            self.assertEqual(json.dumps(old_rows[rel], sort_keys=True), json.dumps(new_rows[rel], sort_keys=True))
+            self.assertEqual(_row_bytes(before["artifacts"], "artifact_id", old_rows[rel]["artifact_id"]),
+                             _row_bytes(after["artifacts"], "artifact_id", old_rows[rel]["artifact_id"]))
+        for key in ("cycle", "routes", "manifest_id"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertEqual(after["events"][:len(before["events"])], before["events"])
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual((record["state"], record["cycle_state"], record["sealed_on"]),
+                         ("sealed", "completed", record_before["sealed_on"]))
+        # The earlier document stays as a preserved copy, byte for byte.
+        copies = {p.name: p.read_bytes() for p in L.manifest_snapshot_dir(self.root, cycle_id).iterdir()}
+        self.assertIn(raw_before, copies.values())
+        self.assertEqual(len(copies), 2)
+        self.assertTrue(adm.verify_index(self.root).ok)
+        # The second refresh writes nothing at all.
+        state = self.tree_state(result)
+        made, published = len(self.history.made), len(self.history.published)
+        quiet = self.refresh(result)
+        self.assertEqual(quiet["status"], "unchanged", quiet)
+        self.assertEqual(state, self.tree_state(result))
+        self.assertEqual((made, published), (len(self.history.made), len(self.history.published)))
+
+    def test_b1_noop_refresh_touches_nothing(self):
+        result = self.closed("b1-noop", {"plans/cycle/a.md": b"a\n", "plans/cycle/b.md": b"b\n"})
+        self.edit(result, "plans/cycle/b.md", b"b, edited\n")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        # A cycle named by the trigger leaves no bookkeeping behind when nothing changed.
+        state = self.tree_state(result)
+        for trigger in ("turn-end", "explicit", "supervisor-poll"):
+            self.assertEqual(self.refresh(result, trigger=trigger)["status"], "unchanged")
+        self.assertEqual(state, self.tree_state(result))
+        latest = self.root / ".runtime/artifact-producer/v1/history/LATEST.json"
+        self.assertTrue(latest.exists())
+        stamp = latest.stat().st_mtime_ns
+        self.assertEqual(self.refresh(result)["status"], "unchanged")
+        self.assertEqual(stamp, latest.stat().st_mtime_ns)
+        # A change touches only the changed row.
+        manifest = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        old_a = next(r for r in manifest["artifact_revisions"] if r["locator"]["path"].endswith("/a.md"))
+        self.edit(result, "plans/cycle/b.md", b"b, edited again\n")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        again = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        new_a = next(r for r in again["artifact_revisions"] if r["locator"]["path"].endswith("/a.md"))
+        self.assertEqual(json.dumps(old_a, sort_keys=True), json.dumps(new_a, sort_keys=True))
+        self.assertEqual(len(self.snapshot_names(result)), 3)
+
+    # -- correction B ----------------------------------------------------
+    def test_b1_locked_index_read_once(self):
+        result = self.closed("b1-index-read", {"plans/cycle/a.md": b"a\n"})
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        locked_reads, free_reads = [], []
+        real_load = adm.load_index
+
+        def counting(root):
+            (locked_reads if adm.holds_lock(Path(root)) else free_reads).append(1)
+            return real_load(root)
+
+        with mock.patch.object(adm, "load_index", counting):
+            self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.assertEqual(len(locked_reads), 1, locked_reads)
+        locked_reads.clear()
+        with mock.patch.object(adm, "load_index", counting):
+            self.assertEqual(self.refresh(result)["status"], "unchanged")
+        self.assertLessEqual(len(locked_reads), 1, locked_reads)
+
+    # -- lock choreography (D-124 "잠금") ----------------------------------
+    def test_b1_scan_and_hash_hold_no_lock_and_publication_is_short(self):
+        files = {f"plans/cycle/f{i}.md": f"f{i}\n".encode() for i in range(6)}
+        result = self.closed("b1-locks", files)
+        for i in range(3):
+            self.edit(result, f"plans/cycle/f{i}.md", f"edited {i}\n".encode())
+        seen = []
+        real_stream = P._stream_file_facts
+
+        def watching(path):
+            seen.append((dispatch_lock_order.held(), adm.holds_lock(self.root)))
+            fd = adm.try_acquire_lock(self.root)  # the admission lock is free to anyone while we hash
+            self.assertIsNotNone(fd)
+            adm._release_lock(self.root, fd)
+            return real_stream(path)
+
+        holds = []
+        real_acquire, real_release = adm._acquire_lock, adm._release_lock
+        started = {}
+
+        def acquire(root, timeout, now=None):
+            fd = real_acquire(root, timeout, now)
+            started[fd] = time.monotonic()
+            return fd
+
+        def release(root, fd):
+            holds.append(time.monotonic() - started.pop(fd, time.monotonic()))
+            return real_release(root, fd)
+
+        with mock.patch.object(P, "_stream_file_facts", watching), \
+                mock.patch.object(adm, "_acquire_lock", acquire), mock.patch.object(adm, "_release_lock", release):
+            self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.assertGreaterEqual(len(seen), 3)
+        self.assertEqual({entry for entry in seen}, {((), False)})
+        self.assertTrue(holds and max(holds) < 1.0, holds)
+
+    def test_b1_history_goes_first_and_a_failed_history_leaves_the_manifest(self):
+        result = self.closed("b1-history-first", {"plans/cycle/a.md": b"a\n"})
+        raw = self.manifest_path(result).read_bytes()
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        order = []
+        self.history.on_publish = lambda root, events: order.append(self.manifest_path(result).read_bytes() == raw)
+        self.history.fail_publish = True
+        out = self.refresh(result)
+        self.assertEqual(out["status"], "skipped", out)
+        self.assertEqual(out["reason"], "history-unavailable")
+        self.assertEqual(self.manifest_path(result).read_bytes(), raw)
+        self.assertEqual(len(self.snapshot_names(result)), 1)
+        self.assertNotIn("history_pending", P.read_cycle_record(self.root, result["cycle_id"]))
+        # The next trigger finds the same change again and publishes it.
+        self.history.fail_publish = False
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.assertEqual(order, [True, True])
+        self.assertNotEqual(self.manifest_path(result).read_bytes(), raw)
+        self.assertEqual(len(self.history.published), 1)
+
+    def test_b1_missing_recorder_keeps_lines_pending_and_the_next_trigger_delivers(self):
+        result = self.closed("b1-pending", {"plans/cycle/a.md": b"a\n", "plans/cycle/b.md": b"b\n"})
+        cycle_id = result["cycle_id"]
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        self.write_output(result, "plans/cycle/c.md", b"c\n")
+        with mock.patch.dict(sys.modules, {"artifact_history": None}):  # import fails: not merged yet
+            out = self.refresh(result)
+            self.assertEqual(out["status"], "emitted", out)
+            pending = P.read_cycle_record(self.root, cycle_id)["history_pending"]
+            self.assertEqual(len(pending), 2)
+            self.assertEqual({entry["operation"] for entry in pending}, {"add", "update"})
+            for entry in pending:
+                self.assertRegex(entry["event_id"], r"^hevt_[0-9a-f]{32}$")
+                self.assertRegex(entry["transaction_id"], r"^htxn_[0-9a-f]{32}$")
+            # Still no recorder: nothing is lost and nothing is rewritten.
+            self.assertEqual(self.refresh(result)["status"], "unchanged")
+            self.assertEqual(len(P.read_cycle_record(self.root, cycle_id)["history_pending"]), 2)
+        # The recorder appears but fails: the lines stay.
+        self.history.fail_publish = True
+        self.assertEqual(self.refresh(result)["status"], "unchanged")
+        self.assertEqual(len(P.read_cycle_record(self.root, cycle_id)["history_pending"]), 2)
+        self.history.fail_publish = False
+        out = self.refresh(result)
+        self.assertEqual(out["status"], "unchanged")
+        self.assertEqual(len(self.history.published), 2)
+        self.assertEqual({e["event_id"] for e in self.history.published}, {e["event_id"] for e in pending})
+        self.assertNotIn("history_pending", P.read_cycle_record(self.root, cycle_id))
+        state = self.tree_state(result)
+        self.assertEqual(self.refresh(result)["status"], "unchanged")
+        self.assertEqual(state, self.tree_state(result))
+
+    def test_b1_pending_survives_a_crash_after_the_manifest(self):
+        result = self.closed("b1-crash-pending", {"plans/cycle/a.md": b"a\n"})
+        cycle_id = result["cycle_id"]
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        with mock.patch.dict(sys.modules, {"artifact_history": None}):
+            with self.assertRaises(adm.AdmissionRecoveryRequired):
+                self.refresh(result, crash_after_manifest=True)
+            P.recover(self.root)
+            self.assertEqual(len(P.read_cycle_record(self.root, cycle_id).get("history_pending", [])), 1)
+        self.assertEqual(self.refresh(result)["status"], "unchanged")
+        self.assertEqual(len(self.history.published), 1)
+
+    def test_b1_first_close_records_one_line_or_leaves_it_pending(self):
+        self.activate()
+        route, route_file = self.route(slug="b1-close", campaign_key="b1-close")
+        first = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.write_output(first)
+        self.close(route, route_file)
+        self.history.fail_publish = True  # a failing recorder never fails the close
+        self.assertEqual(P.finalize(self.root, cycle_id=first["cycle_id"])["status"], "sealed")
+        record = P.read_cycle_record(self.root, first["cycle_id"])
+        self.assertEqual(len(record["history_pending"]), 1)
+        line = record["history_pending"][0]
+        self.assertEqual((line["kind"], line["target_type"], line["field"], line["operation"]),
+                         ("lifecycle", "cycle", "state", "update"))
+        document = json.loads(self.manifest_path(first).read_text(encoding="utf-8"))
+        value = line["after"]["value"]
+        self.assertEqual(set(value), {"state", "manifest_digest", "revision_id", "files", "excluded"})
+        self.assertEqual((value["state"], value["manifest_digest"], value["revision_id"], value["files"]),
+                         ("completed", m_digest(document), document["manifest_revision_id"], 1))
+        self.history.fail_publish = False
+        self.assertEqual(self.refresh(first)["status"], "unchanged")
+        self.assertEqual([e["field"] for e in self.history.published], ["state"])
+        self.assertNotIn("history_pending", P.read_cycle_record(self.root, first["cycle_id"]))
+        # With the recorder present the close line is published at once.
+        route2, route_file2 = self.route(slug="b1-close-two", campaign_key="b1-close")
+        second = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        self.write_output(second)
+        self.close(route2, route_file2)
+        P.finalize(self.root, cycle_id=second["cycle_id"])
+        self.assertEqual(len(self.history.published), 2)
+        self.assertNotIn("history_pending", P.read_cycle_record(self.root, second["cycle_id"]))
+
+    # -- A28-4 -----------------------------------------------------------
+    def test_b1_delete_everything_and_edit_twice_through_the_bounded_path(self):
+        files = {"plans/cycle/plan.md": b"plan\n", "plans/cycle/notes.md": b"notes\n"}
+        result = self.closed("b1-delete", files)
+        cycle_id = result["cycle_id"]
+        artifacts = Path(result["cycle_dir"]) / "artifacts"
+        self.edit(result, "plans/cycle/notes.md", b"notes 1\n")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.edit(result, "plans/cycle/notes.md", b"notes 2\n")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.assertEqual(len(self.snapshot_names(result)), 3)
+        before = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        required = next(r for r in before["artifact_revisions"] if r["locator"]["path"].endswith("/plan.md"))
+        (artifacts / "plans/cycle/plan.md").unlink()
+        out = self.refresh(result)
+        self.assertEqual(out["changes"]["removed"], ["artifacts/plans/cycle/plan.md"])
+        self.assertEqual([e["operation"] for e in self.history.published[-1:]], ["delete"])
+        self.assertEqual(self.history.published[-1]["after"], {"value": None})
+        (artifacts / "plans/cycle/notes.md").unlink()
+        self.write_output(result, "plans/cycle/.cache/blob", b"hidden")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        after = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        self.assertEqual(after["artifact_revisions"], [])
+        self.assertEqual(after["events"][:len(before["events"])], before["events"])
+        self.assertNotIn(".cache", json.dumps(after))
+        self.assertNotIn(".cache", json.dumps(self.history.published))
+        earlier = [json.loads(raw) for raw in
+                   (p.read_text(encoding="utf-8") for p in L.manifest_snapshot_dir(self.root, cycle_id).iterdir())]
+        self.assertTrue(M.validate_update(after, preserved=earlier, previous=before).ok)
+        index = adm.load_index(self.root)
+        self.assertIn(required["artifact_id"], index.stable_ids)
+        rebuilt = adm.rebuild_index(self.root)
+        self.assertEqual(artifact_index.canonical_bytes(rebuilt), artifact_index.canonical_bytes(adm.load_index(self.root)))
+        self.assertIn(required["artifact_id"], rebuilt.stable_ids)
+        # An empty file list is still a closed cycle; a later file is simply added.
+        self.write_output(result, "plans/cycle/again.md", b"again\n")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+
+    # -- A28-9 -----------------------------------------------------------
+    def test_b1_cycle_closed_by_an_older_release_refreshes_without_preparation(self):
+        result = self.closed("b1-old-release", {"plans/cycle/a.md": b"a\n"})
+        raw = self.manifest_path(result).read_bytes()
+        shutil.rmtree(L.manifest_snapshot_dir(self.root, result["cycle_id"]))
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        out = self.refresh(result)
+        self.assertEqual(out["status"], "emitted", out)
+        copies = {p.name: p.read_bytes() for p in L.manifest_snapshot_dir(self.root, result["cycle_id"]).iterdir()}
+        self.assertIn(raw, copies.values())
+        self.assertEqual(len(copies), 2)
+        self.assertTrue(adm.verify_index(self.root).ok)
+
+    def test_b1_a_file_changed_after_the_scan_skips_this_publication_only(self):
+        result = self.closed("b1-recheck", {"plans/cycle/a.md": b"a\n"})
+        raw = self.manifest_path(result).read_bytes()
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        real_lock = P._refresh_lock
+
+        def lock_after_a_write(root, cycle_id, *, timeout):
+            self.edit(result, "plans/cycle/a.md", b"a, edited again while we scanned\n")
+            return real_lock(root, cycle_id, timeout=timeout)
+
+        with mock.patch.object(P, "_refresh_lock", lock_after_a_write):
+            out = self.refresh(result)
+        self.assertEqual((out["status"], out["reason"]), ("skipped", "superseded"))
+        self.assertEqual(self.manifest_path(result).read_bytes(), raw)
+        self.assertEqual(self.history.published, [])
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+
+    def test_b1_a_busy_refresh_lock_defers_without_an_error(self):
+        result = self.closed("b1-busy", {"plans/cycle/a.md": b"a\n"})
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        with P._refresh_lock(self.root, result["cycle_id"], timeout=0.0):
+            out = self.refresh(result)
+        self.assertEqual((out["status"], out["reason"]), ("skipped", "busy"))
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+
+    def test_b1_unknown_and_open_cycles_are_skipped_not_failed(self):
+        self.activate()
+        route, route_file, opened = self.begin(campaign_key="b1-open")
+        self.assertEqual(self.refresh(opened)["reason"], "cycle-not-closed")
+        self.assertEqual(P.refresh_cycle(self.root, "cyc_" + "5" * 32)["reason"], "cycle-unknown")
+
+    # -- budget (D-124 "비용 예산") ----------------------------------------
+    def test_b1_walk_budget_leaves_a_cursor_and_never_reads_the_rest_as_deleted(self):
+        files = {f"plans/cycle/f{i:02d}.md": f"f{i}\n".encode() for i in range(30)}
+        result = self.closed("b1-walk", files)
+        for i in range(30):
+            self.edit(result, f"plans/cycle/f{i:02d}.md", f"f{i} edited\n".encode())
+        (Path(result["cycle_dir"]) / "artifacts/plans/cycle/f29.md").unlink()
+        runs, removed = 0, []
+        while True:
+            runs += 1
+            out = self.refresh(result, budget=P.RefreshBudget(max_walk_entries=12))
+            removed.extend(out.get("changes", {}).get("removed", []))
+            if out.get("complete"):
+                break
+            self.assertEqual(out["status"], "emitted", out)
+            self.assertIsNotNone(out["cursor"])
+            self.assertLess(runs, 12)
+        self.assertGreaterEqual(runs, 3)
+        # Only the file whose absence was looked at directly leaves the rows, once.
+        self.assertEqual(removed, ["artifacts/plans/cycle/f29.md"])
+        document = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        rows = {r["locator"]["path"]: r for r in document["artifact_revisions"]}
+        self.assertEqual(len(rows), 29)
+        for i in range(29):
+            data = f"f{i} edited\n".encode()
+            self.assertEqual(rows[f"artifacts/plans/cycle/f{i:02d}.md"]["content_digest"],
+                             "sha256:" + hashlib.sha256(data).hexdigest())
+        self.assertTrue(adm.verify_index(self.root).ok)
+        # Everything seen, nothing left to do: a full pass is quiet again.
+        self.assertEqual(self.refresh(result, budget=P.RefreshBudget(max_walk_entries=12))["status"], "unchanged")
+
+    def test_b1_hash_budget_stops_between_files_and_a_changed_file_is_always_finished(self):
+        files = {f"plans/cycle/f{i}.bin": bytes([i]) * (600 * 1024) for i in range(4)}
+        result = self.closed("b1-hash", files)
+        for i in range(4):
+            self.edit(result, f"plans/cycle/f{i}.bin", bytes([i + 10]) * (600 * 1024))
+        out = self.refresh(result, budget=P.RefreshBudget(max_hash_bytes=1024 * 1024))
+        self.assertFalse(out["complete"], out)
+        self.assertLessEqual(len(out["changes"]["modified"]), 2)
+        self.assertGreaterEqual(len(out["changes"]["modified"]), 1)
+        for _ in range(6):
+            if self.refresh(result, budget=P.RefreshBudget(max_hash_bytes=1024 * 1024)).get("complete"):
+                break
+        document = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        for row in document["artifact_revisions"]:
+            index = int(row["locator"]["path"].split("/f")[-1].split(".")[0])
+            self.assertEqual(row["content_digest"],
+                             "sha256:" + hashlib.sha256(bytes([index + 10]) * (600 * 1024)).hexdigest())
+
+    def test_b1_a_300_mib_file_is_reflected_in_one_run_by_streaming(self):
+        result = self.closed("b1-300mib", {"plans/cycle/small.md": b"small\n", "plans/cycle/model.bin": b"x\n"})
+        big = Path(result["cycle_dir"]) / "artifacts/plans/cycle/model.bin"
+        size = 300 * 1024 * 1024
+        with open(big, "wb") as handle:
+            handle.truncate(size)
+        expected = hashlib.sha256()
+        zeros = bytes(1024 * 1024)
+        for _ in range(300):
+            expected.update(zeros)
+        tracemalloc.start()
+        try:
+            out = self.refresh(result)  # the default budget is 256 MiB: smaller than this one file
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(out["status"], "emitted", out)
+        self.assertLess(peak, 64 * 1024 * 1024, peak)
+        document = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        row = next(r for r in document["artifact_revisions"] if r["locator"]["path"].endswith("model.bin"))
+        self.assertEqual((row["content_digest"], row["byte_size"]), ("sha256:" + expected.hexdigest(), size))
+
+    def test_b1_15300_temporary_files_finish_inside_the_budget_and_never_reach_history(self):
+        result = self.closed("b1-temp", {"plans/cycle/plan.md": b"plan\n"})
+        tmp = Path(result["cycle_dir"]) / "artifacts/plans/cycle/scratch"
+        tmp.mkdir(parents=True)
+        for i in range(15300):
+            (tmp / f"t{i}.tmp").write_bytes(b"")
+        cache = Path(result["cycle_dir"]) / "artifacts/plans/cycle/.pytest_cache"
+        cache.mkdir()
+        (cache / "x").write_bytes(b"x")
+        self.edit(result, "plans/cycle/plan.md", b"plan, edited\n")
+        started = time.monotonic()
+        out = self.refresh(result)
+        self.assertLess(time.monotonic() - started, 60.0)
+        self.assertEqual(out["status"], "emitted", out)
+        self.assertTrue(out["complete"])
+        self.assertLessEqual(out["walked"], 20000)
+        self.assertGreaterEqual(out["walked"], 15300)
+        self.assertEqual([e["field"] for e in self.history.published], ["artifacts/plans/cycle/plan.md"])
+        self.assertNotIn(".tmp", json.dumps(json.loads(self.manifest_path(result).read_text(encoding="utf-8"))))
+        # A tree larger than the walk budget stops and continues, and never asks for a lock meanwhile.
+        out = self.refresh(result, budget=P.RefreshBudget(max_walk_entries=5000))
+        self.assertFalse(out["complete"])
+        self.assertIsNotNone(out["cursor"])
+
+    # -- root sweep (D-124 "순환 커서") ------------------------------------
+    def test_b1_sweep_cursor_observes_every_closed_cycle_with_no_cutoff(self):
+        old = {}
+        for i in range(14):
+            old[i] = self.closed(f"b1-sweep-{i:02d}", {"plans/cycle/plan.md": b"plan\n"}, activate=(i == 0))
+        # Three of them were closed more than three days ago.
+        for i in (0, 5, 13):
+            record = P.read_cycle_record(self.root, old[i]["cycle_id"])
+            record["sealed_on"] = "2026-09-20T00:00:00Z"
+            P._write_cycle_record(self.root, record, exclusive=False)
+        for i in range(14):
+            self.edit(old[i], "plans/cycle/plan.md", f"plan edited {i}\n".encode())
+        env = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        calls = 0
+        while calls < 60:
+            calls += 1
+            out = P.refresh_sweep(self.root, trigger="turn-end", budget=P.RefreshBudget(max_walk_entries=7))
+            if all(json.loads(self.manifest_path(old[i]).read_text(encoding="utf-8"))["artifact_revisions"][0][
+                    "content_digest"] == "sha256:" + hashlib.sha256(f"plan edited {i}\n".encode()).hexdigest()
+                   for i in range(14)):
+                break
+        else:
+            self.fail("the cursor did not reach every closed cycle")
+        self.assertGreater(calls, 2)
+        cursor = self.root / ".runtime/artifact-producer/v1/checkpoints/refresh/cursor.json"
+        self.assertTrue(cursor.is_file())
+        # The cycle a trigger names is seen first, whatever the cursor says.
+        self.edit(old[3], "plans/cycle/plan.md", b"named cycle edited\n")
+        self.edit(old[12], "plans/cycle/plan.md", b"far cycle edited\n")
+        out = P.refresh_sweep(self.root, trigger="turn-end", first_cycle_id=old[12]["cycle_id"],
+                              budget=P.RefreshBudget(max_walk_entries=4))
+        self.assertEqual(out["refreshed"][0], old[12]["cycle_id"])
+
+    def test_b1_checkpoint_command_reaches_a_closed_cycle_and_the_sweep(self):
+        env = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        one = self.closed("b1-cp-one", {"plans/cycle/plan.md": b"plan\n"})
+        two = self.closed("b1-cp-two", {"plans/cycle/plan.md": b"plan\n"}, activate=False)
+        self.edit(one, "plans/cycle/plan.md", b"one edited\n")
+        self.edit(two, "plans/cycle/plan.md", b"two edited\n")
+        out = P.checkpoint(self.root, cycle_id=one["cycle_id"], trigger="explicit")
+        self.assertEqual((out["status"], out["cycle_id"]), ("emitted", one["cycle_id"]))
+        # An automatic trigger sees its own cycle and then the rest of the root.
+        self.edit(one, "plans/cycle/plan.md", b"one edited again\n")
+        out = P.checkpoint(self.root, cycle_id=one["cycle_id"], trigger="turn-end")
+        self.assertEqual(out["status"], "emitted")
+        self.assertIn(two["cycle_id"], out["refresh"]["refreshed"])
+
+    # -- explicit callers ------------------------------------------------
+    def test_b1_explicit_reclose_scans_before_it_takes_the_lock(self):
+        result = self.closed("b1-reclose", {"plans/cycle/a.md": b"a\n", "plans/cycle/b.md": b"b\n"})
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        hashed = []
+        real_stream = P._stream_file_facts
+
+        def watching(path):
+            hashed.append(adm.holds_lock(self.root))
+            return real_stream(path)
+
+        with mock.patch.object(P, "_stream_file_facts", watching):
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(out["refreshed"], out)
+        self.assertTrue(hashed)
+        self.assertEqual(set(hashed), {False})
+
+    def test_b1_cursor_walks_nested_directories_without_skipping_or_repeating(self):
+        files = {f"plans/d{d}/sub/f{i}.md": f"d{d} f{i}\n".encode() for d in range(5) for i in range(4)}
+        files.update({f"plans/d{d}.md": f"top {d}\n".encode() for d in range(5)})
+        result = self.closed("b1-nested", files)
+        for rel in files:
+            self.edit(result, rel, b"edited " + rel.encode())
+        hashed = []
+        real_stream = P._stream_file_facts
+
+        def counting(path):
+            hashed.append(Path(path).relative_to(result["cycle_dir"]).as_posix())
+            return real_stream(path)
+
+        with mock.patch.object(P, "_stream_file_facts", counting):
+            for _ in range(30):
+                if self.refresh(result, budget=P.RefreshBudget(max_walk_entries=6)).get("complete"):
+                    break
+            else:
+                self.fail("the walk never completed")
+        self.assertEqual(sorted(hashed), sorted("artifacts/" + rel for rel in files))  # each file read exactly once
+        document = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        for row in document["artifact_revisions"]:
+            rel = row["locator"]["path"][len("artifacts/"):]
+            self.assertEqual(row["content_digest"], "sha256:" + hashlib.sha256(b"edited " + rel.encode()).hexdigest())
+        self.assertEqual(len(document["artifact_revisions"]), len(files))
+
+    def test_b1_failures_never_fail_the_command_that_triggered_the_refresh(self):
+        result = self.closed("b1-nofail", {"plans/cycle/a.md": b"a\n"})
+        raw = self.manifest_path(result).read_bytes()
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        # Whatever goes wrong inside a refresh is a skipped result, not an exception.
+        with mock.patch.object(P, "_bounded_scan", side_effect=P.ProducerError("artifacts-dir-missing", "x")):
+            out = self.refresh(result)
+        self.assertEqual((out["status"], out["reason"]), ("skipped", "artifacts-dir-missing"))
+        with mock.patch.object(adm, "_acquire_lock", side_effect=adm.AdmissionBusy("busy")):
+            out = self.refresh(result)
+        self.assertEqual((out["status"], out["reason"]), ("skipped", "busy"))
+        self.assertEqual(self.manifest_path(result).read_bytes(), raw)
+        # The checkpoint command a trigger runs returns a result too.
+        with mock.patch.object(P, "refresh_cycle", side_effect=RuntimeError("boom")):
+            sweep = P.refresh_sweep(self.root, trigger="turn-end")
+        self.assertEqual(sweep["refreshed"], [])
+        # A recorder that raises never fails an explicit re-close: the lines wait in the record.
+        self.history.fail_publish = True
+        out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(out["refreshed"], out)
+        self.assertEqual(len(P.read_cycle_record(self.root, result["cycle_id"])["history_pending"]), 1)
+        self.history.fail_publish = False
+        self.assertEqual(self.refresh(result)["status"], "unchanged")
+        self.assertEqual(len(self.history.published), 1)
+        self.assertNotIn("history_pending", P.read_cycle_record(self.root, result["cycle_id"]))
+
+    def test_b1_real_history_recorder_takes_the_same_lines(self):
+        real = Path(__file__).resolve().parents[2] / "artifact-meta-1001/utilities/artifact_history.py"
+        if not real.is_file():
+            self.skipTest("the f0 recorder worktree is not present")
+        saved_path = list(sys.path)
+        try:
+            spec = importlib.util.spec_from_file_location("artifact_history", real)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"the f0 recorder does not import here: {exc}")
+        finally:
+            sys.path[:] = saved_path
+        with mock.patch.dict(sys.modules, {"artifact_history": module}):
+            result = self.closed("b1-real-recorder", {"plans/cycle/a.md": b"a\n"})
+            self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+            self.write_output(result, "plans/cycle/b.md", b"b\n")
+            self.assertEqual(self.refresh(result)["status"], "emitted")
+            events = list(module.iter_events(self.root))
+            self.assertEqual(sorted((e["kind"], e["operation"], e["field"]) for e in events),
+                             [("artifact", "add", "artifacts/plans/cycle/b.md"),
+                              ("artifact", "update", "artifacts/plans/cycle/a.md"),
+                              ("lifecycle", "update", "state")])
+            self.assertTrue((self.root / ".runtime/artifact-producer/v1/history/LATEST.json").is_file())
+            self.assertNotIn("history_pending", P.read_cycle_record(self.root, result["cycle_id"]))
+
+    def test_b1_automatic_trigger_waits_for_the_interval_after_a_publication(self):
+        result = self.closed("b1-interval", {"plans/cycle/a.md": b"a\n"})
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "900"}):
+            self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+            self.assertEqual(self.refresh(result, now=1_000_000.0)["status"], "emitted")
+            self.edit(result, "plans/cycle/a.md", b"a, edited twice\n")
+            out = self.refresh(result, now=1_000_100.0)
+            self.assertEqual((out["status"], out["reason"]), ("skipped", "min-interval"))
+            self.assertEqual(self.refresh(result, now=1_000_100.0, trigger="explicit")["status"], "emitted")
+            self.edit(result, "plans/cycle/a.md", b"a, edited three times\n")
+            self.assertEqual(self.refresh(result, now=1_001_200.0)["status"], "emitted")
+
+    def test_b1_explicit_refresh_ignores_the_interval_and_the_budget(self):
+        result = self.closed("b1-explicit", {"plans/cycle/a.md": b"a\n"})
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        self.assertEqual(self.refresh(result, trigger="explicit")["status"], "emitted")
+        self.edit(result, "plans/cycle/a.md", b"a, edited twice\n")
+        out = self.refresh(result, trigger="explicit")
+        self.assertEqual(out["status"], "emitted", out)
+        self.assertTrue(out["complete"])
 
 
 def m_digest(document):

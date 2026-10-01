@@ -3538,6 +3538,39 @@ def checkpoint(
     allocator: Optional[artifact_identity.IdAllocator] = None,
     limits: Optional[CheckpointLimits] = None,
 ) -> Dict[str, Any]:
+    """Look at the cycle a trigger names; an automatic trigger then looks at the rest of the root.
+
+    An open cycle gets its interim manifest (`_checkpoint_cycle`); a closed one is observed
+    for changed files (`refresh_cycle`, §45 D-124).  An automatic trigger (not `explicit`)
+    then spends what is left of the same budget on the root's other closed cycles
+    (`refresh_sweep`); that never changes the named cycle's result except for a `refresh` key
+    naming what the sweep did."""
+    budget = RefreshBudget.unlimited() if trigger == "explicit" else RefreshBudget()
+    result = _checkpoint_cycle(root, cycle_id=cycle_id, route_file=route_file, trigger=trigger, now=now,
+                               allocator=allocator, limits=limits, budget=budget)
+    if trigger != "explicit":
+        try:
+            sweep = refresh_sweep(Path(root).resolve(), trigger=trigger, now=now, budget=budget,
+                                  skip_cycle_id=result.get("cycle_id"), allocator=allocator)
+        except Exception:  # noqa: BLE001 -- the sweep never changes what the trigger returns
+            sweep = {}
+        if sweep.get("visited"):
+            result["refresh"] = {key: sweep[key] for key in ("visited", "refreshed", "skipped", "cursor")
+                                 if key in sweep}
+    return result
+
+
+def _checkpoint_cycle(
+    root: Path,
+    *,
+    cycle_id: Optional[str] = None,
+    route_file: Optional[Path] = None,
+    trigger: str = "explicit",
+    now: Optional[float] = None,
+    allocator: Optional[artifact_identity.IdAllocator] = None,
+    limits: Optional[CheckpointLimits] = None,
+    budget: Optional[RefreshBudget] = None,
+) -> Dict[str, Any]:
     """Publish (or refresh) an open cycle's interim manifest.
 
     Every outcome that is not an error is a result: `emitted`, `unchanged`, or
@@ -3567,6 +3600,13 @@ def checkpoint(
     def skipped(reason: str, **extra: Any) -> Dict[str, Any]:
         return {"status": "skipped", "reason": reason, **base, **extra}
 
+    if record.get("state") == "sealed":
+        observed = refresh_cycle(root, cid, trigger=trigger, now=now, allocator=allocator, budget=budget)
+        if observed["status"] == "skipped":
+            return {"status": "skipped", "reason": observed["reason"], **base}
+        return {"status": observed["status"], **base,
+                **{key: observed[key] for key in ("changes", "complete", "cursor", "manifest_digest")
+                   if key in observed}}
     if record.get("state") != "open":
         return skipped("cycle-not-open", cycle_state=record.get("state"))
     directory = cycle_dir(root, record["campaign_id"], cid, record)
@@ -4515,6 +4555,9 @@ def finalize(
     except dispatch_lock_order.LockOrderError as error:
         raise ProducerError("finalize-reentry-forbidden", error.detail or cycle_id) from error
     alloc = allocator or artifact_identity.IdAllocator()
+    # A closed cycle closed again is compared with its files by reading them here, before the
+    # admission lock: under the lock only `lstat` has to confirm what was read (§45 D-124).
+    known = _prescan_known(root, cycle_id) if expected_binding is None else {}
     lock_fd = _admission_lock_fd
     owns_lock = lock_fd is None
     if owns_lock:
@@ -4591,7 +4634,7 @@ def finalize(
                 # cycle's files are compared with its manifest and the next
                 # document is published when they differ.
                 refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
-                                                  crash_after_manifest=crash_after_manifest)
+                                                  crash_after_manifest=crash_after_manifest, known=known)
                 return _finish({**refreshed, "storage_state": "sealed", "cycle_state": published})
             return _finish({"status": "already-sealed", "cycle_id": cycle_id,
                     "manifest_digest": record.get("manifest_digest"),
@@ -4764,7 +4807,8 @@ def finalize(
         try:
             _write_journal(root, cycle_id, state="published", manifest_digest=digest, cycle_path=cycle_path)
             # The admission lock has been held since `index` was read, so it is still current.
-            _commit_sealed(root, record, document, digest, now=now, index=index)
+            _commit_sealed(root, record, document, digest, now=now, index=index,
+                           excluded_count=len(excluded_hidden) + len(excluded_symlinks))
         except BaseException as exc:
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
@@ -4985,12 +5029,16 @@ def _stream_file_facts(path: Path) -> Tuple[str, int]:
 
 
 def _scan_cycle_facts(directory: Path, *, excluded: List[str],
-                      excluded_symlinks: List[str]) -> List[Tuple[str, str, int]]:
+                      excluded_symlinks: List[str],
+                      known: Optional[Mapping[str, Sequence[Any]]] = None) -> List[Tuple[str, str, int]]:
     """The manifest's file facts `(path, digest, size)` under the one inclusion rule.
 
     Same rule as `_enumerate_output`, read in chunks.  A path a manifest cannot
     name (not a regular file, not a valid locator) is left out and listed as
-    excluded: a refresh never turns such a file into a failure."""
+    excluded: a refresh never turns such a file into a failure.  `known` maps a
+    path to `(size, mtime_ns, inode, digest)` from a scan made before the lock was
+    taken: a file whose fingerprint still matches keeps that digest instead of
+    being read again under the lock."""
     facts: List[Tuple[str, str, int]] = []
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
@@ -5005,6 +5053,15 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
         if _outside_inclusion_rule(rel) or not entry.is_file() or not artifact_manifest.validate_locator_path(rel).ok:
             excluded.append(rel)
             continue
+        remembered = (known or {}).get(rel)
+        if remembered is not None:
+            try:
+                st = os.lstat(str(entry))
+            except OSError:
+                st = None
+            if st is not None and list(remembered[:3]) == _fingerprint(st):
+                facts.append((rel, remembered[3], st.st_size))
+                continue
         digest, size = _stream_file_facts(entry)
         facts.append((rel, digest, size))
     return facts
@@ -5012,14 +5069,18 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
 
 def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
                         facts: Sequence[Tuple[str, str, int]], *, allocator: artifact_identity.IdAllocator,
-                        now: Optional[float]) -> Tuple[Optional[Dict[str, Any]], Dict[str, List[str]]]:
+                        now: Optional[float],
+                        removable: Optional[Iterable[str]] = None,
+                        ) -> Tuple[Optional[Dict[str, Any]], Dict[str, List[str]]]:
     """The cycle's next document, or `None` when no file differs from `document`.
 
     Unchanged rows are carried over untouched; a changed file keeps its
     `artifact_id` and gets a new revision; a new file gets a new artifact; a file
     that is gone leaves the rows (its events stay).  A row the inclusion rule
     would not list today is neither changed nor removed.  `cycle`, `routes[]` and
-    the terminal fields are never touched."""
+    the terminal fields are never touched.  `removable`, when given, names the only
+    declared paths a missing fact may remove: a scan that stopped early has not seen
+    the rest of the tree, so a file it did not visit is never read as deleted."""
     declared = {row.get("locator", {}).get("path"): row
                 for row in document.get("artifact_revisions", []) or [] if isinstance(row, dict)}
     present = {rel: (digest, size) for rel, digest, size in facts}
@@ -5030,8 +5091,10 @@ def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping
             changes["added"].append(rel)
         elif row.get("content_digest") != digest or row.get("byte_size") != size:
             changes["modified"].append(rel)
+    removable_set = None if removable is None else set(removable)
     for rel in sorted(declared):
-        if rel not in present and not _outside_inclusion_rule(rel):
+        if (rel not in present and not _outside_inclusion_rule(rel)
+                and (removable_set is None or rel in removable_set)):
             changes["removed"].append(rel)
     if not any(changes.values()):
         return None, changes
@@ -5180,13 +5243,19 @@ def _refresh_journal_resume(root: Path, record: Mapping[str, Any], journal: Mapp
     if current_digest != new_digest:
         raise artifact_admission.AdmissionRecoveryRequired(
             f"manifest digest mismatch for {cycle_id}; manual inspection required")
+    carried = journal.get("history_pending")
+    if isinstance(carried, list):
+        # History lines the refresh could not hand over before it stopped belong to the record.
+        record = _with_pending(record, [entry for entry in carried if isinstance(entry, dict)])
     _commit_sealed(root, record, current, new_digest, now=now, previous_digest=previous_digest)
     return True
 
 
 def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optional[float] = None,
                           allocator: Optional[artifact_identity.IdAllocator] = None,
-                          crash_after_manifest: bool = False) -> Dict[str, Any]:
+                          crash_after_manifest: bool = False,
+                          known: Optional[Mapping[str, Sequence[Any]]] = None,
+                          trigger: str = "finalize") -> Dict[str, Any]:
     """Re-finalize a closed cycle: publish its next manifest document if any file changed.
 
     The admission lock is held.  Order, so that a crash anywhere resumes by
@@ -5212,7 +5281,7 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
         raise ProducerError("already-sealed-mismatch", "index")
     excluded: List[str] = []
     excluded_symlinks: List[str] = []
-    facts = _scan_cycle_facts(directory, excluded=excluded, excluded_symlinks=excluded_symlinks)
+    facts = _scan_cycle_facts(directory, excluded=excluded, excluded_symlinks=excluded_symlinks, known=known)
     alloc = allocator or artifact_identity.IdAllocator()
     refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=now)
     revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
@@ -5233,6 +5302,9 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     if additions is not None:
         result["terminal_added"] = additions["row"]["route_id"]
     if refreshed is None:
+        carried = list(record.get("history_pending") or [])
+        if carried and _history_deliver_locked(root, carried):
+            _write_history_pending(root, record, [])
         return result
     artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, raw)
     earlier = _earlier_documents(root, cycle_id, refreshed)
@@ -5249,21 +5321,783 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     if not index_report.ok:
         raise ProducerError("index-rejected", ";".join(v.code for v in index_report.violations))
     cycle_path = os.path.relpath(str(directory), str(root))
+    # §45 D-125: the file lines go to the recorder before the new document is published; a
+    # recorder that is not there (or fails) leaves them in the record, so the explicit command
+    # still publishes current bytes and the next trigger hands the lines over.
+    lines = _refresh_history_lines(root, record, directory, document, refreshed, changes, trigger=trigger,
+                                   now=time.time() if now is None else float(now))
+    pending = _merge_pending(record.get("history_pending") or [], lines)
+    if _history_deliver_locked(root, pending):
+        pending = []
     _write_journal(root, cycle_id, state="refreshing", manifest_digest=new_digest,
                    previous_manifest_digest=digest, cycle_path=cycle_path,
-                   manifest_revision_id=refreshed["manifest_revision_id"])
+                   manifest_revision_id=refreshed["manifest_revision_id"], history_pending=pending)
     artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, new_raw)
     # COMMIT POINT: atomic replacement of the current document.
     _write_atomic(manifest_path, new_raw)
     if crash_after_manifest:  # test hook: simulate a crash after the commit point
         raise artifact_admission.AdmissionRecoveryRequired("simulated crash after manifest refresh")
     try:
-        _commit_sealed(root, record, refreshed, new_digest, now=now, index=index, previous_digest=digest)
+        _commit_sealed(root, _with_pending(record, pending), refreshed, new_digest, now=now, index=index,
+                       previous_digest=digest)
     except BaseException as exc:
         raise artifact_admission.AdmissionRecoveryRequired(
             f"cycle {cycle_id} manifest refreshed but post-publish update failed; run recover") from exc
     result.update(manifest_digest=new_digest, manifest_path=str(manifest_path))
     return result
+
+
+# ---------------------------------------------------------------------------
+# refresh without a long lock: bounded scan, cursor, history (§45 D-124, D-125)
+# ---------------------------------------------------------------------------
+#
+# A closed cycle is looked at in three steps and only the last one takes a lock:
+#
+#   1. walk, lstat and hash the files with no lock at all, inside one budget
+#      (`RefreshBudget`), reusing the digest of a file whose (size, mtime_ns,
+#      inode) is what the last scan saw;
+#   2. under the cycle's own *refresh* lock (a file under `checkpoints/refresh/`
+#      that nothing but a refresh takes, so the open-cycle order "admission, then
+#      checkpoint" of `finalize` is never crossed) re-check the changed files and
+#      the manifest digest with `lstat` only;
+#   3. two short admission sections: the history lines, then the manifest, index
+#      row and record.  A recorder that is not there leaves the lines in the
+#      record's `history_pending`; a recorder that fails leaves the manifest as
+#      it was, and the next trigger finds the same change again.
+#
+# Nothing here raises to the command that triggered it: a lock that is busy, a
+# file that moved while it was read or a recorder that failed is a `skipped`.
+
+REFRESH_DIR = "refresh"
+REFRESH_MAX_WALK_ENTRIES = 20000
+REFRESH_MAX_HASH_BYTES = 256 * 1024 * 1024
+REFRESH_MAX_SECONDS = 60.0
+REFRESH_ADMISSION_WAIT_SECONDS = 5.0
+REFRESH_ABSENCE_CHECK_FLOOR = 1000
+_UNLIMITED = float("inf")
+_HISTORY_TOKEN = re.compile(r"^[\x21-\x7e]{1,128}$")
+
+
+class RefreshBudget:
+    """One refresh run's share of walking, hashing and time.
+
+    The budget is looked at between files, never inside one, and a run always
+    finishes the first file it starts hashing, so a file larger than the whole
+    byte budget is still reflected by a single run.  `unlimited()` is for the
+    caller that asked for the answer now (an explicit `finalize` or checkpoint)."""
+
+    def __init__(self, max_walk_entries: float = REFRESH_MAX_WALK_ENTRIES,
+                 max_hash_bytes: float = REFRESH_MAX_HASH_BYTES,
+                 max_seconds: float = REFRESH_MAX_SECONDS) -> None:
+        self.max_walk_entries = max_walk_entries
+        self.max_hash_bytes = max_hash_bytes
+        self.max_seconds = max_seconds
+        self.walked = 0
+        self.hashed_bytes = 0
+        self.hashed_files = 0
+        self._started = time.monotonic()
+
+    @classmethod
+    def unlimited(cls) -> "RefreshBudget":
+        return cls(_UNLIMITED, _UNLIMITED, _UNLIMITED)
+
+    def walk_exhausted(self) -> bool:
+        return self.walked >= self.max_walk_entries or time.monotonic() - self._started >= self.max_seconds
+
+    def hash_exhausted(self) -> bool:
+        return self.hashed_bytes >= self.max_hash_bytes or time.monotonic() - self._started >= self.max_seconds
+
+    def exhausted(self) -> bool:
+        return self.walk_exhausted() or self.hash_exhausted()
+
+
+def _fingerprint(st: os.stat_result) -> List[int]:
+    return [st.st_size, st.st_mtime_ns, st.st_ino]
+
+
+def _refresh_state_dir(root: Path) -> Path:
+    return producer_dir(root) / CHECKPOINT_DIR / REFRESH_DIR
+
+
+def _refresh_state_path(root: Path, cycle_id: str) -> Path:
+    if not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ProducerError("cycle-id-invalid", str(cycle_id))
+    return _refresh_state_dir(root) / f"{cycle_id}.json"
+
+
+def _refresh_cursor_path(root: Path) -> Path:
+    return _refresh_state_dir(root) / "cursor.json"
+
+
+@contextlib.contextmanager
+def _refresh_lock(root: Path, cycle_id: str, *, timeout: float):
+    """The cycle's refresh lock.  Only refreshes take it, so it can be held while
+    the admission lock is waited for; `finalize` never takes it."""
+    path = _refresh_state_path(root, cycle_id).with_suffix(".lock")
+    _ensure_dir(path.parent)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ProducerError("refresh-lock-busy", cycle_id)
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _read_refresh_state(root: Path, cycle_id: str) -> Dict[str, Any]:
+    """The last scan's bookkeeping: `cursor`, `observed_at` and `files`
+    (path -> [size, mtime_ns, inode, digest]).  It has no authority: a missing or
+    odd file just means the next run starts over."""
+    try:
+        raw = _read_json(_refresh_state_path(root, cycle_id))
+    except ProducerError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    files = raw.get("files")
+    kept: Dict[str, List[Any]] = {}
+    if isinstance(files, dict):
+        for rel, row in files.items():
+            if (isinstance(rel, str) and isinstance(row, list) and len(row) == 4
+                    and all(isinstance(v, int) and not isinstance(v, bool) for v in row[:3])
+                    and isinstance(row[3], str)):
+                kept[rel] = row
+    cursor = raw.get("cursor")
+    observed = raw.get("observed_at")
+    return {"cursor": cursor if isinstance(cursor, str) and cursor else None, "files": kept,
+            "observed_at": observed if isinstance(observed, (int, float)) and not isinstance(observed, bool) else None}
+
+
+def _write_refresh_state(root: Path, cycle_id: str, *, cursor: Optional[str], files: Mapping[str, Sequence[Any]],
+                         observed_at: float) -> None:
+    path = _refresh_state_path(root, cycle_id)
+    _ensure_dir(path.parent)
+    _write_atomic(path, _json_bytes({"schema_version": 1, "cycle_id": cycle_id, "cursor": cursor,
+                                     "observed_at": observed_at, "files": dict(sorted(files.items()))}), 0o644)
+
+
+@dataclass
+class _RefreshScan:
+    facts: Dict[str, Tuple[str, int, List[int]]] = field(default_factory=dict)
+    visited: Set[str] = field(default_factory=set)
+    excluded: List[str] = field(default_factory=list)
+    excluded_symlinks: List[str] = field(default_factory=list)
+    complete: bool = True
+    cursor: Optional[str] = None
+    from_top: bool = True
+
+
+def _pruned_directory(parts: Sequence[str]) -> bool:
+    """A directory the inclusion rule leaves out whole (hidden component or `__pycache__`)."""
+    return any(part.startswith(".") or part == "__pycache__" for part in parts)
+
+
+def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]]):
+    """Entries under `top` in name order, depth first, as `(parts, DirEntry, is_dir)`.
+
+    `after` is the last entry an earlier run finished: everything up to it is
+    skipped without a `stat`.  A directory the rule leaves out is yielded once and
+    not entered."""
+    try:
+        entries = sorted(os.scandir(top), key=lambda entry: entry.name)
+    except OSError:
+        return
+    for entry in entries:
+        parts = prefix + (entry.name,)
+        is_dir = entry.is_dir(follow_symlinks=False)
+        enter = is_dir and not _pruned_directory(parts)
+        if after is not None:
+            head = after[:len(parts)]
+            if parts < head:
+                continue
+            if parts == after:
+                if enter:
+                    yield from _walk_sorted(entry.path, parts, None)
+                continue
+            if parts == head:
+                if enter:
+                    yield from _walk_sorted(entry.path, parts, after)
+                continue
+        yield parts, entry, is_dir
+        if enter:
+            yield from _walk_sorted(entry.path, parts, None)
+
+
+def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str, Sequence[Any]],
+                  budget: RefreshBudget) -> _RefreshScan:
+    """Walk a closed cycle's `artifacts/` with no lock and read what the budget allows.
+
+    The same inclusion rule as the close (`_outside_inclusion_rule`, symbolic
+    links by `lstat`).  A file whose fingerprint matches `known` is not read; any
+    other is hashed in chunks, and a file that moves while it is read is left out
+    of this run.  The budget is looked at between entries; the run stops with a
+    cursor naming the last entry it finished."""
+    artifacts = directory / "artifacts"
+    if not artifacts.is_dir() or artifacts.is_symlink():
+        raise ProducerError("artifacts-dir-missing", str(artifacts))
+    after = tuple(cursor.split("/")) if cursor else None
+    scan = _RefreshScan(from_top=after is None)
+    last_parts: Optional[Tuple[str, ...]] = None
+    processed = 0
+    for parts, entry, is_dir in _walk_sorted(str(artifacts), (), after):
+        if processed and budget.walk_exhausted():
+            scan.complete, scan.cursor = False, "/".join(last_parts) if last_parts else cursor
+            return scan
+        budget.walked += 1
+        processed += 1
+        rel = "artifacts/" + "/".join(parts)
+        if entry.is_symlink():
+            scan.excluded_symlinks.append(rel)
+            last_parts = parts
+            continue
+        if is_dir:
+            if _pruned_directory(parts):
+                scan.excluded.append(rel + "/")
+            last_parts = parts
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            scan.visited.add(rel)
+            last_parts = parts
+            continue
+        if not stat.S_ISREG(st.st_mode) or _outside_inclusion_rule(rel) \
+                or not artifact_manifest.validate_locator_path(rel).ok:
+            scan.excluded.append(rel)
+            last_parts = parts
+            continue
+        scan.visited.add(rel)
+        fingerprint = _fingerprint(st)
+        remembered = known.get(rel)
+        if remembered is not None and list(remembered[:3]) == fingerprint:
+            scan.facts[rel] = (remembered[3], st.st_size, fingerprint)
+            last_parts = parts
+            continue
+        if budget.hashed_files and budget.hash_exhausted():
+            scan.visited.discard(rel)
+            scan.complete, scan.cursor = False, "/".join(last_parts) if last_parts else cursor
+            return scan
+        try:
+            digest, size = _stream_file_facts(Path(entry.path))
+            after_stat = os.lstat(entry.path)
+        except (ProducerError, OSError):
+            last_parts = parts
+            continue  # moved while it was read, or not a plain file now: the next run looks again
+        budget.hashed_bytes += size
+        budget.hashed_files += 1
+        if _fingerprint(after_stat) != fingerprint:
+            last_parts = parts
+            continue
+        scan.facts[rel] = (digest, size, fingerprint)
+        last_parts = parts
+    return scan
+
+
+def _confirmed_absent(directory: Path, document: Mapping[str, Any], scan: _RefreshScan,
+                      budget: RefreshBudget) -> List[str]:
+    """Declared files this run did not see and that are really gone (`lstat`).
+
+    A scan that stopped early has not seen the rest of the tree, so a file it did not
+    visit is never read as deleted: only an `lstat` that finds nothing is."""
+    gone: List[str] = []
+    remaining = (_UNLIMITED if budget.max_walk_entries == _UNLIMITED
+                 else max(0, int(budget.max_walk_entries) - budget.walked))
+    allowance = remaining + REFRESH_ABSENCE_CHECK_FLOOR
+    for row in document.get("artifact_revisions", []) or []:
+        rel = row.get("locator", {}).get("path") if isinstance(row, dict) else None
+        if not isinstance(rel, str) or rel in scan.visited or _outside_inclusion_rule(rel):
+            continue
+        if allowance <= 0:
+            break
+        allowance -= 1
+        budget.walked += 1
+        try:
+            os.lstat(str(directory / rel))
+        except (FileNotFoundError, NotADirectoryError):
+            gone.append(rel)
+        except OSError:
+            continue
+    return gone
+
+
+# -- the history lines of D-125 --------------------------------------------
+
+
+def _history_module():
+    """The one history recorder, or `None` when it is not importable (not merged yet)."""
+    try:
+        import artifact_history  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001 -- a missing or broken recorder is a pending line, never a failure
+        return None
+    if not all(callable(getattr(artifact_history, name, None)) for name in ("make_event", "publish_events_locked")):
+        return None
+    return artifact_history
+
+
+def _history_id(prefix: str, *parts: str) -> str:
+    """A stable ID, so that a line delivered twice after a crash is the same line."""
+    return prefix + "_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _history_token(name: str) -> Optional[str]:
+    value = os.environ.get(name)
+    return value if isinstance(value, str) and _HISTORY_TOKEN.match(value) else None
+
+
+def _history_actor(default_by: str) -> Dict[str, str]:
+    """`make_event` actor keywords: the agent session's markers when the environment has them,
+    else `default_by`.  A runtime that observed a change without seeing who wrote it passes `rule`."""
+    session = _history_token("AGENT_DISPATCH_ATTEMPT_ID")
+    harness = _history_token("AGENT_DISPATCH_CURRENT_HARNESS")
+    route = _history_token("AGENT_ROUTE_ID")
+    actor = {"actor_by": default_by}
+    if default_by != "rule" and any(os.environ.get(name) for name in (
+            "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_CURRENT_HARNESS", "AGENT_ROUTE_ID")):
+        actor["actor_by"] = "agent"
+    for key, value in (("session", session), ("harness", harness), ("route", route), ("attempt", session)):
+        if value:
+            actor[key] = value
+    return actor
+
+
+def _history_file_ref(row: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if row is None:
+        return {"value": None}
+    return {"digest": row["content_digest"], "bytes": row["byte_size"]}
+
+
+def _refresh_history_lines(root: Path, record: Mapping[str, Any], directory: Path,
+                           previous: Mapping[str, Any], refreshed: Mapping[str, Any],
+                           changes: Mapping[str, Sequence[str]], *, trigger: str,
+                           now: float) -> List[Dict[str, Any]]:
+    """One `make_event` argument set for each file added, changed or removed since the close.
+
+    File content is only ever a digest and a size.  The IDs come from the cycle, the
+    new document and the file, and the time is fixed here, so a line that is built again
+    for the same change is the same line."""
+    old_rows = {row["locator"]["path"]: row for row in previous.get("artifact_revisions", []) or []}
+    new_rows = {row["locator"]["path"]: row for row in refreshed.get("artifact_revisions", []) or []}
+    cycle_id = record["cycle_id"]
+    revision_id = refreshed["manifest_revision_id"]
+    transaction_id = _history_id("htxn", "refresh", cycle_id, revision_id)
+    actor = _history_actor("rule")
+    cycle_rel = Path(os.path.relpath(str(directory), str(root))).as_posix()
+    lines: List[Dict[str, Any]] = []
+    for operation, key in (("add", "added"), ("update", "modified"), ("delete", "removed")):
+        for rel in changes.get(key, []):
+            before, after = old_rows.get(rel), new_rows.get(rel)
+            target = after or before
+            if target is None:
+                continue
+            lines.append({
+                "kind": "artifact", "target_type": "artifact", "target_id": target["artifact_id"],
+                "target_path": f"{cycle_rel}/{rel}", "operation": operation, "field": rel,
+                "before": _history_file_ref(before), "after": _history_file_ref(after),
+                "reason": trigger, "transaction_id": transaction_id,
+                "event_id": _history_id("hevt", "refresh", cycle_id, revision_id, operation, rel),
+                "now": now, **actor})
+    return lines
+
+
+def _close_history_line(root: Path, record: Mapping[str, Any], document: Mapping[str, Any], digest: str,
+                        directory: Path, *, excluded: int, now: Optional[float]) -> Dict[str, Any]:
+    """The one lifecycle line a first close leaves: state, manifest digest and revision, file count."""
+    revision_id = document["manifest_revision_id"]
+    route_id = record.get("route_id")
+    return {
+        "kind": "lifecycle", "target_type": "cycle", "target_id": record["cycle_id"],
+        "target_path": Path(os.path.relpath(str(directory), str(root))).as_posix(),
+        "operation": "update", "field": "state", "before": {"value": "open"},
+        "after": {"value": {"state": document["cycle"]["state"], "manifest_digest": digest,
+                            "revision_id": revision_id,
+                            "files": len(document.get("artifact_revisions", []) or []), "excluded": excluded}},
+        "reason": f"finalize {route_id}" if route_id else "finalize",
+        "transaction_id": _history_id("htxn", "close", record["cycle_id"], revision_id),
+        "event_id": _history_id("hevt", "close", record["cycle_id"], revision_id),
+        "now": time.time() if now is None else float(now), **_history_actor("human")}
+
+
+def _history_deliver_locked(root: Path, lines: Sequence[Mapping[str, Any]]) -> bool:
+    """Hand lines to the recorder while the admission lock is held.
+
+    `False` when there is no recorder or it failed: the caller keeps the lines (and
+    must not call a change recorded).  A line the recorder rejects as malformed is
+    dropped rather than kept forever: it could never be delivered."""
+    if not lines:
+        return True
+    module = _history_module()
+    if module is None:
+        return False
+    try:
+        events = []
+        for line in lines:
+            try:
+                events.append(module.make_event(**dict(line)))
+            except Exception:  # noqa: BLE001
+                continue
+        if events:
+            module.publish_events_locked(root, events)
+        return True
+    except Exception:  # noqa: BLE001 -- the recorder failing never fails the change
+        return False
+
+
+def _merge_pending(carried: Sequence[Mapping[str, Any]], lines: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    seen = {entry.get("event_id") for entry in carried}
+    return [dict(entry) for entry in carried] + [dict(line) for line in lines if line.get("event_id") not in seen]
+
+
+def _with_pending(record: Mapping[str, Any], pending: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    updated = dict(record)
+    if pending:
+        updated["history_pending"] = [dict(entry) for entry in pending]
+    else:
+        updated.pop("history_pending", None)
+    return updated
+
+
+def _write_history_pending(root: Path, record: Mapping[str, Any], pending: Sequence[Mapping[str, Any]]) -> None:
+    """Rewrite a cycle record with only its `history_pending` changed (the admission lock is held).
+
+    No locator row input is touched, so this is a leaf record write with no index effect."""
+    _write_cycle_record(root, _with_pending(record, pending), exclusive=False)
+
+
+def _deliver_pending(root: Path, cycle_id: str, *, timeout: float) -> str:
+    """Hand a cycle record's `history_pending` lines to the recorder and clear what was taken."""
+    if _history_module() is None:
+        return "pending"
+    fd = artifact_admission._acquire_lock(root, timeout)
+    try:
+        record = read_cycle_record(root, cycle_id)
+        pending = (record or {}).get("history_pending") or []
+        if not pending:
+            return "none"
+        if not _history_deliver_locked(root, pending):
+            return "pending"
+        _write_history_pending(root, record, [])
+        return "delivered"
+    finally:
+        artifact_admission._release_lock(root, fd)
+
+
+def _recheck_candidate(directory: Path, manifest_path: Path, raw: bytes, scan: _RefreshScan,
+                       changes: Mapping[str, Sequence[str]]) -> bool:
+    """Under the refresh lock, with `lstat` only: is what the scan saw still true?"""
+    try:
+        if manifest_path.read_bytes() != raw:
+            return False
+        for rel in list(changes.get("added", [])) + list(changes.get("modified", [])):
+            if _fingerprint(os.lstat(str(directory / rel))) != scan.facts[rel][2]:
+                return False
+        for rel in changes.get("removed", []):
+            try:
+                os.lstat(str(directory / rel))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _remember_scan(root: Path, cycle_id: str, scan: _RefreshScan, state: Mapping[str, Any], *,
+                   published: bool, observe: bool, clock: float) -> None:
+    """Keep the scan's fingerprints and cursor where the next run finds them.
+
+    Written when a document was published, when the run stopped early, and when a sweep
+    looks at a cycle for the first time; never for a cycle a trigger named that had
+    nothing to say (that run touches nothing)."""
+    previous = dict(state.get("files", {}))
+    files = {rel: [*fp, digest] for rel, (digest, _size, fp) in scan.facts.items()}
+    if not (scan.complete and scan.from_top):
+        files = {**previous, **files}
+    if not (published or not scan.complete or (observe and files != previous)
+            or (scan.complete and state.get("cursor") is not None)):
+        return
+    try:
+        _write_refresh_state(root, cycle_id, cursor=scan.cursor, files=files, observed_at=clock)
+    except (OSError, ProducerError):
+        pass
+
+
+def refresh_cycle(
+    root: Path, cycle_id: str, *, trigger: str = "explicit", now: Optional[float] = None,
+    budget: Optional[RefreshBudget] = None,
+    allocator: Optional[artifact_identity.IdAllocator] = None,
+    observe: bool = False, crash_after_manifest: bool = False,
+) -> Dict[str, Any]:
+    """Observe one closed cycle (§45 D-124): publish its next manifest document if a file changed.
+
+    Every outcome is a result, none is an error for the caller: `emitted` (a new
+    document is current), `unchanged`, or `skipped` with a `reason` (busy, the cycle moved
+    while it was scanned, the recorder was unavailable, ...) -- a skipped run changed
+    nothing and the next trigger finds the same work again.  A run that changes nothing
+    writes nothing.  `explicit` ignores the interval and the budget."""
+    root = Path(root).resolve()
+    clock = time.time() if now is None else float(now)
+    base = {"cycle_id": cycle_id, "trigger": trigger}
+    if budget is None:
+        budget = RefreshBudget.unlimited() if trigger == "explicit" else RefreshBudget()
+
+    def skipped(reason: str, **extra: Any) -> Dict[str, Any]:
+        return {"status": "skipped", "reason": reason, **base, **extra}
+
+    try:
+        return _refresh_cycle_observed(root, cycle_id, trigger=trigger, clock=clock, budget=budget,
+                                       allocator=allocator, observe=observe,
+                                       crash_after_manifest=crash_after_manifest, base=base, skipped=skipped)
+    except (artifact_admission.AdmissionBusy, dispatch_lock_order.LockOrderError) as exc:
+        return skipped("busy", detail=str(exc))
+    except ProducerError as exc:
+        return skipped("busy" if exc.code == "refresh-lock-busy" else exc.code, detail=exc.detail)
+    except (artifact_lifecycle.LifecycleError, artifact_locator.LocatorError, OSError, ValueError) as exc:
+        return skipped(type(exc).__name__, detail=str(exc))
+
+
+def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: float, budget: RefreshBudget,
+                            allocator: Optional[artifact_identity.IdAllocator], observe: bool,
+                            crash_after_manifest: bool, base: Mapping[str, Any], skipped) -> Dict[str, Any]:
+    record = read_cycle_record(root, cycle_id)
+    if record is None:
+        return skipped("cycle-unknown")
+    if record.get("state") != "sealed":
+        return skipped("cycle-not-closed", cycle_state=record.get("state"))
+    manifest_path = _record_cycle_manifest_path(root, record)
+    if not _path_entry_present(manifest_path):
+        return skipped("manifest-absent")
+    if journal_path(root, cycle_id).exists():
+        return skipped("journal-pending")  # the next locked command finishes it
+    raw = manifest_path.read_bytes()
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return skipped("manifest-unreadable")
+    digest = artifact_manifest.manifest_digest(document)
+    if record.get("manifest_digest") != digest:
+        return skipped("record-digest-mismatch")
+    state = _read_refresh_state(root, cycle_id)
+    observed_at = state.get("observed_at")
+    if (trigger != "explicit" and observed_at is not None and state.get("cursor") is None
+            and clock - observed_at < checkpoint_interval_seconds()):
+        return skipped("min-interval", next_eligible_at=_rfc3339(observed_at + checkpoint_interval_seconds()))
+    directory = manifest_path.parent
+    scan = _bounded_scan(directory, cursor=None if trigger == "explicit" else state.get("cursor"),
+                         known=state.get("files", {}), budget=budget)
+    gone = _confirmed_absent(directory, document, scan, budget)
+    alloc = allocator or artifact_identity.IdAllocator()
+    facts = [(rel, digest_, size) for rel, (digest_, size, _fp) in sorted(scan.facts.items())]
+    refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=clock,
+                                             removable=gone)
+    result = {"status": "unchanged", **base, "changes": changes, "complete": scan.complete,
+              "cursor": scan.cursor, "walked": budget.walked, "hashed_bytes": budget.hashed_bytes,
+              "excluded_hidden": scan.excluded, "excluded_symlinks": scan.excluded_symlinks,
+              "manifest_digest": digest}
+    if refreshed is None:
+        if record.get("history_pending"):
+            result["history"] = _deliver_pending(root, cycle_id, timeout=REFRESH_ADMISSION_WAIT_SECONDS)
+        _remember_scan(root, cycle_id, scan, state, published=False, observe=observe, clock=clock)
+        return result
+    new_digest = artifact_manifest.manifest_digest(refreshed)
+    earlier = {old.get("manifest_revision_id"): old for old in _earlier_documents(root, cycle_id, refreshed)}
+    earlier[document.get("manifest_revision_id")] = document
+    report = artifact_manifest.validate_update(refreshed, preserved=list(earlier.values()), previous=document)
+    if not report.ok:
+        return skipped("manifest-invalid", detail=";".join(v.code for v in report.violations))
+    lines = _refresh_history_lines(root, record, directory, document, refreshed, changes, trigger=trigger, now=clock)
+    with _refresh_lock(root, cycle_id, timeout=0.0):
+        outcome = _publish_refresh(
+            root, cycle_id, manifest_path, raw, digest, refreshed, new_digest, scan, changes, lines,
+            now=clock, crash_after_manifest=crash_after_manifest)
+    if outcome is not None:
+        return skipped(outcome)
+    _remember_scan(root, cycle_id, scan, state, published=True, observe=observe, clock=clock)
+    result.update(status="emitted", manifest_digest=new_digest, manifest_path=str(manifest_path),
+                  history="pending" if not _history_published(root, cycle_id) else "published")
+    return result
+
+
+def _history_published(root: Path, cycle_id: str) -> bool:
+    record = read_cycle_record(root, cycle_id) or {}
+    return not record.get("history_pending")
+
+
+def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes, digest: str,
+                     refreshed: Mapping[str, Any], new_digest: str, scan: _RefreshScan,
+                     changes: Mapping[str, Sequence[str]], lines: Sequence[Mapping[str, Any]], *,
+                     now: float, crash_after_manifest: bool) -> Optional[str]:
+    """Publish a prepared next document; `None` on success, else why this run skipped.
+
+    The refresh lock is held and the admission lock is not.  Order: re-check with `lstat`,
+    history lines (a short admission section), then manifest, index row and record (a second
+    one).  Both sections hold the admission lock for file writes only."""
+    directory = manifest_path.parent
+    if not _recheck_candidate(directory, manifest_path, raw, scan, changes):
+        return "superseded"
+    record = read_cycle_record(root, cycle_id)
+    if record is None or record.get("state") != "sealed" or record.get("manifest_digest") != digest:
+        return "superseded"
+    carried = list(record.get("history_pending") or [])
+    pending = _merge_pending(carried, lines)
+    if _history_module() is not None:
+        fd = artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS)
+        try:
+            delivered = _history_deliver_locked(root, pending)
+            if delivered and carried:
+                _write_history_pending(root, record, [])
+        finally:
+            artifact_admission._release_lock(root, fd)
+        if not delivered:
+            return "history-unavailable"  # history first, manifest second: the same change is found again
+        pending = []
+    fd = artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS)
+    try:
+        record = read_cycle_record(root, cycle_id)
+        if record is None or record.get("state") != "sealed" or record.get("manifest_digest") != digest:
+            return "superseded"
+        if manifest_path.read_bytes() != raw:
+            return "superseded"
+        index = artifact_admission.load_index(root)  # the one read of this locked section
+        row = index.manifests.get(cycle_id)
+        if not isinstance(row, dict) or row.get("manifest_digest") != digest:
+            return "index-mismatch"
+        identity = artifact_lifecycle.read_root_identity(root)
+        index_report = artifact_index.check(
+            index, refreshed, idempotency_key=cycle_id, manifest_digest=new_digest,
+            repository_id=identity.repository_id if identity else None, replaces_manifest_digest=digest)
+        if not index_report.ok:
+            return "index-rejected"
+        new_raw = artifact_manifest.canonical_bytes(refreshed)
+        cycle_path = os.path.relpath(str(directory), str(root))
+        artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, raw)
+        _write_journal(root, cycle_id, state="refreshing", manifest_digest=new_digest,
+                       previous_manifest_digest=digest, cycle_path=cycle_path,
+                       manifest_revision_id=refreshed["manifest_revision_id"], history_pending=pending)
+        artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, new_raw)
+        # COMMIT POINT: atomic replacement of the current document.
+        _write_atomic(manifest_path, new_raw)
+        if crash_after_manifest:  # test hook: simulate a crash after the commit point
+            raise artifact_admission.AdmissionRecoveryRequired("simulated crash after manifest refresh")
+        try:
+            _commit_sealed(root, _with_pending(record, pending), refreshed, new_digest, now=now,
+                           index=index, previous_digest=digest)
+        except BaseException as exc:
+            raise artifact_admission.AdmissionRecoveryRequired(
+                f"cycle {cycle_id} manifest refreshed but post-publish update failed; run recover") from exc
+    finally:
+        artifact_admission._release_lock(root, fd)
+    return None
+
+
+def _cycle_ids_with_records(root: Path) -> List[str]:
+    directory = producer_dir(root) / "cycles"
+    if not directory.is_dir():
+        return []
+    return sorted(entry.stem for entry in directory.iterdir()
+                  if entry.suffix == ".json" and artifact_identity.is_well_formed(entry.stem, "cycle"))
+
+
+def refresh_sweep(
+    root: Path, *, trigger: str = "turn-end", now: Optional[float] = None,
+    budget: Optional[RefreshBudget] = None, first_cycle_id: Optional[str] = None,
+    skip_cycle_id: Optional[str] = None,
+    allocator: Optional[artifact_identity.IdAllocator] = None,
+) -> Dict[str, Any]:
+    """Look at the root's closed cycles in turn, with what is left of one budget (§45 D-124).
+
+    `first_cycle_id` is the cycle a trigger names, looked at before the rest whatever its
+    state.  The rest follow a cursor that moves around all closed cycles in ID order: no
+    date or count leaves a cycle out, and an old one is reached on a later round.  The cursor
+    is bookkeeping under `checkpoints/refresh/`, with no authority; a run that could not finish
+    a cycle leaves it before that cycle so the next run resumes there."""
+    root = Path(root).resolve()
+    clock = time.time() if now is None else float(now)
+    budget = budget or (RefreshBudget.unlimited() if trigger == "explicit" else RefreshBudget())
+    out: Dict[str, Any] = {"status": "swept", "trigger": trigger, "visited": 0, "refreshed": [], "skipped": [],
+                           "cursor": None}
+
+    def look(cycle_id: str, *, observe: bool) -> Dict[str, Any]:
+        try:
+            result = refresh_cycle(root, cycle_id, trigger=trigger, now=clock, budget=budget,
+                                   allocator=allocator, observe=observe)
+        except Exception as exc:  # noqa: BLE001 -- one cycle's trouble never stops the sweep
+            return {"status": "skipped", "reason": type(exc).__name__}
+        if result["status"] == "emitted":
+            out["refreshed"].append(cycle_id)
+        elif result["status"] == "skipped" and result.get("reason") != "cycle-not-closed":
+            out["skipped"].append({"cycle_id": cycle_id, "reason": result.get("reason")})
+        return result
+
+    if first_cycle_id:
+        look(first_cycle_id, observe=False)
+        out["visited"] += 1
+    cursor_path = _refresh_cursor_path(root)
+    cursor = _read_json(cursor_path) or {}
+    last_sweep = cursor.get("last_sweep_at")
+    if (trigger != "explicit" and isinstance(last_sweep, (int, float)) and not isinstance(last_sweep, bool)
+            and clock - last_sweep < checkpoint_interval_seconds()):
+        out["rotation"] = "min-interval"
+        return out
+    ids = _cycle_ids_with_records(root)
+    if not ids:
+        return out
+    after = cursor.get("after") if isinstance(cursor.get("after"), str) else None
+    start = 0
+    if after is not None:
+        start = next((i for i, cid in enumerate(ids) if cid > after), 0)
+    last_done, looked = after, 0
+    for cycle_id in ids[start:] + ids[:start]:
+        if looked and budget.exhausted():
+            break
+        if cycle_id in (first_cycle_id, skip_cycle_id):
+            last_done = cycle_id
+            continue
+        record = read_cycle_record(root, cycle_id)
+        if record is None or record.get("state") != "sealed":
+            last_done = cycle_id
+            continue
+        result = look(cycle_id, observe=True)
+        looked += 1
+        out["visited"] += 1
+        if result["status"] != "skipped" and not result.get("complete", True):
+            break  # unfinished: the next run resumes inside this cycle
+        last_done = cycle_id
+    out["cursor"] = last_done
+    if looked:
+        try:
+            _ensure_dir(cursor_path.parent)
+            _write_atomic(cursor_path, _json_bytes({"schema_version": 1, "after": last_done,
+                                                    "last_sweep_at": clock}), 0o644)
+        except (OSError, ProducerError):
+            pass
+    return out
+
+
+def _prescan_known(root: Path, cycle_id: str) -> Dict[str, List[Any]]:
+    """Fingerprints and digests of a closed cycle's files, read before any lock is taken.
+
+    An explicit `finalize` or `admit-shared` of a closed cycle compares its files with the
+    manifest under the admission lock; reading them here means the lock only has to `lstat`."""
+    try:
+        record = read_cycle_record(root, cycle_id)
+        if record is None or record.get("state") != "sealed":
+            return {}
+        manifest_path = _record_cycle_manifest_path(root, record)
+        if not _path_entry_present(manifest_path):
+            return {}
+        scan = _bounded_scan(manifest_path.parent, cursor=None,
+                             known=_read_refresh_state(root, cycle_id).get("files", {}),
+                             budget=RefreshBudget.unlimited())
+        return {rel: [*fp, digest] for rel, (digest, _size, fp) in scan.facts.items()}
+    except Exception:  # noqa: BLE001 -- only an optimisation
+        return {}
 
 
 def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
@@ -5308,6 +6142,7 @@ def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mappi
 def _commit_sealed(
     root: Path, record: Mapping[str, Any], document: Mapping[str, Any], digest: str, *, now: Optional[float],
     index: Optional[artifact_index.IndexDocument] = None, previous_digest: Optional[str] = None,
+    excluded_count: Optional[int] = None,
 ) -> None:
     """Apply a published manifest to the index and the cycle record.
 
@@ -5341,6 +6176,15 @@ def _commit_sealed(
         sealed["sealed_on"] = _rfc3339(now)
     sealed["manifest_digest"] = digest
     sealed["cycle_state"] = document["cycle"]["state"]
+    if not already_closed:
+        # §45 D-125: a first close leaves one history line.  A recorder that is not there (or
+        # fails) leaves the line in the record for the next trigger; it never fails the close.
+        line = _close_history_line(
+            root, sealed, document, digest, directory, now=now,
+            excluded=excluded_count if excluded_count is not None
+            else len(record.get("excluded_symlinks") or []))
+        pending = _merge_pending(sealed.get("history_pending") or [], [line])
+        sealed = _with_pending(sealed, [] if _history_deliver_locked(root, pending) else pending)
     _write_cycle_record(root, sealed, exclusive=False)
     _write_journal(root, record["cycle_id"], state="committed", manifest_digest=digest,
                    cycle_path=os.path.relpath(str(directory), str(root)))
@@ -6185,6 +7029,7 @@ def admit_shared(
     if key and not _KEY_RE.match(key):
         raise ProducerError("reference-key-invalid", key)
     alloc = allocator or artifact_identity.IdAllocator()
+    known = _prescan_known(root, cycle_id)  # the cycle's own files, read before the lock (§45 D-124)
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
         pre = read_cycle_record(root, cycle_id)
@@ -6267,7 +7112,7 @@ def admit_shared(
         # §45 D-123/D-124: a new publication takes the files as they are now, so the
         # cycle's manifest is brought up to them first (it may have changed since the close).
         if _path_entry_present(_record_cycle_manifest_path(root, record)):
-            if _refresh_cycle_locked(root, record, now=now)["refreshed"]:
+            if _refresh_cycle_locked(root, record, now=now, known=known, trigger="admit-shared")["refreshed"]:
                 record = read_cycle_record(root, cycle_id)
         # An unresolved publication intent for this exact source cannot be
         # replaced by a second publication. Preserve it for checked recovery.
