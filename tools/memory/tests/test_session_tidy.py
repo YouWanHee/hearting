@@ -157,15 +157,26 @@ class CardConsumeTest(TidyCase):
             self.assertEqual(self.hook("claude", "prompt", "sid-A"), "")
         self.assertEqual(self.hook("claude", "start", "sid-A", "--source", "resume"), "")
 
-    def test_card_arrives_once_after_compact_for_the_author_and_the_receiver(self):
+    def test_card_arrives_once_after_compact_for_the_author(self):
         self.hook("claude", "start", "sid-A")
         self.card("sid-A", "표식-C")
         after = self.hook("claude", "start", "sid-A", "--source", "compact")
         self.assertIn("표식-C", after)
         self.assertEqual(self.hook("claude", "prompt", "sid-A"), "")
-        self.assertIn("표식-C", self.hook("claude", "start", "sid-B"))
-        self.assertIn("표식-C", self.hook("claude", "start", "sid-B", "--source", "compact"))
-        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+        # the compact delivery was the one hand-over of this generation for the whole seat
+        self.assertEqual(self.hook("claude", "start", "sid-B"), "")
+
+    def test_one_generation_is_handed_over_once_for_the_whole_seat(self):
+        self.hook("claude", "start", "sid-A")
+        self.card("sid-A", "표식-S")
+        self.assertIn("표식-S", self.hook("claude", "start", "sid-B"))
+        self.assertEqual(self.hook("claude", "start", "sid-C"), "")
+        self.assertEqual(self.hook("claude", "prompt", "sid-C"), "")
+        self.assertEqual(self.hook("claude", "start", "sid-B", "--source", "compact"), "")
+        self.assertEqual(self.hook("claude", "start", "sid-A", "--source", "compact"), "")
+        self.card("sid-A", "표식-S2")                                      # a new card: once more
+        self.assertIn("표식-S2", self.hook("claude", "start", "sid-C", "--source", "resume"))
+        self.assertEqual(self.hook("claude", "start", "sid-D"), "")
 
     def test_compact_event_only_marks_the_round_and_the_next_prompt_delivers(self):
         self.hook("opencode", "start", "ses_A")

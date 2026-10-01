@@ -597,9 +597,11 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
             eligible = (not same_session) or epoch > int(author.get("epoch", 0) or 0)
             consumed = read_json(_consumed_path(seat))
-            done = set(consumed.get("receipts", [])) if isinstance(consumed, dict) \
-                and consumed.get("generation") == card.get("generation") else set()
-            card_due = eligible and _receipt(harness, sid, epoch) not in done
+            # One card generation is injected once for the whole seat: any receipt for it,
+            # from any session, means the card has already been handed over.
+            taken = isinstance(consumed, dict) and consumed.get("generation") == card.get("generation") \
+                and bool(consumed.get("receipts"))
+            card_due = eligible and not taken
             if card_due:
                 room = INJECTION_MAX_BYTES - len(notice_block.encode("utf-8")) - (1 if notice_block else 0)
                 parts.append(build_card_injection(card, card_text_path(seat), now, room))
