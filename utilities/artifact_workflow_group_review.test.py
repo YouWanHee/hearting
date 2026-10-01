@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission as adm  # noqa: E402
+import artifact_history as H  # noqa: E402
+import artifact_meta as M  # noqa: E402
 import artifact_producer as P  # noqa: E402
 import artifact_workflow_group_review as R  # noqa: E402
 import artifact_workflow_groups as W  # noqa: E402
@@ -44,14 +47,50 @@ def target_ids(prompt):
     return [row["cycle_id"] for row in data_of(prompt)["targets"]]
 
 
+def group_ids(prompt):
+    return data_of(prompt)["group_target_ids"]
+
+
+def meta_for(prompt, title="쉬운 제목", summary="한 일과 결과를 한 줄로 적음"):
+    """A valid v2 `metadata` + `new_branches` pair for whatever the prompt asks (the model is never called)."""
+    data = data_of(prompt)
+    vocab = [item["code"] for item in data["project_meta"]["branches"]]
+    entity = {"title": title, "summary": summary, "branches": [vocab[0] if vocab else "GEN"], "kinds": ["평가"]}
+    return {"metadata": {"campaign": dict(entity), "cycles": {cid: dict(entity) for cid in data["metadata_target_ids"]}},
+            "new_branches": [] if vocab else [{"code": "GEN", "label": "일반", "note": "기본 갈래"}]}
+
+
+def _no_duplicates(pairs):
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _complete(text, prompt):
+    """`text` with the first JSON object given the v2 `metadata` keys it lacks; anything else is left alone."""
+    start = text.find("{")
+    try:
+        value, end = json.JSONDecoder(object_pairs_hook=_no_duplicates).raw_decode(text, start)
+    except ValueError:
+        return text
+    if not isinstance(value, dict) or "metadata" in value or "decisions" not in value:
+        return text
+    return text[:start] + json.dumps({**value, **meta_for(prompt)}, ensure_ascii=False) + text[end:]
+
+
 def answer(payload):
-    text = payload if isinstance(payload, str) else json.dumps(payload)
-    return lambda prompt: (text, "claude")
+    """An `invoke` answering `payload`; a legacy three-key answer is completed with metadata from the prompt."""
+    def invoke(prompt):
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        return _complete(text, prompt), "claude"
+    return invoke
 
 
 def none_for(prompt, reason="No shared subgoal is visible in the bodies."):
     return json.dumps({"decisions": [{"cycle_id": cid, "verdict": "none", "reason": reason}
-                                     for cid in target_ids(prompt)], "new_groups": [], "relations": []})
+                                     for cid in group_ids(prompt)], "new_groups": [], "relations": [],
+                       **meta_for(prompt)}, ensure_ascii=False)
 
 
 class Recorder:
@@ -88,6 +127,7 @@ class ReviewBase(fixture.ProducerTestBase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop(R.DISABLE_ENV, None)
+        os.environ.pop(M.TITLE_DISABLE_ENV, None)  # the runner switches both jobs off; these suites turn them on
         self.activate()
 
     def _restore_attempt(self):
@@ -234,13 +274,21 @@ class SelectionTest(ReviewBase):
             {"cycle_id": b["cycle_id"], "stage_label": "Two"}], "relations": []}])
         invoke = Recorder()
         result = R.sweep(self.root, cycles=[a["cycle_id"], c["cycle_id"]], invoke=invoke)
-        self.assertEqual(invoke.targets, [[c["cycle_id"]]])
+        # A member is sent only for metadata: it is a target but gets no group decision.
+        self.assertEqual([sorted(ids) for ids in invoke.targets], [sorted([a["cycle_id"], c["cycle_id"]])])
+        self.assertEqual(group_ids(invoke.prompts[0]), [c["cycle_id"]])
+        self.assertEqual(result["already_member"], [])
+        self.assertEqual(self.record()["cycles"][a["cycle_id"]]["verdict"], "member")
+        again = Recorder()
+        result = R.sweep(self.root, cycles=[a["cycle_id"]], invoke=again)  # it has metadata now
+        self.assertEqual(again.prompts, [])
         self.assertEqual(result["already_member"], [a["cycle_id"]])
-        self.assertNotIn(a["cycle_id"], self.record()["cycles"])
         auto = Recorder()
-        result = R.sweep(self.root, auto=True, cycles=[b["cycle_id"]], invoke=auto)
-        self.assertEqual(auto.prompts, [])
-        self.assertEqual(result["already_member"], [b["cycle_id"]])
+        R.sweep(self.root, auto=True, cycles=[b["cycle_id"]], invoke=auto)
+        self.assertEqual((auto.targets, group_ids(auto.prompts[0])), ([[b["cycle_id"]]], []))
+        auto = Recorder()
+        R.sweep(self.root, auto=True, cycles=[b["cycle_id"]], invoke=auto)
+        self.assertEqual(auto.prompts, [])  # judged once: its record says `member`
 
     def test_retry_limit_and_reassessment_after_seal(self):  # T3
         cycle = self.seal(slug="retry")
@@ -497,8 +545,9 @@ class ValidationTest(ReviewBase):
         result = R.sweep(self.root, cycles=[other["cycle_id"]], invoke=answer(
             {"decisions": [{"cycle_id": other["cycle_id"], "verdict": "none", "reason": reason}],
              "new_groups": [], "relations": []}))
-        self.assertEqual(self.report(result)["status"], "no-change")
+        self.assertEqual(self.report(result)["status"], "applied")  # metadata is written even for `none`
         self.assertFalse(W.declaration_path(self.root, other["campaign_id"]).exists())
+        self.assertEqual(M.read_campaign_meta(self.root, other["campaign_id"]).status, "ok")
         entry = self.record()["cycles"][other["cycle_id"]]
         self.assertEqual((entry["verdict"], entry["profile"], entry["harness"], entry["mode"]),
                          ("unassigned", "light", "claude", "explicit"))
@@ -519,7 +568,7 @@ class ValidationTest(ReviewBase):
         self.assertFalse(R.pending_dir(self.root).exists())
 
     def test_apply_conflict_is_retried_once(self):
-        real = W.apply
+        real = W._validated_apply_locked
         calls = []
 
         def racing(root, plan):
@@ -528,25 +577,19 @@ class ValidationTest(ReviewBase):
                 raise W.WorkflowGroupError("declaration-preimage-conflict")
             return real(root, plan)
 
-        with mock.patch.object(W, "apply", side_effect=racing):
+        with mock.patch.object(W, "_validated_apply_locked", side_effect=racing):
             report = self.report(self.run_reply(self.new_reply()))
         self.assertEqual((report["status"], len(calls)), ("applied", 2))
 
     def test_apply_failure_is_a_hard_failure(self):
-        with mock.patch.object(W, "apply", side_effect=W.WorkflowGroupError("evidence-total-size-limit")):
+        with mock.patch.object(W, "_validated_apply_locked",
+                               side_effect=W.WorkflowGroupError("evidence-total-size-limit")):
             report = self.report(self.run_reply(self.new_reply()))
         self.assertEqual((report["status"], report["failure_class"]), ("failed", "apply-failed"))
         self.assertEqual(self.record()["cycles"][self.tid]["hard_failures"], 1)
 
 
 class TriggerTest(ReviewBase):
-    def setUp(self):
-        super().setUp()
-        # The campaign-title trigger spawns through the same `Popen`; these tests count review spawns only.
-        patcher = mock.patch.object(repair, "launch_after_seal", return_value=False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def spawned(self):
         return mock.patch.object(R.subprocess, "Popen")
 
@@ -627,6 +670,416 @@ class TriggerTest(ReviewBase):
             self.assertFalse(R.launch_after_seal(self.root / "nowhere", {"cycle_id": "cyc_" + "2" * 32}))
             self.assertFalse(R.launch_after_seal(self.root, {"cycle_id": "not-a-cycle"}))
         popen.assert_not_called()
+
+
+def content_snapshot(root):
+    """rel path -> digest of every regular file except the review's own judgement record and locks."""
+    skip = ("workflow-group-review", "admission")
+    return {row[0]: row[3] for row in tree_snapshot(root) if row[3] and not any(word in row[0] for word in skip)}
+
+
+MUTATIONS = {
+    "missing-metadata": lambda v: {k: x for k, x in v.items() if k != "metadata"},
+    "missing-new-branches": lambda v: {k: x for k, x in v.items() if k != "new_branches"},
+    "extra-top-key": lambda v: {**v, "ids": {}},
+    "cycle-missing": lambda v: {**v, "metadata": {**v["metadata"], "cycles": {}}},
+    "cycle-unknown": lambda v: {**v, "metadata": {**v["metadata"], "cycles": {
+        **v["metadata"]["cycles"], "cyc_" + "0" * 32: next(iter(v["metadata"]["cycles"].values()))}}},
+    "source-injected": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "source": {"title": {"by": "human"}}}}},
+    "id-injected": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "short_id": "CMD-01"}}},
+    "title-too-long": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "title": "가" * 121}}},
+    "title-empty": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {**v["metadata"]["campaign"], "title": ""}}},
+    "summary-too-long": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "summary": "가" * 401}}},
+    "unknown-kind": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "kinds": ["없는성격"]}}},
+    "unknown-branch": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "branches": ["NOPE"]}}},
+    "empty-branches": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {**v["metadata"]["campaign"], "branches": []}}},
+    "duplicate-branch": lambda v: {**v, "metadata": {**v["metadata"], "campaign": {
+        **v["metadata"]["campaign"], "branches": ["GEN", "GEN"]}}},
+    "bad-new-branch-code": lambda v: {**v, "new_branches": [{"code": "gen", "label": "x", "note": ""}]},
+    "etc-as-new-branch": lambda v: {**v, "new_branches": [{"code": "ETC", "label": "x", "note": ""}]},
+    "duplicate-new-branch": lambda v: {**v, "new_branches": [v["new_branches"][0], v["new_branches"][0]]},
+    "too-many-new-branches": lambda v: {**v, "new_branches": [
+        {"code": f"B{chr(65 + i)}", "label": "x", "note": ""} for i in range(13)]},
+    "new-branch-extra-key": lambda v: {**v, "new_branches": [{**v["new_branches"][0], "extra": 1}]},
+}
+
+
+class UnifiedReviewTest(ReviewBase):
+    """One model call per campaign decides the groups and the metadata; failures write nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.a1 = self.seal(slug="a1")
+        self.a2 = self.seal(slug="a2")
+        self.b1 = self.seal(key="other", slug="b1")
+        self.camp, self.other = self.a1["campaign_id"], self.b1["campaign_id"]
+
+    def meta_doc(self, begun):
+        read = M.read_campaign_meta(self.root, begun["campaign_id"])
+        self.assertEqual(read.status, "ok", read.code)
+        return read.doc
+
+    def valid_reply(self, ids):
+        prompt_data = {"project_meta": {"branches": []}, "metadata_target_ids": ids}
+        entity = {"title": "쉬운 제목", "summary": "한 일과 결과", "branches": ["GEN"], "kinds": ["평가"]}
+        return {"decisions": [{"cycle_id": cid, "verdict": "none", "reason": "r"} for cid in ids],
+                "new_groups": [], "relations": [],
+                "metadata": {"campaign": entity, "cycles": {cid: dict(entity) for cid in prompt_data["metadata_target_ids"]}},
+                "new_branches": [{"code": "GEN", "label": "일반", "note": ""}]}
+
+    def test_one_call_per_campaign_decides_groups_and_metadata_together(self):
+        invoke = Recorder()
+        result = R.sweep(self.root, cycles=[self.a1["cycle_id"], self.a2["cycle_id"], self.b1["cycle_id"]], invoke=invoke)
+        self.assertEqual(len(invoke.prompts), 2)  # one per campaign, whatever the target count
+        self.assertEqual(sorted(len(t) for t in invoke.targets), [1, 2])
+        self.assertEqual({r["status"] for r in result["campaigns"]}, {"applied"})
+        for begun in (self.a1, self.b1):
+            doc = self.meta_doc(begun)
+            self.assertEqual(doc["campaign"]["title"], "쉬운 제목")
+            self.assertTrue(all(e["short_id"].startswith("GEN-0") for e in doc["cycles"].values()))
+        self.assertEqual(sorted(self.meta_doc(c)["campaign"]["short_id"] for c in (self.a1, self.b1)),
+                         ["GEN-01", "GEN-02"])  # seals in one second tie, so the order between campaigns is not fixed
+        self.assertEqual([b["code"] for b in M.read_project(self.root).doc["branches"]], ["GEN"])
+
+    def test_the_prompt_carries_vocabulary_protected_fields_and_the_two_target_lists(self):
+        invoke = Recorder()
+        R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=invoke)
+        data = data_of(invoke.prompts[0])
+        self.assertEqual(data["group_target_ids"], [self.a1["cycle_id"]])
+        self.assertEqual(data["metadata_target_ids"], [self.a1["cycle_id"]])
+        self.assertEqual(set(data["project_meta"]), {"display_name", "branches", "kinds", "general_branch_limit",
+                                                     "new_branch_allowance"})
+        self.assertEqual((data["project_meta"]["kinds"], data["project_meta"]["new_branch_allowance"]),
+                         (list(M.KINDS), 12))
+        self.assertEqual(data["protected_fields"], {"campaign": [], "cycles": {self.a1["cycle_id"]: []}})
+        self.assertIn("own new group", invoke.prompts[0])  # the one-member rule is in the prompt
+        # a person's fields are named as protected in the next call
+        M.run_write(self.root, lambda ws: M.op_set(ws, self.camp, None, {"summary": "사람 요약"}), now=1_790_000_000.0)
+        again = Recorder()
+        R.sweep(self.root, cycles=[self.a2["cycle_id"]], invoke=again)
+        self.assertEqual(data_of(again.prompts[0])["protected_fields"]["campaign"], ["summary"])
+        self.assertEqual(data_of(again.prompts[0])["campaign_meta"]["summary"], "사람 요약")
+        self.assertEqual(data_of(again.prompts[0])["project_meta"]["new_branch_allowance"], 1)
+
+    def test_a_none_decision_still_writes_metadata_and_a_group_member_context_is_untouched(self):
+        context = self.seal(slug="context")
+        self.declare(self.camp, [{"title": "Existing", "members": [
+            {"cycle_id": self.a1["cycle_id"], "stage_label": "One"}], "relations": []}])
+        declared = W.declaration_path(self.root, self.camp).read_bytes()
+        invoke = Recorder()
+        result = R.sweep(self.root, cycles=[self.a2["cycle_id"], self.a1["cycle_id"]], invoke=invoke)
+        self.assertEqual(group_ids(invoke.prompts[0]), [self.a2["cycle_id"]])
+        self.assertEqual(sorted(target_ids(invoke.prompts[0])), sorted([self.a1["cycle_id"], self.a2["cycle_id"]]))
+        self.assertEqual(self.report(result)["status"], "applied")
+        self.assertEqual(W.declaration_path(self.root, self.camp).read_bytes(), declared)  # `none` leaves the groups
+        cycles = self.meta_doc(self.a1)["cycles"]
+        self.assertEqual(set(cycles), {self.a1["cycle_id"], self.a2["cycle_id"]})  # not the ungrouped context cycle
+        self.assertNotIn(context["cycle_id"], cycles)
+
+    def test_the_tail_beyond_the_per_call_cap_is_not_sent_twice_and_waits_for_the_next_sweep(self):
+        extra = self.seal(slug="a3")
+        ids = [self.a1["cycle_id"], self.a2["cycle_id"], extra["cycle_id"]]
+        invoke = Recorder()
+        with mock.patch.object(R, "MAX_TARGETS_PER_CALL", 2):
+            result = R.sweep(self.root, cycles=ids, invoke=invoke)
+        self.assertEqual(len(invoke.prompts), 1)
+        (tail,) = self.report(result)["deferred"]  # which one waits depends on seal order; seals in one second tie
+        self.assertIn(tail, ids)
+        self.assertEqual(sorted(invoke.targets[0] + [tail]), sorted(ids))
+        self.assertNotIn(tail, self.record()["cycles"])  # not marked handled
+        self.assertNotIn(tail, self.meta_doc(self.a1)["cycles"])
+        second = Recorder()
+        R.sweep(self.root, cycles=[tail], invoke=second)
+        self.assertEqual(second.targets, [[tail]])
+        self.assertIn(tail, self.meta_doc(self.a1)["cycles"])
+        auto = Recorder()  # an automatic sweep keeps the same rule: the campaign is asked once per sweep
+        sealed = [self.seal(slug=f"n{i}") for i in range(3)]
+        with mock.patch.object(R, "MAX_TARGETS_PER_CALL", 2):
+            R.sweep(self.root, auto=True, cycles=[s["cycle_id"] for s in sealed], invoke=auto)
+        self.assertEqual(len([p for p in auto.prompts if data_of(p)["campaign"]["campaign_id"] == self.camp]), 1)
+
+    def test_a_cycle_sealed_during_the_call_waits_for_the_next_sweep_instead_of_a_second_call(self):
+        late, asked = [], []
+
+        def invoke(prompt):
+            asked.append(prompt)
+            if not late:  # a seal of the same campaign lands while the model is answering
+                begun = self.seal(slug="late")
+                R._touch_pending(self.root, begun["cycle_id"])
+                late.append(begun["cycle_id"])
+            return none_for(prompt), "claude"
+
+        first = R.sweep(self.root, auto=True, cycles=[self.a1["cycle_id"]], campaign_ids=[self.camp], invoke=invoke)
+        self.assertEqual(len(asked), 1)  # one call for the campaign in the whole sweep
+        self.assertEqual(len(first["campaigns"]), 1)
+        self.assertEqual(R._pending_ids(self.root), late)  # kept, not dropped
+        self.assertNotIn(late[0], self.record()["cycles"])  # and not marked handled
+        second = Recorder()
+        R.sweep(self.root, auto=True, campaign_ids=[self.camp], invoke=second)
+        self.assertEqual(second.targets, [[late[0]]])
+        self.assertEqual(R._pending_ids(self.root), [])
+        self.assertIn(late[0], self.meta_doc(self.a1)["cycles"])
+
+    def test_every_malformed_answer_rejects_the_campaign_and_writes_nothing(self):
+        before = None
+        for label, mutate in MUTATIONS.items():
+            with self.subTest(label):
+                def reply(prompt, mutate=mutate):
+                    data = data_of(prompt)
+                    ids = data["metadata_target_ids"]
+                    base = json.loads(none_for(prompt))
+                    base["new_branches"] = base["new_branches"] or [{"code": "GEN", "label": "일반", "note": ""}]
+                    return json.dumps(mutate(base), ensure_ascii=False)
+                before = content_snapshot(self.root)
+                report = self.report(R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=Recorder(reply)))
+                self.assertEqual((report["status"], report["failure_class"]), ("failed", "invalid-response"), report)
+                self.assertEqual(content_snapshot(self.root), before)
+                self.assertEqual(M.read_campaign_meta(self.root, self.camp).status, "missing")
+                self.assertFalse((self.root / M.PROJECT_REL).exists())
+                self.assertFalse((self.root / M.STATE_REL).exists())
+                self.assertFalse((self.root / H.HISTORY_REL).exists())
+        self.assertEqual(self.record()["cycles"][self.a1["cycle_id"]]["failure_class"], "invalid-response")
+
+    def test_a_decision_for_a_cycle_that_already_has_a_group_is_rejected(self):
+        self.declare(self.camp, [{"title": "Existing", "members": [
+            {"cycle_id": self.a1["cycle_id"], "stage_label": "One"}], "relations": []}])
+
+        def reply(prompt):
+            base = json.loads(none_for(prompt))
+            base["decisions"].append({"cycle_id": self.a1["cycle_id"], "verdict": "none", "reason": "r"})
+            return json.dumps(base, ensure_ascii=False)
+
+        before = content_snapshot(self.root)
+        report = self.report(R.sweep(self.root, cycles=[self.a1["cycle_id"], self.a2["cycle_id"]], invoke=Recorder(reply)))
+        self.assertEqual((report["status"], report["failure_class"]), ("failed", "invalid-response"))
+        self.assertEqual(content_snapshot(self.root), before)
+
+    def test_model_unavailable_conflict_and_a_broken_meta_leave_every_judged_file_alone(self):
+        before = content_snapshot(self.root)
+        for label, invoke in (("empty", lambda prompt: ("", None)), ("not-json", lambda prompt: ("nope", "claude")),
+                              ("raises-as-empty", lambda prompt: ("   ", "claude"))):
+            with self.subTest(label):
+                report = self.report(R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=invoke))
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(content_snapshot(self.root), before)
+        def new_group(prompt):
+            base = json.loads(none_for(prompt))
+            cid = self.a1["cycle_id"]
+            base["decisions"] = [{"cycle_id": cid, "verdict": "new", "new_group": "g1", "stage_label": "S", "reason": "r"}]
+            base["new_groups"] = [{"key": "g1", "title": "Fresh", "members": [{"cycle_id": cid, "stage_label": "S"}]}]
+            return json.dumps(base, ensure_ascii=False)
+
+        with mock.patch.object(W, "_validated_apply_locked",
+                               side_effect=W.WorkflowGroupError("declaration-preimage-conflict")):
+            report = self.report(R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=Recorder(new_group)))
+        self.assertEqual((report["status"], report["failure_class"]), ("failed", "apply-failed"))
+        self.assertEqual(content_snapshot(self.root), before)
+        # a meta.json that breaks the contract: the campaign is skipped before any model call
+        meta_path = self.root / M._campaign_location(self.root, self.camp)[1]
+        meta_path.write_text("{broken", encoding="utf-8")
+        broken = content_snapshot(self.root)
+        calls = Recorder()
+        with redirect_stderr(io.StringIO()) as err:
+            result = R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=calls)
+        self.assertEqual(calls.prompts, [])
+        self.assertTrue(result["skipped"][0]["reason"].startswith("meta-invalid"))
+        self.assertIn("campaign skipped", err.getvalue())
+        self.assertEqual(content_snapshot(self.root), broken)
+        # the other campaign is not held up by it
+        other = Recorder()
+        R.sweep(self.root, cycles=[self.b1["cycle_id"]], invoke=other)
+        self.assertEqual(len(other.prompts), 1)
+
+    def test_a_person_editing_during_the_model_call_wins(self):
+        def invoke(prompt):
+            M.run_write(self.root, lambda ws: M.op_branch_add(ws, "GEN", "일반", ""), now=1_790_000_000.0)
+            M.run_write(self.root, lambda ws: M.op_set(ws, self.camp, None, {"title": "그 사이 사람이 정함"}),
+                        now=1_790_000_000.0)
+            return none_for(prompt), "claude"
+
+        R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=invoke)
+        doc = self.meta_doc(self.a1)
+        self.assertEqual((doc["campaign"]["title"], doc["campaign"]["source"]["title"]["by"]),
+                         ("그 사이 사람이 정함", "human"))
+        self.assertEqual(doc["campaign"]["summary"], "한 일과 결과를 한 줄로 적음")
+        self.assertEqual(doc["cycles"][self.a1["cycle_id"]]["title"], "쉬운 제목")
+
+    def test_an_old_declaration_title_is_kept_and_the_declaration_is_unchanged(self):
+        path = self.root / repair.DISPLAY_TITLE_REL
+        path.write_text(json.dumps({"schema": repair.DECLARATION_SCHEMA, "artifact_root_id": fixture.ROOT_ID, "entries": [{
+            "campaign_id": self.camp, "campaign_locator": "x", "display_title": "사람이 선언한 제목",
+            "manifest_bindings": [], "manifest_revision_ids": [], "manifest_digests": []}]}, ensure_ascii=False),
+            encoding="utf-8")
+        before = path.read_bytes()
+        R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=Recorder())
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("사람이 선언한 제목", "human"))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.meta_doc(self.a1)["cycles"][self.a1["cycle_id"]]["title"], "쉬운 제목")
+
+    def test_an_explicit_backfill_shows_and_renews_the_old_declaration_title(self):
+        path = self.root / repair.DISPLAY_TITLE_REL
+        path.write_text(json.dumps({"schema": repair.DECLARATION_SCHEMA, "artifact_root_id": fixture.ROOT_ID, "entries": [{
+            "campaign_id": self.camp, "campaign_locator": "x", "display_title": "옛 선언 제목",
+            "manifest_bindings": [], "manifest_revision_ids": [], "manifest_digests": []}]}, ensure_ascii=False),
+            encoding="utf-8")
+        before = path.read_bytes()
+        invoke = Recorder()
+        R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=invoke, replace_legacy_titles=True)
+        data = data_of(invoke.prompts[0])
+        self.assertEqual(data["campaign_meta"]["previous_title"], "옛 선언 제목")
+        self.assertNotIn("title", data["protected_fields"]["campaign"])
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("쉬운 제목", "model"))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_a_campaign_whose_cycles_all_have_metadata_is_still_asked_once_to_renew_the_title(self):
+        path = self.root / repair.DISPLAY_TITLE_REL
+        path.write_text(json.dumps({"schema": repair.DECLARATION_SCHEMA, "artifact_root_id": fixture.ROOT_ID, "entries": [{
+            "campaign_id": self.camp, "campaign_locator": "x", "display_title": "옛 선언 제목",
+            "manifest_bindings": [], "manifest_revision_ids": [], "manifest_digests": []}]}, ensure_ascii=False),
+            encoding="utf-8")
+        # a run without the option fills every sealed cycle and copies the old title as a person's
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=Recorder())
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("옛 선언 제목", "human"))
+        quiet = Recorder()
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=quiet, missing_only=True)
+        self.assertEqual(len(quiet.prompts), 0)
+        renew = Recorder()
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=renew, missing_only=True, replace_legacy_titles=True)
+        self.assertEqual(len(renew.prompts), 1)
+        self.assertEqual(data_of(renew.prompts[0])["campaign_meta"].get("previous_title"), "옛 선언 제목")
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("쉬운 제목", "model"))
+
+    def test_the_backfill_options_are_refused_on_an_automatic_run(self):
+        for extra in (["--replace-legacy-titles"], ["--campaign", self.camp]):
+            with self.subTest(extra):
+                err = io.StringIO()
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    code = R.main(["sweep", "--artifact-root", str(self.root), "--auto", *extra])
+                self.assertEqual(code, 65)
+                self.assertIn("auto-explicit-only-option", err.getvalue())
+
+    def test_dry_run_still_asks_the_model_but_writes_nothing_anywhere(self):
+        before = tree_snapshot(self.root)
+        invoke = Recorder()
+        result = R.sweep(self.root, cycles=[self.a1["cycle_id"], self.b1["cycle_id"]], dry_run=True, invoke=invoke)
+        self.assertEqual(tree_snapshot(self.root), before)
+        self.assertEqual(len(invoke.prompts), 2)
+        report = self.report(result)
+        self.assertEqual((report["status"], bool(report["metadata_diff"])), ("dry-run", True))
+        self.assertIn("campaign.title", report["metadata_fields"])
+
+    def test_the_two_switches_have_their_own_reach(self):
+        sealed = self.seal(slug="switch")
+        cases = (({R.DISABLE_ENV: "off"}, "disabled"), ({M.TITLE_DISABLE_ENV: "off"}, "no-title"),
+                 ({R.DISABLE_ENV: "off", M.TITLE_DISABLE_ENV: "off"}, "disabled"), ({}, "all"))
+        for env, expected in cases:
+            with self.subTest(env), mock.patch.dict(os.environ, env):
+                for path in (self.root / M.STATE_REL, self.root / M.PROJECT_REL, self.root / H.HISTORY_REL):
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    elif path.exists():
+                        path.unlink()
+                for begun in (self.a1, self.b1, sealed):
+                    meta = self.root / M._campaign_location(self.root, begun["campaign_id"])[1]
+                    meta.unlink(missing_ok=True)
+                R.record_path(self.root).unlink(missing_ok=True)
+                invoke = Recorder()
+                result = R.sweep(self.root, auto=True, cycles=[sealed["cycle_id"]], invoke=invoke)
+                if expected == "disabled":
+                    self.assertEqual((result["status"], invoke.prompts), ("disabled", []))
+                    continue
+                doc = self.meta_doc(sealed)
+                self.assertEqual("title" in doc["campaign"], expected == "all")
+                self.assertTrue(doc["cycles"][sealed["cycle_id"]]["title"])  # cycle metadata is never held back
+                self.assertEqual(doc["campaign"]["summary"], "한 일과 결과를 한 줄로 적음")
+                # an explicit sweep and a person's edit ignore the title switch
+                explicit = R.sweep(self.root, cycles=[sealed["cycle_id"]], invoke=Recorder())
+                self.assertEqual(explicit["status"], "ok")
+                self.assertIn("title", self.meta_doc(sealed)["campaign"])
+
+    def test_campaign_selector_and_explicit_everything_sweeps_reach_old_cycles_once(self):
+        old = self.seal(slug="old", now=PAST)
+        invoke = Recorder()
+        result = R.sweep(self.root, campaign_ids=[self.camp], invoke=invoke)
+        self.assertEqual(len(invoke.prompts), 1)
+        self.assertEqual(sorted(invoke.targets[0]), sorted([self.a1["cycle_id"], self.a2["cycle_id"], old["cycle_id"]]))
+        self.assertEqual(self.report(result)["campaign_id"], self.camp)
+        every = Recorder()
+        R.sweep(self.root, since=R.MIN_STAMP, missing_only=True, invoke=every)
+        self.assertEqual([data_of(p)["campaign"]["campaign_id"] for p in every.prompts], [self.other])  # nothing else is missing
+        again = Recorder()
+        R.sweep(self.root, campaign_ids=[self.camp], missing_only=True, invoke=again)
+        self.assertEqual(again.prompts, [])  # a fill-in run costs nothing the second time
+        plain = Recorder()
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=plain)  # an explicit sweep without it judges again
+        self.assertEqual(len(plain.prompts), 1)
+
+    def new_group_reply(self, cycle_id):
+        def reply(prompt):
+            base = json.loads(none_for(prompt))
+            base["decisions"] = [{"cycle_id": cycle_id, "verdict": "new", "new_group": "g1", "stage_label": "S",
+                                  "reason": "새 하위 목표"}]
+            base["new_groups"] = [{"key": "g1", "title": "새 하위 목표", "members": [{"cycle_id": cycle_id,
+                                                                                    "stage_label": "S"}]}]
+            return json.dumps(base, ensure_ascii=False)
+        return reply
+
+    def test_a_new_group_and_the_metadata_are_one_change_with_one_history_transaction(self):
+        report = self.report(R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=Recorder(self.new_group_reply(self.a1["cycle_id"]))))
+        self.assertEqual(report["status"], "applied")
+        group_id = next(iter(report["new_group_ids"].values()))
+        events = list(H.iter_events(self.root))
+        groups = [e for e in events if e["kind"] == "group"]
+        self.assertEqual([(e["target"]["id"], e["operation"], e["actor"]["by"]) for e in groups], [(group_id, "add", "model")])
+        self.assertEqual(groups[0]["field"], f"groups.{group_id}")
+        self.assertTrue(groups[0]["target"]["path"].endswith("/workflow-groups.json"))
+        metas = [e for e in events if e["kind"] == "meta"]
+        self.assertEqual({e["transaction_id"] for e in metas}, {groups[0]["transaction_id"]})  # one signal, one transaction
+        self.assertEqual(self.declaration(self.camp)["groups"][0]["group_id"], group_id)
+        self.assertEqual(self.record()["cycles"][self.a1["cycle_id"]]["verdict"], "new-group")
+
+    def test_an_interruption_after_the_commit_point_leaves_group_and_metadata_for_the_next_write_to_finish(self):
+        real = P._write_atomic
+
+        def failing(path, data, mode=0o644):
+            if Path(path).name == Path(M.STATE_REL).name:
+                raise OSError("injected disk failure")
+            return real(path, data, mode)
+
+        with mock.patch.object(P, "_write_atomic", side_effect=failing):
+            report = self.report(R.sweep(self.root, cycles=[self.a1["cycle_id"]],
+                                         invoke=Recorder(self.new_group_reply(self.a1["cycle_id"]))))
+        self.assertEqual((report["status"], report["failure_class"]), ("failed", "apply-failed"))
+        self.assertEqual(len(M.pending_intents(self.root)), 1)
+        self.assertEqual(len(self.declaration(self.camp)["groups"]), 1)  # both files were already replaced
+        self.assertEqual(M.read_campaign_meta(self.root, self.camp).status, "ok")
+        self.assertEqual(list(H.iter_events(self.root)), [])  # the lines wait for the recovery
+        M.run_write(self.root, lambda ws: M.op_set(ws, self.other, None, {"summary": "다음 쓰기"}), now=1_790_000_000.0)
+        self.assertEqual(M.pending_intents(self.root), [])
+        events = list(H.iter_events(self.root))
+        self.assertEqual(len([e for e in events if e["kind"] == "group"]), 1)
+        self.assertEqual(len({e["event_id"] for e in events}), len(events))
+        self.assertTrue(M.read_campaign_meta(self.root, self.camp).doc["campaign"]["short_id"].startswith("GEN-"))
+        self.assertEqual(self.record()["cycles"][self.a1["cycle_id"]]["failure_class"], "apply-failed")
+
+    def test_a_member_of_a_group_and_a_new_cycle_in_one_campaign_share_the_call(self):
+        self.declare(self.camp, [{"title": "Existing", "members": [
+            {"cycle_id": self.a1["cycle_id"], "stage_label": "One"}], "relations": []}])
+        invoke = Recorder()
+        R.sweep(self.root, auto=True, cycles=[self.a1["cycle_id"], self.a2["cycle_id"]], invoke=invoke)
+        self.assertEqual(len([p for p in invoke.prompts if data_of(p)["campaign"]["campaign_id"] == self.camp]), 1)
+        self.assertEqual(self.record()["cycles"][self.a1["cycle_id"]]["verdict"], "member")
+        self.assertEqual(self.record()["cycles"][self.a2["cycle_id"]]["verdict"], "unassigned")
 
 
 class ModelCallTest(unittest.TestCase):

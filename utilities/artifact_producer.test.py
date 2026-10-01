@@ -5508,5 +5508,65 @@ class SharedSpecMergeTest(SharedBaseGuardTest):
             queue.join_thread()
 
 
+class SealBackgroundJobTest(ProducerTestBase):
+    """Sealing starts exactly one background judgement (the unified review); no title job exists any more,
+    and no failure of the trigger changes the seal."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("HEARTING_WORKFLOW_GROUP_REVIEW", "HEARTING_CAMPAIGN_TITLE_AUTO"):
+            os.environ.pop(name, None)  # the runner switches both background jobs off
+
+    def _seal(self, slug="seal-job"):
+        route, route_file = self.route(slug=slug)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.write_output(result)
+        self.close(route, route_file)
+        return result
+
+    def test_a_seal_launches_the_review_once_and_never_a_title_job(self):
+        import artifact_workflow_group_review as review
+        import campaign_title_repair as title_repair
+        self.activate()
+        result = self._seal()
+        with mock.patch.object(review, "launch_after_seal", return_value=True) as launched, \
+                mock.patch.object(title_repair, "launch_after_seal", return_value=True) as titled, \
+                mock.patch.object(title_repair, "auto_title") as auto_title:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(launched.call_count, 1)
+        self.assertEqual(launched.call_args.args[1]["cycle_id"], result["cycle_id"])
+        self.assertEqual(launched.call_args.args[1]["state"], "sealed")
+        titled.assert_not_called()
+        auto_title.assert_not_called()
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "sealed")
+
+    def test_a_failing_or_spawn_failing_trigger_never_changes_the_seal(self):
+        import artifact_workflow_group_review as review
+        self.activate()
+        first = self._seal("first")
+        with mock.patch.object(review, "launch_after_seal", side_effect=RuntimeError("boom")):
+            self.assertEqual(P.finalize(self.root, cycle_id=first["cycle_id"])["status"], "sealed")
+        second = self._seal("second")
+        with mock.patch.object(review, "in_test_process", return_value=False), \
+                mock.patch.object(review.subprocess, "Popen", side_effect=OSError("no fork")) as popen:
+            self.assertEqual(P.finalize(self.root, cycle_id=second["cycle_id"])["status"], "sealed")
+        self.assertEqual(popen.call_count, 1)  # one launch attempt, from the review alone
+        self.assertIn("artifact_workflow_group_review.py", popen.call_args.args[0][1])
+        self.assertEqual(P.read_cycle_record(self.root, second["cycle_id"])["state"], "sealed")
+
+    def test_the_title_switch_alone_does_not_stop_the_review_launch(self):
+        import artifact_workflow_group_review as review
+        self.activate()
+        result = self._seal()
+        with mock.patch.dict(os.environ, {"HEARTING_CAMPAIGN_TITLE_AUTO": "off"}), \
+                mock.patch.object(review, "in_test_process", return_value=False), \
+                mock.patch.object(review.subprocess, "Popen") as popen:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        popen.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
