@@ -1945,8 +1945,15 @@ def _clear_observe(target, req, request_path):
             return str(seen["sid"])
         state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
         sid = agent.get("session_id")
-        if not unavailable and req.get("harness") in ("claude", "codex") and sid not in (None, "-", old):
-            return str(sid)
+        if not unavailable and req.get("harness") in ("claude", "codex"):
+            # The process's own session decides when it can be read; herdr's pane record can lag
+            # a /clear (or keep an older session) and is only the fallback.
+            proven = _process_session(agent.get("pane") or target, req.get("harness"))
+            if proven:
+                if proven != old:
+                    return str(proven)
+            elif sid not in (None, "-", old):
+                return str(sid)
         if not unavailable and req.get("harness") == "opencode" and state in ("idle", "done"):
             lines = _read_screen(target)
             if lines is not None and _opencode_home(lines):

@@ -1951,13 +1951,26 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         rc, line = self.clear_cmd(world)
         self.assertEqual((rc, "reason=target-changed" in line), (3, True))
 
+    def test_the_new_session_is_the_process_one_when_herdr_reports_a_stale_session(self):
+        for proof, expect in (("sid-NEW", "cleared=true"), ("sid-A", "cleared=unverified")):
+            with self.subTest(process_says=proof):
+                self.book()
+                world = _ClearWorld(sid="sid-A", new_sid="sid-stale-older")   # herdr names an older session
+                with mock.patch("fleet.collectors.claude.session_id_of_process", return_value=proof), \
+                        mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                if expect == "cleared=true":
+                    self.assertIn("new_session=sid-NEW", line)
+
     def test_a_pane_record_that_lags_a_clear_is_settled_by_the_process_not_guessed(self):
         # herdr still reports the session before the previous /clear; the process knows better.
         for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
             with self.subTest(process_says=proof):
                 self.book()
                 world = _ClearWorld(sid="sid-before-the-last-clear", new_sid="sid-B")
-                with mock.patch("fleet.collectors.claude.session_id_of_process", return_value=proof):
+                with mock.patch("fleet.collectors.claude.session_id_of_process",
+                                side_effect=lambda pid: "sid-B" if world.sent else proof):
                     rc, line = self.clear_cmd(world)
                 self.assertEqual(len(world.typed()), expect_typed, line)
                 self.assertEqual("cleared=true" in line, bool(expect_typed), line)
