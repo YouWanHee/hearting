@@ -15,6 +15,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -321,15 +322,17 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
 
 
 PARENTS = (("claude-parent-runtime", "claude"), ("codex-native-queue", "codex"),
-           ("codex-managed-gateway", "codex"), ("opencode-turn", "opencode"))
+           ("codex-managed-gateway", "codex"), ("opencode-turn", "opencode"), ("poll-fallback", "opencode"))
 
 
 class OwnerGateReachesEveryParentTest(OwnerRefineBase):
     """The existing question reaches the person on every harness, with no dead end (D2, delivery).
 
     The runtime raises `preview-disposition` inside the parent's own `start`; the receipt that call
-    returns is the delivery, so a parent kind with no push carrier still asks. The owner's own
-    `gate --block` is untouched (SD-OPEN-33), see `workflow_supervisor.test.py`.
+    returns is the delivery, so a parent kind with no push carrier still asks. `poll-fallback` (what an
+    OpenCode depth-0 parent really gets) is polled the same way and takes its owner's own `gate --block`
+    with no record; `opencode-turn` and `codex-stop-hook` keep their typed refusal, see
+    `workflow_supervisor.test.py`.
     """
 
     def fresh(self, name, *args, **kwargs):
@@ -484,6 +487,278 @@ class OwnerGateReachesEveryParentTest(OwnerRefineBase):
                 self.assertEqual(fixture.resolution()["status"], "not-raised")
                 self.assertEqual(fixture.gate_records(), [])
                 self.assertNotEqual(fixture.workflow_state(), "COMPLETE")
+
+
+def polling_parent_kind():
+    """What the production selector seals on an owner an OpenCode depth-0 session launches."""
+    import dispatch_parent_completion as DPC
+    args = SimpleNamespace(action="start", dispatch_depth=1, execution_surface="registered-headless",
+                           registered_worker=True, parent_session_id="fixture-parent", parent_harness="opencode")
+    with mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "fixture-parent"}, clear=False):
+        for key in ("AGENT_DISPATCH_CHILD", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "AGENT_DISPATCH_ATTEMPT_ID"):
+            os.environ.pop(key, None)
+        return DPC.resolve_parent_completion_delivery(args)
+
+
+class PollingParentBase(OwnerRefineBase):
+    """An OpenCode depth-0 parent has no push carrier: it polls `capability-route.py start --wait`."""
+
+    def owner_env(self):
+        return {**os.environ, "AGENT_ARTIFACT_ROOT": str(self.root), "AGENT_DISPATCH_JOBS": str(self.jobs),
+                "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_ATTEMPT_ID": self.owner,
+                "AGENT_HARNESS": "opencode"}
+
+    def owner_block(self):
+        """The owner's own `gate --block`, as the runtime-rendered owner prompt tells it to run."""
+        return subprocess.run([sys.executable, str(R.ROOT / "utilities" / "workflow-supervisor.py"), "gate",
+                               "--route", str(self.path), "--gate", self.PREVIEW, "--block", "--jobs", str(self.jobs),
+                               "--artifact", str(self.preview)], text=True, capture_output=True, env=self.owner_env())
+
+    def build_polling(self, **kwargs):
+        kind = polling_parent_kind()
+        self.assertEqual(kind, "poll-fallback")                  # the real kind, not a fixture's invention
+        self.build("opencode", parent=kind, **kwargs)
+        self.assertEqual(self.meta()["parent_completion_delivery"], "poll-fallback")
+
+    def wait_while_owner_exits(self, verdict):
+        """A parent's `start --wait`: the owner obeys "end your turn" and exits while the call joins it."""
+        import work_start as W
+        real, closed = W.join_selected_attempts, []
+
+        def join(**kw):
+            if not closed:
+                self.verdict = verdict
+                self.close_owner()
+                closed.append(1)
+            return real(**{**kw, "timeout": 0})
+        with self.env(), mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "fixture-parent"}), \
+                mock.patch.object(W, "join_selected_attempts", join):
+            receipt = W.start_work(self.route, self.path, self.jobs, wait=True,
+                                   run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no launch")))
+        self.assertEqual(closed, [1])
+        return receipt
+
+    def assert_asks(self, receipt, artifact=None):
+        self.assertEqual((receipt.get("state"), receipt.get("reason"), receipt.get("required_action"),
+                          receipt.get("gate")),
+                         ("waiting-human-gate", "owner-parked-at-human-gate", "answer-human-gate", self.PREVIEW),
+                         receipt)
+        self.assertEqual(receipt["gate_artifact"], str(artifact or self.preview))
+        for token in ("workflow-supervisor.py", "--gate " + self.PREVIEW, "--decision proceed", str(self.jobs)):
+            self.assertIn(token, receipt["release_command"])
+        self.assertNotIn("next_leg", receipt)
+
+
+class OwnerGateReachesAPollingParentTest(PollingParentBase):
+    """An OpenCode depth-0 parent polls `start --wait`; the owner's own raise must arrive there (D2)."""
+
+    def test_an_opencode_owner_raise_reaches_the_polling_parent_in_its_wait_receipt(self):
+        self.build_polling(close=False)
+        raised = self.owner_block()
+        self.assertEqual(raised.returncode, 0, raised.stderr)
+        self.assertIsNone(json.loads(raised.stdout)["delivery"])       # no new carrier, no record
+        self.assertEqual(self.gate_records(), [])
+        resolution = self.resolution()
+        self.assertEqual((resolution["status"], resolution["epoch"], resolution["artifact"]),
+                         ("blocked", 1, str(self.preview)))
+        self.assertTrue(resolution["artifact_sha256"])
+        self.assert_asks(self.wait_while_owner_exits("BLOCKED"))
+        # approval is still never skipped
+        import dispatch_contract as DC
+        node = next(n for n in self.route["nodes"] if n["id"] == "transaction")
+        with self.env(), self.assertRaises(DC.DispatchContractError) as fenced:
+            DC.owner_operation_fence(self.route, node, jobs=self.jobs)
+        self.assertEqual(fenced.exception.reason, "human-gate-unreleased")
+        self.assertNotEqual(self.release("proceed", worker=True).returncode, 0)
+        self.assertEqual(self.resolution()["status"], "blocked")
+        payload = self.release_in_process("proceed")
+        self.assertEqual(payload["owner_continuation"]["state"], "running")
+        import dispatch_replacement as DR
+        self.assertEqual(DR.owner_parked_gate(self.jobs, self.owner)["status"], "proceed")
+
+    def test_a_blocked_owner_with_its_review_marker_is_asked_on_a_polling_parent(self):
+        self.build_polling(verdict="BLOCKED")
+        receipt = self.start(run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no launch")))
+        self.assert_asks(receipt)
+        self.assertEqual(self.gate_records(), [])
+
+
+class InlineReviewOwnerSettlesThroughAPollingParentTest(PollingParentBase):
+    """An owner that ran `review` itself reaches settlement through a polling parent (round 1).
+
+    The OpenCode r3 owner ran review inline and nothing told it to publish the marker. With the marker
+    (the existing `capability-route.py complete --execution-surface inline`) the same run asks, waits,
+    continues after `proceed` and settles; without it settlement still refuses the unmarked stage.
+    """
+
+    def seal_owner_input(self):
+        """The adapter seals the owner's raw launch input before its first registry write."""
+        import dispatch_replacement as DR
+        prompt = self.jobs.parent / "owner-task.md"
+        prompt.write_text("Refine the README\n")
+        argv = ["--start", "--worktree", str(R.ROOT), "--slug", "owner", "--capability", "autopilot-refine",
+                "--worker-type", "owner", "--dispatch-depth", "1", "--unit", "_kernel/owner",
+                "--owner", "autopilot-refine", "--route-file", str(self.path),
+                "--parent-session-id", "fixture-parent", "--prompt-file", str(prompt)]
+        args = SimpleNamespace(attempt_id=self.owner, jobs_path=self.jobs, worktree=str(R.ROOT),
+                               route_id=self.route["route_id"], route_node="", replacement_input_argv=argv)
+        extra = D.parse_registry_metadata(DR.seal_launch_input(args, "opencode", "Refine the README\n").lstrip(","))
+        lines = self.jobs.read_text().splitlines()
+        fields = lines[0].split("\t")
+        meta = D.parse_registry_metadata(fields[5])
+        meta.update(extra)
+        fields[5] = ",".join(f"{k}={v}" for k, v in meta.items())
+        lines[0] = "\t".join(fields)
+        self.jobs.write_text("\n".join(lines) + "\n")
+        self.owner_meta.update(extra)
+
+    def inline_review_marker(self, evidence):
+        """The documented inline-stage marker, run from inside the owner session."""
+        node = next(n for n in self.route["nodes"] if n["id"] == "review")
+        return subprocess.run([sys.executable, str(R.ROOT / "utilities" / "capability-route.py"), "complete",
+                               "--route", str(self.path), "--node", "review", "--evidence", str(evidence),
+                               "--attempt-id", self.owner + "-review-inline",
+                               "--dispatch-depth", str(node["dispatch_depth"]), "--transport", "headless",
+                               "--execution-surface", "inline", "--registered-worker", "0",
+                               "--fallback-hop", "inline"], text=True, capture_output=True, env=self.owner_env())
+
+    def publish_inline_marker(self):
+        """Returns the marker's evidence, the artifact a parent-side raise binds the gate to."""
+        verdict_file = self.write_output(self.cycle, rel="reviews/refine-verdict.md", data=b"verdict: PASS\n")
+        done = self.inline_review_marker(verdict_file)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        marker = json.loads((R.completion_dir(self.route["route_id"], jobs=self.jobs) / "review.json").read_text())
+        self.assertEqual((marker["registered_worker"], marker["execution_surface"], marker["fallback_hop"],
+                          marker["reviewer_kind"], marker["review_independence"]),
+                         (False, "inline", "inline", "owner-inline", "degraded"))
+        return verdict_file
+
+    def fake_launch(self, command, **kwargs):
+        """Register the continuation owner like the adapter would (real seal + replacement_row)."""
+        import dispatch_replacement as DR
+        from datetime import datetime, timezone
+        self.launches.append(command)
+        argv = command[2:]
+
+        def value(flag):
+            return argv[argv.index(flag) + 1]
+        aid, prior = value("--attempt-id"), value("--automatic-retry-of")
+        source = DR._rows(self.jobs.read_text().splitlines())[prior][1]
+        task = Path(value("--prompt-file")).read_text()
+        args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=value("--worktree"),
+                               route_id=self.route["route_id"], route_node="owner", replacement_input_argv=list(argv))
+        meta = {k: v for k, v in source.items() if k not in {
+            "note", "failure_class", "launch_outcome", "replacement_input_digest", "replacement_family_id",
+            "replacement_attempt_id", "replacement_claim_digest", "replacement_original_attempt_id",
+            "replacement_ordinal", "automatic_retry_of", "log_file", "cleanup_receipt_digest"}}
+        self.log2 = self.jobs.parent / (aid + ".jsonl")
+        meta.update(attempt_id=aid, automatic_retry_of=prior, launch_claimed="1", log_file=str(self.log2))
+        meta.update(D.parse_registry_metadata(DR.seal_launch_input(args, source["harness"], task)))
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = stamp + "\topen\t12\tparent\ttask\t" + ",".join(k + "=" + str(v) for k, v in meta.items())
+        with DR._locked(self.jobs) as lines:
+            row, _ = DR.replacement_row(self.jobs, lines, row)
+            with self.jobs.open("a") as f:
+                f.write(row + "\n")
+        self.continuation_aid = aid
+        # the wrapper publishes the producer binding at owner launch (build() does the same for the first owner)
+        P.begin(self.root, route_file=self.path, capability="autopilot-refine", intensity="standard",
+                jobs=self.jobs, owner_attempt_id=aid)
+        return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
+
+    def release_with_continuation(self):
+        """`release proceed`, with only the continuation's launcher replaced by one that registers the row."""
+        import contextlib
+        import io
+        import work_start as W
+        spec = importlib.util.spec_from_file_location("sup_for_inline_review", R.ROOT / "utilities" / "workflow-supervisor.py")
+        sup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sup)
+
+        def continuation(route_path, jobs):
+            with self.env(), mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "fixture-parent"}):
+                return 0, W.start_work(self.route, self.path, self.jobs, run=self.fake_launch)
+        out = io.StringIO()
+        with self.env(), mock.patch.object(sup, "start_owner_continuation", continuation), contextlib.redirect_stdout(out):
+            sup.main(["release", "--route", str(self.path), "--gate", self.PREVIEW, "--decision", "proceed",
+                      "--actor", "user", "--jobs", str(self.jobs)])
+        return json.loads(out.getvalue())
+
+    def continuation_passes(self):
+        """The continuation owner applies the edit and returns PASS."""
+        text = f"artifact: {self.report}\nverdict: PASS\nblocker: none"
+        self.log2.write_text("\n".join(json.dumps(x) for x in NATIVE_OWNER_RESULT["opencode"](text)) + "\n")
+        lines = self.jobs.read_text().splitlines()
+        for i, line in enumerate(lines):
+            fields = line.split("\t")
+            meta = D.parse_registry_metadata(fields[5])
+            if meta.get("attempt_id") == self.continuation_aid:
+                meta.update(execution_surface="registered-headless", transport="headless",
+                            fallback_hop="same-harness-headless", failure_class="pass",
+                            note="completed-supervisor", launch_outcome="reaped-before-publish")
+                fields[1] = "done"
+                fields[5] = ",".join(f"{k}={v}" for k, v in meta.items())
+                lines[i] = "\t".join(fields)
+        self.jobs.write_text("\n".join(lines) + "\n")
+        with mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "fixture-parent"}):
+            return self.start(run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no second launch")))
+
+    def run_blocked_owner(self, *, marker):
+        self.launches = []
+        self.build_polling(review=False, close=False)
+        self.seal_owner_input()
+        if marker:
+            self.publish_inline_marker()
+        raised = self.owner_block()
+        self.assertEqual(raised.returncode, 0, raised.stderr)           # HEAD: 64 gate-recipient-unresolved
+        self.assertEqual(self.gate_records(), [])
+        self.assert_asks(self.wait_while_owner_exits("BLOCKED"))
+        payload = self.release_with_continuation()
+        self.assertEqual(payload["owner_continuation"]["state"], "running")
+        self.assertEqual(len(self.launches), 1)
+        import dispatch_replacement as DR
+        row = DR._rows(self.jobs.read_text().splitlines())[self.continuation_aid][1]
+        self.assertEqual(row["automatic_retry_of"], self.owner)
+        return self.continuation_passes()
+
+    def test_an_inline_review_owner_raises_waits_and_settles_after_proceed(self):
+        receipt = self.run_blocked_owner(marker=True)
+        self.assertEqual(receipt["state"], "completed", receipt)
+        self.assertEqual(len(self.launches), 1)
+        import dispatch_terminal_commit as T
+        from dispatch_completion_join import exact_attempt_row
+        meta = exact_attempt_row(self.jobs, self.continuation_aid).metadata
+        with self.env():
+            settled = T.settle_owner_completion(self.jobs, "done", meta)
+            state = T.owner_completion_state(self.jobs, "done", meta)
+        self.assertEqual((settled.result, settled.terminal_nodes), ("completed", ("transaction",)))
+        self.assertFalse(str(state.reason).startswith("owner-prerequisite-unproven"), state)
+        self.assertEqual(self.workflow_state(), "COMPLETE")
+        self.assertEqual(P.read_cycle_record(self.root, self.cycle["cycle_id"])["state"], "sealed")
+
+    def test_without_the_inline_marker_the_same_run_stops_before_settlement(self):
+        receipt = self.run_blocked_owner(marker=False)
+        self.assertEqual((receipt["state"], receipt.get("reason")), ("needs-attention", "workflow-executor-exited"),
+                         receipt)
+        self.assertEqual(receipt["missing_terminal_gates"], {"review": "completion-marker-absent"})
+        import dispatch_terminal_commit as T
+        from dispatch_completion_join import exact_attempt_row
+        with self.env():
+            state = T.owner_completion_state(self.jobs, "done", exact_attempt_row(self.jobs, self.continuation_aid).metadata)
+        self.assertTrue(str(state.reason).startswith("owner-prerequisite-unproven"), state)
+        self.assertNotEqual(self.workflow_state(), "COMPLETE")
+
+    def test_a_parent_side_raise_accepts_the_inline_marker(self):
+        self.build_polling(review=False, close=False)
+        evidence = self.publish_inline_marker()
+        self.verdict = "PASS"
+        self.close_owner()                                   # the owner never raised the gate itself
+        receipt = self.start(run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no launch")))
+        self.assert_asks(receipt, artifact=evidence)
+        self.assertEqual(self.release("proceed").returncode, 0)
+        receipt = self.start(run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no launch")))
+        self.assertEqual(receipt["state"], "completed", receipt)
+        self.assertEqual(self.workflow_state(), "COMPLETE")
 
 
 if __name__ == "__main__":

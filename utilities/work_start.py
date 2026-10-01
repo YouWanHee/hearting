@@ -1374,6 +1374,11 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         jobs=jobs, expected_attempts={aid},
         timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
         recover=True)
+    if status != "done" and _rows(jobs).get(aid, (status,))[0] == "done":
+        # The owner exited while this call waited: its receipt asks the same question the next start would.
+        gate_response = _owner_gate_response(route, path, jobs, aid, _rows(jobs)[aid][1], result)
+        if gate_response is not None:
+            return gate_response
     from dispatch_replacement import advance, effective_attempts
     # Only an explicit start resumes an owner that stopped at a usage limit.
     replacement = advance(jobs, aid, run=run, resume_capacity=True)

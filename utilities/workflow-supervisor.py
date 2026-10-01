@@ -755,6 +755,11 @@ GATE_CARRIER_KINDS = frozenset({
     "claude-parent-runtime", "codex-managed-gateway", "codex-native-queue",
 })
 
+# A parent with no push carrier was told `bounded-wait`: it polls `capability-route.py start`, and that
+# call reads the ledger (`dispatch_replacement.owner_parked_gate`) and answers `waiting-human-gate`.
+# Its own receipt is where the question arrives, so no record is written for it.
+GATE_POLLED_KINDS = frozenset({"poll-fallback"})
+
 GATE_SESSION_GENERATION = "unsupported"
 GATE_SESSION_GENERATION_SUPPORTED = "0"
 
@@ -858,9 +863,10 @@ def gate_recipient(route, jobs_path, *, receipt_delivery=False):
     attempt_id = meta.get("attempt_id", "")
     if not recipient_key or not attempt_id:
         raise SupervisorError("gate-recipient-unresolved: owner row names no parent session")
-    if recipient_kind not in PENDING.RECIPIENT_KINDS:
+    polled = recipient_kind in GATE_POLLED_KINDS
+    if recipient_kind not in PENDING.RECIPIENT_KINDS and not polled:
         raise SupervisorError(f"gate-recipient-unresolved: recipient kind {recipient_kind!r}")
-    if recipient_kind not in GATE_CARRIER_KINDS and not receipt_delivery:
+    if recipient_kind not in GATE_CARRIER_KINDS and not (receipt_delivery or polled):
         # A carrier may be selected only after its receipt vocabulary and live
         # recipient proof exist. OpenCode and the legacy Codex stop hook still do
         # not carry this contract and therefore fail closed here.
@@ -1086,8 +1092,9 @@ def create_gate_delivery(
     in_receipt = gate_delivered_in_receipt()
     recipient_key, recipient_kind, attempt_id, harness = gate_recipient(
         route, jobs_path, receipt_delivery=in_receipt)
-    if in_receipt and not gate_carrier_holds(recipient_kind, route, jobs_path):
-        return None, False  # the parent that raised it reads the question in its own receipt
+    if recipient_kind in GATE_POLLED_KINDS or (
+            in_receipt and not gate_carrier_holds(recipient_kind, route, jobs_path)):
+        return None, False  # the parent reads the question in its own (polled) start receipt
     delivery_id = gate_delivery_id(
         recipient_key, route["route_id"], gate, attempt_id, epoch
     )

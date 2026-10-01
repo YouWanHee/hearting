@@ -3158,8 +3158,10 @@ class TestReleaseOwnerContinuation(WorkflowFixture):
 class TestGateDeliveredInParentReceipt(WorkflowFixture):
     """The runtime's own raise inside the parent's `start` is delivered in the receipt it returns.
 
-    Only that call carries the internal option. An owner's own `gate --block` is unchanged
-    (SD-OPEN-33): a recipient kind with no carrier is still refused `gate-carrier-unsupported`.
+    Only that call carries the internal option. An owner's own `gate --block` is refused
+    `gate-carrier-unsupported` for a recipient kind with no carrier, except `poll-fallback`: that parent
+    polls `capability-route.py start`, which reads the ledger, so the raise is taken and no record is
+    written (SD-OPEN-33 stays open for `opencode-turn` and `codex-stop-hook`).
     """
     GATE = "full-run-authorization"
     OPTION = "AGENT_GATE_RECEIPT_DELIVERY"
@@ -3229,6 +3231,22 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
         jobs = self.exited_owner("opencode-turn")
         with self.assertRaises(SUP.SupervisorError) as caught:
             self.block(jobs, **{self.OPTION: "1", "AGENT_DISPATCH_REGISTERED_WORKER": "1"})
+        self.assertIn("gate-carrier-unsupported", str(caught.exception))
+        self.assertEqual(self.records(jobs), [])
+
+    def test_a_polling_parent_kind_takes_the_owners_own_raise_with_no_record(self):
+        jobs, _session, _attempt = self.owner_registry(recipient_kind="poll-fallback")   # owner live
+        code, payload = self.block(jobs, AGENT_DISPATCH_REGISTERED_WORKER="1")           # the owner's own raise
+        self.assertEqual((code, payload["action"], payload["workflow_state"]), (0, "blocked", "BLOCKED_HUMAN_GATE"))
+        self.assertIsNone(payload["delivery"])
+        self.assertEqual(self.records(jobs), [])
+        self.assertEqual(WS.human_gate_resolution(SUP.ledger_for(self.route, jobs).journal(), self.GATE)["status"],
+                         "blocked")
+        # a kind with no push carrier and no polling start keeps the typed refusal
+        self.setUp()
+        jobs, _session, _attempt = self.owner_registry(recipient_kind="opencode-turn")
+        with self.assertRaises(SUP.SupervisorError) as caught:
+            self.block(jobs, AGENT_DISPATCH_REGISTERED_WORKER="1")
         self.assertIn("gate-carrier-unsupported", str(caught.exception))
         self.assertEqual(self.records(jobs), [])
 
