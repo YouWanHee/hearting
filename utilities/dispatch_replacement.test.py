@@ -1019,6 +1019,69 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(result.get('state'),'running',result)
         self.assertEqual(result['attempt_id'],record['replacement_attempt_id'])
 
+    # -- an owner its launcher closed before spawning: a pause the next `start` resumes ----------
+    def _unlaunched_owner(self,**changes):
+        self._owner(note='dead-producer-binding-failed',launch_outcome='never-launched',launch_claimed='0',
+                    log_file=str(self.root/'never-written.log'),**changes)
+
+    def test_owner_closed_before_spawn_is_an_unlaunched_pause(self):
+        self.absent.stop()   # the real settlement check: this attempt never wrote a log
+        self._unlaunched_owner()
+        fields,meta=R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertEqual(R.death_kind(fields,meta),'unlaunched')
+        record=self.claim()
+        self.assertIn('after_capacity',record['logical_node'])
+        self.assertEqual(record['proof']['death_kind'],'unlaunched')
+
+    def test_unlaunched_owner_is_relaunched_only_by_start(self):
+        self._unlaunched_owner()
+        def files():return sorted(str(p) for p in R._directory(self.jobs).rglob('*') if p.is_file())
+        before=(files(),self.jobs.read_bytes())
+        result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,run=lambda *a,**k:self.fail('launched'))
+        self.assertEqual(result,{'state':'not-applicable'})
+        self.assertEqual((files(),self.jobs.read_bytes()),before)
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+        commands=[]
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None),\
+                mock.patch('dispatch_replacement_batch.command',return_value=None):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True,
+                             run=lambda command,**kw:commands.append(command) or SimpleNamespace(returncode=0,stdout='',stderr=''))
+        self.assertEqual(len(commands),1)
+        self.assertEqual(result['reason'],'replacement-launch-pending')
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_unlaunched_replacement_that_again_never_started_opens_a_new_pause_family(self):
+        self._unlaunched_owner()
+        first=self.claim()
+        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),
+                      note='dead-producer-binding-failed',launch_outcome='never-launched',launch_claimed='0')
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None),\
+                mock.patch('dispatch_replacement_batch.command',return_value=None):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True,
+                             run=lambda *a,**k:SimpleNamespace(returncode=0,stdout='',stderr=''))
+        self.assertNotEqual(result.get('reason'),'automatic-replacement-exhausted')
+        second=R.claim(self.jobs,one['attempt_id'])
+        self.assertNotEqual(second['family_id'],first['family_id'])
+        self.assertEqual(second['logical_node']['after_capacity'],one['attempt_id'])
+
+    def test_launched_owner_rows_are_never_unlaunched(self):
+        base={**self.meta,'worker_type':'owner','note':'dead-producer-binding-failed',
+              'launch_outcome':'never-launched','launch_claimed':'0'}
+        self.assertEqual(R.death_kind(['now','done'],base),'unlaunched')
+        for changes in ({'launch_started':'1'},{'pid':'4242'},{'launch_claimed':'1'},
+                        {'worker_type':'stage','dispatch_depth':'2'},{'launch_outcome':''}):
+            with self.subTest(changes=changes):
+                self.assertNotEqual(R.death_kind(['now','done'],{**base,**changes}),'unlaunched')
+        self.assertNotEqual(R.death_kind(['now','open'],base),'unlaunched')
+
+    def test_unlaunched_recovery_text_says_it_never_started(self):
+        self._unlaunched_owner()
+        record=self.claim()
+        text=R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',
+                                     jobs_path=self.jobs,attempt_id=record['replacement_attempt_id']))
+        self.assertIn('never started',text)
+        self.assertNotIn('You replace exact-dead attempt',text)
+
     def test_stage_worker_capacity_death_is_not_a_replacement_source(self):
         self.write({**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity','failure_class':'capacity'})
         self.assertIsNone(R.death_kind(['now','done'],R._rows(self.jobs.read_text().splitlines())['att-source'][1]))

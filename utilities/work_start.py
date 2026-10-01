@@ -394,6 +394,24 @@ def _start(route, path, jobs, node, harness, run):
             "receipt": result.stdout, "diagnostic": result.stderr}
 
 
+def _never_started(status, meta):
+    """An owner row its launcher closed before spawning: nothing ran and nothing failed."""
+    return (status == "done" and meta.get("launch_outcome") == "never-launched"
+            and meta.get("launch_claimed") == "0" and meta.get("launch_started") != "1"
+            and not meta.get("pid"))
+
+
+def _launch_failure_reason(launch):
+    """The `reason=` of the launcher receipt's last `check=failed` block, or `-`."""
+    lines = (launch.get("receipt") or "").splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "check=failed"]
+    for line in lines[starts[-1] + 1:] if starts else []:
+        key, sep, value = line.partition("=")
+        if sep and key == "reason":
+            return value
+    return "-"
+
+
 def _wait_fields(attempts, rows, resume):
     directives = [parent_next(rows[a][1].get("parent_completion_delivery", ""), a, agent_home=ROOT)[0]
                   for a in attempts]
@@ -557,8 +575,15 @@ def _outcome(jobs, aid):
             "required_action": action, "marker": state.marker,
             "recovery_command": completion_harvest_command(aid, action, jobs=str(jobs),
                 surface=str(ROOT / "adapters/codex/bin/preflight.sh"))}
+    row = _rows(jobs).get(aid)
+    if row and _never_started(*row):
+        # No log or result exists to harvest; the way on is to start the same work again.
+        route_file = row[1].get("owner_route_file") or row[1].get("route_file")
+        if route_file:
+            result["recovery_command"] = shlex.join([
+                sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+                "--route", route_file, "--jobs", str(jobs)])
     if action == "advance-completed":
-        row = _rows(jobs).get(aid)
         if row and row[1].get("workflow_completion") == "runtime-v1":
             from dispatch_terminal_commit import completed_owner_handoff
             result["handoff"] = completed_owner_handoff(jobs, *row)
@@ -1298,6 +1323,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     rows = _rows(jobs)
     aid = _slot(route, "owner", rows)
     refusal = None
+    launched_now = aid not in rows
     if aid not in rows:
         owner_pin = ((route.get("selection_pins") or {}).get("owner") or {}).get("harness")
         rows, refusal = _launch_admitted(route, path, jobs, "owner", owner_pin or request["owner_harness"], run, result,
@@ -1305,8 +1331,24 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     if aid not in rows:
         if refusal:
             return _capacity_wait(result, aid, "owner", refusal, resume, clock)
+        if result["launches"] and _launch_failure_reason(result["launches"][-1]).partition(":")[0] == "admission-busy":
+            # The launcher's preparation timed out on a held admission lock before any row existed.
+            return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted",
+                    "required_action": "resume-later", "launch_reason": "admission-busy",
+                    "recovery_command": resume,
+                    "next_step": "The owner did not start: the artifact admission lock stayed busy. Nothing ran; "
+                        "run resume_command again later (after about a minute) and it starts the owner again."}
         return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted"}
     status, metadata = rows[aid]
+    if launched_now and _never_started(status, metadata):
+        # One launch per start: the next start launches this same work again, so no wait is armed here.
+        reason = _launch_failure_reason(result["launches"][-1])
+        return {**result, "state": "needs-attention", "reason": "owner-launch-not-started",
+                "required_action": "resume-later", "owner_attempt_id": aid, "launch_reason": reason,
+                "recovery_command": resume,
+                "next_step": f"The owner did not start ({reason}); nothing ran and nothing failed. "
+                    "Run resume_command again later (for a busy admission lock, after about a minute); "
+                    "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
     result["correction_command"] = shlex.join([
         sys.executable, str(ROOT / "utilities/capability-route.py"), "correct",

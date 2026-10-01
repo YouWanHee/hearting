@@ -1590,6 +1590,35 @@ class TestRoute(unittest.TestCase):
                         capture_output=True,text=True,cwd=str(R.ROOT))
    self.assertEqual(again.returncode,0,again.stderr)
    self.assertEqual(R.outcome_path(route_path).read_bytes(),before)
+ def test_close_accepts_a_route_id(self):
+  # `close --route` named a file only; the `rt-...` id the other commands print was a FileNotFoundError.
+  import subprocess,sys
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact_root=Path(tmp)
+   compiled=self._run_compile_cli(self._compile_cli_args(artifact_root))
+   self.assertEqual(compiled.returncode,0,compiled.stderr)
+   route=json.loads(compiled.stdout)
+   route_path=R.canonical_routes_dir(artifact_root)/f"{route['route_id']}.json"
+   result=subprocess.run(
+    [sys.executable,str(P),"close","--route",route["route_id"],"--artifact-root",str(artifact_root),"--allow-unproven"],
+    capture_output=True,text=True,cwd=str(R.ROOT))
+   self.assertEqual(result.returncode,0,result.stderr)
+   self.assertTrue(R.outcome_path(route_path).exists())
+   self.assertEqual(json.loads(R.outcome_path(route_path).read_text())["route_id"],route["route_id"])
+   # The id works under AGENT_ARTIFACT_ROOT too, with no flag at all.
+   again=subprocess.run([sys.executable,str(P),"close","--route",route["route_id"]],
+                        capture_output=True,text=True,cwd=str(R.ROOT),
+                        env={**os.environ,"AGENT_ARTIFACT_ROOT":str(artifact_root)})
+   self.assertEqual(again.returncode,0,again.stderr)
+ def test_close_with_an_unknown_route_id_says_not_found(self):
+  import subprocess,sys
+  with tempfile.TemporaryDirectory() as tmp:
+   result=subprocess.run(
+    [sys.executable,str(P),"close","--route","rt-0123456789abcdef","--artifact-root",tmp,"--allow-unproven"],
+    capture_output=True,text=True,cwd=str(R.ROOT))
+   self.assertNotEqual(result.returncode,0)
+   self.assertIn("route-not-found",result.stderr)
+   self.assertIn("rt-0123456789abcdef",result.stderr)
  def test_exact_terminal_identity_tracks_bytes_and_latest_attempt(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp); jobs=root/"jobs.log"; evidence=root/"result.md"
