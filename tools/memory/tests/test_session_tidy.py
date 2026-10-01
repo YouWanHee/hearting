@@ -1129,6 +1129,16 @@ class ClearHelperTest(TidyCase):
                       "HEARTING_TIDY_HERDR": str(self.fake_herdr), "HEARTING_TIDY_CLEAR_OBSERVE": "0.3"}
         self.calls = []
 
+    def test_helper_env_keeps_the_herdr_socket_but_not_the_callers_pane(self):
+        env = clear._helper_env({"HERDR_PANE_ID": PANE, "HERDR_TAB_ID": "t", "HERDR_ENV": "1",
+                                 "HERDR_SOCKET_PATH": "/run/herdr/custom.sock", "CLAUDE_CODE_SESSION_ID": "s",
+                                 "PATH": "/usr/bin"})
+        self.assertEqual(env.get("HERDR_SOCKET_PATH"), "/run/herdr/custom.sock")
+        self.assertEqual(env.get("PATH"), "/usr/bin")
+        for dropped in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_ENV", "CLAUDE_CODE_SESSION_ID"):
+            self.assertNotIn(dropped, env)
+        self.assertNotIn("HERDR_SOCKET_PATH", clear._helper_env({"HERDR_PANE_ID": PANE}))
+
     def booked(self, harness="claude", sid="sid-A"):
         with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
             seat = st.resolve_seat(harness, str(self.cwd))

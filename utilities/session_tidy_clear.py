@@ -147,14 +147,30 @@ def _proc_start(pid: int) -> str:
         return ""
 
 
+def _helper_env(environ=None) -> dict:
+    """The runner's clean environment plus where herdr listens.
+
+    ``clean_env`` drops every ``HERDR_*`` name so a detached tidy never inherits the
+    caller's pane; this helper still has to reach the same herdr server, and without
+    ``HERDR_SOCKET_PATH`` herdr falls back to a default path that may not be the one
+    in use ("server not running", measured on a live pane 2026-10-01).
+    """
+    from session_tidy_runner import clean_env
+    environ = os.environ if environ is None else environ
+    env = clean_env(environ)
+    socket_path = environ.get("HERDR_SOCKET_PATH")
+    if socket_path:
+        env["HERDR_SOCKET_PATH"] = socket_path
+    return env
+
+
 def _start_helper(seat_key: str, nonce: str) -> int:
     """Start ``run`` in its own session so neither /clear, a closing pane nor a process-group
     cleanup of the caller can take it down."""
-    from session_tidy_runner import clean_env
     proc = subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "run", "--seat", seat_key, "--nonce", nonce],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        close_fds=True, start_new_session=True, env=clean_env(), cwd=str(st.ensure_dir(st.state_root())))
+        close_fds=True, start_new_session=True, env=_helper_env(), cwd=str(st.ensure_dir(st.state_root())))
     return proc.pid
 
 
@@ -294,10 +310,9 @@ def _run_steward(path: Path, nonce: str, pane: str) -> dict:
     """``peer-steward.py clear`` -- its ``cleared=...`` line as a dict (``cleared`` is ``failed`` on a crash)."""
     injected = _injected("HEARTING_TIDY_PEER_STEWARD")
     base = [str(injected)] if injected else [sys.executable, str(HERE / "peer-steward.py")]
-    from session_tidy_runner import clean_env
     try:
         done = subprocess.run([*base, "clear", pane, "--request", str(path), "--nonce", nonce],
-                              capture_output=True, text=True, timeout=STEWARD_TIMEOUT_SEC, env=clean_env())
+                              capture_output=True, text=True, timeout=STEWARD_TIMEOUT_SEC, env=_helper_env())
     except (OSError, subprocess.SubprocessError) as exc:
         return {"cleared": "failed", "reason": f"peer-steward-unavailable-{type(exc).__name__}"}
     for line in done.stdout.splitlines():
