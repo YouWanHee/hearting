@@ -272,12 +272,19 @@ entrypoints are represented by Codex-native Skills and the installable
 
 Write-denying hook gates are retired; no write preflight or core-read marker is required.
 
-Fleet also reads a pending decision only from structured rollout
-`response_item` records whose `function_call(name=request_user_input, call_id)`
-has no later matching `function_call_output`. It never searches transcript
-prose. This shape is fixture-verified but remains unverified in live Codex
-traffic; App Server `tool/requestUserInput` is experimental, so runtime support
-is reported as `unknown` until an observed rollout proves the projection.
+Fleet reads structured rollout question evidence. Blocking `request_user_input`
+calls remain pending until their matching output or turn boundary. Async
+`request_user_input_async` calls retain only call/turn identity, time and
+unanswered question indices: `accepted:true`, ordinary activity, and normal
+turn completion do not answer them. Exact native user reply envelopes with
+`questionItemId=["request_user_input_async", call_id, index]` resolve each
+question; a failed request or originating-turn interruption also clears it.
+The async call/acceptance/reply shape was observed in local Codex traffic on
+2026-10-01 and is regression-tested. Other clients and Code Mode wrappers
+without this observable shape remain unverified; Fleet never parses executable
+tool input or conversational prose to infer a wait. Questions and answers are
+never retained in Fleet state. The visible badge says `question`, while JSON
+preserves the portable `decision` kind. Client question styling stays native.
 
 Expose it through `codex_setting/codex-hooks`, not through a plain `hooks/`
 projection:

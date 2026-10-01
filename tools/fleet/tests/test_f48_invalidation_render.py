@@ -67,12 +67,12 @@ class InvalidationRenderTest(unittest.TestCase):
         stack = render._session_row_stack(session, term_width=60)[0]
         for segments in (wide, narrow, stack):
             text = render._plain(segments)
-            self.assertIn("decision", text)
+            self.assertIn("question", text)
             self.assertIn("◑", text)
             self.assertNotIn("실제 질문", text)
 
     def test_compact_kind_labels(self):
-        expected = {"decision": "decision", "approval": "approval",
+        expected = {"decision": "question", "approval": "approval",
                     "permission": "approval", "elicitation": "elicit"}
         for kind, label in expected.items():
             self.assertEqual(render._interaction_badge(self.session(kind)).strip(), label)

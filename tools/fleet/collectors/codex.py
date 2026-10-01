@@ -231,8 +231,54 @@ def _advance_task_lifecycle_row(lifecycle, row):
     return None
 
 
+@dataclass(frozen=True)
+class _PendingInput:
+    since: object
+    turn_id: object
+    # None is a blocking call; async calls retain only unanswered question indices.
+    questions: object = None
+
+
+def _question_replies(payload):
+    """Read exact native reply envelopes, never search conversational prose."""
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return
+    opening = "<send_user_message_question_reply>"
+    closing = "</send_user_message_question_reply>"
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "input_text":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not (text.startswith(opening) and text.endswith(closing)):
+            continue
+        try:
+            replies = json.loads(text[len(opening):-len(closing)])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(replies, list):
+            continue
+        for reply in replies:
+            if not isinstance(reply, dict) or not isinstance(reply.get("answer"), str):
+                continue
+            try:
+                identity = json.loads(reply.get("questionItemId", ""))
+            except (ValueError, TypeError):
+                continue
+            if (isinstance(identity, list) and len(identity) == 3
+                    and identity[0] == "request_user_input_async"
+                    and isinstance(identity[1], str) and identity[1]
+                    and type(identity[2]) is int and identity[2] >= 0):
+                yield identity[1], identity[2]
+
+
 def _advance_pending_input(open_calls, lifecycle, row):
-    """Track only call/turn identity/time; never retain question/answer content."""
+    """Track only call/turn identity/time/indices; never retain question content."""
     if not isinstance(row, dict):
         return
     payload = row.get("payload")
@@ -241,28 +287,72 @@ def _advance_pending_input(open_calls, lifecycle, row):
     if row.get("type") == "event_msg":
         kind = payload.get("type")
         if kind == "task_started":
-            open_calls.clear()
+            for call_id, request in list(open_calls.items()):
+                if request.questions is None:
+                    open_calls.pop(call_id)
         elif kind in {"task_complete", "turn_aborted"}:
             # Task lifecycle can become ambiguous after an unrelated terminal.
             # Keep each question's own turn binding until it is answered/ended.
-            for call_id, (_since, turn_id) in list(open_calls.items()):
-                if turn_id is None or turn_id == payload.get("turn_id"):
+            for call_id, request in list(open_calls.items()):
+                if kind == "task_complete" and request.questions is not None:
+                    continue
+                if request.turn_id is None or request.turn_id == payload.get("turn_id"):
                     open_calls.pop(call_id)
         return
     if row.get("type") != "response_item":
         return
+    for answered_call, index in _question_replies(payload):
+        request = open_calls.get(answered_call)
+        if request is None or request.questions is None or index not in request.questions:
+            continue
+        remaining = request.questions - {index}
+        if remaining:
+            open_calls[answered_call] = _PendingInput(request.since, request.turn_id, remaining)
+        else:
+            open_calls.pop(answered_call)
     call_id = payload.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         return
     kind = payload.get("type")
-    if kind == "function_call" and payload.get("name") == "request_user_input":
+    name = payload.get("name")
+    if kind == "function_call" and isinstance(name, str) and name in {
+        "request_user_input", "request_user_input_async",
+        "functions.request_user_input", "functions.request_user_input_async",
+    }:
+        questions = None
+        if name in {"request_user_input_async", "functions.request_user_input_async"}:
+            try:
+                arguments = payload.get("arguments")
+                if isinstance(arguments, str):
+                    arguments = json.loads(arguments)
+                values = arguments.get("questions") if isinstance(arguments, dict) else None
+                if not isinstance(values, list) or not values or not all(
+                        isinstance(value, dict) for value in values):
+                    return
+                questions = frozenset(range(len(values)))
+            except (ValueError, TypeError):
+                return
+        metadata = payload.get("internal_chat_message_metadata_passthrough")
+        turn_id = metadata.get("turn_id") if isinstance(metadata, dict) else None
+        if not isinstance(turn_id, str) or not turn_id:
+            turn_id = lifecycle[1] if lifecycle and lifecycle[0] == "task_started" else None
         # Reinsertion preserves most-recent-call order when an id is reused.
         open_calls.pop(call_id, None)
-        open_calls[call_id] = (
+        open_calls[call_id] = _PendingInput(
             _event_timestamp(row.get("timestamp"), None),
-            lifecycle[1] if lifecycle and lifecycle[0] == "task_started" else None,
+            turn_id, questions,
         )
     elif kind == "function_call_output":
+        request = open_calls.get(call_id)
+        if request is not None and request.questions is not None:
+            try:
+                result = payload.get("output")
+                if isinstance(result, str):
+                    result = json.loads(result)
+                if isinstance(result, dict) and result.get("accepted") is True:
+                    return
+            except (ValueError, TypeError):
+                pass
         open_calls.pop(call_id, None)
 
 
@@ -1489,7 +1579,8 @@ def _event_timestamp(value, fallback):
 def _tail_pending_request_user_input(path, chunk=65536):
     """Full-history, append-cached pending input independent of the gateway.
 
-    The lifecycle cursor pairs calls/outputs and clears abandoned turn requests.
+    The lifecycle cursor pairs blocking calls/outputs and exact async question
+    replies. Async acceptance and normal turn completion keep the wait open.
     A question older than the last read chunk remains visible without rescanning
     history on each Fleet tick. Partial lines and changed file identities fail
     closed under the same cursor contract as task lifecycle observation.
@@ -1500,7 +1591,7 @@ def _tail_pending_request_user_input(path, chunk=65536):
     if cursor is None or not cursor.pending_calls:
         return None
     call_id = next(reversed(cursor.pending_calls))
-    since, _turn_id = cursor.pending_calls[call_id]
+    since = cursor.pending_calls[call_id].since
     return {"call_id": call_id, "waiting_since": since if since is not None else cursor.mtime_ns / 1e9}
 
 
