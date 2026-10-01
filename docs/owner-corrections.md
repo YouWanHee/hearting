@@ -4,6 +4,19 @@
 별도 headless owner에게 전달되지 않았고, `start` 재호출이나 파일 수정도 수신 증거가
 아니었다. 이제 실행 감독자가 동일 owner의 교정 접수와 전송 영수증까지 소유한다.
 
+## 2026-10-01 갱신: 등록 직후부터, quick/solo owner도
+
+- 등록(`--register`) 직후 입력 통로가 생긴다. 첫 consumer가 붙기 전에 보낸 교정은
+  `queued`로 접수되어 첫 turn에 포함된다. 접수는 열려 있지만 감독자는 아직 없는
+  상태(`accepting=true`, `supervisor_live=false`)로 조회된다. 감독자가 끝내 뜨지 못하고
+  행이 닫히면 그 입력은 `undelivered`로 관측되고 기존 통보 경로로 부모에게 알려진다.
+- quick/solo owner도 standard+ owner와 같은 감독자 아래에서 실행한다. Codex는 App Server의
+  활성 turn steer, Claude/OpenCode는 같은 세션의 다음 turn으로 받는다.
+  감독자 지원이 확인되지 않는 호스트는 기존 단발 실행을 하며 입력 상태가 없으므로
+  `owner-input-unsupported`가 그대로 나온다(새 거절·fallback 이름은 없다).
+- 전송 중(`sending`)에 감독자가 끊기면 `delivery-unknown`이며 자동 재전송하지 않는다.
+  새 게이트나 수동 복구 절차는 없다.
+
 ## 사용
 
 `capability-route.py start` 결과의 `correction_command`로 기존 owner의 수신 상태를
@@ -67,6 +80,17 @@ terminal 결과와 교정 통보는 별도이므로 입력 영수증 저장 실�
   이는 native 운송 검증이며 제품 변경의 정확성이나 등록 dispatch 전체 실측은 아니다.
 - Claude/OpenCode는 실제 subprocess fixture로 운송 경계를 확인했다. 이번에 해당 모델을
   새로 호출한 native 실측으로 주장하지 않는다.
+- 2026-10-01 실측(격리 `/tmp` registry, 임시 git 저장소의 sealed solo route의 one-shot owner,
+  worktree 코드): Codex `gpt-6-luna`/low는 `--register`→`correct`(첫 turn 전 `early`)→`--start`로
+  `early`가 첫 turn에 들어가 `turn-completed`가 됐고, 별도 1건에서 활성 turn 중 `active`가
+  같은 turn_id로 steer되어 두 영수증이 모두 `turn-completed`, 출력 파일에 `ACTIVE`가 반영됐다.
+  OpenCode `opencode-go/glm-5.3-flash`는 `early`가 첫 turn, `active`가 같은 native session의
+  turn 2(`--session` 재개)로 전달되어 두 영수증이 `turn-completed`, 출력 `ACTIVE`가 반영됐다.
+  결과 문장은 등록된 one-shot owner의 교정 **운송**에 한정한다. 두 모델은 지시를 매번 같게
+  따르지 않았고(첫 Codex 시도는 교정을 보고 대기 단계를 건너뜀), 이 실측은 route 마감(quick-complete
+  marker·route close)을 모델이 발행하지 않아 확인 범위 밖이다. 실측 중 `--register`와 `--start`
+  사이에 접수한 교정이 relaunch row의 새 lease nonce 때문에 owner를 죽이는 결함이 드러나
+  고쳤다(아직 consumer가 붙지 않은 입력 상태는 relaunch된 row를 따른다).
 - 기존 serial_chain_supervisor 전체 suite는 300초 timeout. 수정 전 main에서도 동일
   16-slice fixture의 child-settlement 대기가 재현됐다. 전체 chain PASS로 기록하지 않는다.
 
