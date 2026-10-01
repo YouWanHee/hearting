@@ -13,9 +13,12 @@ once.  The detached runner:
    waits for its process to end (checked exact-identity state) and then for its output
    file, validates ``actions.json``, runs ``mem tidy-apply``, advances the watermarks and leaves one
    result line for the seat,
-3. on any failure leaves the card, the memory and the watermarks as they were and
-   leaves one failure line.  There is no operator step: the next scheduled tidy
-   simply sees the same unprocessed conversation again.
+3. on any failure leaves the card and the watermarks as they were and leaves one
+   failure line.  When the applier had already written part of the batch (its undo
+   journal says so) the line counts those writes and carries ``mem tidy-undo <batch>``
+   instead of claiming the memory is untouched.  There is no operator step: the next
+   scheduled tidy simply sees the same unprocessed conversation again (source keys and
+   the duplicate check keep the writes that already landed from being made twice).
 
 State (all under ``session_tidy.state_root()``): ``queue/<id>.json`` (+ ``<id>.pid``),
 ``runs/<batch>/{input_v1.json,prompt.md,actions.json,runner.log,undo.json,result.json}``,
@@ -571,7 +574,7 @@ def apply_actions(item: dict, run_dir: Path, bundle: Bundle) -> str:
         done = _mem_cli("tidy-apply", str(run_dir / "actions.json"), "--input", str(bundle.path),
                         "--cwd", item["cwd"], cwd=item["cwd"], timeout=tunable("APPLY_TIMEOUT"))
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RunnerFailure(f"apply did not run: {exc}") from exc
+        raise RunnerFailure(f"apply {'stopped' if applied_writes(run_dir) else 'did not run'}: {exc}") from exc
     lines = [ln for ln in done.stdout.splitlines() if ln.strip()]
     summary = next((ln for ln in reversed(lines) if ln.startswith("[tidy]")), "")
     _log(run_dir, f"apply rc={done.returncode} {summary or (done.stderr.strip().splitlines() or [''])[-1]}")
@@ -591,8 +594,20 @@ def notify(item: dict, text: str) -> None:
         st.write_notice(st.Seat(**item["seat"]), text, author_harness=item["harness"], author_sid=item["sid"])
 
 
-def failure_line(reason: str) -> str:
-    reason = " ".join(str(reason).split())[:80]
+def applied_writes(run_dir: Path) -> int:
+    """Writes the applier finished for this batch (its undo journal), 0 when it never wrote."""
+    with contextlib.suppress(Exception):
+        ops = (st.read_json(run_dir / "undo.json") or {}).get("ops") or []
+        return sum(1 for op in ops if isinstance(op, dict) and op.get("state") == "done")
+    return 0
+
+
+def failure_line(reason: str, batch: str = "", applied: int = 0) -> str:
+    reason = " ".join(str(reason).split(" — 되돌리기")[0].split())[:80]
+    if applied and batch:
+        # Some writes already landed: say so and keep the undo command; never claim memory is untouched.
+        return (f"[정리] 기억 정리가 {applied}건을 반영한 뒤 멈췄습니다. 나머지는 다음 정리 때 이어서 처리됩니다. "
+                f"(사유: {reason}) — 되돌리기: mem tidy-undo {batch}")
     return f"[정리] 기억 정리를 끝내지 못했습니다. 카드와 기존 기억은 그대로이고 다음 정리 때 이어서 처리됩니다. (사유: {reason})"
 
 
@@ -622,12 +637,14 @@ def process_item(item: dict) -> None:
         notify(item, line)
     except RunnerFailure as exc:
         _log(run_dir, f"failed: {exc}")
-        set_status(item, "failed", error=str(exc))
-        notify(item, failure_line(str(exc)))
+        applied = applied_writes(run_dir)
+        set_status(item, "failed", error=str(exc), applied=applied)
+        notify(item, failure_line(str(exc), batch, applied))
     except BaseException as exc:  # noqa: BLE001 - nothing may leave an entry half-done
         _log(run_dir, f"failed: internal {type(exc).__name__}: {exc}")
-        set_status(item, "failed", error=f"internal {type(exc).__name__}")
-        notify(item, failure_line(f"internal {type(exc).__name__}"))
+        applied = applied_writes(run_dir)
+        set_status(item, "failed", error=f"internal {type(exc).__name__}", applied=applied)
+        notify(item, failure_line(f"internal {type(exc).__name__}", batch, applied))
     finally:
         for name in ("input_v1.json", "prompt.md"):
             with contextlib.suppress(OSError):

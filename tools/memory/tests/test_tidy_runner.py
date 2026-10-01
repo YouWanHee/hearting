@@ -27,6 +27,7 @@ import sys
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -579,6 +580,63 @@ class FailureTest(RunnerCase):
         self.assertIn("실패해도 남아야 하는 결정", self.saved_input(2)["sessions"][0]["text"])
         self.assertIn("Recovered on the next tidy.", " ".join(r[3] for r in self.records().values()))
         self.assertIsNotNone(self.watermark("sid-A"))
+
+
+class PartialApplyTest(RunnerCase):
+    """A batch that stopped after some writes must say so and keep its undo command."""
+
+    def run_item(self, apply_stub, **patches):
+        patches.setdefault("advance_watermarks", runner.advance_watermarks)
+        with self.iso.patched_environ(self.env()):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ)
+            item = {"schema": runner.SCHEMA, "id": runner.new_id(), "created": runner._now(),
+                    "status": "queued", "updated": runner._now(), "seat": seat.as_dict(),
+                    "harness": "claude", "sid": "sid-A", "cwd": str(self.cwd), "transcript": "", "attempts": 0}
+            runner.write_item(item)
+            bundle = mock.Mock(empty=False, cursors=[])
+            with mock.patch.object(runner, "assemble", return_value=bundle), \
+                    mock.patch.object(runner, "dispatch_worker", return_value={"attempt_id": "att-x"}), \
+                    mock.patch.object(runner, "wait_worker"), \
+                    mock.patch.object(runner, "validate_actions"), \
+                    mock.patch.object(runner, "apply_actions", side_effect=apply_stub), \
+                    mock.patch.multiple(runner, **patches):
+                runner.process_item(item)
+            return item["id"], self.item(item["id"])
+
+    @staticmethod
+    def journal(run_dir, done):
+        ops = [{"op": "add", "state": "done", "id": f"r{n}"} for n in range(done)] + [{"op": "add", "state": "intent"}]
+        st.atomic_write_json(run_dir / "undo.json", {"ops": ops})
+
+    def test_an_applier_that_stopped_halfway_is_reported_as_partial_with_the_undo_command(self):
+        def stopped(item, run_dir, bundle):
+            self.journal(run_dir, 2)
+            raise runner.RunnerFailure(f"묶음 {run_dir.name}: 부분 적용 2건 · RuntimeError: boom "
+                                       f"— 되돌리기: mem tidy-undo {run_dir.name}")
+        qid, item = self.run_item(stopped)
+        self.assertEqual((item["status"], item["applied"]), ("failed", 2))
+        notes = self.notices()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertRegex(notes[0], rf"^\[정리\] 기억 정리가 2건을 반영한 뒤 멈췄습니다\. .*RuntimeError: boom\) "
+                                   rf"— 되돌리기: mem tidy-undo {qid}$")
+        self.assertNotIn("그대로", notes[0])
+        self.assertEqual(notes[0].count("mem tidy-undo"), 1)
+
+    def test_a_failure_after_a_full_apply_still_names_the_writes_and_the_undo_command(self):
+        def applied(item, run_dir, bundle):
+            self.journal(run_dir, 1)
+            return f"[tidy] 묶음 {run_dir.name}: 추가 1 — 되돌리기: mem tidy-undo {run_dir.name}"
+        qid, item = self.run_item(applied, advance_watermarks=mock.Mock(side_effect=OSError("disk full")))
+        self.assertEqual((item["status"], item["applied"]), ("failed", 1))
+        self.assertRegex(self.notices()[0], rf"^\[정리\] 기억 정리가 1건을 반영한 뒤 멈췄습니다\. .*"
+                                            rf"— 되돌리기: mem tidy-undo {qid}$")
+
+    def test_a_failure_before_any_write_still_says_memory_is_untouched(self):
+        def refused(item, run_dir, bundle):
+            raise runner.RunnerFailure("apply did not run: boom")
+        _qid, item = self.run_item(refused)
+        self.assertEqual(item["applied"], 0)
+        self.assertRegex(self.notices()[0], r"^\[정리\] 기억 정리를 끝내지 못했습니다\. 카드와 기존 기억은 그대로")
 
 
 class GovernorTest(RunnerCase):
