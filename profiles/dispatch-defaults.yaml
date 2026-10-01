@@ -104,12 +104,16 @@ allocation:
   depth_affinity:
     owner: claude
     worker: codex
-  depth_affinity_weight: 0.65
+  depth_affinity_weight: 0.85
   usage_headroom_exponent: 2
   # OpenCode is slow: every enabled harness is a worker candidate, but it takes a
   # smaller target share of default placements (`balanced` strategy). Explicit
   # selection, pins and hard eligibility ignore this.
+  # 2026-09-30 (user: "codex 팍팍 쓰고"): weights only lower a share (at most 1),
+  # so Claude takes half the default share and Codex gets about twice as many
+  # default placements; workers lean further to Codex through depth affinity.
   harness_weights:
+    claude: 0.5
     opencode: 0.3
 
 # Registered headless permission posture (core/OPERATIONS.md §5.10). Hearting-

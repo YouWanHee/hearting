@@ -182,6 +182,62 @@ class DispatchSummaryTest(unittest.TestCase):
         self.assertEqual(calls[-1]["debounce"], 0)
         self.assertIs(calls[-1]["priority"], True)
 
+    def _supervise_with_fake_refresh(self, attempt, results, alive_seconds=0.6):
+        """Run supervise against a short-lived child; `results(phase)` is the value
+        the fake `_refresh` returns. Returns the phases it was called with."""
+        log = Path(self.tmp.name) / f"owner.{attempt}.codex.jsonl"
+        log.write_text(json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "start"},
+        }) + "\n", encoding="utf-8")
+        child = subprocess.Popen(
+            [sys.executable, "-c", f"import time; time.sleep({alive_seconds})"],
+            start_new_session=True,
+        )
+        start = S.process_observation(child.pid)[1]
+        self.assertTrue(start)
+        phases = []
+
+        def fake_refresh(*args, **kwargs):
+            phases.append(kwargs["phase"])
+            return results(kwargs["phase"])
+
+        with mock.patch.object(S, "_refresh", side_effect=fake_refresh):
+            rc = S.supervise(
+                attempt_id=attempt, harness="codex", transcript=log,
+                target_pid=child.pid, target_start=start,
+                poll=0.02, initial_delay=0, final_grace=1, log_quiet=0.05,
+            )
+        child.wait(timeout=5)
+        self.assertEqual(rc, 0)
+        return phases
+
+    def test_failed_initial_is_retried_on_every_poll(self):
+        phases = self._supervise_with_fake_refresh(
+            "att-initial-retry", lambda phase: False)
+        initial = [phase for phase in phases if phase == "initial"]
+        self.assertGreater(len(initial), 3)
+        self.assertNotIn("periodic", phases)
+
+    def test_periodic_attempts_are_spaced_by_the_attempt_interval(self):
+        phases = self._supervise_with_fake_refresh(
+            "att-periodic-spacing", lambda phase: True)
+        self.assertEqual(phases[0], "initial")
+        # Many 20ms polls fit in the child's lifetime, yet only one periodic
+        # attempt fits in one 15s interval.
+        self.assertEqual(phases.count("periodic"), 1)
+        with mock.patch.object(S, "PERIODIC_ATTEMPT_INTERVAL", 0.1):
+            phases = self._supervise_with_fake_refresh(
+                "att-periodic-short", lambda phase: True, alive_seconds=1.0)
+        self.assertGreater(phases.count("periodic"), 1)
+
+    def test_final_refresh_is_not_delayed_by_the_periodic_interval(self):
+        started = time.monotonic()
+        phases = self._supervise_with_fake_refresh(
+            "att-final-prompt", lambda phase: True)
+        self.assertEqual(phases[-1], "final")
+        self.assertLess(time.monotonic() - started, S.PERIODIC_ATTEMPT_INTERVAL)
+
     def test_reconcile_reattaches_only_one_live_exact_attempt(self):
         attempt = "att-summary-recover"
         worker = subprocess.Popen(["sleep", "60"], start_new_session=True)

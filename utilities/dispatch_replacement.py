@@ -1040,6 +1040,10 @@ def _command(jobs, record, source, replay):
     return [sys.executable,str(root/f'adapters/{replay["harness"]}/bin/dispatch-headless.py'),*argv]
 
 
+# The detached launcher returns once the owner is claimed; slow shared storage needs room.
+LAUNCHER_TIMEOUT_SECONDS = 600
+
+
 def _capacity_wait(jobs, aid, source, hold=None):
     """Nothing is written: a usage limit is a pause the person resumes with `start`."""
     result = {'state': 'needs-attention', 'reason': 'replacement-capacity-wait',
@@ -1136,7 +1140,18 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                                                       jobs=Path(jobs)))
             except (ProducerError, OSError, ValueError):
                 pass
-        completed = run(command,env=env,text=True,capture_output=True,check=False,timeout=120)
+        try:
+            completed = run(command,env=env,text=True,capture_output=True,check=False,
+                            timeout=LAUNCHER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            # A slow disk after a usage-limit reset can hold the launcher past its budget.
+            # The unclaimed successor row stays; the next `start` relaunches that same attempt.
+            output = ''.join(part.decode(errors='replace') if isinstance(part, bytes) else str(part or '')
+                             for part in (exc.stdout, exc.stderr))
+            return {'state':'needs-attention','reason':'replacement-launch-timeout',
+                    'attempt_id':replacement,'record':record,
+                    'launcher_diagnostic':'\n'.join(output.splitlines()[-20:]),
+                    'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         current = _rows(Path(jobs).read_text().splitlines()).get(replacement)
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}
@@ -1160,6 +1175,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                   'node': source.get('route_node') or '__owner__'}
         if reason.startswith('replacement-') and getattr(exc,'detail',reason) != reason:
             result['detail'] = str(exc.detail)[:240]
+        elif not isinstance(exc, DC.DispatchContractError):
+            result['detail'] = f'{type(exc).__name__}: {exc}'[:240]
         result.update(getattr(exc,'live',None) or {})
         return result
 
