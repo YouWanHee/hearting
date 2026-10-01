@@ -342,9 +342,11 @@ Harness-specific status signals still need Codex-native realization:
 
 observability caveat: Codex keeps native `/statusline` ownership of model,
 context, limits, and footer monitoring. Fleet does not own summary generation or
-interaction lifecycle; it only renders stored evidence. The decision-wait path
-still does not claim live `request_user_input` rollout proof before that shape
-is observed.
+interaction lifecycle; it only renders stored evidence. The async question
+call/acceptance/exact-reply rollout shape was observed locally on 2026-10-01.
+That does not establish question observability for every client or Code Mode
+wrapper. Unobserved shapes remain unverified, with an explicit native question
+notice as the conversational fallback; the client owns question styling.
 
 ## Required Codex Mappings
 
