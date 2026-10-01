@@ -712,6 +712,15 @@ def fold_supersession_events(root: Path) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def record_display_state(record: Optional[Dict[str, Any]]) -> Optional[str]:
+    """`superseded` when the cycle carries that mark (the `disposition` of D-126, or the earlier
+    `state: superseded`); otherwise the record's own state.  Marking does not change the state."""
+    mark = P.cycle_disposition(record or {})
+    if mark is not None and mark.get("kind") == "superseded":
+        return "superseded"
+    return (record or {}).get("state")
+
+
 def lump_display_state(root: Path) -> Dict[str, Any]:
     root = Path(root).resolve()
     index = lump_index(root)
@@ -723,7 +732,7 @@ def lump_display_state(root: Path) -> Dict[str, Any]:
     for lump in index.get("lumps", []):
         cid = lump["lump_cycle_id"]
         record = P.read_cycle_record(root, cid) or {}
-        record_state = record.get("state")
+        record_state = record_display_state(record)
         fold_entry = fold.get(cid)
         fold_state = fold_entry["state"] if fold_entry else None
         agrees = (record_state == "superseded") == (fold_state == "superseded")
@@ -826,7 +835,7 @@ def _campaign_state_rows(root: Path) -> List[Dict[str, Any]]:
             if record is None:
                 unresolved.append(cid)
             else:
-                states.append(record.get("state"))
+                states.append(record_display_state(record))
         if unresolved:
             # A campaign naming a cycle with no side record cannot be judged either way.
             # Counting the missing one as "live" would quietly hold the campaign at
@@ -2581,7 +2590,7 @@ def _r3_execute(root: Path, run_dir: Path, journal: Dict[str, Any], identity, al
             journal["stream_id"] = alloc.allocate("stream")
             P._write_atomic(journal_path, P._json_bytes(journal))
         record = P.read_cycle_record(root, lump_cycle_id)
-        if record.get("state") != "superseded":
+        if record_display_state(record) != "superseded":
             P.mark_cycle_superseded(root, lump_cycle_id, superseded_by=new_cycle_ids,
                                     superseded_event_id=journal["event_id"])
         journal["phase"] = "side-records-written"
@@ -2899,7 +2908,7 @@ def _supersede_campaign(root: Path, lump_cycle_id: str, *, dry_run: bool) -> Dic
         return {"phase": "hold", "code": "campaign-unknown", "campaign_id": campaign_id}
     if campaign.get("state") == "superseded":
         return {"phase": "no-op", "code": "already-superseded", "campaign_id": campaign_id}
-    states = [(P.read_cycle_record(root, cid) or {}).get("state") for cid in campaign.get("cycles") or []]
+    states = [record_display_state(P.read_cycle_record(root, cid)) for cid in campaign.get("cycles") or []]
     if not states or any(state != "superseded" for state in states):
         return {"phase": "no-op", "code": "campaign-retained-live-cycles", "campaign_id": campaign_id,
                 "cycle_states": sorted(set(s for s in states if s))}

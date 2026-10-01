@@ -240,62 +240,6 @@ class ArtifactLifecycleCycleTest(LifecycleTestBase):
                     typed_reason = failure.rsplit(":", 1)[-1] if failure.startswith("locator-invalid:") else failure.split(":", 1)[0]
                     self.assertEqual(typed_reason, public_reasons.get("lifecycle", reason), (relative, detail))
 
-    # P1 -- identical input_digest, compatible criterion, prior active.
-    def test_compatible_unresolved_resume_preserves_cycle_id(self):
-        prior = _cycle()
-        candidate = _cycle()
-        decision = L.decide_cycle_start_or_resume(prior, candidate)
-        self.assertEqual(decision.status, "resume-same-cycle")
-        self.assertEqual(decision.detail["cycle_id"], prior["cycle_id"])
-
-    # N6 -- changed input_digest, no parent_cycle_id -> new-child-cycle-required + link-missing.
-    def test_changed_input_requires_distinct_child_cycle(self):
-        prior = _cycle()
-        candidate = _cycle(input_digest="sha256:" + "9" * 64)
-        decision = L.decide_cycle_start_or_resume(prior, candidate)
-        self.assertEqual(decision.status, "new-child-cycle-required")
-        self.assertTrue(any(r.code == "material-input-change-reused-cycle-id" for r in decision.reasons))
-
-    def test_changed_outcome_requires_distinct_child_cycle(self):
-        prior = _cycle()
-        candidate = _cycle(
-            outcome_criterion={"required_artifact_roles": ["primary"], "decision_required": False},
-        )
-        decision = L.decide_cycle_start_or_resume(prior, candidate)
-        self.assertEqual(decision.status, "new-child-cycle-required")
-
-    def test_well_formed_child_cycle_is_accepted(self):
-        prior = _cycle()
-        candidate = _cycle(
-            cycle_id="cyc_" + "2" * 32,
-            parent_cycle_id=prior["cycle_id"],
-            input_digest="sha256:" + "9" * 64,
-        )
-        decision = L.decide_cycle_start_or_resume(prior, candidate)
-        self.assertEqual(decision.status, "new-child-cycle-required")
-        self.assertEqual(decision.reasons, ())
-        self.assertEqual(decision.detail["parent_cycle_id"], prior["cycle_id"])
-
-    # N7 -- prior cycle is terminal.
-    def test_rejects_resume_of_terminal_prior_cycle(self):
-        prior = _cycle(state="completed")
-        candidate = _cycle()
-        decision = L.decide_cycle_start_or_resume(prior, candidate)
-        self.assertEqual(decision.status, "reject")
-        self.assertEqual(decision.reasons[0].code, "cycle-prior-terminal")
-
-    # N8 -- prior descriptor not backed by a published manifest.
-    def test_rejects_unverified_prior_descriptor(self):
-        candidate = _cycle()
-        decision = L.decide_cycle_start_or_resume({"not": "a-cycle-shape"}, candidate)
-        self.assertEqual(decision.status, "reject")
-        self.assertEqual(decision.reasons[0].code, "cycle-prior-descriptor-unverified")
-
-    def test_new_root_cycle_with_parent_is_rejected(self):
-        candidate = _cycle(parent_cycle_id="cyc_" + "9" * 32)
-        decision = L.decide_cycle_start_or_resume(None, candidate)
-        self.assertEqual(decision.status, "reject")
-
     def test_read_admitted_cycle_returns_none_when_absent(self):
         self.assertIsNone(L.read_admitted_cycle(self.root, "camp_" + "1" * 32, "cyc_" + "1" * 32))
 

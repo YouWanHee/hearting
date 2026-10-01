@@ -586,9 +586,11 @@ class EndToEndTests(Fixture):
         after_bytes = (self.lump_dir / "manifest.json").read_bytes()
         self.assertEqual(before_bytes, after_bytes)
         record = P.read_cycle_record(self.root, self.lump_cycle_id)
-        self.assertEqual(record["state"], "superseded")
-        self.assertTrue(record.get("superseded_by"))
-        self.assertTrue(record.get("superseded_event_id"))
+        # The mark is the record's disposition (D-126); the cycle's own state is not touched.
+        self.assertEqual(record["state"], "sealed")
+        self.assertEqual(W.record_display_state(record), "superseded")
+        self.assertTrue(record["disposition"].get("superseded_by"))
+        self.assertTrue(record["disposition"].get("superseded_event_id"))
         remaining = list(W.P._walk_files(self.lump_dir / "artifacts"))
         remaining = [f for f in remaining if f.is_file()]
         self.assertEqual(remaining, [])
@@ -1316,11 +1318,12 @@ class RollbackAndCrashTests(Fixture):
         self.assertIsNotNone(hold)
         self.assertEqual(hold["gate"], "r3")
         record_before = P.read_cycle_record(self.root, self.lump_cycle_id)
-        self.assertEqual(record_before["state"], "superseded")
+        self.assertEqual(W.record_display_state(record_before), "superseded")
         result = self.r3()
         self.assertEqual(result["journal"]["phase"], "rolled-back")
         record_after = P.read_cycle_record(self.root, self.lump_cycle_id)
         self.assertEqual(record_after["state"], "sealed")
+        self.assertEqual(W.record_display_state(record_after), "sealed")
         self.assertFalse((W._find_run_dir(self.root, self.lump_cycle_id) / "events.jsonl").exists())
 
     def test_fp6_before_reread_rolls_back(self):
@@ -1504,7 +1507,7 @@ class SupersessionEventTests(Fixture):
             "schema_version", "source_digest",
         })
         record = P.read_cycle_record(self.root, self.lump_cycle_id)
-        self.assertEqual(record["superseded_event_id"], event["event_id"])
+        self.assertEqual(record["disposition"]["superseded_event_id"], event["event_id"])
 
 
 HEARTING_CANARY_ROOT = Path("/home/nas/user/Uihyeop/personal/hearting/.agent_reports")

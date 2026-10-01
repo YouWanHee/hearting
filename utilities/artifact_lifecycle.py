@@ -36,7 +36,6 @@ import artifact_manifest
 PUBLICATION_RESULTS = frozenset(
     {"not-offered", "skipped", "succeeded", "failed"}
 )
-UNRESOLVED_CYCLE_STATES = frozenset({"active", "pending", "in-progress"})
 _ROUTE_ID_RE = re.compile(r"^rt-[A-Za-z0-9][A-Za-z0-9._-]{0,126}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CAPABILITY_ROUTE_MODULE = None
@@ -388,52 +387,6 @@ def read_admitted_cycle(
     ):
         raise LifecycleError("cycle-prior-descriptor-unverified")
     return cycle
-
-
-def decide_cycle_start_or_resume(
-    existing_cycle: Optional[Mapping[str, Any]], candidate_cycle: Mapping[str, Any]
-) -> Decision:
-    required = {"cycle_id", "campaign_id", "parent_cycle_id", "input_digest", "outcome_criterion", "state"}
-    if not isinstance(candidate_cycle, Mapping) or not required.issubset(candidate_cycle):
-        return Decision("reject", (_violation("candidate-cycle-incomplete"),))
-    if existing_cycle is None:
-        if candidate_cycle.get("parent_cycle_id") is not None:
-            return Decision("reject", (_violation("new-root-cycle-has-parent"),))
-        return Decision("new-cycle", detail={"cycle_id": candidate_cycle["cycle_id"]})
-    if not isinstance(existing_cycle, Mapping) or not required.issubset(existing_cycle):
-        return Decision("reject", (_violation("cycle-prior-descriptor-unverified"),))
-    if existing_cycle.get("campaign_id") != candidate_cycle.get("campaign_id"):
-        return Decision("reject", (_violation("cycle-campaign-mismatch"),))
-    if existing_cycle.get("state") not in UNRESOLVED_CYCLE_STATES:
-        return Decision("reject", (_violation("cycle-prior-terminal"),))
-    compatible = (
-        existing_cycle.get("input_digest") == candidate_cycle.get("input_digest")
-        and existing_cycle.get("outcome_criterion") == candidate_cycle.get("outcome_criterion")
-    )
-    if compatible:
-        reasons = []
-        if candidate_cycle.get("cycle_id") != existing_cycle.get("cycle_id"):
-            reasons.append(_violation("compatible-resume-must-preserve-cycle-id"))
-        if candidate_cycle.get("parent_cycle_id") != existing_cycle.get("parent_cycle_id"):
-            reasons.append(_violation("compatible-resume-parent-mismatch"))
-        if reasons:
-            return Decision("reject", tuple(reasons))
-        return Decision(
-            "resume-same-cycle", detail={"cycle_id": existing_cycle["cycle_id"]}
-        )
-    reasons = []
-    if candidate_cycle.get("cycle_id") == existing_cycle.get("cycle_id"):
-        reasons.append(_violation("material-input-change-reused-cycle-id"))
-    if candidate_cycle.get("parent_cycle_id") != existing_cycle.get("cycle_id"):
-        reasons.append(_violation("cycle-child-parent-link-missing"))
-    return Decision(
-        "new-child-cycle-required",
-        tuple(reasons),
-        {
-            "cycle_id": candidate_cycle.get("cycle_id"),
-            "parent_cycle_id": existing_cycle.get("cycle_id"),
-        },
-    )
 
 
 def _sha256_path(path: Path) -> str:

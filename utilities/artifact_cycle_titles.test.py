@@ -169,7 +169,7 @@ class RuleTest(unittest.TestCase):
         ctx2 = self._ctx(manifest=manifest)
         self.assertEqual(CT._primary_heading_candidate(ctx2), (None, "primary-ambiguous"))
 
-    def test_primary_heading_digest_mismatch(self):
+    def test_primary_heading_reads_the_file_as_it_is_now(self):
         with tempfile.TemporaryDirectory() as tmp:
             cycle_dir = Path(tmp)
             (cycle_dir / "artifacts").mkdir()
@@ -181,7 +181,8 @@ class RuleTest(unittest.TestCase):
                                        "content_digest": "sha256:" + "0" * 64}],
             }
             ctx = self._ctx(manifest=manifest, cycle_dir=cycle_dir)
-            self.assertEqual(CT._primary_heading_candidate(ctx), (None, "primary-digest-mismatch"))
+            # The primary was edited after the manifest was written: the current bytes answer (D-123/D-127).
+            self.assertEqual(CT._primary_heading_candidate(ctx), ("Heading", None))
 
     def test_primary_heading_reads_real_heading(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -256,8 +257,8 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(CT._reason_cell(row_multi), "record-title:slug-like, primary-heading:generic")
         row_no_chain = {"verdict": "unassigned", "reason": "primary-missing", "rejected": []}
         self.assertEqual(CT._reason_cell(row_no_chain), "primary-missing")
-        row_ineligible = {"verdict": "ineligible", "reason": "record-superseded", "rejected": []}
-        self.assertEqual(CT._reason_cell(row_ineligible), "record-superseded")
+        row_ineligible = {"verdict": "ineligible", "reason": "record-digest-mismatch", "rejected": []}
+        self.assertEqual(CT._reason_cell(row_ineligible), "record-digest-mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -415,16 +416,16 @@ class CycleTitlesTestBase(producer_fixture.ProducerTestBase):
 
 
 class EligibilityTest(CycleTitlesTestBase):
-    def test_superseded_record_excluded_and_drops_existing_entry(self):
+    def test_marked_record_is_judged_like_any_finished_cycle(self):
         result, _outcome = self.seal(title="Superseded Candidate Title")
         self.assertIn(result["cycle_id"], {e["cycle_id"] for e in self._read_declaration()["entries"]})
         P.mark_cycle_superseded(self.root, result["cycle_id"], superseded_by=[],
                                 superseded_event_id="evt_" + "1" * 32)
         backfill_result = CT.backfill(self.root, reader=self._accept_all_reader)
-        self.assertIn("record-superseded", backfill_result["counts"]["ineligible"])
-        self.assertEqual(backfill_result["counts"]["existing_dropped"], 1)
-        self.assertNotIn(result["cycle_id"], {row["cycle_id"] for row in backfill_result["rows"]
-                                              if row.get("verdict") == "kept"})
+        self.assertEqual(backfill_result["counts"]["ineligible"], {})
+        self.assertEqual(backfill_result["counts"]["eligible"], 1)
+        self.assertEqual(backfill_result["counts"]["existing_dropped"], 0)
+        self.assertIn(result["cycle_id"], {e["cycle_id"] for e in self._read_declaration()["entries"]})
 
     def test_manifest_digest_mismatch_excludes(self):
         result, outcome = self.seal(title="Digest Mismatch Title")

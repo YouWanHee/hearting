@@ -10,7 +10,9 @@ D-125 (a refresh is one short publication, never a long lock);
 `test_b2_*` covers the triggers that start it (begin, Claude Stop, Codex Stop, OpenCode
 `session.idle`) and the root cursor they share;
 `test_c1_*` covers D-126 (cycle-move, cycle-mark, delete, and a hand-made move or
-deletion found again by the next list, begin or close).  Every
+deletion found again by the next list, begin or close);
+`test_d1_*` covers the older tools (a mark is a disposition, titles and workflow groups read a
+finished cycle as it is now, the batch and freeze digest guards stay).  Every
 fixture runs on an isolated temporary artifact root; the real canonical root,
 registry, and routes directory are never touched.
 """
@@ -2102,8 +2104,10 @@ class C1MarkTest(C1ChangesBase):
     def test_c1_old_superseded_records_keep_display_semantics(self):
         first = self.closed_with("old-sup-a", "c1-old-sup", activate=True)
         second = self.closed_with("old-sup-b", "c1-old-sup")
-        P.mark_cycle_superseded(self.root, first["cycle_id"], superseded_by=[second["cycle_id"]],
-                                superseded_event_id="evt_" + "1" * 32)
+        # A record the older writer made: the state itself says superseded.
+        record = dict(self.record(first), state="superseded", superseded_by=[second["cycle_id"]],
+                      superseded_event_id="evt_" + "1" * 32)
+        P._write_cycle_record(self.root, record, exclusive=False)
         record = self.record(first)
         self.assertEqual(record["state"], "superseded")
         shown = P.cycle_disposition(record)
@@ -2891,6 +2895,159 @@ class C1RebuildFindsHandMoveTest(C1ChangesBase):
         self.assertEqual(out["status"], "recovered", out)
         self.assertEqual(self.record(again)["campaign_id"], peer["campaign_id"])
         self.assertTrue(adm.verify_index(self.root).ok)
+
+
+class D1LegacyConsumersTest(C1ChangesBase):
+    """§45 D-123/D-126 for the older tools: a finished cycle is read as it is now, a mark is only a mark."""
+
+    def legacy_superseded(self, result, by):
+        record = self.record(result)
+        record.update(state="superseded", superseded_by=list(by), superseded_event_id="evt_" + "7" * 32)
+        P._write_cycle_record(self.root, record, exclusive=False)
+
+    def test_d1_mark_cycle_superseded_is_a_disposition_not_a_state(self):
+        first = self.closed_with("d1-sup-a", "d1-sup", activate=True)
+        second = self.closed_with("d1-sup-b", "d1-sup")
+        manifest_before = (self.cycle_path(first) / "manifest.json").read_bytes()
+        before = self.record(first)
+        out = P.mark_cycle_superseded(self.root, first["cycle_id"], superseded_by=[second["cycle_id"]],
+                                      superseded_event_id="evt_" + "1" * 32)
+        self.assertEqual(out["status"], "updated", out)
+        after = self.record(first)
+        mark = after["disposition"]
+        self.assertEqual((mark["kind"], mark["superseded_by"]), ("superseded", [second["cycle_id"]]))
+        self.assertEqual(mark["superseded_event_id"], "evt_" + "1" * 32)
+        # Only the one field moved: the cycle is as finished as it was and stays writable.
+        self.assertEqual({k: v for k, v in after.items() if k != "disposition"}, before)
+        self.assertEqual((self.cycle_path(first) / "manifest.json").read_bytes(), manifest_before)
+        self.assertEqual(self.lines(kind="lifecycle", field="disposition", target_id=first["cycle_id"])[0]["operation"], "add")
+        self.edit(first, "plans/cycle/plan.md", b"edited after the mark\n")
+        self.assertEqual(self.refresh(first)["status"], "emitted")
+        # A mark with no named replacement is still a mark (the older callers passed none).
+        P.mark_cycle_superseded(self.root, second["cycle_id"], superseded_by=[], superseded_event_id="evt_" + "2" * 32)
+        self.assertEqual(self.record(second)["state"], "sealed")
+        self.assertEqual(P.cycle_disposition(self.record(second))["kind"], "superseded")
+        # The same call again is the same mark, and an unknown cycle is still unknown.
+        P.mark_cycle_superseded(self.root, second["cycle_id"], superseded_by=[], superseded_event_id="evt_" + "2" * 32)
+        with self.assertRaises(P.ProducerError) as ctx:
+            P.mark_cycle_superseded(self.root, "cyc_" + "9" * 32, superseded_by=[], superseded_event_id="evt_" + "3" * 32)
+        self.assertEqual(ctx.exception.code, "cycle-unknown")
+
+    def test_d1_mark_cycle_superseded_takes_an_open_cycle_too(self):
+        route, route_file, live = self.open_with("d1-open-mark", "d1-open")
+        P.mark_cycle_superseded(self.root, live["cycle_id"], superseded_by=[], superseded_event_id="evt_" + "4" * 32)
+        self.assertEqual(self.record(live)["state"], "open")
+        self.assertEqual(P.cycle_disposition(self.record(live))["kind"], "superseded")
+
+    def test_d1_campaign_superseded_counts_marks_old_states_and_ignores_deleted(self):
+        marked = self.closed_with("d1-camp-a", "d1-camp", activate=True)
+        legacy = self.closed_with("d1-camp-b", "d1-camp")
+        dropped = self.closed_with("d1-camp-c", "d1-camp")
+        live = self.closed_with("d1-camp-d", "d1-camp")
+        campaign_id = marked["campaign_id"]
+        P.cycle_mark(self.root, marked["cycle_id"], discard=True)
+        self.legacy_superseded(legacy, [live["cycle_id"]])
+        P.delete_cycle(self.root, dropped["cycle_id"])
+        with self.assertRaises(P.ProducerError) as ctx:
+            P.mark_campaign_superseded(self.root, campaign_id)
+        self.assertEqual(ctx.exception.code, "campaign-has-live-cycles")
+        P.cycle_mark(self.root, live["cycle_id"], superseded_by=[marked["cycle_id"]])
+        self.assertEqual(P.mark_campaign_superseded(self.root, campaign_id)["state"], "superseded")
+        self.assertEqual(P.read_campaign(self.root, campaign_id)["state"], "superseded")
+
+    def test_d1_resplit_reads_a_marked_cycle_as_superseded(self):
+        import artifact_resplit as RS
+        first = self.closed_with("d1-rs-a", "d1-rs", activate=True)
+        second = self.closed_with("d1-rs-b", "d1-rs")
+        self.assertEqual(RS._supersede_campaign(self.root, first["cycle_id"], dry_run=True)["code"],
+                         "campaign-retained-live-cycles")
+        P.mark_cycle_superseded(self.root, first["cycle_id"], superseded_by=[second["cycle_id"]],
+                                superseded_event_id="evt_" + "5" * 32)
+        self.legacy_superseded(second, [first["cycle_id"]])
+        out = RS._supersede_campaign(self.root, first["cycle_id"], dry_run=True)
+        self.assertEqual(out["code"], "would-supersede", out)
+        self.assertEqual(RS.record_display_state(self.record(first)), "superseded")
+        self.assertEqual(RS.record_display_state(self.record(second)), "superseded")
+
+    def test_d1_title_candidate_reads_the_current_primary_bytes(self):
+        import artifact_cycle_titles as CT
+        result = self.closed_with("d1-title", "d1-title", {"plans/cycle/plan.md": b"# First heading of the plan\n"},
+                                  activate=True)
+
+        def context():
+            directory = self.cycle_path(result)
+            return CT.CycleContext(record=self.record(result), manifest=self.manifest(result), cycle_dir=directory,
+                                   campaign={}, v2_title=None, route_text=None)
+
+        self.assertEqual(CT._primary_heading_candidate(context()), ("First heading of the plan", None))
+        # Edited after the finish, the manifest not yet brought up to date: the file as it is now answers.
+        self.edit(result, "plans/cycle/plan.md", b"# Plan after the rewrite\n")
+        self.assertEqual(CT._primary_heading_candidate(context()), ("Plan after the rewrite", None))
+        # Brought up to date: the primary has two revisions, and the newest one is the one read.
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.edit(result, "plans/cycle/plan.md", b"# Plan after the second rewrite\n")
+        self.assertEqual(self.refresh(result)["status"], "emitted")
+        self.assertEqual(CT._primary_heading_candidate(context()), ("Plan after the second rewrite", None))
+        # A primary that is gone is still just missing.
+        (self.cycle_path(result) / "artifacts/plans/cycle/plan.md").unlink()
+        self.assertEqual(CT._primary_heading_candidate(context()), (None, "primary-missing"))
+
+    def test_d1_title_eligibility_does_not_ask_for_a_state(self):
+        import artifact_cycle_titles as CT
+        result = self.closed_with("d1-elig", "d1-elig", activate=True)
+        identity = L.read_root_identity(self.root)
+        path = self.cycle_path(result) / "manifest.json"
+        raw = path.read_bytes()
+        parsed = json.loads(raw.decode("utf-8"))
+        self.assertIsNone(CT._eligibility_check(self.record(result), raw, parsed, identity))
+        self.legacy_superseded(result, [])
+        self.assertIsNone(CT._eligibility_check(self.record(result), raw, parsed, identity))
+        P.cycle_mark(self.root, result["cycle_id"], discard=True)
+        self.assertIsNone(CT._eligibility_check(self.record(result), raw, parsed, identity))
+        # What stays: the title is bound to the manifest the record names.
+        record = dict(self.record(result), manifest_digest="sha256:" + "0" * 64)
+        self.assertEqual(CT._eligibility_check(record, raw, parsed, identity), "record-digest-mismatch")
+        self.assertEqual(CT._eligibility_check(None, raw, parsed, identity), "record-missing")
+
+    def test_d1_workflow_groups_and_review_read_a_finished_cycle_by_its_files(self):
+        import artifact_workflow_groups as WG
+        import artifact_workflow_group_review as WGR
+        kept = self.closed_with("d1-wg-a", "d1-wg", activate=True)
+        legacy = self.closed_with("d1-wg-b", "d1-wg")
+        gone = self.closed_with("d1-wg-c", "d1-wg")
+        campaign = P.read_campaign(self.root, kept["campaign_id"])
+        self.legacy_superseded(legacy, [kept["cycle_id"]])
+        P.cycle_mark(self.root, kept["cycle_id"], discard=True)
+        for item in (kept, legacy):
+            directory = self.cycle_path(item)
+            value = WG._manifest(self.root, campaign, item["cycle_id"], directory)
+            self.assertEqual(value["cycle"]["cycle_id"], item["cycle_id"])
+        selection = WGR.select_targets(self.root, None, cycles=[kept["cycle_id"], legacy["cycle_id"]])
+        self.assertEqual(sorted(cid for ids in selection.by_campaign.values() for cid in ids),
+                         sorted([kept["cycle_id"], legacy["cycle_id"]]), selection.skipped)
+        # A cycle that was deleted is gone, not "not sealed".
+        P.delete_cycle(self.root, gone["cycle_id"])
+        selection = WGR.select_targets(self.root, None, cycles=[gone["cycle_id"]])
+        self.assertEqual(selection.skipped, [{"cycle_id": gone["cycle_id"], "reason": "cycle-unknown"}])
+        self.assertEqual(selection.by_campaign, {})
+
+    def test_d1_the_unused_start_or_resume_helper_is_gone(self):
+        self.assertFalse(hasattr(L, "decide_cycle_start_or_resume"))
+        # The default it described lives in the producer: changed material input makes a child cycle.
+        self.assertTrue(hasattr(P, "cycle_route_admission"))
+
+    def test_d1_freeze_and_batch_digest_guards_stay(self):
+        bridge = _load_sibling("pointer_bridge_for_d1", "artifact-pointer-bridge.py")
+        with mock.patch.object(bridge, "NORMALIZE_SOURCE_DIGEST", "sha256:" + "0" * 64):
+            with self.assertRaises(bridge.BridgeError) as ctx:
+                bridge._sealed_duplication_inputs({})
+        self.assertEqual(ctx.exception.code, "freeze-digest-mismatch")
+        with mock.patch.object(bridge, "RULE_SOURCE_DIGEST", "sha256:" + "1" * 64):
+            with self.assertRaises(bridge.BridgeError) as ctx:
+                bridge._sealed_duplication_inputs({})
+        self.assertEqual(ctx.exception.code, "freeze-digest-mismatch")
+        recovery = Path(__file__).with_name("dispatch-recovery.py").read_text(encoding="utf-8")
+        self.assertIn('raise RecoveryError("recovery-source-manifest-digest-mismatch")', recovery)
 
 
 def m_digest(document):

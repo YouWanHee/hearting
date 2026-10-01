@@ -7451,33 +7451,19 @@ def mark_cycle_superseded(
     root: Path, cycle_id: str, *, superseded_by: Sequence[str], superseded_event_id: str,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """D-81: mutable side-record supersession marker on a sealed cycle record.
-    The sealed manifest's `cycle.state` stays `completed` forever -- this
-    writes only the cycle record, never the manifest."""
-    root = Path(root).resolve()
-    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
-    try:
-        record = read_cycle_record(root, cycle_id)
-        if record is None:
-            raise ProducerError("cycle-unknown", cycle_id)
-        if record.get("state") != "sealed":
-            raise ProducerError("cycle-not-sealed", record.get("state", "?"))
-        artifact_locator.prepare_index_update(root, [record["campaign_id"]])
-        updated = dict(record)
-        updated["state"] = "superseded"
-        updated["superseded_by"] = list(superseded_by)
-        updated["superseded_event_id"] = superseded_event_id
-        _write_cycle_record(root, updated, exclusive=False)
-        artifact_locator.update_indexes(root, [record["campaign_id"]])
-        return {"status": "updated", "cycle_id": cycle_id, "state": "superseded",
-                "superseded_by": updated["superseded_by"], "superseded_event_id": superseded_event_id}
-    finally:
-        artifact_admission._release_lock(root, lock_fd)
+    """The older name of `cycle-mark --superseded-by` (D-81, now D-126): the mark is the record's
+    `disposition`, written by the one disposition writer.  The cycle's state, files and manifest
+    stay as they were, so a marked cycle is as finished and as writable as before."""
+    out = cycle_mark(root, cycle_id, superseded_by=list(superseded_by), superseded_event_id=superseded_event_id,
+                     now=now)
+    mark = out["disposition"]
+    return {"status": "updated", "cycle_id": cycle_id, "disposition": mark,
+            "superseded_by": list(mark.get("superseded_by") or []), "superseded_event_id": superseded_event_id}
 
 
 def mark_campaign_superseded(root: Path, campaign_id: str, *, now: Optional[float] = None) -> Dict[str, Any]:
-    """D-81: a campaign may be marked `superseded` only once every cycle it
-    owns already carries the `superseded` side-record state."""
+    """D-81: a campaign may be marked `superseded` only once every cycle it owns is set aside:
+    marked (`cycle-mark`, or the earlier `state: superseded`) or deleted."""
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
@@ -7486,7 +7472,7 @@ def mark_campaign_superseded(root: Path, campaign_id: str, *, now: Optional[floa
             raise ProducerError("campaign-unknown", campaign_id)
         for cycle_id in campaign.get("cycles", []):
             record = read_cycle_record(root, cycle_id)
-            if record is None or record.get("state") != "superseded":
+            if record is None or not (record.get("deleted_at") or cycle_disposition(record) is not None):
                 raise ProducerError("campaign-has-live-cycles", campaign_id)
         artifact_locator.prepare_index_update(root, [campaign_id])
         updated = dict(campaign)
@@ -7694,6 +7680,11 @@ def _closed_record(record: Mapping[str, Any]) -> bool:
     return record.get("state") in _CLOSED_RECORD_STATES
 
 
+def cycle_record_closed(record: Optional[Mapping[str, Any]]) -> bool:
+    """A cycle that was finished (its manifest is `manifest.json`), whatever it is marked as since."""
+    return isinstance(record, Mapping) and _closed_record(record)
+
+
 def _cycle_rel(root: Path, directory: Path) -> str:
     return Path(os.path.relpath(str(directory), str(Path(root)))).as_posix()
 
@@ -7732,7 +7723,7 @@ def _preserve_current_manifest(root: Path, record: Mapping[str, Any], directory:
 
 def cycle_mark(root: Path, cycle_id: str, *, discard: bool = False, superseded_by: Optional[Sequence[str]] = None,
                clear: bool = False, primary: Optional[str] = None, reason: Optional[str] = None,
-               now: Optional[float] = None) -> Dict[str, Any]:
+               now: Optional[float] = None, superseded_event_id: Optional[str] = None) -> Dict[str, Any]:
     """D-126: mark a cycle discarded or superseded, take the mark off, or name its primary document.
 
     The first three change one field of the cycle record, `disposition`: the folder, the files,
@@ -7770,12 +7761,14 @@ def cycle_mark(root: Path, cycle_id: str, *, discard: bool = False, superseded_b
                 mark: Dict[str, Any] = {"kind": "discarded"}
             else:
                 named = list(dict.fromkeys(superseded_by or ()))
-                if not named:
-                    raise ProducerError("request-invalid", "--superseded-by names no cycle")
                 for other in named:
                     if not artifact_identity.is_well_formed(other, "cycle") or read_cycle_record(root, other) is None:
                         raise ProducerError("cycle-unknown", str(other))
-                mark = {"kind": "superseded", "superseded_by": named}
+                mark = {"kind": "superseded"}
+                if named:
+                    mark["superseded_by"] = named
+                if superseded_event_id:
+                    mark["superseded_event_id"] = superseded_event_id
             mark.update(reason=reason if isinstance(reason, str) and reason.strip() else None,
                         marked_at=when, marked_by=marked_by)
             updated = dict(record, disposition=mark)
