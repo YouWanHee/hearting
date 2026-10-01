@@ -378,6 +378,7 @@ class Bundle:
         self.allowed_ids = allowed_ids or set()
         self.exchange: Optional[Path] = None
         self.related: list = []
+        self.unreadable: list = []      # sessions whose record could not be read (never "nothing new")
 
 
 def _target_sessions(item: dict, seat) -> list:
@@ -465,7 +466,9 @@ def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     st.atomic_write_json(path, doc)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     empty = not (sessions or choices or pending)
-    return Bundle(path, digest, cursors, empty, unread, {r["id"] for r in records})
+    bundle = Bundle(path, digest, cursors, empty, unread, {r["id"] for r in records})
+    bundle.unreadable = [s for s in skipped if str(s.get("reason", "")).startswith("unreadable")]
+    return bundle
 
 
 def coverage_note(bundle: Bundle) -> str:
@@ -882,6 +885,9 @@ def process_item(item: dict) -> None:
     finished = False
     try:
         bundle = assemble(item, batch, run_dir)
+        if bundle.empty and bundle.unreadable:
+            # A record that could not be read says nothing about what is in it.
+            raise RunnerFailure("대화 기록을 읽지 못했습니다(" + str(bundle.unreadable[0].get("reason", "unreadable")) + ")")
         if bundle.empty:
             # The notice goes first: a terminal status means "the notice was left".
             note = coverage_note(bundle)

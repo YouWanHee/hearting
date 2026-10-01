@@ -712,6 +712,17 @@ class FailureTest(RunnerCase):
         self.assertNotIn("\n", notes[0])
         self.assertFalse((self.state / "runs" / qid / "input_v1.json").exists())
 
+    def test_a_record_that_cannot_be_read_is_a_failure_never_nothing_new(self):
+        path = self.projects / "sid-A.jsonl"
+        path.chmod(0)
+        try:
+            qid = self.enqueue("sid-A")
+            self.assert_untouched_and_told(qid, "대화 기록을 읽지 못했습니다")
+        finally:
+            path.chmod(0o600)
+        self.assertNotIn("새로 정리할 대화가 없습니다", " ".join(self.notices()))
+        self.assertEqual(self.calls(), [])
+
     def test_a_worker_that_wrote_something_that_is_not_json(self):
         self.scenario([{"mode": "bad-json"}])
         self.assert_untouched_and_told(self.enqueue("sid-A"), "not valid JSON")

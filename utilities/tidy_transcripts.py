@@ -111,6 +111,22 @@ def opencode_db_path() -> Path:
     return _sst._opencode_db()
 
 
+OPENCODE_READ_TRIES = 4        # a snapshot of a database other windows keep writing fails now and then
+
+
+def _opencode_retry(read, pause: float = 0.5) -> "Chunk":
+    """``read()`` again while its snapshot was unreadable: every OpenCode window writes the same database,
+    so the private copy is refused whenever a write lands during the copy (about one read in two on a
+    busy 1 GB database, measured 2026-10-01).  A real failure still comes back as the last error."""
+    chunk = read()
+    for _ in range(OPENCODE_READ_TRIES - 1):
+        if not chunk.error:
+            break
+        time.sleep(pause)
+        chunk = read()
+    return chunk
+
+
 def locate_transcript(harness: str, sid: str, hint: Optional[str] = None) -> Optional[Path]:
     """The record for one session: a JSONL file, or the OpenCode database."""
     if hint:
@@ -498,7 +514,7 @@ def read_chunk(harness: str, source, cursor: int = 0, sid: Optional[str] = None,
     limit = max(1, int(limit_bytes))
     cursor = max(0, int(cursor or 0))
     if harness == "opencode":
-        return _read_opencode(Path(source), sid or "", cursor, limit)
+        return _opencode_retry(lambda: _read_opencode(Path(source), sid or "", cursor, limit))
     if harness in ("claude", "codex"):
         return _read_jsonl(harness, Path(source), cursor, limit)
     return Chunk(harness, str(source), cursor, cursor, error="unknown harness")
@@ -781,7 +797,7 @@ def read_pending(harness: str, sid: str, source, limit_bytes: int = DEFAULT_CHUN
     mark = read_watermark(harness, sid)
     limit = max(1, int(limit_bytes))
     if harness == "opencode":
-        return _read_opencode_tail(Path(source), sid or "", mark, limit)
+        return _opencode_retry(lambda: _read_opencode_tail(Path(source), sid or "", mark, limit))
     if harness in ("claude", "codex"):
         return _read_jsonl_tail(harness, Path(source), mark, limit)
     return Chunk(harness, str(source), 0, 0, error="unknown harness")

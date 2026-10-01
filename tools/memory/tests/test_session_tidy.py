@@ -1117,6 +1117,29 @@ class ClearBookingTest(TidyCase):
             self.assertEqual(clear.validate_request(path), (None, "new-input"))
 
 
+class OpenCodeReadRetryTest(unittest.TestCase):
+    """A snapshot of the shared OpenCode database is refused now and then; the read is tried again."""
+
+    def chunk(self, error=""):
+        return tt.Chunk("opencode", "db", 0, 0, error=error)
+
+    def test_a_refused_snapshot_is_tried_again_until_it_reads(self):
+        answers = [self.chunk("unreadable: OSError"), self.chunk("unreadable: OSError"), self.chunk()]
+        calls = []
+        result = tt._opencode_retry(lambda: calls.append(1) or answers[len(calls) - 1], pause=0)
+        self.assertEqual((result.error, len(calls)), ("", 3))
+
+    def test_a_read_that_keeps_failing_ends_with_the_last_error_after_a_bounded_number_of_tries(self):
+        calls = []
+        result = tt._opencode_retry(lambda: calls.append(1) or self.chunk("unreadable: OSError"), pause=0)
+        self.assertEqual((result.error, len(calls)), ("unreadable: OSError", tt.OPENCODE_READ_TRIES))
+
+    def test_a_clean_read_is_not_repeated(self):
+        calls = []
+        tt._opencode_retry(lambda: calls.append(1) or self.chunk(), pause=0)
+        self.assertEqual(len(calls), 1)
+
+
 class ClearHelperTest(TidyCase):
     """The detached helper's decisions, with the herdr wait and ``peer-steward.py clear`` replaced."""
 
