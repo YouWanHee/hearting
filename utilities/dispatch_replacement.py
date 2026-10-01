@@ -29,6 +29,10 @@ DEATH_NOTES = frozenset({
     'dead-missing-result', 'dead-parent-orphaned', 'dead-governor-reservation-transfer',
     'dead-no-progress', 'dead-timeout',
 })
+# An owner whose runtime died under it: the process exited (`dead-runtime-exit`) or the runtime
+# returned an error envelope such as a provider 5xx (`dead-runtime-error`). Only an explicit `start`
+# replaces it, once, from the node's one replacement budget.
+RUNTIME_DEATH_NOTES = frozenset({'dead-runtime-exit', 'dead-runtime-error'})
 SCHEMA = 'automatic-dead-replacement-v1'
 # D2: a frame leg whose `top` the frame rule assigned is replaced once, one profile lower, when it
 # stops at a usage limit. The claim carries exactly this value; nothing else may.
@@ -227,12 +231,14 @@ def launch_input(jobs, aid, meta):
     return value
 
 
-def _terminal_absent(fields, meta, *, capacity=False):
+def _terminal_absent(fields, meta, *, capacity=False, runtime=False):
     from codex_dispatch_terminal import inspect_terminal_attempt
     result = inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
                                       artifact_root_metadata=meta.get('artifact_root'))
     if capacity and result.get('state') == 'invalid' and result.get('failure_class') == 'capacity':
         return True  # A usage-limit result is the stop itself, not a handoff to settle.
+    if runtime and result.get('state') == 'invalid' and result.get('failure_class') == 'runtime':
+        return True  # So is a runtime error envelope (a provider 5xx): no handoff was ever written.
     return result.get('state') == 'absent'
 
 
@@ -288,8 +294,8 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
             and meta.get('launch_outcome') == 'never-launched' and meta.get('launch_claimed') == '0'
             and meta.get('launch_started') != '1' and not meta.get('pid')):
         return 'unlaunched'  # nothing ran: the log never existed and no process was ever bound
-    if meta.get('worker_type') == 'owner' and fields[1] == 'done' and meta.get('note') == 'dead-runtime-exit':
-        return 'runtime'  # the owner's process crashed; only an explicit `start` replaces it
+    if meta.get('worker_type') == 'owner' and fields[1] == 'done' and meta.get('note') in RUNTIME_DEATH_NOTES:
+        return 'runtime'  # the owner's runtime died under it; only an explicit `start` replaces it
     if (jobs is not None and meta.get('worker_type') == 'frame' and fields[1] == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
             and _frame_rule_top(jobs, meta)):
@@ -309,7 +315,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
     proof = DC.attempt_process_quiescence(meta, terminal_receipt=True)
     if proof.state != 'quiescent':
         raise _process_error(proof, meta)
-    if kind not in {'parked', 'unlaunched'} and not _terminal_absent(fields, meta, capacity=kind in {'capacity', FRAME_CAPACITY}):
+    if kind not in {'parked', 'unlaunched'} and not _terminal_absent(
+            fields, meta, capacity=kind in {'capacity', FRAME_CAPACITY}, runtime=kind == 'runtime'):
         raise DC.DispatchContractError('replacement-result-settlement-required')
     result = {'state': proof.state, 'reason': proof.reason, 'death_kind': kind,
               'note': meta.get('note', ''), 'cleanup_receipt_digest': meta.get('cleanup_receipt_digest', ''),

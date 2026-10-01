@@ -384,6 +384,68 @@ class CapacityResumeTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.rows()[self.replacement_id()][1]["automatic_retry_of"], "att-owner")
 
+    # The result row an OpenCode owner wrote when the provider answered 504 (not a capacity stop).
+    PROVIDER_504 = json.dumps({"type": "result", "runtime": "opencode", "session_id": "s",
+        "subtype": "error_during_execution", "is_error": True, "result": "",
+        "error": {"name": "APIError", "data": {"message": "Upstream response was not valid JSON",
+                                               "statusCode": 504, "isRetryable": True}}}) + "\n"
+
+    def _provider_death(self, aid):
+        (self.root / (aid + ".log")).write_text(self.PROVIDER_504)
+        self.set_status(aid, "done", note="dead-runtime-error", failure_class="runtime",
+                        terminal_event="opencode-result", process_exit="1")
+        self.statuses[aid] = dict(verdict="FAIL", completion_proven=False, marker=None, marker_digest=None)
+
+    def _provider_error_owner(self):
+        self.reseed(note="dead-runtime-error", failure_class="runtime", harness="opencode")
+        self._provider_death("att-owner")
+        # Not vacuous: the real post-hoc reader sees a runtime error envelope, not an absent log.
+        from codex_dispatch_terminal import inspect_terminal_attempt
+        seen = inspect_terminal_attempt(str(self.root / "att-owner.log"), worktree=str(self.root),
+                                        artifact_root_metadata=str(self.root / "artifacts"))
+        self.assertEqual((seen["state"], seen["failure_class"]), ("invalid", "runtime"))
+
+    def test_an_owner_killed_by_a_provider_error_is_replaced_once_by_an_explicit_start(self):
+        self._provider_error_owner()
+        # a supervisor/rewake tick never launches it
+        self.assertEqual(R.advance(self.jobs, "att-owner", run=self.launcher,
+                                   authority_check=lambda *a: True)["state"], "not-applicable")
+        R.advance_batch(self.jobs, {"att-owner"}, authority_check=lambda *a: True, run=self.launcher)
+        self.assertEqual((self.calls, self.claims()), ([], []))
+        # one explicit start replaces it once
+        result = self.start()
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual((len(self.calls), len(self.claims())), (1, 1))
+        first = self.replacement_id()
+        self.assertEqual(self.rows()[first][1]["automatic_retry_of"], "att-owner")
+        record = json.loads(self.claims()[0].read_text())
+        self.assertEqual((record["proof"]["death_kind"], record["proof"]["note"]), ("runtime", "dead-runtime-error"))
+        self.assertNotIn("after_capacity", record["logical_node"])  # the node's one budget, not a pause
+        # the replacement dies the same way: the budget is spent, nothing more launches
+        self._provider_death(first)
+        for _ in range(2):
+            result = self.start()
+            self.assertEqual((len(self.calls), len(self.claims())), (1, 1), result)
+            self.assertIn("automatic-replacement-exhausted", json.dumps(result.get("replacement_attention") or result))
+
+    def test_a_provider_error_owner_with_a_live_or_unknown_child_is_not_replaced(self):
+        for child_state, settles in ((("live", "attempt-descendant-live", 99), True),
+                                     (("unverifiable", "post-exit-receipt-incomplete", None), False)):
+            with self.subTest(child=child_state[0]):
+                self._provider_error_owner()
+                self.calls.clear()
+                child = {**self.owner, "attempt_id": "att-child", "parent_attempt_id": "att-owner",
+                         "worker_type": "stage", "dispatch_depth": "2", "route_node": "execute",
+                         "note": "dead-exact-pid", "failure_class": "contract"}
+                child.pop("replacement_input_digest")
+                self.write(child)
+                self.quiet["att-child"] = child_state
+                self.cleanup_settles = settles
+                self.ready = True
+                result = self.start()
+                self.assertEqual(result["reason"], "replacement-owner-child-unsettled", result)
+                self.assertEqual((self.calls, self.claims()), ([], []))
+
     def test_claim_made_under_an_old_runtime_launches_under_the_installed_one(self):
         self._drift_setup()
         record = R.claim(self.jobs, "att-owner")
