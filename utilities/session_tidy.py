@@ -14,9 +14,12 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py status [--json] [--cwd D]
         Print where the state lives and what is waiting.
 
-Later slices add ``enqueue`` and ``handoff`` on top of the helpers here
-(``resolve_seat``, ``seat_lock``, ``read_latest_card``, ``write_notice``,
-``session_summary``); the detached runner is ``session_tidy_runner.py``.
+    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D]
+        Queue the memory tidy and return at once (one line); the detached runner
+        ``session_tidy_runner.py`` does the work and leaves a result notice.
+    session_tidy.py handoff <target> [--harness H] [--session-id S] [--cwd D]
+        Deliver this seat's card to a peer session through ``peer-steward.py prompt``
+        and report its typed verdict (``prompted=...``) and exit code on one line.
 
 State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 (directories 0700, files 0600, temp file + rename, symlinks refused):
@@ -649,6 +652,25 @@ def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
     return best
 
 
+def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
+    """(seat, harness, session id) of the calling session; ids come from the arguments,
+    the harness variables, then the seat ledger, and as a last resort a fresh ``unknown-`` id."""
+    if not sid:
+        harness, sid = session_from_env(harness)
+    detected = harness or session_from_env(None)[0]
+    seat = resolve_seat(detected, cwd)
+    if not sid or not harness:
+        ledger_row = latest_session(seat, harness)
+        if ledger_row is None and seat.kind == "project" and not detected:
+            seat, ledger_row = _guess_seat_from_ledgers(cwd)
+        if ledger_row:
+            harness = harness or ledger_row["harness"]
+            sid = sid or ledger_row["sid"]
+    if seat is None:
+        return None
+    return seat, harness or detected or "unknown", sid or f"unknown-{secrets.token_hex(4)}"
+
+
 def cmd_card(args) -> int:
     if is_worker():
         print("card=none reason=worker")
@@ -663,28 +685,47 @@ def cmd_card(args) -> int:
     if not sanitize_body(body):
         print("card=none reason=empty-body")
         return 0
-    harness, sid = args.harness, args.session_id
-    if not sid:
-        harness, sid = session_from_env(harness)
-    detected = harness or session_from_env(None)[0]
-    seat = resolve_seat(detected, cwd)
-    if not sid or not harness:
-        ledger_row = latest_session(seat, harness)
-        if ledger_row is None and seat.kind == "project" and not detected:
-            seat, ledger_row = _guess_seat_from_ledgers(cwd)
-        if ledger_row:
-            harness = harness or ledger_row["harness"]
-            sid = sid or ledger_row["sid"]
-    if seat is None:
+    caller = resolve_caller(args.harness, args.session_id, cwd)
+    if caller is None:
         print("card=none reason=no-seat")
         return 0
-    harness = harness or detected or "unknown"
-    sid = sid or f"unknown-{secrets.token_hex(4)}"
+    seat, harness, sid = caller
     with seat_lock(seat.key):
         record_event(seat, harness, sid, "card", cwd=cwd)
         write_card(seat, harness, sid, body, cwd=cwd)
     print(f"card={card_text_path(seat)} seat={seat.key}")
     return 0
+
+
+def cmd_enqueue(args) -> int:
+    if is_worker():
+        print("enqueue=none reason=worker")
+        return 0
+    cwd = args.cwd or os.getcwd()
+    caller = resolve_caller(args.harness, args.session_id, cwd)
+    if caller is None:
+        print("enqueue=none reason=no-seat")
+        return 0
+    seat, harness, sid = caller
+    import session_tidy_runner as runner
+    transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
+    item = runner.enqueue_item(seat, harness, sid, cwd, transcript)
+    print(f"enqueue={item['id']} seat={seat.key} status=queued")
+    return 0
+
+
+def cmd_handoff(args) -> int:
+    if is_worker():
+        print("prompted=false reason=worker")
+        return 1
+    caller = resolve_caller(args.harness, args.session_id, args.cwd or os.getcwd())
+    if caller is None:
+        print("prompted=false reason=no-seat")
+        return 1
+    import session_tidy_runner as runner
+    line, code = runner.handoff(caller[0], args.target)
+    print(line)
+    return code
 
 
 def cmd_hook(args) -> int:
@@ -695,6 +736,20 @@ def cmd_hook(args) -> int:
     except BaseException:  # noqa: BLE001 - a hook is silent on every failure
         pass
     return 0
+
+
+def _queue_counts(seat: Seat) -> dict:
+    counts: dict = {}
+    folder = state_root() / "queue"
+    try:
+        names = list(folder.iterdir())
+    except OSError:
+        return counts
+    for path in names:
+        item = read_json(path) if path.suffix == ".json" else None
+        if isinstance(item, dict) and (item.get("seat") or {}).get("key") == seat.key:
+            counts[item.get("status", "?")] = counts.get(item.get("status", "?"), 0) + 1
+    return counts
 
 
 def cmd_status(args) -> int:
@@ -710,6 +765,7 @@ def cmd_status(args) -> int:
                  "path": str(card_text_path(seat))} if card else None,
         "sessions": len(session_summary(seat)),
         "notices": len(notices.get("items", [])) if isinstance(notices, dict) else 0,
+        "queue": _queue_counts(seat),
     }
     if args.json:
         print(json.dumps(info, ensure_ascii=False, sort_keys=True))
@@ -718,6 +774,7 @@ def cmd_status(args) -> int:
         print(f"seat={seat.key} kind={seat.kind}")
         print("card=" + (f"gen{card['generation']} {card['authored_at']}" if card else "none"))
         print(f"sessions={info['sessions']} notices={info['notices']} worker={int(info['worker'])}")
+        print("queue=" + (" ".join(f"{k}={v}" for k, v in sorted(info["queue"].items())) or "empty"))
     return 0
 
 
@@ -740,6 +797,17 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("--cwd")
     hook.add_argument("--reread", action="store_true")
     hook.set_defaults(func=cmd_hook)
+    enqueue = sub.add_parser("enqueue", help="queue the memory tidy and return at once")
+    enqueue.add_argument("--harness", choices=HARNESSES)
+    enqueue.add_argument("--session-id")
+    enqueue.add_argument("--cwd")
+    enqueue.set_defaults(func=cmd_enqueue)
+    handoff = sub.add_parser("handoff", help="deliver this seat's card to a peer session")
+    handoff.add_argument("target")
+    handoff.add_argument("--harness", choices=HARNESSES)
+    handoff.add_argument("--session-id")
+    handoff.add_argument("--cwd")
+    handoff.set_defaults(func=cmd_handoff)
     status = sub.add_parser("status", help="show state location and what is waiting")
     status.add_argument("--json", action="store_true")
     status.add_argument("--cwd")
