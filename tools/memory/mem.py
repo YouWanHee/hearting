@@ -131,7 +131,7 @@ else:
         Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state"))
         / "agent-memory" / "write-events.jsonl"
     )
-WRITE_ACTORS = ("manual", "distiller", "curator", "lifecycle", "sync", "restore")
+WRITE_ACTORS = ("manual", "distiller", "curator", "lifecycle", "sync", "restore", "tidy-applier")
 INSTALLATION_STATE = (
     Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state"))
     / "hearting" / "memory-sync"
@@ -9858,6 +9858,12 @@ def _cli_main():
 
     sub.add_parser("curate-snapshot",
                    help="Read-only current-project durable/working snapshot and signals")
+    ta = sub.add_parser("tidy-apply", help="Apply a session-tidy actions_v1.json (add/supersede/reinforce only)")
+    ta.add_argument("actions")
+    ta.add_argument("--input", default=None, help="input_v1.json carrying the user's choices")
+    ta.add_argument("--cwd", default=None, help="project folder (default: input cwd or current)")
+    tu = sub.add_parser("tidy-undo", help="Undo one tidy-apply batch without deleting anything")
+    tu.add_argument("batch")
     sub.add_parser("curate-artifacts",
                    help="Read-only current-project git, plan, and spec artifact state")
     sub.add_parser("promote-candidates",
@@ -10021,6 +10027,12 @@ def _cli_main():
         sys.exit(0 if graduate(args.id, to=args.to) else 1)
     elif args.cmd == "reattribute":
         sys.exit(0 if reattribute(args.id) else 1)
+    elif args.cmd == "tidy-apply":
+        import tidy_apply
+        sys.exit(tidy_apply.apply_command(sys.modules[__name__], args))
+    elif args.cmd == "tidy-undo":
+        import tidy_apply
+        sys.exit(tidy_apply.undo_command(sys.modules[__name__], args))
     elif args.cmd == "curate-snapshot":
         curate_snapshot()
     elif args.cmd == "curate-artifacts":

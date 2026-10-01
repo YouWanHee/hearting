@@ -976,6 +976,35 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
                 self.assertEqual(self.step(answers=answer)["state"], "released")
                 self.assertEqual(self.calls.count("release"), 1)
 
+    def test_answers_are_recorded_as_decisions_only_by_the_release_not_by_the_start_path(self):
+        """D-87: `release` is the one place an answer is accepted; the start path calls it
+        and must not record a second time, however often the same answers are replayed."""
+        import frame_interview as FI
+        import tidy_decisions
+        question = {**self.question, "questions": [{
+            "id": "q-scope", "topic": "How much to change",
+            "question": "Fix only the approval step, or the questions too?", "kind": "choice",
+            "options": [{"label": "Both (recommended)", "means": "Fix both."},
+                        {"label": "Approval only", "means": "Leave the questions."}],
+            "recommended": 0, "why": "Only you can weigh the wording against the schedule."}]}
+        self.question_file.write_text(json.dumps(question))
+        template = FI.answers_template({**question, "route_id": self.route["route_id"]})
+        template["understanding_confirmed"] = True
+        template["answers"]["q-scope"].update(choice=0, note="go on")
+        answers = self.base / "answers.json"
+        answers.write_text(json.dumps(template))
+        with mock.patch.object(tidy_decisions, "record_interview_answers", return_value="recorded") as record:
+            self.assertEqual(self.step(interview=self.question_file)["state"], "needs-question")
+            self.assertEqual(record.call_count, 0)
+            self.assertEqual(self.step(answers=answers)["state"], "released")
+            self.assertEqual(self.step(answers=answers)["state"], "released")
+            self.assertEqual(self.step(interview=self.question_file, answers=answers)["state"], "released")
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertEqual(record.call_count, 1)
+        interview, given = record.call_args.args
+        self.assertEqual(interview["questions"][0]["id"], "q-scope")
+        self.assertEqual(given["answers"]["q-scope"]["note"], "go on")
+
     def test_already_received_answers_register_and_release_without_reasking(self):
         result = self.step(interview=self.question_file, answers=self.answers())
         self.assertEqual(result["state"], "released")
