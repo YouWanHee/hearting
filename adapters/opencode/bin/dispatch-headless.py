@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
 from dispatch_contract import (
+    _atomic_registry_replace,
     workflow_completion_receipt,  # noqa: E402
     DispatchContractError,
     foreground_review_launch_identity,
@@ -1233,7 +1234,8 @@ def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str,
             changed = True
             break
         if changed:
-            jobs.write_text("".join(lines), encoding="utf-8")
+            # Lock-free readers (join, owner input) must never see a truncated registry.
+            _atomic_registry_replace(jobs, "".join(lines).splitlines())
         return changed
 
 
@@ -1256,7 +1258,8 @@ def annotate_job_row(jobs: Path, slug: str, worktree: str, extra_kv: str, attemp
             if attempt_id and f"attempt_id={attempt_id}" not in pipe.split(","):
                 continue
             lines[i] = f"{ts}\t{status}\t{repo}\t{wt}\t{row_slug}\t{pipe},{extra_kv}\n"
-            jobs.write_text("".join(lines), encoding="utf-8")
+            # Lock-free readers (join, owner input) must never see a truncated registry.
+            _atomic_registry_replace(jobs, "".join(lines).splitlines())
             return True
     return False
 

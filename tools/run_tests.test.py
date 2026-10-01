@@ -1766,11 +1766,16 @@ class ShardPartitionTest(unittest.TestCase):
             with self.assertRaises(self.mod.BaselineError):
                 self.mod.load_durations(root / "absent.tsv")
 
-    def test_committed_table_is_well_formed_and_covers_the_corpus(self):
+    def test_committed_table_is_well_formed(self):
+        # The table only balances shards: a suite without a row is weighed at the
+        # median (shard_weights) and a row for a removed suite is ignored, so a PR
+        # that adds or removes a test file must not have to edit this table.
         durations = self.mod.load_durations(ROOT / "tools" / "test-durations.tsv")
-        corpus = {self.mod.suite_relpath(ROOT, s) for s in self.mod.collect_suites(ROOT)}
-        self.assertFalse(corpus - set(durations), "new suite without a duration row")
-        self.assertFalse(set(durations) - corpus, "duration row for a suite that is gone")
+        self.assertTrue(durations)
+        self.assertTrue(all(value > 0 for value in durations.values()))
+        corpus = sorted(self.mod.suite_relpath(ROOT, s) for s in self.mod.collect_suites(ROOT))
+        weights = self.mod.shard_weights(corpus, durations)
+        self.assertEqual(set(weights), set(corpus))
 
 
 class ShardCliFixture(RunTestsFixtureBase):
