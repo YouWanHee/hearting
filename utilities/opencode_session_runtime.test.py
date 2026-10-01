@@ -8,8 +8,10 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -107,6 +109,79 @@ event('step_finish', part={'reason':'stop'})
         pid = int((self.root/'pid').read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+class ActiveTurnDeadlineTest(unittest.TestCase):
+    """The native turn timeout is a no-progress window for a general owner
+    turn (any event restarts it); silence, a real exit, a session mismatch and
+    a sealed handoff keep their existing behaviour. These drive the real
+    supervisor `run_turn`, which is what decides the policy."""
+
+    WINDOW = 0.6
+    CHATTY = """
+event('step_start', part={})
+for _ in range(6):
+    time.sleep(0.3)
+    event('tool_use', part={'tool':'bash', 'callID':'c', 'state':{'status':'running'}})
+event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})
+event('step_finish', part={'reason':'stop'})
+"""
+
+    program = NativeSessionTest.program
+
+    def setUp(self):
+        NativeSessionTest.setUp(self)
+        self.args.turn_timeout = self.WINDOW
+        self.args.runtime_harness = "opencode"
+        self.supervisor = fixture.supervisor
+        patch = unittest.mock.patch.object(self.supervisor, "emit")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def turn(self, **kwargs):
+        return self.supervisor.run_turn(self.args, "sess", "go", resume=False, **kwargs)
+
+    def test_native_live_turn_with_events_survives_past_the_window(self):
+        self.program(self.CHATTY)
+        started = time.monotonic()
+        result, code = self.turn()
+        self.assertGreater(time.monotonic() - started, self.WINDOW)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["result"], "artifact: -\nverdict: PASS\nblocker: none")
+
+    def test_native_silence_for_the_whole_window_still_times_out_and_reaps(self):
+        self.program("from pathlib import Path\nimport os\nPath('pid').write_text(str(os.getpid()))\n"
+                     "event('step_start', part={})\ntime.sleep(10)\n")
+        with self.assertRaisesRegex(self.supervisor.SupervisorError, "opencode-turn-timeout"):
+            self.turn()
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int((self.root / "pid").read_text()), 0)
+
+    def test_native_post_eof_wait_stays_bounded(self):
+        self.program("from pathlib import Path\nimport os\nPath('pid').write_text(str(os.getpid()))\n"
+                     "event('step_start', part={})\nos.close(1)\ntime.sleep(10)\n")
+        started = time.monotonic()
+        with self.assertRaisesRegex(self.supervisor.SupervisorError, "opencode-turn-timeout"):
+            self.turn()
+        self.assertLess(time.monotonic() - started, 5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int((self.root / "pid").read_text()), 0)
+
+    def test_real_exit_before_final_stop_still_fails(self):
+        self.program("event('text', part={'text':'x'})\n")
+        with self.assertRaisesRegex(self.supervisor.SupervisorError, "final-stop-missing"):
+            self.turn()
+
+    def test_session_mismatch_still_fails(self):
+        runtime.bind_session(self.args, "ses_original")
+        self.program("event('step_start', part={})\n")
+        with self.assertRaisesRegex(self.supervisor.SupervisorError, "identity-mismatch"):
+            self.turn()
+
+    def test_a_sealed_handoff_keeps_the_fixed_deadline_even_with_events(self):
+        self.program(self.CHATTY)
+        with self.assertRaisesRegex(self.supervisor.SupervisorError, "opencode-turn-timeout"):
+            self.turn(handoff_intent={"intent_id": "handoff"})
 
 
 class SharedControllerTest(unittest.TestCase):

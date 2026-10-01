@@ -87,8 +87,13 @@ def command(args, session: str) -> list[str]:
     return result
 
 
-def run_turn(args, prompt: str, *, emit) -> tuple[dict, int]:
-    """Stream one exact native turn, then return the portable result envelope."""
+def run_turn(args, prompt: str, *, emit, idle_reset: bool = False) -> tuple[dict, int]:
+    """Stream one exact native turn, then return the portable result envelope.
+
+    `idle_reset` turns `args.turn_timeout` into a no-progress window: each read
+    from the live process restarts it, so a long owner wait that keeps emitting
+    events is not cut off while silence for the whole window still times out.
+    The default keeps the fixed deadline a bounded caller relies on."""
     session = read_binding(args)
     if session:
         emit({"type": "dispatch.supervisor.session", "runtime": "opencode",
@@ -158,6 +163,8 @@ def run_turn(args, prompt: str, *, emit) -> tuple[dict, int]:
                         if not chunk:
                             eof = True
                             break
+                        if idle_reset:
+                            deadline = time.monotonic() + args.turn_timeout
                         buffer += chunk
                         while b"\n" in buffer:
                             line, buffer = buffer.split(b"\n", 1)

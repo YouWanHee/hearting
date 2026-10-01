@@ -835,6 +835,18 @@ def _completion_evidence_current(state: CurrentDeliveryState) -> bool:
     )
 
 
+def _owner_status(launch: Launch) -> str:
+    """The exact owner row's status in the current delivery snapshot, read the
+    way `classified_receipt` reads it; "" when the snapshot is unavailable."""
+
+    try:
+        return current_delivery_state(
+            launch.jobs, launch.attempt_id, parent_attempt_id=launch.attempt_id
+        ).status
+    except (DispatchContractError, JoinContractError, OSError):
+        return ""
+
+
 def classified_receipt(
     launch: Launch, state: str, reason: str, root: Path
 ) -> tuple[str, str]:
@@ -1036,6 +1048,14 @@ def emit_receipt(state: str, message: str, *, block: bool | None = None) -> int:
         return 0
     print(message, file=sys.stderr)
     return 2
+
+
+def _owner_closed(message: str) -> bool:
+    """True when the receipt's own snapshot saw the owner row past open/running;
+    a missing or unreadable snapshot (`status=-`) is never terminal evidence."""
+
+    match = re.search(r"\bstatus=(\S+)", message)
+    return bool(match and match.group(1) not in {"-", "open", "running"})
 
 
 def _attention_has_open_child(message: str) -> bool:
@@ -1406,8 +1426,9 @@ def main() -> int:
         # wrong AGENT_HOME) is a lapse, not an end: the next Bash call may
         # see a whole home again (review R1 B3).
         settle_arm(claim, "lapsed")
+        wait_state = "bridge-error"
         state, message = classified_receipt(
-            launch, "bridge-error", "readiness-helper-missing", root
+            launch, wait_state, "readiness-helper-missing", root
         )
     else:
         interval = _bounded_number(
@@ -1439,6 +1460,20 @@ def main() -> int:
                 if successor is not None:
                     launch, claim = successor
                     continue  # Same deadline; one registry-bound successor only.
+                if _owner_status(launch) in {"open", "running"}:
+                    # A transient attention (or a ready readout the current
+                    # snapshot already contradicts) is not the owner's end: the
+                    # row has taken no terminal edge, so this process's one
+                    # wake must wait for the real completion. Same absolute
+                    # deadline and interval as every other re-wait.
+                    if time.monotonic() >= deadline:
+                        wait_state, wait_reason = "timeout", f"owner-not-quiescent-after-{maximum}s"
+                        break
+                    if _open_gate_pending(launch):
+                        wait_state, wait_reason = "gate", "human-gate-open"
+                    else:
+                        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+                        continue
             if wait_state != "gate":
                 break
             # SD-129: the owner is alive at its gate. Wake the person now with
@@ -1490,14 +1525,14 @@ def main() -> int:
         # open|running -> done), so there is nothing to claim. This keeps
         # Claude from stopping prematurely; SD-111's claim gate does not
         # apply to it.
-        return _emit_with_gates(launch, claim, state, message, block=True)
+        return _emit_with_gates(launch, claim, state, message, block=True, owner_closed=wait_state == "ready")
     owing = _delivery_owing_row(launch)
     if owing is None:
         # Not (yet) a delivery-owing terminal completion -- still open/
         # running (timeout, bridge error) or a non-SD-111 row. Emit exactly
         # as before the claim gate existed; only a genuine delivery-owing
         # terminal notice is claim-gated.
-        return _emit_with_gates(launch, claim, state, message, block=False)
+        return _emit_with_gates(launch, claim, state, message, block=False, owner_closed=wait_state == "ready")
     win = _carrier_one_claim(launch, owing)
     if win is None and _record_missing(launch, owing):
         grace = _bounded_number(
@@ -1515,7 +1550,7 @@ def main() -> int:
         # completion is delivered by it, so this attempt is finished here --
         # and the recipient's gates are that carrier's (or the sweep's) too.
         return _ended(claim, 0, terminal=True)
-    exit_code = _emit_with_gates(launch, claim, state, message, block=False)
+    exit_code = _emit_with_gates(launch, claim, state, message, block=False, owner_closed=True)
     try:
         pending_delivery.mark_sent_ambiguous(
             win.root, win.recipient_key, win.delivery_id, claim_owner=win.claim_owner,
@@ -1525,7 +1560,10 @@ def main() -> int:
     return exit_code
 
 
-def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, *, block: bool) -> int:
+def _emit_with_gates(
+    launch: Launch, claim: ArmClaim, state: str, message: str, *, block: bool,
+    owner_closed: bool = False,
+) -> int:
     """Fold the recipient's open gates into the receipt about to go out, emit
     it, and only then ack them; seal the claim after the emit."""
 
@@ -1534,7 +1572,10 @@ def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, 
     # receipt *displays*. Letting it also decide this claim sealed a timed-out
     # or helper-less wait as `ended`, so the owner -- still open -- could never
     # be re-armed and its completion never woke the session again.
-    terminal = state in TERMINAL_STATES
+    # `attention` is a display class, not proof the owner ended: only a
+    # receipt whose snapshot read the owner row past open/running, or a
+    # readiness helper that proved terminal quiescence, seals `ended`.
+    terminal = state in TERMINAL_STATES and (owner_closed or _owner_closed(message))
     announced: list[str] = []
     gates = _gate_notices(launch, settle="sent-ambiguous", announced=announced)
     if gates:
