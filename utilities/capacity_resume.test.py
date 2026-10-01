@@ -302,6 +302,55 @@ class CapacityResumeTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.calls[0][2:], self.calls[1][2:])
 
+    def claiming_launcher(self, stop_before_claim):
+        """Like `launcher`, but through the real registry claim with a fresh lease nonce."""
+        def run(command, **kwargs):
+            self.calls.append(command)
+            argv = command[2:]
+
+            def value(flag):
+                return argv[argv.index(flag) + 1]
+            aid, prior = value("--attempt-id"), value("--automatic-retry-of")
+            source = self.rows()[prior][1]
+            args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=value("--worktree"),
+                                   route_id="rt-cap", route_node="owner", replacement_input_argv=list(argv))
+            meta = {k: v for k, v in source.items() if k not in {
+                "note", "failure_class", "launch_outcome", "replacement_input_digest", "replacement_family_id",
+                "replacement_attempt_id", "replacement_claim_digest", "replacement_original_attempt_id",
+                "replacement_ordinal", "automatic_retry_of", "log_file", "cleanup_receipt_digest",
+                "launch_started"}}
+            meta.update(attempt_id=aid, automatic_retry_of=prior, log_file=str(self.root / (aid + ".log")),
+                        supervisor_lease_nonce=os.urandom(16).hex())
+            meta.update(D.parse_registry_metadata(R.seal_launch_input(
+                args, source["harness"], Path(value("--prompt-file")).read_text())))
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            row = (stamp + "\topen\t" + str(self.root) + "\t" + str(self.root) + "\ttask\t"
+                   + ",".join(k + "=" + v for k, v in meta.items()))
+            claimed = D.claim_attempt_row(self.jobs, aid, row, launch=not stop_before_claim)
+            if stop_before_claim:
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout"), output="waiting on disk")
+            return subprocess.CompletedProcess(command, 0 if claimed else 73, "child_spawned=1\n", "")
+        return run
+
+    def test_a_launcher_stopped_before_its_claim_relaunches_from_a_newer_release(self):
+        # Cairn rt-bc71ede6fe68be41: the first start after the limit registered the
+        # replacement and its launcher was killed before the claim; the next start
+        # ran from a newer release. It must launch that same attempt.
+        self.set_limit("att-owner", FREE)
+        result = W.start_work(self.route, self.path, self.jobs, run=self.claiming_launcher(True))
+        pending = result["replacement_attention"][0]
+        self.assertEqual(pending["reason"], "replacement-launch-timeout", result)
+        replacement = self.replacement_id()
+        self.assertEqual(self.rows()[replacement][1]["launch_claimed"], "0")
+        with mock.patch.object(R, "ROOT", self.root / "newer-release"):
+            result = W.start_work(self.route, self.path, self.jobs, run=self.claiming_launcher(False))
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual(self.replacement_id(), replacement)
+        self.assertEqual(self.rows()[replacement][1]["launch_claimed"], "1")
+        self.assertEqual(len(self.claims()), 1)
+        sealed = R.launch_input(self.jobs, replacement, self.rows()[replacement][1])
+        self.assertEqual(sealed["launch_home"], str(self.root / "newer-release"))
+
     def test_claim_made_under_an_old_runtime_launches_under_the_installed_one(self):
         self._drift_setup()
         record = R.claim(self.jobs, "att-owner")

@@ -159,8 +159,54 @@ def seal_launch_input(args, harness: str, task: str) -> str:
         'route_node': getattr(args, 'route_node', None) or '',
         'owner_route_id': getattr(getattr(args, 'owner_route_binding', None), 'route_id', ''),
     }
-    _once(_directory(jobs)/'inputs'/(aid+'.json'), payload)
+    path = _directory(jobs)/'inputs'/(aid+'.json')
+    try:
+        _once(path, payload)
+    except DC.DispatchContractError as exc:
+        if exc.reason != 'replacement-record-conflict' or not _reseal_allowed(jobs, aid, path, payload):
+            raise
+        _replace_record(path, payload)
     return ',replacement_input_digest='+_digest(payload)
+
+
+# A later launcher of the same attempt may run from a newer release and resolve
+# afresh (admission still checks that against the source). The work and the
+# permissions it is granted must not change.
+_RESEAL_STABLE_KEYS = ('schema', 'attempt_id', 'harness', 'jobs', 'worktree', 'argv', 'task',
+                       'route_id', 'route_node', 'owner_route_id', 'applied_permissions')
+
+
+def _reseal_allowed(jobs, aid, path, payload):
+    """A launcher stopped before its claim sealed this input; the next one may reseal it."""
+    previous = _read(path)
+    if not previous or any(previous.get(key) != payload.get(key) for key in _RESEAL_STABLE_KEYS):
+        return False
+    rows = []
+    for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
+        fields = line.split('\t')
+        if len(fields) == 6:
+            meta = DC.parse_registry_metadata(fields[5])
+            if meta.get('attempt_id') == aid:
+                rows.append((fields[1], meta))
+    if not rows:
+        return True
+    if len(rows) != 1:
+        return False
+    status, meta = rows[0]
+    return (status == 'open' and meta.get('launch_claimed') == '0'
+            and meta.get('launch_started') != '1' and not meta.get('pid'))
+
+
+def _replace_record(path, value):
+    temporary = path.with_name('.'+path.name+'.'+os.urandom(8).hex()+'.tmp')
+    try:
+        with temporary.open('xb') as handle:
+            handle.write(_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def launch_input(jobs, aid, meta):

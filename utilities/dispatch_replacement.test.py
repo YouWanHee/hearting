@@ -172,6 +172,31 @@ class ReplacementTest(unittest.TestCase):
                          ',replacement_input_digest='+self.meta['replacement_input_digest'])
         with self.assertRaises(D.DispatchContractError):R.seal_launch_input(args,'codex','changed')
 
+    def test_a_never_started_attempt_reseals_its_input_from_a_newer_release(self):
+        # The first launcher sealed the input, registered the row and stopped before
+        # its claim. The next launcher runs from a newer release.
+        args=SimpleNamespace(**vars(self.args));args.attempt_id='att-next'
+        args.replacement_input_argv=['--start','--attempt-id','att-next','--prompt-text','the raw task']
+        first=R.seal_launch_input(args,'codex','the raw task')
+        self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'0',
+                    **D.parse_registry_metadata(first)},'open',append=True)
+        with mock.patch.object(R,'ROOT',Path('/newer/release')):
+            second=R.seal_launch_input(args,'codex','the raw task')
+        self.assertNotEqual(first,second)
+        saved=json.loads((R._directory(self.jobs)/'inputs'/'att-next.json').read_text())
+        self.assertEqual(saved['launch_home'],'/newer/release')
+        self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
+        # Different work, or an attempt that already started, still conflicts.
+        with mock.patch.object(R,'ROOT',Path('/third/release')):
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R.seal_launch_input(args,'codex','changed task')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+        self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'1'},'open',append=True)
+        with mock.patch.object(R,'ROOT',Path('/third/release')):
+            with self.assertRaises(D.DispatchContractError) as caught:
+                R.seal_launch_input(args,'codex','the raw task')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+
     def test_claim_publication_crash_blocks_legacy_retry(self):
         for fail_before_record in [True,False]:
             with self.subTest(before_record=fail_before_record):
