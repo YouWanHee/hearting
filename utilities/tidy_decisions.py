@@ -432,6 +432,11 @@ def main(argv=None) -> int:
     except LockBusy:
         sys.stderr.write("apply lock busy; waiting decisions stay for the next tidy\n")
         return 3
+    if result["written"]:
+        # This child writes through ``mem.write_record`` without ``mem.main()``, so it asks
+        # for the exchange a foreground write owes by the same call ``main()`` makes.
+        with contextlib.suppress(Exception):
+            load_mem()._exchange_after_command()
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if not result["kept"] else 1
 

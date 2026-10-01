@@ -143,6 +143,19 @@ class TwoPathsTest(unittest.TestCase):
         self.assertIn("대화 기록의 질문 도구", body)       # the first writer's text stands; no overwrite
         self.assertNotIn("메모", body)
 
+    def test_a_drain_that_wrote_asks_for_the_background_exchange_like_any_foreground_write(self):
+        """The drain child writes through ``mem.write_record`` without ``mem.main()``, so the
+        exchange a write owes is requested by the same ``_exchange_after_command`` call."""
+        fake_mem = mock.Mock()
+        for written, calls in ((1, 1), (0, 0)):
+            fake_mem.reset_mock()
+            result = {"written": written, "skipped": 0, "kept": 0, "ids": []}
+            with self.iso.patched_environ(), mock.patch.object(td, "drain_pending", return_value=result), \
+                 mock.patch.object(td, "load_mem", return_value=fake_mem), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(td.main(["drain", "--cwd", str(self.proj)]), 0)
+            self.assertEqual(fake_mem._exchange_after_command.call_count, calls)
+
 
 WF = load("workflow_supervisor_fixture", HERE / "workflow_supervisor.test.py")
 SUP = WF.SUP

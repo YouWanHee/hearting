@@ -53,6 +53,15 @@ class IsolationHelperTest(unittest.TestCase):
         setting = Path(self.iso.env()["XDG_CONFIG_HOME"]) / "hearting" / "memory-sync.json"
         self.assertEqual(json.loads(setting.read_text(encoding="utf-8")), {"enabled": False})
 
+    def test_background_exchange_is_pinned_off_unless_a_test_turns_it_on_by_name(self):
+        self.assertEqual(self.iso.env()["MEM_EXCHANGE_AUTO"], "0")
+        self.assertEqual(self.iso.env({"MEM_EXCHANGE_AUTO": "inline"})["MEM_EXCHANGE_AUTO"], "inline")
+        with self.assertRaises(IsolationError):       # an ambient value never gets through
+            self.iso.assert_env(dict(self.iso.base_env(), MEM_EXCHANGE_AUTO="inline"))
+        with self.assertRaises(IsolationError):
+            self.iso.assert_env(dict(self.iso.base_env(), MEM_EXCHANGE_WINDOW_SECONDS="0"))
+        self.assertNotIn("MEM_EXCHANGE_WORKER", scrub({"MEM_EXCHANGE_WORKER": "1", "HOME": "/x"}))
+
     def test_child_env_drops_remote_pane_worker_and_session_markers(self):
         dirty = {
             "MEM_SYNC_REMOTE": "git@example.invalid:x.git", "MEM_DUMP_PUSH": "1",

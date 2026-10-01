@@ -17,7 +17,8 @@ Two ways to use it:
 
 ``iso.env(extra)`` is the whole child environment: nothing is inherited except
 PATH (minus entries under the real home), LANG/LC_ALL/TZ.  Worker markers,
-``HERDR_*``, ``MEM_SYNC_*`` and ``MEM_DUMP_PUSH`` therefore never leak in; a test
+``HERDR_*``, ``MEM_SYNC_*``, ``MEM_EXCHANGE_*`` and ``MEM_DUMP_PUSH`` therefore never
+leak in (``MEM_EXCHANGE_AUTO=0`` is pinned, so no background exchange starts); a test
 that needs one passes it through ``extra`` on purpose.
 """
 
@@ -45,6 +46,7 @@ PASSTHROUGH_KEYS = ("LANG", "LC_ALL", "TZ")
 # Removed from any environment handed to a child, whatever a caller passes in.
 STRIPPED_PREFIXES = (
     "MEM_SYNC_",
+    "MEM_EXCHANGE_",
     "HERDR_",
     "AGENT_DISPATCH_",
     "OPENCODE_DISPATCH",
@@ -156,6 +158,9 @@ class IsolatedEnv:
             "CLAUDE_CONFIG_DIR": str(self.claude_dir),
             "OPENCODE_DB": str(self.opencode_db),
             "PYTHONDONTWRITEBYTECODE": "1",
+            # Same pin as tools/memory/test-isolation.sh: no detached exchange worker is
+            # spawned by a write or read made inside a test.
+            "MEM_EXCHANGE_AUTO": "0",
         }
         path = _safe_path(os.environ.get("PATH", ""))
         env["PATH"] = path or "/usr/local/bin:/usr/bin:/bin"
@@ -187,6 +192,12 @@ class IsolatedEnv:
         for key, value in env.items():
             if key in allow or key in ISOLATED_PATH_KEYS or key in ("PATH", "PYTHONDONTWRITEBYTECODE"):
                 continue
+            if key == "MEM_EXCHANGE_AUTO":
+                if value.strip().lower() not in ("0", "off", "false", "no"):
+                    raise IsolationError("MEM_EXCHANGE_AUTO would start a background exchange")
+                continue
+            if key.startswith("MEM_EXCHANGE_"):
+                raise IsolationError(f"{key} would steer a background exchange")
             if key.startswith("MEM_SYNC_") or key == "MEM_DUMP_PUSH":
                 raise IsolationError(f"{key} would reach a real remote")
             if key.startswith("HERDR_"):
