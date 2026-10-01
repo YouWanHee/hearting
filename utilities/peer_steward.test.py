@@ -1734,5 +1734,259 @@ class CurrentSessionIdentityDelegationTest(unittest.TestCase):
             self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
 
 
+# --- clear (session-tidy auto-clear) ---------------------------------------------------
+
+RULE = "─" * 40
+CLAUDE_EMPTY = "\x1b[0m\x1b[38;2;80;80;80m❯ \x1b[0m\x1b[38;2;255;255;255m[earlier message]\x1b[0m\n\n" \
+    + RULE + "\n❯ \r\n" + RULE + "\n  \U0001f4c1 proj │ main\n  bypass permissions on\n"
+CLAUDE_SUGGESTION = "❯ earlier\n\n" + RULE + "\n❯ \x1b[2mrun the tests again\x1b[0m\n" + RULE + "\n  footer\n"
+CLAUDE_DRAFT = "❯ earlier\n\n" + RULE + "\n❯ half typed text\n" + RULE + "\n  footer\n"
+CLAUDE_DRAFT_SECOND_LINE = RULE + "\n❯ \x1b[2m\x1b[0m\n  second line of a draft\n" + RULE + "\n  footer\n"
+CLAUDE_FORM = "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n"
+CODEX_EMPTY = "recap line\n\n\n\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n  proj · master · Context 85% used\n"
+CODEX_DRAFT = "recap line\n\x1b[1m›\x1b[0m fix the flaky test\n\n  proj · master\n"
+CODEX_POPUP = "recap line\n\x1b[1m›\x1b[0m \n  /clear   start a new chat\n  /compact summarize\n"
+OPENCODE_EMPTY = "     ▣  Build · Model · 46m\n\n  ┃\n  ┃\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n   /path/to/project\n"
+OPENCODE_WIDE_EMPTY = "     \u25a3  Build \u00b7 Model\n\n  \u2503" + " " * 60 + "\n  \u2503" + " " * 60 + "\n  \u2503" + " " * 120 + "/path/to/project:\n  \u2503  Build \u00b7 Model OpenCode Go" + " " * 80 + "main\n  \u2579\u2580\u2580\u2580\u2580\u2580\n"
+OPENCODE_DRAFT = "     ▣  Build · Model\n\n  ┃  hello there\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
+OPENCODE_HOME = "\n\n  ┃  Ask anything... \"Fix broken tests\"\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
+NO_BOX = "just some output\nwith no prompt box at all\n"
+
+
+class _ClearWorld:
+    """A fake herdr: one pane whose agent record and visible screen change as the test says."""
+
+    def __init__(self, harness="claude", sid="sid-A", status="idle", pane="w1:pX", screens=None,
+                 new_sid="sid-B", home_after=None):
+        self.harness, self.sid, self.status, self.pane = harness, sid, status, pane
+        self.screens = list(screens or [CLAUDE_EMPTY])
+        self.new_sid, self.home_after = new_sid, home_after
+        self.sent = False
+        self.calls = []
+        self.prompt_rc = 0
+        self.reads = 0
+
+    def agent(self):
+        sid = self.new_sid if (self.sent and self.new_sid) else self.sid
+        return {"agent": self.harness, "agent_status": self.status, "name": "w", "pane_id": self.pane,
+                "agent_session": ({"agent": self.harness, "kind": "id", "value": sid}
+                                  if self.harness != "opencode" else None)}
+
+    def run(self, argv, **kw):
+        self.calls.append(list(argv))
+        if argv[:3] == ["herdr", "agent", "get"] or argv[:3] == ["herdr", "agent", "wait"]:
+            return _herdr_json({"id": "x", "result": {"agent": self.agent(), "type": "agent_info"}})
+        if argv[:3] == ["herdr", "agent", "read"]:
+            if self.sent and self.home_after is not None:
+                screen = self.home_after
+            else:
+                screen = self.screens[min(self.reads, len(self.screens) - 1)]
+                self.reads += 1
+            return subprocess.CompletedProcess(argv, 0 if screen is not None else 1,
+                                               stdout=screen or "", stderr="")
+        if argv[:3] == ["herdr", "agent", "prompt"]:
+            if self.prompt_rc == 0:
+                self.sent = True
+            return subprocess.CompletedProcess(argv, self.prompt_rc, stdout="{}", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    def typed(self):
+        return [c for c in self.calls if c[:3] in (["herdr", "agent", "prompt"], ["herdr", "agent", "send-keys"])]
+
+
+class ClearTest(_TmpRootMixin, unittest.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        import session_tidy as st
+        import session_tidy_clear as clear
+        self.st, self.clear = st, clear
+        self.seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "claude", "")
+        self.path = clear.reservation_path(self.seat.key)
+
+    def book(self, harness="claude", sid="sid-A", pane="w1:pX", seq=0, deadline_in=600):
+        st, clear = self.st, self.clear
+        seat = st.Seat("pane", st._digest("pane", pane), pane, harness, "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, harness, sid, "card body", prompt_seq=seq)
+            clear._write_reservation({
+                "schema": 1, "nonce": "n0nce", "status": "reserved", "created": now, "deadline": now + deadline_in,
+                "seat": {"kind": "pane", "key": seat.key, "pane": pane, "harness": harness, "project_key": ""},
+                "harness": harness, "sid": sid, "cwd": str(self.tmp_root),
+                "card_generation": card["generation"], "prompt_seq": seq})
+        self.path = clear.reservation_path(seat.key)
+        return seat
+
+    def clear_cmd(self, world, nonce="n0nce", extra=()):
+        argv = ["clear", world.pane, "--request", str(self.path), *( ["--nonce", nonce] if nonce else [] ), *extra]
+        printed = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(argv)
+        return rc, (printed[-1] if printed else "")
+
+    def rows(self):
+        return [r for r in self._all_records() if r.get("kind") == "notice"]
+
+    # -- success ------------------------------------------------------------------------
+
+    def test_an_idle_claude_with_an_empty_box_gets_exactly_one_clear_and_it_is_true(self):
+        self.book()
+        world = _ClearWorld(screens=[CLAUDE_EMPTY])
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("cleared=true", line)
+        self.assertIn("old_session=sid-A", line)
+        self.assertIn("new_session=sid-B", line)
+        prompts = [c for c in world.calls if c[:3] == ["herdr", "agent", "prompt"]]
+        self.assertEqual(prompts, [["herdr", "agent", "prompt", "w1:pX", "/clear"]])   # no trailer, no wait
+        self.assertEqual([c for c in world.calls if c[:3] == ["herdr", "agent", "send-keys"]], [])
+
+    def test_a_claude_suggestion_is_an_empty_box_but_typed_text_is_not(self):
+        for screen, expect in ((CLAUDE_SUGGESTION, "cleared=true"), (CLAUDE_DRAFT, "reason=draft"),
+                               (CLAUDE_DRAFT_SECOND_LINE, "reason=draft")):
+            with self.subTest(screen=screen[:30]):
+                self.book()
+                world = _ClearWorld(screens=[screen])
+                rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                self.assertEqual(rc, 0 if expect == "cleared=true" else 3)
+                self.assertEqual(len(world.typed()), 1 if rc == 0 else 0)
+
+    def test_codex_placeholder_is_empty_a_draft_or_a_popup_is_not(self):
+        for screen, expect in ((CODEX_EMPTY, "cleared=true"), (CODEX_DRAFT, "reason=draft"),
+                               (CODEX_POPUP, "reason=draft-unknown")):
+            with self.subTest(screen=screen[:40]):
+                self.book(harness="codex", sid="thr-A")
+                world = _ClearWorld(harness="codex", sid="thr-A", screens=[screen], new_sid="thr-B")
+                rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                self.assertEqual(len(world.typed()), 1 if expect == "cleared=true" else 0)
+
+    def test_opencode_types_new_and_the_home_screen_is_the_proof(self):
+        self.book(harness="opencode", sid="ses_A")
+        world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
+                            home_after=OPENCODE_HOME)
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "cleared=true" in line), (0, True), line)
+        self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "/new"]])
+        for screen, reason in ((OPENCODE_DRAFT, "draft"), (NO_BOX, "draft-unknown")):
+            self.book(harness="opencode", sid="ses_A")
+            world = _ClearWorld(harness="opencode", sid="ses_A", screens=[screen], new_sid=None)
+            rc, line = self.clear_cmd(world)
+            self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
+
+    # -- doubt is "not cleared": zero input ---------------------------------------------------
+
+    def test_working_blocked_unreadable_and_form_screens_get_no_input(self):
+        cases = (({"status": "working"}, "not-idle-working"), ({"status": "blocked"}, "form-open"),
+                 ({"status": "unknown"}, "not-idle-unknown"), ({"screens": [None]}, "screen-unknown"),
+                 ({"screens": [CLAUDE_FORM]}, "form-open"), ({"screens": [NO_BOX]}, "draft-unknown"))
+        for kwargs, reason in cases:
+            with self.subTest(reason=reason):
+                self.book()
+                world = _ClearWorld(**kwargs)
+                rc, line = self.clear_cmd(world)
+                self.assertEqual(rc, 3, line)
+                self.assertIn(f"reason={reason}", line)
+                self.assertEqual(world.typed(), [])
+
+    def test_a_draft_that_appears_between_the_two_looks_is_never_typed_over(self):
+        self.book()
+        world = _ClearWorld(screens=[CLAUDE_EMPTY, CLAUDE_DRAFT])      # the user starts typing after look 1
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=draft" in line, world.typed()), (3, True, []), line)
+
+    def test_a_new_request_expiry_a_stale_nonce_or_a_finished_booking_get_no_input(self):
+        seat = self.book(seq=0)
+        with self.st.seat_lock(seat.key):
+            self.st.bump_prompt_seq(seat, "claude", "sid-A", time.time())
+        world = _ClearWorld()
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=new-input" in line), (3, True))
+        self.book(deadline_in=-5)
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=expired" in line), (3, True))
+        self.book()
+        rc, line = self.clear_cmd(world, nonce="another")
+        self.assertEqual((rc, "reason=superseded" in line), (3, True))
+        self.assertEqual(world.typed(), [])
+        self.assertEqual(self.rows(), [])                               # a dead request leaves no ledger row
+
+    def test_the_target_must_be_the_booked_pane_harness_and_session(self):
+        for kwargs, label in (({"harness": "codex"}, "harness"), ({"sid": "someone-else"}, "session")):
+            with self.subTest(label):
+                self.book()
+                world = _ClearWorld(**kwargs)
+                rc, line = self.clear_cmd(world)
+                self.assertEqual((rc, "reason=target-changed" in line, world.typed()), (3, True, []), line)
+        self.book()
+        world = _ClearWorld()
+        world.pane = "w9:pZ"
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=target-changed" in line), (3, True))
+
+    # -- after the send: never a second one -------------------------------------------------
+
+    def test_a_send_that_cannot_be_confirmed_is_unverified_and_nothing_else_is_typed(self):
+        self.book()
+        world = _ClearWorld(new_sid=None)                               # herdr keeps the old id, no hook note
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 5, line)
+        self.assertIn("cleared=unverified", line)
+        self.assertEqual(len(world.typed()), 1)                         # one /clear, no Enter retry, no resend
+
+    def test_the_start_hook_note_alone_proves_the_new_conversation(self):
+        seat = self.book()
+        world = _ClearWorld(new_sid=None)
+        original = world.run
+
+        def run(argv, **kw):
+            result = original(argv, **kw)
+            if argv[:3] == ["herdr", "agent", "prompt"]:               # the new session's start hook fires
+                with self.st.seat_lock(seat.key):
+                    self.clear.note_start_locked(seat, "claude", "sid-NEW", time.time() + 1)
+            return result
+        world.run = run
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "new_session=sid-NEW" in line), (0, True), line)
+
+    def test_a_failing_herdr_prompt_is_failed_and_herdr_missing_is_failed(self):
+        self.book()
+        world = _ClearWorld()
+        world.prompt_rc = 1
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "cleared=failed" in line), (1, True), line)
+        printed = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value=None), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(["clear", "w1:pX", "--request", str(self.path)])
+        self.assertEqual((rc, printed[-1]), (1, "cleared=failed reason=herdr-not-found"))
+
+    def test_every_judged_call_leaves_one_notice_ledger_row_with_the_action(self):
+        self.book()
+        self.clear_cmd(_ClearWorld(screens=[CLAUDE_DRAFT]))
+        self.book()
+        self.clear_cmd(_ClearWorld(screens=[CLAUDE_EMPTY]))
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["kind"] == "notice" and "action=clear" in r["delivery"]["receipt"] for r in rows))
+        self.assertIn("cleared=skipped", rows[0]["delivery"]["receipt"])
+        self.assertIn("cleared=true", rows[1]["delivery"]["receipt"])
+        self.assertEqual((rows[1]["to"]["pane"], rows[1]["from"]["session_id"]), ("w1:pX", "sid-A"))
+
+    def test_the_screen_reader_decides_from_layout_not_from_wishful_text(self):
+        lines = peer_steward._screen_lines
+        draft = peer_steward._draft_state
+        self.assertEqual(draft("claude", lines(CLAUDE_EMPTY)), "empty")
+        self.assertEqual(draft("claude", lines(RULE + "\n❯ typed\n")), "nonempty")   # no closing rule: still a draft
+        self.assertEqual(draft("claude", lines(RULE + "\n❯\n")), "unknown")           # box never closes: unknown
+        self.assertEqual(draft("codex", lines("›\n")), "empty")
+        self.assertEqual(draft("opencode", lines("  ┃  just text\n")), "unknown")      # a single bar line is no box
+        self.assertEqual(draft("unheard-of", lines(CLAUDE_EMPTY)), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()

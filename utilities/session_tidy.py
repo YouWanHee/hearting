@@ -14,9 +14,11 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py status [--json] [--cwd D]
         Print where the state lives and what is waiting.
 
-    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D]
+    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D] [--no-clear]
         Queue the memory tidy and return at once (one line); the detached runner
-        ``session_tidy_runner.py`` does the work and leaves a result notice.
+        ``session_tidy_runner.py`` does the work and leaves a result notice.  Inside
+        herdr it also books the window's auto-clear (``session_tidy_clear.py``);
+        ``--no-clear`` keeps the window and cancels a pending booking.
     session_tidy.py handoff <target> [--harness H] [--session-id S] [--cwd D]
         Deliver this seat's card to a peer session through ``peer-steward.py prompt``
         and report its typed verdict (``prompted=...``) and exit code on one line.
@@ -31,6 +33,8 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
     reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
     notices/<seat>.json     result lines waiting for the next start/prompt
     locks/<seat>.lock       flock for the read-modify-write above
+    prompt-seq/<seat>.json  count of real prompts submitted at the seat (card/enqueue compare it)
+    clear/<seat>.json       the one pending auto-clear reservation (``session_tidy_clear.py``)
     watermarks/  decisions/pending/  runs/  queue/  runner.lock   (other slices)
 
 The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project.
@@ -424,7 +428,7 @@ def read_latest_card(seat: Seat) -> Optional[dict]:
 
 
 def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
-               now: Optional[float] = None) -> dict:
+               now: Optional[float] = None, prompt_seq: Optional[int] = None) -> dict:
     """Write the seat's newest card (caller holds the seat lock)."""
     now = now_epoch() if now is None else now
     body = sanitize_body(body)
@@ -441,6 +445,8 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
         "cwd": cwd,
         "body": body,
     }
+    if prompt_seq is not None:
+        card["prompt_seq"] = int(prompt_seq)    # lets enqueue notice a prompt typed after the card
     if previous:
         history = ensure_dir(state_root() / "card-history" / seat.key)
         atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
@@ -471,6 +477,32 @@ def _reread_path(harness: str, sid: str) -> Path:
 
 def _notices_path(seat: Seat) -> Path:
     return state_root() / "notices" / f"{seat.key}.json"
+
+
+def _prompt_seq_path(seat: Seat) -> Path:
+    return state_root() / "prompt-seq" / f"{seat.key}.json"
+
+
+def read_prompt_seq(seat: Seat) -> int:
+    """How many real prompts were submitted at this seat (0 before the first one)."""
+    data = read_json(_prompt_seq_path(seat))
+    try:
+        return max(0, int(data.get("seq", 0))) if isinstance(data, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_prompt_seq(seat: Seat, harness: str, sid: str, now: float) -> int:
+    """Count one real prompt (caller holds the seat lock).
+
+    A file of its own, written for every prompt: the ledger throttles prompt lines and
+    folds old ones, and neither may lose a request that decides whether the window is
+    still safe to clear.
+    """
+    seq = read_prompt_seq(seat) + 1
+    atomic_write_json(_prompt_seq_path(seat), {"schema": SCHEMA, "seq": seq, "at": now,
+                                              "harness": harness, "sid": sid})
+    return seq
 
 
 def write_notice(seat: Seat, text: str, *, author_harness: str = "", author_sid: str = "",
@@ -576,6 +608,8 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if text and emit:
                 emit(text)
             return text
+        if event == "prompt":
+            bump_prompt_seq(seat, harness, sid, now)
         prior = session_summary(seat).get((harness, sid))
         # SessionStart(source=compact) and a separate compact event describe the same
         # compaction; count it once.
@@ -585,6 +619,10 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                            cwd=cwd, now=now, bump_epoch=compacting)
         if event == "compact":
             return ""
+        if event == "start" and seat.kind == "pane":
+            with contextlib.suppress(BaseException):    # a hook never fails for the clear note
+                import session_tidy_clear
+                session_tidy_clear.note_start_locked(seat, harness, sid, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
         notices = pending_notices(seat, harness, sid, now=now)
@@ -692,7 +730,7 @@ def cmd_card(args) -> int:
     seat, harness, sid = caller
     with seat_lock(seat.key):
         record_event(seat, harness, sid, "card", cwd=cwd)
-        write_card(seat, harness, sid, body, cwd=cwd)
+        write_card(seat, harness, sid, body, cwd=cwd, prompt_seq=read_prompt_seq(seat))
     print(f"card={card_text_path(seat)} seat={seat.key}")
     return 0
 
@@ -709,8 +747,13 @@ def cmd_enqueue(args) -> int:
     seat, harness, sid = caller
     import session_tidy_runner as runner
     transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
+    import session_tidy_clear as clear
     item = runner.enqueue_item(seat, harness, sid, cwd, transcript)
-    print(f"enqueue={item['id']} seat={seat.key} status=queued")
+    try:
+        booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=bool(args.no_clear))
+    except BaseException as exc:  # noqa: BLE001 - the tidy is queued; the window is left alone
+        booked = f"clear=manual reason=internal-{type(exc).__name__} hint={clear.CLEAR_COMMAND.get(harness, '/clear')}"
+    print(f"enqueue={item['id']} seat={seat.key} status=queued {booked}")
     return 0
 
 
@@ -801,6 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--harness", choices=HARNESSES)
     enqueue.add_argument("--session-id")
     enqueue.add_argument("--cwd")
+    enqueue.add_argument("--no-clear", action="store_true",
+                         help="keep this window: no auto-clear (cancels a pending one)")
     enqueue.set_defaults(func=cmd_enqueue)
     handoff = sub.add_parser("handoff", help="deliver this seat's card to a peer session")
     handoff.add_argument("target")

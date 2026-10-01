@@ -1,5 +1,5 @@
 ---
-description: "Run the portable session-tidy capability through the OpenCode adapter. Meaning: Write a handoff card; tidy memory."
+description: "Run the portable session-tidy capability through the OpenCode adapter. Meaning: Write a handoff card; tidy memory; clear the window."
 ---
 
 Use the OpenCode adapter realization of portable capability `session-tidy`.
@@ -16,11 +16,11 @@ This is adapter-owned output generated from `capabilities/session-tidy.md`, not 
 4. Before spec-changing work, run
    `adapters/opencode/bin/preflight.sh capability session-tidy [cwd] [session-id]`.
 5. If the command receives arguments, map them to the portable argument shape:
-   `[정리] | 인계 <받을 세션>`.
+   `[정리] | 정리만 | 인계 <받을 세션>`.
 
 Portable contract excerpt:
 
-- Invocation semantics: The calling main session writes its own handoff card (`utilities/session_tidy.py card`), then `enqueue` returns at once while a detached runner (`utilities/session_tidy_runner.py`) starts one registered memory worker (`ops/session-tidy-memory`), applies its closed `add`/`supersede`/`reinforce` proposal through `mem tidy-apply`, and leaves one result line (with the undo command) for the seat's next session. `handoff <target>` delivers the card to a peer session through `utilities/peer-steward.py prompt` only and reports its typed verdict. There is no required input and no confirmation step; a failure keeps the card and the watermarks unchanged and leaves one warning line, which counts any writes that had landed or may have landed and then carries the undo command. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
+- Invocation semantics: The calling main session writes its own handoff card (`utilities/session_tidy.py card`), then `enqueue` returns at once while a detached runner (`utilities/session_tidy_runner.py`) starts one registered memory worker (`ops/session-tidy-memory`), applies its closed `add`/`supersede`/`reinforce` proposal through `mem tidy-apply`, and leaves one result line (with the undo command) for the seat's next session. `handoff <target>` delivers the card to a peer session through `utilities/peer-steward.py prompt` only and reports its typed verdict. There is no required input and no confirmation step; a failure keeps the card and the watermarks unchanged and leaves one warning line, which counts any writes that had landed or may have landed and then carries the undo command. Clearing is part of the default flow. Inside herdr, `enqueue` also books the calling window's clear (`utilities/session_tidy_clear.py`, a detached helper that never waits for the memory tidy): once the turn has ended and the window is idle, `utilities/peer-steward.py clear` types the harness's own new-conversation command once (Claude `/clear`, Codex `/clear`, OpenCode `/new`), only when no prompt was submitted after the card, no form is open and the input box reads as empty. Anything it cannot decide leaves the window alone and one result line (`cleared=true|skipped|failed|unverified`; a success is silent). `정리만` (`enqueue --no-clear`) keeps the window and cancels a pending booking. Outside herdr the session prints the harness's manual command instead (Claude `/clear`, Codex `/clear`, OpenCode `/new`). A handoff clears only the calling window, never the target, and its failure is separate from the clear. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
 User arguments from OpenCode: `$ARGUMENTS`

@@ -158,6 +158,39 @@ FAKE_STEWARD = textwrap.dedent('''\
     ''')
 
 
+FAKE_HERDR = textwrap.dedent('''\
+    #!{python}
+    import json, os, pathlib, sys, time
+    root = pathlib.Path(os.environ["FAKE_ROOT"])
+    args = sys.argv[1:]
+    with open(root / "herdr.jsonl", "a") as handle:
+        handle.write(json.dumps(args) + "\\n")
+    gate = root / "idle-gate"
+    deadline = time.time() + 60
+    while (root / "hold-idle").exists() and not gate.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    state = os.environ.get("FAKE_PANE_STATE", "idle")
+    if state == "timeout":
+        sys.stderr.write(json.dumps({{"error": {{"code": "timeout"}}}}))
+        sys.exit(1)
+    print(json.dumps({{"result": {{"agent": {{"agent": "claude", "agent_status": state, "pane_id": args[2]}}}}}}))
+    ''')
+
+FAKE_CLEAR_STEWARD = textwrap.dedent('''\
+    #!{python}
+    import json, os, pathlib, sys
+    root = pathlib.Path(os.environ["FAKE_ROOT"])
+    args = sys.argv[1:]
+    with open(root / "clear.jsonl", "a") as handle:
+        handle.write(json.dumps({{"argv": args}}) + "\\n")
+    verdict = os.environ.get("FAKE_CLEAR_VERDICT", "true")
+    exits = {{"true": 0, "skipped": 3, "failed": 1, "unverified": 5}}
+    extra = " new_session=sid-NEW" if verdict == "true" else " reason=draft"
+    print("cleared=" + verdict + " target=" + args[1] + extra)
+    sys.exit(exits[verdict])
+    ''')
+
+
 def jsonl(path: Path, rows) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
 
@@ -255,7 +288,7 @@ class RunnerCase(unittest.TestCase):
         result = self.cli("enqueue", "--harness", "claude", "--session-id", sid, **more)
         self.assertEqual(result.returncode, 0, result.stderr)
         line = result.stdout.strip()
-        self.assertRegex(line, r"^enqueue=tidy-\d{14}-[0-9a-f]{6} seat=[0-9a-f]+ status=queued$")
+        self.assertRegex(line, r"^enqueue=tidy-\d{14}-[0-9a-f]{6} seat=[0-9a-f]+ status=queued clear=manual hint=/clear$")
         return line.split()[0].split("=", 1)[1]
 
     def item(self, qid):
@@ -423,6 +456,121 @@ class EnqueueTest(RunnerCase):
         self.wait_status(qid, "notified")
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.notices(), ["[정리] 새로 정리할 대화가 없습니다."])
+
+
+class AutoClearTest(RunnerCase):
+    """``enqueue`` inside herdr: the memory runner and the clear helper are two detached
+    processes that never wait for each other (fake herdr and fake ``peer-steward.py clear``)."""
+
+    def setUp(self):
+        super().setUp()
+        self.herdr_cmd = self.fake / "bin" / "herdr.py"
+        self.herdr_cmd.write_text(FAKE_HERDR.format(python=sys.executable), encoding="utf-8")
+        self.clear_cmd = self.fake / "bin" / "clear.py"
+        self.clear_cmd.write_text(FAKE_CLEAR_STEWARD.format(python=sys.executable), encoding="utf-8")
+        for path in (self.herdr_cmd, self.clear_cmd):
+            path.chmod(0o755)
+
+    def env(self, **more):
+        env = super().env(HEARTING_TIDY_HERDR=str(self.herdr_cmd), HEARTING_TIDY_PEER_STEWARD=str(self.clear_cmd))
+        env.update(more)
+        return env
+
+    def enqueue_line(self, sid, *flags, **more):
+        result = self.cli("enqueue", "--harness", "claude", "--session-id", sid, *flags, **more)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def reservation(self):
+        files = list((self.state / "clear").glob("*.json")) if (self.state / "clear").is_dir() else []
+        return st.read_json(files[0]) if files else None
+
+    def steps(self, name):
+        path = self.fake / name
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+    def helper_gone(self):
+        res = self.reservation()
+        pid = (res or {}).get("helper", {}).get("pid")
+        return bool(pid) and not alive(pid)
+
+    def test_one_enqueue_starts_both_detached_processes_and_the_window_is_cleared_silently(self):
+        shutil.copy(FIXTURES / "claude-choice.jsonl", self.projects / f"{CHOICE_SID}.jsonl")
+        self.scenario([{"mode": "ok", "gate": self.gate(), "actions": []}])
+        (self.fake / "hold-idle").write_text("x", encoding="utf-8")        # the turn has not ended yet
+        line = self.enqueue_line(CHOICE_SID)
+        self.assertRegex(line, r"^enqueue=tidy-\d{14}-[0-9a-f]{6} seat=[0-9a-f]+ status=queued clear=scheduled$")
+        qid = line.split()[0].split("=", 1)[1]
+        self.wait_for(lambda: (self.reservation() or {}).get("helper", {}).get("pid"), "the helper to register")
+        self.wait_status(qid, "waiting-worker")                            # the tidy runs while the window waits
+        self.assertEqual(self.reservation()["status"], "reserved")
+        self.assertEqual(self.steps("clear.jsonl"), [])                    # nothing is typed before idle
+        (self.fake / "idle-gate").write_text("go", encoding="utf-8")       # the turn ended: idle
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "cleared", "the clear")
+        # the memory worker is still held: the clear did not wait for it
+        self.assertNotIn(self.item(qid)["status"], ("notified", "failed"))
+        calls = self.steps("clear.jsonl")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual((argv[0], argv[1]), ("clear", PANE))
+        self.assertEqual(argv[argv.index("--request") + 1], str(self.state / "clear" / f"{self.item(qid)['seat']['key']}.json"))
+        self.assertEqual(argv[argv.index("--nonce") + 1], self.reservation()["nonce"])
+        self.open_gate()
+        self.wait_status(qid, "notified")
+        self.assertEqual(len(self.notices()), 1, self.notices())           # only the memory line: the clear was silent
+        self.wait_for(self.helper_gone, "the helper to exit")
+
+    def test_no_clear_starts_no_helper_and_cancels_a_pending_booking(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        (self.fake / "hold-idle").write_text("x", encoding="utf-8")
+        self.assertTrue(self.enqueue_line("sid-A").endswith("clear=scheduled"))
+        self.wait_for(lambda: (self.reservation() or {}).get("helper", {}).get("pid"), "the helper to register")
+        pid = self.reservation()["helper"]["pid"]
+        line = self.enqueue_line("sid-A", "--no-clear")
+        self.assertTrue(line.endswith("status=queued clear=off"), line)
+        self.assertIsNone(self.reservation())
+        (self.fake / "idle-gate").write_text("go", encoding="utf-8")       # the first helper wakes and finds nothing
+        self.wait_for(lambda: not alive(pid), "the cancelled helper to exit")
+        self.assertEqual(self.steps("clear.jsonl"), [])
+        self.assertEqual([n for n in self.notices() if "비우" in n], [])
+
+    def test_a_newer_enqueue_replaces_the_booking_and_only_the_new_helper_types(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        (self.fake / "hold-idle").write_text("x", encoding="utf-8")
+        self.enqueue_line("sid-A")
+        self.wait_for(lambda: (self.reservation() or {}).get("helper", {}).get("pid"), "the first helper")
+        first = self.reservation()
+        self.enqueue_line("sid-A")
+        self.wait_for(lambda: (self.reservation() or {}).get("nonce") != first["nonce"]
+                      and (self.reservation() or {}).get("helper", {}).get("pid"), "the second helper")
+        (self.fake / "idle-gate").write_text("go", encoding="utf-8")
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "cleared", "the clear")
+        self.wait_for(lambda: not alive(first["helper"]["pid"]), "the replaced helper to exit")
+        self.assertEqual(len(self.steps("clear.jsonl")), 1)                 # one clear, not two
+
+    def test_a_window_that_cannot_be_cleared_gets_one_line_and_is_never_retried(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        line = self.enqueue_line("sid-A", FAKE_CLEAR_VERDICT="skipped")
+        self.assertTrue(line.endswith("clear=scheduled"), line)
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "skipped", "the skip")
+        self.wait_for(lambda: any("입력창" in n for n in self.notices()), "the one result line")
+        self.assertEqual(len(self.steps("clear.jsonl")), 1)
+        self.assertEqual(len([n for n in self.notices() if "자동으로 비우지 않았습니다" in n]), 1)
+
+    def test_a_window_that_never_goes_idle_times_out_with_one_line_and_no_input(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        self.enqueue_line("sid-A", FAKE_PANE_STATE="timeout")
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "skipped", "the timeout")
+        self.assertEqual(self.steps("clear.jsonl"), [])
+        self.wait_for(lambda: any("10분" in n for n in self.notices()), "the one result line")
+
+    def test_the_helper_is_not_started_for_a_worker_or_outside_herdr(self):
+        result = self.cli("enqueue", "--harness", "claude", "--session-id", "sid-A", AGENT_SESSION_ROLE="worker")
+        self.assertEqual(result.stdout.strip(), "enqueue=none reason=worker")
+        no_pane = self.iso.run([sys.executable, TIDY, "enqueue", "--harness", "codex", "--session-id", "sid-C"],
+                               extra={k: v for k, v in self.env().items() if k != "HERDR_PANE_ID"}, cwd=self.cwd)
+        self.assertTrue(no_pane.stdout.strip().endswith("clear=manual hint=/clear"), no_pane.stdout)
+        self.assertFalse((self.state / "clear").exists())
 
 
 class DetachTest(RunnerCase):

@@ -2,25 +2,25 @@
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
 name: session-tidy
 description: "Use when context fills, before compact, on handoff to another session, after a large task, or on request. Not for primary routing or memory writes."
-argument-hint: "[정리] | 인계 <받을 세션>"
+argument-hint: "[정리] | 정리만 | 인계 <받을 세션>"
 metadata:
   group: ops
   fam: ops
   invocation_class: model-support
   modes: []
-  blurb: "Write a handoff card; tidy memory."
+  blurb: "Write a handoff card; tidy memory; clear the window."
   use_when: "Use when context fills, before compact, on handoff to another session, after a large task, or on request."
   not_for: "Not for primary routing or memory writes."
 ---
 
 # session-tidy (정리)
 
-Write the handoff card yourself, queue the memory tidy, and tell the user the session
-can be cleared or closed. Nothing here is required input and nothing waits for a
-confirmation.
+Write the handoff card yourself, queue the memory tidy, and let the window clear itself
+when it is safe. Nothing here is required input and nothing waits for a confirmation.
 
-Modes: `정리` (default) and `인계 <받을 세션>` (same work, then pass the card to a peer
-session). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
+Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 <받을 세션>` (same
+work, then pass the card to a peer session; only this calling window is cleared, never the
+target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
 
 ## Steps
 
@@ -37,10 +37,11 @@ session). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    CARD
    ```
 
-2. **Queue the tidy.** Do not wait for it.
+2. **Queue the tidy.** Do not wait for it. For `정리만` add `--no-clear`.
 
    ```bash
-   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue
+   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue            # 정리 / 인계
+   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue --no-clear # 정리만
    ```
 
    It prints one line and returns. A detached runner reads the conversation after the
@@ -50,16 +51,28 @@ session). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    card as it was and says so in one line; if some writes had landed or may have landed, that
    line counts them and keeps the undo command.
 
-3. **Handoff only.** For `인계 <받을 세션>`:
+   Inside herdr the same call books the window's clear (`clear=scheduled`): once this turn
+   has ended and the window is idle, with no form open and an empty input box, the
+   harness's own new-conversation command is typed once (Claude `/clear`, Codex `/clear`,
+   OpenCode `/new`) and the new session receives the card. It never waits for the memory
+   tidy. A prompt typed after the card cancels it (`clear=skipped`), and anything the helper
+   cannot decide leaves the window as it is plus one result line at the next prompt.
+
+3. **Handoff only.** For `인계 <받을 세션>`, after step 2:
 
    ```bash
    python3 "$AGENT_HOME/utilities/session_tidy.py" handoff <target>
    ```
 
    Report its one line as printed (`prompted=true|failed|queued|unverified` and the exit
-   code); do not retry or send the card any other way.
+   code); do not retry or send the card any other way. A failed handoff does not change the
+   clear of this window; they are separate results.
 
-4. **Report one line:** "이제 /clear 하거나 닫아도 됩니다."
+4. **Report one line**, from the `clear=` word of step 2:
+   `clear=scheduled` → "곧 이 창이 자동으로 비워집니다." (do not start more work after it);
+   `clear=off` → "이 창은 그대로 둡니다. 이제 /clear 하거나 닫아도 됩니다.";
+   `clear=manual hint=<cmd>` or `clear=skipped` → "이제 <cmd> 하거나 닫아도 됩니다."
+   (`<cmd>` is the hint, or `/clear` after `skipped`; OpenCode's is `/new`).
 
 The next session at this seat receives the latest card once, at start or on its first
 prompt, together with any pending result line.
