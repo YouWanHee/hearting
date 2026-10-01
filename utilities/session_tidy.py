@@ -38,6 +38,11 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
     watermarks/  decisions/pending/  runs/  queue/  runner.lock   (other slices)
 
 The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project.
+A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
+pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
+caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
+a ``/clear``), else -- for the first hook after an auto-clear -- the one window waiting for its
+successor.  No match or several -> the project seat, quietly.
 A worker marker is checked before the pane: a worker that inherited its
 supervisor's pane id gets no card, ledger line or notice.
 """
@@ -53,7 +58,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import stat
+import subprocess
 import sys
 import time
 from typing import Callable, Iterator, Optional
@@ -286,9 +293,110 @@ def seat_for_project(harness: str, project_key: str) -> Seat:
     return Seat("project", _digest("project", harness, project_key), "", harness, project_key)
 
 
-def resolve_seat(harness: Optional[str], cwd=None, env=None) -> Seat:
+HERDR_LOOKUP_TIMEOUT_SEC = 2.0      # a hook has a few seconds in total
+
+
+def _herdr_executable() -> Optional[str]:
+    try:
+        import session_tidy_clear
+        return session_tidy_clear.herdr_command()
+    except BaseException:  # noqa: BLE001 - no herdr, no lookup
+        return shutil.which("herdr")
+
+
+def _herdr_codex_agents() -> Optional[list[dict]]:
+    """The Codex entries of ``herdr agent list``; None when herdr cannot be asked (missing, slow,
+    unreadable).  Read-only: nothing is typed or changed."""
+    exe = _herdr_executable()
+    if not exe:
+        return None
+    try:
+        done = subprocess.run([exe, "agent", "list"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=HERDR_LOOKUP_TIMEOUT_SEC)
+        agents = (json.loads(done.stdout or "").get("result") or {}).get("agents")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+    if not isinstance(agents, list):
+        return None
+    return [a for a in agents if isinstance(a, dict) and a.get("agent") == "codex" and a.get("pane_id")]
+
+
+def _agent_session(agent: dict) -> str:
+    session = agent.get("agent_session")
+    return str(session.get("value") or "") if isinstance(session, dict) else ""
+
+
+def _real(path) -> str:
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        return os.path.realpath(str(path))
+    return ""
+
+
+def _pane_seat_of(pane: str) -> Seat:
+    return Seat("pane", _digest("pane", pane), pane, "codex", "")
+
+
+def ledger_precedes(seat: Seat, older: str, newer: str, harness: str = "codex") -> bool:
+    """True when this seat's own ledger saw session ``older`` strictly before session ``newer``."""
+    try:
+        rows = session_summary(seat)
+        a, b = rows.get((harness, older)), rows.get((harness, newer))
+        return bool(a and b and float(a["first_seen"]) < float(b["first_seen"]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _successor_pane(sid: str, agents: list[dict], cwd: str) -> list[str]:
+    """The window whose auto-clear is under way, for the first hook of the session it started.
+
+    herdr keeps showing the cleared session, and the shared daemon gives the TUI no rollout to
+    read, so the new thread cannot be proven.  It is taken only when everything points at one
+    window: exactly one Codex window of herdr works in this directory, its booking is still
+    waiting for the successor, and herdr shows the booked session there or an older one of the seat."""
+    here = [a for a in agents if _real(a.get("foreground_cwd") or a.get("cwd") or "") == _real(cwd)]
+    if len(here) != 1:
+        return []
+    pane = str(here[0]["pane_id"])
+    try:
+        import session_tidy_clear
+        booking = session_tidy_clear.read_reservation(_pane_seat_of(pane).key)
+    except BaseException:  # noqa: BLE001
+        return []
+    ok = bool(booking) and booking.get("harness") == "codex" and booking.get("status") in ("reserved", "unverified") \
+        and booking.get("sid") not in (sid, "") \
+        and (_agent_session(here[0]) == booking.get("sid")
+             or ledger_precedes(_pane_seat_of(pane), _agent_session(here[0]), str(booking.get("sid")))) \
+        and _real(booking.get("cwd") or "") == _real(cwd) \
+        and (booking.get("seat") or {}).get("pane") == pane
+    return [pane] if ok else []
+
+
+def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
+    """The herdr pane of a Codex session that has no ``HERDR_PANE_ID`` -- exactly one, else "".
+
+    In order: the pane whose herdr session is this thread; the pane whose seat ledger already
+    knows this thread (herdr's value can lag a ``/clear`` for good); for the first hook after a
+    clear (``source=clear``) the one window whose auto-clear is waiting for its successor."""
+    if not sid:
+        return ""
+    agents = _herdr_codex_agents()
+    if agents is None:
+        return ""
+    panes = [str(a["pane_id"]) for a in agents if _agent_session(a) == sid]
+    if not panes:
+        panes = [str(a["pane_id"]) for a in agents
+                 if ("codex", sid) in session_summary(_pane_seat_of(str(a["pane_id"])))]
+    if not panes and source == "clear" and cwd:
+        panes = _successor_pane(sid, agents, cwd)
+    return panes[0] if len(set(panes)) == 1 else ""
+
+
+def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] = None,
+                 source: str = "") -> Seat:
     env = os.environ if env is None else env
     pane = (env.get("HERDR_PANE_ID") or "").strip()
+    if not pane and harness == "codex" and sid:
+        pane = codex_pane_for_session(sid, str(cwd or ""), source)
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
     return seat_for_project(harness or "unknown", project_key_for(cwd))
@@ -692,7 +800,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
     if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact"):
         return ""
     now = now_epoch() if now is None else now
-    seat = resolve_seat(harness, cwd or None, env)
+    seat = resolve_seat(harness, cwd or None, env, sid, source)
     with seat_lock(seat.key):
         if reread:
             saved = read_json(_reread_path(harness, sid))
@@ -835,7 +943,7 @@ def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     if not sid:
         harness, sid = session_from_env(harness)
     detected = harness or session_from_env(None)[0]
-    seat = resolve_seat(detected, cwd)
+    seat = resolve_seat(detected, cwd, sid=sid)
     if not sid or not harness:
         ledger_row = latest_session(seat, harness)
         if ledger_row is None and seat.kind == "project" and not detected:
@@ -940,7 +1048,7 @@ def _queue_counts(seat: Seat) -> dict:
 
 def cmd_status(args) -> int:
     harness, sid = session_from_env(None)
-    seat = resolve_seat(harness, args.cwd or os.getcwd())
+    seat = resolve_seat(harness, args.cwd or os.getcwd(), sid=sid)
     card = read_latest_card(seat)
     notices = read_json(_notices_path(seat))
     info = {

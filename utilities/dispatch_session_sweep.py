@@ -156,7 +156,8 @@ def sweep_deliver(
     # that the seat handover bound to it. Those stay stored (and acked) under the registered
     # parent; only the receiving session differs.
     from dispatch_seat_handover import record_for_session, storage_recipients
-    for storage_key, allowed in storage_recipients(session_id):
+    for storage_key, allowed in storage_recipients(
+            session_id, harness="codex" if recipient_kind.startswith("codex") else None):
         try:
             directory = pending_delivery.record_directory(root, storage_key)
             found = sorted(

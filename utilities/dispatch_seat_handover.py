@@ -154,11 +154,15 @@ def _seat_of(key: str, snapshot: Optional[dict] = None):
     return st.Seat("pane", key)
 
 
-def pane_seat(env=None):
-    """The pane seat of this process, or None outside a herdr pane (project seats never hand over)."""
+def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None):
+    """The pane seat of this process, or None outside a herdr pane (project seats never hand over).
+    A Codex session in the shared app-server daemon has no pane variable: its pane is found the way
+    ``session_tidy.resolve_seat`` finds it."""
     st = _st()
     env = os.environ if env is None else env
     pane = (env.get("HERDR_PANE_ID") or "").strip()
+    if not pane and harness == "codex" and sid:
+        pane = st.codex_pane_for_session(sid)
     return st.Seat("pane", st._digest("pane", pane), pane, "", "") if pane else None
 
 
@@ -219,7 +223,7 @@ def _seat_for_binding(jobs, meta: dict):
     return _seat_of(str(hits[0]["seat"].get("key") or ""), hits[0]) if isinstance(hits[0].get("seat"), dict) else None
 
 
-def storage_recipients(session: str, env=None) -> list:
+def storage_recipients(session: str, env=None, harness: Optional[str] = None) -> list:
     """``[(storage key, attempt ids | None)]``: where records addressed to ``session`` live.
 
     The session's own key first (all its records); then one entry per registered parent it
@@ -228,7 +232,7 @@ def storage_recipients(session: str, env=None) -> list:
     ack there; only the receiving session changes."""
     out: list = [(session, None)]
     try:
-        seat = pane_seat(env)
+        seat = pane_seat(env, harness, session)
         if seat is None:
             return out
         owed: dict = {}

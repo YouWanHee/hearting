@@ -1873,6 +1873,28 @@ def _process_session(pane, harness):
     return None
 
 
+def _herdr_lags(req, herdr_sid):
+    """True when herdr's session for the booked pane is an OLDER session of the booking seat's own
+    ledger than the booked one -- the booked thread is later, herdr just has not followed.
+
+    Codex tools and hooks run in the shared app-server daemon, so the pane's TUI holds no rollout
+    the process check could read and herdr's `agent_session` can stay on the cleared session for
+    good (measured 2026-10-01).  The seat ledger (written by the hooks of both sessions at this very
+    pane) is then the only record that orders the two.  A session the ledger has never seen is not
+    a predecessor."""
+    if req.get("harness") != "codex" or not herdr_sid or herdr_sid == "-" or herdr_sid == req.get("sid"):
+        return False
+    try:
+        import session_tidy as st
+        seat_fields = req.get("seat") or {}
+        seat = st.Seat(str(seat_fields.get("kind") or ""), str(seat_fields.get("key") or ""),
+                       str(seat_fields.get("pane") or ""), str(seat_fields.get("harness") or ""),
+                       str(seat_fields.get("project_key") or ""))
+        return st.ledger_precedes(seat, herdr_sid, str(req.get("sid")))
+    except Exception:
+        return False
+
+
 def _clear_look(target, req):
     """One judgement of the target: `(None, agent)` when it may be cleared, else `(reason, agent)`.
 
@@ -1888,7 +1910,8 @@ def _clear_look(target, req):
         return "target-changed", agent
     if req.get("harness") in ("claude", "codex") and agent.get("session_id") not in (req.get("sid"), "-"):
         # herdr's pane record can lag a /clear; the process itself is the proof, never a guess.
-        if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid"):
+        if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid") \
+                and not _herdr_lags(req, agent.get("session_id")):
             return "target-changed", agent
     if state == "blocked":
         return "form-open", agent
@@ -1949,10 +1972,12 @@ def _clear_observe(target, req, request_path):
             # The process's own session decides when it can be read; herdr's pane record can lag
             # a /clear (or keep an older session) and is only the fallback.
             proven = _process_session(agent.get("pane") or target, req.get("harness"))
+            if proven and _herdr_lags(req, proven):
+                proven = None           # the process check named an older session of this seat
             if proven:
                 if proven != old:
                     return str(proven)
-            elif sid not in (None, "-", old):
+            elif sid not in (None, "-", old) and not _herdr_lags(req, sid):
                 return str(sid)
         if not unavailable and req.get("harness") == "opencode" and state in ("idle", "done"):
             lines = _read_screen(target)

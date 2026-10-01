@@ -1977,6 +1977,31 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                 if not expect_typed:
                     self.assertIn("reason=target-changed", line)
 
+    def test_a_codex_pane_record_that_trails_the_seat_ledger_is_not_a_changed_target(self):
+        # Shared app-server daemon: no rollout for the process check, herdr keeps the session
+        # before the last clear.  The seat ledger (both sessions' hooks at this pane) orders them.
+        st = self.st
+        seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "codex", "")
+        with st.seat_lock(seat.key):
+            st.record_event(seat, "codex", "sid-A", "prompt", cwd="/w", now=time.time() - 100)
+            st.record_event(seat, "codex", "sid-B", "prompt", cwd="/w", now=time.time() - 50)
+        for herdr_says, typed in (("sid-A", 1), ("sid-never-seen", 0), ("sid-B", 1)):
+            with self.subTest(herdr_says=herdr_says):
+                self.book(harness="codex", sid="sid-B")
+                world = _ClearWorld(harness="codex", sid=herdr_says, new_sid=None, screens=[CODEX_EMPTY])
+                # the process check may name the older session too (same-cwd fallback of the board)
+                with mock.patch("fleet.collectors.codex.session_id_of_process",
+                                return_value="sid-A" if herdr_says == "sid-A" else None), \
+                        mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertEqual(len(world.typed()), typed, line)
+                if typed:
+                    # the lagging value is never taken for the new session
+                    self.assertIn("cleared=unverified", line)
+                    self.assertNotIn("new_session=sid-A", line)
+                else:
+                    self.assertIn("reason=target-changed", line)
+
     # -- after the send: never a second one -------------------------------------------------
 
     def test_a_send_that_cannot_be_confirmed_is_unverified_and_nothing_else_is_typed(self):

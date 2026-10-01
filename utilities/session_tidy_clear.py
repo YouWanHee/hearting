@@ -236,7 +236,26 @@ def note_start_locked(seat: "st.Seat", harness: str, sid: str, now: float) -> No
     if (req.get("observed") or {}).get("sid") == sid:
         return
     req["observed"] = {"sid": sid, "harness": harness, "at": now}
+    if req.get("status") == "unverified":
+        # Codex starts the new thread's SessionStart only with its first message, so the successor
+        # can show up after the helper stopped waiting: the clear did happen, drop the doubt.
+        req.update(status="cleared", new_session=sid, reason="")
+        _drop_unverified_notice(seat, req)
     _write_reservation(req)
+
+
+def _drop_unverified_notice(seat: "st.Seat", req: dict) -> None:
+    """Remove the "could not confirm" line this booking left (caller holds the seat lock)."""
+    text = _notice_text("unverified", "", str(req.get("harness") or ""))
+    path = st._notices_path(seat)
+    data = st.read_json(path)
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return
+    kept = [i for i in items if not (isinstance(i, dict) and i.get("text") == text
+                                     and (i.get("author") or {}).get("sid") == req.get("sid"))]
+    if len(kept) != len(items):
+        st.atomic_write_json(path, {"schema": st.SCHEMA, "items": kept})
 
 
 def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] = None):
