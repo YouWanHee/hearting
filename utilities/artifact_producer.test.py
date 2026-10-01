@@ -2705,7 +2705,7 @@ class SharedReferencePinAndRelatedTest(ProducerTestBase):
 
         superseded_first = P.mark_cycle_superseded(
             self.root, first["cycle_id"], superseded_by=[second["cycle_id"]], superseded_event_id="ev_" + "a" * 32)
-        self.assertEqual(superseded_first["state"], "superseded")
+        self.assertEqual(superseded_first["disposition"]["kind"], "superseded")
         manifest_before = (Path(first["cycle_dir"]) / "manifest.json").read_bytes()
 
         with self.assertRaises(P.ProducerError) as ctx:
@@ -2721,7 +2721,9 @@ class SharedReferencePinAndRelatedTest(ProducerTestBase):
         self.assertEqual((Path(first["cycle_dir"]) / "manifest.json").read_bytes(), manifest_before)
         document = json.loads(manifest_before.decode("utf-8"))
         self.assertEqual(document["cycle"]["state"], "completed")
-        self.assertEqual(P.read_cycle_record(self.root, first["cycle_id"])["state"], "superseded")
+        record = P.read_cycle_record(self.root, first["cycle_id"])
+        self.assertEqual(P.cycle_disposition(record)["kind"], "superseded")
+        self.assertEqual(record["state"], "sealed")
         # A key freed only by supersession cannot be resumed through find_campaign_by_key.
         self.assertIsNone(P.find_campaign_by_key(self.root, "camp-live"))
 

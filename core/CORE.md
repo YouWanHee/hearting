@@ -302,8 +302,9 @@ trigger.
 
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-reopen|campaign-recover`
 reports, closes, reopens, and repairs a campaign. An agent that judges the
-recorded completion condition met runs `campaign-close` (`--reason` when the
-criterion is the fixed default); a sealed cycle alone does not close the stream.
+recorded completion condition met runs `campaign-close` (`--reason` optional);
+a sealed cycle alone does not close the stream. `cycle-move`, `cycle-mark` and
+`delete --cycle|--campaign` move, mark, and delete cycles.
 The next cycle selected by key, ID, or parent reopens it with an appended
 `campaign.reopened` event. One validated fold over `campaign.events/` (legacy
 `campaign.satisfied.json` is sequence 1) decides state for begin, compose, list,
