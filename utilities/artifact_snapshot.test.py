@@ -239,6 +239,17 @@ class OwnerPreviewSnapshotTest(PRODUCER_FIXTURE.OwnerRefineBase):
                     self.assertEqual(checked["verdict"],"allow",checked)
             self.assertEqual(producer.check_write(self.root,self.preview)["verdict"],"allow")
 
+    def test_a_declared_support_path_is_not_held_by_the_snapshot_fence(self):
+        # The fence guards the bound target only; a path the transaction declares as support
+        # (`changelog/**`) is classified first and skipped, before any preview exists.
+        self.build("claude",close=False)
+        support=Path(self.cycle["cycle_dir"])/"artifacts"/"changelog"/"topic"/"CHANGELOG.md"
+        support.parent.mkdir(parents=True,exist_ok=True); support.write_text("log\n")
+        result=self.prepare(support)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reason"],"support-artifact")
+        self.assertNotIn("human-gate",result.stdout+result.stderr)
+
     def test_the_target_snapshot_follows_a_persons_proceed(self):
         self.build("claude",close=False)
         doc=self.target()

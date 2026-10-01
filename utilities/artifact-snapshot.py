@@ -236,15 +236,6 @@ def prepare(args) -> int:
         if rel_parts[:2] == ("reviews", "refine") and "reviews/refine/**" in node.get("write_scope", []):
             emit({"status": "skipped", "reason": "quick-preview-artifact", "target": str(target)})
             return 0
-    if capability == "autopilot-refine" and intensity != "quick":
-        # The owner's own `transaction` changes the target after the person released the preview it
-        # raised: the fence the entry gate holds for a child launch, for the step that precedes the edit.
-        import dispatch_contract
-        if node.get("id") in {gated.get("id") for gated, _gate in dispatch_contract.owner_operation_gates(route)}:
-            try:
-                dispatch_contract.owner_operation_fence(route, node, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
-            except dispatch_contract.DispatchContractError as exc:
-                raise SnapshotError(exc.reason + ": " + exc.detail) from exc
     try:
         artifact_dir,relative=target_parts(artifact_root,target)
     except SnapshotError as exc:
@@ -262,6 +253,16 @@ def prepare(args) -> int:
             emit({"status":"skipped","reason":"support-artifact","target":str(target)})
             return 0
         raise
+    if capability == "autopilot-refine" and intensity != "quick":
+        # The owner's own `transaction` changes the target after the person released the preview it
+        # raised: the fence the entry gate holds for a child launch, asked only once the path is known
+        # to be the bound target, for the step that precedes the edit.
+        import dispatch_contract
+        if node.get("id") in {gated.get("id") for gated, _gate in dispatch_contract.owner_operation_gates(route)}:
+            try:
+                dispatch_contract.owner_operation_fence(route, node, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
+            except dispatch_contract.DispatchContractError as exc:
+                raise SnapshotError(exc.reason + ": " + exc.detail) from exc
     if not target.exists():
         emit({"status":"skipped","reason":"new-target","target":str(target)})
         return 0
