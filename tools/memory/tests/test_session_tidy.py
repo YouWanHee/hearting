@@ -15,6 +15,7 @@ import re
 import sqlite3
 import stat
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -593,6 +594,269 @@ class ChunkReaderTest(TidyCase):
                 break
             cursor = chunk.cursor_to
         self.assertEqual(order, [1, 2, 3, 4, 5, 6])
+
+
+def codex_row(kind: str, text: str) -> dict:
+    block = "input_text" if kind == "user" else "output_text"
+    return {"type": "response_item", "payload": {"type": "message", "role": kind,
+                                                 "content": [{"type": block, "text": text}]}}
+
+
+class TailFirstReadingTest(TidyCase):
+    """The newest unread range is read first; an old unread front is never overwritten by a newer end."""
+
+    SID = "sid-tail"
+    ROWS = 4000
+
+    def setUp(self):
+        super().setUp()
+        # ``tempfile`` remembers the first temp dir it saw; keep it from remembering a test's own
+        # (about to be deleted) one when the OpenCode snapshot copies the database.
+        self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+        tempfile.tempdir = str(self.iso.tmpdir)
+
+    def make(self, harness, n=None, tag="행", pad=600):
+        """A multi-MB record (about ``n`` * ``pad`` bytes) whose last row is the recent decision."""
+        n = n or self.ROWS
+        texts = [f"{tag} {i:05d} " + "가" * pad for i in range(n)] + ["최근 결정 마커"]
+        if harness == "opencode":
+            load_opencode_fixture(self.iso.opencode_db)
+            con = sqlite3.connect(self.iso.opencode_db)
+            con.execute("DELETE FROM part")
+            con.execute("INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) "
+                        "VALUES ('msg_big', ?, 1, 1, '{\"role\": \"user\"}')", (self.SID,))
+            con.executemany("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) "
+                            "VALUES (?, 'msg_big', ?, ?, ?, ?)",
+                            [(f"prt_{i:06d}", self.SID, 1, 1, json.dumps({"type": "text", "text": t}, ensure_ascii=False))
+                             for i, t in enumerate(texts)])
+            con.commit()
+            con.close()
+            return self.iso.opencode_db
+        path = self.iso.root / f"{harness}-big.jsonl"
+        build = claude_row if harness == "claude" else codex_row
+        jsonl(path, [build("user" if i % 2 == 0 else "assistant", t) for i, t in enumerate(texts)])
+        return path
+
+    def drain(self, harness, path, limit=192 * 1024, appended=None):
+        """Read and apply chunk after chunk; returns every chunk (the last one is the empty "nothing left")."""
+        chunks = []
+        with self.library():
+            for step in range(200):
+                chunk = tt.read_pending(harness, self.SID, path, limit)
+                self.assertEqual(chunk.error, "")
+                chunks.append(chunk)
+                if chunk.cursor_to == chunk.cursor_from and not chunk.pending_after:
+                    return chunks
+                tt.mark_applied(harness, self.SID, chunk)
+                if appended and step == 0:
+                    appended()
+        self.fail("the unread ranges never ran out")
+
+    def test_the_recent_decision_is_in_the_first_input_and_later_runs_reach_the_front(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                path = self.make(harness)
+                if harness != "opencode":
+                    self.assertGreater(path.stat().st_size, 2 * 1024 * 1024)
+                chunks = self.drain(harness, path)
+                first = chunks[0]
+                self.assertIn("최근 결정 마커", first.text)
+                self.assertNotIn("행 00000", first.text)                       # not the front of a 2.5MB record
+                self.assertTrue(first.pending_after)                            # and it says part is still unread
+                self.assertEqual(first.unit, "rowid" if harness == "opencode" else "byte")
+                self.assertRegex(tt.describe_coverage(first), r"^(byte|rowid) [\d,]+–[\d,]+ / 전체 [\d,]+$")
+                joined = "\n".join(c.text for c in reversed(chunks) if c.text)
+                numbers = re.findall(r"행 (\d{5})", joined)
+                self.assertEqual(numbers, [f"{i:05d}" for i in range(self.ROWS)])  # every row, once, in order
+                self.assertEqual(chunks[-1].pending_after, [])
+                with self.library():
+                    mark = tt.read_watermark(harness, self.SID)
+                self.assertEqual((mark["pending"], mark["cursor"]), ([], mark["end"]))      # nothing is left unread
+
+    def test_nothing_is_marked_read_until_it_is_applied(self):
+        path = self.make("claude", n=600)
+        with self.library():
+            a = tt.read_pending("claude", self.SID, path, 64 * 1024)
+            b = tt.read_pending("claude", self.SID, path, 64 * 1024)         # the apply failed: same range again
+            self.assertEqual((a.cursor_from, a.cursor_to, a.text), (b.cursor_from, b.cursor_to, b.text))
+            tt.mark_applied("claude", self.SID, a)
+            c = tt.read_pending("claude", self.SID, path, 64 * 1024)
+            self.assertEqual(c.cursor_to, a.cursor_from)                     # continues right before it
+            self.assertNotIn("최근 결정 마커", c.text)
+
+    def test_an_append_is_read_first_and_the_old_unread_front_stays_pending(self):
+        path = self.make("claude", n=1500)
+        added = [claude_row("user", f"새 {i}") for i in range(3)]
+
+        def append():
+            with open(path, "a", encoding="utf-8") as handle:
+                for row in added:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        chunks = self.drain("claude", path, limit=128 * 1024, appended=append)
+        self.assertEqual(chunks[1].text, "[user] 새 0\n[user] 새 1\n[user] 새 2")         # the delta, before any backlog
+        self.assertTrue(chunks[1].pending_after)                                          # the front is still unread
+        texts = "\n".join(c.text for c in chunks)
+        self.assertEqual(sorted(re.findall(r"행 (\d{5})", texts)), [f"{i:05d}" for i in range(1500)])
+        self.assertEqual(len(re.findall(r"최근 결정 마커", texts)), 1)
+
+    def test_a_schema_1_watermark_becomes_the_start_of_the_unread_range(self):
+        path = self.make("claude", n=300)
+        raw = path.read_bytes()
+        cut = raw.index(b"\n", len(raw) // 2) + 1
+        with self.library():
+            tt.write_watermark("claude", self.SID, cut, source=str(path))     # what the old runner wrote
+            chunks = self.drain("claude", path, limit=1 << 30)
+        self.assertEqual((chunks[0].cursor_from, chunks[0].cursor_to), (cut, len(raw)))
+        self.assertIn("최근 결정 마커", chunks[0].text)
+
+    def test_a_replaced_record_is_read_again_from_its_start_and_a_half_row_waits(self):
+        path = self.iso.root / "r.jsonl"
+        jsonl(path, [claude_row("user", "옛 " + "x" * 300) for _ in range(5)])
+        with self.library():
+            chunk = tt.read_pending("claude", self.SID, path, 1 << 20)
+            tt.mark_applied("claude", self.SID, chunk)
+            path.unlink()
+            good = json.dumps(claude_row("user", "새 파일"), ensure_ascii=False) + "\n"
+            partial = json.dumps(claude_row("user", "쓰는 중"), ensure_ascii=False)
+            path.write_text(good + partial[:15], encoding="utf-8")
+            chunk = tt.read_pending("claude", self.SID, path, 1 << 20)
+            self.assertEqual((chunk.text, chunk.cursor_from), ("[user] 새 파일", 0))
+            tt.mark_applied("claude", self.SID, chunk)
+            path.write_text(good + partial, encoding="utf-8")
+            self.assertEqual(tt.read_pending("claude", self.SID, path, 1 << 20).text, "[user] 쓰는 중")
+
+    def test_a_row_beyond_the_hard_cap_is_stepped_over_and_counted(self):
+        path = self.iso.root / "o.jsonl"
+        jsonl(path, [claude_row("user", "앞"), claude_row("user", "거대 " + "z" * 3000), claude_row("user", "뒤")])
+        original = tt.MAX_ROW_BYTES
+        tt.MAX_ROW_BYTES = 1000
+        self.addCleanup(setattr, tt, "MAX_ROW_BYTES", original)
+        chunks = self.drain("claude", path, limit=200)
+        self.assertEqual(sum(c.skipped_oversize for c in chunks), 1)
+        self.assertEqual([c.text for c in chunks if c.text], ["[user] 뒤", "[user] 앞"])
+
+    def test_a_question_and_its_answer_in_different_chunks_still_pair_when_the_answer_is_read_first(self):
+        path = FIXTURES / "codex-choice.jsonl"
+        with self.library():
+            choices = [c for chunk in self.drain("codex", path, limit=1) for c in chunk.choices]
+        self.assertEqual(sorted(tuple(c["answers"]) for c in choices),
+                         [("진행 (Recommended)",), ("한 파일만 하고 나머지는 나중에",)])
+
+    def test_opencode_holds_back_at_an_open_question_and_rereads_a_row_that_changed(self):
+        load_opencode_fixture(self.iso.opencode_db)
+        original = tt.now_epoch
+        tt.now_epoch = lambda: FIXTURE_NOW
+        self.addCleanup(setattr, tt, "now_epoch", original)
+        sid = "ses_fixture0000000000000001"
+        with self.library():
+            first = tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20)
+            self.assertEqual((first.blocked, first.cursor_to), ("open-question", 6))      # rowids 1..5 only
+            self.assertEqual(first.pending_after, [[6, 7]])                               # the question stays unread
+            tt.mark_applied("opencode", sid, first)
+            con = sqlite3.connect(self.iso.opencode_db)
+            part = json.loads(con.execute("SELECT data FROM part WHERE rowid = 6").fetchone()[0])
+            part["state"].update({"status": "completed", "metadata": {"answers": [["진행 (권장)"]]}})
+            con.execute("UPDATE part SET data = ?, time_updated = time_updated + 5000 WHERE rowid = 6",
+                        (json.dumps(part, ensure_ascii=False),))
+            con.commit()
+            con.close()
+            second = tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20)
+            self.assertEqual([c["answers"] for c in second.choices], [["진행 (권장)"]])
+            tt.mark_applied("opencode", sid, second)
+            self.assertEqual(tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20).pending_after, [])
+
+
+class MemoryLayerTest(TidyCase):
+    """Card layer B ("참고할 기억"): its own revision and receipt, beside the unchanged layer A."""
+
+    def refs(self, n=3, batch="b1", status="applied", **more):
+        rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
+        return dict(batch=batch, status=status, refs=rows, **more)
+
+    def update(self, **kw):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            return st.update_memory_refs(seat, **kw)
+
+    def read(self):
+        return json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
+
+    def test_only_memory_refs_changes_and_the_same_batch_result_is_a_no_op(self):
+        self.card("sid-A", "카드 본문")
+        before = self.read()
+        first = self.update(**self.refs(result_path="/r/result.json"))
+        after = self.read()
+        for key in ("body", "author", "authored_at", "authored_at_epoch", "generation", "prompt_seq"):
+            self.assertEqual(after.get(key), before.get(key), key)
+        self.assertEqual((first["revision"], first["source_generation"]), (1, 1))
+        again = self.update(**self.refs(result_path="/r/result.json"))
+        self.assertEqual(again["revision"], 1)                                  # the same batch: same revision
+        self.assertEqual(self.update(**self.refs(batch="b2"))["revision"], 2)
+        self.assertIsNone(st.update_memory_refs(st.Seat("pane", "nocard", "x", "claude", ""), batch="b", status="applied", refs=[]))
+
+    def test_a_new_card_keeps_the_finished_list_and_the_late_batch_names_the_card_it_was_queued_under(self):
+        self.card("sid-A", "첫 카드")
+        self.update(**self.refs())
+        self.card("sid-A", "둘째 카드")
+        card = self.read()
+        self.assertEqual((card["generation"], card["memory_refs"]["revision"]), (2, 1))
+        late = self.update(**self.refs(batch="old-runner"), source_generation=1)
+        self.assertEqual((late["source_generation"], self.read()["generation"], self.read()["body"]), (1, 2, "둘째 카드"))
+
+    def test_a_new_session_gets_the_card_and_the_list_in_one_injection_within_the_cap(self):
+        self.card("sid-A", "가나다라 " * 900)
+        self.update(**self.refs(n=8, more=4, coverage="일부만 읽음(byte 1–2 / 전체 3) — 앞부분은 다음 정리에서 계속",
+                                result_path=str(self.state / "runs" / "b1" / "result.json")))
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.write_notice(seat, "정리 결과: 새 기록 3건. 되돌리기: mem tidy-undo b1", author_harness="claude", author_sid="sid-A")
+        got = self.hook("claude", "start", "sid-B")
+        self.assertLessEqual(len(got.encode("utf-8")), st.INJECTION_MAX_BYTES)
+        for needle in ("[정리 결과]", "[세션 카드]", "[참고할 기억]", "mem-0", "일부만 읽음", "b1/result.json", "카드 전문:"):
+            self.assertIn(needle, got)
+        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+
+    def test_a_listed_record_is_never_a_body_and_the_list_alone_stays_within_its_bytes(self):
+        self.card("sid-A", "본문")
+        self.update(**self.refs(n=8, more=0))
+        text = st.build_memory_injection(self.read()["memory_refs"], st.MEMORY_REFS_BYTES + 600)
+        self.assertLessEqual(len(text.encode("utf-8")), st.MEMORY_REFS_BYTES + 600)
+        tiny = st.build_memory_injection(self.read()["memory_refs"], 160)
+        self.assertLessEqual(len(tiny.encode("utf-8")), 160)
+        self.assertTrue(tiny.startswith("[참고할 기억]"))
+
+    def test_a_session_that_took_layer_a_still_gets_a_newer_list_once_and_a_failed_emit_keeps_it(self):
+        self.card("sid-A", "카드")
+        self.assertIn("카드", self.hook("claude", "start", "sid-B"))            # A taken before any list exists
+        self.update(**self.refs())
+
+        def broken(_text):
+            raise BrokenPipeError()
+
+        with self.library():
+            with self.assertRaises(BrokenPipeError):
+                st.run_hook("claude", "prompt", "sid-B", cwd=str(self.cwd), emit=broken)
+        got = self.hook("claude", "prompt", "sid-B")                            # the failed emit used nothing up
+        self.assertIn("[참고할 기억]", got)
+        self.assertNotIn("[세션 카드]", got)
+        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+        consumed = json.loads(next((self.state / "consumed").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual((consumed["generation"], consumed["memory_revision"]), (1, 1))     # two receipts, kept apart
+        self.update(**self.refs(batch="b2"))
+        self.assertIn("[참고할 기억]", self.hook("claude", "prompt", "sid-B"))   # a newer revision is handed out again
+
+    def test_reread_keeps_what_the_session_already_got_and_adds_the_later_list(self):
+        self.card("sid-A", "OpenCode 카드")
+        with self.library({"HERDR_PANE_ID": PANE}):
+            st.run_hook("opencode", "start", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
+        self.update(**self.refs())
+        with self.library({"HERDR_PANE_ID": PANE}):
+            st.run_hook("opencode", "prompt", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
+            replay = []
+            st.run_hook("opencode", "prompt", "ses_B", cwd=str(self.cwd), reread=True, emit=replay.append)
+        self.assertIn("OpenCode 카드", replay[0])                                 # layer A is still in the replay
+        self.assertIn("[참고할 기억]", replay[0])
 
 
 class RecentSessionsTest(TidyCase):

@@ -21,8 +21,20 @@ once.  The detached runner:
    the duplicate check keep the writes that already landed from being made twice).
 
 State (all under ``session_tidy.state_root()``): ``queue/<id>.json`` (+ ``<id>.pid``),
-``runs/<batch>/{input_v1.json,prompt.md,actions.json,runner.log,undo.json,result.json}``,
+``runs/<batch>/{input_v1.json,actions.json,runner.log,undo.json,result.json}``,
 ``runner.lock``.
+
+The worker's own files are the one exception: its sandbox allows the artifact root the
+checked wrapper launches it with, not the state folder, so ``input_v1.json`` (a copy of the
+exact bytes in ``runs/<batch>``), ``prompt.md`` and the one ``actions.json`` it writes live in
+``<artifact root>/.runtime/session-tidy/<batch>/``.  The runner reads that file back (no symlink,
+size-capped), validates it, copies the checked result into ``runs/<batch>`` for ``mem tidy-apply``,
+and removes the conversation copy when the batch ends (the rest goes with the finished entry).
+
+Reading is tail first (``tidy_transcripts.read_pending``): the newest unread range's last whole
+rows are the worker's input; only a successful apply removes that range from the unread ones, so a
+long record's older front stays pending and a short result line says "일부만 읽음(범위)".  A finished
+batch also refreshes the seat card's "참고할 기억" list (``session_tidy.update_memory_refs``).
 
 Test hooks are honoured only inside a test root: ``HEARTING_TIDY_TEST_ROOT`` must
 contain the state folder, and an injected executable must live under it.  They are
@@ -44,6 +56,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -82,6 +95,7 @@ CARD_CONTEXT_CHARS = 3000
 PENDING_DECISIONS_MAX = 20
 DUPLICATE_SIGNAL_MAX = 5
 ACTIONS_MAX_BYTES = 1024 * 1024
+RELATED_MAX = 20
 KEEP_FINISHED_DAYS = 14
 KEEP_RUN_DAYS = 60
 MAX_ITEMS_PER_RUN = 10
@@ -208,6 +222,10 @@ def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: 
     item = {"schema": SCHEMA, "id": new_id(), "created": _now(), "status": "queued", "updated": _now(),
             "seat": seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
             "attempts": 0}
+    with contextlib.suppress(BaseException):
+        card = st.read_latest_card(seat)
+        if card:
+            item["card_generation"] = int(card.get("generation", 0) or 0)   # the card this batch was queued under
     write_item(item)
     start_detached(item["id"])
     return item
@@ -349,8 +367,17 @@ def _pending_decisions(project_key: str) -> list:
 
 
 class Bundle:
-    def __init__(self, path: Path, digest: str, cursors: list, empty: bool):
+    """The assembled input.  ``exchange`` (the worker's folder under the artifact root), ``allowed_ids``
+    (what ``related_existing_ids`` may name), ``unread`` (ranges left unread) and ``related`` (the
+    checked ids the worker named) are filled in later and default to "none"."""
+
+    def __init__(self, path: Path, digest: str, cursors: list, empty: bool, unread: Optional[list] = None,
+                 allowed_ids: Optional[set] = None):
         self.path, self.digest, self.cursors, self.empty = path, digest, cursors, empty
+        self.unread = unread or []
+        self.allowed_ids = allowed_ids or set()
+        self.exchange: Optional[Path] = None
+        self.related: list = []
 
 
 def _target_sessions(item: dict, seat) -> list:
@@ -371,10 +398,18 @@ def _target_sessions(item: dict, seat) -> list:
     return targets[:MAX_TARGETS]
 
 
+MAX_SILENT_HOPS = 16
+
+
+def _unread_entry(target: dict, chunk) -> dict:
+    return {"harness": target["harness"], "sid": target["sid"], "role": target["role"],
+            "coverage": tt.describe_coverage(chunk), "blocked": chunk.blocked, "remaining": tt.unread_total(chunk)}
+
+
 def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     seat = st.Seat(**item["seat"])
     project_key = st.project_key_for(item["cwd"])
-    sessions, cursors, choices, skipped = [], [], [], []
+    sessions, cursors, choices, skipped, unread = [], [], [], [], []
     remaining = TOTAL_CHUNK_BYTES
     for target in _target_sessions(item, seat):
         if remaining <= 0:
@@ -382,22 +417,39 @@ def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
         if not target["transcript"]:
             skipped.append({"harness": target["harness"], "sid": target["sid"], "reason": "no-record"})
             continue
-        chunk = tt.read_pending(target["harness"], target["sid"], target["transcript"],
-                                limit_bytes=min(SESSION_CHUNK_BYTES, remaining))
-        if chunk.error:
-            skipped.append({"harness": target["harness"], "sid": target["sid"], "reason": chunk.error})
-            continue
-        if chunk.cursor_to == chunk.cursor_from and not chunk.text and not chunk.choices:
-            continue
-        remaining -= len(chunk.text.encode("utf-8"))
-        sessions.append({"harness": target["harness"], "sid": target["sid"], "role": target["role"],
-                         "cursor_from": chunk.cursor_from, "cursor_to": chunk.cursor_to, "eof": chunk.eof,
-                         "rows": chunk.rows, "skipped_oversize": chunk.skipped_oversize,
-                         "blocked": chunk.blocked, "text": chunk.text})
-        cursors.append({"harness": target["harness"], "sid": target["sid"], "cursor": chunk.cursor_to,
-                        "source": target["transcript"]})
-        for choice in chunk.choices:
-            choices.append({**choice, "session": target["sid"]})
+        for hop in range(MAX_SILENT_HOPS + 1):
+            chunk = tt.read_pending(target["harness"], target["sid"], target["transcript"],
+                                    limit_bytes=min(SESSION_CHUNK_BYTES, remaining))
+            if chunk.error:
+                skipped.append({"harness": target["harness"], "sid": target["sid"], "reason": chunk.error})
+                break
+            if chunk.skipped_oversize:
+                skipped.append({"harness": target["harness"], "sid": target["sid"], "reason": "oversize-row"})
+            if chunk.cursor_to == chunk.cursor_from:
+                if chunk.pending_after:                 # blocked at an open question: nothing readable yet
+                    unread.append(_unread_entry(target, chunk))
+                break                                   # (or nothing unread at all)
+            if not chunk.text and not chunk.choices:
+                # Nothing to tidy in this range (tool output only): it counts as read, then look further back.
+                tt.mark_applied(target["harness"], target["sid"], chunk)
+                if chunk.pending_after and hop < MAX_SILENT_HOPS:
+                    continue
+                if chunk.pending_after:
+                    unread.append(_unread_entry(target, chunk))
+                break
+            remaining -= len(chunk.text.encode("utf-8"))
+            sessions.append({"harness": target["harness"], "sid": target["sid"], "role": target["role"],
+                             "unit": chunk.unit, "cursor_from": chunk.cursor_from, "cursor_to": chunk.cursor_to,
+                             "total": chunk.total, "eof": chunk.eof, "pending_after": chunk.pending_after,
+                             "rows": chunk.rows, "skipped_oversize": chunk.skipped_oversize,
+                             "blocked": chunk.blocked, "text": chunk.text})
+            cursors.append({"harness": target["harness"], "sid": target["sid"], "cursor": chunk.cursor_to,
+                            "source": target["transcript"], "chunk": chunk})
+            for choice in chunk.choices:
+                choices.append({**choice, "session": target["sid"]})
+            if chunk.pending_after:
+                unread.append(_unread_entry(target, chunk))
+            break
     pending = _pending_decisions(project_key)
     conversation = "\n".join(s["text"] for s in sessions)
     records, groups = existing_records(item["cwd"], conversation) if (sessions or pending or choices) else ([], [])
@@ -413,7 +465,17 @@ def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     st.atomic_write_json(path, doc)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     empty = not (sessions or choices or pending)
-    return Bundle(path, digest, cursors, empty)
+    return Bundle(path, digest, cursors, empty, unread, {r["id"] for r in records})
+
+
+def coverage_note(bundle: Bundle) -> str:
+    """"일부만 읽음(범위)" when part of a record was left unread, else ""; never reads as "nothing to tidy"."""
+    if not bundle.unread:
+        return ""
+    first = bundle.unread[0]
+    more = f" 외 기록 {len(bundle.unread) - 1}개도 일부만 읽음" if len(bundle.unread) > 1 else ""
+    why = "열린 질문 앞까지, " if first.get("blocked") else ""
+    return f"일부만 읽음({why}{first['coverage']}){more} — 앞부분은 다음 정리에서 계속"
 
 
 # ---------------------------------------------------------------------------
@@ -421,19 +483,24 @@ def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
 # ---------------------------------------------------------------------------
 
 def write_prompt(run_dir: Path, batch: str, bundle: Bundle) -> Path:
-    actions = run_dir / "actions.json"
+    where = bundle.exchange or run_dir          # the worker's own folder when there is one
+    actions = where / "actions.json"
     text = (
         "Session-tidy memory worker. Follow the unit instructions (ops/session-tidy-memory).\n\n"
         f"batch_id: {batch}\n"
-        f"input (read only): {bundle.path}\n"
+        f"input (read only): {where / 'input_v1.json' if bundle.exchange else bundle.path}\n"
         f"input_digest: {bundle.digest}\n"
         f"output (write exactly this one file): {actions}\n\n"
         "Read the input, write actions.json (JSON only), then stop. Do not call any memory write command.\n\n"
         "Final message: exactly the three handoff lines with `artifact: -`, then `verdict: PASS` (or FAIL) and\n"
         "`blocker: none` (or one line). The output file above is a private handoff to the runner, not a\n"
         "durable artifact, so its path does not go in the artifact field.\n")
-    path = run_dir / "prompt.md"
-    st.atomic_write(path, text.encode("utf-8"))
+    if bundle.exchange:
+        path = bundle.exchange / "prompt.md"
+        _write_private(path, text.encode("utf-8"))
+    else:
+        path = run_dir / "prompt.md"
+        st.atomic_write(path, text.encode("utf-8"))
     return path
 
 
@@ -449,6 +516,86 @@ def _git_worktree(cwd: str) -> str:
     raise RunnerFailure("no git worktree to register the worker under")
 
 
+def launch_worktree(item: dict) -> str:
+    """The ``--worktree`` the checked wrapper registers the worker under (it derives its artifact root from it)."""
+    return item["cwd"] if injected_executable("HEARTING_TIDY_WORKER_CMD") else _git_worktree(item["cwd"])
+
+
+def artifact_root_for(worktree: str) -> Path:
+    """The artifact root the wrapper launches that worktree's worker with: the same ``artifact-root.sh``
+    on the same worktree, in the same cleaned environment.  Nothing else is ever substituted; a root
+    that cannot be resolved ends the tidy with its one failure line."""
+    try:
+        done = subprocess.run([str(ROOT / "utilities" / "artifact-root.sh"), worktree], env=clean_env(),
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerFailure(f"no artifact root for the worker's files: {type(exc).__name__}") from exc
+    value = done.stdout.strip()
+    if done.returncode != 0 or not value or not os.path.isabs(value):
+        detail = (done.stderr or done.stdout or "unresolved").strip().splitlines()[-1][:80]
+        raise RunnerFailure(f"no artifact root for the worker's files: {detail}")
+    return Path(value)
+
+
+EXCHANGE_PARTS = (".runtime", "session-tidy")
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Atomic 0600 write of a file in the worker's folder (outside the state root, so not ``st.atomic_write``)."""
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def prepare_exchange(item: dict, batch: str, bundle: Bundle) -> Path:
+    """``<artifact root>/.runtime/session-tidy/<batch>/`` (0700) holding an exact copy of the input.
+
+    The folder is where the worker may read and write; the state folder is not.  A symlink on the way
+    is refused.  The root is created when the project has none yet (the wrapper's own launch needs it too).
+    """
+    root = artifact_root_for(launch_worktree(item))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        current = root
+        for part in (*EXCHANGE_PARTS, batch):
+            current = current / part
+            if current.is_symlink():
+                raise RunnerFailure(f"the worker's folder is a symlink: {current}")
+            current.mkdir(mode=0o700, exist_ok=True)
+            if part != EXCHANGE_PARTS[0]:
+                os.chmod(current, 0o700)
+        _write_private(current / "input_v1.json", bundle.path.read_bytes())
+    except OSError as exc:
+        raise RunnerFailure(f"cannot prepare the worker's folder: {type(exc).__name__}") from exc
+    bundle.exchange = current
+    return current
+
+
+def remove_exchange(path, only_conversation: bool = False) -> None:
+    """Delete a batch's worker folder (or just the conversation copy and the prompt) if it is the real one."""
+    if not path:
+        return
+    folder = Path(path)
+    if folder.parent.name != EXCHANGE_PARTS[1] or folder.parent.parent.name != EXCHANGE_PARTS[0] \
+            or folder.is_symlink() or not folder.is_dir():
+        return
+    if only_conversation:
+        for name in ("input_v1.json", "prompt.md"):
+            with contextlib.suppress(OSError):
+                os.unlink(folder / name)
+    else:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def launch_command(item: dict, prompt: Path, slug: str) -> list:
     injected = injected_executable("HEARTING_TIDY_WORKER_CMD")
     harness = WORKER_HARNESS.get(item["harness"], "claude")
@@ -457,7 +604,7 @@ def launch_command(item: dict, prompt: Path, slug: str) -> list:
     else:
         base = [sys.executable, str(ROOT / "adapters" / harness / "bin" / "dispatch-headless.py")]
     return base + [
-        "--start", "--worktree", _git_worktree(item["cwd"]) if not injected else item["cwd"],
+        "--start", "--worktree", launch_worktree(item),
         "--slug", slug, "--capability", CAPABILITY, "--capability-mode", "default",
         "--intensity", "standard", "--dispatch-depth", "1", "--worker-type", "support",
         "--unit", UNIT, "--owner", CAPABILITY, "--assigned-contract", "session-tidy-memory",
@@ -525,13 +672,13 @@ def attempt_state(receipt: dict) -> str:
     return "unknown"
 
 
-def wait_worker(receipt: dict, run_dir: Path) -> None:
+def wait_worker(receipt: dict, run_dir: Path, actions: Optional[Path] = None) -> None:
     """Wait until the registered worker's process is gone (checked exact-identity state, polled
     with a limit), then require its output file.  The model's stdout is never read.
 
     A route-free support worker has no terminal commit, so its registry row is not closed by
     the checked join (``settle_finished_attempt`` answers ``not-route-bound``); the process
-    state is the end signal and ``actions.json`` is the result.
+    state is the end signal and ``actions.json`` (``actions``, else the one in ``run_dir``) is the result.
     """
     if not (receipt.get("job_registry") and receipt.get("child_pid") and receipt.get("child_pid_start")):
         raise RunnerFailure("the launch receipt carries no exact worker identity")
@@ -544,7 +691,7 @@ def wait_worker(receipt: dict, run_dir: Path) -> None:
             raise RunnerFailure("worker did not finish within the wait limit")
         time.sleep(tunable("POLL"))
     _log(run_dir, f"worker process state={state}")
-    if not (run_dir / "actions.json").is_file():
+    if not (actions or run_dir / "actions.json").is_file():
         raise RunnerFailure("worker finished without writing actions.json")
 
 
@@ -552,13 +699,29 @@ def wait_worker(receipt: dict, run_dir: Path) -> None:
 # actions.json check, apply, finish
 # ---------------------------------------------------------------------------
 
-def validate_actions(run_dir: Path, batch: str, bundle: Bundle) -> None:
-    path = run_dir / "actions.json"
+def _read_worker_file(path: Path, limit: int) -> bytes:
+    """The worker's output, read without following a symlink and only if it is a regular file of sane size."""
     try:
-        if path.stat().st_size > ACTIONS_MAX_BYTES:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise RunnerFailure(f"actions.json cannot be read: {type(exc).__name__}") from exc
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise RunnerFailure("actions.json is not a regular file")
+        if info.st_size > limit:
             raise RunnerFailure("actions.json is too large")
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return handle.read(limit + 1)
+
+
+def validate_actions(run_dir: Path, batch: str, bundle: Bundle) -> None:
+    """Check the worker's ``actions.json`` (in its folder when there is one) and leave the checked
+    result in ``run_dir`` for ``mem tidy-apply``; the worker's copy is never what gets applied."""
+    source = (bundle.exchange / "actions.json") if bundle.exchange else run_dir / "actions.json"
+    raw = _read_worker_file(source, ACTIONS_MAX_BYTES)
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
         raise RunnerFailure(f"actions.json is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict) or not isinstance(doc.get("actions"), list):
         raise RunnerFailure("actions.json must be an object with an actions list")
@@ -566,7 +729,15 @@ def validate_actions(run_dir: Path, batch: str, bundle: Bundle) -> None:
         raise RunnerFailure("every action must be an object")
     # The runner owns the identity of the batch; the worker's copies are not trusted.
     doc["schema_version"], doc["batch_id"], doc["input_digest"] = 1, batch, bundle.digest
-    st.atomic_write_json(path, doc)
+    # Optional: which existing records of this project the conversation relates to (ids only).
+    named = doc.get("related_existing_ids")
+    related: list = []
+    for rid in named if isinstance(named, list) else []:
+        if isinstance(rid, str) and rid in bundle.allowed_ids and rid not in related:
+            related.append(rid)
+    doc["related_existing_ids"] = related[:RELATED_MAX]
+    bundle.related = doc["related_existing_ids"]
+    st.atomic_write_json(run_dir / "actions.json", doc)
 
 
 def apply_actions(item: dict, run_dir: Path, bundle: Bundle) -> str:
@@ -585,8 +756,12 @@ def apply_actions(item: dict, run_dir: Path, bundle: Bundle) -> str:
 
 
 def advance_watermarks(bundle: Bundle) -> None:
+    """Take the ranges this batch covered off the unread ones (and nothing more)."""
     for entry in bundle.cursors:
-        tt.write_watermark(entry["harness"], entry["sid"], entry["cursor"], source=entry["source"])
+        if entry.get("chunk") is not None:
+            tt.mark_applied(entry["harness"], entry["sid"], entry["chunk"])
+        else:
+            tt.write_watermark(entry["harness"], entry["sid"], entry["cursor"], source=entry["source"])
 
 
 def notify(item: dict, text: str) -> None:
@@ -613,6 +788,70 @@ def applied_writes(run_dir: Path) -> tuple:
         return 0, -1
 
 
+def journal_ids(run_dir: Path) -> list:
+    """``[(id, kind)]`` of what this batch's undo journal says really landed, new and changed first."""
+    doc = st.read_json(run_dir / "undo.json")
+    ops = [op for op in (doc.get("ops") if isinstance(doc, dict) else None) or []
+           if isinstance(op, dict) and op.get("state") == "done"]
+    out = [(op["id"], "새") for op in ops if op.get("op") == "add" and op.get("id")]
+    out += [(op["new_id"], "갱신") for op in ops if op.get("op") == "supersede" and op.get("new_id")]
+    out += [(op["id"], "강화") for op in ops if op.get("op") == "reinforce" and op.get("id")]
+    return out
+
+
+def _current_headlines(ids: list) -> dict:
+    """``{id: headline}`` of the active records among ``ids`` (read only; best effort, never raises)."""
+    out: dict = {}
+    if not ids:
+        return out
+    try:
+        mem = td.load_mem()
+        if not mem.DB.exists():
+            return out
+        con = mem.get_con()
+        try:
+            for rid in ids:
+                row = con.execute("SELECT headline, status FROM records WHERE id=?", (rid,)).fetchone()
+                if row and row[1] == "active":
+                    out[rid] = " ".join(str(row[0] or "").split())[:120]
+        finally:
+            con.close()
+    except BaseException:  # noqa: BLE001 - the list is a nicety, never a reason to fail the tidy
+        return out
+    return out
+
+
+def memory_refs(run_dir: Path, bundle: Optional[Bundle]) -> tuple:
+    """``(refs, more)``: records this batch touched (from the journal, so only what landed) first,
+    then the existing records the worker named as related; at most 8 and 1,200 UTF-8 bytes."""
+    entries = list(journal_ids(run_dir))
+    seen = {rid for rid, _ in entries}
+    entries += [(rid, "관련") for rid in (bundle.related if bundle else []) if rid not in seen]
+    heads = _current_headlines([rid for rid, _ in entries])
+    refs, used, total = [], 0, 0
+    for rid, kind in entries:
+        if rid not in heads:
+            continue
+        total += 1
+        line = f"- {rid} [{kind}] {heads[rid]}"
+        size = len(line.encode("utf-8")) + 1
+        if len(refs) < st.MEMORY_REFS_MAX and used + size <= st.MEMORY_REFS_BYTES:
+            refs.append({"id": rid, "kind": kind, "headline": heads[rid]})
+            used += size
+    return refs, total - len(refs)
+
+
+def publish_memory(item: dict, batch: str, run_dir: Path, bundle: Optional[Bundle], status: str,
+                   detail: str = "") -> None:
+    """Refresh the seat card's "참고할 기억" list (never touches the card itself); best effort."""
+    with contextlib.suppress(BaseException):
+        refs, more = memory_refs(run_dir, bundle) if status != "failed" or journal_ids(run_dir) else ([], 0)
+        st.update_memory_refs(st.Seat(**item["seat"]), batch=batch, status=status, refs=refs, more=more,
+                              coverage=coverage_note(bundle) if bundle else "", detail=detail,
+                              result_path=str(run_dir / "result.json"),
+                              source_generation=item.get("card_generation"))
+
+
 def failure_line(reason: str, batch: str = "", applied: tuple = (0, 0)) -> str:
     reason = " ".join(str(reason).split(" — 되돌리기")[0].split())[:80]
     done, unconfirmed = applied
@@ -625,6 +864,14 @@ def failure_line(reason: str, batch: str = "", applied: tuple = (0, 0)) -> str:
     return f"[정리] 기억 정리를 끝내지 못했습니다. 카드와 기존 기억은 그대로이고 다음 정리 때 이어서 처리됩니다. (사유: {reason})"
 
 
+def _with_coverage(line: str, note: str) -> str:
+    """Put the coverage note before the undo command so a cut never takes the undo away."""
+    if not note:
+        return line
+    head, sep, undo = line.partition(" — 되돌리기")
+    return f"{head} · {note}{sep}{undo}"
+
+
 def process_item(item: dict) -> None:
     attempts = int(item.get("attempts", 0))
     batch = item["id"] if attempts == 0 else f"{item['id']}-r{attempts}"
@@ -632,38 +879,60 @@ def process_item(item: dict) -> None:
     run_dir = st.ensure_dir(_runs_dir() / batch)
     set_status(item, "assembling", batch=batch)
     bundle = None
+    finished = False
     try:
         bundle = assemble(item, batch, run_dir)
         if bundle.empty:
             # The notice goes first: a terminal status means "the notice was left".
-            notify(item, "[정리] 새로 정리할 대화가 없습니다.")
-            set_status(item, "notified", result="nothing-new")
+            note = coverage_note(bundle)
+            # Unread ranges left means the read part had nothing to tidy, never "nothing new".
+            notify(item, f"[정리] 읽은 범위에는 정리할 대화가 없었습니다 · {note}" if note
+                   else "[정리] 새로 정리할 대화가 없습니다.")
+            set_status(item, "notified", result="nothing-in-range" if note else "nothing-new")
+            finished = True
             return
-        set_status(item, "dispatching")
+        set_status(item, "dispatching", exchange=str(prepare_exchange(item, batch, bundle)))
         receipt = dispatch_worker(item, batch, run_dir, bundle)
         set_status(item, "waiting-worker", attempt_id=receipt["attempt_id"])
-        wait_worker(receipt, run_dir)
+        wait_worker(receipt, run_dir, bundle.exchange / "actions.json")
         set_status(item, "validating")
         validate_actions(run_dir, batch, bundle)
         set_status(item, "applying")
         line = apply_actions(item, run_dir, bundle)
-        advance_watermarks(bundle)
+        result = st.read_json(run_dir / "result.json")
+        over = int(result.get("discarded_over_budget") or 0) if isinstance(result, dict) else 0
+        if over:
+            # Proposals beyond the batch's ten were dropped: that conversation is read again next time.
+            line = _with_coverage(line, "상한을 넘은 제안은 다음 정리에서 다시 봅니다")
+        else:
+            advance_watermarks(bundle)
+            line = _with_coverage(line, coverage_note(bundle))
+        publish_memory(item, batch, run_dir, bundle, "applied" if not over else "partial",
+                       "상한 초과 제안 폐기" if over else "")
         notify(item, line)
         set_status(item, "notified", result="applied")
+        finished = True
     except RunnerFailure as exc:
         _log(run_dir, f"failed: {exc}")
         applied = applied_writes(run_dir)
+        publish_memory(item, batch, run_dir, bundle, "failed", str(exc)[:80])
         notify(item, failure_line(str(exc), batch, applied))
         set_status(item, "failed", error=str(exc), applied=list(applied))
     except BaseException as exc:  # noqa: BLE001 - nothing may leave an entry half-done
         _log(run_dir, f"failed: internal {type(exc).__name__}: {exc}")
         applied = applied_writes(run_dir)
+        publish_memory(item, batch, run_dir, bundle, "failed", f"internal {type(exc).__name__}")
         notify(item, failure_line(f"internal {type(exc).__name__}", batch, applied))
         set_status(item, "failed", error=f"internal {type(exc).__name__}", applied=list(applied))
     finally:
         for name in ("input_v1.json", "prompt.md"):
             with contextlib.suppress(OSError):
                 os.unlink(run_dir / name)
+        # The conversation copy and the prompt go in every case; the rest of the worker's folder goes
+        # with a clean finish (a failed batch keeps its actions.json until the entry is pruned).
+        remove_exchange(item.get("exchange"), only_conversation=not finished)
+        if finished:
+            remove_exchange(item.get("exchange"))
 
 
 def prune_finished() -> None:
@@ -671,6 +940,7 @@ def prune_finished() -> None:
     for item in list_items():
         if item["status"] in UNFINISHED or float(item.get("updated", _now()) or 0) >= cutoff:
             continue
+        remove_exchange(item.get("exchange"))
         for suffix in (".json", ".pid"):
             with contextlib.suppress(OSError):
                 os.unlink(_queue_dir() / f"{item['id']}{suffix}")

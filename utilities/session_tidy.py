@@ -29,7 +29,7 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
     cards/<seat>.json|.md   latest card (canonical JSON + readable text)
     card-history/<seat>/    bounded older cards
     sessions/<seat>.jsonl   seat ledger: one line per hook/card event
-    consumed/<seat>.json    who already received the latest card generation
+    consumed/<seat>.json    who already received the latest card generation (+ the "참고할 기억" revision)
     reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
     notices/<seat>.json     result lines waiting for the next start/prompt
     locks/<seat>.lock       flock for the read-modify-write above
@@ -62,6 +62,9 @@ SCHEMA = 1
 HARNESSES = ("claude", "codex", "opencode")
 CARD_BODY_MAX_BYTES = 8 * 1024
 INJECTION_MAX_BYTES = 2400
+MEMORY_REFS_MAX = 8                 # "참고할 기억" (card layer B): records listed
+MEMORY_REFS_BYTES = 1200            # ... and the bytes their lines may take
+CARD_MIN_WHEN_BUNDLED = 900         # the card keeps at least this much room when B rides along
 NOTICE_MAX_BYTES = 500
 CARD_HISTORY_KEEP = 20
 LEDGER_FOLD_LINES = 500
@@ -447,6 +450,8 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
     }
     if prompt_seq is not None:
         card["prompt_seq"] = int(prompt_seq)    # lets enqueue notice a prompt typed after the card
+    if previous and isinstance(previous.get("memory_refs"), dict):
+        card["memory_refs"] = previous["memory_refs"]   # layer B outlives the card: only its revision moves it
     if previous:
         history = ensure_dir(state_root() / "card-history" / seat.key)
         atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
@@ -454,9 +459,83 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
             with contextlib.suppress(OSError):
                 old.unlink()
     atomic_write_json(card_json_path(seat), card)
-    header = f"# session card {generation} — {card['authored_at']} ({harness} {sid[:8]})\n\n"
-    atomic_write(card_text_path(seat), (header + body + "\n").encode("utf-8"))
+    atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
     return card
+
+
+def render_card_text(card: dict) -> str:
+    """The readable card file: header, the card body (layer A), and the "참고할 기억" section (layer B)."""
+    author = card.get("author") or {}
+    header = (f"# session card {card.get('generation')} — {card.get('authored_at')} "
+              f"({author.get('harness', '')} {str(author.get('sid', ''))[:8]})\n\n")
+    text = header + str(card.get("body", "")) + "\n"
+    refs = card.get("memory_refs")
+    if isinstance(refs, dict) and refs.get("revision"):
+        text += "\n" + build_memory_injection(refs, MEMORY_REFS_BYTES + 600) + "\n"
+    return text
+
+
+STATUS_LABEL = {"applied": "정돈 결과", "partial": "일부만 반영", "failed": "정돈을 끝내지 못함"}
+
+
+def build_memory_injection(refs: dict, room: int) -> str:
+    """The "참고할 기억" section within ``room`` UTF-8 bytes: ids and headlines only, never a record body.
+
+    The header, the coverage/reason lines and the result path always survive; list lines are dropped
+    from the end first and counted as "외 N건".
+    """
+    head = f"[참고할 기억] 묶음 {refs.get('batch', '')} — {STATUS_LABEL.get(refs.get('status'), '')}".rstrip(" —")
+    tail = [str(refs[k]) for k in ("coverage",) if refs.get(k)]
+    if refs.get("detail"):
+        tail.append(f"사유: {refs['detail']}")
+    items = [f"- {r.get('id', '')} [{r.get('kind', '')}] {r.get('headline', '')}" for r in refs.get("refs") or []
+             if isinstance(r, dict)]
+    hidden = int(refs.get("more") or 0)
+    path = f"전체 결과: {refs['result_path']}" if refs.get("result_path") else ""
+    fixed = [head] + tail + ([path] if path else [])
+    room = max(0, room)
+    used = sum(len(x.encode("utf-8")) + 1 for x in fixed)
+    shown: list = []
+    for line in items:
+        size = len(line.encode("utf-8")) + 1
+        if used + size + (24 if len(shown) + 1 < len(items) or hidden else 0) > room:
+            break
+        shown.append(line)
+        used += size
+    omitted = len(items) - len(shown) + hidden
+    lines = [head] + shown + ([f"외 {omitted}건"] if omitted else []) + tail + ([path] if path else [])
+    return _cut_bytes("\n".join(lines), room)[0] if room else ""
+
+
+def update_memory_refs(seat: Seat, *, batch: str, status: str, refs: list, more: int = 0, coverage: str = "",
+                       detail: str = "", result_path: str = "", source_generation: Optional[int] = None,
+                       now: Optional[float] = None) -> Optional[dict]:
+    """Set the latest card's layer B ("참고할 기억") for a finished tidy batch; takes the seat lock.
+
+    Only ``memory_refs`` changes: the card's body, author, time and generation stay, so layer A is
+    never handed out again because of this.  ``revision`` rises by one per batch result for the seat
+    and is what the hooks hand out once.  The same batch with the same result changes nothing, and a
+    batch that finishes after a newer card was written still lands here (marked with the generation
+    it was queued under).  No card, no layer: ``None``.
+    """
+    now = now_epoch() if now is None else now
+    with seat_lock(seat.key):
+        card = read_latest_card(seat)
+        if not card:
+            return None
+        old = card.get("memory_refs") if isinstance(card.get("memory_refs"), dict) else {}
+        new = {"batch": batch, "status": status, "refs": refs, "more": int(more), "coverage": coverage,
+               "detail": detail, "result_path": result_path}
+        if old and all(old.get(k) == v for k, v in new.items()):
+            return old
+        new["revision"] = int(old.get("revision", 0) or 0) + 1
+        new["source_generation"] = int(card.get("generation", 0) or 0) if source_generation is None \
+            else int(source_generation)
+        new["updated"] = iso_utc(now)
+        card["memory_refs"] = new
+        atomic_write_json(card_json_path(seat), card)
+        atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
+        return new
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +544,15 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
 
 def _consumed_path(seat: Seat) -> Path:
     return state_root() / "consumed" / f"{seat.key}.json"
+
+
+def _write_consumed(seat: Seat, **fields) -> None:
+    """Merge ``fields`` into the seat's consumption file (layer A and layer B receipts are independent)."""
+    consumed = read_json(_consumed_path(seat))
+    data = dict(consumed) if isinstance(consumed, dict) else {}
+    data.update(fields)
+    data["schema"] = SCHEMA
+    atomic_write_json(_consumed_path(seat), data)
 
 
 def _receipt(harness: str, sid: str, epoch: int) -> str:
@@ -633,6 +721,8 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             parts.append(notice_block)
         card = read_latest_card(seat)
         card_due = False
+        memory_due = False
+        memory = None
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
@@ -643,9 +733,24 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             taken = isinstance(consumed, dict) and consumed.get("generation") == card.get("generation") \
                 and bool(consumed.get("receipts"))
             card_due = eligible and not taken
+            # Layer B ("참고할 기억") has its own revision and its own receipt: a session that already
+            # took card generation N still gets a newer B once, and the writer of the card (who
+            # could be cleared next) does not use it up before the new session can see it.
+            memory = card.get("memory_refs") if isinstance(card.get("memory_refs"), dict) else None
+            taken_rev = int(consumed.get("memory_revision", 0) or 0) if isinstance(consumed, dict) else 0
+            memory_due = bool(memory) and eligible and int(memory.get("revision", 0) or 0) > taken_rev
+            used = len(notice_block.encode("utf-8")) + (1 if notice_block else 0)
+            room = INJECTION_MAX_BYTES - used
+            memory_text = ""
+            if memory_due:
+                wanted = build_memory_injection(memory, MEMORY_REFS_BYTES + 600)
+                memory_text = build_memory_injection(
+                    memory, min(len(wanted.encode("utf-8")), room - CARD_MIN_WHEN_BUNDLED - 1) if card_due else room)
+                room -= len(memory_text.encode("utf-8")) + 1
             if card_due:
-                room = INJECTION_MAX_BYTES - len(notice_block.encode("utf-8")) - (1 if notice_block else 0)
                 parts.append(build_card_injection(card, card_text_path(seat), now, room))
+            if memory_text:
+                parts.append(memory_text)
         text = "\n".join(parts)
         if not text:
             return ""
@@ -655,14 +760,24 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             receipts = list(consumed.get("receipts", [])) if isinstance(consumed, dict) \
                 and consumed.get("generation") == card.get("generation") else []
             receipts.append(_receipt(harness, sid, epoch))
-            atomic_write_json(_consumed_path(seat), {"schema": SCHEMA, "generation": card["generation"],
-                                                     "receipts": receipts[-200:]})
+            _write_consumed(seat, generation=card["generation"], receipts=receipts[-200:])
+        if memory_due:
+            consumed = read_json(_consumed_path(seat))
+            same = isinstance(consumed, dict) and consumed.get("memory_revision") == memory["revision"]
+            receipts = list(consumed.get("memory_receipts", [])) if same else []
+            receipts.append(_receipt(harness, sid, epoch))
+            _write_consumed(seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
         if notices:
             shown = {n["id"] for n in notices}
             data = read_json(_notices_path(seat))
             rest = [i for i in (data.get("items", []) if isinstance(data, dict) else []) if i.get("id") not in shown]
             atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest})
-        atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": text, "at": now})
+        # OpenCode re-emits this cache every turn: a later "참고할 기억" is added to what the session
+        # already received instead of replacing it.
+        earlier = read_json(_reread_path(harness, sid))
+        kept = str(earlier.get("text") or "") if isinstance(earlier, dict) and earlier.get("epoch") == epoch else ""
+        cached = _cut_bytes(kept + "\n" + text, 2 * INJECTION_MAX_BYTES)[0] if kept else text
+        atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": cached, "at": now})
         return text
 
 

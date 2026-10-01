@@ -47,7 +47,9 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    It prints one line and returns. A detached runner reads the conversation after the
    last tidy (plus recent untidied sessions of this seat), starts one registered memory
    worker, applies its proposal through `mem tidy-apply`, and leaves one result line for
-   the next session of this seat — with the command that undoes it. A failure leaves the
+   the next session of this seat — with the command that undoes it. A long conversation is
+   read from its recent end first; the line says `일부만 읽음(범위)` when an older part is
+   still waiting for the next tidy. A failure leaves the
    card as it was and says so in one line; if some writes had landed or may have landed, that
    line counts them and keeps the undo command.
 
@@ -75,4 +77,6 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    (`<cmd>` is the hint, or `/clear` after `skipped`; OpenCode's is `/new`).
 
 The next session at this seat receives the latest card once, at start or on its first
-prompt, together with any pending result line.
+prompt, together with any pending result line and a short "참고할 기억" list (ids and titles
+only, read with `mem show <id>` when needed). If the tidy ends after that session started, the
+list arrives once at its next prompt.
