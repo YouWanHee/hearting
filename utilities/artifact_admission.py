@@ -802,6 +802,34 @@ def _preserved_documents(root: Path, cycle_id: Any) -> List[Mapping[str, Any]]:
     return documents
 
 
+def _retired_documents(root: Path) -> Dict[str, List[Mapping[str, Any]]]:
+    """The preserved documents of every cycle the root deleted (§45 D-126), by cycle ID.
+
+    A deleted cycle has no current row, but its IDs stay owned: a rebuilt index folds these
+    documents in and then drops the cycle's own rows, so no ID a deleted cycle used is issued again."""
+    directory = Path(root) / _CYCLE_RECORD_REL
+    try:
+        names = sorted(os.listdir(str(directory)))
+    except OSError:
+        return {}
+    found: Dict[str, List[Mapping[str, Any]]] = {}
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            raw = (directory / name).read_bytes()
+            if b'"deleted_at"' not in raw:
+                continue
+            record = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(record, dict) and record.get("deleted_at") and _CYCLE_ID_FILE_RE.match(str(record.get("cycle_id"))):
+            documents = _preserved_documents(root, record["cycle_id"])
+            if documents:
+                found[record["cycle_id"]] = documents
+    return found
+
+
 def _compute_rebuilt_index(
     root: Path,
 ) -> Tuple[artifact_index.IndexDocument, List[str]]:
@@ -863,14 +891,24 @@ def _compute_rebuilt_index(
                 items.append((document, cycle_path, digest, idempotency_key))
                 if earlier:
                     preserved[cycle_id] = earlier
-    if not items:
+    present = {(doc.get("cycle") or {}).get("cycle_id") for doc, _p, _d, _k in items}
+    retired = {cycle_id: docs for cycle_id, docs in _retired_documents(root).items() if cycle_id not in present}
+    if not items and not retired:
         return artifact_index.empty(identity.artifact_root_id), fallback_keys
     return artifact_index.build(
-        items, known_parent_cycle_ids=_producer_cycle_ids(root), preserved=preserved), fallback_keys
+        items, known_parent_cycle_ids=_producer_cycle_ids(root), preserved=preserved,
+        retired=retired, artifact_root_id=identity.artifact_root_id), fallback_keys
 
 
 def rebuild_index(root: Path) -> artifact_index.IndexDocument:
     root = Path(root)
+    try:
+        # §45 D-126: a cycle or campaign folder moved, renamed or removed by hand is found first, so the
+        # index is rebuilt from records that say where things are.  Never an error for the rebuild.
+        import artifact_producer
+        artifact_producer.reconcile_root(root)
+    except Exception:  # noqa: BLE001
+        pass
     index, fallback_keys = _compute_rebuilt_index(root)
     # A manifest-id fallback means the caller-supplied idempotency key was not
     # recoverable (index absent), so an exact retry with the original custom

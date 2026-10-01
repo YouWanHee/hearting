@@ -105,7 +105,9 @@ DETACHED_STATES = frozenset({"abandoned", "no-lineage"})
 
 
 def is_member_record(record):
-    return isinstance(record, dict) and record.get("state") not in DETACHED_STATES
+    # A deleted cycle (§45 D-126) keeps its record but is no longer a member of anything.
+    return (isinstance(record, dict) and record.get("state") not in DETACHED_STATES
+            and not record.get("deleted_at"))
 
 
 def campaign_records(root, campaign_id):
@@ -606,6 +608,7 @@ def _snapshot(root, path):
 
 def status(root, selection):
     root = Path(root).resolve()
+    _reconcile(root)
     path = campaign_path(root, selection)
     record, _ = read_json(root, path)
     folded = campaign_state(root, path, record)
@@ -734,6 +737,31 @@ def _new_event(root, path, state, event_type, actor, payload, provenance):
     return event
 
 
+def _reconcile(root):
+    """§45 D-126: a cycle or campaign folder moved, renamed or removed by hand is found before the
+    campaign is read.  Never an error for the caller."""
+    try:
+        import artifact_producer as producer
+        producer.reconcile_root(root)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _state_line(root, event, action):
+    """§45 D-125: the close or reopen leaves one `state` line; a recorder that cannot take it keeps it
+    in the campaign's runtime record.  Never fails the close."""
+    try:
+        import artifact_producer as producer
+        payload = event.get("payload") or {}
+        reason = (payload.get("closure") or {}).get("reason") if action == "close" else payload.get("reason")
+        before, after = ("active", "satisfied") if action == "close" else ("satisfied", "active")
+        producer.record_campaign_state_line(
+            root, event["target_id"], before=before, after=after, reason=reason if isinstance(reason, str) else None,
+            event_id=event.get("event_id"), command="campaign-" + action)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _commit_event(root, path, event, action):
     campaign_id = event["target_id"]
     _index_update(locator.prepare_index_update, root, campaign_id)
@@ -741,6 +769,7 @@ def _commit_event(root, path, event, action):
         _publish_event(root, path, event)
         result = _materialize(root, path)
         _index_update(locator.update_indexes, root, campaign_id)
+        _state_line(root, event, action)
         return result
     except Exception as exc:
         try:
@@ -791,6 +820,7 @@ def _close_locked(root, path, *, reason=None):
 
 def close(root, selection, *, reason=None):
     root = Path(root).resolve()
+    _reconcile(root)
     path = campaign_path(root, selection)
     lock = admission._acquire_lock(root, admission.LOCK_TIMEOUT_DEFAULT)
     try:
@@ -829,6 +859,7 @@ def _reopen_locked(root, path, *, actor_id=None, reason="manual", route_id=None,
 
 def reopen(root, selection, *, reason=None):
     root = Path(root).resolve()
+    _reconcile(root)
     path = campaign_path(root, selection)
     lock = admission._acquire_lock(root, admission.LOCK_TIMEOUT_DEFAULT)
     try:

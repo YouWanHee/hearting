@@ -1,6 +1,6 @@
 """Retryable direct inline route finish transaction."""
 from __future__ import annotations
-import fcntl, hashlib, json, os, stat, subprocess, sys, tempfile
+import fcntl, hashlib, json, os, stat, subprocess, sys, tempfile, time
 import fnmatch
 from pathlib import Path
 from typing import Any, Mapping
@@ -131,8 +131,14 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
     admitted = artifact_producer.cycle_route_admission(root, record, route, finalize=True)
     if not admitted.allow:
         raise InlineFinishError("finish-route-cycle-" + admitted.reason)
-    campaign = artifact_producer.read_campaign(root, record["campaign_id"])
-    if not campaign or campaign.get("key") != route.get("campaign_key") or not route.get("campaign_key"):
+    if record.get("deleted_at") and not finished:
+        # The cycle was deleted while its route ran (§45 D-126): the route ends as a route with no output.
+        return _finish_deleted_cycle(root, route, route_file, record, args, api)
+    # A campaign deleted since the finish is the campaign it was; a cycle moved to another campaign is
+    # still this route's cycle (§45 D-126), so its campaign's key is not the route's to compare.
+    campaign = artifact_producer.campaign_or_tombstone(root, record["campaign_id"])
+    if not campaign or not route.get("campaign_key") or (
+            campaign.get("key") != route.get("campaign_key") and not record.get("moved_at") and not finished):
         raise InlineFinishError("finish-campaign-key-mismatch")
     if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
         raise InlineFinishError("finish-active-review-lease")
@@ -208,7 +214,8 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
               "summary_sha256":_digest(summary_raw) if summary_raw is not None else recorded_intent.get("summary_sha256"),
               "commit":commit, "cycle_record_digest":dispatch_terminal_commit.cycle_identity_digest(record)}
     if finished and all(recorded_intent.get(key) == value for key, value in intent.items()
-                        if key not in {"evidence_sha256", "summary_sha256", "campaign_id", "cycle_record_digest"}):
+                        if key not in {"evidence_sha256", "summary_sha256", "campaign_id", "cycle_record_digest",
+                                       "campaign_key"}):
         # The same finish, asked again after its files or its cycle's campaign moved on:
         # what it recorded stands (the receipt is not rewritten, nor is it cancelled).
         intent = dict(recorded_intent)
@@ -407,6 +414,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                         or state.get("receipt", {}).get("terminal_marker_digest") != marker_digest):
                     raise InlineFinishError("finish-seal-drift")
             result = dict(state["receipt"]); result["replay"] = replayed_at_entry
+            if finished and verified.get("deleted"):
+                # Information only: the cycle (or its campaign) was deleted after the finish.
+                result["deleted_since"] = True
             if finished and verified.get("updated_since"):
                 # Information only: the stored receipt keeps the revision it finished at.
                 result["manifest_updated_since"] = verified["current_manifest_digest"]
@@ -419,6 +429,25 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             return result
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+def _finish_deleted_cycle(root: Path, route: dict, route_file: Path, record: dict, args, api) -> dict:
+    """Close the route of a deleted cycle the way the runtime closes one nobody works on: no proof is
+    claimed, and the cycle ends with the existing no-output record (the folder is not made again)."""
+    try:
+        summary = Path(args.summary_file).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        summary = ""
+    commit = str(args.commit or api._head_commit(route["cwd"]) or "").lower() or None
+    api.close_route(route, route_file, commit, summary or f"{route.get('capability')} {route.get('slug') or route['route_id']}",
+                    allow_unproven=True,
+                    autoclose={"reason": "cycle-deleted", "trigger": "finish", "closed_by": "finish",
+                               "proof": "not-claimed",
+                               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="abandoned",
+                               abandon_reason="route-unrecoverable")
+    return {"schema": "finish_receipt_v1", "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "cycle_id": record["cycle_id"], "state": "cycle-deleted", "terminal_gate_proven": False}
+
 
 def pending_state(root: Path, route_id: str):
     return _read(Path(root)/".runtime"/"inline-finish"/"v1"/route_id/"finish.json")

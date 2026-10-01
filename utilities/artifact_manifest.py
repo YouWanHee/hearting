@@ -1537,6 +1537,7 @@ def validate_update(
     preserved: Sequence[Mapping[str, Any]] = (),
     previous: Optional[Mapping[str, Any]] = None,
     published: bool = False,
+    changeable_cycle_fields: Sequence[str] = (),
 ) -> ValidationReport:
     """§45 D-124: a document the runtime published after the cycle closed.
 
@@ -1547,7 +1548,8 @@ def validate_update(
     asked again, so removing a required or every file leaves a valid document.
     With `previous` the document must also keep that document's events, and
     its routes, exactly as they were: only a revision record (or the terminal
-    record of a later route) may follow.  `published=True` reads a document
+    record of a later route) may follow; `changeable_cycle_fields` names the cycle
+    fields a move (`campaign_id`) or a parent change (`parent_cycle_id`) may differ in.  `published=True` reads a document
     that is already out (a rebuild, a proof): a reference no preserved copy
     resolves any more is then accepted, because losing a copy must not turn a
     finished cycle into a broken one -- only publishing a new document asks for
@@ -1584,6 +1586,8 @@ def validate_update(
     before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
     after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
     for key in ("cycle_id", "campaign_id", "state", "parent_cycle_id", "started_on", "input_digest"):
+        if key in changeable_cycle_fields:
+            continue  # a move or a new parent (§45 D-126) says which fields it may change
         if before_cycle.get(key) != after_cycle.get(key):
             violations.append(Violation(
                 "update-cycle-field-changed", "$.cycle.%s" % key, "a refresh does not change the cycle"))

@@ -484,11 +484,28 @@ def apply(
     )
 
 
+def retire(index: IndexDocument, cycle_id: str) -> IndexDocument:
+    """§45 D-126: a deleted cycle has no current row; every ID its documents declared stays owned.
+
+    The cycle's `manifests` and `cycles` rows go; `stable_ids`, `routes`, `event_ids` and `streams`
+    keep naming it, so an ID it used is never issued again and an earlier reference still resolves."""
+    if cycle_id not in index.manifests and cycle_id not in index.cycles:
+        return index
+    manifests = {k: v for k, v in index.manifests.items() if v.get("cycle_id") != cycle_id and k != cycle_id}
+    cycles = {k: v for k, v in index.cycles.items() if k != cycle_id}
+    return IndexDocument(
+        schema_version=index.schema_version, artifact_root_id=index.artifact_root_id,
+        stable_ids=index.stable_ids, routes=index.routes, event_ids=index.event_ids,
+        streams=index.streams, manifests=manifests, cycles=cycles)
+
+
 def build(
     admitted: Iterable[Tuple[Mapping[str, Any], str, str, str]],
     *,
     known_parent_cycle_ids: Optional[Collection[str]] = None,
     preserved: Optional[Mapping[str, Iterable[Mapping[str, Any]]]] = None,
+    retired: Optional[Mapping[str, Iterable[Mapping[str, Any]]]] = None,
+    artifact_root_id: Optional[str] = None,
 ) -> IndexDocument:
     """Rebuild from published documents, refusing cross-manifest conflicts.
 
@@ -498,6 +515,9 @@ def build(
     (a removed artifact or revision) stays owned by its cycle, so a rebuilt
     index refuses to reuse it just as the incrementally updated one does.
 
+    ``retired`` maps a deleted cycle's ID to its preserved documents (§45 D-126): they own their IDs
+    again after the rebuild, but the cycle has no current row.
+
     Rebuild input order is directory order, not admission order, so per-item
     stream-continuity cursors cannot be enforced here; instead the union of
     each stream's sequences is verified for duplicates and gaps after the fold.
@@ -505,9 +525,9 @@ def build(
     a conflict is a refusal, never a silent overwrite (D-7).
     """
     items = list(admitted)
-    if not items:
+    if not items and not artifact_root_id:
         raise ValueError("build() requires at least one admitted document to seed artifact_root_id")
-    root_id = items[0][0].get("artifact_root_id")
+    root_id = items[0][0].get("artifact_root_id") if items else artifact_root_id
     index = empty(root_id)
     stream_sequences: Dict[str, Dict[int, int]] = {}
     for document, cycle_path, manifest_digest, idempotency_key in items:
@@ -560,6 +580,10 @@ def build(
             manifest_digest=manifest_digest,
             idempotency_key=idempotency_key,
         )
+    for retired_id, old_documents in sorted((retired or {}).items()):
+        for old in old_documents:
+            index = apply(index, old, cycle_path="", manifest_digest="", idempotency_key=retired_id)
+        index = retire(index, retired_id)
     for stream_id, bucket in sorted(stream_sequences.items()):
         duplicates = sorted(seq for seq, count in bucket.items() if count > 1)
         if duplicates:

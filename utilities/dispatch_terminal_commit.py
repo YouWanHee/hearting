@@ -1070,14 +1070,38 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         return TerminalCommitResult("recoverable", "recovery-unavailable", str(exc))
 
 
+def _missing_after_seal(artifact_root: Path, primary: Path) -> str:
+    """Why the sealed report is not there: its cycle was deleted since (§45 D-126), or it moved on.
+
+    Information beside the stored envelope, never a failure."""
+    directory = Path(artifact_root) / ".runtime/artifact-producer/v1/cycles"
+    try:
+        names = os.listdir(str(directory))
+    except OSError:
+        return "primary-missing-after-seal"
+    text = primary.as_posix()
+    for name in names:
+        try:
+            raw = (directory / name).read_bytes()
+            if b'"deleted_at"' not in raw:
+                continue
+            record = json.loads(raw)
+        except (OSError, ValueError):
+            continue
+        locator = record.get("locator") if isinstance(record, dict) else None
+        if isinstance(locator, str) and locator and record.get("deleted_at") and f"/{locator}/" in text:
+            return "cycle-deleted-after-seal"
+    return "primary-missing-after-seal"
+
+
 def _sealed_owner_envelope(request, commit_id):
     """The stored envelope text and what became of its primary report afterwards.
 
     The envelope and its content digest, and the commit identity they were sealed
     under, are proved.  The report the envelope names is judged only as news
     (§45 D-127): `None` when it still holds the sealed bytes, else
-    `primary-changed-after-seal` or `primary-missing-after-seal` (edited, moved,
-    or removed).  Nothing here fails because the report moved on."""
+    `primary-changed-after-seal`, `primary-missing-after-seal` (moved or removed) or
+    `cycle-deleted-after-seal` (its cycle was deleted, §45 D-126).  Nothing here fails because the report moved on."""
     slot = _commit_state_path(request).parent
     try:
         meta = json.loads((slot / "owner-envelope.json").read_text())
@@ -1092,11 +1116,11 @@ def _sealed_owner_envelope(request, commit_id):
     if not primary.is_absolute():
         raise TerminalCommitError("recovery-unavailable", "primary-no-longer-in-root")
     if not _in_root_regular(primary, request.artifact_root.resolve()):
-        return text, "primary-missing-after-seal"
+        return text, _missing_after_seal(request.artifact_root, primary)
     try:
         sealed_bytes = primary.read_bytes()
     except OSError:
-        return text, "primary-missing-after-seal"
+        return text, _missing_after_seal(request.artifact_root, primary)
     if _digest(sealed_bytes) != meta.get("primary_digest"):
         return text, "primary-changed-after-seal"
     return text, None

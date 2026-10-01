@@ -8,7 +8,9 @@ D-127 proofs (a finished cycle stays finished after its files change);
 `test_b1_*` covers the bounded, lock-free scan of D-124 and the history calls of
 D-125 (a refresh is one short publication, never a long lock);
 `test_b2_*` covers the triggers that start it (begin, Claude Stop, Codex Stop, OpenCode
-`session.idle`) and the root cursor they share.  Every
+`session.idle`) and the root cursor they share;
+`test_c1_*` covers D-126 (cycle-move, cycle-mark, delete, and a hand-made move or
+deletion found again by the next list, begin or close).  Every
 fixture runs on an isolated temporary artifact root; the real canonical root,
 registry, and routes directory are never touched.
 """
@@ -1966,6 +1968,929 @@ class B2TriggerTest(B1RefreshBase):
             self.assertEqual((quiet["status"], quiet["reason"]), ("skipped", "min-interval"))
             explicit = P.checkpoint(self.root, cycle_id=cycles[4]["cycle_id"], trigger="explicit", now=stamp + 60)
             self.assertEqual(explicit["status"], "emitted")
+
+
+TASLP_ROOT = Path("/home/nas/user/Uihyeop/IIPLab/projects/2025-12_TASLP_SR-CorrNet/.agent_reports")
+TASLP_MANUSCRIPT = "cyc_8513b910a82937ab87404e5d0677c7ce"
+TASLP_CHEATSHEET = "cyc_a33b829c03c2d972fd59271e3de169fd"
+RFC3339 = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
+
+
+class C1ChangesBase(B1RefreshBase):
+    """§45 D-126: moving, marking and deleting cycles, and finding a hand-made change."""
+
+    def closed_with(self, slug, campaign_key, files=None, *, activate=False):
+        if activate:
+            self.activate()
+        route, route_file = self.route(slug=slug, campaign_key=campaign_key)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        for rel, data in (files or {"plans/cycle/plan.md": b"plan body\n"}).items():
+            self.write_output(result, rel, data)
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        self.history.made.clear()
+        self.history.published.clear()
+        return result
+
+    def open_with(self, slug, campaign_key):
+        route, route_file = self.route(slug=slug, campaign_key=campaign_key)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.write_output(result, "plans/cycle/draft.md", b"draft\n")
+        self.history.made.clear()
+        return route, route_file, result
+
+    def record(self, result):
+        return P.read_cycle_record(self.root, result["cycle_id"])
+
+    def lines(self, **match):
+        return [m for m in self.history.made if all(m.get(k) == v for k, v in match.items())]
+
+    def cycle_path(self, result):
+        record = self.record(result)
+        return P.cycle_dir(self.root, record["campaign_id"], record["cycle_id"], record)
+
+    def index_row(self, result):
+        index = adm.load_index(self.root)
+        return index.cycles.get(result["cycle_id"]), index.manifests.get(result["cycle_id"])
+
+    def locator_map(self):
+        return json.loads((self.root / "campaigns" / "INDEX.json").read_text(encoding="utf-8"))
+
+    def tree_digest(self, top):
+        digest = hashlib.sha256()
+        for path in sorted(Path(top).rglob("*")):
+            if path.is_file():
+                digest.update(path.relative_to(top).as_posix().encode())
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    def taslp_copy(self):
+        if not TASLP_ROOT.is_dir():
+            self.skipTest("the TASLP root is not on this host")
+        target = Path(self._tmp.name) / "taslp-copy"
+        shutil.copytree(TASLP_ROOT, target, symlinks=True)
+        return target
+
+
+class C1MarkTest(C1ChangesBase):
+    # -- A28-13 ------------------------------------------------------------
+    def test_c1_mark_discard_supersede_clear_open_and_closed(self):
+        closed = self.closed_with("mark-closed", "c1-mark", activate=True)
+        route, route_file, live = self.open_with("mark-open", "c1-mark")
+        gone = self.closed_with("mark-gone", "c1-mark")
+        P.delete_cycle(self.root, gone["cycle_id"])
+        for target in (closed, live):
+            cycle_id = target["cycle_id"]
+            before = self.record(target)
+            manifest_before = (self.cycle_path(target) / "manifest.json").read_bytes() \
+                if (self.cycle_path(target) / "manifest.json").exists() else None
+            files_before = self.tree_digest(self.cycle_path(target))
+            self.history.made.clear()
+            out = P.cycle_mark(self.root, cycle_id, discard=True, reason="owner said drop it")
+            self.assertEqual(out["status"], "marked", out)
+            after = self.record(target)
+            mark = after["disposition"]
+            self.assertEqual((mark["kind"], mark["reason"], mark["marked_by"]), ("discarded", "owner said drop it", "human"))
+            self.assertRegex(mark["marked_at"], RFC3339)
+            self.assertNotIn("superseded_by", mark)
+            # Only the one field moved: state, manifest digest, files and manifest bytes are as they were.
+            self.assertEqual({k: v for k, v in after.items() if k != "disposition"}, before)
+            self.assertEqual(self.tree_digest(self.cycle_path(target)), files_before)
+            if manifest_before is not None:
+                self.assertEqual((self.cycle_path(target) / "manifest.json").read_bytes(), manifest_before)
+            (line,) = self.lines(kind="lifecycle", field="disposition")
+            self.assertEqual((line["target_type"], line["target_id"], line["operation"]), ("cycle", cycle_id, "add"))
+            self.assertEqual(line["before"], {"value": None})
+            self.assertEqual(line["after"]["value"]["kind"], "discarded")
+            self.assertEqual(line["reason"], "owner said drop it")
+            # A mark never blocks a write, a close or a refresh.
+            self.write_output(target, "plans/cycle/after-mark.md", b"after the mark\n")
+            self.history.made.clear()
+            out = P.cycle_mark(self.root, cycle_id, superseded_by=[closed["cycle_id"] if target is live else live["cycle_id"],
+                                                                    gone["cycle_id"]])
+            mark = self.record(target)["disposition"]
+            self.assertEqual(mark["kind"], "superseded")
+            self.assertEqual(len(mark["superseded_by"]), 2)
+            self.assertIn(gone["cycle_id"], mark["superseded_by"])  # a deleted cycle is a valid replacement
+            self.assertIsNone(mark["reason"])
+            (line,) = self.lines(field="disposition")
+            self.assertEqual((line["operation"], line["before"]["value"]["kind"]), ("update", "discarded"))
+            self.history.made.clear()
+            P.cycle_mark(self.root, cycle_id, clear=True)
+            self.assertNotIn("disposition", self.record(target))
+            (line,) = self.lines(field="disposition")
+            self.assertEqual((line["operation"], line["after"]), ("delete", {"value": None}))
+            # Clearing what is not there still says so, once.
+            self.history.made.clear()
+            P.cycle_mark(self.root, cycle_id, clear=True)
+            self.assertNotIn("disposition", self.record(target))
+        self.assertEqual(self.record(live)["state"], "open")
+        self.assertEqual(self.record(closed)["state"], "sealed")
+        # A replacement that is no cycle of this root is the one thing named wrong.
+        with self.assertRaises(P.ProducerError):
+            P.cycle_mark(self.root, closed["cycle_id"], superseded_by=["cyc_" + "9" * 32])
+        # The command line: no confirmation flag, a reason when one is given.
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = P.main(["cycle-mark", "--artifact-root", str(self.root), "--cycle", closed["cycle_id"],
+                           "--discard", "--reason", "cli"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["status"], "marked")
+        self.assertEqual(self.record(closed)["disposition"]["reason"], "cli")
+
+    def test_c1_old_superseded_records_keep_display_semantics(self):
+        first = self.closed_with("old-sup-a", "c1-old-sup", activate=True)
+        second = self.closed_with("old-sup-b", "c1-old-sup")
+        P.mark_cycle_superseded(self.root, first["cycle_id"], superseded_by=[second["cycle_id"]],
+                                superseded_event_id="evt_" + "1" * 32)
+        record = self.record(first)
+        self.assertEqual(record["state"], "superseded")
+        shown = P.cycle_disposition(record)
+        self.assertEqual((shown["kind"], shown["superseded_by"]), ("superseded", [second["cycle_id"]]))
+        self.assertIsNone(P.cycle_disposition(self.record(second)))
+        # The old fields are left alone by a new mark and a clear, and the new field wins when both exist.
+        P.cycle_mark(self.root, first["cycle_id"], discard=True)
+        record = self.record(first)
+        self.assertEqual((record["state"], record["superseded_by"]), ("superseded", [second["cycle_id"]]))
+        self.assertEqual(P.cycle_disposition(record)["kind"], "discarded")
+        P.cycle_mark(self.root, first["cycle_id"], clear=True)
+        record = self.record(first)
+        self.assertEqual((record["state"], record["superseded_by"]), ("superseded", [second["cycle_id"]]))
+        self.assertEqual(P.cycle_disposition(record)["kind"], "superseded")
+        # The campaign list reads both the same way.
+        summary = next(row for row in P.list_campaign_summaries(self.root) if row["key"] == "c1-old-sup")
+        self.assertEqual(summary["cycle_count"], 2)
+        self.assertEqual(summary["dispositions"], {"superseded": 1})
+        P.cycle_mark(self.root, second["cycle_id"], discard=True)
+        summary = next(row for row in P.list_campaign_summaries(self.root) if row["key"] == "c1-old-sup")
+        self.assertEqual(summary["dispositions"], {"superseded": 1, "discarded": 1})
+        self.assertTrue(summary["all_set_aside"])
+
+    def test_c1_taslp_copy_discard_clear_preserves_payload(self):
+        copy = self.taslp_copy()
+        record_path = copy / ".runtime/artifact-producer/v1/cycles" / (TASLP_MANUSCRIPT + ".json")
+        campaigns = copy / "campaigns"
+        payload = self.tree_digest(campaigns)
+        before = json.loads(record_path.read_text())
+        reason = ("user instruction: set this manuscript aside; the new draft lives in "
+                  "campaigns/2026-09-30_tasl-sr-corrnet-revision-r1/2026-10-01_strategy-derived-cheatsheet")
+        marked = P.cycle_mark(copy, TASLP_MANUSCRIPT, discard=True, reason=reason)
+        self.assertEqual(marked["status"], "marked", marked)
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record["disposition"]["kind"], "discarded")
+        self.assertEqual(record["disposition"]["reason"], reason)
+        self.assertEqual({k: v for k, v in record.items() if k != "disposition"}, before)
+        self.assertEqual(self.tree_digest(campaigns), payload)  # no file or manifest of any cycle moved
+        self.assertEqual(len(self.lines(field="disposition")), 1)
+        P.cycle_mark(copy, TASLP_MANUSCRIPT, clear=True)
+        self.assertEqual(json.loads(record_path.read_text()), before)
+        self.assertEqual(self.tree_digest(campaigns), payload)
+        self.assertEqual(len(self.lines(field="disposition")), 2)
+        # The real root was only read.
+        self.assertNotIn("disposition", json.loads(
+            (TASLP_ROOT / ".runtime/artifact-producer/v1/cycles" / (TASLP_MANUSCRIPT + ".json")).read_text()))
+
+    # -- the fourth mode: which document stands for the cycle ----------------
+    def roles(self, result):
+        document = self.manifest(result)
+        by_id = {row["artifact_id"]: row for row in document["artifacts"]}
+        return {row["locator"]["path"]: by_id[row["artifact_id"]]["role"] for row in document["artifact_revisions"]}
+
+    def test_c1_mark_primary_swaps_roles_only(self):
+        result = self.closed_with("primary-swap", "c1-primary", {
+            "plans/cycle/plan.md": b"plan body\n", "plans/cycle/other.md": b"other\n"}, activate=True)
+        before = self.manifest(result)
+        roles_before = self.roles(result)
+        old_primary = next(rel for rel, role in roles_before.items() if role == "primary")
+        wanted = next(rel for rel in roles_before if rel != old_primary)
+        self.history.made.clear()
+        out = P.cycle_mark(self.root, result["cycle_id"], primary=wanted, reason="the other one is the report")
+        self.assertEqual(out["status"], "marked", out)
+        after = self.manifest(result)
+        roles = self.roles(result)
+        self.assertEqual(roles[wanted], "primary")
+        self.assertNotEqual(roles[old_primary], "primary")
+        self.assertEqual([r for r, role in roles.items() if role == "primary"], [wanted])
+        self.assertNotEqual(after["manifest_revision_id"], before["manifest_revision_id"])
+        # Content is untouched: both rows keep their artifact and revision IDs, and every event stands.
+        self.assertEqual(after["artifact_revisions"], before["artifact_revisions"])
+        self.assertEqual(after["events"][:len(before["events"])], before["events"])
+        self.assertEqual(after["routes"], before["routes"])
+        self.assertEqual(after["cycle"], before["cycle"])
+        differing = [(a["artifact_id"], a["role"]) for a, b in zip(after["artifacts"], before["artifacts"]) if a != b]
+        self.assertEqual(len(differing), 2)
+        # The earlier document is kept as it was published.
+        names = self.snapshot_names(result)
+        self.assertIn(before["manifest_revision_id"] + ".json", names)
+        # One history line: field primary, cycle-relative paths.
+        (line,) = self.lines(kind="lifecycle", field="primary")
+        self.assertEqual((line["target_type"], line["operation"]), ("cycle", "update"))
+        self.assertEqual((line["before"], line["after"]), ({"value": old_primary}, {"value": wanted}))
+        self.assertEqual(line["reason"], "the other one is the report")
+        self.assertEqual(self.record(result)["manifest_digest"], m_digest(after))
+        row, manifest_row = self.index_row(result)
+        self.assertEqual(manifest_row["manifest_digest"], m_digest(after))
+        # The same designation again writes nothing.
+        state = self.tree_state(result)
+        self.history.made.clear()
+        again = P.cycle_mark(self.root, result["cycle_id"], primary=wanted)
+        self.assertEqual(again["status"], "unchanged", again)
+        self.assertEqual(self.tree_state(result), state)
+        self.assertEqual(self.history.made, [])
+        # A path the manifest does not list is named and nothing changes (an ordinary usage error).
+        with self.assertRaises(P.ProducerError):
+            P.cycle_mark(self.root, result["cycle_id"], primary="artifacts/plans/cycle/missing.md")
+        self.assertEqual(self.tree_state(result), state)
+        # Neither can the mark modes be mixed.
+        with self.assertRaises(P.ProducerError):
+            P.cycle_mark(self.root, result["cycle_id"], primary=old_primary, discard=True)
+
+    def test_c1_mark_primary_survives_refresh_and_rebuild(self):
+        result = self.closed_with("primary-keep", "c1-primary-keep", {
+            "plans/cycle/plan.md": b"plan body\n", "plans/cycle/other.md": b"other\n",
+            "plans/cycle/third.md": b"third\n"}, activate=True)
+        roles = self.roles(result)
+        old_primary = next(rel for rel, role in roles.items() if role == "primary")
+        wanted = next(rel for rel in roles if rel != old_primary)
+        P.cycle_mark(self.root, result["cycle_id"], primary=wanted)
+        marked = self.manifest(result)
+        # Another file is edited and the cycle is closed again; then the index is rebuilt.
+        other = next(rel for rel in roles if rel not in (old_primary, wanted))
+        self.edit(result, other[len("artifacts/"):], b"third, edited\n")
+        refreshed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(refreshed["refreshed"], refreshed)
+        after = self.manifest(result)
+        self.assertEqual(self.roles(result)[wanted], "primary")
+        self.assertEqual([r for r, role in self.roles(result).items() if role == "primary"], [wanted])
+        for rel in (old_primary, wanted):
+            rows = lambda doc: next(r for r in doc["artifact_revisions"] if r["locator"]["path"] == rel)
+            self.assertEqual(rows(after), rows(marked))
+        self.assertEqual(after["events"][:len(marked["events"])], marked["events"])
+        self.assertEqual([e["stream_sequence"] for e in after["events"][:len(marked["events"])]],
+                         [e["stream_sequence"] for e in marked["events"]])
+        incremental = adm.load_index(self.root)
+        rebuilt = adm.rebuild_index(self.root)
+        self.assertEqual(artifact_index.to_payload(rebuilt)["cycles"], artifact_index.to_payload(incremental)["cycles"])
+        self.assertEqual(artifact_index.to_payload(rebuilt)["manifests"], artifact_index.to_payload(incremental)["manifests"])
+        self.assertEqual(self.roles(result)[wanted], "primary")
+
+    def test_c1_taslp_copy_primary_redesignation(self):
+        copy = self.taslp_copy()
+        wanted = "artifacts/reviews/refine/revision_cheatsheet.md"
+        manifest_path = next((copy / "campaigns").glob("*/2026-10-01_strategy-derived-cheatsheet/manifest.json"))
+        before = json.loads(manifest_path.read_text())
+        by_id = {row["artifact_id"]: row for row in before["artifacts"]}
+        old = next(r["locator"]["path"] for r in before["artifact_revisions"] if by_id[r["artifact_id"]]["role"] == "primary")
+        out = P.cycle_mark(copy, TASLP_CHEATSHEET, primary=wanted, reason="redesignated by the owner")
+        self.assertEqual(out["status"], "marked", out)
+        after = json.loads(manifest_path.read_text())
+        by_id = {row["artifact_id"]: row for row in after["artifacts"]}
+        primaries = [r["locator"]["path"] for r in after["artifact_revisions"] if by_id[r["artifact_id"]]["role"] == "primary"]
+        self.assertEqual(primaries, [wanted])
+        self.assertNotEqual(old, wanted)
+        self.assertEqual(after["artifact_revisions"], before["artifact_revisions"])
+        self.assertEqual(len(after["events"]), len(before["events"]))
+        self.assertEqual(len(self.lines(field="primary")), 1)
+        self.assertEqual(json.loads((TASLP_ROOT / "campaigns" / manifest_path.relative_to(copy / "campaigns")).read_text()), before)
+
+
+class C1MoveTest(C1ChangesBase):
+    # -- A28-7 -------------------------------------------------------------
+    def test_c1_move_and_manual_reconcile_keep_ids(self):
+        mover = self.closed_with("same-slug", "c1-src", {"plans/cycle/a.md": b"a\n", "plans/cycle/b.md": b"b\n"}, activate=True)
+        peer = self.closed_with("same-slug", "c1-dst")
+        src_id, dst_id = mover["campaign_id"], peer["campaign_id"]
+        self.assertNotEqual(src_id, dst_id)
+        old_document = self.manifest(mover)
+        old_locator = self.record(mover)["locator"]
+        self.assertEqual(self.record(peer)["locator"], old_locator)  # the same name in two campaigns
+        out = P.cycle_move(self.root, mover["cycle_id"], campaign=dst_id, reason="regroup")
+        self.assertEqual(out["status"], "moved", out)
+        record = self.record(mover)
+        new_dir = Path(out["cycle_dir"])
+        self.assertEqual((record["cycle_id"], record["campaign_id"]), (mover["cycle_id"], dst_id))
+        self.assertEqual(record["locator"], old_locator + "-2")  # D-90: the smallest unused suffix
+        self.assertEqual(new_dir, P.campaign_dir(self.root, dst_id) / record["locator"])
+        self.assertFalse(Path(mover["cycle_dir"]).exists())
+        self.assertEqual(json.loads((new_dir / ".cycle.json").read_text())["campaign_id"], dst_id)
+        document = json.loads((new_dir / "manifest.json").read_text())
+        self.assertEqual((document["cycle"]["campaign_id"], document["campaign"]["campaign_id"]), (dst_id, dst_id))
+        self.assertNotEqual(document["manifest_revision_id"], old_document["manifest_revision_id"])
+        self.assertEqual(document["artifact_revisions"], old_document["artifact_revisions"])
+        self.assertEqual(document["events"], old_document["events"])
+        self.assertIn(old_document["manifest_revision_id"] + ".json", self.snapshot_names(mover))
+        cycle_row, manifest_row = self.index_row(mover)
+        self.assertEqual((cycle_row["campaign_id"], cycle_row["cycle_path"]),
+                         (dst_id, new_dir.relative_to(self.root).as_posix()))
+        self.assertEqual(manifest_row["manifest_digest"], m_digest(document))
+        self.assertEqual(self.record(mover)["manifest_digest"], m_digest(document))
+        self.assertEqual(P.read_campaign(self.root, src_id)["cycles"], [])
+        self.assertEqual(P.read_campaign(self.root, dst_id)["cycles"], [peer["cycle_id"], mover["cycle_id"]])
+        self.assertEqual(self.locator_map()[mover["cycle_id"]], new_dir.relative_to(self.root).as_posix())
+        (line,) = self.lines(kind="lifecycle", field="campaign")
+        self.assertEqual((line["target_type"], line["target_id"], line["operation"]),
+                         ("cycle", mover["cycle_id"], "move"))
+        self.assertEqual((line["before"]["value"], line["after"]["value"]), (src_id, dst_id))
+        self.assertEqual(line["reason"], "regroup")
+        status = CAMP.status(self.root, dst_id)
+        self.assertNotIn("close_refusal", status)
+        self.assertEqual({row["cycle_id"] for row in status["cycles"]}, {peer["cycle_id"], mover["cycle_id"]})
+        # The parent is changed by the same command and by it alone.
+        self.history.made.clear()
+        P.cycle_move(self.root, mover["cycle_id"], parent=peer["cycle_id"])
+        self.assertEqual(self.record(mover)["parent_cycle_id"], peer["cycle_id"])
+        self.assertEqual(self.manifest_of(mover)["cycle"]["parent_cycle_id"], peer["cycle_id"])
+        (line,) = self.lines(field="parent")
+        self.assertEqual((line["before"]["value"], line["after"]["value"]), (None, peer["cycle_id"]))
+        self.assertEqual(self.lines(field="campaign"), [])
+        P.cycle_move(self.root, mover["cycle_id"], no_parent=True)
+        self.assertIsNone(self.record(mover)["parent_cycle_id"])
+        self.assertIsNone(self.manifest_of(mover)["cycle"]["parent_cycle_id"])
+        with self.assertRaises(P.ProducerError):
+            P.cycle_move(self.root, mover["cycle_id"], parent=peer["cycle_id"], no_parent=True)
+        # A target that is closed is opened again, as a begin would.
+        third = self.closed_with("third", "c1-closed")
+        CAMP.close(self.root, third["campaign_id"])
+        self.assertEqual(P.read_campaign(self.root, third["campaign_id"])["state"], "satisfied")
+        P.cycle_move(self.root, mover["cycle_id"], campaign=third["campaign_id"])
+        self.assertEqual(P.read_campaign(self.root, third["campaign_id"])["state"], "active")
+        self.assertEqual(self.record(mover)["campaign_id"], third["campaign_id"])
+        # A campaign set aside takes a cycle as well; its state is not changed by that.
+        aside = self.closed_with("aside", "c1-aside")
+        P.mark_cycle_superseded(self.root, aside["cycle_id"], superseded_by=[mover["cycle_id"]],
+                                superseded_event_id="evt_" + "2" * 32)
+        P.mark_campaign_superseded(self.root, aside["campaign_id"])
+        P.cycle_move(self.root, mover["cycle_id"], campaign=aside["campaign_id"])
+        self.assertEqual(self.record(mover)["campaign_id"], aside["campaign_id"])
+        self.assertEqual(P.read_campaign(self.root, aside["campaign_id"])["state"], "superseded")
+        # The campaign may be named by its key as well; an unknown one changes nothing.
+        P.cycle_move(self.root, mover["cycle_id"], campaign="c1-src")
+        self.assertEqual(self.record(mover)["campaign_id"], src_id)
+        state = (self.record(mover), self.locator_map())
+        with self.assertRaises(P.ProducerError):
+            P.cycle_move(self.root, mover["cycle_id"], campaign="camp_" + "8" * 32)
+        self.assertEqual((self.record(mover), self.locator_map()), state)
+        # An open cycle moves too, with no manifest to write.
+        route, route_file, live = self.open_with("live-move", "c1-live")
+        P.cycle_move(self.root, live["cycle_id"], campaign=src_id)
+        moved_live = self.cycle_path(live)
+        self.assertEqual(self.record(live)["campaign_id"], src_id)
+        self.assertFalse((moved_live / "manifest.json").exists())
+        self.assertEqual(self.record(live)["state"], "open")
+        self.assertTrue((moved_live / "artifacts/plans/cycle/draft.md").is_file())
+        # The command line: no confirmation flag; `--parent` and `--no-parent` exclude each other.
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = P.main(["cycle-move", "--artifact-root", str(self.root), "--cycle", live["cycle_id"],
+                           "--campaign", dst_id, "--parent", peer["cycle_id"], "--reason", "cli"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["status"], "moved")
+        self.assertEqual((self.record(live)["campaign_id"], self.record(live)["parent_cycle_id"]), (dst_id, peer["cycle_id"]))
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            P.main(["cycle-move", "--artifact-root", str(self.root), "--cycle", live["cycle_id"],
+                    "--parent", peer["cycle_id"], "--no-parent"])
+
+    def manifest_of(self, result):
+        return json.loads((self.cycle_path(result) / "manifest.json").read_text(encoding="utf-8"))
+
+    def test_c1_manual_move_and_rename_are_found_by_the_next_listing(self):
+        mover = self.closed_with("hand-move", "c1-hand-src", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        peer = self.closed_with("hand-peer", "c1-hand-dst")
+        src_id, dst_id = mover["campaign_id"], peer["campaign_id"]
+        old_revision = self.manifest(mover)["manifest_revision_id"]
+        source = Path(mover["cycle_dir"])
+        target = P.campaign_dir(self.root, dst_id) / source.name
+        os.rename(str(source), str(target))
+        # No command and no recovery step: the next listing finds the cycle where it now is.
+        rows = P.list_campaign_summaries(self.root, active_only=False)
+        self.assertEqual({row["key"]: row["cycle_count"] for row in rows}["c1-hand-dst"], 2)
+        record = self.record(mover)
+        self.assertEqual((record["cycle_id"], record["campaign_id"], record["locator"]), (mover["cycle_id"], dst_id, source.name))
+        self.assertEqual(json.loads((target / ".cycle.json").read_text())["campaign_id"], dst_id)
+        document = json.loads((target / "manifest.json").read_text())
+        self.assertEqual(document["cycle"]["campaign_id"], dst_id)
+        self.assertNotEqual(document["manifest_revision_id"], old_revision)
+        cycle_row, _ = self.index_row(mover)
+        self.assertEqual((cycle_row["campaign_id"], cycle_row["cycle_path"]), (dst_id, target.relative_to(self.root).as_posix()))
+        self.assertEqual(P.read_campaign(self.root, src_id)["cycles"], [])
+        self.assertEqual(P.read_campaign(self.root, dst_id)["cycles"], [peer["cycle_id"], mover["cycle_id"]])
+        (line,) = self.lines(field="campaign")
+        self.assertEqual((line["operation"], line["actor_by"], line["before"]["value"], line["after"]["value"]),
+                         ("move", "rule", src_id, dst_id))
+        # Looking again changes nothing.
+        before = (self.record(mover), self.locator_map(), adm.load_index(self.root))
+        self.history.made.clear()
+        P.list_campaign_summaries(self.root, active_only=False)
+        self.assertEqual((self.record(mover), self.locator_map(), adm.load_index(self.root)), before)
+        self.assertEqual(self.history.made, [])
+        # The campaign closes: the moved cycle is a member of where it is.
+        self.assertEqual(CAMP.close(self.root, dst_id)["status"], "satisfied")
+        # A campaign folder renamed by hand keeps its ID; its record follows the folder.
+        folder = P.campaign_dir(self.root, dst_id)
+        renamed = folder.with_name("renamed-by-hand")
+        os.rename(str(folder), str(renamed))
+        self.history.made.clear()
+        P.list_campaign_summaries(self.root, active_only=False)
+        self.assertEqual(P.read_campaign(self.root, dst_id)["locator"], "renamed-by-hand")
+        self.assertEqual(P.campaign_dir(self.root, dst_id), renamed)
+        (line,) = self.lines(field="path", target_type="campaign")
+        self.assertEqual((line["target_id"], line["actor_by"]), (dst_id, "rule"))
+        self.assertEqual(Path(self.locator_map()[mover["cycle_id"]]).parts[1], "renamed-by-hand")
+        cycle_row, _ = self.index_row(mover)
+        self.assertEqual(Path(cycle_row["cycle_path"]).parts[1], "renamed-by-hand")
+        # A cycle folder renamed inside its campaign keeps its ID too.
+        inner = renamed / source.name
+        os.rename(str(inner), str(renamed / "inner-rename"))
+        P.list_campaign_summaries(self.root, active_only=False)
+        self.assertEqual(self.record(mover)["locator"], "inner-rename")
+        self.assertEqual(self.record(mover)["campaign_id"], dst_id)
+
+    def test_c1_an_unreadable_or_odd_scan_never_makes_a_tombstone(self):
+        keep = self.closed_with("odd-scan", "c1-odd", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        other = self.closed_with("odd-other", "c1-odd-other")
+        # A symbolic link where a campaign folder was is not a campaign and not a deletion.
+        folder = P.campaign_dir(self.root, other["campaign_id"])
+        hidden = folder.with_name("moved-away")
+        os.rename(str(folder), str(hidden))
+        os.symlink(str(hidden), str(folder))
+        P.list_campaign_summaries(self.root, active_only=False)
+        for result in (keep, other):
+            self.assertNotIn("deleted_at", self.record(result))
+        self.assertIsNone(P.read_campaign_tombstone(self.root, other["campaign_id"]))
+        os.unlink(str(folder))
+        os.rename(str(hidden), str(folder))
+        # A cycle seen twice (a copy of its folder) is not guessed at: neither is declared gone or moved.
+        original = Path(keep["cycle_dir"])
+        copy = P.campaign_dir(self.root, other["campaign_id"]) / "copy-of-keep"
+        shutil.copytree(str(original), str(copy))
+        P.list_campaign_summaries(self.root, active_only=False)
+        self.assertEqual(self.record(keep)["campaign_id"], keep["campaign_id"])
+        self.assertNotIn("deleted_at", self.record(keep))
+        self.assertEqual(self.record(keep)["locator"], original.name)
+        # An unreadable campaign folder stops the deletion judgment for the whole listing.
+        victim = self.closed_with("odd-victim", "c1-odd-victim")
+        shutil.rmtree(str(Path(victim["cycle_dir"])))
+        folder = P.campaign_dir(self.root, keep["campaign_id"])
+        os.chmod(str(folder), 0)
+        try:
+            out = P.reconcile_root(self.root)
+            self.assertNotEqual(out.get("status"), "reconciled", out)
+            self.assertNotIn("deleted_at", self.record(victim))
+        finally:
+            os.chmod(str(folder), 0o755)
+        # With every folder readable again (and the copy gone) the removed cycle is found, and only that one.
+        shutil.rmtree(str(copy))
+        P.reconcile_root(self.root)
+        self.assertIn("deleted_at", self.record(victim))
+        self.assertNotIn("deleted_at", self.record(keep))
+
+
+class C1DeleteTest(C1ChangesBase):
+    # -- A28-8 -------------------------------------------------------------
+    def test_c1_delete_preserves_records_and_handoff(self):
+        keep = self.closed_with("del-keep", "c1-del", {"plans/cycle/k.md": b"k\n"}, activate=True)
+        gone = self.closed_with("del-gone", "c1-del", {"plans/cycle/g.md": b"g\n", "plans/cycle/h.md": b"h\n"})
+        gone_document = self.manifest(gone)
+        digest = m_digest(gone_document)
+        folder = Path(gone["cycle_dir"])
+        index_before = adm.load_index(self.root)
+        out = P.delete_cycle(self.root, gone["cycle_id"], reason="not needed")
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertFalse(folder.exists())
+        record = self.record(gone)
+        self.assertRegex(record["deleted_at"], RFC3339)
+        self.assertEqual((record["cycle_id"], record["state"]), (gone["cycle_id"], "sealed"))
+        self.assertNotIn(gone["cycle_id"], P.read_campaign(self.root, gone["campaign_id"])["cycles"])
+        self.assertEqual(P.read_campaign(self.root, gone["campaign_id"])["cycles"], [keep["cycle_id"]])
+        # The list and the index drop the current rows; the IDs stay owned.
+        index = adm.load_index(self.root)
+        self.assertNotIn(gone["cycle_id"], index.cycles)
+        self.assertNotIn(gone["cycle_id"], index.manifests)
+        self.assertEqual(index.stable_ids, index_before.stable_ids)
+        self.assertEqual(index.event_ids, index_before.event_ids)
+        self.assertNotIn(gone["cycle_id"], self.locator_map())
+        self.assertIn(gone_document["manifest_revision_id"] + ".json", self.snapshot_names(gone))
+        (line,) = self.lines(kind="lifecycle", target_type="cycle", operation="delete")
+        self.assertEqual(line["target_id"], gone["cycle_id"])
+        self.assertEqual(line["before"]["value"]["manifest_digest"], digest)
+        self.assertEqual(line["before"]["value"]["path"], folder.relative_to(self.root).as_posix())
+        self.assertEqual(line["reason"], "not needed")
+        # The ID is never issued again: an index rebuilt from what is left still owns it.
+        rebuilt = adm.rebuild_index(self.root)
+        self.assertEqual(rebuilt.stable_ids, index_before.stable_ids)
+        self.assertNotIn(gone["cycle_id"], rebuilt.cycles)
+        # Deleting again, and deleting what is already gone by hand, is the same answer.
+        self.history.made.clear()
+        again = P.delete_cycle(self.root, gone["cycle_id"])
+        self.assertEqual(again["status"], "already-deleted", again)
+        self.assertEqual(self.history.made, [])
+        self.assertEqual(CAMP.close(self.root, keep["campaign_id"])["status"], "satisfied")
+        # A campaign: its folder goes, its record stays beside the root's other runtime records.
+        campaign_id = keep["campaign_id"]
+        campaign_folder = P.campaign_dir(self.root, campaign_id)
+        last_path = campaign_folder.relative_to(self.root).as_posix()
+        key = P.read_campaign(self.root, campaign_id)["key"]
+        self.history.made.clear()
+        out = P.delete_campaign(self.root, campaign_id, reason="whole stream dropped")
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertFalse(campaign_folder.exists())
+        tomb = P.read_campaign_tombstone(self.root, campaign_id)
+        self.assertEqual((tomb["campaign_id"], tomb["key"], tomb["last_path"]), (campaign_id, key, last_path))
+        self.assertRegex(tomb["deleted_at"], RFC3339)
+        self.assertIsNone(P.read_campaign(self.root, campaign_id))
+        self.assertFalse((self.root / last_path).exists())  # nothing re-creates the folder
+        self.assertEqual([row for row in P.list_campaign_summaries(self.root, active_only=False)
+                          if row["campaign_id"] == campaign_id], [])
+        self.assertNotIn(keep["cycle_id"], self.locator_map())
+        self.assertIsNotNone(self.record(keep)["deleted_at"])
+        # One line for each member that was still there, and one for the campaign.
+        member_lines = self.lines(target_type="cycle", operation="delete")
+        self.assertEqual([m["target_id"] for m in member_lines], [keep["cycle_id"]])
+        (campaign_line,) = self.lines(target_type="campaign", operation="delete")
+        self.assertEqual(campaign_line["target_id"], campaign_id)
+        self.assertEqual(self.lines(target_type="campaign")[0]["reason"], "whole stream dropped")
+        # The preserved copies stay for every member, deleted earlier or now.
+        for result in (gone, keep):
+            self.assertTrue(self.snapshot_names(result))
+        self.assertFalse(self.root.joinpath(last_path).exists())
+        # A listing and a recovery find nothing to put back, and the index rebuilt from what is left agrees.
+        P.list_campaign_summaries(self.root, active_only=False)
+        self.assertFalse(self.root.joinpath(last_path).exists())
+        recovered = P.recover(self.root)
+        self.assertEqual(recovered["status"], "recovered", recovered)
+        self.assertFalse(self.root.joinpath(last_path).exists())
+        self.assertTrue(adm.verify_index(self.root).ok)
+        # The command line takes exactly one of the two.
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = P.main(["delete", "--artifact-root", str(self.root), "--cycle", gone["cycle_id"]])
+        self.assertEqual(code, 0, out.getvalue())
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            P.main(["delete", "--artifact-root", str(self.root)])
+
+    def test_c1_old_cycle_snapshot_before_delete(self):
+        result = self.closed_with("old-copy", "c1-old-copy", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        manifest = (Path(result["cycle_dir"]) / "manifest.json").read_bytes()
+        # A cycle closed before copies existed has none: the first sight of it is this delete.
+        shutil.rmtree(L.manifest_snapshot_dir(self.root, result["cycle_id"]))
+        seen = []
+        real_rmtree = shutil.rmtree
+
+        def watching(path, *args, **kwargs):
+            if Path(path) == Path(result["cycle_dir"]):
+                seen.append(sorted(p.name for p in L.manifest_snapshot_dir(self.root, result["cycle_id"]).iterdir()))
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(P.shutil, "rmtree", watching):
+            P.delete_cycle(self.root, result["cycle_id"])
+        revision = json.loads(manifest)["manifest_revision_id"]
+        self.assertEqual(seen, [[revision + ".json"]], "the copy is made before the folder goes")
+        self.assertEqual(L.manifest_snapshot_path(self.root, result["cycle_id"], revision).read_bytes(), manifest)
+
+    def test_c1_refinalize_immediate_delete_preserves_latest_revision(self):
+        result = self.closed_with("re-close", "c1-reclose", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        first = self.manifest(result)["manifest_revision_id"]
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        refreshed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(refreshed["refreshed"], refreshed)
+        latest = self.manifest(result)
+        P.delete_cycle(self.root, result["cycle_id"])
+        names = self.snapshot_names(result)
+        self.assertEqual(names, sorted([first + ".json", latest["manifest_revision_id"] + ".json"]))
+        copy = L.manifest_snapshot_path(self.root, result["cycle_id"], latest["manifest_revision_id"])
+        self.assertEqual(json.loads(copy.read_text())["manifest_revision_id"], latest["manifest_revision_id"])
+        self.assertEqual(M.manifest_digest(json.loads(copy.read_text())), self.record(result)["manifest_digest"])
+
+    def test_c1_manual_delete_before_observation_uses_terminal(self):
+        result = self.closed_with("hand-del", "c1-hand-del", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        other = self.closed_with("hand-del-peer", "c1-hand-del")
+        shutil.rmtree(L.manifest_snapshot_dir(self.root, result["cycle_id"]))  # closed before copies existed
+        shutil.rmtree(result["cycle_dir"])
+        P.list_campaign_summaries(self.root, active_only=False)
+        record = self.record(result)
+        self.assertRegex(record["deleted_at"], RFC3339)
+        self.assertNotIn(result["cycle_id"], adm.load_index(self.root).cycles)
+        self.assertEqual(P.read_campaign(self.root, result["campaign_id"])["cycles"], [other["cycle_id"]])
+        # Nothing could be copied from a folder that was already gone: none is made up.
+        self.assertEqual(self.snapshot_names(result), [])
+        (line,) = self.lines(target_type="cycle", operation="delete")
+        self.assertEqual((line["target_id"], line["actor_by"]), (result["cycle_id"], "rule"))
+        # The campaign still closes and a replay still finds the cycle (deleted).
+        self.assertEqual(CAMP.close(self.root, other["campaign_id"])["status"], "satisfied")
+        verdict = P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding={
+            "cycle_id": result["cycle_id"], "producer_id": record["producer_id"]},
+            expected_manifest_digest=record["manifest_digest"])
+        self.assertEqual((verdict["manifest_digest"], verdict["deleted"]), (record["manifest_digest"], True))
+        # A whole campaign gone by hand: every member is recorded, and the campaign's own record is made.
+        solo = self.closed_with("hand-del-solo", "c1-hand-del-solo")
+        folder = P.campaign_dir(self.root, solo["campaign_id"])
+        last_path = folder.relative_to(self.root).as_posix()
+        shutil.rmtree(str(folder))
+        self.history.made.clear()
+        P.list_campaign_summaries(self.root, active_only=False)
+        tomb = P.read_campaign_tombstone(self.root, solo["campaign_id"])
+        self.assertEqual((tomb["campaign_id"], tomb["last_path"]), (solo["campaign_id"], last_path))
+        self.assertIsNotNone(self.record(solo)["deleted_at"])
+        self.assertEqual(len(self.lines(target_type="campaign", operation="delete")), 1)
+        self.assertFalse(folder.exists())
+
+    def test_c1_deleted_cycle_campaign_replay_and_close(self):
+        # A finished cycle is deleted, then its campaign: the finish is replayed as it was recorded.
+        fixture = INLINE.PublicInlineFinishTest("test_public_finish_seals_and_exact_replay_returns_one_receipt")
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        first = fixture.finish()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        cycle_id = fixture.cycle["cycle_id"]
+        campaign_id = fixture.cycle["campaign_id"]
+        root = fixture.root
+        state_file = root / ".runtime/inline-finish/v1" / fixture.route["route_id"] / "finish.json"
+        state_before = state_file.read_bytes()
+        INLINE.artifact_producer.delete_cycle(root, cycle_id)
+        gone = fixture.finish()
+        self.assertEqual(gone.returncode, 0, gone.stderr)
+        replayed = json.loads(gone.stdout)
+        self.assertTrue(replayed["replay"])
+        self.assertEqual((replayed["inline_finish_id"], replayed["manifest_digest"]),
+                         (receipt["inline_finish_id"], receipt["manifest_digest"]))
+        self.assertTrue(replayed.get("deleted_since"), replayed)
+        INLINE.artifact_producer.delete_campaign(root, campaign_id)
+        gone = fixture.finish()
+        self.assertEqual(gone.returncode, 0, gone.stderr)
+        self.assertEqual(json.loads(gone.stdout)["manifest_digest"], receipt["manifest_digest"])
+        self.assertEqual(state_file.read_bytes(), state_before)
+
+    def test_c1_close_after_deleting_a_member(self):
+        keep = self.closed_with("close-keep", "c1-close-del", activate=True)
+        gone = self.closed_with("close-gone", "c1-close-del")
+        P.delete_cycle(self.root, gone["cycle_id"])
+        status = CAMP.status(self.root, keep["campaign_id"])
+        self.assertNotIn("close_refusal", status)
+        self.assertEqual([row["cycle_id"] for row in status["cycles"]], [keep["cycle_id"]])
+        self.assertEqual(CAMP.close(self.root, keep["campaign_id"])["status"], "satisfied")
+        self.assertEqual(self.record(gone)["state"], "sealed")
+        # A cycle can still name a deleted one as its parent.
+        route, route_file = self.route(slug="close-child", campaign_key="c1-close-del")
+        child = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct",
+                        parent_cycle_id=gone["cycle_id"])
+        self.assertEqual(child["status"], "begun", child)
+        self.assertEqual(self.record(child)["parent_cycle_id"], gone["cycle_id"])
+
+    # -- a route that was running when its cycle was deleted ---------------
+    def test_c1_deleted_live_route_ends_without_material_success(self):
+        route, route_file, live = self.open_with("live-delete", "c1-live-del")
+        folder = Path(live["cycle_dir"])
+        self.assertTrue((folder / "artifacts/plans/cycle/draft.md").is_file())
+        P.delete_cycle(self.root, live["cycle_id"], reason="dropped while running")
+        self.assertFalse(folder.exists())
+        # The route keeps its quality gate: closing it is exactly what it was.
+        self.close(route, route_file)
+        out = P.finalize(self.root, cycle_id=live["cycle_id"])
+        self.assertEqual(out["status"], "no-lineage", out)
+        self.assertFalse(out["lineage_committed"])
+        record = self.record(live)
+        self.assertEqual(record["state"], "no-lineage")
+        self.assertRegex(record["deleted_at"], RFC3339)
+        self.assertFalse(folder.exists(), "the folder is never put back")
+        self.assertFalse(folder.parent.joinpath(folder.name).exists())
+        self.assertNotIn(live["cycle_id"], adm.load_index(self.root).cycles)
+        # The same answer on a second call, and the abandon path of the runtime's own sweep.
+        again = P.finalize(self.root, cycle_id=live["cycle_id"], state="abandoned", abandon_reason="route-unrecoverable")
+        self.assertEqual(again["status"], "no-lineage")
+        self.assertFalse(folder.exists())
+        # The terminal proof for it is the existing no-output one: never a verified material cycle.
+        verdict = P.verify_finalized_cycle(self.root, cycle_id=live["cycle_id"], expected_binding={
+            "cycle_id": live["cycle_id"], "producer_id": record["producer_id"]})
+        self.assertTrue(verdict.get("deleted"))
+        self.assertNotIn("manifest_digest", verdict)
+        # A begin by the same route is a new cycle, not the old folder back.
+        route2, route_file2 = self.route(slug="live-delete-next", campaign_key="c1-live-del")
+        nxt = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        self.assertNotEqual(nxt["cycle_id"], live["cycle_id"])
+        self.assertFalse(folder.exists())
+
+    def test_c1_deleted_inline_route_finishes_as_closed_without_proof(self):
+        fixture = INLINE.PublicInlineFinishTest("test_public_finish_seals_and_exact_replay_returns_one_receipt")
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        cycle_id = fixture.cycle["cycle_id"]
+        folder = fixture.cycle_dir
+        INLINE.artifact_producer.delete_cycle(fixture.root, cycle_id)
+        done = fixture.finish()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        receipt = json.loads(done.stdout)
+        self.assertEqual(receipt["state"], "cycle-deleted")
+        self.assertFalse(folder.exists())
+        outcome = json.loads(R.outcome_path(fixture.route_file).read_text())
+        self.assertIsNot(outcome.get("terminal_gate_proven"), True)
+        self.assertIn(INLINE.artifact_producer.read_cycle_record(fixture.root, cycle_id)["state"], {"abandoned", "no-lineage"})
+        # Asked again, it is the same answer.
+        again = fixture.finish()
+        self.assertEqual(again.returncode, 0, again.stderr)
+
+    # -- A28-11 ------------------------------------------------------------
+    def test_c1_mutation_history_failure_pending_after_delete(self):
+        moved = self.closed_with("pend-move", "c1-pend-a", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        peer = self.closed_with("pend-peer", "c1-pend-b")
+        self.history.fail_publish = True
+        out = P.cycle_move(self.root, moved["cycle_id"], campaign=peer["campaign_id"])
+        self.assertEqual(out["status"], "moved")
+        pending = self.record(moved)["history_pending"]
+        self.assertEqual([entry["field"] for entry in pending], ["campaign"])
+        self.assertEqual(self.history.published, [])
+        P.cycle_mark(self.root, moved["cycle_id"], discard=True)
+        self.assertEqual([e["field"] for e in self.record(moved)["history_pending"]], ["campaign", "disposition"])
+        # Deleting keeps the change and the record that carries the lines.
+        out = P.delete_cycle(self.root, moved["cycle_id"])
+        self.assertEqual(out["status"], "deleted")
+        record = self.record(moved)
+        self.assertEqual([e["operation"] for e in record["history_pending"]], ["move", "add", "delete"])
+        out = P.delete_campaign(self.root, peer["campaign_id"])
+        self.assertEqual(out["status"], "deleted")
+        tomb = P.read_campaign_tombstone(self.root, peer["campaign_id"])
+        self.assertTrue(tomb["history_pending"])
+        self.assertTrue(self.record(peer)["history_pending"])
+        # A close and a reopen leave their state lines the same way.
+        solo = self.closed_with("pend-solo", "c1-pend-solo")
+        CAMP.close(self.root, solo["campaign_id"])
+        CAMP.reopen(self.root, solo["campaign_id"], reason="again")
+        sidecar = P.campaign_runtime_record(self.root, solo["campaign_id"])
+        self.assertEqual([e["field"] for e in sidecar["history_pending"]], ["state", "state"])
+        # The recorder comes back: the next trigger hands every line over once and empties the lists.
+        self.history.fail_publish = False
+        wanted = ({e["event_id"] for e in self.record(moved)["history_pending"]}
+                  | {e["event_id"] for e in self.record(peer)["history_pending"]}
+                  | {e["event_id"] for e in tomb["history_pending"]}
+                  | {e["event_id"] for e in sidecar["history_pending"]}
+                  | {e["event_id"] for e in self.record(solo)["history_pending"]})  # its own close line
+        P.list_campaign_summaries(self.root, active_only=False)
+        self.assertEqual({e["event_id"] for e in self.history.published}, wanted)
+        self.assertNotIn("history_pending", self.record(moved))
+        self.assertNotIn("history_pending", self.record(peer))
+        self.assertNotIn("history_pending", P.read_campaign_tombstone(self.root, peer["campaign_id"]))
+        self.assertNotIn("history_pending", P.campaign_runtime_record(self.root, solo["campaign_id"]))
+        # No recorder at all: the command still succeeds and the lines wait.
+        with mock.patch.dict(sys.modules, {"artifact_history": None}):
+            P.cycle_mark(self.root, solo["cycle_id"], discard=True)
+            self.assertEqual(len(self.record(solo)["history_pending"]), 1)
+        P.checkpoint(self.root, cycle_id=solo["cycle_id"], trigger="explicit")
+        self.assertNotIn("history_pending", self.record(solo))
+
+
+class C1InlineFinishAfterMoveTest(unittest.TestCase):
+    """The route's cycle is the same cycle after it moved; a finish is not refused for the campaign's key."""
+
+    def test_c1_inline_finish_follows_a_cycle_moved_before_it_finished(self):
+        fixture = INLINE.PublicInlineFinishTest("test_public_finish_seals_and_exact_replay_returns_one_receipt")
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        root = fixture.root
+        cycle_id = fixture.cycle["cycle_id"]
+        origin = INLINE.artifact_producer.read_campaign(root, fixture.cycle["campaign_id"])
+        # A second campaign under another key (the way `begin` makes one).
+        other_id = "camp_" + "d" * 32
+        created = origin["created_on"]
+        locator, suffix = INLINE.artifact_producer.artifact_locator.allocate_locator(root / "campaigns", created, "other-stream")
+        other = {"schema_version": 1, "contract": "artifact-producer/v1", "campaign_id": other_id,
+                 "key": "other-stream", "slug": "other-stream", "title": "other-stream", "slug_source": "campaign-key",
+                 "slug_truncated": False, "locator": locator, "locator_suffix": suffix, "goal": "g",
+                 "completion_criterion": {"statement": "done"}, "state": "active", "created_on": created, "cycles": []}
+        fd = INLINE.artifact_producer.artifact_admission._acquire_lock(root, 5.0)
+        try:
+            INLINE.artifact_producer._write_campaign(root, other, exclusive=True)
+            INLINE.artifact_producer.artifact_locator.update_indexes(root, [other_id])
+        finally:
+            INLINE.artifact_producer.artifact_admission._release_lock(root, fd)
+        moved = INLINE.artifact_producer.cycle_move(root, cycle_id, campaign=other_id)
+        self.assertEqual(moved["status"], "moved", moved)
+        new_dir = Path(moved["cycle_dir"])
+        evidence = new_dir / fixture.evidence.relative_to(fixture.cycle_dir)
+        self.assertTrue(evidence.is_file())
+        fixture.command[fixture.command.index("--evidence") + 1] = str(evidence)
+        done = fixture.finish()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        receipt = json.loads(done.stdout)
+        self.assertEqual(receipt["cycle_id"], cycle_id)
+        record = INLINE.artifact_producer.read_cycle_record(root, cycle_id)
+        self.assertEqual((record["campaign_id"], record["state"]), (other_id, "sealed"))
+        # The finish replays as it was, and again after the cycle is moved back out of that campaign.
+        replay = fixture.finish()
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertTrue(json.loads(replay.stdout)["replay"])
+
+
+class C1EnvelopeAfterDeleteTest(TERM._TerminalCommitFixture):
+    """A finished route's report sat in a cycle that was deleted: the stored envelope is delivered, and says so."""
+
+    def test_c1_envelope_replay_says_the_cycle_was_deleted(self):
+        cycle_dir = self.root / "campaigns/2026-10-01_stream/2026-10-01_report-cycle"
+        (cycle_dir / "artifacts").mkdir(parents=True)
+        moved = cycle_dir / "artifacts/summary.md"
+        self.artifact.rename(moved)
+        self.artifact = moved
+        self.gates["execute"]["evidence"] = str(moved)
+        owner = A2EnvelopeReplayTest.seal_once(self)
+        stored = (self._slot() / "owner-envelope.txt").read_text()
+        # The producer's record of the deleted cycle (the folder holding the report is gone).
+        records = self.root / ".runtime/artifact-producer/v1/cycles"
+        records.mkdir(parents=True)
+        (records / ("cyc_" + "e" * 32 + ".json")).write_text(json.dumps(
+            {"cycle_id": "cyc_" + "e" * 32, "locator": "2026-10-01_report-cycle", "state": "sealed",
+             "deleted_at": "2026-10-02T00:00:00Z"}), encoding="utf-8")
+        shutil.rmtree(str(cycle_dir))
+        gone = A2EnvelopeReplayTest.replay(self, owner)
+        self.assertEqual((gone.result, gone.detail), ("completed", "cycle-deleted-after-seal"))
+        self.assertEqual(gone.envelope_text, stored)
+
+
+class C1LockedReadTest(C1ChangesBase):
+    """Correction B for the commands: one admission-lock section reads the index at most once."""
+
+    def test_c1_locked_index_read_once(self):
+        mover = self.closed_with("lock-move", "c1-lock-a", {"plans/cycle/a.md": b"a\n", "plans/cycle/b.md": b"b\n"},
+                                 activate=True)
+        peer = self.closed_with("lock-peer", "c1-lock-b")
+        locked_reads = []
+        real_load = adm.load_index
+
+        def counting(root):
+            if adm.holds_lock(Path(root)):
+                locked_reads.append(1)
+            return real_load(root)
+
+        def reads(call):
+            locked_reads.clear()
+            with mock.patch.object(adm, "load_index", counting):
+                call()
+            return len(locked_reads)
+
+        self.assertEqual(reads(lambda: P.cycle_mark(self.root, mover["cycle_id"], discard=True)), 0)
+        manifest = self.manifest(mover)
+        by_id = {row["artifact_id"]: row for row in manifest["artifacts"]}
+        other = next(r["locator"]["path"] for r in manifest["artifact_revisions"]
+                     if by_id[r["artifact_id"]]["role"] != "primary")
+        self.assertLessEqual(reads(lambda: P.cycle_mark(self.root, mover["cycle_id"], primary=other)), 1)
+        self.assertLessEqual(reads(lambda: P.cycle_move(self.root, mover["cycle_id"], campaign=peer["campaign_id"])), 1)
+        # A folder renamed by hand inside its campaign: the same one read.
+        folder = self.cycle_path(mover)
+        os.rename(str(folder), str(folder.with_name("hand-renamed")))
+        self.assertLessEqual(reads(lambda: P.reconcile_root(self.root)), 1)
+        self.assertEqual(self.record(mover)["locator"], "hand-renamed")
+        self.assertLessEqual(reads(lambda: P.delete_cycle(self.root, mover["cycle_id"])), 1)
+        self.assertLessEqual(reads(lambda: P.delete_campaign(self.root, peer["campaign_id"])), 1)
+
+
+class C1RealRecorderTest(C1ChangesBase):
+    def test_c1_real_history_recorder_takes_the_command_lines(self):
+        real = Path(__file__).resolve().parents[2] / "artifact-meta-1001/utilities/artifact_history.py"
+        if not real.is_file():
+            self.skipTest("the f0 recorder worktree is not present")
+        saved_path = list(sys.path)
+        try:
+            spec = importlib.util.spec_from_file_location("artifact_history", real)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"the f0 recorder does not import here: {exc}")
+        finally:
+            sys.path[:] = saved_path
+        with mock.patch.dict(sys.modules, {"artifact_history": module}):
+            mover = self.closed_with("real-move", "c1-real-a", {"plans/cycle/a.md": b"a\n"}, activate=True)
+            peer = self.closed_with("real-peer", "c1-real-b")
+            P.cycle_move(self.root, mover["cycle_id"], campaign=peer["campaign_id"], reason="regroup")
+            P.cycle_mark(self.root, mover["cycle_id"], discard=True)
+            P.delete_cycle(self.root, mover["cycle_id"])
+            P.delete_campaign(self.root, peer["campaign_id"])
+            events = list(module.iter_events(self.root))
+            changes = sorted((e["target"]["type"], e["operation"], e["field"]) for e in events
+                             if e["kind"] == "lifecycle" and e["operation"] != "update")
+            self.assertEqual(changes, [("campaign", "delete", "state"), ("cycle", "add", "disposition"),
+                                       ("cycle", "delete", "state"), ("cycle", "delete", "state"),
+                                       ("cycle", "move", "campaign")])
+            for name in (mover, peer):
+                self.assertNotIn("history_pending", self.record(name))
+            self.assertNotIn("history_pending", P.read_campaign_tombstone(self.root, peer["campaign_id"]))
+
+
+class C1RebuildFindsHandMoveTest(C1ChangesBase):
+    def test_c1_rebuild_and_recover_find_a_hand_made_move(self):
+        mover = self.closed_with("rb-move", "c1-rb-src", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        peer = self.closed_with("rb-peer", "c1-rb-dst")
+        source = Path(mover["cycle_dir"])
+        os.rename(str(source), str(P.campaign_dir(self.root, peer["campaign_id"]) / source.name))
+        rebuilt = adm.rebuild_index(self.root)
+        self.assertEqual(rebuilt.cycles[mover["cycle_id"]]["campaign_id"], peer["campaign_id"])
+        self.assertEqual(self.record(mover)["campaign_id"], peer["campaign_id"])
+        # A second hand move, found by `recover` this time.
+        again = self.closed_with("rb-move-2", "c1-rb-src")
+        source = Path(again["cycle_dir"])
+        os.rename(str(source), str(P.campaign_dir(self.root, peer["campaign_id"]) / source.name))
+        out = P.recover(self.root)
+        self.assertEqual(out["status"], "recovered", out)
+        self.assertEqual(self.record(again)["campaign_id"], peer["campaign_id"])
+        self.assertTrue(adm.verify_index(self.root).ok)
 
 
 def m_digest(document):

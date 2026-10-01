@@ -928,6 +928,13 @@ _EXPECTED_WRITER_CENSUS = {
     ("artifact_producer.py", "finalize"): "no-row-effect",  # the no-lineage cycle-record write
     ("artifact_producer.py", "_recover_locked"): "no-row-effect",  # the dropped-record write
     ("artifact_producer.py", "_bind_cycle_route_locked"): "no-row-effect",  # D-120: `route_bindings[]` is audit-only, never a judgment input
+    # §45 D-126: the three commands and the finding of a hand-made change.
+    ("artifact_producer.py", "cycle_mark"): "no-row-effect",  # `disposition` is a record field no locator row reads
+    ("artifact_producer.py", "_publish_document_locked"): "incremental",  # its callers update the locator indexes
+    ("artifact_producer.py", "_adopt_location_locked"): "incremental",  # `cycle_move` and `reconcile_root` update them
+    ("artifact_producer.py", "_tombstone_cycle_locked"): "incremental",  # `delete_cycle`, `delete_campaign`, `reconcile_root`
+    ("artifact_producer.py", "_finalize_deleted_locked"): "no-row-effect",  # a deleted cycle has no row
+    ("artifact_producer.py", "delete_cycle"): "incremental",
     ("artifact_producer.py", "recover_cycle_times"): "full",
     ("artifact_producer.py", "backfill_cycle_bindings"): "full",
     ("artifact_campaign.py", "_commit_event"): "incremental",
