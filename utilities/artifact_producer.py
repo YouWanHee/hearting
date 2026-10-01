@@ -8305,7 +8305,7 @@ def _tombstone_cycle_locked(root: Path, record: Mapping[str, Any], *, where: str
         command=command, stamp=stamp, target_type="cycle", target_id=record["cycle_id"], target_path=where,
         operation="delete", field="state", before={"value": {"manifest_digest": digest, "path": where}},
         after={"value": None}, reason=reason, now=now, by=by)
-    updated = dict(record, deleted_at=_rfc3339(now))
+    updated = dict(record, deleted_at=_rfc3339(now), deleted_by=command)  # a record of who, not a gate
     written = _with_cycle_lines(updated, [line])
     _write_cycle_record(root, written, exclusive=False)
     if record.get("state") == "open":
@@ -8539,7 +8539,8 @@ def _scan_layout(root: Path) -> _LayoutScan:
 
 def _hand_changes(root: Path, scan: _LayoutScan, published: Mapping[str, str]) -> Dict[str, Any]:
     """What the folders say that the records do not (read-only)."""
-    changes: Dict[str, Any] = {"campaign_paths": [], "cycle_moves": [], "cycle_gone": [], "campaign_gone": []}
+    changes: Dict[str, Any] = {"campaign_paths": [], "cycle_moves": [], "cycle_revive": [],
+                               "cycle_gone": [], "campaign_gone": []}
     for campaign_id, folder in sorted(scan.campaigns.items()):
         campaign = _read_json(folder / "campaign.json") or {}
         # A record that never carried a readable locator (an old W7 campaign) is not rewritten.
@@ -8549,7 +8550,13 @@ def _hand_changes(root: Path, scan: _LayoutScan, published: Mapping[str, str]) -
         if published.get(cycle_id) == _cycle_rel(root, folder):
             continue
         record = read_cycle_record(root, cycle_id)
-        if record is None or record.get("deleted_at"):
+        if record is not None and record.get("deleted_at"):
+            # Only what a reconcile took for gone comes back with its folder; an explicit `delete` stays deleted.
+            if record.get("deleted_by") == "reconcile" and read_campaign_tombstone(
+                    root, scan.folder_campaign[cycle_id]) is None:
+                changes["cycle_revive"].append((cycle_id, folder))
+            continue
+        if record is None:
             continue
         if record.get("campaign_id") != scan.folder_campaign[cycle_id] or (
                 isinstance(record.get("locator"), str) and record["locator"] != folder.name):
@@ -8592,12 +8599,67 @@ def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]
             changes = _hand_changes(root, scan, published)
             if not any(changes.values()):
                 return {"status": "unchanged"}
-            result = _reconcile_locked_run(root, now, scan, published, changes)
+            seen: frozenset = frozenset()
+            if changes["cycle_gone"] or changes["campaign_gone"]:
+                changes, seen = _look_again_before_gone(root, changes)
+                if not any(changes.values()):
+                    return {"status": "unchanged"}
+            result = _reconcile_locked_run(root, now, scan, published, changes, seen)
             if result is not None:
                 return result
         return {"status": "skipped", "reason": "layout-changed-during-scan"}
     except Exception as exc:  # noqa: BLE001 -- finding a hand-made change never fails the command that asked
         return {"status": "skipped", "reason": type(exc).__name__, "detail": str(exc)}
+
+
+def _revive_cycle_locked(root: Path, record: Mapping[str, Any], folder: Path, *, stamp: str,
+                         now: Optional[float], by: str,
+                         old_campaign_folder: Optional[Path]) -> List[str]:
+    """A cycle a reconcile took for gone has its folder again (the admission lock is held).
+
+    The tombstone comes off, the location is adopted as a hand-made move is, the cycle joins its campaign's
+    list, the index gets its row from the current manifest, and one line says it is back.  Returns the campaign
+    IDs whose locator index is now stale."""
+    cycle_id = record["cycle_id"]
+    where = _cycle_rel(root, folder)
+    revived = {key: value for key, value in record.items() if key not in ("deleted_at", "deleted_by")}
+    index = artifact_admission.load_index(root)  # the one read of this locked section
+    found = _read_manifest_raw(folder) if _closed_record(record) else None
+    if found is not None and (cycle_id not in index.cycles or cycle_id not in index.manifests):
+        # The row comes back first, from the manifest the folder carries; a changed campaign is then an
+        # ordinary replacement of that row.
+        digest = artifact_manifest.manifest_digest(found[1])
+        index = artifact_index.apply(index, found[1], cycle_path=where, manifest_digest=digest,
+                                     idempotency_key=cycle_id)
+        artifact_admission._write_index(root, index)
+        revived["manifest_digest"] = digest
+    written, touched = _adopt_location_locked(
+        root, revived, folder, command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
+        old_campaign_folder=old_campaign_folder, index=index)
+    _edit_campaign_members(root, folder.parent, cycle_id, joining=True)
+    line = _command_line(
+        command="reconcile", stamp=stamp, target_type="cycle", target_id=cycle_id, target_path=where,
+        operation="update", field="path", before={"value": None}, after={"value": where},
+        reason="reconcile", now=now, by=by)
+    _write_cycle_record(root, _with_cycle_lines(written, [line]), exclusive=False)
+    return touched + [written["campaign_id"]]
+
+
+def _look_again_before_gone(root: Path, changes: Mapping[str, Any]) -> Tuple[Dict[str, Any], frozenset]:
+    """A folder carried from a campaign the scan had not reached yet into one it had already read is
+    in neither: before anything is taken for gone, the folders are read once more (no lock held).
+
+    What the second reading sees is left out of the gone lists (the next look finds where it moved to),
+    and a second reading that is not complete takes nothing for gone.  Returns the changes and the cycle
+    IDs the second reading saw."""
+    again = _scan_layout(root)
+    if not again.complete:
+        return dict(changes, cycle_gone=[], campaign_gone=[]), frozenset()
+    seen = frozenset(again.cycles) | frozenset(again.duplicates)
+    return dict(
+        changes, cycle_gone=[item for item in changes["cycle_gone"] if item not in seen],
+        campaign_gone=[item for item in changes["campaign_gone"]
+                       if item not in again.campaigns and item not in again.duplicates]), seen
 
 
 def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mapping[str, str]) -> bool:
@@ -8619,7 +8681,7 @@ def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mappin
         campaign = _read_json(folder / "campaign.json") if folder_is(folder) else None
         if not campaign or campaign.get("campaign_id") != campaign_id or campaign.get("locator") == folder.name:
             return False
-    for cycle_id, folder in changes["cycle_moves"]:
+    for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
         try:
             binding = artifact_locator.read_cycle_binding(folder) if folder_is(folder) else None
         except artifact_locator.LocatorError:
@@ -8633,7 +8695,7 @@ def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mappin
 
 
 def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, published: Mapping[str, str],
-                          changes: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+                          changes: Mapping[str, Any], seen: frozenset = frozenset()) -> Optional[Dict[str, Any]]:
     """Apply what `reconcile_root` found, under the admission lock.  `None` when what was found
     no longer holds, for the caller to look again."""
     held = artifact_admission.holds_lock(root)
@@ -8677,6 +8739,16 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             if was != written["campaign_id"]:
                 left.setdefault(was, []).append(cycle_id)
             result["cycle_moves"].append(cycle_id)
+        for cycle_id, folder in changes["cycle_revive"]:
+            record = read_cycle_record(root, cycle_id)
+            if record is None or record.get("deleted_by") != "reconcile" or not record.get("deleted_at"):
+                continue
+            was = record["campaign_id"]
+            touched = _revive_cycle_locked(root, record, folder, stamp=stamp, now=now, by=by,
+                                           old_campaign_folder=scan.campaigns.get(was))
+            _flush_cycle_pending_locked(root, cycle_id)
+            stale += touched + [was]
+            result["cycle_moves"].append(cycle_id)  # back where a folder is: no field of its own
         gone_cycles: List[str] = []
         for cycle_id in changes["cycle_gone"]:
             record = read_cycle_record(root, cycle_id)
@@ -8693,7 +8765,7 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             last_path = published.get(campaign_id, "") or f"campaigns/{campaign_id}"
             members = [r for r in list_cycle_records(root) if r.get("campaign_id") == campaign_id]
             for member in members:
-                if member.get("deleted_at") or not _closed_record(member):
+                if member.get("deleted_at") or not _closed_record(member) or member["cycle_id"] in seen:
                     continue
                 _tombstone_cycle_locked(root, member, where=_last_known_path(root, member, published.get(member["cycle_id"], "")),
                                         command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,

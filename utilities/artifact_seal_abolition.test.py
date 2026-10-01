@@ -3450,6 +3450,178 @@ class E2BeginWaitsForAdmissionTest(B1RefreshBase):
         self.assertEqual(result["layout"], "cycle")
 
 
+class E3ReconcileRaceTest(C1ChangesBase):
+    """A cycle carried between campaigns while the layout is being read is never taken for gone."""
+
+    def two_campaigns(self):
+        first = self.closed_with("e3-one", "e3-a", {"plans/cycle/a.md": b"a\n"}, activate=True)
+        second = self.closed_with("e3-two", "e3-b", {"plans/cycle/b.md": b"b\n"})
+        folders = {r["campaign_id"]: P.campaign_dir(self.root, r["campaign_id"]) for r in (first, second)}
+        early, late = sorted(folders.values(), key=lambda path: path.name)
+        by_folder = {folders[r["campaign_id"]]: r for r in (first, second)}
+        return by_folder[early], by_folder[late], early, late
+
+    def carry_during_scan(self, moved, early, late):
+        """Run `reconcile_root` and, right after the scan reads `early`'s children, carry `moved` from `late` into it."""
+        source = Path(moved["cycle_dir"])
+        target = early / source.name
+        real_listdir, state = os.listdir, {"done": False}
+
+        def listdir(path="."):
+            names = real_listdir(path)
+            if not state["done"] and Path(str(path)) == early:
+                state["done"] = True
+                os.rename(str(source), str(target))
+            return names
+
+        with mock.patch.object(os, "listdir", listdir):
+            out = P.reconcile_root(self.root)
+        self.assertTrue(state["done"])
+        return out, target
+
+    def test_e3_a_cycle_carried_during_the_scan_is_not_tombstoned_and_the_next_look_moves_it(self):
+        keep, moved, early, late = self.two_campaigns()
+        out, target = self.carry_during_scan(moved, early, late)
+        record = self.record(moved)
+        self.assertNotIn("deleted_at", record, f"tombstoned although its folder is at {target}: {out}")
+        self.assertEqual(out.get("cycle_gone", []), [])
+        self.assertTrue(target.is_dir())
+        self.assertEqual(self.index_row(moved)[0]["cycle_path"], P._cycle_rel(self.root, Path(moved["cycle_dir"])))
+        # The look after finds the cycle where it now is.
+        again = P.reconcile_root(self.root)
+        self.assertEqual(again["status"], "reconciled", again)
+        record = self.record(moved)
+        self.assertEqual(record["campaign_id"], keep["campaign_id"])
+        self.assertNotIn("deleted_at", record)
+        self.assertEqual(self.index_row(moved)[0]["cycle_path"], P._cycle_rel(self.root, target))
+        self.assertIn(moved["cycle_id"], P.read_campaign(self.root, keep["campaign_id"])["cycles"])
+
+    def test_e3_an_incomplete_second_reading_takes_nothing_for_gone(self):
+        keep, victim, early, late = self.two_campaigns()
+        shutil.rmtree(str(Path(victim["cycle_dir"])))
+        incomplete = P._scan_layout(self.root)
+        incomplete.complete = False
+        real_scan, calls = P._scan_layout, []
+
+        def scan(root):
+            calls.append(1)
+            return real_scan(root) if len(calls) == 1 else incomplete
+
+        with mock.patch.object(P, "_scan_layout", scan):
+            out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "unchanged", out)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("deleted_at", self.record(victim))
+        # With a complete second reading the removal is found as before.
+        self.assertEqual(P.reconcile_root(self.root)["status"], "reconciled")
+        self.assertIn("deleted_at", self.record(victim))
+
+    def test_e3_a_member_seen_again_survives_the_removal_of_its_campaign(self):
+        keep, victim, early, late = self.two_campaigns()
+        # `victim`'s campaign folder is removed, but its cycle is carried into `keep`'s while the scan runs.
+        source = Path(victim["cycle_dir"])
+        target = early / source.name
+        os.rename(str(source), str(target))
+        shutil.rmtree(str(late))
+        first = P._scan_layout(self.root)
+        self.assertEqual(first.cycles[victim["cycle_id"]], target)  # the folders say where it is
+        # A scan that missed the carried folder: the look-again must stop both from being tombstoned.
+        stale = P._LayoutScan(dict(first.campaigns), {k: v for k, v in first.cycles.items()
+                                                      if k != victim["cycle_id"]},
+                              dict(first.folder_campaign), set(), True)
+        published = adm.load_index(self.root) and P.artifact_locator._load_index(self.root)
+        changes = P._hand_changes(self.root, stale, published)
+        self.assertIn(victim["cycle_id"], changes["cycle_gone"])
+        changes, seen = P._look_again_before_gone(self.root, changes)
+        self.assertEqual(changes["cycle_gone"], [])
+        self.assertIn(victim["cycle_id"], seen)
+        self.assertEqual(changes["campaign_gone"], [victim["campaign_id"]])
+        out = P._reconcile_locked_run(self.root, None, stale, published, changes, seen)
+        self.assertEqual(out["status"], "reconciled")
+        self.assertNotIn("deleted_at", self.record(victim))
+        self.assertTrue(target.is_dir())
+
+
+class E4ReviveTest(C1ChangesBase):
+    """A cycle a reconcile took for gone comes back with its folder; an explicit delete never does."""
+
+    def test_e4_a_reconcile_tombstone_is_revived_when_the_folder_returns(self):
+        keep = self.closed_with("e4-keep", "e4-a", {"plans/cycle/k.md": b"k\n"}, activate=True)
+        gone = self.closed_with("e4-gone", "e4-a", {"plans/cycle/g.md": b"g\n"})
+        folder = Path(gone["cycle_dir"])
+        copy = Path(self._tmp.name) / "e4-copy"
+        shutil.copytree(str(folder), str(copy), symlinks=True)
+        shutil.rmtree(str(folder))
+        self.assertEqual(P.reconcile_root(self.root)["status"], "reconciled")
+        record = self.record(gone)
+        self.assertEqual((bool(record.get("deleted_at")), record.get("deleted_by")), (True, "reconcile"))
+        self.assertNotIn(gone["cycle_id"], P.read_campaign(self.root, gone["campaign_id"])["cycles"])
+        self.assertIsNone(self.index_row(gone)[0])
+        # The folder is put back (a copy, a restore from a backup).
+        shutil.copytree(str(copy), str(folder), symlinks=True)
+        self.history.made.clear()
+        out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "reconciled", out)
+        record = self.record(gone)
+        self.assertNotIn("deleted_at", record)
+        self.assertNotIn("deleted_by", record)
+        self.assertNotIn("history_pending", record)
+        self.assertIn(gone["cycle_id"], P.read_campaign(self.root, gone["campaign_id"])["cycles"])
+        cycle_row, manifest_row = self.index_row(gone)
+        self.assertEqual(cycle_row["cycle_path"], P._cycle_rel(self.root, folder))
+        self.assertEqual(manifest_row["manifest_digest"], m_digest(json.loads((folder / "manifest.json").read_text())))
+        (line,) = self.history.made
+        self.assertEqual((line["target_type"], line["field"], line["operation"], line["actor"]["by"]),
+                         ("cycle", "path", "update", "rule"))
+        self.assertEqual((line["before"], line["after"]),
+                         ({"value": None}, {"value": P._cycle_rel(self.root, folder)}))
+        self.assertEqual(P.reconcile_root(self.root)["status"], "unchanged")
+        self.assertNotIn("deleted_at", self.record(keep))
+
+    def test_e4_a_revived_cycle_follows_a_folder_that_came_back_somewhere_else(self):
+        keep = self.closed_with("e4-home", "e4-home", {"plans/cycle/k.md": b"k\n"}, activate=True)
+        other = self.closed_with("e4-other", "e4-other", {"plans/cycle/o.md": b"o\n"})
+        gone = self.closed_with("e4-away", "e4-home", {"plans/cycle/g.md": b"g\n"})
+        folder = Path(gone["cycle_dir"])
+        copy = Path(self._tmp.name) / "e4-away-copy"
+        shutil.copytree(str(folder), str(copy), symlinks=True)
+        shutil.rmtree(str(folder))
+        P.reconcile_root(self.root)
+        self.assertIn("deleted_at", self.record(gone))
+        destination = P.campaign_dir(self.root, other["campaign_id"]) / folder.name
+        shutil.copytree(str(copy), str(destination), symlinks=True)
+        self.assertEqual(P.reconcile_root(self.root)["status"], "reconciled")
+        record = self.record(gone)
+        self.assertEqual((record["campaign_id"], record["locator"]), (other["campaign_id"], destination.name))
+        self.assertNotIn("deleted_at", record)
+        self.assertIn(gone["cycle_id"], P.read_campaign(self.root, other["campaign_id"])["cycles"])
+        self.assertNotIn(gone["cycle_id"], P.read_campaign(self.root, keep["campaign_id"])["cycles"])
+        self.assertEqual(self.index_row(gone)[0]["campaign_id"], other["campaign_id"])
+        self.assertEqual(self.index_row(gone)[0]["cycle_path"], P._cycle_rel(self.root, destination))
+        self.assertEqual(json.loads((destination / ".cycle.json").read_text())["campaign_id"], other["campaign_id"])
+
+    def test_e4_an_explicit_delete_stopped_before_the_folder_went_is_finished_not_revived(self):
+        keep = self.closed_with("e4-del-keep", "e4-del", {"plans/cycle/k.md": b"k\n"}, activate=True)
+        gone = self.closed_with("e4-del-gone", "e4-del", {"plans/cycle/g.md": b"g\n"})
+        folder = Path(gone["cycle_dir"])
+        with mock.patch.object(P, "_remove_folder", side_effect=RuntimeError("stopped here")):
+            with self.assertRaises(RuntimeError):
+                P.delete_cycle(self.root, gone["cycle_id"])
+        record = self.record(gone)
+        self.assertEqual((bool(record.get("deleted_at")), record.get("deleted_by")), (True, "delete"))
+        self.assertTrue(folder.is_dir())
+        out = P.reconcile_root(self.root)
+        self.assertNotIn(gone["cycle_id"], out.get("cycle_moves", []))
+        record = self.record(gone)
+        self.assertTrue(record.get("deleted_at"))
+        self.assertEqual(record.get("deleted_by"), "delete")
+        # The same command again finishes it.
+        self.assertEqual(P.delete_cycle(self.root, gone["cycle_id"])["status"], "deleted")
+        self.assertFalse(folder.exists())
+        self.assertEqual(P.delete_cycle(self.root, gone["cycle_id"])["status"], "already-deleted")
+        self.assertNotIn("deleted_at", self.record(keep))
+
+
 def m_digest(document):
     return M.manifest_digest(document)
 
