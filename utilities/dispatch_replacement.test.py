@@ -177,6 +177,9 @@ class ReplacementTest(unittest.TestCase):
         # its claim. The next launcher runs from a newer release.
         args=SimpleNamespace(**vars(self.args));args.attempt_id='att-next'
         args.replacement_input_argv=['--start','--attempt-id','att-next','--prompt-text','the raw task']
+        # The launcher holds the allow-list as a tuple; the sealed file reads it back as a list.
+        args.resolved_permission_posture={'mode':'bypass','mode_flag':'bypassPermissions',
+                 'allowed_tools':('Bash(git status)','Read'),'inherited_default_mode':'default'}
         first=R.seal_launch_input(args,'codex','the raw task')
         self.write({**self.meta,'attempt_id':'att-next','launch_claimed':'0',
                     **D.parse_registry_metadata(first)},'open',append=True)

@@ -179,7 +179,8 @@ _RESEAL_STABLE_KEYS = ('schema', 'attempt_id', 'harness', 'jobs', 'worktree', 'a
 def _reseal_allowed(jobs, aid, path, payload):
     """A launcher stopped before its claim sealed this input; the next one may reseal it."""
     previous = _read(path)
-    if not previous or any(previous.get(key) != payload.get(key) for key in _RESEAL_STABLE_KEYS):
+    stored = json.loads(_bytes(payload))  # compare in the stored form: a tuple reads back as a list
+    if not previous or any(previous.get(key) != stored.get(key) for key in _RESEAL_STABLE_KEYS):
         return False
     rows = []
     for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
