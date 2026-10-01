@@ -7927,17 +7927,20 @@ def _publish_document_locked(root: Path, record: Mapping[str, Any], directory: P
                              record_after: Optional[Mapping[str, Any]] = None,
                              moved_fields: Sequence[str] = (),
                              index: Optional[artifact_index.IndexDocument] = None,
-                             cycle_path: Optional[str] = None) -> Dict[str, Any]:
+                             cycle_path: Optional[str] = None,
+                             digest: Optional[str] = None) -> Dict[str, Any]:
     """Publish `refreshed` as the cycle's current document (the admission lock is held).
 
     The same order a refresh keeps: the earlier document is preserved, the history lines go to the
     recorder (what it cannot take waits in the record), the new document is preserved, the manifest is
     replaced atomically, then the index row is swapped on the earlier digest and the record follows.
     `record_after` is the record the caller already changed (a move); `cycle_path` is where the folder
-    is now.  Returns the record as written."""
+    is now; `digest` is the earlier document's digest when the caller already has it.  Returns the
+    record as written."""
     cycle_id = record["cycle_id"]
     manifest_path = directory / "manifest.json"
-    digest = artifact_manifest.manifest_digest(document)
+    if digest is None:
+        digest = artifact_manifest.manifest_digest(document)
     artifact_lifecycle.preserve_manifest_snapshot(root, cycle_id, raw)
     earlier = {old.get("manifest_revision_id"): old for old in _earlier_documents(root, cycle_id, refreshed)}
     earlier[document.get("manifest_revision_id")] = dict(document)
@@ -8112,6 +8115,7 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
                            command: str, stamp: str, reason: Optional[str], now: Optional[float],
                            by: str, parent: Any = _UNSET, old_campaign_folder: Optional[Path] = None,
                            index: Optional[artifact_index.IndexDocument] = None,
+                           manifest: Any = _UNSET, manifest_digest: Optional[str] = None,
                            ) -> Tuple[Dict[str, Any], List[str]]:
     """Make the records say what the folders say: the cycle now sits at `new_directory`.
 
@@ -8119,7 +8123,9 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
     held; the folder is already where it is).  The cycle's own binding, record, campaign lists, current
     manifest (a new document, the earlier one preserved) and index row follow, in an order a stopped run
     is finished by the next look.  `parent` (when given) is the new parent cycle ID or `None`.  Returns
-    the record as written and the campaign IDs whose locator index is now stale."""
+    the record as written and the campaign IDs whose locator index is now stale.  `manifest` (the
+    `_read_manifest_raw` result, `None` for none) and its `manifest_digest` are what a reconcile read
+    before it took the lock; left out, the folder's manifest is read here."""
     cycle_id = record["cycle_id"]
     target_campaign_dir = new_directory.parent
     target = _read_json(target_campaign_dir / "campaign.json")
@@ -8165,7 +8171,8 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
         _edit_campaign_members(root, old_campaign_folder, cycle_id, joining=False)
         _edit_campaign_members(root, target_campaign_dir, cycle_id, joining=True)
     pending_record = _with_cycle_lines(updated, lines)
-    manifest = _read_manifest_raw(new_directory) if _closed_record(record) else None
+    if manifest is _UNSET:
+        manifest = _read_manifest_raw(new_directory) if _closed_record(record) else None
     if manifest is not None:
         raw, document = manifest
         refreshed = _next_document(document, artifact_identity.IdAllocator())
@@ -8184,7 +8191,8 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
         else:
             written = _publish_document_locked(
                 root, record, new_directory, raw, document, refreshed, lines, now=now, record_after=updated,
-                moved_fields=("campaign_id", "parent_cycle_id"), index=index, cycle_path=where)
+                moved_fields=("campaign_id", "parent_cycle_id"), index=index, cycle_path=where,
+                digest=manifest_digest)
     else:
         written = pending_record
         _write_cycle_record(root, written, exclusive=False)
@@ -8575,6 +8583,35 @@ def _hand_changes(root: Path, scan: _LayoutScan, published: Mapping[str, str]) -
     return changes
 
 
+class _PreManifest(NamedTuple):
+    """A closed cycle's manifest as read before the lock, with the `lstat` fingerprint it was read under."""
+    found: Optional[Tuple[bytes, Dict[str, Any]]]
+    digest: Optional[str]
+    fingerprint: Optional[Tuple[int, int, int]]
+
+
+def _manifest_fingerprint(folder: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        seen = os.lstat(str(Path(folder) / "manifest.json"))
+    except OSError:
+        return None
+    return (seen.st_size, seen.st_mtime_ns, seen.st_ino)
+
+
+def _preread_manifests(root: Path, changes: Mapping[str, Any]) -> Dict[str, _PreManifest]:
+    """Read, with no lock held, the manifest of each closed cycle a reconcile is about to adopt or revive."""
+    out: Dict[str, _PreManifest] = {}
+    for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
+        record = read_cycle_record(root, cycle_id)
+        if record is None or not _closed_record(record):
+            continue
+        fingerprint = _manifest_fingerprint(folder)
+        found = _read_manifest_raw(folder)
+        out[cycle_id] = _PreManifest(
+            found, artifact_manifest.manifest_digest(found[1]) if found is not None else None, fingerprint)
+    return out
+
+
 def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]:
     """D-126: find what was moved, renamed or removed by hand and make the records say so.
 
@@ -8604,7 +8641,8 @@ def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]
                 changes, seen = _look_again_before_gone(root, changes)
                 if not any(changes.values()):
                     return {"status": "unchanged"}
-            result = _reconcile_locked_run(root, now, scan, published, changes, seen)
+            result = _reconcile_locked_run(root, now, scan, published, changes, seen,
+                                           _preread_manifests(root, changes))
             if result is not None:
                 return result
         return {"status": "skipped", "reason": "layout-changed-during-scan"}
@@ -8614,28 +8652,31 @@ def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]
 
 def _revive_cycle_locked(root: Path, record: Mapping[str, Any], folder: Path, *, stamp: str,
                          now: Optional[float], by: str,
-                         old_campaign_folder: Optional[Path]) -> List[str]:
+                         old_campaign_folder: Optional[Path],
+                         manifest: Any = _UNSET, manifest_digest: Optional[str] = None) -> List[str]:
     """A cycle a reconcile took for gone has its folder again (the admission lock is held).
 
     The tombstone comes off, the location is adopted as a hand-made move is, the cycle joins its campaign's
     list, the index gets its row from the current manifest, and one line says it is back.  Returns the campaign
-    IDs whose locator index is now stale."""
+    IDs whose locator index is now stale.  `manifest` and `manifest_digest` are what the reconcile read
+    before the lock (see `_adopt_location_locked`)."""
     cycle_id = record["cycle_id"]
     where = _cycle_rel(root, folder)
     revived = {key: value for key, value in record.items() if key not in ("deleted_at", "deleted_by")}
     index = artifact_admission.load_index(root)  # the one read of this locked section
-    found = _read_manifest_raw(folder) if _closed_record(record) else None
+    found = manifest if manifest is not _UNSET else (_read_manifest_raw(folder) if _closed_record(record) else None)
     if found is not None and (cycle_id not in index.cycles or cycle_id not in index.manifests):
         # The row comes back first, from the manifest the folder carries; a changed campaign is then an
         # ordinary replacement of that row.
-        digest = artifact_manifest.manifest_digest(found[1])
+        digest = manifest_digest or artifact_manifest.manifest_digest(found[1])
         index = artifact_index.apply(index, found[1], cycle_path=where, manifest_digest=digest,
                                      idempotency_key=cycle_id)
         artifact_admission._write_index(root, index)
         revived["manifest_digest"] = digest
     written, touched = _adopt_location_locked(
         root, revived, folder, command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
-        old_campaign_folder=old_campaign_folder, index=index)
+        old_campaign_folder=old_campaign_folder, index=index, manifest=found,
+        manifest_digest=manifest_digest)
     _edit_campaign_members(root, folder.parent, cycle_id, joining=True)
     line = _command_line(
         command="reconcile", stamp=stamp, target_type="cycle", target_id=cycle_id, target_path=where,
@@ -8695,14 +8736,25 @@ def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mappin
 
 
 def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, published: Mapping[str, str],
-                          changes: Mapping[str, Any], seen: frozenset = frozenset()) -> Optional[Dict[str, Any]]:
+                          changes: Mapping[str, Any], seen: frozenset = frozenset(),
+                          manifests: Optional[Mapping[str, _PreManifest]] = None) -> Optional[Dict[str, Any]]:
     """Apply what `reconcile_root` found, under the admission lock.  `None` when what was found
-    no longer holds, for the caller to look again."""
+    no longer holds, for the caller to look again.  `manifests` are the closed cycles' manifests read
+    before the lock; under it only their `lstat` fingerprint is looked at (a manifest that changed since
+    is for the next look).  Left out, they are read here."""
     held = artifact_admission.holds_lock(root)
     lock_fd = None if held else artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS, now=now)
     try:
         if artifact_locator._load_index(root) != published or not _hand_changes_hold(root, changes, published):
             return None
+        if manifests is not None:
+            for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
+                current = read_cycle_record(root, cycle_id)
+                if current is None or not _closed_record(current):
+                    continue
+                pre = manifests.get(cycle_id)
+                if pre is None or pre.fingerprint != _manifest_fingerprint(folder):
+                    return None
         stamp = _command_stamp()
         by = _HAND_ACTOR
         stale: List[str] = []
@@ -8731,9 +8783,11 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             if record is None:
                 continue
             was = record["campaign_id"]
+            pre = (manifests or {}).get(cycle_id)
+            read = {"manifest": pre.found, "manifest_digest": pre.digest} if pre is not None else {}
             written, touched = _adopt_location_locked(
                 root, record, folder, command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
-                old_campaign_folder=scan.campaigns.get(was))
+                old_campaign_folder=scan.campaigns.get(was), **read)
             _flush_cycle_pending_locked(root, cycle_id)
             stale += touched + [was]
             if was != written["campaign_id"]:
@@ -8744,8 +8798,10 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             if record is None or record.get("deleted_by") != "reconcile" or not record.get("deleted_at"):
                 continue
             was = record["campaign_id"]
+            pre = (manifests or {}).get(cycle_id)
+            read = {"manifest": pre.found, "manifest_digest": pre.digest} if pre is not None else {}
             touched = _revive_cycle_locked(root, record, folder, stamp=stamp, now=now, by=by,
-                                           old_campaign_folder=scan.campaigns.get(was))
+                                           old_campaign_folder=scan.campaigns.get(was), **read)
             _flush_cycle_pending_locked(root, cycle_id)
             stale += touched + [was]
             result["cycle_moves"].append(cycle_id)  # back where a folder is: no field of its own

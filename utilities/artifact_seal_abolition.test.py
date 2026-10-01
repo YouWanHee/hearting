@@ -3622,6 +3622,140 @@ class E4ReviveTest(C1ChangesBase):
         self.assertNotIn("deleted_at", self.record(keep))
 
 
+class E5ManifestReadOutsideLockTest(C1ChangesBase):
+    """A reconcile reads (and hashes) the manifests it adopts before the admission lock, not under it."""
+
+    two_campaigns = E3ReconcileRaceTest.two_campaigns
+
+    def probe(self, documents):
+        """Record, per call, whether the admission lock was held: every manifest read, and every digest of a document in `documents`."""
+        seen = {"read": [], "digest": []}
+        real_read, real_digest = P._read_manifest_raw, P.artifact_manifest.manifest_digest
+
+        def read(directory):
+            seen["read"].append(adm.holds_lock(self.root))
+            return real_read(directory)
+
+        def digest(document):
+            if document in documents:
+                seen["digest"].append(adm.holds_lock(self.root))
+            return real_digest(document)
+
+        patches = (mock.patch.object(P, "_read_manifest_raw", read),
+                   mock.patch.object(P.artifact_manifest, "manifest_digest", digest))
+        return seen, patches
+
+    def run_probed(self, documents):
+        seen, patches = self.probe(documents)
+        with patches[0], patches[1]:
+            out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "reconciled", out)
+        self.assertTrue(seen["read"], "the manifest was never read")
+        self.assertNotIn(True, seen["read"], "a manifest was read with the admission lock held")
+        self.assertNotIn(True, seen["digest"], "the adopted manifest was hashed with the admission lock held")
+        return out
+
+    def removed_and_returned(self, slug, campaign_key, where=None):
+        keep = self.closed_with(slug + "-keep", campaign_key, {"plans/cycle/k.md": b"k\n"}, activate=True)
+        gone = self.closed_with(slug + "-gone", campaign_key, {"plans/cycle/g.md": b"g\n"})
+        folder = Path(gone["cycle_dir"])
+        copy = Path(self._tmp.name) / (slug + "-copy")
+        shutil.copytree(str(folder), str(copy), symlinks=True)
+        document = json.loads((folder / "manifest.json").read_text())
+        shutil.rmtree(str(folder))
+        self.assertEqual(P.reconcile_root(self.root)["status"], "reconciled")
+        self.assertIn("deleted_at", self.record(gone))
+        destination = (where or folder.parent) / folder.name
+        shutil.copytree(str(copy), str(destination), symlinks=True)
+        return keep, gone, destination, document
+
+    def test_e5_a_revival_reads_and_hashes_the_manifest_before_the_lock(self):
+        keep, gone, folder, document = self.removed_and_returned("e5-rev", "e5-rev")
+        self.run_probed([document])
+        self.assertNotIn("deleted_at", self.record(gone))
+        self.assertEqual(self.index_row(gone)[1]["manifest_digest"], m_digest(document))
+        self.assertEqual(P.reconcile_root(self.root)["status"], "unchanged")
+
+    def test_e5_a_revival_in_another_campaign_does_not_hash_the_old_manifest_under_the_lock(self):
+        home = self.closed_with("e5-home", "e5-home", {"plans/cycle/h.md": b"h\n"}, activate=True)
+        other = self.closed_with("e5-other", "e5-other", {"plans/cycle/o.md": b"o\n"})
+        keep, gone, destination, document = self.removed_and_returned(
+            "e5-away", "e5-home", where=P.campaign_dir(self.root, other["campaign_id"]))
+        self.run_probed([document])
+        record = self.record(gone)
+        self.assertEqual(record["campaign_id"], other["campaign_id"])
+        self.assertNotIn("deleted_at", record)
+        self.assertEqual(self.index_row(gone)[0]["cycle_path"], P._cycle_rel(self.root, destination))
+
+    def test_e5_a_hand_move_reads_and_hashes_the_manifest_before_the_lock(self):
+        keep, moved, early, late = self.two_campaigns()
+        source = Path(moved["cycle_dir"])
+        document = json.loads((source / "manifest.json").read_text())
+        target = early / source.name
+        os.rename(str(source), str(target))
+        out = self.run_probed([document])
+        self.assertEqual(out["cycle_moves"], [moved["cycle_id"]])
+        record = self.record(moved)
+        self.assertEqual(record["campaign_id"], keep["campaign_id"])
+        self.assertEqual(self.index_row(moved)[0]["cycle_path"], P._cycle_rel(self.root, target))
+        self.assertEqual(len(self.lines(field="campaign", target_id=moved["cycle_id"])), 1)
+
+    def change_after_preread(self, folder):
+        """Patch `_preread_manifests` so the manifest at `folder` is touched (same bytes, new mtime) once it was read."""
+        real, state = P._preread_manifests, {"calls": 0}
+
+        def preread(root, changes):
+            out = real(root, changes)
+            state["calls"] += 1
+            if state["calls"] == 1:
+                path = Path(folder) / "manifest.json"
+                seen = path.stat()
+                os.utime(str(path), ns=(seen.st_atime_ns, seen.st_mtime_ns + 1_000_000_000))
+            return out
+
+        return mock.patch.object(P, "_preread_manifests", preread), state
+
+    def test_e5_a_manifest_that_changes_after_the_read_is_adopted_by_the_next_look(self):
+        keep, moved, early, late = self.two_campaigns()
+        source = Path(moved["cycle_dir"])
+        target = early / source.name
+        os.rename(str(source), str(target))
+        patch, state = self.change_after_preread(target)
+        adopted = []
+        real_adopt = P._adopt_location_locked
+
+        def adopt(*args, **kwargs):
+            adopted.append(1)
+            return real_adopt(*args, **kwargs)
+
+        with patch, mock.patch.object(P, "_adopt_location_locked", adopt):
+            out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "reconciled", out)
+        self.assertEqual(state["calls"], 2)  # the first run saw the change and left it to the second look
+        self.assertEqual(len(adopted), 1)
+        record = self.record(moved)
+        self.assertEqual(record["campaign_id"], keep["campaign_id"])
+        self.assertEqual(self.index_row(moved)[0]["cycle_path"], P._cycle_rel(self.root, target))
+        self.assertEqual(self.index_row(moved)[1]["manifest_digest"],
+                         m_digest(json.loads((target / "manifest.json").read_text())))
+        self.assertEqual(len(self.lines(field="campaign", target_id=moved["cycle_id"])), 1)
+        self.assertNotIn("history_pending", record)
+        self.assertEqual(P.reconcile_root(self.root)["status"], "unchanged")
+
+    def test_e5_a_manifest_that_changes_after_the_read_is_revived_by_the_next_look(self):
+        keep, gone, folder, document = self.removed_and_returned("e5-stale", "e5-stale")
+        patch, state = self.change_after_preread(folder)
+        with patch:
+            out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "reconciled", out)
+        self.assertEqual(state["calls"], 2)
+        record = self.record(gone)
+        self.assertNotIn("deleted_at", record)
+        self.assertEqual(self.index_row(gone)[1]["manifest_digest"], m_digest(document))
+        self.assertEqual(len(self.lines(field="path", target_id=gone["cycle_id"])), 1)
+        self.assertEqual(P.reconcile_root(self.root)["status"], "unchanged")
+
+
 def m_digest(document):
     return M.manifest_digest(document)
 
