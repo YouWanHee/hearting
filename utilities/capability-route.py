@@ -8622,14 +8622,32 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         print(json.dumps(result,sort_keys=True))
     return output_path.resolve()
 
-def _route_autoclose(artifact_root, trigger):
+def _close_route_argument(a):
+    """`close --route` takes a route file or an `rt-...` id; an id is looked up under the artifact root."""
+    import artifact_producer
+    if not artifact_producer._ROUTE_ID_RE.fullmatch(a.route) or Path(a.route).exists():
+        return a.route
+    root=a.artifact_root or os.environ.get("AGENT_ARTIFACT_ROOT") or _compose_artifact_root(os.getcwd())
+    path=artifact_producer.resolve_route_argument(Path(root),a.route)
+    if not path.is_file():
+        raise ValueError(f"route-not-found: {a.route} under {root}/.runtime/routes")
+    return str(path)
+
+def _route_autoclose(artifact_root, trigger, route=None):
     """The runtime closes routes nobody works on any more (utilities/route_autoclose.py).
-    Bookkeeping only: it never fails or blocks the command that triggered it."""
+    Bookkeeping only: it never fails or blocks the command that triggered it.
+    With `route`, only that route's own campaign is swept; a campaign not yet begun has nothing to close."""
     try:
         import route_autoclose
         api=sys.modules.get(__name__)
         if api is None: return
-        route_autoclose.report(route_autoclose.sweep(artifact_root,api=api,trigger=trigger))
+        scope={}
+        if route is not None:
+            found=route_autoclose.campaign_of_route(Path(artifact_root),route)
+            if found is None: return
+            scope={"scope_campaign_id":found[0],"scope_dir":found[1],
+                   "scope_key":route_autoclose.campaign_key_of(route)}
+        route_autoclose.report(route_autoclose.sweep(artifact_root,api=api,trigger=trigger,**scope))
     except Exception as exc:  # noqa: BLE001
         print(f"route_autoclose error={type(exc).__name__}",file=sys.stderr)
 
@@ -8772,7 +8790,9 @@ def main():
     rv.add_argument("--author-attempt-id",help="the recording attempt; default AGENT_DISPATCH_ATTEMPT_ID")
     rv.add_argument("--recorded-by",default="owner")
     rv.add_argument("--output")
-    cl=sub.add_parser("close"); cl.add_argument("--route",required=True)
+    cl=sub.add_parser("close"); cl.add_argument("--route",required=True,help="route file path or route id (rt-...)")
+    cl.add_argument("--artifact-root",default=None,
+                    help="for a route id: default AGENT_ARTIFACT_ROOT, else utilities/artifact-root.sh for the current directory")
     cl.add_argument("--commit",help="result commit; defaults to HEAD in the route cwd")
     cl.add_argument("--summary",help="one line naming what the route produced")
     cl.add_argument("--allow-unproven",action="store_true",
@@ -8873,7 +8893,7 @@ def main():
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
-        _route_autoclose(artifact_root,"compose")
+        _route_autoclose(artifact_root,"compose",route)
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
@@ -9062,6 +9082,8 @@ def main():
         receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
         print(json.dumps(receipt,sort_keys=True))
     else:
+        if a.command=="close":
+            a.route=_close_route_argument(a)
         route=verify_route(
             json.loads(Path(a.route).read_text()), getattr(a,"cwd",None),
             allow_stale_registry=a.command=="close",

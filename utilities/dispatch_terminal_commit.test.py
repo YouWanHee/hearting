@@ -1,6 +1,8 @@
+import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,7 @@ from unittest import mock
 
 import dispatch_terminal_commit as T
 import owner_route_binding
+import artifact_admission
 import artifact_producer
 
 # The one already-loaded handle on capability-route.py; the quick-branch tests
@@ -825,6 +828,45 @@ class ForwardRecoveryTest(_TerminalCommitFixture):
         self.assertEqual(second.result, "completed")
         self.assertEqual(calls.count("close"), 1)
         self.assertEqual(calls.count("finalize"), 0)
+
+
+class HeldAdmissionLockTest(unittest.TestCase):
+    """A producer step that meets a busy admission lock is a recoverable finalize failure.
+
+    The settle path turns `producer-finalize-failed` into `recoverable` (the replay tests above),
+    so the reaper, join or an explicit `finish` try again; this pins the lock side with a real flock.
+    """
+
+    HOLDER = ("import fcntl, os, sys, time\n"
+              "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+              "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+              "print('held', flush=True)\n"
+              "time.sleep(30)\n")
+
+    def test_finalize_under_a_held_admission_lock_is_recoverable_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = artifact_admission._lock_file_path(root)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            holder = subprocess.Popen([sys.executable, "-c", self.HOLDER, str(lock_path)],
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                probe = os.open(str(lock_path), os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(probe)
+                with self.assertRaises(T.TerminalCommitError) as caught:
+                    T._producer_operation(artifact_admission._acquire_lock, root, 0.3)
+                self.assertEqual(caught.exception.code, "producer-finalize-failed")
+            finally:
+                holder.kill()
+                holder.wait()
+                holder.stdout.close()
+            fd = T._producer_operation(artifact_admission._acquire_lock, root, 0.3)  # the retry succeeds
+            artifact_admission._release_lock(root, fd)
 
 
 class ForwardRecoveryIdentityMismatchTest(_TerminalCommitFixture):

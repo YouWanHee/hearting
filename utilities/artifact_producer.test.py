@@ -3767,6 +3767,16 @@ class RouteLaunchContextTest(ProducerTestBase):
         self.assertEqual(Path(env["AGENT_ARTIFACT_OUTPUT_DIR"]), Path(env["AGENT_ARTIFACT_CYCLE_DIR"]) / "artifacts")
 
 
+_ADMISSION_HOLDER = """
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+stat = os.fstat(fd)
+print("held", stat.st_dev, stat.st_ino, flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
 class OwnerLaunchBindingTest(ProducerTestBase):
     def _prepared_owner(self):
         from types import SimpleNamespace
@@ -3786,6 +3796,58 @@ class OwnerLaunchBindingTest(ProducerTestBase):
         args = SimpleNamespace(worker_type="owner", dispatch_depth=1, route_file=str(route_file),
                                owner_route_binding=None, attempt_id=owner)
         return route, route_file, launch_env, owner, args
+
+    def _hold_admission_lock(self, root, seconds):
+        """Hold the root's real admission flock from another process; return once it holds."""
+        lock_path = P.artifact_admission._lock_file_path(root)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen([sys.executable, "-c", _ADMISSION_HOLDER, str(lock_path), str(seconds)],
+                                  stdout=subprocess.PIPE, text=True)
+
+        def reap():
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        self.addCleanup(reap)
+        held = holder.stdout.readline().split()
+        self.assertEqual(held[0], "held")
+        stat = os.stat(P.artifact_admission._lock_file_path(root))
+        self.assertEqual((int(held[1]), int(held[2])), (stat.st_dev, stat.st_ino))
+        probe = os.open(str(lock_path), os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        return holder
+
+    def test_owner_launch_waits_out_a_briefly_held_admission_lock(self):
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        root = Path(route["artifact_root"]).resolve()
+        self._hold_admission_lock(root, 1.5)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}), \
+                mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 5.0, create=True):
+            result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+        self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+
+    def test_owner_launch_at_the_wait_bound_reports_admission_busy(self):
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        root = Path(route["artifact_root"]).resolve()
+        binding = P.dispatch_terminal_commit.producer_binding_path(self.root, route["route_id"], owner)
+        holder = self._hold_admission_lock(root, 30)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}), \
+                mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 1.0, create=True):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.bind_owner_launch(args, self.jobs, environ=launch_env)
+            self.assertEqual(caught.exception.code, "admission-busy")
+            self.assertIn("run start again later", caught.exception.detail)
+            self.assertFalse(binding.exists())
+            holder.kill()
+            holder.wait()
+            result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+        self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
 
     def test_resume_only_owner_launch_publishes_and_replays_binding(self):
         route, route_file, launch_env, owner, args = self._prepared_owner()

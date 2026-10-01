@@ -507,6 +507,105 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual((result['state'],result['reason']),('waiting-capacity','owner-capacity-wait'))
         self.assertEqual(result['retry_at'],'2099-01-01T00:00:00Z')
 
+    # -- an owner its launcher closed before spawning: nothing ran, so say "start again later" ----
+    def _never_started_meta(self, aid):
+        return {"attempt_id": aid, "parent_sid": "parent", "worker_type": "owner", "dispatch_depth": "1",
+                "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                "owner_route_hash": self.route["route_hash"], "owner_route_file": str(self.path),
+                "launch_claimed": "0", "launch_outcome": "never-launched",
+                "note": "dead-producer-binding-failed", "failure_class": "contract"}
+
+    def _unstarted_run(self, reason="admission-busy"):
+        """A launcher that registers the owner, then closes it before spawning (exit 73)."""
+        def run(command, **kwargs):
+            self.calls.append(command)
+            meta = self._never_started_meta(command[command.index("--attempt-id") + 1])
+            with self.jobs.open("a") as stream:
+                stream.write("now\tdone\t12\tparent\ttask\t" + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+            return subprocess.CompletedProcess(
+                command, 73, f"check=failed\nreason={reason}\ndetail=admission lock busy\nchild_spawned=0\n", "")
+        return run
+
+    def test_owner_that_did_not_start_says_run_start_later_not_harvest(self):
+        self.route["nodes"] = []
+        result = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "owner-launch-not-started", "resume-later"), result)
+        self.assertEqual(result["launch_reason"], "admission-busy")
+        self.assertEqual(result["owner_attempt_id"], W.attempt_id(self.route, "owner"))
+        self.assertIn("capability-route.py", result["recovery_command"])
+        self.assertIn("start", result["recovery_command"])
+        self.assertNotIn("harvest", result["recovery_command"])
+        self.assertIn("again later", result["next_step"])
+        self.assertEqual(len(self.calls), 1)   # one launch per start, however it ended
+
+    def test_outcome_of_a_never_started_owner_points_at_start(self):
+        aid = W.attempt_id(self.route, "owner")
+        meta = self._never_started_meta(aid)
+        self.jobs.write_text("now\tdone\t12\tparent\ttask\t" + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+        command = W._outcome(self.jobs, aid)["recovery_command"]
+        self.assertIn("capability-route.py", command)
+        self.assertIn(str(self.path), command)
+        self.assertNotIn("harvest", command)
+
+    def test_next_start_relaunches_an_owner_that_never_started(self):
+        """The row shape of the stuck BC route: closed by its launcher, no log, sealed launch input."""
+        import dispatch_replacement as R
+        from dispatch_contract import parse_registry_metadata
+        self.route["nodes"] = []
+        self.route.update(artifact_root=self.tmp.name, cwd=self.tmp.name, capability="autopilot-code")
+        self.path.write_text(json.dumps(self.route))
+        aid = W.attempt_id(self.route, "owner")
+        args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=self.tmp.name,
+                               route_id=self.route["route_id"], route_node="",
+                               replacement_input_argv=["--start", "--attempt-id", aid, "--prompt-text", "the raw task"])
+        meta = {**self._never_started_meta(aid), "attempt_schema_version": "2", "transport": "headless",
+                "execution_surface": "registered-headless", "registered_worker": "1",
+                "fallback_hop": "same-harness-headless", "harness": "codex",
+                "log_file": str(Path(self.tmp.name) / "never-written.jsonl")}
+        meta.update(parse_registry_metadata(R.seal_launch_input(args, "codex", "the raw task")))
+        self.jobs.write_text("now\tdone\t" + self.tmp.name + "\t" + self.tmp.name + "\ttask\t"
+                             + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+        launched = []
+
+        def run(command, **kwargs):
+            launched.append(command)
+            replacement = command[command.index("--attempt-id") + 1]
+            record = R.claim(self.jobs, aid)   # the one claim `advance` already made, replayed
+            source = R._rows(self.jobs.read_text().splitlines())[aid][1]
+            replay = R.launch_input(self.jobs, aid, source)
+            sealed = SimpleNamespace(**vars(args))
+            sealed.attempt_id = replacement
+            sealed.replacement_input_argv = R._replacement_argv(record, source, replay)
+            row = {k: v for k, v in meta.items()
+                   if k not in ("note", "failure_class", "launch_outcome", "replacement_input_digest")}
+            row.update(attempt_id=replacement, automatic_retry_of=aid, launch_claimed="1", launch_started="1",
+                       replacement_family_id=record["family_id"], replacement_original_attempt_id=aid,
+                       replacement_ordinal="1", replacement_claim_digest=R._digest(record))
+            row.update(parse_registry_metadata(R.seal_launch_input(sealed, "codex", "the raw task")))
+            with self.jobs.open("a") as stream:
+                stream.write("now\topen\t" + self.tmp.name + "\t" + self.tmp.name + "\ttask\t"
+                             + ",".join(k + "=" + v for k, v in row.items()) + "\n")
+            return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
+
+        with mock.patch("dispatch_replacement._authorized"), \
+             mock.patch("dispatch_replacement._reuse_snapshot", return_value={
+                 "completed": [], "cycle_id": "cyc-test", "producer_id": "prod-test", "gate_releases": []}), \
+             mock.patch("dispatch_replacement._logical_key",
+                        side_effect=lambda r, m: {"root_route_id": "rt-root", "node": "__owner__"}), \
+             mock.patch("dispatch_replacement._route", return_value=(self.path, self.route)), \
+             mock.patch("dispatch_replacement._runtime_drift"), \
+             mock.patch("dispatch_replacement._terminal_absent", side_effect=AssertionError("no log to read")), \
+             mock.patch("dispatch_contract.attempt_process_quiescence",
+                        return_value=SimpleNamespace(state="quiescent", reason="process-absent")), \
+             mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None), \
+             mock.patch("dispatch_replacement_batch.command", return_value=None):
+            result = W.start_work(self.route, self.path, self.jobs, run=run)
+        self.assertEqual(len(launched), 1, result)
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual(self.calls, [])   # the fresh-owner launcher was not used: a replacement was
+        self.assertEqual([edge["original_attempt_id"] for edge in result["replacement_lineage"]], [aid])
+
     def _parked_owner_row(self):
         self.start();self.ready=self.released=True;self.start()
         owner=W.attempt_id(self.route,'owner')

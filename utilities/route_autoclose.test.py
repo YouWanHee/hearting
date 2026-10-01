@@ -134,8 +134,11 @@ class RouteAutocloseTest(unittest.TestCase):
             state.write_text(json.dumps(data))
 
     def sweep(self):
-        """The next compose from some other session is what triggers a sweep."""
+        """The next compose from some other session is what triggers a sweep.  A compose sweeps its own
+        campaign, so that campaign must exist: a started route in `k1` stands in when none does."""
         self.sweeps += 1
+        if artifact_producer.find_campaign_by_key(self.root, "k1") is None:
+            self.compose("campaign-anchor", "codex", "anchor")
         self.compose(f"observer-{self.sweeps}", "codex", "observer", start=False)
         return self.last_stderr
 
@@ -331,6 +334,111 @@ class RouteAutocloseTest(unittest.TestCase):
         self.compose("second", "claude", "S", campaign="k2")
         self.assertIsNone(self.outcome(first_file))
         self.assertEqual(self.cycle_record(record["cycle_id"])["state"], "open")
+
+    # ---- compose sweeps only its own campaign ------------------------------------
+    def _api(self):
+        spec = importlib.util.spec_from_file_location("route_autoclose_capability_api", CAP)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _other_campaign_ended(self):
+        """A stale route of campaign `other-stream` that any root-wide sweep would close and seal."""
+        self.claude_crashed("other-session")
+        other_file, other = self.compose("other", "claude", "other-session", campaign="other-stream")
+        record = self.write_artifact(other)
+        self.age(other_file, "claude", "other-session", TWO_HOURS)
+        return other_file, other, record
+
+    def _spies(self, stack, RA, artifact_locator, artifact_campaign):
+        """Real-calling spies on every read a sweep makes of a cycle record or a campaign folder."""
+        targets = [(artifact_producer, "read_cycle_record"), (artifact_producer, "cycle_record_path"),
+                   (artifact_producer, "finalize"), (artifact_producer, "_finalize_route"),
+                   (artifact_producer, "_read_json"), (artifact_producer, "campaign_dir"),
+                   (artifact_producer, "read_campaign"), (artifact_producer, "find_campaign_by_key"),
+                   (artifact_producer, "_campaigns_by_key"), (artifact_locator, "read_cycle_binding"),
+                   (artifact_campaign, "fold_campaign"), (RA, "_signature"), (RA, "_newest_mtime"),
+                   (os, "scandir")]
+        return {f"{owner.__name__}.{name}": stack.enter_context(
+            mock.patch.object(owner, name, wraps=getattr(owner, name))) for owner, name in targets}
+
+    @staticmethod
+    def _touched(spies):
+        """Every argument any spied call received, as text, plus the per-spy call lists."""
+        return {name: [" ".join(map(str, (*call.args, *call.kwargs.values()))) for call in spy.call_args_list]
+                for name, spy in spies.items()}
+
+    def test_compose_never_scans_or_seals_another_campaigns_cycles(self):
+        import contextlib
+        import artifact_campaign
+        import artifact_locator
+        import route_autoclose as RA
+        other_file, other, other_record = self._other_campaign_ended()
+        other_dir = artifact_producer.campaign_dir(self.root, other_record["campaign_id"])
+        other_cycle = other_record["cycle_id"]
+        other_record_path = artifact_producer.cycle_record_path(self.root, other_cycle)
+        mine_file, mine = self.compose("mine", "codex", "mine-session", campaign="scope-mine")
+        mine_record = self.cycle(mine)
+        # The public path: a compose in the other campaign's neighbour leaves it alone.
+        self.compose("observer-compose", "codex", "observer", campaign="scope-mine", start=False)
+        self.assertIsNone(self.outcome(other_file))
+        self.assertEqual(self.cycle_record(other_cycle)["state"], "open")
+        # The same sweep in process, watching what it reads.
+        found = RA.campaign_of_route(self.root, mine)
+        self.assertEqual(found, (mine_record["campaign_id"], self.cycle_dir(mine_record).parent))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, self.env))
+            spies = self._spies(stack, RA, artifact_locator, artifact_campaign)
+            summary = RA.sweep(self.root, api=self._api(), trigger="compose",
+                               scope_campaign_id=found[0], scope_dir=found[1])
+        self.assertEqual(summary["errors"], [])
+        touched = self._touched(spies)
+        everything = [item for calls in touched.values() for item in calls]
+        self.assertNotIn(other_cycle, " ".join(everything))                       # (1) no cycle id
+        self.assertNotIn(str(other_dir), " ".join(everything))                    # (2) no campaign folder
+        self.assertNotIn(str(other_record_path), " ".join(everything))            #     no record file
+        cycles_dir = str(self.root / ".runtime/artifact-producer/v1/cycles")
+        self.assertFalse([item for item in touched["os.scandir"] if item.strip() == cycles_dir])   # (3)
+        self.assertTrue(any(mine_record["cycle_id"] in item                                       # (4) the spies were live
+                            for item in touched["artifact_producer.read_cycle_record"]))
+        self.assertTrue(touched["artifact_locator.read_cycle_binding"])
+        self.assertEqual(touched["artifact_producer.find_campaign_by_key"], [])
+        self.assertEqual(touched["artifact_producer._campaigns_by_key"], [])
+        self.assertEqual(self.cycle_record(other_cycle)["state"], "open")
+
+    def test_compose_whose_campaign_is_not_found_by_name_skips_its_sweep_and_reads_no_campaign(self):
+        import contextlib
+        import artifact_campaign
+        import artifact_locator
+        import route_autoclose as RA
+        other_file, other, other_record = self._other_campaign_ended()
+        self.compose("mine", "codex", "mine-session", campaign="scope-mine")
+        spec = {"campaign_key": "brand-new-stream", "route_id": "rt-" + "0" * 16}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, self.env))
+            spies = self._spies(stack, RA, artifact_locator, artifact_campaign)
+            sweeps = stack.enter_context(mock.patch.object(RA, "sweep", wraps=RA.sweep))
+            self.assertIsNone(RA.campaign_of_route(self.root, spec))
+            self._api()._route_autoclose(self.root, "compose", spec)
+        self.assertEqual(sweeps.call_count, 0)                  # the miss skips the sweep
+        touched = self._touched(spies)
+        for name in ("artifact_producer._read_json", "artifact_campaign.fold_campaign",
+                     "artifact_producer.find_campaign_by_key", "artifact_producer._campaigns_by_key",
+                     "artifact_producer.read_cycle_record", "artifact_locator.read_cycle_binding"):
+            self.assertEqual(touched[name], [], name)           # no campaign.json and no cycle opened
+        self.assertIsNone(self.outcome(other_file))
+        # A key that only prefixes another stream's folder name finds nothing.
+        self.assertIsNone(RA.campaign_of_route(self.root, {"campaign_key": "other"}))
+
+    def test_campaign_status_still_closes_routes_in_every_campaign(self):
+        other_file, other, other_record = self._other_campaign_ended()
+        mine_file, mine = self.compose("mine", "codex", "mine-session", campaign="scope-mine")
+        self.assertIsNone(self.outcome(other_file))
+        done = self.campaign("campaign-status", self.cycle(mine)["campaign_id"])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "session-ended")
+        self.assertEqual(self.cycle_record(other_record["cycle_id"])["state"], "sealed")
 
     def test_r6_sub_agent_sharing_the_session_id_leaves_the_parent_route_alone(self):
         self.claude_alive("parent")
