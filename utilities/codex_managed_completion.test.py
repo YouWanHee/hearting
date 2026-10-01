@@ -805,6 +805,61 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         restart.assert_not_called()  # Transport owns exact restart decisions.
 
 
+    def test_a_cleared_windows_successor_receives_the_item_while_claim_and_ack_stay_with_the_registered_parent(self) -> None:
+        from types import SimpleNamespace
+
+        module = load_completion_module()
+        receipt = {"schema_version": 2, "state": "ready", "children": []}
+        delivery_id = "delivery-ledger-one"
+        client_id = "delivery-" + hashlib.sha256(
+            "\0".join(("codex-native-queue-v1", SESSION, delivery_id)).encode("utf-8")).hexdigest()[:32]
+        row = SimpleNamespace(
+            attempt_id="att-one", raw="terminal-row",
+            metadata={"delivery_id": delivery_id, "delivery_recipient_kind": "codex-native-queue",
+                      "delivery_row_revision": "revision", "delivery_receipt_digest": "sha256:record-digest"})
+        ledger_record = {"delivery_id": delivery_id, "recipient_kind": "codex-native-queue",
+                         "attempt_ids": ["att-one"], "receipt_digest": "sha256:record-digest",
+                         "row_revisions": {"att-one": "revision"}, "state": "pending"}
+        args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
+                               sealed_batch_id="batch-exact", jobs=Path("/tmp/jobs.log"), timeout=3.0,
+                               interval=0.01, delivery_retry_interval=0.01)
+        with mock.patch.object(module, "queue_target", return_value="successor-thread"), \
+             mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
+                 "thread": {"id": "successor-thread", "cwd": "/tmp/repo"}}) as rpc, \
+             mock.patch.object(module, "current_session_children", return_value=[row]), \
+             mock.patch.object(module.pending_delivery, "read", return_value=ledger_record) as read, \
+             mock.patch.object(module.pending_delivery, "claim") as claim, \
+             mock.patch.object(module.pending_delivery, "release_claim"), \
+             mock.patch.object(module.pending_delivery, "mark_sent_ambiguous"), \
+             mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.codex_queue_delivery, "_known_consumed", return_value=None) as consumed, \
+             mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                               return_value={"status": "consumed"}) as send:
+            result = module.deliver_to_native_queue(args, receipt, {"att-one"})
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(rpc.call_args.args[2], {"threadId": "successor-thread"})
+        self.assertEqual(send.call_args.kwargs["thread_id"], "successor-thread")
+        self.assertEqual(send.call_args.kwargs["client_message_id"], client_id)       # the same stable id
+        consumed.assert_called_with(Path("/tmp/app-server.sock"), SESSION, client_id, timeout=5.0)  # asked of the old thread first
+        self.assertEqual({call.args[1] for call in read.call_args_list}, {SESSION})
+        self.assertEqual(claim.call_args.args[1], SESSION)
+        self.assertEqual(ack.call_args.args[1], SESSION)
+
+    def test_queue_target_follows_the_handover_and_defaults_to_the_registered_parent(self) -> None:
+        import tempfile
+        import dispatch_seat_handover as handover
+
+        module = load_completion_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)      # no registry: registered
+            jobs.write_text("t\topen\t/w\t/w\tslug\tattempt_id=att-one,parent_sid=" + SESSION + "\n", encoding="utf-8")
+            self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
+            with mock.patch.object(handover, "effective_parent", return_value="successor-thread"):
+                self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), "successor-thread")
+            with mock.patch.object(handover, "effective_parent", side_effect=OSError("boom")):
+                self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
+
     def test_accepted_send_is_not_repeated_during_history_outage(self) -> None:
         from types import SimpleNamespace
 

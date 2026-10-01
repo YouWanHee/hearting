@@ -175,6 +175,31 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         records, count = SWEEP.sweep_deliver(self.root, "codex-stop-hook", "sess-owner")
         self.assertEqual((records, count), ([], 1))
 
+    def test_a_successor_at_the_same_pane_receives_the_stored_record_and_acks_it_under_the_old_key(self):
+        # After a /clear the record stays stored (and acked) under the registered parent; the
+        # handover binds only the attempts it names to the new session.
+        import dispatch_seat_handover as handover
+        from unittest import mock
+        self._seed(session_id="sess-old")
+        self._seed(session_id="sess-old", delivery_id="delivery-" + "b" * 32,
+                   attempt_ids=["att-0000000000000000000000000000cccc"],
+                   row_revisions={"att-0000000000000000000000000000cccc": "beef"})
+        bound = frozenset({"att-0000000000000000000000000000bbbb"})
+        with mock.patch.object(handover, "storage_recipients",
+                               return_value=[("sess-new", None), ("sess-old", bound)]):
+            records, count = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new")
+            self.assertEqual([r["delivery_id"] for r in records], ["delivery-" + "a" * 32])
+            self.assertEqual(count, 2)                                  # both are seen; only the bound one is taken
+            self.assertEqual(SWEEP.ack_delivered(self.root, "sess-new", records, acked_by="t"), 1)
+        self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "a" * 32)["state"], "acked")
+        self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "b" * 32)["state"], "pending")
+        self.assertIsNone(PD.read(self.root, "sess-new", "delivery-" + "a" * 32))
+
+    def test_without_a_handover_another_session_still_receives_nothing(self):
+        self._seed(session_id="sess-old")
+        self.assertEqual(SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new"), ([], 0))
+        self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "a" * 32)["state"], "pending")
+
     def test_hook_injects_additional_context_and_acks(self):
         self._seed()
         hook = Path(__file__).resolve().parents[1] / "hooks" / "dispatch-session-sweep.py"

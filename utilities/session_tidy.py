@@ -69,6 +69,7 @@ NOTICE_MAX_BYTES = 500
 CARD_HISTORY_KEEP = 20
 LEDGER_FOLD_LINES = 500
 LEDGER_KEEP_RAW = 100
+HANDOVER_KEEP_ROWS = 40
 PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
@@ -318,6 +319,8 @@ def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
+        if item.get("event") == "handover":     # a relation row (dispatch_seat_handover), not a session event
+            continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
         row = out.setdefault(key, {"harness": key[0], "sid": key[1], "first_seen": item.get("first_seen", item.get("ts", 0)),
                                    "last_seen": 0, "epoch": 0, "transcript": "", "cwd": "",
@@ -381,6 +384,9 @@ def _fold_ledger(seat: Seat) -> None:
     lines = _read_ledger_lines(seat)
     if len(lines) <= LEDGER_FOLD_LINES:
         return
+    # Handover rows (A -> B, with their bindings) are the seat's authority record: they stay raw.
+    relations = [l for l in lines if l.get("event") == "handover"][-HANDOVER_KEEP_ROWS:]
+    lines = [l for l in lines if l.get("event") != "handover"]
     recent = lines[-LEDGER_KEEP_RAW:]
     older = lines[:-LEDGER_KEEP_RAW]
     folded: dict[tuple[str, str], dict] = {}
@@ -394,7 +400,7 @@ def _fold_ledger(seat: Seat) -> None:
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]
-    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + recent)
+    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + relations + recent)
     atomic_write(_ledger_path(seat), body.encode("utf-8"))
 
 
@@ -711,6 +717,13 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             with contextlib.suppress(BaseException):    # a hook never fails for the clear note
                 import session_tidy_clear
                 session_tidy_clear.note_start_locked(seat, harness, sid, now)
+        # The one place a same-seat handover (A -> B) is recorded: B's confirmed start/first prompt.
+        handed = None
+        handover = None
+        if seat.kind == "pane" and event in ("start", "prompt"):
+            with contextlib.suppress(BaseException):    # a hook never fails for the handover
+                import dispatch_seat_handover as handover
+                handed = handover.record_locked(seat, harness, sid, event, source, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
         notices = pending_notices(seat, harness, sid, now=now)
@@ -723,6 +736,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         card_due = False
         memory_due = False
         memory = None
+        resume_text = ""
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
@@ -740,6 +754,10 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             taken_rev = int(consumed.get("memory_revision", 0) or 0) if isinstance(consumed, dict) else 0
             memory_due = bool(memory) and eligible and int(memory.get("revision", 0) or 0) > taken_rev
             used = len(notice_block.encode("utf-8")) + (1 if notice_block else 0)
+            # The verified route and the existing resume command, one line, with the card B receives.
+            if handover is not None and (card_due or handed):
+                resume_text = handover.resume_line(seat, harness, sid)
+                used += len(resume_text.encode("utf-8")) + (1 if resume_text else 0)
             room = INJECTION_MAX_BYTES - used
             memory_text = ""
             if memory_due:
@@ -747,10 +765,16 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 memory_text = build_memory_injection(
                     memory, min(len(wanted.encode("utf-8")), room - CARD_MIN_WHEN_BUNDLED - 1) if card_due else room)
                 room -= len(memory_text.encode("utf-8")) + 1
+            if resume_text:
+                parts.append(resume_text)
             if card_due:
                 parts.append(build_card_injection(card, card_text_path(seat), now, room))
             if memory_text:
                 parts.append(memory_text)
+        if not card and handed and handover is not None:
+            resume_text = handover.resume_line(seat, harness, sid)
+            if resume_text:
+                parts.append(resume_text)
         text = "\n".join(parts)
         if not text:
             return ""
@@ -863,6 +887,10 @@ def cmd_enqueue(args) -> int:
     import session_tidy_runner as runner
     transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
     import session_tidy_clear as clear
+    with contextlib.suppress(BaseException):    # the tidy goes ahead even if the snapshot cannot be taken
+        import dispatch_seat_handover as handover
+        with seat_lock(seat.key):
+            handover.write_snapshot_locked(seat, harness, sid)
     item = runner.enqueue_item(seat, harness, sid, cwd, transcript)
     try:
         booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=bool(args.no_clear))

@@ -36,6 +36,7 @@ from dispatch_completion_join import (  # noqa: E402
     delivery_required_action,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import dispatch_seat_handover as seat_handover  # noqa: E402
 from dispatch_session_sweep import (  # noqa: E402
     HUMAN_GATE_PREFIX,
     _bounded_receipt_text,
@@ -389,7 +390,7 @@ def _session_owner_rows(
     now = time.time()
     rows: list[tuple[str, float]] = []
     for attempt_id, (stamp, status, metadata) in latest.items():
-        if status not in statuses or metadata.get("parent_sid") != session:
+        if status not in statuses or not seat_handover.owns(metadata, session, jobs):
             continue
         if any(metadata.get(key) != value for key, value in REGISTRY_DEPTH1_START.items()):
             continue
@@ -535,6 +536,34 @@ def _gate_record_open(jobs: Path, session: str, delivery_id: object) -> bool:
     return record.get("state") in pending_delivery.OPEN_STATES
 
 
+def _row_metadata(jobs: Path, attempt_id: object) -> dict[str, str] | None:
+    if not isinstance(attempt_id, str) or ATTEMPT.fullmatch(attempt_id) is None:
+        return None
+    try:
+        row = current_attempt_row(jobs, attempt_id)
+    except (JoinContractError, OSError):
+        return None
+    return row.metadata if row is not None else None
+
+
+def _handed_to(jobs: Path, attempt_id: object, session: str) -> bool:
+    """Whether the registry row of `attempt_id` now belongs to `session` by a same-seat handover."""
+    metadata = _row_metadata(jobs, attempt_id)
+    return bool(metadata) and metadata.get("parent_sid") != session \
+        and seat_handover.effective_parent(metadata, jobs) == session
+
+
+def _handed_away(launch: "Launch") -> bool:
+    """Whether the attempt this hook waits for is now answered by another session (a cleared window's successor)."""
+    metadata = _row_metadata(launch.jobs, launch.attempt_id)
+    return bool(metadata) and seat_handover.effective_parent(metadata, launch.jobs) != launch.session_id
+
+
+def _holds_arm(claim: "ArmClaim") -> bool:
+    held = _read_arm(claim.path)
+    return bool(held) and held.get("holder") == list(claim.holder) and held.get("session_id") == claim.session_id
+
+
 def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str | None:
     """None when the existing record may be re-taken, else the typed reason."""
 
@@ -542,7 +571,9 @@ def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str 
         return "unreadable"
     if existing.get("schema") != ARM_SCHEMA:
         return "unreadable"
-    if existing.get("session_id") != session:
+    # The session that armed it may have been cleared; its same-seat successor takes the wait over.
+    handed = existing.get("session_id") != session and _handed_to(jobs, existing.get("attempt_id"), session)
+    if existing.get("session_id") != session and not handed:
         return "foreign-session"
     arms = existing.get("arms")
     if not isinstance(arms, int):
@@ -554,9 +585,10 @@ def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str 
         return "ended"
     if state not in ARM_STATES:
         return "unreadable"
-    if _holder_alive(existing.get("holder")):
+    if _holder_alive(existing.get("holder")) and not handed:
         return "held-live"
-    if state == "gate-wake-sent" and _gate_record_open(jobs, session, existing.get("gate_delivery_id")):
+    if state == "gate-wake-sent" and _gate_record_open(jobs, existing.get("session_id") or session,
+                                                       existing.get("gate_delivery_id")):
         return "gate-open"
     return None  # waiting with a dead holder, lapsed, or a gate that has closed
 
@@ -779,7 +811,8 @@ def replacement_authority(launch: Launch, claim: ArmClaim, jobs: Path, aid: str,
     return bool(
         trusted is not None and Path(jobs).resolve() == trusted.resolve() == launch.jobs.resolve()
         and aid == launch.attempt_id == claim.attempt_id
-        and claim.session_id == launch.session_id == metadata.get("parent_sid")
+        and claim.session_id == launch.session_id
+        and seat_handover.owns(metadata, launch.session_id, jobs)
         and held and held.get("holder") == list(claim.holder)
         and held.get("state") == "waiting" and held.get("attempt_id") == aid
         and held.get("session_id") == launch.session_id
@@ -1483,6 +1516,11 @@ def main() -> int:
     # `sent-ambiguous` while the receipt goes out, and acked only after it
     # did (A59-3: a gate folded into a delivered terminal receipt is not
     # re-announced; one that was not delivered still is).
+    if not _holds_arm(claim) or _handed_away(launch):
+        # The window was cleared: the successor session re-armed this wait (or will receive the
+        # durable record on its next prompt). This stale carrier must not speak into the new
+        # conversation, and it leaves the record unclaimed for the session that now owns it.
+        return 0
     block = _attention_has_open_child(message)
     if block:
         # A live owned child is still open -- no delivery-owing terminal

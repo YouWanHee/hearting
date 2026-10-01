@@ -1256,5 +1256,209 @@ class ClearHelperTest(TidyCase):
         self.assertIn("예약 시간", self.notices(seat)[0])
 
 
+class SeatHandoverTest(TidyCase):
+    """A cleared window's successor at the same pane answers for the predecessor's depth-1 attempts."""
+
+    def setUp(self):
+        super().setUp()
+        self.jobs = self.iso.root / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir()
+        self.rows = []
+        import dispatch_seat_handover as handover
+        self.handover = handover
+
+    def row(self, aid, parent="sid-A", status="open", route="rt-1", node="one-shot", depth="1",
+            worker="owner", harness="claude", digest="sha256:aa", route_file="/tmp/rt-1.json"):
+        meta = {"attempt_id": aid, "parent_sid": parent, "parent_harness": harness, "dispatch_depth": depth,
+                "worker_type": worker, "route_id": route, "route_hash": digest, "route_node": node,
+                "route_file": route_file}
+        self.rows.append(f"2026-10-01T00:00:00Z\t{status}\t/w\t/w\tslug\t" + ",".join(f"{k}={v}" for k, v in meta.items()))
+        self.jobs.write_text("\n".join(self.rows) + "\n", encoding="utf-8")
+        return meta
+
+    def seat(self, pane=PANE):
+        return st.resolve_seat("claude", str(self.cwd), {"HERDR_PANE_ID": pane})
+
+    def snapshot(self, sid="sid-A", harness="claude", pane=PANE, now=None):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            seat = self.seat(pane)
+            with st.seat_lock(seat.key):
+                st.record_event(seat, harness, sid, "start", cwd=str(self.cwd), now=now)
+                return self.handover.write_snapshot_locked(seat, harness, sid, now=now, jobs=self.jobs)
+
+    def start(self, sid, harness="claude", event="start", source="clear", pane=PANE):
+        out = []
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            st.run_hook(harness, event, sid, source=source, cwd=str(self.cwd),
+                        env={"HERDR_PANE_ID": pane}, emit=out.append)
+            seat = self.seat(pane)
+            return out, self.handover.handover_rows(seat)
+
+    def effective(self, meta):
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            return self.handover.effective_parent(meta, self.jobs)
+
+    def test_the_snapshot_takes_only_live_route_bound_depth1_attempts_of_the_session(self):
+        keep = self.row("att-keep")
+        self.row("att-depth2", depth="2")
+        self.row("att-free", route="")
+        self.row("att-other", parent="sid-X")
+        self.row("att-done", status="done", route="rt-9")
+        self.assertEqual(self.snapshot(), 1)
+        with self.iso.patched_environ():
+            snap = self.handover.read_snapshot(self.seat().key)
+        self.assertEqual([b["attempt"] for b in snap["bindings"]], [keep["attempt_id"]])
+        self.assertEqual(snap["from"], {"harness": "claude", "sid": "sid-A"})
+
+    def test_no_live_attempt_leaves_no_snapshot(self):
+        self.row("att-1")
+        self.assertEqual(self.snapshot(), 1)
+        self.jobs.write_text("", encoding="utf-8")
+        self.assertEqual(self.snapshot(), 0)
+        with self.iso.patched_environ():
+            self.assertIsNone(self.handover.read_snapshot(self.seat().key))
+
+    def test_a_confirmed_clear_start_records_one_row_and_the_successor_answers(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(self.effective(meta), "sid-A")                 # nothing handed over yet
+        out, rows = self.start("sid-B")
+        self.assertEqual([(r["from"], r["sid"], r["source"]) for r in rows], [("sid-A", "sid-B", "clear")])
+        self.assertEqual(self.effective(meta), "sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
+            self.assertTrue(self.handover.owns(meta, "sid-A", self.jobs))     # the registered parent keeps its name
+            self.assertFalse(self.handover.owns(meta, "sid-Z", self.jobs))
+        self.assertEqual(meta["parent_sid"], "sid-A")                    # the registry row is untouched
+        again, rows2 = self.start("sid-B", event="prompt", source="")
+        self.assertEqual(len(rows2), 1)                                  # the same A -> B again is a no-op
+
+    def test_the_card_gets_the_verified_route_and_the_existing_resume_command(self):
+        self.row("att-1", route_file="/tmp/rt-1.json")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd), now=st.now_epoch() - 9)
+                st.write_card(seat, "claude", "sid-A", "카드 본문", cwd=str(self.cwd))
+                self.handover.write_snapshot_locked(seat, "claude", "sid-A", jobs=self.jobs)
+        out, _ = self.start("sid-B")
+        text = "\n".join(out)
+        self.assertIn("[이어받은 진행 작업] route=rt-1", text)
+        self.assertIn("capability-route.py start --route /tmp/rt-1.json --jobs " + str(self.jobs), text)
+        self.assertIn("카드 본문", text)
+
+    def test_only_a_confirmed_clear_hands_over(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(self.start("sid-B", source="startup")[1], [])          # a fresh start is not a clear
+        self.assertEqual(self.start("sid-B2", event="prompt", source="")[1], [])
+        self.assertEqual(self.effective(meta), "sid-A")
+
+    def test_the_clear_booking_confirms_a_start_that_carries_no_source(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                clear._write_reservation({"schema": 1, "nonce": "n", "status": "reserved", "created": st.now_epoch() - 4,
+                                          "deadline": st.now_epoch() + 500, "seat": seat.as_dict(), "harness": "claude",
+                                          "sid": "sid-A", "card_generation": 0, "prompt_seq": 0})
+        out, rows = self.start("sid-B", source="startup")
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("sid-A", "sid-B")])
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_a_session_older_than_the_snapshot_is_not_its_successor(self):
+        self.row("att-1")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-old", "start", cwd=str(self.cwd), now=st.now_epoch() - 600)
+        self.snapshot()
+        self.assertEqual(self.start("sid-old", source="clear")[1], [])
+
+    def test_another_pane_or_harness_never_receives_the_attempts(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(self.start("sid-B", pane="test:pane-b")[1], [])
+        self.assertEqual(self.start("sid-B", harness="codex")[1], [])
+        self.assertEqual(self.effective(meta), "sid-A")
+
+    def test_no_pane_means_no_handover(self):
+        meta = self.row("att-1")
+        with self.iso.patched_environ():
+            seat = st.resolve_seat("claude", str(self.cwd), {})
+            self.assertEqual(seat.kind, "project")
+            with st.seat_lock(seat.key):
+                self.assertEqual(self.handover.write_snapshot_locked(seat, "claude", "sid-A", jobs=self.jobs), 0)
+            self.assertEqual(self.handover.storage_recipients("sid-B", {}), [("sid-B", None)])
+        self.assertEqual(self.effective(meta), "sid-A")
+
+    def test_two_successors_of_one_session_are_refused_the_second(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(len(self.start("sid-B")[1]), 1)
+        self.assertEqual(len(self.start("sid-C")[1]), 1)                # A -> C is refused: still one row
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_the_next_clear_hands_over_only_through_the_successors_own_tidy(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.assertEqual(self.start("sid-C", source="clear")[1][-1]["sid"], "sid-B")     # no B snapshot: no B -> C
+        self.snapshot(sid="sid-B", now=st.now_epoch() - 5)           # B tidies: its snapshot still binds the route
+        rows = self.start("sid-D")[1]
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("sid-A", "sid-B"), ("sid-B", "sid-D")])
+        self.assertEqual(self.effective(meta), "sid-D")
+
+    def test_a_replacement_attempt_of_the_same_route_node_follows_the_binding(self):
+        self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        replacement = self.row("att-2")                                   # same route, hash and node, still parent A
+        self.assertEqual(self.effective(replacement), "sid-B")
+        other_node = self.row("att-3", node="other")
+        self.assertEqual(self.effective(other_node), "sid-A")             # a different node was never bound
+        self.assertEqual(self.effective(self.row("att-4", digest="sha256:bb")), "sid-A")
+
+    def test_opencode_hands_over_at_the_first_message_of_the_new_session(self):
+        meta = self.row("att-1", parent="ses_A", harness="opencode")
+        self.snapshot(sid="ses_A", harness="opencode", now=st.now_epoch() - 5)
+        rows = self.start("ses_B", harness="opencode", event="prompt", source="")[1]
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("ses_A", "ses_B")])
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertEqual(self.handover.effective_parent(meta, self.jobs), "ses_B")
+
+    def test_storage_stays_with_the_registered_parent_and_only_bound_attempts_reach_the_taker(self):
+        self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            recipients = self.handover.storage_recipients("sid-B")
+            self.assertEqual(recipients, [("sid-B", None), ("sid-A", frozenset({"att-1"}))])
+            allowed = recipients[1][1]
+            self.assertTrue(self.handover.record_for_session({"attempt_ids": ["att-1"]}, allowed))
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": ["att-1", "att-9"]}, allowed))
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": []}, allowed))
+            self.assertEqual(self.handover.storage_recipients("sid-A"), [("sid-A", None)])
+
+    def test_folding_the_ledger_keeps_the_handover_rows_and_leaves_sessions_alone(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                for index in range(st.LEDGER_FOLD_LINES + 5):
+                    st.record_event(seat, "claude", f"sid-n{index}", "start", cwd=str(self.cwd))
+            self.assertEqual([(r["from"], r["sid"]) for r in self.handover.handover_rows(seat)], [("sid-A", "sid-B")])
+            self.assertTrue(st.latest_session(seat)["sid"].startswith("sid-n"))     # the rows are not sessions
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_a_broken_state_answers_the_registered_parent(self):
+        meta = self.row("att-1")
+        with mock.patch.object(self.handover, "_all_snapshots", side_effect=OSError("boom")):
+            self.assertEqual(self.handover.effective_parent(meta, self.jobs), "sid-A")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,7 @@ def _append_self_instrumentation(
 
 
 DELIVER_LEASE_SECONDS = 120.0
+STORAGE_KEY = "_storage_key"     # added to a returned copy only: the directory a record is stored under
 
 
 HUMAN_GATE_PREFIX = "human-gate:"
@@ -151,23 +152,33 @@ def sweep_deliver(
     start_ns = time.monotonic_ns()
     claimed: list[dict] = []
     entries: list[Path] = []
-    try:
-        directory = pending_delivery.record_directory(root, session_id)
-        entries = sorted(
-            p for p in directory.glob("delivery-*.json") if p.is_file()
-        )
-        for entry in entries:
+    # The session's own records, then the records of a cleared predecessor at the same pane
+    # that the seat handover bound to it. Those stay stored (and acked) under the registered
+    # parent; only the receiving session differs.
+    from dispatch_seat_handover import record_for_session, storage_recipients
+    for storage_key, allowed in storage_recipients(session_id):
+        try:
+            directory = pending_delivery.record_directory(root, storage_key)
+            found = sorted(
+                p for p in directory.glob("delivery-*.json") if p.is_file()
+            )
+        except (OSError, pending_delivery.PendingDeliveryError):
+            continue
+        entries.extend(found)
+        for entry in found:
             delivery_id = entry.stem
             try:
-                current = pending_delivery.read(root, session_id, delivery_id)
+                current = pending_delivery.read(root, storage_key, delivery_id)
             except pending_delivery.PendingDeliveryError:
                 continue
             if current is None or current.get("recipient_kind") != recipient_kind:
                 continue
+            if not record_for_session(current, allowed):
+                continue
             state = current.get("state")
             if state in {"claimed", "sent-ambiguous"}:
                 try:
-                    pending_delivery.reclaim(root, session_id, delivery_id, now_ns=now)
+                    pending_delivery.reclaim(root, storage_key, delivery_id, now_ns=now)
                 except pending_delivery.PendingDeliveryError:
                     continue
             elif state != "pending":
@@ -178,7 +189,7 @@ def sweep_deliver(
             try:
                 record = pending_delivery.claim(
                     root,
-                    session_id,
+                    storage_key,
                     delivery_id,
                     claim_owner=claim_owner,
                     lease_seconds=DELIVER_LEASE_SECONDS,
@@ -187,24 +198,27 @@ def sweep_deliver(
             except pending_delivery.PendingDeliveryError:
                 continue
             from dispatch_notice_state import keep_claim
-            if not keep_claim(root, session_id, delivery_id, record, claim_owner):
+            try:
+                if not keep_claim(root, storage_key, delivery_id, record, claim_owner):
+                    continue
+            except OSError:
                 continue
-            claimed.append(record)
-    except OSError:
-        pass
+            claimed.append({**record, STORAGE_KEY: storage_key})
     elapsed_ns = time.monotonic_ns() - start_ns
     _append_self_instrumentation(root, elapsed_ns, len(entries), len(claimed))
     return claimed, len(entries)
 
 
 def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by: str) -> int:
-    """Ack the records whose bounded receipt was injected; returns the count."""
+    """Ack the records whose bounded receipt was injected; returns the count.
+
+    A record a handover bound to this session is acked under the registered parent it is stored under."""
 
     acked = 0
     for record in records:
         try:
             pending_delivery.ack(
-                root, session_id, record["delivery_id"], acked_by=acked_by
+                root, record.get(STORAGE_KEY) or session_id, record["delivery_id"], acked_by=acked_by
             )
             acked += 1
         except (pending_delivery.PendingDeliveryError, KeyError, OSError):

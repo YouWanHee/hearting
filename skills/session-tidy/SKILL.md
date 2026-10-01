@@ -76,6 +76,11 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    `clear=manual hint=<cmd>` or `clear=skipped` → "이제 <cmd> 하거나 닫아도 됩니다."
    (`<cmd>` is the hint, or `/clear` after `skipped`; OpenCode's is `/new`).
 
+A route that was still running when the window was cleared is taken over by the new session at
+the same pane: its card carries one line with the verified route and the usual resume command
+(`capability-route.py start --route <file> --jobs <registry>`), the new session may resume it,
+and it receives the completion. The registered launch identity does not change.
+
 The next session at this seat receives the latest card once, at start or on its first
 prompt, together with any pending result line and a short "참고할 기억" list (ids and titles
 only, read with `mem show <id>` when needed). If the tidy ends after that session started, the
