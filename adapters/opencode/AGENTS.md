@@ -190,6 +190,9 @@ runtime bridge. `OPERATIONS §5.12` owns the mechanics.
 
 Main prompts receive capsule headline/IDs; read relevant records fully.
 Fallback: `preflight.sh recall-gate <cwd> ...`. Workers skip it.
+Call `session-tidy` when context is filling or before compact, before handing
+work to another session, and when a large task ends; a new session receives the
+seat's card once.
 
 OpenCode token self-regulation remains explicitly deferred: Phase 2 automatic accounting and the isolated experiment CLI are not projected; it does not copy
 Codex token-budget hooks or mutate runtime config. Ordinary lifecycle context
