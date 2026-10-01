@@ -120,6 +120,9 @@ Ignore unrelated candidates and read a relevant record in full before use. If
 the prompt hook is unavailable, record `recall` or `skip` with
 `mem recall-gate`. Retrieve full pending obligations before applying or
 consuming them. Workers do not run this main-session probe.
+Call `/session-tidy` when context is filling or before compact, before handing
+work to another session, and when a large task ends; a new session receives the
+seat's card once.
 
 Context pressure is orthogonal to quality and stage graph. Ordinary hook states stay silent. Static bytes, code lines, and directive counts are footprint measures, not token or billing savings. `core/ADAPTATION.md §6.1` owns budgets; real savings claims require paired production sessions.
 

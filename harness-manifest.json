@@ -605,6 +605,24 @@
      "plan/frame"
     ]
    }
+  },
+  "session-tidy": {
+   "group": "ops",
+   "family": "ops",
+   "modes": [],
+   "summary": "Write a handoff card; tidy memory.",
+   "invocation": {
+    "class": "model-support",
+    "use_when": "Use when context fills, before compact, on handoff to another session, after a large task, or on request.",
+    "not_for": "Not for primary routing or memory writes."
+   },
+   "argument_shape": "[정리] | 인계 <받을 세션>",
+   "requires": {
+    "capabilities": [],
+    "units": [
+     "ops/session-tidy-memory"
+    ]
+   }
   }
  },
  "units": {
@@ -703,6 +721,12 @@
    "role": "fast tool worker",
    "worker_type": "support",
    "floor": "near-zero"
+  },
+  "ops/session-tidy-memory": {
+   "family": "ops",
+   "role": "deep editor",
+   "worker_type": "support",
+   "floor": "low"
   },
   "plan/frame": {
    "family": "plan",
@@ -875,6 +899,10 @@
   "material/web-image-search": {
    "unit": "material/web-image-search",
    "status": "portable-with-tool-contract"
+  },
+  "ops/session-tidy-memory": {
+   "unit": "ops/session-tidy-memory",
+   "status": "portable-persona"
   },
   "plan/frame": {
    "unit": "plan/frame",

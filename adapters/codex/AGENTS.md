@@ -186,7 +186,9 @@ bounded capsule headline-and-ID candidates. Ignore unrelated candidates and
 read a relevant record in full before use. If the prompt hook is unavailable,
 record `recall` or `skip` with `preflight.sh recall-gate <cwd> ...`. Retrieve
 full pending obligations before applying or consuming them. Workers do not run
-the main prompt probe or other main memory lifecycle.
+the main prompt probe or other main memory lifecycle. Call the `session-tidy`
+Skill when context is filling or before compact, before handing work to another
+session, and when a large task ends; a new session receives the seat's card once.
 
 `preflight.sh token-budget` exposes exact-session telemetry. The normal, unknown, repeated-band, and validated-native states inject zero bytes; a verified
 tight/critical transition may emit one directive of at most 240 UTF-8 bytes.

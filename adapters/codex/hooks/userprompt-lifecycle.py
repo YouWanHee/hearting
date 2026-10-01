@@ -18,6 +18,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 PREFLIGHT = ROOT / "adapters" / "codex" / "bin" / "preflight.sh"
 RECALL_HOOK = ROOT / "hooks" / "mem-recall-inject.sh"
+SESSION_TIDY = ROOT / "utilities" / "session_tidy.py"
 TOOLS = ROOT / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
@@ -114,6 +115,26 @@ def candidate_context(payload: dict[str, Any], current_cwd: str, sid: str) -> st
             command, cwd=str(ROOT), env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def card_context(payload: dict[str, Any], current_cwd: str) -> str:
+    """Session card / tidy notice due at this prompt; needs no prompt text or candidate."""
+    sid = interaction_session_id(payload)
+    if not sid or not SESSION_TIDY.is_file():
+        return ""
+    command = [sys.executable, str(SESSION_TIDY), "hook", "--harness", "codex",
+               "--event", "prompt", "--session-id", sid, "--cwd", current_cwd]
+    transcript = nested_string(payload, "transcript_path", "transcriptPath")
+    if transcript:
+        command += ["--transcript", transcript]
+    try:
+        result = subprocess.run(
+            command, cwd=str(ROOT), env=os.environ.copy(), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -423,6 +444,7 @@ def main() -> int:
         batches, parts = native_queue_prompt_receipts(sid)
     except Exception:
         parts = []
+    parts.append(card_context(payload, current_cwd))
     parts.append(candidate_context(payload, current_cwd, sid))
     parts.append(run_preflight("briefing", current_cwd))
     # Phase 1 token self-regulation is transition-only. Normal, unknown,

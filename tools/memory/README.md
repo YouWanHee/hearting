@@ -102,6 +102,8 @@ python3 <agent-home>/tools/memory/mem.py <command>
 | `reattribute <id>` | Reassign a true orphan to the current project without deleting it. Reverse gates reject live, global, profile, or self targets. |
 | `supersede <old> --by <new>` | Preserve the older row as historical and route its canonical id to the newer active record. Cross-scope/project, pending, profile, and cycle cases fail closed. |
 | `activate <id>` | Guardedly reactivate a historical row only when its successor is no longer active and no canonical ambiguity exists. |
+| `tidy-apply <actions.json> [--input <input_v1.json>] [--cwd DIR]` | Apply a session-tidy action list through a closed set (add, supersede, reinforce; no delete, graveyard unchanged), after recording answered-question decisions. Prints a final `[tidy] 묶음 <id>: …` line with the undo command. Exit 0 applied, 1 partial, 2 input/state error. |
+| `tidy-undo <batch-id>` | Reverse one tidy batch from its journal; refuses without changing anything if a touched record changed after the batch. |
 | `register-postit <path>` | Deprecated legacy-migration-only registry command. Current post-its write DB working records directly. |
 
 ## Existing-store migration
