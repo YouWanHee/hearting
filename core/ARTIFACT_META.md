@@ -148,27 +148,55 @@ title the same way.
 ## The history line: the one recorder
 
 `utilities/artifact_history.py`: `make_event(...)` builds and validates one event,
-`publish_events_locked(root, events)` publishes events under the producer admission
-lock. Every change to producer metadata records its meaning with this pair; later file
-and flow changes (the sealing-removal work, `cycle-flex-spec`) use the same two
-functions. There is no second recorder and no second change signal: the same lines are
-what Cairn watches.
+`publish_events_locked(root, events)` publishes events and **assumes the producer
+admission lock is held** (a caller already inside the lock, such as cycle-flex, calls it
+there). `publish_events(root, events)` is the thin wrapper for a caller outside the lock:
+it takes the same lock, then calls the locked one. Every change to producer metadata
+records its meaning with these; lifecycle, file, and flow changes (the sealing-removal
+work, `cycle-flex-spec`) use the same functions. There is no second recorder and no
+second change signal: the same lines are what Cairn watches.
 
 Location: `.runtime/artifact-producer/v1/history/YYYY-MM/<event_id>.jsonl` (UTC month of
 `at`). One file holds exactly one LF-terminated JSON line. A published file is never
 modified, truncated, renamed, or deleted; a new month starts a new directory; there is
 no destructive rotation or retention. File names and directory order are **not** a
-global sequence; use `at`. Re-publishing an event with the same bytes is a no-op, the same
-`event_id` with other bytes is a conflict.
+global sequence; use `at`. Re-publishing an event with the same bytes is harmless (no new
+file), the same `event_id` with other bytes is a conflict.
+
+`history/LATEST.json` = `{"event_id", "at", "count"}`: the last event a publish created, its
+`at`, and the number of event files. It is rewritten (same-directory temp file, fsync,
+atomic rename) inside the admission lock after a publish created new files, and not at
+all when nothing new was written. It is a convenience signal for a watcher: if that update
+fails the publish still succeeds and the next publish brings it back in step.
+
+A publish that fails raises `HistoryPublishError` (a `HistoryError` with `.code`:
+`admission-lock-required`, `admission-busy`, `event-invalid`, `event-conflict`,
+`event-duplicate`, `history-unreadable`, `history-write-failed`); nothing is hidden. The
+caller decides: cycle-flex leaves its manifest unchanged so the next change attempt finds the
+same change again; a command keeps the unpublished line (`history_pending`) and the next
+trigger publishes it again, which is safe because of the identical-bytes rule.
 
 Keys, in this order: `schema_version`, `contract`, `event_id`, `transaction_id`, `at`,
 `actor`, `kind`, `target`, `operation`, `field`, `before`, `after`, `reason`.
 
-- `actor` = `{by: rule|model|human|agent, session: string|null}`; the session is the
-  dispatch attempt or native session when one exists (never required).
-- `kind` = `meta` | `group` | `flow` | `artifact`. `target` = `{type, id, path}` with
-  `type` = `campaign` | `cycle` | `project` | `group` | `flow` | `artifact` and a
+- `actor` = `{by, session, harness, route, attempt}`: `by` = `rule` | `model` | `human` |
+  `agent`; the other four are plain tokens or `null` and none is required. `actor_from_env()`
+  gives the default: an agent session environment (`AGENT_DISPATCH_ATTEMPT_ID`,
+  `AGENT_DISPATCH_CURRENT_HARNESS`, `AGENT_ROUTE_ID`, …) → `by=agent` with those markers
+  (`session` = the attempt id), otherwise `human` (`actor_from_env(default_by=…)` changes
+  that fallback). A change the runtime merely observed passes `by=rule` itself with the
+  session and route it saw (`make_actor("rule", session=…, route=…)`).
+- `kind` = `meta` | `group` | `flow` | `artifact` | `lifecycle`. `target` = `{type, id, path}`
+  with `type` = `campaign` | `cycle` | `project` | `group` | `flow` | `artifact` and a
   root-relative POSIX `path`.
+- `lifecycle` (target `cycle` or `campaign`) has `field` = `state` | `campaign` (membership
+  move) | `parent` | `disposition` (discard/supersede mark) | `path` (folder name or
+  location). A cycle close is `operation=update`, `field=state`, `after.value` =
+  `{state: completed|abandoned, manifest_digest, revision_id, files, excluded}`; a campaign
+  close/reopen is `update` of `state` with plain state names; a delete is `operation=delete`,
+  `field=state`, `before.value` = `{manifest_digest: sha256:…|null, path}`, `after.value` null.
+  A file added, changed, or deleted after a close stays `kind=artifact`, `target.type=artifact`,
+  `field` = the file's relative path, `before`/`after` = digest and size.
 - `operation` = `add` | `update` | `move` | `delete`. `field` is a field path
   (`campaign.title`, `cycles.<cycle_id>.summary`, `branches.CMD`, `groups.<group_id>`) or,
   for a file, its root-relative path.
@@ -176,10 +204,16 @@ Keys, in this order: `schema_version`, `contract`, `event_id`, `transaction_id`,
   is at most 512 bytes, otherwise `{"digest": "sha256:…", "bytes": n}`; file bytes are
   always digest and size; absent is `{"value": null}`.
 - `transaction_id` (`htxn_…`) ties the lines of one change together; `event_id` is
-  `hevt_…`. `reason` has an automatic default; nobody has to supply one.
+  `hevt_…`. `reason` is the caller's sentence, otherwise the command or trigger name.
 
 ```json
-{"schema_version":1,"contract":"artifact-history/v1","event_id":"hevt_44444444444444444444444444444444","transaction_id":"htxn_55555555555555555555555555555555","at":"2026-10-01T09:00:00Z","actor":{"by":"agent","session":"att-3521eef711234e77a156c5d972e7f628"},"kind":"meta","target":{"type":"campaign","id":"camp_22222222222222222222222222222222","path":"campaigns/2026-10-01_example/meta.json"},"operation":"update","field":"campaign.title","before":{"value":"명령어 모델 실험"},"after":{"value":"명령어 모델 집 적응 비교"},"reason":"사용자 요청에 따른 제목 수정"}
+{"schema_version":1,"contract":"artifact-history/v1","event_id":"hevt_44444444444444444444444444444444","transaction_id":"htxn_55555555555555555555555555555555","at":"2026-10-01T09:00:00Z","actor":{"by":"agent","session":"att-3521eef711234e77a156c5d972e7f628","harness":null,"route":null,"attempt":null},"kind":"meta","target":{"type":"campaign","id":"camp_22222222222222222222222222222222","path":"campaigns/2026-10-01_example/meta.json"},"operation":"update","field":"campaign.title","before":{"value":"명령어 모델 실험"},"after":{"value":"명령어 모델 집 적응 비교"},"reason":"사용자 요청에 따른 제목 수정"}
+```
+
+A cycle close:
+
+```json
+{"schema_version":1,"contract":"artifact-history/v1","event_id":"hevt_66666666666666666666666666666666","transaction_id":"htxn_77777777777777777777777777777777","at":"2026-10-01T10:30:00Z","actor":{"by":"agent","session":"att-3521eef711234e77a156c5d972e7f628","harness":"claude","route":"rt-379f8a5e9ad09c54","attempt":"att-3521eef711234e77a156c5d972e7f628"},"kind":"lifecycle","target":{"type":"cycle","id":"cyc_33333333333333333333333333333333","path":"campaigns/2026-10-01_example/2026-10-01_first-cycle"},"operation":"update","field":"state","before":{"value":"open"},"after":{"value":{"state":"completed","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision_id":"rev_20261001T103000Z","files":12,"excluded":0}},"reason":"route rt-379f8a5e9ad09c54 closed the cycle"}
 ```
 
 DESIGN §6.1 fixed only "an append-only line under `history/` with when, who, what,

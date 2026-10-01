@@ -860,10 +860,12 @@ class HistorySignalTest(MetaBase):
                              "--title", "에이전트 제목", "--by", "agent", "--session", "att-abc123", "--reason", "요청")
         self.assertEqual(code, 0, out)
         line = [e for e in self.events() if e["field"] == "campaign.title"][0]
-        self.assertEqual((line["actor"], line["reason"]), ({"by": "agent", "session": "att-abc123"}, "요청"))
+        self.assertEqual((line["actor"], line["reason"]), ({"by": "agent", "session": "att-abc123", "harness": None,
+                                                    "route": None, "attempt": None}, "요청"))
         code, _ = self.cli("set", "--artifact-root", str(self.root), "--campaign", self.B["campaign_id"], "--title", "기본값")
         line = [e for e in self.events() if e["target"]["id"] == self.B["campaign_id"]][0]
-        self.assertEqual((line["actor"], bool(line["reason"])), ({"by": "human", "session": None}, True))
+        self.assertEqual((line["actor"], bool(line["reason"])), ({"by": "human", "session": None, "harness": None,
+                                                    "route": None, "attempt": None}, True))
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_ATTEMPT_ID": "att-envsession"}):
             self.cli("set", "--artifact-root", str(self.root), "--campaign", self.G["campaign_id"], "--title", "환경")
         line = [e for e in self.events() if e["target"]["id"] == self.G["campaign_id"]][0]
@@ -1186,11 +1188,14 @@ class ContractDocumentTest(unittest.TestCase):
         self.assertIn("HEARTING_WORKFLOW_GROUP_REVIEW", self.text)
         self.assertIn(M.TITLE_DISABLE_ENV, self.text)
 
-    def test_the_history_example_is_the_one_in_the_history_tests(self):
+    def test_the_history_examples_are_the_ones_in_the_history_tests(self):
         spec = importlib.util.spec_from_file_location("artifact_history_test", Path(__file__).with_name("artifact_history.test.py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.assertEqual(self.block("artifact-history/v1"), module.EXAMPLE)
+        lines = [b for b in self.blocks if b.get("contract") == "artifact-history/v1"]
+        self.assertEqual(lines, [module.EXAMPLE, module.LIFECYCLE_EXAMPLE])
+        for line in lines:
+            self.assertEqual(json.loads(H.event_bytes(line)), line)
 
 
 if __name__ == "__main__":

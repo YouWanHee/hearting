@@ -21,10 +21,22 @@ import artifact_history as H  # noqa: E402
 TXN = "htxn_" + "5" * 32
 EXAMPLE = {"schema_version": 1, "contract": "artifact-history/v1", "event_id": "hevt_" + "4" * 32,
            "transaction_id": TXN, "at": "2026-10-01T09:00:00Z",
-           "actor": {"by": "agent", "session": "att-3521eef711234e77a156c5d972e7f628"}, "kind": "meta",
+           "actor": {"by": "agent", "session": "att-3521eef711234e77a156c5d972e7f628", "harness": None,
+                     "route": None, "attempt": None}, "kind": "meta",
            "target": {"type": "campaign", "id": "camp_" + "2" * 32, "path": "campaigns/2026-10-01_example/meta.json"},
            "operation": "update", "field": "campaign.title", "before": {"value": "명령어 모델 실험"},
            "after": {"value": "명령어 모델 집 적응 비교"}, "reason": "사용자 요청에 따른 제목 수정"}
+CLOSE = {"state": "completed", "manifest_digest": "sha256:" + "a" * 64, "revision_id": "rev_20261001T103000Z",
+         "files": 12, "excluded": 0}
+LIFECYCLE_EXAMPLE = {
+    "schema_version": 1, "contract": "artifact-history/v1", "event_id": "hevt_" + "6" * 32,
+    "transaction_id": "htxn_" + "7" * 32, "at": "2026-10-01T10:30:00Z",
+    "actor": {"by": "agent", "session": "att-3521eef711234e77a156c5d972e7f628", "harness": "claude",
+              "route": "rt-379f8a5e9ad09c54", "attempt": "att-3521eef711234e77a156c5d972e7f628"},
+    "kind": "lifecycle", "target": {"type": "cycle", "id": "cyc_" + "3" * 32,
+                                    "path": "campaigns/2026-10-01_example/2026-10-01_first-cycle"},
+    "operation": "update", "field": "state", "before": {"value": "open"}, "after": {"value": CLOSE},
+    "reason": "route rt-379f8a5e9ad09c54 closed the cycle"}
 NOW = 1_790_000_000.0
 MONTH_2 = 1_793_000_000.0  # a later UTC month
 
@@ -102,12 +114,101 @@ class EventFormatTest(HistoryBase):
                 self.assertEqual((made["kind"], made["target"]["type"], made["operation"]),
                                  (kind, target_type, operation))
 
-    def test_session_is_optional_and_actor_is_closed(self):
-        self.assertIsNone(event()["actor"]["session"])
-        self.assertEqual(event(session="att-abc")["actor"], {"by": "human", "session": "att-abc"})
-        for bad in ({"actor_by": "robot"}, {"session": "bad session"}, {"session": ""}):
-            with self.assertRaises(H.HistoryError):
+    def test_lifecycle_example_line_is_exactly_the_published_example(self):
+        line = H.event_bytes(H.validate_event(json.loads(json.dumps(LIFECYCLE_EXAMPLE)))).decode("utf-8")
+        self.assertEqual(json.loads(line), LIFECYCLE_EXAMPLE)
+
+    def test_only_by_is_required_and_the_actor_is_closed(self):
+        self.assertEqual(event()["actor"], {"by": "human", "session": None, "harness": None, "route": None,
+                                            "attempt": None})
+        self.assertEqual(event(session="att-abc")["actor"]["session"], "att-abc")
+        full = {"by": "rule", "session": "s1", "harness": "claude", "route": "rt-1", "attempt": "att-1"}
+        self.assertEqual(event(actor_by=None, actor=full)["actor"], full)
+        self.assertEqual(event(actor_by=None, actor={"by": "model"})["actor"]["route"], None)
+        for bad in ({"actor_by": "robot"}, {"session": "bad session"}, {"session": ""}, {"route": "a b"},
+                    {"harness": "x" * 129}, {"actor_by": None, "actor": {"session": "s"}},
+                    {"actor_by": None, "actor": {"by": "human", "extra": 1}},
+                    {"actor": {"by": "human"}}):  # actor plus actor_by is ambiguous
+            with self.subTest(bad), self.assertRaises(H.HistoryError):
                 event(**bad)
+        loose = json.loads(json.dumps(EXAMPLE))
+        loose["actor"] = {"by": "agent", "session": None}  # the old two-key actor is no longer a line
+        with self.assertRaises(H.HistoryError):
+            H.validate_event(loose)
+
+    def test_actor_from_env_is_agent_with_its_markers_and_otherwise_human(self):
+        self.assertEqual(H.actor_from_env(env={}), {"by": "human", "session": None, "harness": None,
+                                                    "route": None, "attempt": None})
+        self.assertEqual(H.actor_from_env("rule", env={})["by"], "rule")
+        self.assertEqual(H.actor_from_env(env={"AGENT_DISPATCH_JOBS": "/x"})["by"], "human")  # not a session marker
+        agent = H.actor_from_env(env={"AGENT_DISPATCH_ATTEMPT_ID": "att-1", "AGENT_ROUTE_ID": "rt-1",
+                                      "AGENT_DISPATCH_CURRENT_HARNESS": "codex"})
+        self.assertEqual(agent, {"by": "agent", "session": "att-1", "harness": "codex", "route": "rt-1",
+                                 "attempt": "att-1"})
+        self.assertEqual(H.actor_from_env("rule", env={"AGENT_ROUTE_ID": "rt-2"})["by"], "agent")
+        odd = H.actor_from_env(env={"AGENT_ROUTE_ID": "rt 1", "AGENT_DISPATCH_ATTEMPT_ID": "att-1"})
+        self.assertEqual((odd["by"], odd["route"]), ("agent", None))  # a bad marker is dropped, never an error
+        with mock.patch.dict(os.environ, {"AGENT_ROUTE_ID": "rt-9"}, clear=True):
+            self.assertEqual(H.actor_from_env()["route"], "rt-9")
+        with self.assertRaises(H.HistoryError):
+            H.actor_from_env("robot", env={})
+        self.assertEqual(event(actor_by=None, actor=agent)["actor"], agent)
+
+    def test_lifecycle_close_needs_the_closed_manifest_summary(self):
+        def life(**over):
+            base = dict(kind="lifecycle", target_type="cycle", field_name="state", before=H.value_ref("open"),
+                        after=H.value_ref(CLOSE))
+            base.update(over)
+            return event(**base)
+
+        self.assertEqual(life()["after"], {"value": CLOSE})
+        self.assertEqual(life(after=H.value_ref(dict(CLOSE, state="abandoned")))["after"]["value"]["state"], "abandoned")
+        for bad in (dict(CLOSE, state="open"), dict(CLOSE, manifest_digest="sha256:short"),
+                    dict(CLOSE, files=-1), dict(CLOSE, excluded="0"), dict(CLOSE, files=True),
+                    {k: v for k, v in CLOSE.items() if k != "revision_id"}, dict(CLOSE, extra=1)):
+            with self.subTest(bad), self.assertRaises(H.HistoryError):
+                life(after=H.value_ref(bad))
+        with self.assertRaises(H.HistoryError):
+            life(operation="add")
+        with self.assertRaises(H.HistoryError):
+            life(after=H.value_ref("completed"))
+
+    def test_lifecycle_delete_keeps_the_removed_manifest_digest_and_path(self):
+        gone = {"manifest_digest": "sha256:" + "b" * 64, "path": "campaigns/c/cycle"}
+
+        def delete(**over):
+            base = dict(kind="lifecycle", target_type="cycle", field_name="state", operation="delete",
+                        before=H.value_ref(gone), after=H.value_ref(None))
+            base.update(over)
+            return event(**base)
+
+        self.assertEqual(delete()["before"], {"value": gone})
+        self.assertIsNone(delete(before=H.value_ref(dict(gone, manifest_digest=None)))["before"]["value"]["manifest_digest"])
+        self.assertEqual(delete(target_type="campaign")["target"]["type"], "campaign")
+        for bad in (dict(before=H.value_ref("campaigns/c/cycle")), dict(before=H.value_ref({"path": "a"})),
+                    dict(before=H.value_ref(dict(gone, path="/abs"))),
+                    dict(before=H.value_ref(dict(gone, manifest_digest="x"))),
+                    dict(after=H.value_ref(1)), dict(field_name="parent")):
+            with self.subTest(bad), self.assertRaises(H.HistoryError):
+                delete(**bad)
+
+    def test_lifecycle_fields_and_targets_are_a_closed_list(self):
+        moved = dict(kind="lifecycle", target_type="cycle", operation="move",
+                     before=H.value_ref({"campaign_id": "camp_a", "path": "campaigns/a/c"}),
+                     after=H.value_ref({"campaign_id": "camp_b", "path": "campaigns/b/c"}))
+        for field in ("campaign", "parent", "disposition", "path"):
+            self.assertEqual(event(field_name=field, **moved)["field"], field)
+        self.assertEqual(event(field_name="state", **dict(moved, target_type="campaign", operation="update",
+                                                         before=H.value_ref("open"), after=H.value_ref("closed")))
+                         ["after"], {"value": "closed"})
+        for bad in (dict(field_name="title"), dict(target_type="project"), dict(target_type="artifact"),
+                    dict(field_name="state", target_type="campaign", operation="update",
+                         before=H.value_ref("open"), after=H.value_ref({"a": 1}))):
+            with self.subTest(bad), self.assertRaises(H.HistoryError):
+                event(**{**moved, **bad})
+        # the file/flow kinds keep their free field paths
+        self.assertEqual(event(kind="artifact", target_type="artifact", field_name="plans/plan.md",
+                               before=H.file_ref(b"a"), after=H.file_ref(b"b"))["field"], "plans/plan.md")
 
     def test_invalid_events_are_refused(self):
         for bad in (dict(kind="note"), dict(target_type="folder"), dict(operation="rename"),
@@ -208,6 +309,93 @@ class PublishTest(HistoryBase):
     def test_history_directory_is_the_documented_location(self):
         self.assertEqual(H.HISTORY_REL, ".runtime/artifact-producer/v1/history")
         self.assertIsNotNone(re.fullmatch(r"\d{4}-\d{2}", event()["at"][:7]))
+
+
+class PublishFailureAndLatestTest(HistoryBase):
+    def latest(self):
+        return json.loads((self.root / H.LATEST_REL).read_text(encoding="utf-8"))
+
+    def test_every_publish_failure_is_the_typed_exception_with_its_code(self):
+        self.assertTrue(issubclass(H.HistoryPublishError, H.HistoryError))
+        one = event()
+        with self.assertRaises(H.HistoryPublishError) as ctx:
+            H.publish_events_locked(self.root, [one])
+        self.assertEqual(ctx.exception.code, "admission-lock-required")
+        with self.locked():
+            H.publish_events_locked(self.root, [one])
+            for events, code in (([dict(one, reason="다른 이유")], "event-conflict"), ([one, one], "event-duplicate"),
+                                 ([dict(one, kind="note")], "event-invalid")):
+                with self.subTest(code), self.assertRaises(H.HistoryPublishError) as ctx:
+                    H.publish_events_locked(self.root, events)
+                self.assertEqual(ctx.exception.code, code)
+        with mock.patch.object(H.admission, "_acquire_lock", side_effect=adm.AdmissionBusy("busy")):
+            with self.assertRaises(H.HistoryPublishError) as ctx:
+                H.publish_events(self.root, [event()], lock_timeout=0)
+        self.assertEqual(ctx.exception.code, "admission-busy")
+
+    def test_an_identical_republish_creates_no_file_and_leaves_latest_alone(self):
+        first, second = event(now=NOW), event(now=NOW + 5)
+        with self.locked():
+            H.publish_events_locked(self.root, [first, second])
+            latest = self.root / H.LATEST_REL
+            before = (latest.read_bytes(), latest.stat().st_mtime_ns, latest.stat().st_ino, len(self.files()))
+            self.assertEqual(len(H.publish_events_locked(self.root, [first])), 1)
+            H.publish_events_locked(self.root, [first, second])
+        self.assertEqual((latest.read_bytes(), latest.stat().st_mtime_ns, latest.stat().st_ino, len(self.files())), before)
+        self.assertEqual(self.latest()["event_id"], second["event_id"])
+
+    def test_latest_names_the_last_published_event_and_the_cumulative_count(self):
+        a, b, c = event(now=NOW), event(now=NOW + 5), event(now=MONTH_2)
+        self.assertFalse((self.root / H.LATEST_REL).exists())
+        with self.locked():
+            H.publish_events_locked(self.root, [a, b])
+        self.assertEqual(self.latest(), {"event_id": b["event_id"], "at": b["at"], "count": 2})
+        with self.locked():
+            H.publish_events_locked(self.root, [b, c])  # b repeats; only c is new
+        self.assertEqual(self.latest(), {"event_id": c["event_id"], "at": c["at"], "count": 3})
+        self.assertEqual(list(self.latest()), ["event_id", "at", "count"])
+        self.assertEqual(len(self.files()), 3)  # LATEST.json is not an event
+        self.assertEqual(len(list(H.iter_events(self.root))), 3)
+        leftovers = [p.name for p in (self.root / H.HISTORY_REL).iterdir() if p.is_file()]
+        self.assertEqual(leftovers, ["LATEST.json"])  # no temp file stays
+
+    def test_latest_failure_does_not_fail_the_publish_and_the_next_publish_re_syncs(self):
+        a, b = event(now=NOW), event(now=NOW + 5)
+        with self.locked(), mock.patch.object(H.producer, "_write_atomic", side_effect=OSError("read-only")):
+            paths = H.publish_events_locked(self.root, [a])
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(len(self.files()), 1)
+        self.assertFalse((self.root / H.LATEST_REL).exists())
+        with self.locked():
+            H.publish_events_locked(self.root, [b])
+        self.assertEqual(self.latest(), {"event_id": b["event_id"], "at": b["at"], "count": 2})
+
+    def test_latest_follows_the_lines_made_visible_before_a_failure(self):
+        a, b = event(now=NOW), event(now=NOW + 5)
+        with self.locked():
+            H.publish_events_locked(self.root, [a])
+            with self.assertRaises(H.HistoryPublishError):
+                H.publish_events_locked(self.root, [b, dict(a, reason="다른 이유")])
+        self.assertEqual(self.latest(), {"event_id": b["event_id"], "at": b["at"], "count": 2})
+
+    def test_publish_events_takes_the_admission_lock_and_releases_it(self):
+        seen = []
+        real = H._publish_locked
+
+        def spy(root, events, created):
+            seen.append(adm.holds_lock(root))
+            return real(root, events, created)
+
+        one = event()
+        self.assertFalse(adm.holds_lock(self.root))
+        with mock.patch.object(H, "_publish_locked", spy):
+            paths = H.publish_events(self.root, [one])
+        self.assertEqual((seen, len(paths)), ([True], 1))
+        self.assertFalse(adm.holds_lock(self.root))
+        self.assertEqual(self.latest()["event_id"], one["event_id"])
+        with self.locked():  # a caller already inside the lock is not locked twice
+            self.assertEqual(H.publish_events(self.root, [one]), paths)
+        self.assertFalse(adm.holds_lock(self.root))
 
 
 if __name__ == "__main__":
