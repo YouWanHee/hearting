@@ -93,8 +93,8 @@ Adapter hook bridges own the final runtime output protocol. A portable helper ca
 print human-readable status for explicit CLI use, but a native runtime hook must
 not forward that text unless the runtime accepts it for that hook event. For
 example, a context hook may emit `hookSpecificOutput.additionalContext` when the
-runtime supports it, while a lifecycle side-effect hook such as a session-end
-sync may need to perform the mutation with empty stdout or a minimal structured
+runtime supports it, while a lifecycle side-effect hook such as a summary or state refresh
+may need to perform the mutation with empty stdout or a minimal structured
 success object so the runtime does not attempt to parse helper text as hook
 JSON.
 
@@ -120,20 +120,10 @@ Use `adapters/codex/bin/preflight.sh worklog [cwd]` to inspect the configured
 agent-notes/worklog-board state read-only before touching that layer.
 Use `adapters/codex/bin/preflight.sh design <file>` after design HTML writes
 to run the same console verification without Claude hook JSON.
-Use `adapters/codex/bin/preflight.sh distill-delta <session-id>` for Codex
-transcript extraction. `CODEX_DISTILL_ENABLE=1 adapters/codex/bin/preflight.sh
-distill-propose <session-id> [cwd]` can generate a constrained proposal, but it
-is a manual preview surface and does not auto-apply unless the apply and
-contract-accepted env gates are explicit. Codex adapter-owned `session-end` and
-`turn-nudge` paths are the verified automatic realization: after the documented
-read-only `codex exec` tool-free proof, they default to automatic apply and opt
-out with `CODEX_DISTILL_ENABLE=0`. They run only for an interactive main;
-dispatch/title/distill/loop workers make both paths silent no-ops under D-42.
-Use `adapters/opencode/bin/preflight.sh distill-delta <session-id>` for
-OpenCode transcript extraction through `opencode export`. OpenCode's no-tools
-worker contract is verified (`opencode run --pure --agent <distiller>` with all
-tools disabled), so `distill-propose` runs the worker and the plugin
-`event`/`session.idle` trigger auto-distills via `preflight.sh session-end`
-(debounced, enabled by default for main sessions; opt out
-`OPENCODE_DISTILL_ENABLE=0`). Worker sessions keep spec-read observations and
-liveness heartbeats but skip automatic memory context and session-idle distill.
+Memory does nothing when a session ends (D-82). Claude `SessionEnd`, the Codex
+`SessionEnd` bridge and the OpenCode `session.idle` event keep only their
+non-memory work (Fleet/herdr state, the final summary, pane and heartbeat). Memory
+instead exchanges in the background after a successful write and after a read that
+finds the last receive older than ten minutes (`tools/memory/README.md`). Worker
+sessions keep spec-read observations and liveness heartbeats but skip automatic
+memory context.

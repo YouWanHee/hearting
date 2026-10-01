@@ -46,7 +46,7 @@ and `ADAPTATION.md`; command output is authoritative for current support.
 
 | Need | Command |
 |---|---|
-| lifecycle | `preflight.sh session-end`, `preflight.sh prompt-signal` |
+| lifecycle | `preflight.sh prompt-signal` |
 | workflow/context | `preflight.sh status`, `preflight.sh briefing`, `preflight.sh worklog` |
 | memory | `preflight.sh memory`, `preflight.sh recall-gate`, `preflight.sh recall` |
 | token/UI | `preflight.sh token-budget`, `preflight.sh ui-info`, `preflight.sh tui-config` |

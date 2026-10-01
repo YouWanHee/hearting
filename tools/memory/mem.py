@@ -13,7 +13,7 @@ Design boundary:
     storage, retrieval, scope, lifecycle, telemetry, and recovery contracts.
   - No external Python dependencies; rg accelerates session retrieval when present.
 """
-import argparse, contextlib, datetime, fcntl, functools, hashlib, io, json, os, re, shutil, sqlite3, stat, subprocess, sys, tarfile, tempfile, time
+import argparse, contextlib, datetime, fcntl, functools, hashlib, io, json, os, re, select, shutil, sqlite3, stat, subprocess, sys, tarfile, tempfile, time
 from collections import namedtuple
 from pathlib import Path
 
@@ -99,6 +99,24 @@ CANDIDATE_MAX_RESULTS = 6
 CANDIDATE_MAX_UTF8_BYTES = 2400
 CANDIDATE_MAX_QUERY_CHARS = 16000
 CANDIDATE_MAX_FTS_TERMS = 32
+# D-86: a session is shown each record at most once. The display history is one
+# small file per (session, project) beside the recall receipts; it is advisory,
+# so every lock/read/write failure lets the candidate through instead.
+CANDIDATE_SEEN = Path(os.environ.get(
+    "MEM_CANDIDATE_SEEN", RECALL_RECEIPTS.parent / "candidate-seen"))
+CANDIDATE_SEEN_MAX_IDS = 512
+CANDIDATE_SEEN_TTL_SECONDS = 24 * 60 * 60
+CANDIDATE_SEEN_LOCK_WAIT_SECONDS = 1.0
+# Values a bridge passes when it has no real session; they must never share a history.
+CANDIDATE_SEEN_SESSIONLESS = frozenset(
+    {"", "memory-prompt-hook", "opencode-plugin", "codex-hook"})
+CANDIDATE_HOOK_STDIN_SECONDS = 0.5
+# Optional short body (off unless MEM_CANDIDATE_BODY=1): one clearly leading,
+# newly shown record, at most CANDIDATE_BODY_MAX_CHARS characters, paid for by
+# at most half of the bytes this session already saved by not repeating ids.
+CANDIDATE_BODY_MAX_CHARS = 600
+CANDIDATE_BODY_MIN_GAP = 2.0     # bm25 lead of rank 1 over rank 2 (rank 2 = 0 when alone)
+CANDIDATE_BODY_MIN_BYTES = 48    # a body trimmed below this is not worth a line
 RECALL_RECEIPT_SCHEMA = 1
 RECALL_RECEIPT_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 # D-37 write-event journal mirrors recall telemetry location and rotation but is
@@ -259,9 +277,12 @@ def _commit_dump():
     prints a ONE-LINE stderr warning while sync itself stays non-fatal.
     History compaction is an explicit operator action: ``mem maintenance
     [--squash-days N] [--apply]`` squashes old auto-sync history and gcs (see
-    ``maintenance()``); it is run by the session finalizer or the user, never
-    a daemon. Routine sync never pushes this compatibility projection;
-    ``MEM_DUMP_PUSH=1`` is only a deprecated alias for immutable v2 exchange.
+    ``maintenance()``); the user or an agent runs it on request, and nothing
+    runs it on session end. The background exchange (``_exchange_worker_main``)
+    calls this after every routine run, which is what keeps the local mirror
+    current without a session finalizer. Routine sync never pushes this
+    compatibility projection; ``MEM_DUMP_PUSH=1`` is only a deprecated alias
+    for immutable v2 exchange.
     """
     if os.environ.get("MEM_DUMP_COMMIT") == "0":
         return  # Explicit escape hatch.
@@ -294,8 +315,9 @@ def maintenance(squash_days=14, apply=False):
     """Compact the dump repository: squash old auto-sync history, then gc.
 
     Companion policy for plain-commit dump mode (audit W1/W2): commits now
-    accumulate one per sync, so an OPERATOR (session finalizer or the user —
-    never a daemon) periodically squashes first-parent history older than
+    accumulate one per sync (and one per background exchange that changed the
+    dump), so an OPERATOR (the user or an agent on request — never a daemon
+    and never a session-end hook) periodically squashes first-parent history older than
     ``squash_days`` into a single root commit and garbage-collects loose
     objects. Retained commits keep their trees, subjects, and dates
     byte-identically, so HEAD's tree and the worktree never change. Dry-run
@@ -613,24 +635,6 @@ def slugify(text, n=4):
 
 def norm_body(body):
     return re.sub(r"[\s\W_]+", " ", body.lower()).strip()
-
-
-def _distill_state_path(sid):
-    return STORE / f".distill-state-{sid}"
-
-
-def read_marker(sid):
-    """Read the last processed session-distillation UUID."""
-    p = _distill_state_path(sid)
-    if not p.exists():
-        return ""
-    return p.read_text(encoding="utf-8").strip()
-
-
-def advance_marker(sid, last_uuid):
-    """Advance the marker to ``last_uuid``."""
-    STORE.mkdir(parents=True, exist_ok=True)
-    _distill_state_path(sid).write_text(last_uuid + "\n", encoding="utf-8")
 
 
 # ---------- frontmatter for migration input and projection output ----------
@@ -1662,6 +1666,9 @@ def _capture_v2_operation(con, kind, *, post_ids=(), tombstones=None,
     sync_v2.record_local_operation(
         con, operation, installation_fingerprint=installation_fingerprint
     )
+    # The one place every committed semantic mutation passes: remember it so the
+    # foreground command can ask for a background exchange once it ends.
+    _exchange_mark_dirty(operation["op_id"])
     for rid, action in tombstones.items():
         prior_bytes = protocol_v2.canonical_bytes(prior_states.get(rid) or {})
         tombstone = next(item["tombstone"] for item in mutations
@@ -1761,6 +1768,116 @@ def find_dup(tier, scope, body, cwd_origin, con=None):
     return None
 
 
+SOURCE_HISTORY = STORE / "source-history.jsonl"
+SOURCE_HISTORY_MAX_BYTES = 1024 * 1024
+
+
+def _source_history_max_bytes():
+    raw = os.environ.get("MEM_SOURCE_HISTORY_MAX_BYTES", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return SOURCE_HISTORY_MAX_BYTES
+    return value if value > 0 else SOURCE_HISTORY_MAX_BYTES
+
+
+def _source_history_files():
+    """Rotated generations oldest first, then the active file."""
+    rotated = sorted(SOURCE_HISTORY.parent.glob("source-history.*.jsonl"))
+    return rotated + ([SOURCE_HISTORY] if SOURCE_HISTORY.is_file() else [])
+
+
+SOURCE_HISTORY_LOCK_WAIT_SECONDS = 2.0
+
+
+@contextlib.contextmanager
+def _source_history_lock(wait=SOURCE_HISTORY_LOCK_WAIT_SECONDS):
+    """Short flock on the history file; yields False (never raises) when unavailable."""
+    fd = None
+    held = False
+    try:
+        SOURCE_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(SOURCE_HISTORY.parent / ".source-history.lock",
+                     os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+    except OSError:
+        held = False
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            if held:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
+def _source_history_append(entry):
+    """Keep a replaced body after its overwrite committed; never fail the write.
+
+    The local, append-only file is a recovery aid: it is not part of the dump
+    or of the v2 exchange.  When it grows past the size cap it is renamed to a
+    timestamped generation, so no body is ever dropped.  The size check, the
+    rotation and the append happen under one short file lock so two writers
+    cannot rotate over each other; if the lock cannot be taken the body is still
+    appended without it.  Returns True when the entry is on disk.
+    """
+    line = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
+    try:
+        SOURCE_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with _source_history_lock():
+            try:
+                size = SOURCE_HISTORY.stat().st_size if SOURCE_HISTORY.is_file() else 0
+            except OSError:
+                size = 0
+            if size and size + len(line.encode("utf-8")) > _source_history_max_bytes():
+                stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+                SOURCE_HISTORY.rename(
+                    SOURCE_HISTORY.with_name(f"source-history.{stamp}.jsonl"))
+            fd = os.open(SOURCE_HISTORY,
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                         0o600)
+            try:
+                os.write(fd, line.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return True
+    except OSError as e:
+        sys.stderr.write(
+            f"[history] could not keep the previous body of {entry.get('id')}: {e}\n")
+        return False
+
+
+def _source_history_entries(rid):
+    """Every kept entry for one record, oldest first."""
+    found = []
+    for path in _source_history_files():
+        try:
+            with path.open(encoding="utf-8") as f:
+                for raw in f:
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict) and entry.get("id") == rid:
+                        found.append(entry)
+        except OSError:
+            continue
+    return found
+
+
 def write_record(tier, scope, rtype, body, cwd_origin=None, tags=None, links=None,
                  source=None, quiet=False, requires_consume=False, journal_action=None,
                  journal_insert_only=False, journal_actor=None,
@@ -1831,6 +1948,23 @@ def write_record(tier, scope, rtype, body, cwd_origin=None, tags=None, links=Non
                 new_expires = None
             # Recompute injection_flag whenever the body changes.
             new_inj_flag = 1 if "injection-pattern" in flags else 0
+            # A different body replaces the old one in place; keep the old text
+            # (after the commit below) so it can be brought back.
+            replaced = None
+            prev = con.execute(
+                "SELECT body, headline, updated, tags, links FROM records WHERE id=?",
+                (existing,)).fetchone()
+            if prev is not None and prev[0] != body:
+                replaced = {
+                    "v": 1, "id": existing, "tier": tier, "scope": scope,
+                    "type": rtype, "source": source, "cwd_origin": cwd_origin,
+                    "prev_headline": prev[1], "prev_body": prev[0],
+                    "prev_updated": prev[2],
+                    "prev_tags": json.loads(prev[3]) if prev[3] else [],
+                    "prev_links": json.loads(prev[4]) if prev[4] else [],
+                    "replaced_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "actor": journal_actor if journal_actor in WRITE_ACTORS else _write_actor(),
+                }
             con.execute(
                 "UPDATE records SET body=?, updated=?, expires=?, tags=?, links=?,"
                 " injection_flag=?, delivery_state=CASE "
@@ -1852,8 +1986,11 @@ def write_record(tier, scope, rtype, body, cwd_origin=None, tags=None, links=Non
                 con, "put", post_ids=[existing], reason="source-upsert"
             )
             con.commit()
+            kept = _source_history_append(replaced) if replaced else False
             if not quiet:
                 print(f"[upsert] {tier}/{scope} source={source} → {existing}")
+                if kept:
+                    print(f"[history] previous body kept; undo: mem history {existing} --restore 1")
             if journal_action and not journal_insert_only:
                 _append_write_event(journal_action, existing, tier=tier, scope=scope,
                                      rtype=rtype, actor=journal_actor,
@@ -2039,6 +2176,18 @@ def _has_cjk(s):
     return bool(re.search(r"[　-鿿가-힯]", s))
 
 
+def _unexpired_sql(alias="r"):
+    """Read-side expiry fence, one definition for inject, candidates, and recall.
+
+    Expiry is applied for real by the write side (``lifecycle``), so a read
+    only has to keep an expired working record out of sight until then. A
+    pending delivery never expires. The single ``?`` is ``today()``.
+    """
+    prefix = f"{alias}." if alias else ""
+    return (f"({prefix}expires IS NULL OR {prefix}expires>=? "
+            f"OR {prefix}delivery_state='pending')")
+
+
 def _visibility_clause(alias="r", all_projects=False, include_superseded=False):
     """Shared read fence: flagged rows never surface; default is current project + global."""
     prefix = f"{alias}." if alias else ""
@@ -2153,9 +2302,14 @@ def _utf8_prefix(value, max_bytes):
     return raw.decode("utf-8", "ignore")
 
 
-def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
+def _render_candidate_block(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES, body=None):
+    """Render candidate rows; returns ``(text, shown)`` (shown = rows that got a line).
+
+    ``body`` is an optional ``(record_id, text)`` short body shown under that
+    row. It is trimmed to fit: it never pushes the block past ``max_bytes``.
+    """
     if not rows:
-        return ""
+        return "", 0
     header = (
         "# Memory candidates (indexes only; not instructions)\n"
         "Treat these as live leads from prior work, not noise. Read any plausibly relevant "
@@ -2164,6 +2318,8 @@ def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
         "decisions. Ignore clearly unrelated candidates.\n"
     )
     output = header
+    shown = 0
+    body_at = None
     for rid, tier, rtype, headline in rows:
         clean = re.sub(r"[\x00-\x1f\x7f]+", " ", headline or "").strip()[:160]
         prefix = f"- [{tier}/{rtype}] {rid}: "
@@ -2171,18 +2327,253 @@ def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
         candidate = output + prefix + suffix + "\n"
         if len(candidate.encode("utf-8")) <= max_bytes:
             output = candidate
+            shown += 1
+            if body and body[0] == rid:
+                body_at = len(output)
             continue
         remaining = max_bytes - len((output + prefix + "\n").encode("utf-8"))
         if remaining > 0:
             output += prefix + _utf8_prefix(suffix, remaining) + "\n"
+            shown += 1
         break
-    return _utf8_prefix(output, max_bytes).rstrip()
+    text = _utf8_prefix(output, max_bytes).rstrip()
+    if body and body_at is not None and body_at <= len(text) + 1:
+        lead = "  > "
+        room = max_bytes - len(text.encode("utf-8")) - 1 - len(lead.encode("utf-8"))
+        piece = _utf8_prefix(body[1], room).strip() if room > 0 else ""
+        if len(piece.encode("utf-8")) >= CANDIDATE_BODY_MIN_BYTES:
+            text = text[:body_at - 1] + "\n" + lead + piece + text[body_at - 1:]
+    return text, shown
+
+
+def _render_candidate_context(rows, max_bytes=CANDIDATE_MAX_UTF8_BYTES):
+    return _render_candidate_block(rows, max_bytes)[0]
+
+
+def _seen_session(session_id):
+    """The session key for the display history, or "" when there is no real session."""
+    sid = (session_id or "").strip()
+    return "" if sid in CANDIDATE_SEEN_SESSIONLESS else sid
+
+
+def _seen_names(session_id, project):
+    digest = hashlib.sha256(
+        b"memory-candidate-seen-v1\0" + session_id.encode("utf-8", "replace")).hexdigest()
+    proj = hashlib.sha256(project.encode("utf-8", "replace")).hexdigest()[:12]
+    return digest, f"{digest}.{proj}"
+
+
+@contextlib.contextmanager
+def _seen_lock(name, wait=CANDIDATE_SEEN_LOCK_WAIT_SECONDS):
+    """Short flock on one history key; yields False (never raises) when unavailable."""
+    fd = None
+    held = False
+    try:
+        CANDIDATE_SEEN.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(CANDIDATE_SEEN / f"{name}.lock",
+                     os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+    except OSError:
+        held = False
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            if held:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
+def _seen_load(name, now):
+    """The history for one key; anything unreadable or malformed is an empty history."""
+    state = {"ids": {}, "body_ids": {}, "saved_bytes": 0, "body_bytes": 0}
+    try:
+        raw = json.loads((CANDIDATE_SEEN / f"{name}.json").read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("v") != 1:
+            return state
+        for key in ("ids", "body_ids"):
+            items = raw.get(key)
+            if isinstance(items, dict):
+                state[key] = {str(k): float(v) for k, v in items.items()
+                              if isinstance(v, (int, float)) and now - float(v)
+                              <= CANDIDATE_SEEN_TTL_SECONDS}
+        for key in ("saved_bytes", "body_bytes"):
+            if isinstance(raw.get(key), int) and raw[key] >= 0:
+                state[key] = raw[key]
+    except (OSError, ValueError, TypeError):
+        return {"ids": {}, "body_ids": {}, "saved_bytes": 0, "body_bytes": 0}
+    return state
+
+
+def _seen_save(name, digest, project, state, now):
+    """Atomic replace, ids capped at 512 (oldest dropped). Returns False on failure."""
+    try:
+        ids = state["ids"]
+        if len(ids) > CANDIDATE_SEEN_MAX_IDS:
+            keep = sorted(ids.items(), key=lambda kv: kv[1])[-CANDIDATE_SEEN_MAX_IDS:]
+            state["ids"] = dict(keep)
+        path = CANDIDATE_SEEN / f"{name}.json"
+        created = not path.exists()
+        value = {"v": 1, "session_digest": digest, "project": project,
+                 "updated_at": now, **state}
+        fd, raw = tempfile.mkstemp(prefix=f".{name}.", dir=CANDIDATE_SEEN)
+        temp = Path(raw)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+            os.replace(temp, path)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+        if created:
+            _seen_sweep(now, keep=path)
+        return True
+    except OSError:
+        return False
+
+
+def _seen_sweep(now, keep=None):
+    """Drop history files past the TTL (and their orphaned lock files)."""
+    try:
+        for entry in CANDIDATE_SEEN.iterdir():
+            if entry == keep or entry.is_symlink() or entry.name.startswith("."):
+                continue
+            try:
+                if now - entry.stat().st_mtime <= CANDIDATE_SEEN_TTL_SECONDS:
+                    continue
+                if entry.suffix == ".lock" and entry.with_suffix(".json").exists():
+                    continue
+                if entry.suffix in (".json", ".lock"):
+                    entry.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _seen_reset(session_id):
+    """Forget what this session was shown (compact/clear). Returns files removed."""
+    sid = _seen_session(session_id)
+    if not sid:
+        return 0
+    digest, _ = _seen_names(sid, "")
+    removed = 0
+    try:
+        files = sorted(CANDIDATE_SEEN.glob(f"{digest}.*.json"))
+    except OSError:
+        return 0
+    for path in files:
+        if path.is_symlink():
+            continue
+        with _seen_lock(path.stem):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def _seen_reset_main(argv):
+    """Hidden ``_seen-reset --session-id ID``: the one reset all three harnesses call."""
+    sid = ""
+    if "--session-id" in argv:
+        try:
+            sid = argv[argv.index("--session-id") + 1]
+        except IndexError:
+            sid = ""
+    try:
+        _seen_reset(sid)
+    except Exception:
+        pass
+    return 0
+
+
+def _hook_stdin_payload(timeout=CANDIDATE_HOOK_STDIN_SECONDS, limit=65536):
+    """The hook JSON on stdin, read without ever waiting for it: {} when absent."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        fd = sys.stdin.fileno()
+    except (OSError, ValueError, AttributeError):
+        return {}
+    deadline = time.monotonic() + timeout
+    chunks, total = [], 0
+    while total < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {}
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                return {}
+            data = os.read(fd, 65536)
+        except (OSError, ValueError):
+            return {}
+        if not data:
+            break
+        chunks.append(data)
+        total += len(data)
+    try:
+        value = json.loads(b"".join(chunks).decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _seen_reset_from_hook_payload(payload):
+    """SessionStart ``source`` compact/clear empties that session's history."""
+    if not isinstance(payload, dict):
+        return
+    source = payload.get("source")
+    if not isinstance(source, str) or source.strip().lower() not in ("compact", "clear"):
+        return
+    for key in ("session_id", "sessionID", "thread_id", "threadID"):
+        sid = payload.get(key)
+        if isinstance(sid, str) and sid:
+            _seen_reset(sid)
+            return
+
+
+def _candidate_dedup_enabled():
+    """Only the replay tool turns this off (MEM_CANDIDATE_DEDUP=0), to measure the old behaviour."""
+    return os.environ.get("MEM_CANDIDATE_DEDUP", "").strip().lower() not in (
+        "0", "off", "false", "no")
+
+
+def _candidate_body_enabled():
+    return os.environ.get("MEM_CANDIDATE_BODY", "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+def _candidate_body_text(body):
+    return re.sub(r"[\x00-\x1f\x7f\s]+", " ", body or "").strip()[:CANDIDATE_BODY_MAX_CHARS]
 
 
 def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                max_bytes=CANDIDATE_MAX_UTF8_BYTES, runtime=None,
                session_id=None, turn_id=None, hook=False):
-    """Expose capsule-only lexical indexes without reading or touching bodies."""
+    """Expose capsule-only lexical indexes; a session sees each record once.
+
+    The ranked top ``limit`` is chosen exactly as before; the ones this session
+    was already shown are then dropped and their places stay empty. Bodies are
+    neither read nor touched unless MEM_CANDIDATE_BODY=1.
+    """
     runtime = runtime or os.environ.get("MEM_RECALL_RUNTIME", "unknown")
     session_id = session_id if session_id is not None else (
         os.environ.get("MEM_SID") or os.environ.get("CODEX_THREAD_ID") or ""
@@ -2193,7 +2584,10 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
     limit = max(1, min(int(limit), CANDIDATE_MAX_RESULTS))
     max_bytes = max(1, min(int(max_bytes), CANDIDATE_MAX_UTF8_BYTES))
     rows = []
+    scores = []
+    lead_body = ""
     probe_ok = True
+    want_body = _candidate_body_enabled()
     terms = _tokenize_query((query or "")[:CANDIDATE_MAX_QUERY_CHARS])[
         :CANDIDATE_MAX_FTS_TERMS
     ]
@@ -2209,24 +2603,72 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                 probe_ok = False
             else:
                 expression = " OR ".join(terms)
-                rows = con.execute(
-                    "SELECT r.id,r.tier,r.type,COALESCE(r.headline,'') "
+                found = con.execute(
+                    "SELECT r.id,r.tier,r.type,COALESCE(r.headline,''),"
+                    "bm25(records_capsule_fts) "
                     "FROM records_capsule_fts c JOIN records r ON r.id=c.id "
                     "WHERE records_capsule_fts MATCH ? AND r.status='active' "
                     "AND (r.injection_flag=0 OR r.injection_flag IS NULL) "
                     "AND (r.scope='global' OR r.cwd_origin=?) "
+                    f"AND {_unexpired_sql('r')} "
                     "ORDER BY bm25(records_capsule_fts),r.strength DESC,r.updated DESC "
                     "LIMIT ?",
-                    (expression, project, limit),
+                    (expression, project, today(), limit),
                 ).fetchall()
+                rows = [tuple(row[:4]) for row in found]
+                scores = [row[4] for row in found]
+                if want_body and rows:
+                    second = scores[1] if len(scores) > 1 else 0.0
+                    if scores[0] <= second - CANDIDATE_BODY_MIN_GAP:
+                        got = con.execute(
+                            "SELECT body FROM records WHERE id=?", (rows[0][0],)
+                        ).fetchone()
+                        lead_body = _candidate_body_text(got[0] if got else "")
         except (OSError, sqlite3.Error):
             rows = []
             probe_ok = False
         finally:
             if con is not None:
                 con.close()
-    result_ids = [row[0] for row in rows]
-    context = _render_candidate_context(rows, max_bytes=max_bytes)
+    shown_rows = rows
+    suppressed = 0
+    body_count = 0
+    context = None
+    seen_sid = _seen_session(session_id)
+    if rows and seen_sid and _candidate_dedup_enabled():
+        digest, name = _seen_names(seen_sid, project)
+        with _seen_lock(name) as held:
+            if held:
+                now = time.time()
+                state = _seen_load(name, now)
+                fresh = [row for row in rows if row[0] not in state["ids"]]
+                suppressed = len(rows) - len(fresh)
+                base, shown = _render_candidate_block(fresh, max_bytes)
+                if suppressed:
+                    full = _render_candidate_block(rows, max_bytes)[0]
+                    state["saved_bytes"] += max(
+                        0, len(full.encode("utf-8")) - len(base.encode("utf-8")))
+                context = base
+                if (lead_body and fresh and fresh[0][0] == rows[0][0]
+                        and rows[0][0] not in state["body_ids"]):
+                    budget = state["saved_bytes"] // 2 - state["body_bytes"]
+                    if budget >= CANDIDATE_BODY_MIN_BYTES:
+                        with_body, shown_b = _render_candidate_block(
+                            fresh, max_bytes,
+                            body=(rows[0][0], _utf8_prefix(lead_body, budget - 5)))
+                        extra = len(with_body.encode("utf-8")) - len(base.encode("utf-8"))
+                        if 0 < extra <= budget:
+                            context, shown = with_body, shown_b
+                            state["body_bytes"] += extra
+                            state["body_ids"][rows[0][0]] = now
+                            body_count = 1
+                shown_rows = fresh[:shown]
+                for row in shown_rows:
+                    state["ids"][row[0]] = now
+                _seen_save(name, digest, project, state, now)
+    if context is None:
+        context = _render_candidate_context(rows, max_bytes=max_bytes)
+    result_ids = [row[0] for row in shown_rows]
     _append_recall_event({
         "at": datetime.datetime.now().isoformat(timespec="seconds"),
         "event": "candidate-probe" if probe_ok else "candidate-probe-error",
@@ -2236,6 +2678,7 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
         "project": project, "query_sha256": query_hash,
         "result_count": len(result_ids), "result_ids": result_ids,
         "output_utf8_bytes": len(context.encode("utf-8")),
+        "suppressed_count": suppressed, "body_count": body_count,
     })
     if probe_ok:
         _write_recall_receipt(
@@ -2248,7 +2691,7 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
             }}, ensure_ascii=False))
     elif context:
         print(context)
-    return rows
+    return shown_rows
 
 
 def _write_actor(default="manual"):
@@ -2330,6 +2773,7 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
                 conds.append("(r.scope='global' OR r.cwd_origin=?)"); p.append(encc)
             if not include_superseded:
                 conds.append("r.status='active'")
+                conds.append(_unexpired_sql("r")); p.append(today())
             if topic:
                 conds.append("EXISTS (SELECT 1 FROM record_topics rt "
                              "WHERE rt.record_id=r.id AND rt.topic=?)")
@@ -2928,22 +3372,6 @@ class OpenCodeExportSource:
 # Other runtime adapters need only implement the same ``messages()`` interface.
 
 
-def ingest_session(source):
-    """Yield normalized messages strictly after the shared marker.
-
-    Yield all messages when no marker exists, and none when a recorded marker is
-    absent from the source to avoid conservative re-duplication.
-    """
-    after = read_marker(source.sid)
-    started = not after
-    for msg in source.messages():
-        if not started:
-            if msg.uuid == after:
-                started = True
-            continue
-        yield msg
-
-
 # ---------- export / import ----------
 def export_dump(target_path=None):
     """Export a deterministic, ID-sorted 16-column JSONL mirror."""
@@ -3064,6 +3492,7 @@ def import_dump(path, recovery=False):
                 _sync_capsule_row(con, rid)
                 n += 1
         con.commit()
+        _exchange_mark_dirty()  # this path writes records without a v2 operation
     finally:
         con.close()
     print(f"[import] {n} records ← {Path(path).name}")
@@ -3787,7 +4216,12 @@ def activate(rid):
         con.close()
 
 
-def lifecycle(apply=False):
+def lifecycle(apply=False, dup_scan=True):
+    """Report or apply working-record expiry; optionally flag durable near-duplicates.
+
+    The background exchange passes ``dup_scan=False``: it only has to make the
+    expiry the read side already hides real, not rescan the whole store.
+    """
     print(f"# lifecycle  ({'APPLY' if apply else 'report'})")
     con = get_con()
     try:
@@ -3797,7 +4231,7 @@ def lifecycle(apply=False):
         expired_rows = list(db_iter_records(
             con, "tier='working' AND expires IS NOT NULL AND expires < ?", (today(),)))
         # Flag durable near-duplicates.
-        dups = near_dup_groups(con, "delivery_state!='pending'")
+        dups = near_dup_groups(con, "delivery_state!='pending'") if dup_scan else []
 
         protected = []
         deleted = 0
@@ -4116,6 +4550,67 @@ def restore(rid):
         return True
     finally:
         con.close()
+
+
+def history_command(rid, show=None, restore_index=None):
+    """List, show, or bring back bodies a source-keyed overwrite replaced.
+
+    Entries are numbered newest first.  Bringing one back is itself a source
+    overwrite, so the body it displaces is kept too and the change can be
+    undone the same way.  Only global records and the current project's own
+    records are visible.
+    """
+    pkey = project_key(Path.cwd())
+    entries = [e for e in reversed(_source_history_entries(rid))
+               if e.get("scope") == "global" or e.get("cwd_origin") == pkey]
+    if show is None and restore_index is None:
+        if not entries:
+            print(f"[history] no previous body kept for {rid}")
+            return 0
+        head = entries[0]
+        print(f"[history] {rid} source={head.get('source')} — "
+              f"{len(entries)} previous bod{'y' if len(entries) == 1 else 'ies'}, newest first")
+        for n, entry in enumerate(entries, 1):
+            first = _first_line(entry.get("prev_body") or "")[:60]
+            print(f"  {n}. replaced {entry.get('replaced_at')} "
+                  f"(written {entry.get('prev_updated')}, by {entry.get('actor')}, "
+                  f"{len(entry.get('prev_body') or '')} chars): {first}")
+        print(f"show one: mem history {rid} --show N   bring one back: "
+              f"mem history {rid} --restore N")
+        return 0
+    index = show if show is not None else restore_index
+    if index < 1 or index > len(entries):
+        print(f"[history] no entry {index} for {rid}")
+        return 1
+    entry = entries[index - 1]
+    if show is not None:
+        print(f"[history] {rid} entry {index} replaced {entry.get('replaced_at')}")
+        print(entry.get("prev_body") or "")
+        return 0
+    con = get_con()
+    try:
+        live = find_by_source(entry["tier"], entry["scope"], entry["type"],
+                              entry["source"], entry["cwd_origin"], con)
+        pending = None
+        if live == rid:
+            pending = con.execute(
+                "SELECT delivery_state FROM records WHERE id=?", (rid,)).fetchone()
+    finally:
+        con.close()
+    if live != rid:
+        print(f"[history] {rid} is not the active record for source "
+              f"{entry.get('source')}; nothing restored")
+        return 1
+    done = write_record(
+        entry["tier"], entry["scope"], entry["type"], entry["prev_body"],
+        cwd_origin=entry["cwd_origin"], tags=entry.get("prev_tags"),
+        links=entry.get("prev_links"), source=entry["source"],
+        requires_consume=bool(pending and pending[0] == "pending"),
+        journal_action="update", headline=entry.get("prev_headline"))
+    if done is None:
+        return 1
+    print(f"[history] restored entry {index} of {rid}")
+    return 0
 
 
 def _in_current_project(con, rid, pkey=None):
@@ -5365,12 +5860,12 @@ def inject(max_working=None, max_durable=None, hook=False):
         # Exclude injection-flagged records; trusted profile reads remain separate.
         work = list(db_iter_records(
             con, "status='active' AND tier='working' AND cwd_origin=? "
-                 "AND (expires IS NULL OR expires >= ? OR delivery_state='pending')"
+                 f"AND {_unexpired_sql('')}"
                  " AND (injection_flag=0 OR injection_flag IS NULL)",
             (encc, today())))
         dur  = list(db_iter_records(
             con, "status='active' AND tier='durable' AND scope='project' AND cwd_origin=? "
-                 "AND (expires IS NULL OR expires >= ? OR delivery_state='pending')"
+                 f"AND {_unexpired_sql('')}"
                  " AND (injection_flag=0 OR injection_flag IS NULL)",
             (encc, today())))
         # Collect cleanup candidates while the connection remains open.
@@ -5852,7 +6347,12 @@ def _persistent_remote_guard(ref):
     return str(row[1])
 
 
+_LAST_SYNC_STATUS = None
+
+
 def _emit_sync(status, json_output):
+    global _LAST_SYNC_STATUS
+    _LAST_SYNC_STATUS = dict(status)
     if json_output:
         print(json.dumps(status, sort_keys=True, ensure_ascii=False))
     else:
@@ -5947,8 +6447,15 @@ def sync(json_output=False):
         }, json_output)
 
 
-def _sync_locked(json_output=False):
-    """Run local maintenance and an optional, safety-gated immutable exchange."""
+def _sync_locked(json_output=False, routine=False, apply_expiry=False):
+    """Run local maintenance and an optional, safety-gated immutable exchange.
+
+    ``routine`` is the background exchange: it takes the same safety path
+    (policy, fetch validation, fold, old-writer fence, render, publish,
+    confirm) but skips ``migrate``, the full ``index_build(rebuild=True)``, and
+    the duplicate scan. ``apply_expiry`` (write-triggered runs only) makes the
+    working-record expiry real; a read-triggered run only receives and exports.
+    """
     identity_con = get_con()
     try:
         identity_con.execute("BEGIN IMMEDIATE")
@@ -5976,24 +6483,32 @@ def _sync_locked(json_output=False):
         "remote-confirm": "pending",
     }
     with contextlib.redirect_stdout(sink):
-        try:
-            n = migrate(apply=True, absorb_auto_memory=False)
-            phases["migrate"] = "ok"
-        except Exception as e:
-            phases["migrate"] = "failed"
-            sys.stderr.write(f"[sync] migrate failed; continuing: {e}\n")
-        try:
-            lifecycle(apply=True)
-            phases["lifecycle"] = "ok"
-        except Exception as e:
-            phases["lifecycle"] = "failed"
-            sys.stderr.write(f"[sync] lifecycle failed; continuing: {e}\n")
-        try:
-            index_build(rebuild=True)
-            phases["index"] = "ok"
-        except Exception as e:
-            phases["index"] = "failed"
-            sys.stderr.write(f"[sync] index failed: {e}\n")
+        if routine:
+            phases["migrate"] = "skipped"
+            phases["index"] = "skipped"
+        else:
+            try:
+                n = migrate(apply=True, absorb_auto_memory=False)
+                phases["migrate"] = "ok"
+            except Exception as e:
+                phases["migrate"] = "failed"
+                sys.stderr.write(f"[sync] migrate failed; continuing: {e}\n")
+        if routine and not apply_expiry:
+            phases["lifecycle"] = "skipped"
+        else:
+            try:
+                lifecycle(apply=True, dup_scan=not routine)
+                phases["lifecycle"] = "ok"
+            except Exception as e:
+                phases["lifecycle"] = "failed"
+                sys.stderr.write(f"[sync] lifecycle failed; continuing: {e}\n")
+        if not routine:
+            try:
+                index_build(rebuild=True)
+                phases["index"] = "ok"
+            except Exception as e:
+                phases["index"] = "failed"
+                sys.stderr.write(f"[sync] index failed: {e}\n")
         try:
             export_dump()
             _commit_dump()
@@ -6080,6 +6595,7 @@ def _sync_locked(json_output=False):
         phases["remote-fetch-validate"] = "ok"
         result = _ingest_and_fold_snapshot(snapshot, ref)
         phases["remote-fold"] = "ok"
+        _exchange_note_receive()
         with contextlib.redirect_stdout(sink):
             export_dump()
             _commit_dump()
@@ -6224,6 +6740,441 @@ def _sync_locked(json_output=False):
             reason = "sync-invariant-failure"
         return _emit_sync({**common, "status": "hard-failure", "exit_code": 2,
                            "reason": reason}, json_output)
+
+
+# ---------- background exchange (D-83) ----------
+# One exchange, two triggers. A foreground command that committed a mutation
+# (W) and a main-session read whose last successful receive is stale (R) both
+# ask ``_schedule_exchange`` to start the same detached ``_exchange-worker``;
+# the worker runs the existing ``_sync_locked`` safety path in routine mode.
+# Nothing here waits for the exchange, and every failure here is swallowed: a
+# write or read never fails or slows down because the exchange could not start.
+EXCHANGE_STATE_FILE = ".exchange-state.json"
+EXCHANGE_RUN_LOCK = ".exchange-run.lock"
+EXCHANGE_SCHEDULE_LOCK = ".exchange-schedule.lock"
+EXCHANGE_WINDOW_SECONDS = 20.0        # writes that arrive inside it share one run
+EXCHANGE_READ_INTERVAL_SECONDS = 600.0
+EXCHANGE_RECEIVE_RETRY_SECONDS = 120.0  # a dead remote is not retried per prompt
+EXCHANGE_SPAWN_GRACE_SECONDS = 5.0    # a just-spawned worker has not taken its lock yet
+EXCHANGE_MAX_RUNS = 2                 # one run, plus at most one follow-up
+EXCHANGE_NOTICE_REPEAT_SECONDS = 6 * 60 * 60  # the same failure reason speaks once per this
+
+_EXCHANGE_DIRTY_OPS = []      # op ids captured by this process (last few)
+_EXCHANGE_FORCE_DIRTY = False  # a mutation that bypasses the operation funnel
+_EXCHANGE_SUPPRESS = False     # this command already ran the exchange itself
+_EXCHANGE_IN_WORKER = False
+
+
+def _exchange_mode():
+    """``on`` (default), ``off`` (MEM_EXCHANGE_AUTO=0), or ``inline`` (tests)."""
+    value = os.environ.get("MEM_EXCHANGE_AUTO", "").strip().lower()
+    if value in ("0", "off", "false", "no"):
+        return "off"
+    if value == "inline":
+        return "inline"
+    return "on"
+
+
+def _exchange_in_worker():
+    return _EXCHANGE_IN_WORKER or os.environ.get("MEM_EXCHANGE_WORKER") == "1"
+
+
+def _exchange_mark_dirty(op_id=None):
+    """Remember that this process changed the store (the funnel calls this)."""
+    global _EXCHANGE_FORCE_DIRTY
+    if op_id is None:
+        _EXCHANGE_FORCE_DIRTY = True
+        return
+    _EXCHANGE_DIRTY_OPS.append(op_id)
+    del _EXCHANGE_DIRTY_OPS[:-32]
+
+
+def _exchange_write_committed():
+    """True when a mutation of this process really reached the database."""
+    if _EXCHANGE_FORCE_DIRTY:
+        return True
+    if not _EXCHANGE_DIRTY_OPS:
+        return False
+    con = None
+    try:
+        con = sqlite3.connect(DB.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+        marks = ",".join("?" for _ in _EXCHANGE_DIRTY_OPS)
+        return con.execute(
+            f"SELECT 1 FROM sync_outbox WHERE op_id IN ({marks}) LIMIT 1",
+            _EXCHANGE_DIRTY_OPS,
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return True
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _exchange_open_lock(name):
+    STORE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(STORE / name, flags, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise OSError(f"unsafe exchange lock file: {name}")
+    return fd
+
+
+def _exchange_try_flock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+@contextlib.contextmanager
+def _exchange_schedule_lock(wait=0.3):
+    """Short non-blocking reservation lock; yields False instead of waiting long."""
+    fd = None
+    held = False
+    try:
+        fd = _exchange_open_lock(EXCHANGE_SCHEDULE_LOCK)
+        deadline = time.monotonic() + wait
+        while True:
+            if _exchange_try_flock(fd):
+                held = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+    except OSError:
+        pass
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            try:
+                if held:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _exchange_run_lock_busy():
+    """True while some worker holds this store's run lock."""
+    try:
+        fd = _exchange_open_lock(EXCHANGE_RUN_LOCK)
+    except OSError:
+        return False
+    try:
+        if _exchange_try_flock(fd):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def _exchange_state_load():
+    """Read the small state file; a missing or damaged file is an empty state."""
+    try:
+        data = json.loads((STORE / EXCHANGE_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _exchange_state_save(state):
+    """Atomically replace the state file (caller holds the schedule lock)."""
+    temp = None
+    try:
+        fd, raw = tempfile.mkstemp(prefix=".exchange-state.", dir=STORE)
+        temp = Path(raw)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, sort_keys=True))
+        os.replace(temp, STORE / EXCHANGE_STATE_FILE)
+        temp = None
+    except OSError:
+        pass
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+
+
+def _exchange_num(state, key):
+    value = state.get(key)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _exchange_note_receive():
+    """Record that a remote fetch+fold just succeeded (R's staleness clock)."""
+    try:
+        with _exchange_schedule_lock(wait=2.0) as held:
+            if held:
+                state = _exchange_state_load()
+                state["last_success_receive"] = time.time()
+                _exchange_state_save(state)
+    except Exception:
+        pass
+
+
+def _exchange_main_session():
+    """False inside any worker/dispatch child: only a main session triggers R."""
+    env = os.environ
+    if env.get("AGENT_SESSION_ROLE") == "worker":
+        return False
+    if env.get("AGENT_DISPATCH_CHILD") == "1":
+        return False
+    depth = env.get("AGENT_DISPATCH_DEPTH", "").strip()
+    if depth:
+        try:
+            if int(depth) > 0:
+                return False
+        except ValueError:
+            return False
+    if env.get("OPENCODE_DISPATCH_SLUG", "").strip():
+        return False
+    if env.get("FLEET_TITLE_REFRESH") == "1":
+        return False
+    return True
+
+
+def _exchange_read_interval():
+    try:
+        value = float(os.environ.get("MEM_SYNC_READ_INTERVAL_SECONDS", ""))
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    return EXCHANGE_READ_INTERVAL_SECONDS
+
+
+def _exchange_window():
+    try:
+        value = float(os.environ.get("MEM_EXCHANGE_WINDOW_SECONDS", ""))
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    return EXCHANGE_WINDOW_SECONDS
+
+
+def _exchange_read_due(state, now):
+    return (now - _exchange_num(state, "last_success_receive") > _exchange_read_interval()
+            and now - _exchange_num(state, "last_receive_attempt")
+            > EXCHANGE_RECEIVE_RETRY_SECONDS)
+
+
+def _exchange_spawn(window):
+    """Start the detached worker; never wait for it, never raise."""
+    if _exchange_mode() == "inline":
+        _exchange_worker_run(0.0)
+        return
+    try:
+        env = dict(os.environ)
+        env["MEM_EXCHANGE_WORKER"] = "1"
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()),
+             "_exchange-worker", "--window", repr(float(window))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+            start_new_session=True, cwd=str(STORE), env=env,
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def _schedule_exchange(kind):
+    """Ask for one background exchange: ``write`` (W) or ``read`` (R)."""
+    if _exchange_mode() == "off" or _exchange_in_worker():
+        return
+    now = time.time()
+    if kind == "read":
+        # Cheap, lock-free pre-checks first: most reads stop here.
+        if not (_exchange_main_session() and DB.exists()):
+            return
+        if not _exchange_read_due(_exchange_state_load(), now):
+            return
+        try:
+            if not sync_v2.remote_policy(_sync_environment()).get("enabled"):
+                return
+        except Exception:
+            return
+    spawn = False
+    with _exchange_schedule_lock() as held:
+        if not held:
+            return
+        state = _exchange_state_load()
+        starting = now - _exchange_num(state, "worker_spawned_at") < EXCHANGE_SPAWN_GRACE_SECONDS
+        busy = _exchange_run_lock_busy()
+        if kind == "write":
+            state["dirty_gen"] = int(_exchange_num(state, "dirty_gen")) + 1
+            if busy:
+                state["rerun_requested"] = True
+        elif busy or starting or not _exchange_read_due(state, now):
+            return
+        else:
+            state["last_receive_attempt"] = now
+        if not busy and not starting:
+            spawn = True
+            state["worker_spawned_at"] = now
+        _exchange_state_save(state)
+    if spawn:
+        _exchange_spawn(_exchange_window() if kind == "write" else 0.0)
+
+
+def _exchange_after_command():
+    """Run once when a foreground command ends: W trigger for committed writes."""
+    if _EXCHANGE_SUPPRESS or _exchange_in_worker() or _exchange_mode() == "off":
+        return
+    if _exchange_write_committed():
+        _schedule_exchange("write")
+
+
+def _exchange_read_trigger():
+    """R trigger at the start of inject/candidates/recall; never raises."""
+    try:
+        _schedule_exchange("read")
+    except Exception:
+        pass
+
+
+def _exchange_clean_reason(value):
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "unknown")).strip()
+    return text[:120] or "unknown"
+
+
+def _exchange_consume_notice():
+    """Print the last background failure once, then clear it (foreground only)."""
+    try:
+        if not _exchange_state_load().get("failure_notice"):
+            return
+        notice = None
+        with _exchange_schedule_lock() as held:
+            if not held:
+                return
+            state = _exchange_state_load()
+            notice = state.pop("failure_notice", None)
+            if notice:
+                reason = _exchange_clean_reason(
+                    notice.get("reason") if isinstance(notice, dict) else notice)
+                state["last_notified"] = {"reason": reason, "at": time.time()}
+                _exchange_state_save(state)
+        if not notice:
+            return
+        reason = _exchange_clean_reason(
+            notice.get("reason") if isinstance(notice, dict) else notice)
+        if reason == "remote-unavailable":
+            sys.stderr.write(
+                "[sync] remote unreachable in the last background exchange; "
+                "local changes are kept and will be sent on a later write or read\n")
+        else:
+            sys.stderr.write(
+                f"[sync] last background exchange failed: {reason} "
+                "— will retry on the next write or read\n")
+    except Exception:
+        pass
+
+
+def _exchange_run_once(apply_expiry):
+    """One routine pass. Returns ``(ok, reason)``; ok is None when merely busy."""
+    global _LAST_SYNC_STATUS
+    _LAST_SYNC_STATUS = None
+    try:
+        with _sync_process_lock():
+            _sync_locked(json_output=True, routine=True, apply_expiry=apply_expiry)
+    except _SyncLockBusy:
+        return None, "local sync busy"
+    except (OSError, sync_v2.SyncError) as exc:
+        return False, ("local-io-failure" if isinstance(exc, OSError)
+                       else "local-sync-invariant-failed")
+    except Exception as exc:
+        return False, type(exc).__name__
+    status = _LAST_SYNC_STATUS or {}
+    if int(status.get("exit_code", 2)) == 0:
+        return True, None
+    return False, status.get("reason") or status.get("status")
+
+
+def _exchange_worker_run(window):
+    """The worker body: one run lock, a batching window, then at most two passes."""
+    global _EXCHANGE_IN_WORKER
+    _EXCHANGE_IN_WORKER = True
+    try:
+        run_fd = _exchange_open_lock(EXCHANGE_RUN_LOCK)
+    except OSError:
+        return 0
+    try:
+        if not _exchange_try_flock(run_fd):
+            with _exchange_schedule_lock(wait=2.0) as held:
+                if held:
+                    state = _exchange_state_load()
+                    state["rerun_requested"] = True
+                    _exchange_state_save(state)
+            return 0
+        if window > 0:
+            time.sleep(window)
+        runs = 0
+        while True:
+            runs += 1
+            with _exchange_schedule_lock(wait=5.0) as held:
+                state = _exchange_state_load()
+                started_gen = int(_exchange_num(state, "dirty_gen"))
+                write_triggered = started_gen > int(_exchange_num(state, "done_gen"))
+                if held:
+                    state["last_receive_attempt"] = time.time()
+                    state["rerun_requested"] = False
+                    state["worker_spawned_at"] = 0
+                    state["run_count"] = int(_exchange_num(state, "run_count")) + 1
+                    _exchange_state_save(state)
+            ok, reason = _exchange_run_once(write_triggered)
+            again = False
+            with _exchange_schedule_lock(wait=5.0) as held:
+                if held:
+                    state = _exchange_state_load()
+                    if ok:
+                        state["done_gen"] = max(int(_exchange_num(state, "done_gen")),
+                                                started_gen)
+                        state["last_success_exchange"] = time.time()
+                        state.pop("failure_notice", None)
+                        state.pop("last_notified", None)
+                    elif ok is False:
+                        clean = _exchange_clean_reason(reason)
+                        told = state.get("last_notified")
+                        repeat = (isinstance(told, dict) and told.get("reason") == clean
+                                  and time.time() - _exchange_num(told, "at")
+                                  < EXCHANGE_NOTICE_REPEAT_SECONDS)
+                        if not repeat:
+                            state["failure_notice"] = {"reason": clean, "at": time.time()}
+                    again = bool(ok and runs < EXCHANGE_MAX_RUNS
+                                 and int(_exchange_num(state, "dirty_gen")) > started_gen)
+                    _exchange_state_save(state)
+                    if not again:
+                        # Free the run lock while still holding the reservation
+                        # lock, so a request landing now sees either a live worker
+                        # that will notice it or a free lock that spawns a new one.
+                        fcntl.flock(run_fd, fcntl.LOCK_UN)
+            if not again:
+                return 0
+    finally:
+        os.close(run_fd)
+        _EXCHANGE_IN_WORKER = False
+
+
+def _exchange_worker_main(argv):
+    """Entry point of the hidden ``_exchange-worker`` subcommand."""
+    os.environ["MEM_EXCHANGE_WORKER"] = "1"
+    window = 0.0
+    if "--window" in argv:
+        try:
+            window = max(0.0, float(argv[argv.index("--window") + 1]))
+        except (ValueError, IndexError):
+            window = 0.0
+    try:
+        return _exchange_worker_run(window)
+    except Exception:
+        return 0
 
 
 # ---------- CLI ----------
@@ -8723,6 +9674,22 @@ def _migration_command_locked(args):
 
 
 def main():
+    """Run one foreground command, then ask for the background exchange it owes."""
+    if len(sys.argv) > 1 and sys.argv[1] == "_exchange-worker":
+        sys.exit(_exchange_worker_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "_seen-reset":
+        sys.exit(_seen_reset_main(sys.argv[2:]))
+    try:
+        _cli_main()
+    finally:
+        try:
+            _exchange_after_command()
+        except Exception:
+            pass
+
+
+def _cli_main():
+    global _EXCHANGE_SUPPRESS
     ap = argparse.ArgumentParser(prog="mem", description="Unified Memory System", allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True,
                             parser_class=functools.partial(argparse.ArgumentParser, allow_abbrev=False))
@@ -8838,6 +9805,15 @@ def main():
     rs = sub.add_parser("restore", help="Restore the latest graveyard entry for one record")
     rs.add_argument("id")
 
+    hy = sub.add_parser(
+        "history",
+        help="List, show, or bring back bodies a source-keyed overwrite replaced")
+    hy.add_argument("id")
+    hy_act = hy.add_mutually_exclusive_group()
+    hy_act.add_argument("--show", type=int, metavar="N", help="Print entry N (newest first)")
+    hy_act.add_argument("--restore", type=int, metavar="N", dest="restore_index",
+                        help="Bring entry N back; the body it displaces is kept too")
+
     ix = sub.add_parser("index", help="Build the FTS5 index")
     ix.add_argument("--rebuild", action="store_true")
 
@@ -8943,6 +9919,14 @@ def main():
 
     args = ap.parse_args()
 
+    # A failed background exchange is reported once, by the next command a
+    # person or agent runs. Hook-driven reads (candidates, inject) stay silent:
+    # nobody sees their stderr, so they must not use the notice up.
+    if args.cmd not in ("candidates", "inject", "recall-gate"):
+        _exchange_consume_notice()
+    if args.cmd in ("recall", "candidates", "inject"):
+        _exchange_read_trigger()
+
     if args.cmd == "add":
         write_record(
             args.tier, args.scope, args.type, args.body,
@@ -9007,6 +9991,8 @@ def main():
         sys.exit(migration_command(args))
     elif args.cmd == "restore":
         sys.exit(0 if restore(args.id) else 1)
+    elif args.cmd == "history":
+        sys.exit(history_command(args.id, show=args.show, restore_index=args.restore_index))
     elif args.cmd == "index":
         index_build(rebuild=args.rebuild)
     elif args.cmd == "project":
@@ -9044,8 +10030,13 @@ def main():
     elif args.cmd == "stats":
         stats()
     elif args.cmd == "sync":
+        _EXCHANGE_SUPPRESS = True  # the explicit sync is the exchange
         sys.exit(sync(json_output=args.json_output))
     elif args.cmd == "inject":
+        if args.hook:
+            # SessionStart hands its JSON to stdin; compact/clear mean the
+            # model's context lost what the display history says it saw.
+            _seen_reset_from_hook_payload(_hook_stdin_payload())
         inject(hook=args.hook)
     elif args.cmd == "register-postit":
         register_postit(args.path)

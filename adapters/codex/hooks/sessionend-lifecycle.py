@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Codex SessionEnd bridge for synchronous lifecycle cleanup."""
+"""Codex SessionEnd bridge: Fleet wait cleanup and the final session summary.
+
+Memory does nothing when a session ends; it exchanges after writes and reads (D-82/D-83).
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PREFLIGHT = ROOT / "adapters" / "codex" / "bin" / "preflight.sh"
 UTILITIES = ROOT / "utilities"
 if str(UTILITIES) not in sys.path:
     sys.path.insert(0, str(UTILITIES))
@@ -54,35 +55,15 @@ def is_worker_session() -> bool:
         or bool(os.environ.get("AGENT_DISPATCH_DEPTH"))
         or bool(os.environ.get("OPENCODE_DISPATCH_SLUG"))
         or os.environ.get("FLEET_TITLE_REFRESH") == "1"
-        or os.environ.get("MEM_DISTILL") == "1"
     )
-
-
-def run_preflight(*args: str, quiet: bool = False) -> None:
-    env = os.environ.copy()
-    env.setdefault("AGENT_HOME", str(ROOT))
-    result = subprocess.run(
-        [str(PREFLIGHT), *args],
-        cwd=str(ROOT),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.stderr and not quiet:
-        sys.stderr.write(result.stderr)
 
 
 def main() -> int:
-    # SessionEnd owns final synchronous route/memory cleanup. Stop is a
+    # SessionEnd owns the Fleet cleanup and the final summary. Stop is a
     # separate short bridge and never enters this code path.
     if is_worker_session():
         return 0
     payload = load_payload()
-    event_cwd = nested_string(
-        payload, "cwd", "working_directory", "workingDirectory"
-    ) or os.getcwd()
     event_session_id = nested_string(
         payload, "session_id", "sessionID", "thread_id", "threadID"
     )
@@ -101,8 +82,6 @@ def main() -> int:
             launch_trigger("codex", event_session_id, "final")
         except Exception:
             pass
-    event_session_id = event_session_id or "codex-hook"
-    run_preflight("session-end", event_cwd, event_session_id)
     return 0
 
 
