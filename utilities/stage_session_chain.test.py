@@ -316,6 +316,28 @@ class PlanSlicesTest(unittest.TestCase):
                                          node=json.loads(route_path.read_text())["nodes"][0])
             self.assertEqual(len(proven["sessions"]), 2)
 
+    def test_plan_slices_seals_the_routes_worker_pin_over_the_requested_adapter(self):
+        """`--pin worker=<h>` is the route's statement about every worker, so the manifest that
+        `dispatch-node` later takes as the authority is written with the pinned adapter, whatever
+        `--adapter` or a slice's own `adapter` asked for. Owner/frame pins and no pin are untouched."""
+        def planned(pins):
+            with tempfile.TemporaryDirectory() as td:
+                route_path, worktree, slices_path, output = self._fixture(td)
+                if pins is not None:
+                    route = json.loads(route_path.read_text())
+                    route["selection_pins"] = pins
+                    route_path.write_text(json.dumps(route), encoding="utf-8")
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                  slices_path=slices_path, output_path=output, default_adapter="codex")
+                return [s["adapter"] for s in json.loads(output.read_text())["sessions"]]
+        pin = lambda target, harness: {"contract_version": 1, target: {"harness": harness, "model": None, "effort": None}}
+        self.assertEqual(planned(pin("worker", "claude")), ["claude", "claude"])
+        self.assertEqual(planned(pin("worker", "opencode")), ["opencode", "opencode"])
+        # contrast: no pin / a pin for another target keeps the slice's own adapter or the default
+        self.assertEqual(planned(None), ["codex", "codex"])
+        self.assertEqual(planned(pin("owner", "claude")), ["codex", "codex"])
+        self.assertEqual(planned(pin("frame", "claude")), ["codex", "codex"])
+
     def test_plan_slices_worktree_must_be_the_sealed_cwd(self):
         """Round-1 B2: a foreign worktree is refused; omitting it uses the route's cwd."""
         with tempfile.TemporaryDirectory() as td:

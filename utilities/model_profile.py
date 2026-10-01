@@ -423,6 +423,28 @@ def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) ->
     return {"status": "applied", "model": model, "effort": pin.get("effort") or None}
 
 
+def sealed_pin_harness(route, *, worker_type: str | None) -> str | None:
+    """The harness this route sealed for the launch's pin target, or None."""
+
+    pins = route.get("selection_pins") if isinstance(route, dict) else None
+    pin = pins.get(pin_target(worker_type)) if isinstance(pins, dict) else None
+    return (pin.get("harness") or None) if isinstance(pin, dict) else None
+
+
+def pinned_launch_harness(route, *, worker_type: str | None, requested: str | None, available) -> tuple[str | None, str | None]:
+    """A sealed pin beats the requested harness while the pinned one is available.
+
+    Returns `(harness, overridden_request)`; the second item is the request the pin replaced
+    (None when nothing was replaced), so the caller can record it.  An unavailable pin, or no
+    pin, leaves the request alone.  `available` is the caller's own hard-eligibility test.
+    """
+
+    pinned = sealed_pin_harness(route, worker_type=worker_type)
+    if not pinned or (pinned != requested and not available(pinned)):
+        return requested, None
+    return pinned, (requested if requested not in (None, pinned) else None)
+
+
 # The frame bootstrap tier ladder -- ONE function, ONE home.
 # Both legs make the route's irreversible framing judgment and use `top`.
 #

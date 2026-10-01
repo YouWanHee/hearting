@@ -605,5 +605,104 @@ class CliComposeTest(IsolatedCase):
         self.assertIn("warning=pin-dropped:owner:", result.stderr)
 
 
+class DispatchNodePinRowTest(unittest.TestCase):
+    """The real `compose --pin worker=claude` then the real `dispatch-node --action register`.
+
+    register spawns nothing, so no runtime projection is needed. The row the registry ends up with
+    is what the e2e Claude run showed: a pinned route whose worker row says `harness=codex`."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.repo = base / "repo"
+        self.repo.mkdir()
+        for command in (["init", "-q", str(self.repo)], ["-C", str(self.repo), "config", "user.email", "f@example.com"],
+                        ["-C", str(self.repo), "config", "user.name", "Fixture"]):
+            subprocess.run(["git", *command], check=True)
+        (self.repo / "x").write_text("x", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "x"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "init"], check=True)
+        self.artifacts = self.repo / ".agent_reports"  # the canonical root a wrapper resolves for this repo
+        self.artifacts.mkdir()
+        self.state = base / "state"
+        self.state.mkdir()
+        self.jobs = self.state / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
+        self.home = base / "home"
+        self.home.mkdir()
+        # A runtime wrapper may create these empty ignored folders under the source tree it runs from.
+        for name in (".core-grounding", ".spec-grounding"):
+            if not (ROOT / name).exists():
+                self.addCleanup(lambda path=ROOT / name: path.is_dir() and not any(path.iterdir()) and path.rmdir())
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("AGENT_", "CODEX_", "CLAUDE_"))}
+        self.env.update(AGENT_HOME=str(ROOT), HOME=str(self.home), XDG_STATE_HOME=str(self.state),
+                        XDG_CONFIG_HOME=str(self.home / "config"), XDG_DATA_HOME=str(self.home / "data"),
+                        CLAUDE_CONFIG_DIR=str(self.home / "claude"), CODEX_HOME=str(self.home / "codex"),
+                        AGENT_DISPATCH_JOBS=str(self.jobs), DISPATCH_DEFAULTS_CONFIG=str(self.home / "defaults.yaml"))
+        (self.home / "defaults.yaml").write_text(ALL_ENABLED, encoding="utf-8")
+
+    def compose(self, *pins):
+        import subprocess
+        import sys
+        tuples = evidence("claude")
+        for row in tuples["tuples"]:
+            row["checked_worktree"] = str(self.repo.resolve())
+        (self.home / "evidence.json").write_text(json.dumps(tuples), encoding="utf-8")
+        (self.home / "task.md").write_text("do the small thing\n", encoding="utf-8")
+        command = [sys.executable, str(ROOT / "utilities" / "capability-route.py"), "compose",
+                   "--slug", "pin-row", "--unassigned", "--shape", "staged", "--graph", "execute,test,report",
+                   "--cwd", str(self.repo), "--artifact-root", str(self.artifacts), "--spec-read", "fixture",
+                   "--drift-verdict", "fixture", "--dispatch-evidence", str(self.home / "evidence.json"),
+                   "--prompt-file", str(self.home / "task.md"), "--jobs", str(self.jobs)]
+        for pin in pins:
+            command += ["--pin", pin]
+        result = subprocess.run(command, text=True, capture_output=True, env=self.env, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return max(self.artifacts.glob(".runtime/routes/rt-*.json"), key=lambda path: path.stat().st_mtime_ns)
+
+    def register(self, route_file, adapter, node="execute"):
+        import subprocess
+        import sys
+        owner = subprocess.Popen(["sleep", "120"])
+        self.addCleanup(lambda: (owner.kill(), owner.wait()))
+        started = (Path("/proc") / str(owner.pid) / "stat").read_text().split()[21]
+        self.jobs.write_text(
+            f"2026-07-23T00:00:00Z\topen\t{self.repo}\t{self.repo}\towner\t"
+            "attempt_schema_version=2,dispatch_depth=1,transport=headless,harness=claude,"
+            "runtime_sandbox=adapter-default,execution_surface=registered-headless,registered_worker=1,"
+            "fallback_hop=same-harness-headless,worker_type=owner,attempt_id=att-pin-owner,"
+            f"pid={owner.pid},pid_start={started}\n", encoding="utf-8")
+        env = dict(self.env, AGENT_DISPATCH_SELF_SLUG="owner", AGENT_DISPATCH_ATTEMPT_ID="att-pin-owner",
+                   AGENT_DISPATCH_CURRENT_HARNESS="claude", AGENT_DISPATCH_CURRENT_TRANSPORT="headless",
+                   AGENT_DISPATCH_CURRENT_SANDBOX="adapter-default")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "utilities" / "dispatch-node.py"), "--route", str(route_file), "--node", node,
+             "--adapter", adapter, "--action", "register", "--slug", "pin-exec", "--parent", "owner",
+             "--jobs", str(self.jobs)], text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = next(line for line in self.jobs.read_text().splitlines() if "\tpin-exec\t" in line)
+        return dict(item.split("=", 1) for item in row.split("\t")[5].split(",") if "=" in item)
+
+    def test_a_pinned_worker_row_is_the_pinned_harness_and_records_the_request(self):
+        row = self.register(self.compose("worker=claude"), "codex")
+        self.assertEqual(row["harness"], "claude")
+        self.assertEqual(row["explicit_adapter"], "codex")
+        self.assertEqual(row["model_pin_status"], "harness-only")
+        self.assertEqual(row["fallback_hop"], "same-harness-headless")
+        self.assertEqual(row["harness_affinity"], "claude")
+
+    def test_requesting_the_pinned_harness_or_having_no_worker_pin_adds_no_override_field(self):
+        pinned = self.register(self.compose("worker=claude"), "claude")
+        self.assertEqual((pinned["harness"], pinned["model_pin_status"]), ("claude", "harness-only"))
+        self.assertNotIn("explicit_adapter", pinned)
+        # an owner-only pin does not steer a worker
+        other = self.register(self.compose("owner=claude"), "codex")
+        self.assertEqual(other["harness"], "codex")
+        self.assertNotIn("explicit_adapter", other)
+
+
 if __name__ == "__main__":
     unittest.main()

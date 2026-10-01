@@ -13,6 +13,7 @@ from dispatch_contract import (
     resolve_global_registry,
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind
+import model_profile as MODEL_PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 import dispatch_subsession_advance as SUBSESSION
 
@@ -51,7 +52,7 @@ PROTECTED_ADAPTER_FLAGS = frozenset({
     "--dispatch-depth", "--worker-type", "--unit", "--assigned-contract",
     "--owner", "--route-file", "--route-id", "--route-hash", "--route-node",
     "--registry-digest", "--write-scope", "--completion-gate", "--prompt-text",
-    "--harness-affinity", "--parent", "--start", "--register", "--dry-run",
+    "--harness-affinity", "--explicit-adapter", "--parent", "--start", "--register", "--dry-run",
     "--model-role", "--model-profile", "--model", "--reasoning", "--effort",
     "--variant", "--inherit-model-settings",
     "--subsession-id", "--subsession-index", "--subsession-count",
@@ -572,6 +573,29 @@ def bind_dispatch_evidence(route, node, adapter, adapter_args, parent_identity=N
     return extra
 
 
+def pin_harness_available(route, node, harness, jobs):
+    """Whether the route's sealed worker pin can run this node now.
+
+    The same hard checks `dispatch-batch` applies before it places a leg: the node's own harness
+    policy names the harness, no active usage limit holds it, and (for a dispatch-depth-2 node)
+    the checked tuple for this parent supports it. The soft usage gate is not one of them.
+    """
+    policy = node.get("harness_policy")
+    if isinstance(policy, dict):
+        members = {name for band in ("primary", "relief", "last_resort") for name in (policy.get(band) or [])}
+        if harness not in members:
+            return False
+    from dispatch_capacity_evidence import active_limits
+    if harness in active_limits(jobs, profile=node.get("model_profile")):
+        return False
+    if node.get("dispatch_depth") == 2:
+        try:
+            resolve_checked_tuple(route, node, harness, current_parent_identity())
+        except DispatchNodeError:
+            return False
+    return True
+
+
 def replacement_task(args, route, node, jobs):
  """A verified death replacement replays its original semantic round verbatim."""
  import dispatch_replacement as replacement
@@ -716,11 +740,20 @@ def main():
    print("child_spawned=0")
    raise SystemExit(64)
  print("completion_marker="+str(ROUTE.completion_dir(route["route_id"],jobs=registry.path)/(node["id"]+".json")))
- wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"
  try:
   worker_type=worker_type_for_kind(node["kind"])
  except ValueError as e:
   raise SystemExit(str(e))
+ # A sealed `--pin worker=<harness>` beats the requested adapter while that harness can run this node
+ # (CONVENTIONS §2.1: an explicit route pin leads the selection order). The request is kept as `explicit_adapter`.
+ # A replay keeps its predecessor's harness and a subsession keeps the one its sealed manifest names.
+ overridden_adapter=None
+ replaying=any(t=="--automatic-retry-of" or t.startswith("--automatic-retry-of=") for t in strip_leading_separator(a.adapter_args))
+ if worker_type not in {"owner","frame"} and not a.subsession_id and not replaying:
+  a.adapter,overridden_adapter=MODEL_PROFILE.pinned_launch_harness(
+   route,worker_type=worker_type,requested=a.adapter,
+   available=lambda harness:pin_harness_available(route,node,harness,registry.path))
+ wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"
  # SD-165: a borrowed part reads its origin capability's contract; the route binding stays the host's.
  contract=assigned_contract(capability=(node.get("part") or "").partition(":")[0] or route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)
  try:
@@ -813,6 +846,7 @@ def main():
  if a.qa: argv += ["--qa",a.qa]
  affinity=node.get("harness_affinity")
  if affinity: argv += ["--harness-affinity",affinity]
+ if overridden_adapter: argv += ["--explicit-adapter",overridden_adapter]
  if node.get("dispatch_depth")==2:
   if not a.parent: raise SystemExit("dispatch-depth-2 route node requires --parent")
   argv += ["--parent",a.parent]

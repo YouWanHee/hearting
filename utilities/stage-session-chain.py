@@ -27,6 +27,7 @@ from dispatch_contract import (  # noqa: E402
     resolve_model_governor_root,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
+from model_profile import pinned_launch_harness  # noqa: E402
 import dispatch_subsession_resume_record as RESUME_RECORD  # noqa: E402
 import parent_next_directive  # noqa: E402
 
@@ -369,7 +370,11 @@ def plan_slices(
         if not isinstance(narrow_verify, str) or not narrow_verify.strip() or "\n" in narrow_verify:
             raise StageSessionError(f"narrow-verify-invalid:{slice_id}")
         rounds = item.get("expected_round_trips", 2)
-        adapter = item.get("adapter") or default_adapter
+        # The manifest is the authority `dispatch-node` follows for a slice, so the route's sealed
+        # worker pin (CONVENTIONS §2.1) is applied here, once, when the manifest is written.
+        adapter, _requested = pinned_launch_harness(
+            route, worker_type="stage", requested=item.get("adapter") or default_adapter,
+            available=lambda _harness: True)
         fixed = item.get("fixed_files")
         if not isinstance(fixed, list) or not fixed:
             raise StageSessionError(f"fixed-files-missing:{slice_id}")
