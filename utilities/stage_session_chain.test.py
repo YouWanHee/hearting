@@ -289,6 +289,22 @@ class PlanSlicesTest(unittest.TestCase):
         slices_path.write_text(json.dumps(slices), encoding="utf-8")
         return route_path, worktree, slices_path, root / "out" / "chain.json"
 
+    @staticmethod
+    def _seal_checked_tuples(route_path, harnesses=("claude", "codex")):
+        """Seal checked evidence for `harnesses` into the route, as a depth-2 node needs to launch one."""
+        row = lambda harness: {
+            "child_harness": harness, "checked_worktree": "/tmp/x", "codex_command": "ok" if harness == "codex" else "not-applicable",
+            "failure_class": "", "failure_scope": "none", "launch_authority": "conductor", "parent_harness": "claude",
+            "parent_sandbox": "default", "parent_transport": "headless", "probe_source": "fixture-check",
+            "probe_time": "2026-07-17T00:00:00Z", "status": "supported", "retry_on_isolated_worktree": 0}
+        route = json.loads(route_path.read_text())
+        route["dispatch_evidence"] = {"tuples": [row(h) for h in harnesses]}
+        route["nodes"][0]["fallback_hops"] = [
+            {"ordinal": 1, "fallback_hop": "same-harness-headless", "candidates": [row("claude")]},
+            {"ordinal": 2, "fallback_hop": "cross-harness-headless",
+             "candidates": [row(h) for h in harnesses if h != "claude"]}]
+        route_path.write_text(json.dumps(route), encoding="utf-8")
+
     def test_plan_slices_writes_a_proven_manifest_and_briefs(self):
         with tempfile.TemporaryDirectory() as td:
             route_path, worktree, slices_path, output = self._fixture(td)
@@ -323,12 +339,16 @@ class PlanSlicesTest(unittest.TestCase):
         def planned(pins):
             with tempfile.TemporaryDirectory() as td:
                 route_path, worktree, slices_path, output = self._fixture(td)
+                self._seal_checked_tuples(route_path, ("claude", "codex", "opencode"))
                 if pins is not None:
                     route = json.loads(route_path.read_text())
                     route["selection_pins"] = pins
                     route_path.write_text(json.dumps(route), encoding="utf-8")
-                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
-                                  slices_path=slices_path, output_path=output, default_adapter="codex")
+                with mock.patch.dict(os.environ):
+                    for name in ("AGENT_DISPATCH_CURRENT_HARNESS", "AGENT_DISPATCH_CURRENT_TRANSPORT", "AGENT_DISPATCH_CURRENT_SANDBOX"):
+                        os.environ.pop(name, None)
+                    CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree, slices_path=slices_path,
+                                      output_path=output, default_adapter="codex", jobs=Path(td) / "jobs.log")
                 return [s["adapter"] for s in json.loads(output.read_text())["sessions"]]
         pin = lambda target, harness: {"contract_version": 1, target: {"harness": harness, "model": None, "effort": None}}
         self.assertEqual(planned(pin("worker", "claude")), ["claude", "claude"])
@@ -337,6 +357,34 @@ class PlanSlicesTest(unittest.TestCase):
         self.assertEqual(planned(None), ["codex", "codex"])
         self.assertEqual(planned(pin("owner", "claude")), ["codex", "codex"])
         self.assertEqual(planned(pin("frame", "claude")), ["codex", "codex"])
+
+    def test_plan_slices_applies_the_pin_only_while_the_pinned_harness_can_run_the_node(self):
+        """The manifest is the authority a slice launch follows, so a pin that `dispatch-node` would not
+        launch (outside the node's harness policy, under an active usage limit, or with no checked
+        tuple for this parent) must not be written over the requested adapter."""
+        import dispatch_capacity_evidence as CAPACITY
+        def planned(*, policy=None, limits=None, tuples=("claude", "codex")):
+            with tempfile.TemporaryDirectory() as td:
+                route_path, worktree, slices_path, output = self._fixture(td)
+                self._seal_checked_tuples(route_path, tuples)
+                route = json.loads(route_path.read_text())
+                route["selection_pins"] = {"contract_version": 1, "worker": {"harness": "claude", "model": None, "effort": None}}
+                if policy is not None:
+                    route["nodes"][0]["harness_policy"] = policy
+                route_path.write_text(json.dumps(route), encoding="utf-8")
+                with mock.patch.object(CAPACITY, "active_limits", return_value=limits or {}), \
+                     mock.patch.dict(os.environ, {}):
+                    for name in ("AGENT_DISPATCH_CURRENT_HARNESS", "AGENT_DISPATCH_CURRENT_TRANSPORT",
+                                 "AGENT_DISPATCH_CURRENT_SANDBOX"):
+                        os.environ.pop(name, None)  # a manual caller: no runtime parent to filter by
+                    CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree, slices_path=slices_path,
+                                      output_path=output, default_adapter="codex", jobs=Path(td) / "jobs.log")
+                return [s["adapter"] for s in json.loads(output.read_text())["sessions"]]
+        self.assertEqual(planned(), ["claude", "claude"])                                          # usable pin still wins
+        self.assertEqual(planned(policy={"primary": ["claude", "codex"]}), ["claude", "claude"])
+        self.assertEqual(planned(limits={"claude": {"reset_epoch": 4102444800}}), ["codex", "codex"])   # under a usage limit
+        self.assertEqual(planned(policy={"primary": ["codex"], "relief": ["opencode"]}), ["codex", "codex"])  # outside the node's policy
+        self.assertEqual(planned(tuples=("codex",)), ["codex", "codex"])                           # no checked tuple for the pin
 
     def test_plan_slices_worktree_must_be_the_sealed_cwd(self):
         """Round-1 B2: a foreign worktree is refused; omitting it uses the route's cwd."""

@@ -281,6 +281,20 @@ class ProposalValidationTest(ValidationBase):
                 legs = [dict(leg) for leg in shown]
                 legs[index].update(change)
                 self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": legs}, resolved=shown))
+        # a copy is one of the two complete legs, never a per-key blend of them
+        for index in (0, 1):
+            with self.subTest(index=index, blend="own+resolved"):
+                own = refine["proposal"]["legs"][index]
+                differing = [key for key in RP._LEG_KEYS if own.get(key) != shown[index].get(key)]
+                self.assertGreaterEqual(len(differing), 2, differing)
+                for key in differing:
+                    blend = [dict(leg) for leg in shown]
+                    blend[index][key] = own.get(key)
+                    self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": blend}, resolved=shown), key)
+        pure = [dict(own) for own in refine["proposal"]["legs"]]
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": pure}, resolved=shown))   # all own: still matches
+        pure[1] = dict(shown[1])
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": pure}, resolved=shown))   # one leg each: still matches
         self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown[:1]}, resolved=shown))   # leg count
         self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown + shown[:1]}, resolved=shown))
         # an omitted mode/intensity equals its explicit default once compiled

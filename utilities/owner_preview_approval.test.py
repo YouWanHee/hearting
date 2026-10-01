@@ -74,7 +74,11 @@ class OwnerRefineBase(PF.ProducerTestBase):
             dispatch_evidence={"tuples": [nested(harness, "codex")]}, unassigned=True,
             work_request={"text": "Refine the README", "owner_harness": harness})
         self.path = Path(L.admit_runtime_route(self.root, self.route).route_file)
-        self.owner, self.child, self.log = "att-preview-owner", "att-preview-review", self.jobs.parent / "owner.jsonl"
+        # Per-process ids: `worker_bootstrap.test.py` and `artifact_snapshot.test.py` load this fixture and may run in
+        # a sibling process at the same time; the process-wide tagged-descendant scan keys on the attempt id, so a
+        # shared literal made a sibling's live `capability-route.py complete` read as this owner's live descendant.
+        self.owner, self.child = f"att-preview-owner-{os.getpid()}", f"att-preview-review-{os.getpid()}"
+        self.log = self.jobs.parent / "owner.jsonl"
         self.owner_meta = dict(
             attempt_id=self.owner, worker_type="owner", unit="_kernel/owner", dispatch_depth=1,
             registered_worker=1, harness=harness, owner_route_file=self.path,

@@ -416,16 +416,17 @@ _LEG_KEYS = ("capability", "mode", "shape", "graph", "intensity")
 
 def same_proposal(left, right, resolved=None) -> bool:
     """Whether `right` (an interview's copy) names the legs of `left` (a proposal the runtime validated):
-    each leg's (capability, mode, shape, graph, intensity) is the proposal's own value or, given
-    `resolved` (that proposal's compiled legs, `facts["legs"]`, shown as `legs` in
-    route_proposal_review), the value its compile resolved it to. The copy's approval
-    questions are the interview's own and are not compared."""
+    each leg's (capability, mode, shape, graph, intensity) is, taken together, the proposal's own
+    leg or, given `resolved` (that proposal's compiled legs, `facts["legs"]`, shown as `legs` in
+    route_proposal_review), the leg its compile resolved it to -- never a per-key blend of the
+    two. The copy's approval questions are the interview's own and are not compared."""
     try:
         own, copy = left["legs"], right["legs"]
         shown = own if resolved is None else resolved
+        key_values = lambda leg: [leg.get(key) for key in _LEG_KEYS]
         return (len(own) == len(copy) == len(shown)
-                and all(leg.get(key) in (mine.get(key), compiled.get(key))
-                        for leg, mine, compiled in zip(copy, own, shown) for key in _LEG_KEYS))
+                and all(key_values(leg) in (key_values(mine), key_values(compiled))
+                        for leg, mine, compiled in zip(copy, own, shown)))
     except (AttributeError, KeyError, TypeError):
         return False
 
