@@ -464,16 +464,53 @@ FRAME_ANCHOR_SHAPE_DEMAND = {
 }
 
 
-def frame_profile_for_owner(owner_profile: str) -> dict:
+# The ONE prior frame policy (v2.167.1-v2.169.0), kept only so a verifier can still accept a sealed
+# route whose frame nodes were declared under it. It is never a compile default and not a release
+# selector: `frame_profile_for_owner(..., prior=True)` is read by the route verifier alone. Any later
+# policy generation needs its own evidence and its own entry; this is not an open-ended registry.
+PRIOR_FRAME_PROFILE_LADDER = {
+    "top": {"anchor": "top", "others": "deep"},
+    "deep": {"anchor": "top", "others": "deep"},
+    "balanced-deep": {"anchor": "deep", "others": "deep"},
+    "balanced": {"anchor": "balanced-deep", "others": "balanced-deep"},
+    "light": {"anchor": "balanced", "others": "balanced"},
+}
+# Same shape demand as `FRAME_ANCHOR_SHAPE_DEMAND`; only the execution rationale was worded differently.
+PRIOR_FRAME_ANCHOR_SHAPE_DEMAND = {
+    "schema_version": DEMAND_SCHEMA_VERSION,
+    "judgment_requirement": "difficult-uncertain",
+    "execution_scope": "short-local",
+    "judgment_reason": (
+        "framing is the route's one irreversible judgment: every later node "
+        "inherits the direction this leg picks, and no later stage is scoped "
+        "to re-open it"
+    ),
+    "execution_reason": (
+        "one direction brief, written once, with no multi-step execution of "
+        "its own"
+    ),
+    "evidence_refs": ["roles/units/plan/frame.md"],
+}
+
+
+def frame_profile_for_owner(owner_profile: str, *, prior: bool = False) -> dict:
     """Map an owner's resolved profile to its frame pair's two profiles.
 
     Returns `{"anchor": <profile>, "others": <profile>}`. Unknown or absent
     owner profiles fall back to the `light` rung rather than raising: this runs
     inside route compilation for every recipe, and a route that framed nothing
-    is worse than a route framed conservatively."""
+    is worse than a route framed conservatively. `prior` selects the one prior
+    policy, for verification of an already sealed route only."""
 
-    return dict(FRAME_PROFILE_LADDER.get(owner_profile or "light",
-                                         FRAME_PROFILE_LADDER["light"]))
+    ladder = PRIOR_FRAME_PROFILE_LADDER if prior else FRAME_PROFILE_LADDER
+    return dict(ladder.get(owner_profile or "light", ladder["light"]))
+
+
+def frame_anchor_shape_demand(*, prior: bool = False) -> dict:
+    """A private copy of the frame shape demand (current, or the one prior policy's)."""
+
+    return json.loads(json.dumps(
+        PRIOR_FRAME_ANCHOR_SHAPE_DEMAND if prior else FRAME_ANCHOR_SHAPE_DEMAND))
 
 
 def _lower_launch_verified(args, route, node_id, selection, profile):

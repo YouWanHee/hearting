@@ -63,7 +63,7 @@ class OwnerRefineBase(PF.ProducerTestBase):
                 + ",".join(f"{k}={v}" for k, v in meta.items()) + "\n")
 
     def build(self, harness="claude", *, review=True, close=True, parent="claude-parent-runtime",
-              report_rel="owner-report.md"):
+              report_rel="owner-report.md", verdict="PASS"):
         os.environ["AGENT_HOME"] = str(R.ROOT)
         self.activate()
         self.harness = harness
@@ -95,7 +95,9 @@ class OwnerRefineBase(PF.ProducerTestBase):
                 launch_outcome="reaped-before-publish")
             self.jobs.write_text(self.row("open", "owner", self.owner_meta) + self.row("open", "review", child_meta))
             R.complete_node(self.route, node, node["id"], self.preview, jobs=self.jobs, attempt_id=self.child)
-        text = f"artifact: {self.report}\nverdict: PASS\nblocker: none"
+        self.verdict = verdict
+        blocker = "none" if verdict == "PASS" else "the gate command was refused, so I did not apply"
+        text = f"artifact: {self.report}\nverdict: {verdict}\nblocker: {blocker}"
         self.log.write_text("\n".join(json.dumps(x) for x in NATIVE_OWNER_RESULT[harness](text)) + "\n")
         if close:
             self.close_owner()
@@ -108,8 +110,10 @@ class OwnerRefineBase(PF.ProducerTestBase):
             meta = D.parse_registry_metadata(fields[5])
             if meta.get("attempt_id") != self.owner:
                 continue
+            blocked = getattr(self, "verdict", "PASS") == "BLOCKED"
             meta.update(execution_surface="registered-headless", transport="headless",
-                        fallback_hop="same-harness-headless", failure_class="pass", note="completed-supervisor",
+                        fallback_hop="same-harness-headless", failure_class="blocked" if blocked else "pass",
+                        note="dead-worker-blocked" if blocked else "completed-supervisor",
                         launch_outcome="reaped-before-publish")
             fields[1] = "done"
             fields[5] = ",".join(f"{k}={v}" for k, v in meta.items())
@@ -133,6 +137,29 @@ class OwnerRefineBase(PF.ProducerTestBase):
         return self.supervisor("release", "--route", str(self.path), "--gate", self.PREVIEW,
                                "--decision", decision, "--jobs", str(self.jobs), "--actor", "user", worker=worker)
 
+    def release_in_process(self, decision="proceed"):
+        """`release` run in this process so the continuation (a `start`) can be observed, not spawned."""
+        import contextlib
+        import io
+        spec = importlib.util.spec_from_file_location("sup_for_release", R.ROOT / "utilities" / "workflow-supervisor.py")
+        sup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sup)
+        self.continuation_calls = []
+
+        def continuation(route_path, jobs):
+            import dispatch_replacement as DR
+            self.continuation_calls.append({"attempt": self.owner})
+            with mock.patch.object(DR, "advance", return_value={"state": "not-applicable"}) as advance:
+                self.start(run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no launch")))
+            advance.assert_called()
+            return 0, {"state": "running"}
+
+        out = io.StringIO()
+        with self.env(), mock.patch.object(sup, "start_owner_continuation", continuation), contextlib.redirect_stdout(out):
+            sup.main(["release", "--route", str(self.path), "--gate", self.PREVIEW, "--decision", decision,
+                      "--actor", "user", "--jobs", str(self.jobs)])
+        return json.loads(out.getvalue())
+
     def resolution(self):
         import workflow_state as WS
         return WS.human_gate_resolution(
@@ -154,10 +181,10 @@ class OwnerRefineBase(PF.ProducerTestBase):
         with self.env():
             return T.settle_owner_completion(self.jobs, "done", self.meta())
 
-    def start(self):
+    def start(self, run=None):
         import work_start as W
         with self.env():
-            return W.start_work(self.route, self.path, self.jobs)
+            return W.start_work(self.route, self.path, self.jobs, **({"run": run} if run else {}))
 
     def gate_records(self):
         return sorted((self.jobs.parent / "pending-delivery").rglob("*.json")) if (self.jobs.parent / "pending-delivery").exists() else []
@@ -284,26 +311,6 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
         self.assertNotEqual(self.settle().result, "completed")
         self.assertNotEqual(self.workflow_state(), "COMPLETE")
 
-    def test_a_parent_whose_carrier_cannot_hold_the_gate_gets_the_same_attention_receipt(self):
-        # The runtime can raise the question only where a carrier can hold it for an owner that has
-        # already exited; elsewhere the receipt says so instead of settling or inventing an approval.
-        for parent in ("opencode-turn", "codex-native-queue", "codex-managed-gateway"):
-            with self.subTest(parent=parent):
-                fixture = OwnerPreviewApprovalTest(
-                    "test_a_parent_whose_carrier_cannot_hold_the_gate_gets_the_same_attention_receipt")
-                fixture.setUp()
-                try:
-                    fixture.build("claude", parent=parent)
-                    receipt = fixture.start()
-                    self.assertEqual((receipt["state"], receipt["reason"], receipt["gate"]),
-                                     ("needs-attention", "human-gate-not-raised", fixture.PREVIEW), receipt)
-                    self.assertEqual(Path(receipt["owner_report"]).name, "owner-report.md")
-                    self.assertNotIn("next_leg", receipt)
-                    self.assertEqual(fixture.resolution()["status"], "not-raised")
-                    self.assertNotEqual(fixture.workflow_state(), "COMPLETE")
-                finally:
-                    fixture.doCleanups()
-
     def test_completing_the_owner_node_by_hand_does_not_bypass_the_gate(self):
         self.build("claude", close=False)
         node = next(n for n in self.route["nodes"] if n["id"] == "transaction")
@@ -311,6 +318,157 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
             R.complete_node(self.route, node, "transaction", self.report, jobs=self.jobs)
         self.assertIn("human-gate-not-raised", str(caught.exception))
         self.assertFalse((R.completion_dir(self.route["route_id"], jobs=self.jobs) / "transaction.json").exists())
+
+
+PARENTS = (("claude-parent-runtime", "claude"), ("codex-native-queue", "codex"),
+           ("codex-managed-gateway", "codex"), ("opencode-turn", "opencode"))
+
+
+class OwnerGateReachesEveryParentTest(OwnerRefineBase):
+    """The existing question reaches the person on every harness, with no dead end (D2, delivery).
+
+    The runtime raises `preview-disposition` inside the parent's own `start`; the receipt that call
+    returns is the delivery, so a parent kind with no push carrier still asks. The owner's own
+    `gate --block` is untouched (SD-OPEN-33), see `workflow_supervisor.test.py`.
+    """
+
+    def fresh(self, name, *args, **kwargs):
+        fixture = type(self)(name)
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture.build(*args, **kwargs)
+
+    def assert_not_settled(self, fixture):
+        settled = fixture.settle()                      # a BLOCKED owner has nothing to settle at all
+        self.assertTrue(settled is None or settled.result != "completed", settled)
+        self.assertNotEqual(fixture.workflow_state(), "COMPLETE")
+
+    def no_launch(self, *a, **k):
+        raise AssertionError("asking the question never launches or replaces an owner")
+
+    def assert_asks(self, fixture, receipt, *, records):
+        self.assertEqual((receipt["state"], receipt["reason"], receipt["required_action"], receipt["gate"]),
+                         ("waiting-human-gate", "owner-parked-at-human-gate", "answer-human-gate", fixture.PREVIEW),
+                         receipt)
+        self.assertEqual(receipt["gate_artifact"], str(fixture.preview))
+        for token in ("workflow-supervisor.py", "--gate " + fixture.PREVIEW, "--decision proceed", str(fixture.jobs)):
+            self.assertIn(token, receipt["release_command"])
+        self.assertEqual(Path(receipt["owner_report"]).name, "owner-report.md")
+        self.assertNotIn("next_leg", receipt)
+        self.assertNotIn("parent_next", receipt)
+        resolution = fixture.resolution()
+        self.assertEqual((resolution["status"], resolution["epoch"], resolution["artifact"]),
+                         ("blocked", 1, str(fixture.preview)))
+        self.assertEqual(len(fixture.gate_records()), records)
+        self.assertNotEqual(fixture.workflow_state(), "COMPLETE")
+
+    def test_a_pass_that_never_raised_asks_in_the_start_receipt_for_every_parent_kind(self):
+        for kind, harness in PARENTS:
+            with self.subTest(parent=kind):
+                fixture = self.fresh("test_a_pass_that_never_raised_asks_in_the_start_receipt_for_every_parent_kind",
+                                     harness, parent=kind)
+                first = fixture.start(run=self.no_launch)
+                self.assert_asks(fixture, first, records=1 if kind == "claude-parent-runtime" else 0)
+                again = fixture.start(run=self.no_launch)        # a repeated start asks, never raises twice
+                self.assert_asks(fixture, again, records=1 if kind == "claude-parent-runtime" else 0)
+                self.assert_not_settled(fixture)
+
+    def test_a_blocked_owner_that_obeyed_the_refusal_line_is_asked_about_never_replaced(self):
+        # Owner row `done`, verdict BLOCKED, gate never raised: the same runtime raise, recognised as the
+        # existing owner park. No replacement, relaunch or settlement happens before the person answers.
+        import dispatch_replacement as DR
+        for kind, harness in PARENTS:
+            with self.subTest(parent=kind):
+                fixture = self.fresh("test_a_blocked_owner_that_obeyed_the_refusal_line_is_asked_about_never_replaced",
+                                     harness, parent=kind, verdict="BLOCKED")
+                rows = fixture.jobs.read_text()
+                with mock.patch.object(DR, "advance", side_effect=AssertionError("a blocked gate never continues")):
+                    first = fixture.start(run=self.no_launch)
+                    again = fixture.start(run=self.no_launch)
+                for receipt in (first, again):
+                    self.assert_asks(fixture, receipt, records=1 if kind == "claude-parent-runtime" else 0)
+                self.assertEqual(fixture.jobs.read_text(), rows, "no row was added or changed")
+                self.assert_not_settled(fixture)
+                self.assertEqual(DR.owner_parked_gate(fixture.jobs, fixture.owner)["status"], "blocked")
+
+    def test_the_receipt_says_what_a_proceed_will_really_do_for_each_owner_result(self):
+        for verdict, expected, forbidden in (
+                ("PASS", "settles the owner's finished work", "starts the continuation"),
+                ("BLOCKED", "starts the continuation", "settles the owner's finished work")):
+            with self.subTest(verdict=verdict):
+                fixture = self.fresh("test_the_receipt_says_what_a_proceed_will_really_do_for_each_owner_result",
+                                     "opencode", parent="opencode-turn", verdict=verdict)
+                text = fixture.start(run=self.no_launch)["next_step"]
+                self.assertIn(expected, text)
+                self.assertNotIn(forbidden, text)
+
+    def test_a_proceed_settles_a_passed_owner_for_every_parent_kind(self):
+        for kind, harness in PARENTS:
+            with self.subTest(parent=kind):
+                fixture = self.fresh("test_a_proceed_settles_a_passed_owner_for_every_parent_kind", harness, parent=kind)
+                fixture.start(run=self.no_launch)
+                released = fixture.release("proceed")
+                self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+                receipt = fixture.start(run=self.no_launch)
+                self.assertEqual(receipt["state"], "completed", receipt)
+                self.assertEqual(fixture.workflow_state(), "COMPLETE")
+                self.assertEqual(P.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])["state"], "sealed")
+
+    def test_revise_and_stop_are_handled_for_every_parent_kind_and_owner_result(self):
+        import dispatch_replacement as DR
+        for kind, harness in PARENTS:
+            for verdict in ("PASS", "BLOCKED"):
+                for decision, state, reason in (("stop", "stopped", "human-gate-stop"),
+                                                ("revise", "needs-attention", "human-gate-revise-owner-parked")):
+                    with self.subTest(parent=kind, verdict=verdict, decision=decision):
+                        fixture = self.fresh("test_revise_and_stop_are_handled_for_every_parent_kind_and_owner_result",
+                                             harness, parent=kind, verdict=verdict)
+                        fixture.start(run=self.no_launch)
+                        self.assertEqual(fixture.release(decision).returncode, 0)
+                        with mock.patch.object(DR, "advance", side_effect=AssertionError("never continues")):
+                            receipt = fixture.start(run=self.no_launch)
+                        self.assertEqual((receipt["state"], receipt["reason"]), (state, reason), receipt)
+                        self.assertEqual(Path(receipt["owner_report"]).name, "owner-report.md")
+                        self.assertNotIn("next_leg", receipt)
+                        self.assert_not_settled(fixture)
+
+    def test_a_proceed_after_a_blocked_owner_enters_the_existing_replacement_path(self):
+        import dispatch_replacement as DR
+        for kind, harness in PARENTS:
+            with self.subTest(parent=kind):
+                fixture = self.fresh("test_a_proceed_after_a_blocked_owner_enters_the_existing_replacement_path",
+                                     harness, parent=kind, verdict="BLOCKED")
+                fixture.start(run=self.no_launch)
+                payload = fixture.release_in_process("proceed")
+                self.assertEqual(payload["decision"], "proceed")
+                self.assertEqual(payload["owner_continuation"]["state"], "running")
+                self.assertEqual(DR.owner_parked_gate(fixture.jobs, fixture.owner)["status"], "proceed")
+                fields, meta = DR._rows(fixture.jobs.read_text().splitlines())[fixture.owner]
+                self.assertEqual(DR.death_kind(fields, meta, jobs=fixture.jobs), "parked")
+                self.assertEqual(fixture.continuation_calls[0]["attempt"], fixture.owner)
+
+    def test_a_raise_the_runtime_cannot_make_keeps_the_attention_receipt_and_asks_nothing(self):
+        # The one case that still ends at `human-gate-not-raised`: the runtime tried to ask and the raise itself
+        # was refused (a preview that stopped being provable at that moment, a ledger that cannot enter the
+        # gate, a timeout). There is nothing the person could be shown, so nothing is settled, raised or
+        # released. A missing review stage is not this case: it keeps `workflow-executor-exited`.
+        import dispatch_contract as DC
+        for kind, harness in PARENTS:
+            with self.subTest(parent=kind):
+                fixture = self.fresh("test_a_raise_the_runtime_cannot_make_keeps_the_attention_receipt_and_asks_nothing",
+                                     harness, parent=kind)
+                with mock.patch.object(DC, "raise_preview_gate_for_node",
+                                       side_effect=ValueError("gate-carrier-refused: ledger cannot enter the gate")):
+                    receipt = fixture.start(run=self.no_launch)
+                self.assertEqual((receipt["state"], receipt["reason"], receipt["required_action"], receipt["gate"]),
+                                 ("needs-attention", "human-gate-not-raised", "report-unapproved-apply",
+                                  fixture.PREVIEW), receipt)
+                self.assertEqual(Path(receipt["owner_report"]).name, "owner-report.md")
+                self.assertIn("ledger cannot enter the gate", receipt["next_step"])
+                self.assertNotIn("next_leg", receipt)
+                self.assertEqual(fixture.resolution()["status"], "not-raised")
+                self.assertEqual(fixture.gate_records(), [])
+                self.assertNotEqual(fixture.workflow_state(), "COMPLETE")
 
 
 if __name__ == "__main__":

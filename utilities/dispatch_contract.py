@@ -6529,13 +6529,23 @@ def owner_operation_fence(route: dict, node: dict, jobs: Path | None = None) -> 
     _human_gate_entry_fence(route, node, jobs, release_proof=True, only=OWNER_OPERATION_GATES)
 
 
-def raise_preview_gate_for_node(route_file, route_node, jobs, agent_home) -> str:
+# Set by the runtime's own raise inside the parent's `start` (and nowhere else): the caller is the
+# parent session reading the receipt right now, so that receipt is the delivery. See
+# `workflow-supervisor.gate_delivered_in_receipt`.
+GATE_RECEIPT_DELIVERY_ENV = "AGENT_GATE_RECEIPT_DELIVERY"
+
+
+def raise_preview_gate_for_node(route_file, route_node, jobs, agent_home, *, in_parent_receipt=False) -> str:
     """Raise the existing `preview-disposition` question from the completed preview node.
 
     One body for two callers: a refused child start (`recover_preview_gate_after_refusal`) and
     an owner that already applied its transaction without ever raising the gate. Only a
     current completed review artifact can back the gate transaction; this never releases
-    anything. Returns the carrier's delivery id; raises ValueError with the reason otherwise.
+    anything. Returns the carrier's delivery id (`-` when the receipt itself is the delivery);
+    raises ValueError with the reason otherwise.
+
+    `in_parent_receipt` is for the parent's own `start` only: the question reaches the person in
+    the receipt that call returns, so a parent kind with no push carrier needs no pending record.
     """
     route = json.loads(Path(route_file).read_text())
     bindings = [b for b in route.get("human_gate_bindings", [])
@@ -6563,13 +6573,14 @@ def raise_preview_gate_for_node(route_file, route_node, jobs, agent_home) -> str
         [sys.executable, str(Path(__file__).with_name("workflow-supervisor.py")),
          "gate", "--route", str(route_file), "--gate", "preview-disposition",
          "--block", "--jobs", str(jobs), "--artifact", str(artifact)],
-        text=True, capture_output=True, timeout=15, check=False)
+        text=True, capture_output=True, timeout=15, check=False,
+        env={**os.environ, GATE_RECEIPT_DELIVERY_ENV: "1"} if in_parent_receipt else None)
     if result.returncode:
         raise ValueError("gate-carrier-refused: " + result.stderr.strip()[:240])
     payload = json.loads(result.stdout)
     if payload.get("action") != "blocked" or payload.get("workflow_state") != "BLOCKED_HUMAN_GATE":
         raise ValueError("gate-block-unverified")
-    return str(payload.get("delivery", "-"))
+    return str(payload.get("delivery") or "-")
 
 
 def recover_preview_gate_after_refusal(route_file, route_node, action, agent_home, jobs,

@@ -572,6 +572,32 @@ class FirstLegStateReplayTest(StartBase):
         self.assertIn("release_command", again)
         self.untouched(before)
 
+    def test_a_replay_of_an_exited_leg_owner_asks_the_approval_question_it_never_raised(self):
+        # The frame route's own resume is a parent `start` too: an exited owner that never raised the gate
+        # sealed on its own operation is asked about here as well, and still nothing launches or settles.
+        first = self.staged_leg()
+        self.end_owner_row()
+        before = self.snapshot()
+        parked = {"gate": "preview-disposition", "status": "blocked", "artifact": "/tmp/preview.md",
+                  "route_file": str(self.leg()[1])}
+        with mock.patch.object(W, "_raise_owner_entry_gate") as raised, \
+                mock.patch("dispatch_replacement.owner_parked_gate",
+                           side_effect=lambda *a, **k: parked if raised.called else None), \
+                mock.patch("dispatch_replacement.advance", side_effect=AssertionError("a replay never launches")), \
+                mock.patch.object(W, "_launch_admitted", side_effect=AssertionError("a replay never launches")):
+            again = self.replay()
+        raised.assert_called_once()
+        self.assertEqual(raised.call_args.args[3], first["owner_attempt_id"])
+        self.assertEqual((again["state"], again["required_action"], again["gate"]),
+                         ("waiting-human-gate", "answer-human-gate", "preview-disposition"), again)
+        self.assertEqual(again["resume_command"], first["resume_command"])
+        self.untouched(before)
+
+    def test_a_replay_of_a_leg_whose_owner_still_runs_asks_nothing(self):
+        self.staged_leg()
+        with mock.patch.object(W, "_raise_owner_entry_gate", side_effect=AssertionError("owner is live")):
+            self.assertEqual(self.replay()["state"], "running")
+
     def test_an_inline_finish_still_pending_on_the_leg_is_reported_as_such(self):
         self.settle()
         route, _ = self.leg()

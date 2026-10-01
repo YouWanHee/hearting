@@ -2331,7 +2331,7 @@ def _quick_frame_diversity(candidates):
             else "single-harness:" + harnesses[0])
 
 
-def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=True):
+def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=True, prior=False):
     """Stamp every frame leg's `model_profile` from the one tier ladder.
 
     ONE function called by BOTH the compiler and `verify_route`'s expected-node
@@ -2342,9 +2342,13 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
     the first time this was written inline in the compiler.
 
     Runs BEFORE `_seal_profile_demands` on both sides, because that is what
-    turns the stamped profile into the node's sealed selection."""
+    turns the stamped profile into the node's sealed selection.
 
-    rungs = PROFILE.frame_profile_for_owner(owner_profile)
+    `prior` is for the verifier alone (`_expected_nodes_under_frame_policy`): it rebuilds the
+    declaration an already sealed route made under the one prior frame policy. Compilation never
+    passes it."""
+
+    rungs = PROFILE.frame_profile_for_owner(owner_profile, prior=prior)
     for node in nodes:
         if not _frame_node(node):
             continue
@@ -2366,8 +2370,42 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
             # demand. Each leg seals its own selection and demand.
             node["profile_explicit"] = True
             node["profile_demand"] = json.loads(json.dumps(
-                owner_demand or PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
+                owner_demand or PROFILE.frame_anchor_shape_demand(prior=prior)))
     return nodes
+
+
+def _expected_nodes_under_frame_policy(base_nodes, route, *, persona_version, legacy, accepts):
+    """The route's expected nodes, stamped and sealed under ONE frame policy.
+
+    A route sealed before the top/top default keeps the frame declaration it was made with. The
+    current policy is tried first; if the route does not hold it, the one prior policy is tried, and
+    only as a whole -- every frame node of the route is rebuilt under the same policy, so a route
+    that mixes the two is refused. Everything else (graph, scope, gates, explicit caller profiles,
+    the demand digests) is rebuilt and compared exactly as before by the caller. When neither policy
+    is held, the current policy's nodes (or its error) are returned so the caller reports the
+    same diagnostic as before."""
+
+    attempts = (False, True) if any(_frame_node(n) for n in base_nodes) else (False,)
+    first_error = first_nodes = None
+    for prior in attempts:
+        nodes = json.loads(json.dumps(base_nodes))
+        try:
+            _stamp_frame_profiles(nodes, route.get("owner_model_profile"),
+                                  route.get("owner_profile_demand"),
+                                  seal_persona=persona_version == 1, prior=prior)
+            _seal_profile_demands(nodes, route.get("profile_demands"),
+                                  route.get("explicit_profiles"), legacy=legacy)
+        except ValueError as exc:
+            if not prior:
+                first_error = exc
+            continue
+        if accepts(nodes):
+            return nodes
+        if not prior:
+            first_nodes = nodes
+    if first_error is not None:
+        raise first_error
+    return first_nodes
 
 
 def _recipe_has_frame(recipe):
@@ -4304,12 +4342,13 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             auxiliary_check_units=registry.get("auxiliary_check_units"),
             persona_policy=persona_version == 1)
         if route.get("profile_selection_contract_version") == 1:
-            # Same ladder, same order as the compiler: stamp, then seal.
-            _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
-                                  route.get("owner_profile_demand"), seal_persona=persona_version == 1)
-            _seal_profile_demands(expected_nodes, route.get("profile_demands"),
-                                  route.get("explicit_profiles"),
-                                  legacy=_versioned_subgraph(registry, composed_recipe))
+            # Same ladder, same order as the compiler: stamp, then seal (under the policy the
+            # route's frame nodes were declared with).
+            expected_nodes=_expected_nodes_under_frame_policy(
+                expected_nodes, route, persona_version=persona_version,
+                legacy=_versioned_subgraph(registry, composed_recipe),
+                accepts=lambda nodes: ([_node_identity(n) for n in route.get("nodes",[])]
+                                       == [_node_identity(n) for n in nodes]))
         if ([_node_identity(n) for n in route.get("nodes",[])]
                 != [_node_identity(n) for n in expected_nodes]):
             raise ValueError("composed route nodes differ from embedded composed recipe")
@@ -4328,11 +4367,18 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 auxiliary_check_units=registry.get("auxiliary_check_units"),
             persona_policy=persona_version == 1)
             if route.get("profile_selection_contract_version") == 1:
-                # Same ladder, same order as the compiler: stamp, then seal.
-                _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
-                                      route.get("owner_profile_demand"), seal_persona=persona_version == 1)
-                _seal_profile_demands(expected_nodes, route.get("profile_demands"),
-                                      route.get("explicit_profiles"), legacy=True)
+                # Same ladder, same order as the compiler: stamp, then seal (under the policy the
+                # route's frame nodes were declared with).
+                def declared(nodes):
+                    by_id = {n["id"]: n for n in nodes}
+                    return not any(
+                        (expected := by_id.get(node.get("id"))) and not _no_model_node(node) and any(
+                            node.get(key) != expected.get(key)
+                            for key in ("profile_demand", "profile_selection", "model_profile"))
+                        for node in route.get("nodes", []))
+                expected_nodes=_expected_nodes_under_frame_policy(
+                    expected_nodes, route, persona_version=persona_version, legacy=True,
+                    accepts=declared)
                 by_id = {n["id"]: n for n in expected_nodes}
                 for node in route.get("nodes", []):
                     expected = by_id.get(node.get("id"))
