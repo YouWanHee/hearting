@@ -159,8 +159,54 @@ def seal_launch_input(args, harness: str, task: str) -> str:
         'route_node': getattr(args, 'route_node', None) or '',
         'owner_route_id': getattr(getattr(args, 'owner_route_binding', None), 'route_id', ''),
     }
-    _once(_directory(jobs)/'inputs'/(aid+'.json'), payload)
+    path = _directory(jobs)/'inputs'/(aid+'.json')
+    try:
+        _once(path, payload)
+    except DC.DispatchContractError as exc:
+        if exc.reason != 'replacement-record-conflict' or not _reseal_allowed(jobs, aid, path, payload):
+            raise
+        _replace_record(path, payload)
     return ',replacement_input_digest='+_digest(payload)
+
+
+# A later launcher of the same attempt may run from a newer release and resolve
+# afresh (admission still checks that against the source). The work and the
+# permissions it is granted must not change.
+_RESEAL_STABLE_KEYS = ('schema', 'attempt_id', 'harness', 'jobs', 'worktree', 'argv', 'task',
+                       'route_id', 'route_node', 'owner_route_id', 'applied_permissions')
+
+
+def _reseal_allowed(jobs, aid, path, payload):
+    """A launcher stopped before its claim sealed this input; the next one may reseal it."""
+    previous = _read(path)
+    if not previous or any(previous.get(key) != payload.get(key) for key in _RESEAL_STABLE_KEYS):
+        return False
+    rows = []
+    for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
+        fields = line.split('\t')
+        if len(fields) == 6:
+            meta = DC.parse_registry_metadata(fields[5])
+            if meta.get('attempt_id') == aid:
+                rows.append((fields[1], meta))
+    if not rows:
+        return True
+    if len(rows) != 1:
+        return False
+    status, meta = rows[0]
+    return (status == 'open' and meta.get('launch_claimed') == '0'
+            and meta.get('launch_started') != '1' and not meta.get('pid'))
+
+
+def _replace_record(path, value):
+    temporary = path.with_name('.'+path.name+'.'+os.urandom(8).hex()+'.tmp')
+    try:
+        with temporary.open('xb') as handle:
+            handle.write(_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def launch_input(jobs, aid, meta):
@@ -201,6 +247,8 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     if (meta.get('worker_type') == 'owner' and fields[1] == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
         return 'capacity'
+    if meta.get('worker_type') == 'owner' and fields[1] == 'done' and meta.get('note') == 'dead-runtime-exit':
+        return 'runtime'  # the owner's process crashed; only an explicit `start` replaces it
     return None
 
 
@@ -1079,8 +1127,11 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return advance(jobs, source['replacement_original_attempt_id'], run=run,
                        authority_check=authority_check, resume_capacity=resume_capacity)
     kind = death_kind(fields, source, jobs=jobs)
+    # A usage-limit resume is a pause, not the node's one silent replacement: when that
+    # resumed attempt dies silently, claim() still judges the node's silent budget.
     if (source.get('replacement_original_attempt_id') and fields[1] not in {'open','running'}
-            and not DC.verdict_pass(source) and kind != 'capacity'):
+            and not DC.verdict_pass(source) and kind != 'capacity'
+            and not _in_capacity_family(jobs, source)):
         return exhausted_attention(jobs, aid, source)
     # Avoid side effects or errors on ordinary success/live observations.
     if kind is None:
@@ -1088,6 +1139,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return {'state': 'not-applicable', 'parked_gate': parked} if parked else {'state':'not-applicable'}
     if kind == 'capacity' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return _capacity_wait(jobs, aid, source)
+    if kind == 'runtime' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
+        return {'state': 'not-applicable'}  # never a supervisor tick: no loop of relaunches
     try:
         if authority_check is None:
             _authorized(jobs, rows, source)
@@ -1110,8 +1163,10 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             replacement_fields, replacement_meta = rows[replacement]
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
-                    if death_kind(replacement_fields, replacement_meta) == 'capacity':
-                        # The replacement stopped at a limit too: it is the next source.
+                    next_kind = death_kind(replacement_fields, replacement_meta)
+                    if next_kind == 'capacity' or (next_kind and _is_capacity_record(record)):
+                        # The replacement stopped at a limit too, or a limit resume died on its
+                        # own: it is the next source, and claim() judges the node's budget.
                         return advance(jobs, replacement, run=run, authority_check=authority_check,
                                        resume_capacity=resume_capacity)
                     return exhausted_attention(jobs, replacement, replacement_meta)
