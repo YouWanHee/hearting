@@ -24,6 +24,7 @@ import artifact_admission as adm  # noqa: E402
 import artifact_producer as P  # noqa: E402
 import artifact_workflow_group_review as R  # noqa: E402
 import artifact_workflow_groups as W  # noqa: E402
+import campaign_title_repair as repair  # noqa: E402
 
 _SPEC = importlib.util.spec_from_file_location(
     "workflow_group_review_producer_fixture", Path(__file__).with_name("artifact_producer.test.py"))
@@ -539,6 +540,13 @@ class ValidationTest(ReviewBase):
 
 
 class TriggerTest(ReviewBase):
+    def setUp(self):
+        super().setUp()
+        # The campaign-title trigger spawns through the same `Popen`; these tests count review spawns only.
+        patcher = mock.patch.object(repair, "launch_after_seal", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def spawned(self):
         return mock.patch.object(R.subprocess, "Popen")
 
@@ -659,6 +667,26 @@ class ModelCallTest(unittest.TestCase):
         governor.acquire.assert_called_once()
         self.assertEqual(governor.acquire.call_args.args[1], "title")
         governor.release.assert_called_once()
+
+    def test_invoke_model_passes_a_caller_agent_out_tag_and_label(self):
+        rt = R._refresh_title()
+        governor = mock.Mock()
+        governor.acquire.return_value = "token"
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), \
+                mock.patch.object(rt, "selected_providers", return_value=("claude",)), \
+                mock.patch.object(rt, "provider_command", return_value=(["claude", "-p"], "P", "out")) as command, \
+                mock.patch.object(rt, "_executable_available", return_value=True), \
+                mock.patch.object(rt, "run_provider_cascade", return_value=("reply", 0)), \
+                mock.patch.object(R, "_load_governor", return_value=governor):
+            result = R._invoke_model("P", agent=("x", "y"), out_tag="campaign-title", label="campaign-title")
+        self.assertEqual(result, ("reply", "claude"))
+        self.assertEqual(command.call_args.kwargs["opencode_agent"], ("x", "y"))
+        self.assertEqual(command.call_args.kwargs["out_tag"], "campaign-title")
+        self.assertEqual(command.call_args.kwargs["profile"], "light")
+        governor.acquire.assert_called_once()
+        self.assertEqual(governor.acquire.call_args.args[1], "title")
+        self.assertEqual(governor.acquire.call_args.kwargs["label"], "campaign-title")
 
     def test_no_provider_or_governor_failure_is_unavailable(self):
         rt = R._refresh_title()

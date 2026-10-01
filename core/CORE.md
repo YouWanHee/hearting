@@ -277,6 +277,24 @@ rescanning or moving outputs. A worker `begin --node`, an omitted title, or an
 unchanged title does not rewrite title metadata. Existing identities, locators,
 other cycles, and sealed records stay unchanged.
 
+**Campaign display titles.** A campaign whose visible title (its entry in
+`campaign-display-titles.json`, else its `campaign.json` title) has no Korean
+text and equals its locator, slug, key, or first sealed manifest title — or is a
+forbidden generic label — gets a Korean display title in the background after
+one of its cycles seals. A detached `campaign_title_repair.py auto` call asks the
+`light` model profile through the same provider cascade and title slot as the
+workflow-group review, checks the answer against the 2026-09-11 title rules in
+Korean (at most 34 characters, a goal rather than a date, slug, or codename, no
+duplicate in the root), and adds one v2 entry anchored to the campaign's first
+sealed manifest; later cycles need no new entry. `campaign.json`, keys,
+locators, and manifests stay unchanged, and any title a person set — Korean, or
+different from the key — is never replaced. A failure leaves the seal and the
+declaration as they were, writes one line to the producer-only log, and is
+retried at the campaign's next seal. `campaign_title_repair.py backfill
+--root-declaration FILE [--dry-run]` applies the same step to existing campaigns
+across listed roots. `HEARTING_CAMPAIGN_TITLE_AUTO=off` disables only the seal
+trigger.
+
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-reopen|campaign-recover`
 reports, closes, reopens, and repairs a campaign. An agent that judges the
 recorded completion condition met runs `campaign-close` (`--reason` when the

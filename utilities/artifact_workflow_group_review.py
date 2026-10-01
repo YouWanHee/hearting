@@ -229,9 +229,9 @@ def _now_iso(now: Optional[float]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _try_flock(root: Path) -> Optional[int]:
+def _try_flock(root: Path, path: Optional[Path] = None) -> Optional[int]:
     """Non-blocking exclusive lock; the kernel drops it when the holder dies."""
-    fd = os.open(str(lock_path(root)), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(str(path or lock_path(root)), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -764,8 +764,14 @@ def _load_governor(home: Path):
     return module
 
 
-def _invoke_model(prompt: str) -> Tuple[str, Optional[str]]:
-    """(text, harness) from the shared provider cascade at the `light` profile; ('', None) on any failure."""
+def _invoke_model(prompt: str, *, agent: Tuple[str, str] = ("workflow-group-reviewer", REVIEW_AGENT),
+                  out_tag: str = "workflow-group-review",
+                  label: str = "workflow-group-review") -> Tuple[str, Optional[str]]:
+    """(text, harness) from the shared provider cascade at the `light` profile; ('', None) on any failure.
+
+    `agent`, `out_tag`, and `label` name the opencode agent, output file tag, and governor
+    label; another background caller (campaign titles) passes its own and shares the rest.
+    """
     try:
         rt = _refresh_title()
         home = rt.agent_home()
@@ -775,8 +781,7 @@ def _invoke_model(prompt: str) -> Tuple[str, Optional[str]]:
         for adapter in rt.selected_providers(profile=PROFILE, pin_env=None):
             command = rt.provider_command(
                 adapter, prompt, home=home, stdin_prompt=True,
-                opencode_agent=("workflow-group-reviewer", REVIEW_AGENT),
-                out_tag="workflow-group-review", workdir=workdir, profile=PROFILE)
+                opencode_agent=agent, out_tag=out_tag, workdir=workdir, profile=PROFILE)
             if command and rt._executable_available(command[0]):
                 commands.append(command)
                 adapters.append(adapter)
@@ -784,7 +789,7 @@ def _invoke_model(prompt: str) -> Tuple[str, Optional[str]]:
             return "", None
         governor = _load_governor(home)
         governor_root = governor.default_root()
-        token = governor.acquire(governor_root, "title", label="workflow-group-review")
+        token = governor.acquire(governor_root, "title", label=label)
         try:
             env = _child_env()
             env["AGENT_SESSION_ROLE"] = "worker"

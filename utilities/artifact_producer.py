@@ -4900,6 +4900,11 @@ def _commit_sealed(
         artifact_workflow_group_review.launch_after_seal(root, sealed)
     except Exception:  # noqa: BLE001 -- the review trigger never changes a seal
         pass
+    try:
+        import campaign_title_repair  # lazy, like the review trigger
+        campaign_title_repair.launch_after_seal(root, sealed)
+    except Exception:  # noqa: BLE001 -- the title trigger never changes a seal
+        pass
 
 
 # ---------------------------------------------------------------------------
