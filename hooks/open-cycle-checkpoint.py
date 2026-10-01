@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Stop hook: refresh this session's open-cycle interim manifest.
+"""Stop hook: refresh this session's cycle manifest.
 
 Launches `artifact_producer.py checkpoint --trigger turn-end` detached through
-`artifact_checkpoint_trigger`; silent, never blocks, never fails the turn.
+`artifact_checkpoint_trigger` -- the same launcher Codex Stop, OpenCode
+`session.idle` and `begin` use; an open cycle gets its interim manifest, a closed
+one is looked at for changed files.  Silent, never blocks, never fails the turn.
 """
 import sys
 from pathlib import Path

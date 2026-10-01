@@ -6,16 +6,21 @@ One file for the whole §45 loop, one slice prefix per implementation step:
 `test_a2_*` covers the preserved copies, the next-document publisher and the
 D-127 proofs (a finished cycle stays finished after its files change);
 `test_b1_*` covers the bounded, lock-free scan of D-124 and the history calls of
-D-125 (a refresh is one short publication, never a long lock).  Every
+D-125 (a refresh is one short publication, never a long lock);
+`test_b2_*` covers the triggers that start it (begin, Claude Stop, Codex Stop, OpenCode
+`session.idle`) and the root cursor they share.  Every
 fixture runs on an isolated temporary artifact root; the real canonical root,
 registry, and routes directory are never touched.
 """
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import tracemalloc
 import types
@@ -27,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission as adm  # noqa: E402
 import artifact_campaign as CAMP  # noqa: E402
+import artifact_checkpoint_trigger as TRIG  # noqa: E402
 import artifact_index  # noqa: E402
 import artifact_manifest as M  # noqa: E402
 import artifact_producer as P  # noqa: E402
@@ -1727,6 +1733,239 @@ class B1RefreshTest(B1RefreshBase):
         out = self.refresh(result, trigger="explicit")
         self.assertEqual(out["status"], "emitted", out)
         self.assertTrue(out["complete"])
+
+
+class B2TriggerTest(B1RefreshBase):
+    """§45 D-124 trigger parity: every harness and `begin` start the same checkpoint child."""
+
+    HOOKS = Path(__file__).resolve().parents[1]
+
+    def setUp(self):
+        super().setUp()
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        self.state_home = state.name
+        env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": state.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def popen(self):
+        """Patch the launcher so a trigger records its child instead of starting one."""
+        # Only the launcher's own `subprocess` name is replaced: the module is shared, and the
+        # fixtures run git through it.
+        in_test = mock.patch.object(TRIG, "in_test_process", return_value=False)
+        fake = mock.patch.object(TRIG, "subprocess")
+        in_test.start()
+        self.addCleanup(in_test.stop)
+        started = fake.start()
+        self.addCleanup(fake.stop)
+        return started.Popen
+
+    def child_argvs(self, popen):
+        return [call.args[0][1:] for call in popen.call_args_list]
+
+    def checkpoint_argv(self, trigger, root, cycle_id):
+        return [str(TRIG.PRODUCER), "checkpoint", "--trigger", trigger, "--artifact-root", str(root),
+                "--cycle", cycle_id]
+
+    # -- begin / compose --------------------------------------------------
+    def test_b2_begin_observes_the_parent_and_the_cycle_it_continues(self):
+        parent = self.closed("b2-begin", {"plans/cycle/plan.md": b"plan\n"})
+        self.edit(parent, "plans/cycle/plan.md", b"plan, edited after the close\n")
+        popen = self.popen()
+        interval = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "900"})
+        interval.start()
+        self.addCleanup(interval.stop)
+        child_route, child_file = self.route(slug="b2-child", parent_cycle_id=parent["cycle_id"])
+        child = P.begin(self.root, route_file=child_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(self.child_argvs(popen), [self.checkpoint_argv("begin", self.root, parent["cycle_id"])])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        # The child that begin started is the ordinary checkpoint command: it refreshes the closed parent.
+        out = subprocess.run([sys.executable] + self.child_argvs(popen)[0], capture_output=True, text=True,
+                             env={**os.environ, "AGENT_ARTIFACT_CHECKPOINT": "off"}, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        document = json.loads(self.manifest_path(parent).read_text(encoding="utf-8"))
+        self.assertEqual(document["artifact_revisions"][0]["content_digest"],
+                         "sha256:" + hashlib.sha256(b"plan, edited after the close\n").hexdigest())
+        # A continuing begin on the same route sees the cycle it resumes, once per interval.
+        popen.reset_mock()
+        again = P.begin(self.root, route_file=child_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(again["status"], "resumed")
+        self.assertEqual(self.child_argvs(popen),
+                         [self.checkpoint_argv("begin", self.root, child["cycle_id"])])
+        popen.reset_mock()
+        P.begin(self.root, route_file=child_file, capability="autopilot-code", intensity="direct")
+        popen.assert_not_called()
+
+    def test_b2_begin_never_waits_on_or_fails_because_of_the_observation(self):
+        parent = self.closed("b2-quiet", {"plans/cycle/plan.md": b"plan\n"})
+        popen = self.popen()
+        popen.side_effect = OSError("no process slots")
+        route, route_file = self.route(slug="b2-quiet-child", parent_cycle_id=parent["cycle_id"])
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(result["layout"], "cycle")
+        self.assertTrue(popen.called)  # it was tried, and the failure stayed inside the launcher
+        with mock.patch.object(TRIG, "launch", side_effect=RuntimeError("launcher broke")) as launch:
+            route, route_file = self.route(slug="b2-quiet-two", parent_cycle_id=parent["cycle_id"])
+            result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(result["layout"], "cycle")
+        launch.assert_called()
+        # The observation is silent when automatic checkpoints are off.
+        popen.reset_mock(side_effect=True)
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT": "off"}):
+            route, route_file = self.route(slug="b2-quiet-three", parent_cycle_id=parent["cycle_id"])
+            P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        popen.assert_not_called()
+        # A begin with no parent and no earlier cycle has nothing to observe.
+        route, route_file = self.route(slug="b2-quiet-fresh", campaign_key="b2-fresh-stream")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.state_home + "/fresh"}):
+            P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        popen.assert_not_called()
+
+    # -- the three harnesses ---------------------------------------------
+    def _hook(self, relative, name):
+        spec = importlib.util.spec_from_file_location(name, self.HOOKS / relative)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _fire(self, module, payload, env):
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))):
+            return module.main()
+
+    def test_b2_three_harness_triggers_and_root_cursor(self):
+        result = self.closed("b2-harness", {"plans/cycle/plan.md": b"plan\n"})
+        cycle_id, root = result["cycle_id"], str(self.root)
+        worker_env = {"AGENT_ARTIFACT_ROOT": root, "AGENT_ARTIFACT_CYCLE_ID": cycle_id,
+                      "AGENT_SESSION_ROLE": "worker"}
+        route_file = str(self.root / "rt-b2.json")
+        popen = self.popen()
+        claude = self._hook("hooks/open-cycle-checkpoint.py", "b2_claude_stop")
+        sys.path.insert(0, str(self.HOOKS / "tools"))
+        self.addCleanup(sys.path.remove, str(self.HOOKS / "tools"))
+        codex = self._hook("adapters/codex/hooks/stop-lifecycle.py", "b2_codex_stop")
+        seen_sessions = []
+
+        def lookup(harness, session_id):
+            seen_sessions.append((harness, session_id))
+            return root, route_file
+
+        with mock.patch.object(TRIG, "session_route", side_effect=lookup), \
+                mock.patch("session_summary_trigger.launch_trigger"), mock.patch("fleet.interaction.clear_wait"):
+            for harness, module in (("claude", claude), ("codex", codex)):
+                # A dispatched worker names its cycle in its environment ...
+                popen.reset_mock()
+                self.assertEqual(self._fire(module, {"session_id": f"sid-{harness}-w"}, worker_env), 0)
+                self.assertEqual(self.child_argvs(popen), [self.checkpoint_argv("turn-end", root, cycle_id)])
+                self.assertEqual(popen.call_args.kwargs["env"]["AGENT_ARTIFACT_CYCLE_ID"], cycle_id)
+                # ... an interactive session is found from its session id on stdin.
+                popen.reset_mock()
+                self.assertEqual(self._fire(module, {"session_id": f"sid-{harness}-i"}, {}), 0)
+                self.assertEqual(self.child_argvs(popen),
+                                 [[str(TRIG.PRODUCER), "checkpoint", "--trigger", "turn-end",
+                                   "--artifact-root", root, "--route", route_file]])
+                # The off switch silences the hook without failing the turn.
+                popen.reset_mock()
+                self.assertEqual(self._fire(module, {"session_id": f"sid-{harness}-o"},
+                                            {**worker_env, "AGENT_ARTIFACT_CHECKPOINT": "off"}), 0)
+                popen.assert_not_called()
+        self.assertEqual(seen_sessions, [("claude", "sid-claude-i"), ("codex", "sid-codex-i")])
+
+    def test_b2_opencode_session_idle_runs_the_same_trigger(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        plugin = self.HOOKS / "adapters/opencode/plugins/hearting-guards.js"
+        scratch = Path(self.state_home) / "opencode"
+        (scratch / "bin").mkdir(parents=True)
+        shim = scratch / "bin" / "python3"
+        shim.write_text(
+            "#!/bin/sh\nd=\"$FAKE_PYTHON_LOG/$$\"; mkdir -p \"$d\"; printf '%s\\n' \"$@\" > \"$d/argv\"\n"
+            "env > \"$d/env\"; cat > \"$d/stdin\"\n", encoding="utf-8")
+        shim.chmod(0o755)
+        script = scratch / "fire.mjs"
+        script.write_text(
+            f'import {{ AgentHarnessGuards }} from {json.dumps(plugin.as_uri())}\n'
+            'const hooks = await AgentHarnessGuards({ directory: process.cwd(), worktree: process.cwd() })\n'
+            'await hooks.event({ event: { type: "session.idle", properties: { sessionID: process.env.B2_SID } } })\n'
+            'await new Promise((resolve) => setTimeout(resolve, 1500))\n', encoding="utf-8")
+
+        def fire(sid, extra):
+            log = scratch / f"log-{sid}"
+            log.mkdir()
+            env = {key: value for key, value in os.environ.items() if not key.startswith(("AGENT_", "HERDR_"))}
+            env.update({"PATH": f"{scratch / 'bin'}{os.pathsep}{env.get('PATH', '')}", "B2_SID": sid,
+                        "FAKE_PYTHON_LOG": str(log), **extra})
+            done = subprocess.run([node, str(script)], cwd=str(scratch), env=env, capture_output=True, text=True,
+                                  timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            calls = []
+            for entry in sorted(log.iterdir()):
+                argv = (entry / "argv").read_text(encoding="utf-8").splitlines()
+                if any(arg.endswith("artifact_checkpoint_trigger.py") for arg in argv):
+                    calls.append({"argv": argv, "stdin": (entry / "stdin").read_text(encoding="utf-8"),
+                                  "env": (entry / "env").read_text(encoding="utf-8").splitlines()})
+            return calls
+
+        trigger = str(self.HOOKS / "utilities" / "artifact_checkpoint_trigger.py")
+        # An interactive session: the session id travels on stdin.
+        calls = fire("sid-main", {})
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["argv"], [trigger, "turn-end", "--harness", "opencode"])
+        self.assertEqual(json.loads(calls[0]["stdin"])["sessionID"], "sid-main")
+        # A worker is a target too, and its cycle environment reaches the child.
+        root, cycle_id = str(self.root), "cyc_" + "d" * 32
+        calls = fire("sid-worker", {"AGENT_SESSION_ROLE": "worker", "AGENT_ARTIFACT_ROOT": root,
+                                    "AGENT_ARTIFACT_CYCLE_ID": cycle_id})
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["argv"], [trigger, "turn-end", "--harness", "opencode"])
+        self.assertIn(f"AGENT_ARTIFACT_CYCLE_ID={cycle_id}", calls[0]["env"])
+        self.assertIn(f"AGENT_ARTIFACT_ROOT={root}", calls[0]["env"])
+        # The existing off switch is respected before anything starts.
+        self.assertEqual(fire("sid-off", {"AGENT_ARTIFACT_CHECKPOINT": "off"}), [])
+
+    def test_b2_twelve_old_cycles_round_robin_and_interval(self):
+        cycles = []
+        for i in range(13):
+            cycles.append(self.closed(f"b2-rr-{i:02d}", {"plans/cycle/plan.md": b"plan\n"}, activate=(i == 0)))
+        for i in (0, 6, 12):  # closed more than three days ago
+            record = P.read_cycle_record(self.root, cycles[i]["cycle_id"])
+            record["sealed_on"] = "2026-09-20T00:00:00Z"
+            P._write_cycle_record(self.root, record, exclusive=False)
+        for i, result in enumerate(cycles):
+            self.edit(result, "plans/cycle/plan.md", f"edited {i}\n".encode())
+        real = P.RefreshBudget
+
+        class Small(real):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs) if args or kwargs else super().__init__(max_walk_entries=6)
+
+        def current(result):
+            return json.loads(self.manifest_path(result).read_text(encoding="utf-8"))["artifact_revisions"][0][
+                "content_digest"]
+
+        wanted = ["sha256:" + hashlib.sha256(f"edited {i}\n".encode()).hexdigest() for i in range(13)]
+        triggers = ("stage-complete", "supervisor-poll", "turn-end", "begin")
+        with mock.patch.object(P, "RefreshBudget", Small):
+            for call in range(80):
+                out = P.checkpoint(self.root, cycle_id=cycles[0]["cycle_id"], trigger=triggers[call % 4])
+                self.assertNotEqual(out.get("reason"), "checkpoint-trigger-invalid")
+                if [current(result) for result in cycles] == wanted:
+                    break
+            else:
+                self.fail("the root cursor did not reach every closed cycle")
+        self.assertGreater(call, 1)
+        # The 900 second interval holds for every automatic trigger and never for an explicit one.
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL": "900"}):
+            self.edit(cycles[4], "plans/cycle/plan.md", b"edited again\n")
+            stamp = time.time() + 1000  # past the last observation of this cycle
+            first = P.checkpoint(self.root, cycle_id=cycles[4]["cycle_id"], trigger="begin", now=stamp)
+            self.assertEqual(first["status"], "emitted", first)
+            self.edit(cycles[4], "plans/cycle/plan.md", b"edited a third time\n")
+            quiet = P.checkpoint(self.root, cycle_id=cycles[4]["cycle_id"], trigger="begin", now=stamp + 60)
+            self.assertEqual((quiet["status"], quiet["reason"]), ("skipped", "min-interval"))
+            explicit = P.checkpoint(self.root, cycle_id=cycles[4]["cycle_id"], trigger="explicit", now=stamp + 60)
+            self.assertEqual(explicit["status"], "emitted")
 
 
 def m_digest(document):

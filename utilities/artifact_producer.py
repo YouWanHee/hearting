@@ -2431,8 +2431,30 @@ def _begin_cycle_record(
         artifact_admission._release_lock(root, lock_fd)
 
 
+def _observe_after_begin(root: Path, result: Mapping[str, Any]) -> None:
+    """§45 D-124: an owner `begin` has the cycles it builds on looked at (detached, once per interval).
+
+    The parent the new cycle names and the cycle a continuing route resumes may have changed since
+    they closed.  The launcher never raises and never waits; this must not make `begin` slower or fail."""
+    try:
+        import artifact_checkpoint_trigger
+
+        cycle_id = result.get("cycle_id")
+        record = read_cycle_record(root, cycle_id) if cycle_id else None
+        wanted = [record.get("parent_cycle_id")] if record else []
+        if result.get("status") == "resumed":
+            wanted.append(cycle_id)
+        for observed in dict.fromkeys(item for item in wanted if item):
+            artifact_checkpoint_trigger.launch(trigger="begin", key=f"begin-{observed}",
+                                               artifact_root=str(root), cycle_id=observed)
+    except Exception:  # noqa: BLE001 -- observing other cycles never fails a begin
+        pass
+
+
 def begin(root: Path, **kwargs: Any) -> Dict[str, Any]:
     result = _begin_cycle_record(root, **kwargs)
+    if kwargs.get("node_id") is None and result.get("layout") == "cycle":
+        _observe_after_begin(Path(root).resolve(), result)
     if result.get("title_updated"):
         # The existing publisher rereads the current open manifest under the
         # admission -> checkpoint lock order. No checkpoint scan or payload
@@ -3078,7 +3100,7 @@ def build_manifest(
 
 OPEN_MANIFEST_DIR = "open-manifests"
 CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_TRIGGERS = ("explicit", "stage-complete", "supervisor-poll", "turn-end")
+CHECKPOINT_TRIGGERS = ("explicit", "stage-complete", "supervisor-poll", "turn-end", "begin")
 CHECKPOINT_INTERVAL_ENV = "AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL"
 CHECKPOINT_MIN_INTERVAL_SECONDS = 900.0
 # An automatic trigger never publishes a first interim document for a cycle
