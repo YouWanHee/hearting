@@ -1632,6 +1632,26 @@ def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str,
 OWNER_LAUNCH_ADMISSION_WAIT_SECONDS = 120.0
 
 
+def _begin_waiting_for_admission(root: Path, **kwargs: Any) -> Dict[str, Any]:
+    """`begin`, asking again while the admission lock is held, up to the launch wait bound.
+
+    AdmissionBusy surfaces when the lock is taken, before anything is written,
+    and the steps ahead of it are read-only, so asking again is safe. Past the
+    bound nothing has started: the typed error tells the caller to run start
+    again later.
+    """
+    deadline = time.monotonic() + OWNER_LAUNCH_ADMISSION_WAIT_SECONDS
+    while True:
+        try:
+            return begin(root, **kwargs)
+        except artifact_admission.AdmissionBusy:
+            if time.monotonic() >= deadline:
+                raise ProducerError(
+                    "admission-busy",
+                    f"admission lock held past {OWNER_LAUNCH_ADMISSION_WAIT_SECONDS:g}s; "
+                    "nothing started; run start again later")
+
+
 def bind_owner_launch(args, jobs: Path, *, environ=None) -> Optional[Dict[str, Any]]:
     """Publish the owner binding at the registered launch seam (§13.53.3).
 
@@ -1656,21 +1676,10 @@ def bind_owner_launch(args, jobs: Path, *, environ=None) -> Optional[Dict[str, A
         if existing_open is not None and existing_open["cycle_id"] != env_cycle:
             raise ProducerError("producer-binding-mismatch",
                                 f"launch-cycle={env_cycle} bound={existing_open['cycle_id']}")
-        # AdmissionBusy surfaces when the lock is taken, before anything is written,
-        # and the steps ahead of it are read-only, so asking again is safe.
-        deadline = time.monotonic() + OWNER_LAUNCH_ADMISSION_WAIT_SECONDS
-        while True:
-            try:
-                result = begin(root, route_file=Path(route_file), capability=route["capability"],
-                               intensity=route["effective_intensity"], require_cycle=True,
-                               jobs=Path(jobs), owner_attempt_id=args.attempt_id, resume_only=True)
-                break
-            except artifact_admission.AdmissionBusy:
-                if time.monotonic() >= deadline:
-                    raise ProducerError(
-                        "admission-busy",
-                        f"admission lock held past {OWNER_LAUNCH_ADMISSION_WAIT_SECONDS:g}s; "
-                        "nothing started; run start again later")
+        result = _begin_waiting_for_admission(
+            root, route_file=Path(route_file), capability=route["capability"],
+            intensity=route["effective_intensity"], require_cycle=True,
+            jobs=Path(jobs), owner_attempt_id=args.attempt_id, resume_only=True)
         if result.get("cycle_id") != env_cycle:
             raise ProducerError("producer-binding-mismatch",
                                 f"launch-cycle={env_cycle} bound={result.get('cycle_id', '')}")
@@ -1701,9 +1710,9 @@ def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> 
             if not group_context_matches_campaign(route, context):
                 raise ProducerError("workflow-group-campaign-mismatch", context["campaign_id"])
             selection = {"workflow_group_id": context["group_id"]}
-        return begin(root, route_file=route_file, capability=route["capability"],
-                     intensity=route["effective_intensity"], require_cycle=True, jobs=jobs,
-                     **selection)["env"]
+        return _begin_waiting_for_admission(
+            root, route_file=route_file, capability=route["capability"],
+            intensity=route["effective_intensity"], require_cycle=True, jobs=jobs, **selection)["env"]
     record = route_cycle_for(root, route)
     if record is None:
         return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (

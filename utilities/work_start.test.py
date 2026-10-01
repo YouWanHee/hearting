@@ -539,6 +539,38 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("again later", result["next_step"])
         self.assertEqual(len(self.calls), 1)   # one launch per start, however it ended
 
+    def test_owner_preparation_busy_with_no_row_says_run_start_later(self):
+        """dispatch-owner failed before any row existed: the typed admission-busy error."""
+        self.route["nodes"] = []
+        calls = self.calls
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command, 65, "check=failed\nreason=admission-busy:admission lock held past 120s; "
+                "nothing started; run start again later\nchild_spawned=0\n", "")
+        result = W.start_work(self.route, self.path, self.jobs, run=run)
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "owner-launch-not-admitted", "resume-later"), result)
+        self.assertEqual(result["launch_reason"], "admission-busy")
+        self.assertEqual(result["recovery_command"], result["resume_command"])
+        self.assertIn("capability-route.py", result["recovery_command"])
+        self.assertNotIn("harvest", result["recovery_command"])
+        self.assertIn("Nothing ran", result["next_step"])
+        self.assertIn("again later", result["next_step"])
+        self.assertEqual(len(calls), 1)
+        # no row exists, so the next start launches the same owner again
+        again = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
+        self.assertEqual(again["reason"], "owner-launch-not-started", again)
+        self.assertEqual(len(calls), 2)
+
+    def test_owner_launch_refused_for_another_reason_keeps_needs_inspection(self):
+        self.route["nodes"] = []
+        result = W.start_work(self.route, self.path, self.jobs, run=lambda command, **kwargs:
+                              subprocess.CompletedProcess(command, 65, "check=failed\nreason=x\n", ""))
+        self.assertEqual((result["state"], result["reason"]), ("needs-attention", "owner-launch-not-admitted"))
+        self.assertNotEqual(result.get("required_action"), "resume-later")
+
     def test_outcome_of_a_never_started_owner_points_at_start(self):
         aid = W.attempt_id(self.route, "owner")
         meta = self._never_started_meta(aid)

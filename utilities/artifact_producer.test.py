@@ -3849,6 +3849,37 @@ class OwnerLaunchBindingTest(ProducerTestBase):
             result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
         self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
 
+    def _unbegun_route(self):
+        self.activate()
+        route, route_file = self.route()
+        root = Path(route["artifact_root"]).resolve()
+        self.assertEqual(list(P.list_cycle_records(root)), [])
+        return route, route_file, root
+
+    def test_owner_preparation_waits_out_a_briefly_held_admission_lock(self):
+        route, route_file, root = self._unbegun_route()
+        self._hold_admission_lock(root, 1.5)
+        with mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 5.0):
+            env = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+        self.assertTrue(env["AGENT_ARTIFACT_CYCLE_ID"])
+        self.assertEqual(len(list(P.list_cycle_records(root))), 1)
+
+    def test_owner_preparation_at_the_wait_bound_reports_admission_busy(self):
+        route, route_file, root = self._unbegun_route()
+        holder = self._hold_admission_lock(root, 30)
+        with mock.patch.object(P.artifact_admission, "LOCK_TIMEOUT_DEFAULT", 0.5), \
+                mock.patch.object(P, "OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 1.0):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+            self.assertEqual(caught.exception.code, "admission-busy")
+            self.assertIn("run start again later", caught.exception.detail)
+            self.assertEqual(list(P.list_cycle_records(root)), [])   # nothing was written
+            holder.kill()
+            holder.wait()
+            env = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+        self.assertTrue(env["AGENT_ARTIFACT_CYCLE_ID"])
+
     def test_resume_only_owner_launch_publishes_and_replays_binding(self):
         route, route_file, launch_env, owner, args = self._prepared_owner()
         self.assertFalse(P.dispatch_terminal_commit.producer_binding_path(

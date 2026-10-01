@@ -1703,6 +1703,37 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
         self.assertNotIn("--qa", cmd)
         self.assertNotIn("--route-evidence", cmd)
 
+    def test_owner_preparation_held_by_the_admission_lock_is_a_typed_error_not_a_traceback(self):
+        from unittest import mock
+        from contextlib import redirect_stdout
+        import artifact_admission
+        path = self._quick_route()
+        raw = json.loads(path.read_text())
+        raw["artifact_root"] = str(path.parent)
+        path.write_text(json.dumps(raw))
+        jobs = path.parent / "jobs.log"; jobs.touch()
+        binding = SimpleNamespace(route_file=str(path), route_id="rt-x", route_hash="sha256:x",
+                                  route_node="one-shot", registry_digest="sha256:r",
+                                  write_scope="source-scoped", completion_gate="quick-complete")
+        calls = []
+        buf = io.StringIO()
+        with mock.patch.object(OWNER.subprocess, "run", side_effect=lambda cmd, **kw: calls.append(cmd)), \
+             mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
+             mock.patch.object(OWNER._capacity, "capacity_scores", return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
+             mock.patch.object(OWNER, "derive_quick_owner_binding", return_value=binding), \
+             mock.patch("artifact_producer.load_route", return_value={"capability": "autopilot-code",
+                                                                      "effective_intensity": "quick"}), \
+             mock.patch("artifact_producer.begin", side_effect=artifact_admission.AdmissionBusy("busy")), \
+             mock.patch("artifact_producer.OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 0.0, create=True), \
+             mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
+             redirect_stdout(buf):
+            rc = OWNER.main(["--start", "--route-evidence", str(path), "--prompt-text", "probe"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 65, out)
+        self.assertRegex(out, r"(?m)^reason=admission-busy:.*run start again later")
+        self.assertIn("child_spawned=0", out)
+        self.assertEqual(calls, [])
+
     def test_receipt_says_none_when_the_caller_spelled_out_the_tuple(self):
         from unittest import mock
         from contextlib import redirect_stdout

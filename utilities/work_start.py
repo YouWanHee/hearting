@@ -1155,6 +1155,13 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     if aid not in rows:
         if refusal:
             return _capacity_wait(result, aid, "owner", refusal, resume, clock)
+        if result["launches"] and _launch_failure_reason(result["launches"][-1]).partition(":")[0] == "admission-busy":
+            # The launcher's preparation timed out on a held admission lock before any row existed.
+            return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted",
+                    "required_action": "resume-later", "launch_reason": "admission-busy",
+                    "recovery_command": resume,
+                    "next_step": "The owner did not start: the artifact admission lock stayed busy. Nothing ran; "
+                        "run resume_command again later (after about a minute) and it starts the owner again."}
         return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted"}
     status, metadata = rows[aid]
     if launched_now and _never_started(status, metadata):
