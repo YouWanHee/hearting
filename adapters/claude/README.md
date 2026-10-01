@@ -145,6 +145,19 @@ both axes, reasons and evidence references. `--explicit-profiles profiles.json`
 uses a matching map and cannot bypass the judgment floor. Custom unit recipes
 provide `profile_demand` on every ad-hoc unit. Missing fields fail closed.
 
+### SD-165 part tokens
+
+`stages [--capability <name>] [--json]` prints the part catalog a graph is
+assembled from: every stage as `capability:stage` with its one-line summary,
+inputs and outputs, `unit_choices`, `shareable`, `start_approval`, optional parts,
+and the parts of other recipes this host can borrow. `compose --graph` accepts a
+host stage id or a shareable `capability:stage` (for example
+`inspect,autopilot-research:retrieval,autopilot-research:synthesis,report`); a
+borrowed part is written under `parts/<capability>/<stage>/` inside the host's own
+artifact scope. Claude reaches both through `adapters/claude/bin/capability-route.py`,
+Codex and OpenCode through `preflight.sh compose|stages`; every surface forwards
+the arguments unmodified and prints the same output.
+
 The five portable profiles are deep, balanced-deep, balanced, light and mini.
 Concrete defaults and generated native agents come from this adapter's
 `config/models.conf`; runtime loading selects the user's whole file first.

@@ -114,7 +114,7 @@ The Korean user prompts below are intentional multilingual request fixtures and 
 → S0: read the last five RUNLOG rows and recommend TF_Restormer from similar_models
 → S1: draft the spec from the prior 28.4 validation baseline, then confirm
 → S2: development/new-lib creates model/TF_Restormer/_ft01_lr_3e-4.yaml, changing config only
-→ S3: provide the command and append a pending RUNLOG row
+→ S3: run the included start-approved full-run part, or provide its command for a later compose; append a pending RUNLOG row
 
 [The user trains on the cluster.]
 
@@ -131,7 +131,7 @@ The Korean user prompts below are intentional multilingual request fixtures and 
 → S0: cite the best config from the previous lr_sweep
 → S1: specify _ft02_no_mdta
 → S2: replace only MDTA with standard PyTorch MHA; introduce no new layer
-→ S3: provide the command and record pending
+→ S3: run the included start-approved full-run part or provide its command for a later compose; record pending
 → After eval: record that removing MDTA changed 28.7 to 28.1 (-0.6)
 ```
 
@@ -142,7 +142,7 @@ The Korean user prompts below are intentional multilingual request fixtures and 
 → S0: read parent summary, config, and checkpoint
 → S1: record parent, new data, and domain-adaptation motivation
 → S2: set init_ckpt to the parent best checkpoint and create an _ft03_finetune branch
-→ S3: provide the command and record pending with the parent marker
+→ S3: run the included start-approved full-run part or provide its command for a later compose; record pending with the parent marker
 → After eval: report newdata +1.2 with existing test performance preserved
 ```
 

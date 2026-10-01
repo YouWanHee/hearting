@@ -36,7 +36,9 @@ INSTALL_CMD = (
 def load_data() -> dict:
     manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
     harness = json.loads((ROOT / "harness-manifest.json").read_text(encoding="utf-8"))
-    caps = harness["capabilities"]
+    # A compiler-internal capability is not a product surface: the landing page never counts or lists it.
+    caps = {name: spec for name, spec in harness["capabilities"].items()
+            if spec["invocation"]["class"] != "compiler-internal"}
     units = harness["units"]
     entries = sorted(
         name for name, spec in caps.items()

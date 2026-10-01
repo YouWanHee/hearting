@@ -66,7 +66,7 @@ def main() -> int:
     manifest = harness_manifest.load()
     expected: dict[Path, str] = {}
     for output_root in OUTPUT_ROOTS:
-        for identifier, spec in manifest["capabilities"].items():
+        for identifier, spec in harness_manifest.skill_capabilities(manifest).items():
             path = output_root / identifier / "SKILL.md"
             if not path.is_file():
                 raise harness_manifest.ManifestError(f"Claude Skill missing: {path}")
@@ -93,7 +93,7 @@ def main() -> int:
     for path in extras:
         path.unlink()
     print(
-        f"generated metadata for {len(manifest['capabilities'])} Claude native Skills "
+        f"generated metadata for {len(harness_manifest.skill_capabilities(manifest))} Claude native Skills "
         "and compatibility references"
     )
     return 0

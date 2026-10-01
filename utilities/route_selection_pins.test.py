@@ -255,6 +255,19 @@ class ComposeSealTest(IsolatedCase):
         self.assertNotIn("worker", route["selection_pins"])
         R.verify_route(route, R.ROOT)
 
+    def test_a_frame_pin_is_sealed_beside_two_top_legs_and_changes_neither_profile(self):
+        self.config(ALL_ENABLED)
+        pins = R._parse_selection_pins(["frame=claude:fable@xhigh"], None)
+        route = self.compose(pins=pins)
+        self.assertEqual(route["selection_pins"]["frame"],
+                         {"harness": "claude", "model": "fable", "effort": "xhigh"})
+        frames = [n for n in route["nodes"] if R._frame_node(n)]
+        self.assertEqual([(n["id"], n["model_profile"]) for n in frames],
+                         [("frame", "top"), ("frame-alternative", "top")])
+        # the pin is the user's explicit choice for the launch; the route's own profile stays `top`
+        # and the wrapper resolves the pinned harness/model/effort (RouteSelectionPinHelperTest)
+        R.verify_route(route, R.ROOT)
+
     def test_frame_legs_carry_their_profile_policy_and_old_routes_still_verify(self):
         self.config(ALL_ENABLED)
         route = self.compose()

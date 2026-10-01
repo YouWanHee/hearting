@@ -1,0 +1,2229 @@
+{
+ "capability_registry_digest": {
+  "analyze-project": "sha256:160c04dc760b81584a7d445da0733c778d7caaabd12f43d606e72a00fb9ca574",
+  "analyze-user": "sha256:a787e6d28fbc54ba019dc635f462ddb9b5ffd1112f9a08ecf56dab950761899a",
+  "audit": "sha256:d2e6741875289ba300b4334b9a84e1cf99fcf1a4e60c73c6c594a1bcaa65d314",
+  "autopilot-apply": "sha256:317c03fb47f59789c1a12b15c1a0dcf93f60fcee57408f0ae1ab4cb45f6f7cd5",
+  "autopilot-code": "sha256:5ac6894bb49c421060551625bdcfdde3f7af9676f9f52f65373428bfb8030893",
+  "autopilot-design": "sha256:a0d62cb63ec8bd255f254417241c97856fbeae4095cde072a878f65c313cecca",
+  "autopilot-draft": "sha256:37c3b4a3fc45a5df8f199f220ef940dbc19ca8eae17e51b2b14f267053057af5",
+  "autopilot-lab": "sha256:41e59b4c50376ae247eb110b8f830693f67203d482c5017210ed89a5ac0cc55c",
+  "autopilot-refine": "sha256:f97b337937dd64cb49ba675b9e19bda3a05077e9389a73e4ad99ffed91f46729",
+  "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
+  "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",
+  "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb",
+  "route-frame": "sha256:00b90489f7ac06edb802424cbccb44a60f5c12fc01813e150c0bdbd9f85b1979"
+ },
+ "scenarios": {
+  "framed:route-frame": {
+   "briefs": {
+    "frame": "f956d0db90b04a54d485",
+    "frame-alternative": "40b21afb057a4dcae436"
+   },
+   "card": "[경로] route-frame · framed(standard) frame→frame-alternative→route-decision · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 2개: sd165-lab, sd165-code\n  frame이 방향과 경로를 조립해 제안합니다\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회",
+   "completion_gates": "31917371286f7b7174f7",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "750d5eab8cf92fa0eaca",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "route-decision"
+   ],
+   "nodes": {
+    "frame": "3342eaff881322f19bb0",
+    "frame-alternative": "42ab22c3d7f8ee3eb199",
+    "route-decision": "118b078f8655b56d1102"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "487935e3cb1809a682f9",
+   "workflow_contract": "06d32468156759abf3e8"
+  },
+  "full:analyze-project:code": {
+   "briefs": {
+    "analyze": "9f42b556b4a4ffe10b73",
+    "qa": "5cb7a6211989225f4a45"
+   },
+   "card": "[경로] analyze-project · staged(standard) analyze→qa · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "127a0acbc4890db1bfb0",
+   "composed_recipe": "52c8e846219876efb763",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "analyze",
+    "qa"
+   ],
+   "nodes": {
+    "analyze": "f6e5d3147b397427c04a",
+    "qa": "f33013f41184892a0747"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "15575b019f576c8c4651",
+   "workflow_contract": "05f9dbc4d9718b15cce6"
+  },
+  "full:analyze-user:init": {
+   "briefs": {
+    "profile": "ff982376d8cd37478a83",
+    "verify": "837823a9efbbce0071ab"
+   },
+   "card": "[경로] analyze-user · staged(standard) profile→verify · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "867b1d8f9c8edf23f5d7",
+   "composed_recipe": "1f3a2c43fd27f149a7f9",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "profile",
+    "verify"
+   ],
+   "nodes": {
+    "profile": "f8c85d43180c9f67e9eb",
+    "verify": "298536bcc2d16e80923b"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "c5f0afcbbcc423b00f50",
+   "workflow_contract": "b1e6bbe7b8d88ba0a8f3"
+  },
+  "full:audit:default": {
+   "briefs": {
+    "inspect": "826d2ab829f2208d6091",
+    "report": "b5a57dc06512246abdf7"
+   },
+   "card": "[경로] audit · staged(standard) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "dce35550d538e4b1de2b",
+   "composed_recipe": "a0103f366e636f4adeac",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "inspect",
+    "report"
+   ],
+   "nodes": {
+    "inspect": "908eb16ba2481635f38f",
+    "report": "49e037a8770a45805e2c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "1bdc158c3622d3f9ceb0",
+   "workflow_contract": "0796a50ef695aefd6d17"
+  },
+  "full:autopilot-apply:default": {
+   "briefs": {
+    "apply": "4e432c222d42bb438ce2",
+    "handback": "29c3e4fa300dc2fdf950",
+    "verify": "eb11a084071e1903729c"
+   },
+   "card": "[경로] autopilot-apply · staged(standard) apply→verify→handback · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 handback (autopilot-apply:handback)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "f1594a0198f5d7628cca",
+   "composed_recipe": "c3ef724cf4e556dac506",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "apply",
+    "verify",
+    "handback"
+   ],
+   "nodes": {
+    "apply": "2081339e346f18b3e537",
+    "handback": "50e6bd80ca5949dea7f1",
+    "verify": "76bb24bf0158079f5bc9"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "bb7db87ef08da493ad79",
+   "workflow_contract": "803911889260563af32e"
+  },
+  "full:autopilot-code:audit": {
+   "briefs": {
+    "execute": "169320765779a74b2430",
+    "frame": "899151d204b112c4fb58",
+    "frame-alternative": "1626889663b320cf9fdd",
+    "impl-review": "cdd2d40816a2d4baf703",
+    "plan": "83c4cefbe17a329f373f",
+    "plan-check": "0ddcc515dfadd83eda6e",
+    "report": "546c565ee919d334bcc3",
+    "test": "843bc09c1933578d4b05"
+   },
+   "card": "[경로] autopilot-code · staged(standard) frame→frame-alternative→plan→plan-check→execute→impl-review→test→report · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "e5d55b4db5bd774a2f12",
+   "composed_recipe": "ebb116b29da91962060e",
+   "conditional_extensions": "1c35f287e42041098273",
+   "human_gate_bindings": "5c42bb7fed19a3bc080e",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "plan",
+    "plan-check",
+    "execute",
+    "impl-review",
+    "test",
+    "report"
+   ],
+   "nodes": {
+    "execute": "62bee46ff60e1439a352",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
+    "impl-review": "67159d8c3d1024937397",
+    "plan": "16ecd56ef296d3a01a58",
+    "plan-check": "1af0490d85bdae3c5139",
+    "report": "f88144b017defeb9c36d",
+    "test": "8a2cafdb0fad1a5430bd"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "58165fcf9a342bb1db4d",
+   "workflow_contract": "bdf7b87120746579513d"
+  },
+  "full:autopilot-design:default": {
+   "briefs": {
+    "build": "a00c44e77fd99c500974",
+    "critic-review": "cdec76cc5870c1c29c67",
+    "frame": "97829d85a081a1004447",
+    "frame-alternative": "4233b578588dd32002d6",
+    "handoff": "d672287db5aee6b8f284",
+    "refs": "f4d03e541fc59fe5da7d",
+    "refs-alternative": "fa5f70fbd9c8a3db5fcb",
+    "visual-verify": "75a641c18060fdc2f81f"
+   },
+   "card": "[경로] autopilot-design · staged(standard) frame→frame-alternative→refs→refs-alternative→build→visual-verify→critic-review→handoff · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "38b9e69ad8dc899ec595",
+   "composed_recipe": "225ac3acc3b114844aa5",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "2b60d578c2167df7eb77",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "refs",
+    "refs-alternative",
+    "build",
+    "visual-verify",
+    "critic-review",
+    "handoff"
+   ],
+   "nodes": {
+    "build": "c5090fd1c60edd227efb",
+    "critic-review": "c5127078b910c3e4f26b",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
+    "handoff": "d43048210014552287c5",
+    "refs": "646330cf1023f9a6177d",
+    "refs-alternative": "f644e4997492b717feb4",
+    "visual-verify": "ab86d70cf8131556a6f6"
+   },
+   "parallel_groups": "58ee499b14b3866130f3",
+   "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
+   "workflow_contract": "459cb87eedd974d67171"
+  },
+  "full:autopilot-draft:doc": {
+   "briefs": {
+    "draft-production": "2dda835312b9c938cb07",
+    "fact-verify": "bf08d93199da67a9fa9f",
+    "finalize": "6ceaac470fc150cb93bc",
+    "frame": "69c2ceccc3f29e093019",
+    "frame-alternative": "83366a8ed06cf070d1a2",
+    "material-strategy": "0b5e05c9d4aee575f960",
+    "material-strategy-alternative": "3a1591f8e4e24c68242b",
+    "quality-review": "775193712e2803f9f636",
+    "strategy-review": "a34c0e9931a3535d8b25"
+   },
+   "card": "[경로] autopilot-draft · staged(standard) frame→frame-alternative→material-strategy→material-strategy-alternative→strategy-review→draft-production→quality-review→fact-verify→finalize · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "c817168192736db82e83",
+   "composed_recipe": "3b3c78c7204ed6a9b496",
+   "conditional_extensions": "b056b9625be214a20b3f",
+   "human_gate_bindings": "53860b3d0e843b01a100",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "material-strategy",
+    "material-strategy-alternative",
+    "strategy-review",
+    "draft-production",
+    "quality-review",
+    "fact-verify",
+    "finalize"
+   ],
+   "nodes": {
+    "draft-production": "6257dbf84f6acc53acb2",
+    "fact-verify": "939c42edaf963a217389",
+    "finalize": "cfb9ce42387a6051c148",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
+    "material-strategy": "b057ce3a9d574d0237d6",
+    "material-strategy-alternative": "5f8711c08f9e62852876",
+    "quality-review": "d1a05306ede30ea58a78",
+    "strategy-review": "f3e71eed0f66218a4aac"
+   },
+   "parallel_groups": "0df15d083d28bfecf292",
+   "resume_retry_boundaries": "bd4d6a89231fb8e5ca56",
+   "workflow_contract": "acfb9dbb09e457ec5401"
+  },
+  "full:autopilot-lab:eval": {
+   "briefs": {
+    "eval-run": "34bc1de5fdd29af87ff1",
+    "independent-verify": "a8bdf7b4b0c6596593fc",
+    "media": "d7a1ec30fe44d938b33f",
+    "metrics": "580cc90f22c9f175ef61",
+    "publish": "52c851d5192cf4025716",
+    "report": "f83bf68f0ae4fd5d7907",
+    "sync": "0b5c4791b8a64412c1ee"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) eval-run→metrics→media→report→independent-verify→publish→sync · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "fe8d1120c6efbc775cbc",
+   "composed_recipe": "e46509e61429f4c39a84",
+   "conditional_extensions": "a72ac988a99a64e7987a",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "eval-run",
+    "metrics",
+    "media",
+    "report",
+    "independent-verify",
+    "publish",
+    "sync"
+   ],
+   "nodes": {
+    "eval-run": "d8eb148526235c878d06",
+    "independent-verify": "1e8ece653945873d0352",
+    "media": "76d12982784a2a2b16a2",
+    "metrics": "b646e9c8ffef5599d29d",
+    "publish": "9ce87d1c081d1cf44cd9",
+    "report": "0fd3e8bcd26ff851eeb0",
+    "sync": "17fadd8b3141167375be"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "829bb16ceec3d55e0694",
+   "workflow_contract": "7ef67849b3399ea59be0"
+  },
+  "full:autopilot-lab:setup": {
+   "briefs": {
+    "full-run": "b58a1b4df9d88f1463cb",
+    "handoff": "2bd7eb094ce504ba9a5a",
+    "run-verify": "f9cee8a900b02cd4cd2f",
+    "scaffold": "e774b31ac4da498c2729",
+    "smoke": "84e1a3236dfaa5a9b1f7"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) scaffold→smoke→full-run→run-verify→handoff · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 full-run (autopilot-lab:full-run)",
+   "completion_gates": "37529aac6db024b7c26b",
+   "composed_recipe": "a083739c3b968e567112",
+   "conditional_extensions": "8eaf2f0bb49917e3599e",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "scaffold",
+    "smoke",
+    "full-run",
+    "run-verify",
+    "handoff"
+   ],
+   "nodes": {
+    "full-run": "9479e5bcaab0cd5461e8",
+    "handoff": "72cf668663bb88a5fe05",
+    "run-verify": "f222e147086433649bcb",
+    "scaffold": "16de76c2bf9a5e7de177",
+    "smoke": "a0e9a21551c94d211e0c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "fa4b8fcb0af11baa867e",
+   "workflow_contract": "827cbc891ea30915037f"
+  },
+  "full:autopilot-refine:default": {
+   "briefs": {
+    "frame": "ccc1b905a66a5505c2ef",
+    "frame-alternative": "4df946baee935721b951",
+    "review": "25154dc17d4ce425ae08",
+    "transaction": "d4edf84572c47178d810"
+   },
+   "card": "[경로] autopilot-refine · staged(standard) frame→frame-alternative→review→transaction · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "7be6ed6dacc44f9abedd",
+   "composed_recipe": "e5e01e92f315898a45fc",
+   "conditional_extensions": "1c90d16dc25b0339d09a",
+   "human_gate_bindings": "b017ed0c89377f6fbe31",
+   "human_gates": "06cc065ba71874ba684f",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "review",
+    "transaction"
+   ],
+   "nodes": {
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
+    "review": "fbfd888a48cf35110d6c",
+    "transaction": "d6732a9044ff372d85b5"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "7f8079c9d0c78bba8fde",
+   "workflow_contract": "8268f1e37305cbfd7b66"
+  },
+  "full:autopilot-research:academic": {
+   "briefs": {
+    "claim-verify": "97fcb53d5083ac686d64",
+    "report": "b92e489c8e4d062dd92f",
+    "retrieval": "42cd19b5a9c653a5b563",
+    "retrieval-alternative": "0bca4352f7dca3293d9a",
+    "synthesis": "9d8ff0c31160f1ba778e"
+   },
+   "card": "[경로] autopilot-research · staged(standard) retrieval→retrieval-alternative→synthesis→report→claim-verify · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "001d6a372d8da666c2a7",
+   "composed_recipe": "f9caa7326e1b14345955",
+   "conditional_extensions": "3190e5c9e1ee25d039c9",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "retrieval",
+    "retrieval-alternative",
+    "synthesis",
+    "report",
+    "claim-verify"
+   ],
+   "nodes": {
+    "claim-verify": "28416038dfb316da9bc9",
+    "report": "5ea219a2bd08d9be0e67",
+    "retrieval": "5b5c0a171e667fc8f184",
+    "retrieval-alternative": "f947cff3cb75ef9b4d6e",
+    "synthesis": "13df7898d82a5243c305"
+   },
+   "parallel_groups": "ffa303e193c1d1833c36",
+   "resume_retry_boundaries": "f76520442e754beec0e0",
+   "workflow_contract": "401ebb9dcc86e67f56de"
+  },
+  "full:autopilot-ship:default": {
+   "briefs": {
+    "deploy": "44b0f54d1e154676a008",
+    "post-deploy-verify": "81fdb6e4fd918bc08754",
+    "release-review": "2498eecc508f1d970025",
+    "release-setup": "5ac999289585bb51342d",
+    "security-review": "3a713a36ce62774b1b45"
+   },
+   "card": "[경로] autopilot-ship · staged(standard) release-setup→security-review→release-review→deploy→post-deploy-verify · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 deploy (autopilot-ship:deploy)",
+   "completion_gates": "f33e71ea8f68a70600b1",
+   "composed_recipe": "4326258b062590dab580",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "release-setup",
+    "security-review",
+    "release-review",
+    "deploy",
+    "post-deploy-verify"
+   ],
+   "nodes": {
+    "deploy": "63c220ca99cac9713868",
+    "post-deploy-verify": "c4c4250b90f2b7208dcd",
+    "release-review": "0c1902713307220131eb",
+    "release-setup": "7a3d73beef1d6fe41afc",
+    "security-review": "b065fdb0483097b3cb8e"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "ea4355148774db2197d0",
+   "workflow_contract": "eb7bb9a039bcf1ddad54"
+  },
+  "full:autopilot-ship:package": {
+   "briefs": {
+    "package": "c0934e18d94dbc42b3a4"
+   },
+   "card": "[경로] autopilot-ship · staged(standard) package · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "e449a08ec812d99fb510",
+   "composed_recipe": "56c2c054e6bd76b8e517",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "package"
+   ],
+   "nodes": {
+    "package": "5bea037ecce1f1aae41c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "7b2aa63ef26dad0d149c",
+   "workflow_contract": "8bf0de58b41518c03726"
+  },
+  "full:autopilot-spec:api": {
+   "briefs": {
+    "frame": "33c2a97785e014eafaef",
+    "frame-alternative": "f2e7ee47c50cb0b9a5c6",
+    "prd-transaction": "7ad6e9072ba2cbf0d0f1",
+    "research": "da1b9a476fd97945085c",
+    "research-alternative": "c1d836ad538ab8be81c6",
+    "review": "01eb217123e829c8086a"
+   },
+   "card": "[경로] autopilot-spec · staged(standard) frame→frame-alternative→research→research-alternative→review→prd-transaction · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "d17fa400f1adf8ea0bd2",
+   "composed_recipe": "3fb6ef7c902ba0ffd28d",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "7df3a80b44df5c5f4921",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "research",
+    "research-alternative",
+    "review",
+    "prd-transaction"
+   ],
+   "nodes": {
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
+    "prd-transaction": "1bf3bc9546a9752b719c",
+    "research": "dc092f1e003d2a3eab66",
+    "research-alternative": "11aacc87b246af85b232",
+    "review": "af0db466de850a7cb625"
+   },
+   "parallel_groups": "acb3c8b1d0d1fc9f7101",
+   "resume_retry_boundaries": "946a44c224fc8d977731",
+   "workflow_contract": "5849c74fb09a1af56e1c"
+  },
+  "partial:audit:default:inspect,report:standard": {
+   "briefs": {
+    "inspect": "826d2ab829f2208d6091",
+    "report": "b5a57dc06512246abdf7"
+   },
+   "card": "[경로] audit · staged(standard) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "dce35550d538e4b1de2b",
+   "composed_recipe": "a0103f366e636f4adeac",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "inspect",
+    "report"
+   ],
+   "nodes": {
+    "inspect": "908eb16ba2481635f38f",
+    "report": "49e037a8770a45805e2c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "1bdc158c3622d3f9ceb0",
+   "workflow_contract": "0796a50ef695aefd6d17"
+  },
+  "partial:autopilot-code:dev:execute,test,report:standard": {
+   "briefs": {
+    "execute": "28bba6885103d209077f",
+    "report": "1b098fa76381a1275c50",
+    "test": "222470c112f0461b1ea1"
+   },
+   "card": "[경로] autopilot-code · staged(standard) execute→test→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "066508ccd6fbc97d04a0",
+   "composed_recipe": "a7cb2906af697b04a443",
+   "conditional_extensions": "1c35f287e42041098273",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "execute",
+    "test",
+    "report"
+   ],
+   "nodes": {
+    "execute": "6e773cf49dc454516841",
+    "report": "34b417aa7259fa74e9e8",
+    "test": "6801b66d7b0b98e7750f"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "a14202a81976262fb12b",
+   "workflow_contract": "a53c110cf7e9cc719b6b"
+  },
+  "partial:autopilot-code:dev:execute:dev/refactor,test:standard": {
+   "briefs": {
+    "execute": "09510d14c52f6a1e3d5a",
+    "test": "222470c112f0461b1ea1"
+   },
+   "card": "[경로] autopilot-code · staged(standard) execute→test · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "9c2637bb7ed2a02f43b6",
+   "composed_recipe": "d9dd0bf4ceb94ba49a22",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "execute",
+    "test"
+   ],
+   "nodes": {
+    "execute": "d95d2329b128b4c0499d",
+    "test": "0d7868ebcb12b6437ad0"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "a8b865dbd4fc384d6020",
+   "workflow_contract": "91213202e6fc5ee24036"
+  },
+  "partial:autopilot-lab:eval:eval-run,metrics,report:standard": {
+   "briefs": {
+    "eval-run": "34bc1de5fdd29af87ff1",
+    "metrics": "580cc90f22c9f175ef61",
+    "report": "8d0f0d4933f88c463e71"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) eval-run→metrics→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "d3b2b79bceb4ebfca5b8",
+   "composed_recipe": "eb30a954c76a84755412",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "eval-run",
+    "metrics",
+    "report"
+   ],
+   "nodes": {
+    "eval-run": "d8eb148526235c878d06",
+    "metrics": "b646e9c8ffef5599d29d",
+    "report": "1ab0ac091b8d6975bc14"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "330c54f6d321223c8600",
+   "workflow_contract": "1b24c10b4e44de3e0525"
+  },
+  "partial:autopilot-lab:eval:report,independent-verify,publish,sync:strong": {
+   "briefs": {
+    "independent-verify": "762f666d0c48c8c0a175",
+    "independent-verify-alternative": "d6e3f30ca0d39ad76593",
+    "publish": "69b568cfc2124e7febe8",
+    "report": "a76f10e3b3d300ad5ca3",
+    "sync": "6475c28da93e3d36d00c"
+   },
+   "card": "[경로] autopilot-lab · staged(strong) report→independent-verify→independent-verify-alternative→publish→sync · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "10eb9737570429262dd8",
+   "composed_recipe": "da4b07991fd1c36dbca6",
+   "conditional_extensions": "a72ac988a99a64e7987a",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "report",
+    "independent-verify",
+    "independent-verify-alternative",
+    "publish",
+    "sync"
+   ],
+   "nodes": {
+    "independent-verify": "7df8e85c84e752df18c2",
+    "independent-verify-alternative": "4fd972b55453e688b926",
+    "publish": "d571845b3fa6c6c295ff",
+    "report": "27dc9f1a82be739e3987",
+    "sync": "17fadd8b3141167375be"
+   },
+   "parallel_groups": "06212fbb70ee2d86a44c",
+   "resume_retry_boundaries": "85162028422176e9182d",
+   "workflow_contract": "16d090d3cf2946d9acf0"
+  },
+  "partial:autopilot-lab:setup:smoke,full-run,run-verify:standard": {
+   "briefs": {
+    "full-run": "b58a1b4df9d88f1463cb",
+    "run-verify": "f9cee8a900b02cd4cd2f",
+    "smoke": "84e1a3236dfaa5a9b1f7"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) smoke→full-run→run-verify · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 full-run (autopilot-lab:full-run)",
+   "completion_gates": "a5bd215581785b14ac60",
+   "composed_recipe": "9064034d3a427d588589",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "smoke",
+    "full-run",
+    "run-verify"
+   ],
+   "nodes": {
+    "full-run": "9479e5bcaab0cd5461e8",
+    "run-verify": "38e7e31320452995fa11",
+    "smoke": "e2cf08c3a54c1318119d"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "01bcd54d42986c3283f3",
+   "workflow_contract": "c744514e76f297576274"
+  },
+  "partial:autopilot-research:technology:retrieval,synthesis,report:thorough": {
+   "briefs": {
+    "report": "f9d686f061e244539387",
+    "retrieval": "fd950525c4209e1891c1",
+    "retrieval-alternative": "50785bfa9eeb0f6aee52",
+    "retrieval-assumption": "99569a907dbdacab98be",
+    "synthesis": "0b1b8f250ae67d94b206"
+   },
+   "card": "[경로] autopilot-research · staged(thorough) retrieval→retrieval-alternative→retrieval-assumption→synthesis→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "6ee3b4332fbd4edcf78e",
+   "composed_recipe": "7b378aaaa7a90a993e7f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "retrieval",
+    "retrieval-alternative",
+    "retrieval-assumption",
+    "synthesis",
+    "report"
+   ],
+   "nodes": {
+    "report": "fb8064cbfb960803114a",
+    "retrieval": "a3c2b95fe9fab583e04e",
+    "retrieval-alternative": "45747dfcc7dc3f8ee03a",
+    "retrieval-assumption": "b71ad81362a390ed87f0",
+    "synthesis": "e917299c84c0c989b136"
+   },
+   "parallel_groups": "c850a922ff120cbb1865",
+   "resume_retry_boundaries": "81f87141f3c26a6c0f77",
+   "workflow_contract": "0c469551f9b4ca3b5ff3"
+  },
+  "preset:analyze-project:code:standard": {
+   "briefs": {
+    "analyze": "9f42b556b4a4ffe10b73",
+    "qa": "5cb7a6211989225f4a45"
+   },
+   "card": "[경로] analyze-project · staged(standard) analyze · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "34d2e1645d095787daf1",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "analyze",
+    "qa"
+   ],
+   "nodes": {
+    "analyze": "8f69b951221ab673e396",
+    "qa": "70808cefdbd7d338ec59"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "4d6ff9a770d7bdede167",
+   "workflow_contract": "05f9dbc4d9718b15cce6"
+  },
+  "preset:analyze-project:code:strong": {
+   "briefs": {
+    "analyze": "522a0ec22075431fea5c",
+    "qa": "ab89a388588d8411510e"
+   },
+   "card": "[경로] analyze-project · staged(strong) analyze · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "34d2e1645d095787daf1",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "analyze",
+    "qa"
+   ],
+   "nodes": {
+    "analyze": "8f69b951221ab673e396",
+    "qa": "70808cefdbd7d338ec59"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "4d6ff9a770d7bdede167",
+   "workflow_contract": "05f9dbc4d9718b15cce6"
+  },
+  "preset:analyze-project:code:thorough": {
+   "briefs": {
+    "analyze": "47d86b30b971aff3c738",
+    "qa": "122f14498cb5d629dfce"
+   },
+   "card": "[경로] analyze-project · staged(thorough) analyze · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "34d2e1645d095787daf1",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "analyze",
+    "qa"
+   ],
+   "nodes": {
+    "analyze": "8f69b951221ab673e396",
+    "qa": "70808cefdbd7d338ec59"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "4d6ff9a770d7bdede167",
+   "workflow_contract": "05f9dbc4d9718b15cce6"
+  },
+  "preset:analyze-user:init:standard": {
+   "briefs": {
+    "profile": "ff982376d8cd37478a83",
+    "verify": "837823a9efbbce0071ab"
+   },
+   "card": "[경로] analyze-user · staged(standard) profile · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "882ab1192e3b127b154f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "profile",
+    "verify"
+   ],
+   "nodes": {
+    "profile": "8439148b7a63b79a1f5f",
+    "verify": "231c36db9d9533d5693e"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "b9eb77547cbbb3d860a2",
+   "workflow_contract": "b1e6bbe7b8d88ba0a8f3"
+  },
+  "preset:analyze-user:init:strong": {
+   "briefs": {
+    "profile": "cfc86b1342107de96c20",
+    "verify": "8e7e13c29c5f6ce1dab1"
+   },
+   "card": "[경로] analyze-user · staged(strong) profile · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "882ab1192e3b127b154f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "profile",
+    "verify"
+   ],
+   "nodes": {
+    "profile": "8439148b7a63b79a1f5f",
+    "verify": "231c36db9d9533d5693e"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "b9eb77547cbbb3d860a2",
+   "workflow_contract": "b1e6bbe7b8d88ba0a8f3"
+  },
+  "preset:analyze-user:init:thorough": {
+   "briefs": {
+    "profile": "6bfd61603142d2495964",
+    "verify": "d74f92f54239094c1f04"
+   },
+   "card": "[경로] analyze-user · staged(thorough) profile · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "882ab1192e3b127b154f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "profile",
+    "verify"
+   ],
+   "nodes": {
+    "profile": "8439148b7a63b79a1f5f",
+    "verify": "231c36db9d9533d5693e"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "b9eb77547cbbb3d860a2",
+   "workflow_contract": "b1e6bbe7b8d88ba0a8f3"
+  },
+  "preset:audit:default:standard": {
+   "briefs": {
+    "inspect": "826d2ab829f2208d6091",
+    "report": "b5a57dc06512246abdf7"
+   },
+   "card": "[경로] audit · staged(standard) inspect · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "dce35550d538e4b1de2b",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "inspect",
+    "report"
+   ],
+   "nodes": {
+    "inspect": "bd882fff56751a5a92f4",
+    "report": "1537553f69c055d0fa87"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "5ab21a055924dad5241e",
+   "workflow_contract": "0796a50ef695aefd6d17"
+  },
+  "preset:audit:default:strong": {
+   "briefs": {
+    "inspect": "048019ff412baa403efa",
+    "report": "13c9db1a6e3cf840c910"
+   },
+   "card": "[경로] audit · staged(strong) inspect · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "dce35550d538e4b1de2b",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "inspect",
+    "report"
+   ],
+   "nodes": {
+    "inspect": "bd882fff56751a5a92f4",
+    "report": "1537553f69c055d0fa87"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "5ab21a055924dad5241e",
+   "workflow_contract": "0796a50ef695aefd6d17"
+  },
+  "preset:audit:default:thorough": {
+   "briefs": {
+    "inspect": "d814bcd28444635e379e",
+    "report": "d5cfc647ac2ad3539f8e"
+   },
+   "card": "[경로] audit · staged(thorough) inspect · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "dce35550d538e4b1de2b",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "inspect",
+    "report"
+   ],
+   "nodes": {
+    "inspect": "bd882fff56751a5a92f4",
+    "report": "1537553f69c055d0fa87"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "5ab21a055924dad5241e",
+   "workflow_contract": "0796a50ef695aefd6d17"
+  },
+  "preset:autopilot-apply:default:standard": {
+   "briefs": {
+    "apply": "4e432c222d42bb438ce2",
+    "handback": "29c3e4fa300dc2fdf950",
+    "verify": "eb11a084071e1903729c"
+   },
+   "card": "[경로] autopilot-apply · staged(standard) apply · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 handback (autopilot-apply:handback)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "461249f5ae79aa45cd39",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "apply",
+    "verify",
+    "handback"
+   ],
+   "nodes": {
+    "apply": "2bb318b7382d5085c587",
+    "handback": "50e6bd80ca5949dea7f1",
+    "verify": "d96113b59537617dc0c7"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "e85c1b13185c5ab84312",
+   "workflow_contract": "803911889260563af32e"
+  },
+  "preset:autopilot-apply:default:strong": {
+   "briefs": {
+    "apply": "7eaac94a4bf5b214384d",
+    "handback": "cf42cd414674b5d22df6",
+    "verify": "ae7fdbd6eba9bc2879da",
+    "verify-alternative": "38d97499ac72598ca5be"
+   },
+   "card": "[경로] autopilot-apply · staged(strong) apply · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 handback (autopilot-apply:handback)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "461249f5ae79aa45cd39",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "apply",
+    "verify",
+    "verify-alternative",
+    "handback"
+   ],
+   "nodes": {
+    "apply": "2bb318b7382d5085c587",
+    "handback": "b9752352271f85778d5b",
+    "verify": "968e83a3bce48ac81821",
+    "verify-alternative": "443132a347e6403f6ecc"
+   },
+   "parallel_groups": "8148970f9ddff45b5c3b",
+   "resume_retry_boundaries": "e85c1b13185c5ab84312",
+   "workflow_contract": "c29cc3010fda1674b0ed"
+  },
+  "preset:autopilot-apply:default:thorough": {
+   "briefs": {
+    "apply": "dc1ad4c5ad882f81ef57",
+    "handback": "3d4812396ffe02691b74",
+    "verify": "20dc84f37d3eeff9778d",
+    "verify-alternative": "3cdb06797476bd886974"
+   },
+   "card": "[경로] autopilot-apply · staged(thorough) apply · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 handback (autopilot-apply:handback)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "461249f5ae79aa45cd39",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "apply",
+    "verify",
+    "verify-alternative",
+    "handback"
+   ],
+   "nodes": {
+    "apply": "2bb318b7382d5085c587",
+    "handback": "b9752352271f85778d5b",
+    "verify": "968e83a3bce48ac81821",
+    "verify-alternative": "443132a347e6403f6ecc"
+   },
+   "parallel_groups": "8148970f9ddff45b5c3b",
+   "resume_retry_boundaries": "e85c1b13185c5ab84312",
+   "workflow_contract": "c29cc3010fda1674b0ed"
+  },
+  "preset:autopilot-code:audit:standard": {
+   "briefs": {
+    "execute": "169320765779a74b2430",
+    "frame": "899151d204b112c4fb58",
+    "frame-alternative": "1626889663b320cf9fdd",
+    "impl-review": "cdd2d40816a2d4baf703",
+    "plan": "83c4cefbe17a329f373f",
+    "plan-check": "0ddcc515dfadd83eda6e",
+    "report": "546c565ee919d334bcc3",
+    "test": "843bc09c1933578d4b05"
+   },
+   "card": "[경로] autopilot-code · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "77b96d149e2aad4b1825",
+   "conditional_extensions": "1c35f287e42041098273",
+   "human_gate_bindings": "5c42bb7fed19a3bc080e",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "plan",
+    "plan-check",
+    "execute",
+    "impl-review",
+    "test",
+    "report"
+   ],
+   "nodes": {
+    "execute": "de546b5b6db75e89abd5",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
+    "impl-review": "fe09366a6dd009208672",
+    "plan": "3be56b34984cc1e4cd55",
+    "plan-check": "f89cf48792bf2e3daf2d",
+    "report": "fbf7328e6f79846ebd2a",
+    "test": "8defb38ad558b3da3cf8"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "58165fcf9a342bb1db4d",
+   "workflow_contract": "bdf7b87120746579513d"
+  },
+  "preset:autopilot-code:audit:strong": {
+   "briefs": {
+    "execute": "6035cd8ff76e419258db",
+    "frame": "bd30a0a056fafdd842dd",
+    "frame-alternative": "cb78d3b9b4763501f984",
+    "impl-review": "5943918c25b3e9831e98",
+    "impl-review-alternative": "441888fff30ad8312858",
+    "plan": "3947ec29b0805f4b6100",
+    "plan-alternative": "2b869bdf39a897eab128",
+    "plan-check": "9e6c753a06b06ccd4648",
+    "plan-check-alternative": "4ca1ebd754ec93501ffb",
+    "report": "5d7fbdae44ce9e653b53",
+    "test": "3d5e842c01aadf879bbc"
+   },
+   "card": "[경로] autopilot-code · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "77b96d149e2aad4b1825",
+   "conditional_extensions": "1c35f287e42041098273",
+   "human_gate_bindings": "5c42bb7fed19a3bc080e",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "plan",
+    "plan-alternative",
+    "plan-check",
+    "plan-check-alternative",
+    "execute",
+    "impl-review",
+    "impl-review-alternative",
+    "test",
+    "report"
+   ],
+   "nodes": {
+    "execute": "17d2fa0ad8f38ff24143",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
+    "impl-review": "a5e2fd0fec3f6256ade2",
+    "impl-review-alternative": "e41ce04d72b6837ba8bb",
+    "plan": "389f4f1181e84367abbc",
+    "plan-alternative": "622b9003c76e553a1124",
+    "plan-check": "3a130c15a6487f88d674",
+    "plan-check-alternative": "aa6771413878bc7e63bd",
+    "report": "fbf7328e6f79846ebd2a",
+    "test": "2f840557aa1eeefa131c"
+   },
+   "parallel_groups": "5f88557e6f6b1919d9d8",
+   "resume_retry_boundaries": "58165fcf9a342bb1db4d",
+   "workflow_contract": "75c1fdfbdf488979aa69"
+  },
+  "preset:autopilot-code:audit:thorough": {
+   "briefs": {
+    "execute": "32e5f045de807e04363d",
+    "frame": "4cf3dd15e641e50f18a1",
+    "frame-alternative": "25ba88b98c803c18b4a3",
+    "impl-review": "7a8ef11dc883a92be00a",
+    "impl-review-alternative": "f0ffa6518f4a5c8d5695",
+    "impl-review-failure-mode": "e13f6d7579a20a732d66",
+    "plan": "4ee5c3c5a685607726b8",
+    "plan-alternative": "20fd65ae7dc6241910ec",
+    "plan-check": "eb74e432be3efd5aeda1",
+    "plan-check-alternative": "48e329fd15b27abda13c",
+    "plan-check-simplicity": "3e4ea9a107555472dde6",
+    "plan-implementation-risk": "5b75bd46d9fd740311fd",
+    "report": "39b8ec3702d00334c04f",
+    "test": "69ae06fe22f6ba37ae42"
+   },
+   "card": "[경로] autopilot-code · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "77b96d149e2aad4b1825",
+   "conditional_extensions": "1c35f287e42041098273",
+   "human_gate_bindings": "5c42bb7fed19a3bc080e",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "plan",
+    "plan-alternative",
+    "plan-implementation-risk",
+    "plan-check",
+    "plan-check-alternative",
+    "plan-check-simplicity",
+    "execute",
+    "impl-review",
+    "impl-review-alternative",
+    "impl-review-failure-mode",
+    "test",
+    "report"
+   ],
+   "nodes": {
+    "execute": "380a4a81eaf18c71167e",
+    "frame": "cc26c72e493d1f02e6dc",
+    "frame-alternative": "38ae5068f43b9fb7c4fc",
+    "impl-review": "b332734ae04c33825e18",
+    "impl-review-alternative": "b4b8689c9fe63379c2a8",
+    "impl-review-failure-mode": "73da4288ba0735d17c33",
+    "plan": "1688c50859e6cb9fd4bc",
+    "plan-alternative": "618f1a442367aaea60f2",
+    "plan-check": "a4fb07e02ae7624d9784",
+    "plan-check-alternative": "c1fe49d99d09c3467c79",
+    "plan-check-simplicity": "18f9f6e971e4ee926da3",
+    "plan-implementation-risk": "26bc486e8d7f6109c64f",
+    "report": "fbf7328e6f79846ebd2a",
+    "test": "7411d6598804dc87a389"
+   },
+   "parallel_groups": "fb29d1d1767166fd835f",
+   "resume_retry_boundaries": "58165fcf9a342bb1db4d",
+   "workflow_contract": "44faeb15373e431cc606"
+  },
+  "preset:autopilot-design:default:standard": {
+   "briefs": {
+    "build": "a00c44e77fd99c500974",
+    "critic-review": "cdec76cc5870c1c29c67",
+    "frame": "97829d85a081a1004447",
+    "frame-alternative": "4233b578588dd32002d6",
+    "handoff": "d672287db5aee6b8f284",
+    "refs": "f4d03e541fc59fe5da7d",
+    "refs-alternative": "fa5f70fbd9c8a3db5fcb",
+    "visual-verify": "75a641c18060fdc2f81f"
+   },
+   "card": "[경로] autopilot-design · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "4fb32a3fc3c7c2f1a70f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "2b60d578c2167df7eb77",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "refs",
+    "refs-alternative",
+    "build",
+    "visual-verify",
+    "critic-review",
+    "handoff"
+   ],
+   "nodes": {
+    "build": "89f360f894ab033b22bf",
+    "critic-review": "4b52a2069190def77a9f",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
+    "handoff": "84170812dc0d8b556ead",
+    "refs": "200b42bbfecb1d192ad9",
+    "refs-alternative": "73e3ecb484519fccab5b",
+    "visual-verify": "5af720e981f57853b872"
+   },
+   "parallel_groups": "58ee499b14b3866130f3",
+   "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
+   "workflow_contract": "459cb87eedd974d67171"
+  },
+  "preset:autopilot-design:default:strong": {
+   "briefs": {
+    "build": "383d6cef0d9d9feb21e9",
+    "critic-review": "7f5fc713d7d266b2a08c",
+    "critic-review-alternative": "11ecaf8c7d26556fe28e",
+    "frame": "66cf873905ff4a0d48f9",
+    "frame-alternative": "af573bb4029507925dcb",
+    "handoff": "7a0c965650d965eed09f",
+    "refs": "ca31700e776fe13fa74a",
+    "refs-alternative": "c7a24567b6b6acd08c30",
+    "visual-verify": "4369d926753a69df19e1",
+    "visual-verify-alternative": "eaaa2b7e9b0f16cb071b"
+   },
+   "card": "[경로] autopilot-design · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "4fb32a3fc3c7c2f1a70f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "2b60d578c2167df7eb77",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "refs",
+    "refs-alternative",
+    "build",
+    "visual-verify",
+    "visual-verify-alternative",
+    "critic-review",
+    "critic-review-alternative",
+    "handoff"
+   ],
+   "nodes": {
+    "build": "89f360f894ab033b22bf",
+    "critic-review": "6faa722dbdf50f2b8769",
+    "critic-review-alternative": "819f501d4d9953e24b0b",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
+    "handoff": "ccde71e95a073ddddf48",
+    "refs": "200b42bbfecb1d192ad9",
+    "refs-alternative": "73e3ecb484519fccab5b",
+    "visual-verify": "941d2a749211d7eb1ab4",
+    "visual-verify-alternative": "34615e95e69bc7801583"
+   },
+   "parallel_groups": "6cf8b76887c4fe678262",
+   "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
+   "workflow_contract": "82ac979d2f94759466e6"
+  },
+  "preset:autopilot-design:default:thorough": {
+   "briefs": {
+    "build": "ac586ca94baebe6b5bdc",
+    "critic-review": "fc042d90443981ab7112",
+    "critic-review-alternative": "8345cf9d3349f0582ee3",
+    "frame": "fc9ece5fbb9f721c60b4",
+    "frame-alternative": "34702833683bebfc9fbc",
+    "handoff": "df158090ec73e2762186",
+    "refs": "ba86cd37a1a4e1c29c5a",
+    "refs-alternative": "a54bc0ec6e28de76bb96",
+    "visual-verify": "2f690fa1c42593b55e19",
+    "visual-verify-alternative": "3397306638ad3e0674b8"
+   },
+   "card": "[경로] autopilot-design · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "4fb32a3fc3c7c2f1a70f",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "2b60d578c2167df7eb77",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "refs",
+    "refs-alternative",
+    "build",
+    "visual-verify",
+    "visual-verify-alternative",
+    "critic-review",
+    "critic-review-alternative",
+    "handoff"
+   ],
+   "nodes": {
+    "build": "89f360f894ab033b22bf",
+    "critic-review": "6faa722dbdf50f2b8769",
+    "critic-review-alternative": "819f501d4d9953e24b0b",
+    "frame": "0f1d2d80552321e495c5",
+    "frame-alternative": "497de28b410345634c59",
+    "handoff": "ccde71e95a073ddddf48",
+    "refs": "200b42bbfecb1d192ad9",
+    "refs-alternative": "73e3ecb484519fccab5b",
+    "visual-verify": "941d2a749211d7eb1ab4",
+    "visual-verify-alternative": "34615e95e69bc7801583"
+   },
+   "parallel_groups": "6cf8b76887c4fe678262",
+   "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
+   "workflow_contract": "82ac979d2f94759466e6"
+  },
+  "preset:autopilot-draft:doc:standard": {
+   "briefs": {
+    "draft-production": "2dda835312b9c938cb07",
+    "fact-verify": "bf08d93199da67a9fa9f",
+    "finalize": "6ceaac470fc150cb93bc",
+    "frame": "69c2ceccc3f29e093019",
+    "frame-alternative": "83366a8ed06cf070d1a2",
+    "material-strategy": "0b5e05c9d4aee575f960",
+    "material-strategy-alternative": "3a1591f8e4e24c68242b",
+    "quality-review": "775193712e2803f9f636",
+    "strategy-review": "a34c0e9931a3535d8b25"
+   },
+   "card": "[경로] autopilot-draft · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "64b72e6172ef2c500741",
+   "conditional_extensions": "b056b9625be214a20b3f",
+   "human_gate_bindings": "53860b3d0e843b01a100",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "material-strategy",
+    "material-strategy-alternative",
+    "strategy-review",
+    "draft-production",
+    "quality-review",
+    "fact-verify",
+    "finalize"
+   ],
+   "nodes": {
+    "draft-production": "7c407542a8483771687e",
+    "fact-verify": "a3719946e63f21e9863d",
+    "finalize": "0776755afd14b8d63f10",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
+    "material-strategy": "82d2c9f860bda2a82c6c",
+    "material-strategy-alternative": "bbc0cc7c3f798b882a69",
+    "quality-review": "a621ce06ad36f29af303",
+    "strategy-review": "fe380ec3ee23b2c7d0b9"
+   },
+   "parallel_groups": "0df15d083d28bfecf292",
+   "resume_retry_boundaries": "bd4d6a89231fb8e5ca56",
+   "workflow_contract": "acfb9dbb09e457ec5401"
+  },
+  "preset:autopilot-draft:doc:strong": {
+   "briefs": {
+    "draft-production": "f92751efcec48c930798",
+    "fact-verify": "bb5a98b990bee7a98e97",
+    "fact-verify-alternative": "cd053fb73ff1951001cf",
+    "finalize": "e5503509c950ed5ddb8d",
+    "frame": "8c8bafc94df5f94946dd",
+    "frame-alternative": "04f263e166977d847858",
+    "material-strategy": "a43ddcaac6864a946b0b",
+    "material-strategy-alternative": "a953d9e7118ae6e1b7c7",
+    "quality-review": "2b2019c85c1eb97a11ef",
+    "quality-review-alternative": "5e8cbc05c55b24d220b5",
+    "strategy-review": "4974620c2ea7516426f3",
+    "strategy-review-alternative": "674e58fdb4b55080bb85"
+   },
+   "card": "[경로] autopilot-draft · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "64b72e6172ef2c500741",
+   "conditional_extensions": "b056b9625be214a20b3f",
+   "human_gate_bindings": "53860b3d0e843b01a100",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "material-strategy",
+    "material-strategy-alternative",
+    "strategy-review",
+    "strategy-review-alternative",
+    "draft-production",
+    "quality-review",
+    "quality-review-alternative",
+    "fact-verify",
+    "fact-verify-alternative",
+    "finalize"
+   ],
+   "nodes": {
+    "draft-production": "7f33d308965fbee03748",
+    "fact-verify": "39b67d5c89c92f36e6c7",
+    "fact-verify-alternative": "9fafb25d72ffbafad72e",
+    "finalize": "1be28cfc895a082d9043",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
+    "material-strategy": "82d2c9f860bda2a82c6c",
+    "material-strategy-alternative": "bbc0cc7c3f798b882a69",
+    "quality-review": "bf5d7319046c4f4a71a0",
+    "quality-review-alternative": "f1115c809f46b826e778",
+    "strategy-review": "29ed5754949f3891b49f",
+    "strategy-review-alternative": "c69ce492978ad3aa33ab"
+   },
+   "parallel_groups": "a5eb7d908f669d4a38a2",
+   "resume_retry_boundaries": "bd4d6a89231fb8e5ca56",
+   "workflow_contract": "d57fda15a9906a610f75"
+  },
+  "preset:autopilot-draft:doc:thorough": {
+   "briefs": {
+    "draft-production": "8de717d6ba426e12c3d7",
+    "fact-verify": "defe57e78f582a7a477a",
+    "fact-verify-alternative": "d0608aec3527da755b44",
+    "finalize": "2675f617e50fca22d6eb",
+    "frame": "0d919f74e4c14a8d4129",
+    "frame-alternative": "5beae7edbcc13a29b084",
+    "material-strategy": "18cfbbe58886a8113184",
+    "material-strategy-alternative": "b9c81b3ff058fbaf9ba5",
+    "quality-review": "7f774066421e638f9847",
+    "quality-review-alternative": "c284b9a766f3b8287e33",
+    "quality-review-assumption": "5a612a37f0dd124bbaf5",
+    "strategy-review": "0d66303c62f19e833773",
+    "strategy-review-alternative": "ad622b1770f7f37e87be"
+   },
+   "card": "[경로] autopilot-draft · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "64b72e6172ef2c500741",
+   "conditional_extensions": "b056b9625be214a20b3f",
+   "human_gate_bindings": "53860b3d0e843b01a100",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "material-strategy",
+    "material-strategy-alternative",
+    "strategy-review",
+    "strategy-review-alternative",
+    "draft-production",
+    "quality-review",
+    "quality-review-alternative",
+    "quality-review-assumption",
+    "fact-verify",
+    "fact-verify-alternative",
+    "finalize"
+   ],
+   "nodes": {
+    "draft-production": "7f33d308965fbee03748",
+    "fact-verify": "39b67d5c89c92f36e6c7",
+    "fact-verify-alternative": "9fafb25d72ffbafad72e",
+    "finalize": "d72492c033aadfe9b3a7",
+    "frame": "dad3f3b12fe7f8d36d58",
+    "frame-alternative": "6569ba87c822b4cfa8e7",
+    "material-strategy": "82d2c9f860bda2a82c6c",
+    "material-strategy-alternative": "bbc0cc7c3f798b882a69",
+    "quality-review": "6b0f2193a807a77ad3ec",
+    "quality-review-alternative": "6a802536570ac2ee9aae",
+    "quality-review-assumption": "070320be1a356aff7cb9",
+    "strategy-review": "29ed5754949f3891b49f",
+    "strategy-review-alternative": "c69ce492978ad3aa33ab"
+   },
+   "parallel_groups": "4499910c08cf3da44c04",
+   "resume_retry_boundaries": "bd4d6a89231fb8e5ca56",
+   "workflow_contract": "3e735a656eb508d3aac0"
+  },
+  "preset:autopilot-lab:eval:standard": {
+   "briefs": {
+    "eval-run": "34bc1de5fdd29af87ff1",
+    "independent-verify": "a8bdf7b4b0c6596593fc",
+    "media": "d7a1ec30fe44d938b33f",
+    "metrics": "580cc90f22c9f175ef61",
+    "publish": "52c851d5192cf4025716",
+    "report": "f83bf68f0ae4fd5d7907",
+    "sync": "0b5c4791b8a64412c1ee"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) eval-run · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "304fc82d7682dab2b229",
+   "conditional_extensions": "a72ac988a99a64e7987a",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "eval-run",
+    "metrics",
+    "media",
+    "report",
+    "independent-verify",
+    "publish",
+    "sync"
+   ],
+   "nodes": {
+    "eval-run": "d8eb148526235c878d06",
+    "independent-verify": "b6586f161117d77a3145",
+    "media": "4e8ec6a5d9e60bff5e6c",
+    "metrics": "f1821a60593f3b754814",
+    "publish": "9ce87d1c081d1cf44cd9",
+    "report": "f7e7f5ede76d7d164b80",
+    "sync": "17fadd8b3141167375be"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "829bb16ceec3d55e0694",
+   "workflow_contract": "7ef67849b3399ea59be0"
+  },
+  "preset:autopilot-lab:eval:strong": {
+   "briefs": {
+    "eval-run": "ed9cba32be9f2ff938a7",
+    "independent-verify": "c07640c5aa6953e39c64",
+    "independent-verify-alternative": "e75b4ecd2e3d00985fdc",
+    "media": "a4c3f7d72284855e9820",
+    "metrics": "ae45436a96fc527a091b",
+    "publish": "69b568cfc2124e7febe8",
+    "report": "6fdecc1ce9a68121b5b2",
+    "sync": "6475c28da93e3d36d00c"
+   },
+   "card": "[경로] autopilot-lab · staged(strong) eval-run · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "304fc82d7682dab2b229",
+   "conditional_extensions": "a72ac988a99a64e7987a",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "eval-run",
+    "metrics",
+    "media",
+    "report",
+    "independent-verify",
+    "independent-verify-alternative",
+    "publish",
+    "sync"
+   ],
+   "nodes": {
+    "eval-run": "d8eb148526235c878d06",
+    "independent-verify": "4c18ca05dcd9da64c234",
+    "independent-verify-alternative": "0de611dcdea4b63fd77f",
+    "media": "4e8ec6a5d9e60bff5e6c",
+    "metrics": "f1821a60593f3b754814",
+    "publish": "d571845b3fa6c6c295ff",
+    "report": "f7e7f5ede76d7d164b80",
+    "sync": "17fadd8b3141167375be"
+   },
+   "parallel_groups": "06212fbb70ee2d86a44c",
+   "resume_retry_boundaries": "829bb16ceec3d55e0694",
+   "workflow_contract": "c0bb0dc2507a76757e50"
+  },
+  "preset:autopilot-lab:eval:thorough": {
+   "briefs": {
+    "eval-run": "2242ca3ce7dbb0e6da2b",
+    "independent-verify": "4e084edde5e0686455e3",
+    "independent-verify-alternative": "dde7db6aca8a670c4940",
+    "media": "182f6cb5af9a8d6a48e4",
+    "metrics": "74033a923450897e0a6c",
+    "publish": "ab15dcfdba03eb8608ca",
+    "report": "c4bf31cf3ebc5b5cb029",
+    "sync": "110ae796bb18c0cfc3b9"
+   },
+   "card": "[경로] autopilot-lab · staged(thorough) eval-run · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "304fc82d7682dab2b229",
+   "conditional_extensions": "a72ac988a99a64e7987a",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "eval-run",
+    "metrics",
+    "media",
+    "report",
+    "independent-verify",
+    "independent-verify-alternative",
+    "publish",
+    "sync"
+   ],
+   "nodes": {
+    "eval-run": "d8eb148526235c878d06",
+    "independent-verify": "4c18ca05dcd9da64c234",
+    "independent-verify-alternative": "0de611dcdea4b63fd77f",
+    "media": "4e8ec6a5d9e60bff5e6c",
+    "metrics": "f1821a60593f3b754814",
+    "publish": "d571845b3fa6c6c295ff",
+    "report": "f7e7f5ede76d7d164b80",
+    "sync": "17fadd8b3141167375be"
+   },
+   "parallel_groups": "06212fbb70ee2d86a44c",
+   "resume_retry_boundaries": "829bb16ceec3d55e0694",
+   "workflow_contract": "c0bb0dc2507a76757e50"
+  },
+  "preset:autopilot-lab:setup:standard": {
+   "briefs": {
+    "full-run": "b58a1b4df9d88f1463cb",
+    "handoff": "2bd7eb094ce504ba9a5a",
+    "run-verify": "f9cee8a900b02cd4cd2f",
+    "scaffold": "e774b31ac4da498c2729",
+    "smoke": "84e1a3236dfaa5a9b1f7"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) scaffold · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 full-run (autopilot-lab:full-run)",
+   "completion_gates": "902bca21725b7585bda7",
+   "conditional_extensions": "8eaf2f0bb49917e3599e",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "scaffold",
+    "smoke",
+    "full-run",
+    "run-verify",
+    "handoff"
+   ],
+   "nodes": {
+    "full-run": "9479e5bcaab0cd5461e8",
+    "handoff": "72cf668663bb88a5fe05",
+    "run-verify": "4d5aabea52623a8b8fbe",
+    "scaffold": "34fa6a7da643e4f211e8",
+    "smoke": "268e1cc7cc1c0d2f3b37"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "fa4b8fcb0af11baa867e",
+   "workflow_contract": "827cbc891ea30915037f"
+  },
+  "preset:autopilot-lab:setup:strong": {
+   "briefs": {
+    "full-run": "b9f4d177d7b312dc768f",
+    "handoff": "b2a1bb84e7a6bc1d9487",
+    "run-verify": "6e83a8bf162208e63e74",
+    "run-verify-alternative": "b0af23bfcdc2b124e2cf",
+    "scaffold": "e9cb1ff32b8385f27337",
+    "smoke": "749de089161d84e50ff2",
+    "smoke-alternative": "fd8d2323e0b96610e3ca"
+   },
+   "card": "[경로] autopilot-lab · staged(strong) scaffold · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 full-run (autopilot-lab:full-run)",
+   "completion_gates": "902bca21725b7585bda7",
+   "conditional_extensions": "8eaf2f0bb49917e3599e",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "scaffold",
+    "smoke",
+    "smoke-alternative",
+    "full-run",
+    "run-verify",
+    "run-verify-alternative",
+    "handoff"
+   ],
+   "nodes": {
+    "full-run": "723e7f6ccf56ba297214",
+    "handoff": "64f5f30bdebfc49d9282",
+    "run-verify": "fbe490d6b7c955c5623e",
+    "run-verify-alternative": "330c4066fc3f540ac0ce",
+    "scaffold": "34fa6a7da643e4f211e8",
+    "smoke": "b714afdae87404128623",
+    "smoke-alternative": "9375a6e4c96036665c10"
+   },
+   "parallel_groups": "b666800772608b7b2707",
+   "resume_retry_boundaries": "fa4b8fcb0af11baa867e",
+   "workflow_contract": "ca448b1e5da188b884f0"
+  },
+  "preset:autopilot-lab:setup:thorough": {
+   "briefs": {
+    "full-run": "91664e97bf741de0a9f0",
+    "handoff": "edf824401f32d8e8c4da",
+    "run-verify": "79c4f6da6f861d72635d",
+    "run-verify-alternative": "1f712d065b285c5ef313",
+    "scaffold": "c3ae3f7563c3f218fa52",
+    "smoke": "868c615832bddfa8c9fe",
+    "smoke-alternative": "c84f2c82cf17f048f264"
+   },
+   "card": "[경로] autopilot-lab · staged(thorough) scaffold · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 full-run (autopilot-lab:full-run)",
+   "completion_gates": "902bca21725b7585bda7",
+   "conditional_extensions": "8eaf2f0bb49917e3599e",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "scaffold",
+    "smoke",
+    "smoke-alternative",
+    "full-run",
+    "run-verify",
+    "run-verify-alternative",
+    "handoff"
+   ],
+   "nodes": {
+    "full-run": "723e7f6ccf56ba297214",
+    "handoff": "64f5f30bdebfc49d9282",
+    "run-verify": "fbe490d6b7c955c5623e",
+    "run-verify-alternative": "330c4066fc3f540ac0ce",
+    "scaffold": "34fa6a7da643e4f211e8",
+    "smoke": "b714afdae87404128623",
+    "smoke-alternative": "9375a6e4c96036665c10"
+   },
+   "parallel_groups": "b666800772608b7b2707",
+   "resume_retry_boundaries": "fa4b8fcb0af11baa867e",
+   "workflow_contract": "ca448b1e5da188b884f0"
+  },
+  "preset:autopilot-refine:default:standard": {
+   "briefs": {
+    "frame": "ccc1b905a66a5505c2ef",
+    "frame-alternative": "4df946baee935721b951",
+    "review": "25154dc17d4ce425ae08",
+    "transaction": "d4edf84572c47178d810"
+   },
+   "card": "[경로] autopilot-refine · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "7be6ed6dacc44f9abedd",
+   "conditional_extensions": "1c90d16dc25b0339d09a",
+   "human_gate_bindings": "b017ed0c89377f6fbe31",
+   "human_gates": "06cc065ba71874ba684f",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "review",
+    "transaction"
+   ],
+   "nodes": {
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
+    "review": "626bc93d343ee593237a",
+    "transaction": "d6732a9044ff372d85b5"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "7f8079c9d0c78bba8fde",
+   "workflow_contract": "8268f1e37305cbfd7b66"
+  },
+  "preset:autopilot-refine:default:strong": {
+   "briefs": {
+    "frame": "5b31285cb0dd75170c61",
+    "frame-alternative": "e142f4677d98210b1d49",
+    "review": "f54887521418236a733a",
+    "review-alternative": "ed1559d1daa99b8e5b94",
+    "transaction": "08e75147fdec0cd109d9"
+   },
+   "card": "[경로] autopilot-refine · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "7be6ed6dacc44f9abedd",
+   "conditional_extensions": "1c90d16dc25b0339d09a",
+   "human_gate_bindings": "b017ed0c89377f6fbe31",
+   "human_gates": "06cc065ba71874ba684f",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "review",
+    "review-alternative",
+    "transaction"
+   ],
+   "nodes": {
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
+    "review": "576a462c54e3767439d6",
+    "review-alternative": "75853cc015ba893895ae",
+    "transaction": "73b0e6d83c97548f3441"
+   },
+   "parallel_groups": "7bfa940e962478a7fc1d",
+   "resume_retry_boundaries": "7f8079c9d0c78bba8fde",
+   "workflow_contract": "1830d6cfdc7ff86a701a"
+  },
+  "preset:autopilot-refine:default:thorough": {
+   "briefs": {
+    "frame": "e21bcfb728660bfed34d",
+    "frame-alternative": "1d948efdcc5bbd70d3b4",
+    "review": "ace200342123da27f1a5",
+    "review-alternative": "95d0689df0b57777c72e",
+    "transaction": "fe38c1c8a602e549ba2a"
+   },
+   "card": "[경로] autopilot-refine · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "7be6ed6dacc44f9abedd",
+   "conditional_extensions": "1c90d16dc25b0339d09a",
+   "human_gate_bindings": "b017ed0c89377f6fbe31",
+   "human_gates": "06cc065ba71874ba684f",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "review",
+    "review-alternative",
+    "transaction"
+   ],
+   "nodes": {
+    "frame": "dbbcc81d050949a8b603",
+    "frame-alternative": "c966f5736cd053a0e087",
+    "review": "576a462c54e3767439d6",
+    "review-alternative": "75853cc015ba893895ae",
+    "transaction": "73b0e6d83c97548f3441"
+   },
+   "parallel_groups": "7bfa940e962478a7fc1d",
+   "resume_retry_boundaries": "7f8079c9d0c78bba8fde",
+   "workflow_contract": "1830d6cfdc7ff86a701a"
+  },
+  "preset:autopilot-research:academic:standard": {
+   "briefs": {
+    "claim-verify": "97fcb53d5083ac686d64",
+    "report": "b92e489c8e4d062dd92f",
+    "retrieval": "42cd19b5a9c653a5b563",
+    "retrieval-alternative": "0bca4352f7dca3293d9a",
+    "synthesis": "9d8ff0c31160f1ba778e"
+   },
+   "card": "[경로] autopilot-research · staged(standard) retrieval · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "6bdc481f4c654eca8905",
+   "conditional_extensions": "3190e5c9e1ee25d039c9",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "retrieval",
+    "retrieval-alternative",
+    "synthesis",
+    "report",
+    "claim-verify"
+   ],
+   "nodes": {
+    "claim-verify": "100c2c9157f15c1a775b",
+    "report": "e44cf9cbfb67f5a75b5f",
+    "retrieval": "b8bb66a2cf3f726b0c19",
+    "retrieval-alternative": "0134eeef535f08b22374",
+    "synthesis": "25e60e5887aa6530cd97"
+   },
+   "parallel_groups": "ffa303e193c1d1833c36",
+   "resume_retry_boundaries": "f76520442e754beec0e0",
+   "workflow_contract": "401ebb9dcc86e67f56de"
+  },
+  "preset:autopilot-research:academic:strong": {
+   "briefs": {
+    "claim-verify": "2e11d6073acec584ca6b",
+    "claim-verify-alternative": "9df65c61e53ae6236cc1",
+    "report": "c70221b5b6c744522c80",
+    "retrieval": "88293cf4db831cb8db56",
+    "retrieval-alternative": "50a44a6a3df7064e0b6c",
+    "synthesis": "c47c41179fa8b9ebc1da"
+   },
+   "card": "[경로] autopilot-research · staged(strong) retrieval · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "6bdc481f4c654eca8905",
+   "conditional_extensions": "3190e5c9e1ee25d039c9",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "retrieval",
+    "retrieval-alternative",
+    "synthesis",
+    "report",
+    "claim-verify",
+    "claim-verify-alternative"
+   ],
+   "nodes": {
+    "claim-verify": "06e56309aed49054af61",
+    "claim-verify-alternative": "97bcfcbe6dda84553316",
+    "report": "e44cf9cbfb67f5a75b5f",
+    "retrieval": "b8bb66a2cf3f726b0c19",
+    "retrieval-alternative": "0134eeef535f08b22374",
+    "synthesis": "25e60e5887aa6530cd97"
+   },
+   "parallel_groups": "61642013255fab430ebb",
+   "resume_retry_boundaries": "f76520442e754beec0e0",
+   "workflow_contract": "05d649349d148b7e4913"
+  },
+  "preset:autopilot-research:academic:thorough": {
+   "briefs": {
+    "claim-verify": "53448c85b1f250b1099b",
+    "claim-verify-alternative": "517315b2a6b002580cf2",
+    "report": "bff0bf48115ef07e584e",
+    "retrieval": "494a7dddc6ad2d6cf288",
+    "retrieval-alternative": "0388abbd6f1c0d028734",
+    "retrieval-assumption": "a35ad8eedb11dafe8666",
+    "synthesis": "69c0eb10e1d8fa26beef"
+   },
+   "card": "[경로] autopilot-research · staged(thorough) retrieval · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "6bdc481f4c654eca8905",
+   "conditional_extensions": "3190e5c9e1ee25d039c9",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "retrieval",
+    "retrieval-alternative",
+    "retrieval-assumption",
+    "synthesis",
+    "report",
+    "claim-verify",
+    "claim-verify-alternative"
+   ],
+   "nodes": {
+    "claim-verify": "06e56309aed49054af61",
+    "claim-verify-alternative": "97bcfcbe6dda84553316",
+    "report": "e44cf9cbfb67f5a75b5f",
+    "retrieval": "c60ecd6a1b6bf79bf7dc",
+    "retrieval-alternative": "5c3c84cac3eda1dd5f2c",
+    "retrieval-assumption": "7d84df66331ad8ecb6d3",
+    "synthesis": "63fa175d3b157dfc987c"
+   },
+   "parallel_groups": "bc989392d4bd0ee70580",
+   "resume_retry_boundaries": "f76520442e754beec0e0",
+   "workflow_contract": "89353975971d87cf63de"
+  },
+  "preset:autopilot-ship:default:standard": {
+   "briefs": {
+    "deploy": "44b0f54d1e154676a008",
+    "post-deploy-verify": "81fdb6e4fd918bc08754",
+    "release-review": "2498eecc508f1d970025",
+    "release-setup": "5ac999289585bb51342d",
+    "security-review": "3a713a36ce62774b1b45"
+   },
+   "card": "[경로] autopilot-ship · staged(standard) release-setup · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 deploy (autopilot-ship:deploy)",
+   "completion_gates": "aedc0f6552c23e404645",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "release-setup",
+    "security-review",
+    "release-review",
+    "deploy",
+    "post-deploy-verify"
+   ],
+   "nodes": {
+    "deploy": "b2cd5f7b5f9bdd8a1926",
+    "post-deploy-verify": "e91862107f55d07c77d8",
+    "release-review": "e6d8a9533e2c3249976a",
+    "release-setup": "7a3d73beef1d6fe41afc",
+    "security-review": "6f005d744a27af4001d6"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "ea4355148774db2197d0",
+   "workflow_contract": "eb7bb9a039bcf1ddad54"
+  },
+  "preset:autopilot-ship:default:strong": {
+   "briefs": {
+    "deploy": "c2ef76a81266a1a8247f",
+    "post-deploy-verify": "2fb14bad7cf01ba24b6d",
+    "release-review": "15625803c4b44cc3055e",
+    "release-review-alternative": "7e220bba73febad14799",
+    "release-setup": "f0b81b71a90b85536c55",
+    "security-review": "f9e039ccc64b1e6ba411",
+    "security-review-alternative": "4f90a1a186a22809fcb3"
+   },
+   "card": "[경로] autopilot-ship · staged(strong) release-setup · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 deploy (autopilot-ship:deploy)",
+   "completion_gates": "aedc0f6552c23e404645",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "release-setup",
+    "security-review",
+    "security-review-alternative",
+    "release-review",
+    "release-review-alternative",
+    "deploy",
+    "post-deploy-verify"
+   ],
+   "nodes": {
+    "deploy": "cd75a166441f23d80859",
+    "post-deploy-verify": "e91862107f55d07c77d8",
+    "release-review": "112687c9dde7bcafcf9d",
+    "release-review-alternative": "639642d0c40e0dad2817",
+    "release-setup": "7a3d73beef1d6fe41afc",
+    "security-review": "ec7fe0cb6ab17c927f68",
+    "security-review-alternative": "9f06459f67fe03f2c54a"
+   },
+   "parallel_groups": "a28d4fad40dc995690e8",
+   "resume_retry_boundaries": "ea4355148774db2197d0",
+   "workflow_contract": "9881c67e7a3445f6f7b6"
+  },
+  "preset:autopilot-ship:default:thorough": {
+   "briefs": {
+    "deploy": "3d22638dfe85a07d6a00",
+    "post-deploy-verify": "10550cbfb29e36db6edc",
+    "release-review": "ecd53160955f5d9969fc",
+    "release-review-alternative": "e6e0781eb8fbc7ccb856",
+    "release-setup": "fe0cb0c90cd3756fcf85",
+    "security-review": "9d97ea803c93f39e9b0e",
+    "security-review-alternative": "3cfc2cd80ebbf13814d6"
+   },
+   "card": "[경로] autopilot-ship · staged(thorough) release-setup · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 deploy (autopilot-ship:deploy)",
+   "completion_gates": "aedc0f6552c23e404645",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "release-setup",
+    "security-review",
+    "security-review-alternative",
+    "release-review",
+    "release-review-alternative",
+    "deploy",
+    "post-deploy-verify"
+   ],
+   "nodes": {
+    "deploy": "cd75a166441f23d80859",
+    "post-deploy-verify": "e91862107f55d07c77d8",
+    "release-review": "112687c9dde7bcafcf9d",
+    "release-review-alternative": "639642d0c40e0dad2817",
+    "release-setup": "7a3d73beef1d6fe41afc",
+    "security-review": "ec7fe0cb6ab17c927f68",
+    "security-review-alternative": "9f06459f67fe03f2c54a"
+   },
+   "parallel_groups": "a28d4fad40dc995690e8",
+   "resume_retry_boundaries": "ea4355148774db2197d0",
+   "workflow_contract": "9881c67e7a3445f6f7b6"
+  },
+  "preset:autopilot-ship:package:standard": {
+   "briefs": {
+    "package": "c0934e18d94dbc42b3a4"
+   },
+   "card": "[경로] autopilot-ship · staged(standard) package · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "e449a08ec812d99fb510",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "package"
+   ],
+   "nodes": {
+    "package": "5bea037ecce1f1aae41c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "7b2aa63ef26dad0d149c",
+   "workflow_contract": "8bf0de58b41518c03726"
+  },
+  "preset:autopilot-ship:package:strong": {
+   "briefs": {
+    "package": "9353c190d5090b736875"
+   },
+   "card": "[경로] autopilot-ship · staged(strong) package · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "e449a08ec812d99fb510",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "package"
+   ],
+   "nodes": {
+    "package": "5bea037ecce1f1aae41c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "7b2aa63ef26dad0d149c",
+   "workflow_contract": "8bf0de58b41518c03726"
+  },
+  "preset:autopilot-ship:package:thorough": {
+   "briefs": {
+    "package": "de5e845e866998313e85"
+   },
+   "card": "[경로] autopilot-ship · staged(thorough) package · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "e449a08ec812d99fb510",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "package"
+   ],
+   "nodes": {
+    "package": "5bea037ecce1f1aae41c"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "7b2aa63ef26dad0d149c",
+   "workflow_contract": "8bf0de58b41518c03726"
+  },
+  "preset:autopilot-spec:api:standard": {
+   "briefs": {
+    "frame": "33c2a97785e014eafaef",
+    "frame-alternative": "f2e7ee47c50cb0b9a5c6",
+    "prd-transaction": "7ad6e9072ba2cbf0d0f1",
+    "research": "da1b9a476fd97945085c",
+    "research-alternative": "c1d836ad538ab8be81c6",
+    "review": "01eb217123e829c8086a"
+   },
+   "card": "[경로] autopilot-spec · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "96bf3ba93e2efb023cc9",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "7df3a80b44df5c5f4921",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "research",
+    "research-alternative",
+    "review",
+    "prd-transaction"
+   ],
+   "nodes": {
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
+    "prd-transaction": "1bf3bc9546a9752b719c",
+    "research": "336080f7a89c0f87ad95",
+    "research-alternative": "df772cf92e4411b634d2",
+    "review": "6b6bf29b83839551b573"
+   },
+   "parallel_groups": "acb3c8b1d0d1fc9f7101",
+   "resume_retry_boundaries": "946a44c224fc8d977731",
+   "workflow_contract": "5849c74fb09a1af56e1c"
+  },
+  "preset:autopilot-spec:api:strong": {
+   "briefs": {
+    "frame": "2824a81a15ead36018c7",
+    "frame-alternative": "714cea7654cdb06d16c2",
+    "prd-transaction": "374cef3c34f8822ec1c1",
+    "research": "54a2e674e03ff0008d92",
+    "research-alternative": "d6aae07136ed4d980a6a",
+    "review": "9fb52c8be950a18b7342",
+    "review-alternative": "9edfbf3e7e858f8d7d57"
+   },
+   "card": "[경로] autopilot-spec · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "96bf3ba93e2efb023cc9",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "7df3a80b44df5c5f4921",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "research",
+    "research-alternative",
+    "review",
+    "review-alternative",
+    "prd-transaction"
+   ],
+   "nodes": {
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
+    "prd-transaction": "cf40ecbd9894f4fe9344",
+    "research": "336080f7a89c0f87ad95",
+    "research-alternative": "df772cf92e4411b634d2",
+    "review": "e3be1934aa6159867aea",
+    "review-alternative": "9bbc099dd1e63c4be85d"
+   },
+   "parallel_groups": "566378b2cba880a37fda",
+   "resume_retry_boundaries": "946a44c224fc8d977731",
+   "workflow_contract": "c37a8f3ed62ec8a3be0b"
+  },
+  "preset:autopilot-spec:api:thorough": {
+   "briefs": {
+    "frame": "2b7d539b99599c001c94",
+    "frame-alternative": "d956e1b50c7371f56e81",
+    "prd-transaction": "2af80ea2fcfae2550bb2",
+    "research": "26d38177121f5089aae9",
+    "research-alternative": "e222c61544eb596aa6eb",
+    "research-assumption": "959fda13be730e5a655e",
+    "review": "73ddbe8348091d09defa",
+    "review-alternative": "759231d68bb0d309af20",
+    "review-test-gap": "310ec0e3f47812abe55b"
+   },
+   "card": "[경로] autopilot-spec · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
+   "completion_gates": "96bf3ba93e2efb023cc9",
+   "conditional_extensions": "4f53cda18c2baa0c0354",
+   "human_gate_bindings": "7df3a80b44df5c5f4921",
+   "human_gates": "5b005605a5f0ddb1dfdf",
+   "input_sources": {},
+   "node_ids": [
+    "frame",
+    "frame-alternative",
+    "research",
+    "research-alternative",
+    "research-assumption",
+    "review",
+    "review-alternative",
+    "review-test-gap",
+    "prd-transaction"
+   ],
+   "nodes": {
+    "frame": "08aa70a26b22336f58d8",
+    "frame-alternative": "77b1b0d05c3bba6d1606",
+    "prd-transaction": "4ddac8dc4bb96b3db1b2",
+    "research": "0ff659b8fa149c7f1231",
+    "research-alternative": "fbd5640f70eceb2840af",
+    "research-assumption": "05ef1757175a8d831853",
+    "review": "69b693882dbcd714c548",
+    "review-alternative": "e8e8abff4d3960947ab2",
+    "review-test-gap": "02b5b9a153f0e24e088e"
+   },
+   "parallel_groups": "5d839dca6210c4e6a90e",
+   "resume_retry_boundaries": "946a44c224fc8d977731",
+   "workflow_contract": "e1f9885b465e41f284f8"
+  },
+  "prior:code:execute,test,report": {
+   "briefs": {
+    "execute": "35e8ee20b61e7c33b52c",
+    "report": "400bdd3096be215fd35f",
+    "test": "57fc8d8e3afa08567222"
+   },
+   "card": "[경로] autopilot-code · staged(standard) execute→test→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 sd165-code (기존 합류) · 활성 캠페인 1개: sd165-code\n  입력 plan.md·checklist.md ← <cyc> <TMP>/campaigns/<date>_sd165-code/<date>_prior-1/artifacts\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "completion_gates": "066508ccd6fbc97d04a0",
+   "composed_recipe": "a20014eda4b2177efb52",
+   "conditional_extensions": "1c35f287e42041098273",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {
+    "execute": {
+     "checklist.md": {
+      "cycle_id": "<cyc>",
+      "path": "campaigns/<date>_sd165-code/<date>_prior-1/artifacts/checklist.md"
+     },
+     "plan.md": {
+      "cycle_id": "<cyc>",
+      "path": "campaigns/<date>_sd165-code/<date>_prior-1/artifacts/plan.md"
+     }
+    },
+    "report": {
+     "checklist.md": {
+      "cycle_id": "<cyc>",
+      "path": "campaigns/<date>_sd165-code/<date>_prior-1/artifacts/checklist.md"
+     },
+     "plan.md": {
+      "cycle_id": "<cyc>",
+      "path": "campaigns/<date>_sd165-code/<date>_prior-1/artifacts/plan.md"
+     }
+    },
+    "test": {
+     "checklist.md": {
+      "cycle_id": "<cyc>",
+      "path": "campaigns/<date>_sd165-code/<date>_prior-1/artifacts/checklist.md"
+     },
+     "plan.md": {
+      "cycle_id": "<cyc>",
+      "path": "campaigns/<date>_sd165-code/<date>_prior-1/artifacts/plan.md"
+     }
+    }
+   },
+   "node_ids": [
+    "execute",
+    "test",
+    "report"
+   ],
+   "nodes": {
+    "execute": "6313d4bea9657c342c0b",
+    "report": "cf3ebd0d1b0c5d6682ab",
+    "test": "d6ab54e340b822c93915"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "a14202a81976262fb12b",
+   "workflow_contract": "a53c110cf7e9cc719b6b"
+  },
+  "prior:lab-eval:full": {
+   "briefs": {
+    "eval-run": "34bc1de5fdd29af87ff1",
+    "independent-verify": "a8bdf7b4b0c6596593fc",
+    "media": "d7a1ec30fe44d938b33f",
+    "metrics": "580cc90f22c9f175ef61",
+    "publish": "52c851d5192cf4025716",
+    "report": "f83bf68f0ae4fd5d7907",
+    "sync": "0b5c4791b8a64412c1ee"
+   },
+   "card": "[경로] autopilot-lab · staged(standard) eval-run→metrics→media→report→independent-verify→publish→sync · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 sd165-lab (기존 합류) · 활성 캠페인 2개: sd165-lab, sd165-code",
+   "completion_gates": "fe8d1120c6efbc775cbc",
+   "composed_recipe": "e46509e61429f4c39a84",
+   "conditional_extensions": "a72ac988a99a64e7987a",
+   "human_gate_bindings": "4f53cda18c2baa0c0354",
+   "human_gates": "4f53cda18c2baa0c0354",
+   "input_sources": {},
+   "node_ids": [
+    "eval-run",
+    "metrics",
+    "media",
+    "report",
+    "independent-verify",
+    "publish",
+    "sync"
+   ],
+   "nodes": {
+    "eval-run": "d8eb148526235c878d06",
+    "independent-verify": "1e8ece653945873d0352",
+    "media": "76d12982784a2a2b16a2",
+    "metrics": "b646e9c8ffef5599d29d",
+    "publish": "9ce87d1c081d1cf44cd9",
+    "report": "0fd3e8bcd26ff851eeb0",
+    "sync": "17fadd8b3141167375be"
+   },
+   "parallel_groups": "4f53cda18c2baa0c0354",
+   "resume_retry_boundaries": "829bb16ceec3d55e0694",
+   "workflow_contract": "7ef67849b3399ea59be0"
+  }
+ }
+}

@@ -13,6 +13,9 @@ CANONICAL_RECEIPT_KEYS = frozenset({
 CANONICAL_CHILD_KEYS = frozenset({
     "attempt_id", "status", "readiness", "reason", "required_action", "harness",
     "delivery_classification",
+    # Optional: the route plan's next leg, present only on a completed owner of an approved plan.
+    # A receipt without it has exactly the bytes and digest it had before.
+    "next_leg",
 })
 NOTICE_KINDS = frozenset({"human-gate", "supervision"})
 COMPLETION_ACTIONS = frozenset({"complete-open", "inspect-done-failure", "advance-completed",

@@ -1,6 +1,6 @@
 ---
 name: autopilot-design
-description: "Use when a visual product surface needs references, design tokens, components or mockups, review, and development handoff. Not for implementing an already-approved design in code or for document prose work."
+description: "Use when a visual product surface needs references, design tokens, components or mockups, review, and development handoff. Owns design; default preset. Not for implementing an already-approved design in code or for document prose work."
 ---
 
 # autopilot-design

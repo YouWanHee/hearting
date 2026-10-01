@@ -32,10 +32,17 @@ fail=0
 # reach those hooks at $ROOT/hooks/* (adapters/codex/bin/preflight.sh), where
 # $ROOT/utilities/memory-store.sh already resolves. A per-adapter copy would
 # assert a projection surface nothing loads.
-SHARED_UTILITY_DEFERRED="hearting_gates.py spec_merge.py prd_readability.py owner_write_advisory.py review_input.py dispatch_replacement_subsession.py dispatch_replacement.py dispatch_replacement_batch.py dispatch_owner_input.py artifact_campaign.py dispatch_capacity_evidence.py work_start.py opencode_session_runtime.py dispatch_parent_completion.py dispatch_attempt_policy.py dispatch_receipt_identity.py dispatch_notice_receipt.py dispatch_notice_state.py dispatch_supervision.py artifact-pointer-bridge.py artifact-quiescence.py artifact-relocation.py artifact-relocation-live.py artifact-knowledge-feed.py cairn-artifact-read.sh cairn-artifact-read.ts dispatch-readiness.py verification-background-lease.py memory-store.sh compute-hosts execution_access.py execution_access_diagnose.py execution-access-diagnose.py governor_identity.py artifact_restore_sealed.py review_watchdog.py campaign_title_repair.py artifact_metadata_amendment.py artifact_locator_amendment.py artifact_cycle_titles.py artifact_workflow_group_review.py interactive-main-recovery.py transcript_turn.py"
+SHARED_UTILITY_DEFERRED="route_plan.py hearting_gates.py spec_merge.py prd_readability.py owner_write_advisory.py review_input.py dispatch_replacement_subsession.py dispatch_replacement.py dispatch_replacement_batch.py dispatch_owner_input.py artifact_campaign.py dispatch_capacity_evidence.py work_start.py opencode_session_runtime.py dispatch_parent_completion.py dispatch_attempt_policy.py dispatch_receipt_identity.py dispatch_notice_receipt.py dispatch_notice_state.py dispatch_supervision.py artifact-pointer-bridge.py artifact-quiescence.py artifact-relocation.py artifact-relocation-live.py artifact-knowledge-feed.py cairn-artifact-read.sh cairn-artifact-read.ts dispatch-readiness.py verification-background-lease.py memory-store.sh compute-hosts execution_access.py execution_access_diagnose.py execution-access-diagnose.py governor_identity.py artifact_restore_sealed.py review_watchdog.py campaign_title_repair.py artifact_metadata_amendment.py artifact_locator_amendment.py artifact_cycle_titles.py artifact_workflow_group_review.py interactive-main-recovery.py transcript_turn.py"
 
 say() {
   printf '%s\n' "$*"
+}
+
+# A compiler-internal capability has a portable contract but no Skill, no native command and no
+# persona; the invocation policy (generated from the manifest) is where its class is read.
+is_compiler_internal() {
+  awk -F '\t' -v name="$1" '$1 == name && $2 == "compiler-internal" {found = 1} END {exit !found}' \
+    tools/skill-conformance/invocation-policy.tsv
 }
 
 fail_msg() {
@@ -1499,6 +1506,10 @@ check_codex_native_skill_projection() {
     [ "$(basename "$f")" = "README.md" ] && continue
     slug=$(basename "$f" .md)
     skill="adapters/codex/skills/$slug/SKILL.md"
+    if is_compiler_internal "$slug"; then
+      [ ! -e "adapters/codex/skills/$slug" ] || fail_msg "compiler-internal $slug must have no Codex Skill"
+      continue
+    fi
     if [ ! -f "$skill" ]; then
       fail_msg "$skill is missing"
       continue
@@ -2454,6 +2465,10 @@ check_opencode_native_skill_projection() {
     [ "$(basename "$f")" = "README.md" ] && continue
     slug=$(basename "$f" .md)
     skill="adapters/opencode/skills/$slug/SKILL.md"
+    if is_compiler_internal "$slug"; then
+      [ ! -e "adapters/opencode/skills/$slug" ] || fail_msg "compiler-internal $slug must have no OpenCode Skill"
+      continue
+    fi
     if [ ! -f "$skill" ]; then
       fail_msg "$skill is missing"
       continue
@@ -2598,6 +2613,10 @@ check_opencode_native_command_projection() {
     [ "$(basename "$f")" = "README.md" ] && continue
     slug=$(basename "$f" .md)
     command="adapters/opencode/commands/$slug.md"
+    if is_compiler_internal "$slug"; then
+      [ ! -e "$command" ] || fail_msg "compiler-internal $slug must have no OpenCode command"
+      continue
+    fi
     if [ ! -f "$command" ]; then
       fail_msg "$command is missing"
       continue

@@ -17,10 +17,11 @@ This is the portable capability contract for `autopilot-lab`. It defines runtime
 
 ## Invocation Semantics
 
-Rapid experiment prototype entrypoint. The user runs heavy training; the lab
-supports the work before and after it. `setup` prepares an experiment from spec
-to scaffold and run commands. `eval` owns experiment evaluation, synthetic
-failure reproduction, model comparison, and the resulting analysis and report,
+Rapid experiment prototype entrypoint. `setup` prepares an experiment from spec
+through scaffold, smoke, and the full run when the execution environment and
+`full-run` part are included in the approval obtained at route start. Otherwise,
+report the run command and leave the part out for a later compose. `eval` owns
+experiment evaluation, synthetic failure reproduction, model comparison, and the resulting analysis and report,
 including interpretation of already fixed metrics without new measurements.
 Prose and HTML reports remain lab outputs; audio/media uses playback HTML.
 Reuse sufficient existing results and select only the needed stages. Extension
@@ -71,7 +72,7 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 
 Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concrete model names, subagent frontmatter, and runtime-specific tool lists belong in adapter files.
 
-Pipeline intensity follows `core/CONVENTIONS.md §1`: `direct` has no plan stage or durable plan artifact; `quick` is one registered-headless dispatch-depth-1 one-shot conductor with its inline micro-plan plus plan-check-lite; `standard+` uses the capability's durable work-cycle plan when applicable. `plan-check` is required for every non-`direct` graph, but independent QA is not repeated after every stage by default. Verification rigor for plan-check, selected independent reviews, and final verify is derived from intensity; it does not name a model or introduce a separate stage graph.
+Pipeline intensity follows `core/CONVENTIONS.md §1`: `direct` has no plan stage or durable plan artifact; `quick` is one registered-headless dispatch-depth-1 one-shot conductor with its inline micro-plan plus plan-check-lite; `standard+` uses the capability's durable work-cycle plan when applicable. This recipe has no separate `plan-check` node (only `autopilot-code` declares one): `quick` checks its micro-plan inline (plan-check-lite), and `standard+` reviews through the recipe's own review stages — `smoke` and `run-verify` (setup) and `independent-verify` (eval), plus the optional `diagnose` part — rather than after every stage. Verification rigor for those reviews and final verify is derived from intensity; it does not name a model or introduce a separate stage graph. `capabilities/topologies.json` (recipe plus `part_catalog`) is the one stage list; `capability-route.py stages --capability autopilot-lab` prints it.
 
 ## Guard Requirements
 
@@ -96,11 +97,11 @@ observes its exact termination and advances to `run-verify`, and only `handoff`
 is terminal. `handoff`'s gate is satisfied by *recording the successor* — a
 registered evaluation route or attempt, or an explicit human gate — so a run that
 finishes with "evaluate it later" written in prose is not complete. The
-`full-run-authorization` human gate binds to `full-run` as an entry gate, which
-makes `smoke`'s continuation a human gate: a full run is never started
-automatically. While the person decides, the owner parks or keeps waiting as
-`core/WORKFLOW.md` §0.6 describes; a proceed for a parked owner starts the
-continuation owner that launches `full-run`.
+`full-run` carries `start_approval: full-run`; the route card obtains approval
+for this part before the route starts. Leave `full-run` out when the approval
+or executable environment is absent, and compose it separately after approval.
+The resource runner continues to enforce route verification, hash-bound smoke
+attestation, config provenance, the governor, and its `supervised` continuation.
 
 This replaced a graph whose last node was the training process itself. On
 2026-08-04 the BC_ResNet_tf run finished training and its hard-negative loop, the
@@ -110,6 +111,34 @@ callback, and the session ended with no follow-up mechanism registered. See
 
 For `eval`, `eval-run` is likewise a supervised detached run whose termination
 advances `metrics`, and `sync` is the terminal node.
+
+### Parts (SD-165)
+
+Every stage above is a part `autopilot-lab:<stage>`; `capabilities/topologies.json`
+(recipes plus `part_catalog`) is the one stage list and
+`capability-route.py stages --capability autopilot-lab` prints it. The presets
+stay as they are; the following appear only in an explicit `--graph`:
+
+| Part | Kind / unit | What it adds |
+|---|---|---|
+| `autopilot-lab:eval-spec` | pipeline-stage, `plan/plan-author` | Writes the evaluation contract `eval-spec.md` (data, checkpoint, metrics, comparison baseline) inside the eval route. |
+| `autopilot-lab:eval-smoke` | review-worker, `qa/ml-debug` | Small evaluation pass that writes `reviews/smoke-attestation.json` with `tools/smoke-attestation.py`, hash-bound to checkpoint, eval-spec and the config snapshot; the route links it to `eval-run`'s `smoke-attestation` input as `part_io`. |
+| `autopilot-lab:diagnose` | review-worker, `qa/ml-debug` | After `metrics`: `reviews/diagnosis.md` with hypotheses, reproduction conditions, verdict and a falsifying experiment. Optional external inputs (field samples, reproduction conditions) are named in the assignment. Shareable. |
+| `metrics:qa/ml-debug` | unit choice | Runs `metrics` with the diagnosing unit instead of `material/data-script`. |
+
+Example: `--graph eval-spec,eval-smoke,eval-run,metrics,diagnose,report`. When
+`eval-spec` or `eval-smoke` is left out of a partial graph, `eval-run`'s
+`eval-spec` and `smoke-attestation` inputs are filled from the prior cycle under
+the catalog's name mapping (`eval-spec.md`, `reviews/smoke-attestation.json`);
+nothing found leaves the route as before.
+
+`autopilot-lab:smoke` and `autopilot-lab:full-run` are shareable to
+`autopilot-code` and `autopilot-lab` routes, so a code route can run training
+or a benchmark without leaving its cycle. The resource runner's conditions are
+unchanged: a verified route, a hash-bound smoke attestation, config-manifest
+provenance, the governor, and the `supervised` continuation. `full-run` carries
+the declared mark `start_approval: full-run`; it is data for the route card and
+the frame catalog, not a gate.
 
 ### Eval execution topology (`standard+`)
 

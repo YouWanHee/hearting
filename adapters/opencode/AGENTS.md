@@ -81,8 +81,9 @@ Follow `parent_next`; reuse `resume_command` after wakes or corrections. At
 Actual release precedes owner execution; runtime closes route/cycle at success or once idle.
 
 Route by `core/WORKFLOW.md §0.2`: precedence names the capability that owns
-the artifacts; §0.2.1 then picks the work **shape** before any preset.
-`direct`/`solo`/`staged` go through `preflight.sh compose` (portable
+the artifacts; §0.2.1 then picks the work **shape** before any preset:
+new non-direct work defaults to `framed` (exceptions there).
+`direct`/`solo`/`staged`/`framed` go through `preflight.sh compose` (portable
 `capability-route.py compose`; flags, spec-read gate and probes default from
 the checkout; a staged `--graph execute,test,report` is your own stage
 subgraph). Use the preset recipe (`preflight.sh route --capability …`) only

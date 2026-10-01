@@ -1818,17 +1818,23 @@ class ManagedGateway:
             ):
                 raise GatewayError("receipt-child-contract-invalid")
             observed.add(attempt_id)
-            children.append(
-                {
-                    "attempt_id": attempt_id,
-                    "status": str(status),
-                    "readiness": "ready",
-                    "reason": str(raw["reason"]),
-                    "required_action": str(required_action),
-                    "harness": str(harness),
-                    "delivery_classification": str(delivery_state),
-                }
-            )
+            child = {
+                "attempt_id": attempt_id,
+                "status": str(status),
+                "readiness": "ready",
+                "reason": str(raw["reason"]),
+                "required_action": str(required_action),
+                "harness": str(harness),
+                "delivery_classification": str(delivery_state),
+            }
+            if "next_leg" in raw:
+                next_leg = raw["next_leg"]
+                if (not isinstance(next_leg, dict) or set(next_leg) != {"index", "leg", "compose_command"}
+                        or not isinstance(next_leg["compose_command"], str)
+                        or delivery_state != "success"):
+                    raise GatewayError("receipt-child-next-leg-invalid")
+                child["next_leg"] = next_leg
+            children.append(child)
         aggregate = (
             "success"
             if children and {child["delivery_classification"] for child in children} == {"success"}

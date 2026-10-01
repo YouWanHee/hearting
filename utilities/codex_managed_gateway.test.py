@@ -1225,6 +1225,31 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertIn('"harness":"opencode"', context)
         self.assertIn('"delivery_classification":"success"', context)
 
+    NEXT_LEG = {"index": 1, "leg": {"capability": "autopilot-code", "shape": "direct"},
+                "compose_command": "python3 capability-route.py compose --route-plan rec.json#1"}
+
+    def test_a_completed_child_keeps_its_next_leg_in_the_delivered_context(self) -> None:
+        request = receipt_request("batch-next-leg")
+        request["receipt"]["children"][0]["next_leg"] = dict(self.NEXT_LEG)
+        result = control(self.control, request)
+        self.assertEqual(result["status"], "accepted", result)
+        starts = [value for value in self.server.messages if value.get("method") == "turn/start"]
+        context = starts[0]["params"]["additionalContext"]["hearting-completion"]["value"]
+        self.assertIn('"next_leg":{', context)
+        self.assertIn("--route-plan rec.json#1", context)
+
+    def test_a_malformed_or_attention_next_leg_is_rejected_before_upstream(self) -> None:
+        before = self.server.counts()
+        for label, mutate in (("not an object", lambda child: child.update(next_leg="x")),
+                              ("extra key", lambda child: child.update(next_leg={**self.NEXT_LEG, "auto": True})),
+                              ("no command", lambda child: child.update(next_leg={"index": 1, "leg": {}}))):
+            with self.subTest(label):
+                request = receipt_request("batch-bad-next-leg-" + label.replace(" ", "-"))
+                mutate(request["receipt"]["children"][0])
+                result = control(self.control, request)
+                self.assertEqual((result["status"], result["reason"]), ("rejected", "receipt-child-next-leg-invalid"))
+        self.assertEqual(self.server.counts(), before)
+
     def test_invalid_delivery_timing_is_rejected_before_upstream(self) -> None:
         before = self.server.counts()
         request = receipt_request("batch-bad-timing")

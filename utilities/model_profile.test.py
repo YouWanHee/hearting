@@ -511,14 +511,83 @@ class TopExceptionProfileTest(unittest.TestCase):
         PROFILE.require_top_route(None, profile="deep", node="frame")
 
 
+class LowerLaunchSelectionReceiptTest(unittest.TestCase):
+    """D2 seam: a node stays sealed at `top`; a launch at another profile passes `selection_receipt` only
+    as the exact replacement a verified transition names. The claim itself is proven by
+    `dispatch_replacement.read_profile_transition` (covered in dispatch_replacement.test.py and the
+    per-adapter end-to-end cases); here the reader is the variable."""
+
+    TRANSITION = {"from": "top", "to": "deep", "reason": "capacity", "ordinal": 1, "origin": "frame-rule"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        selection = PROFILE.resolve_profile_demand(None, explicit_profile="top")
+        route = {"route_id": "rt-x", "route_hash": "sha256:x", "profile_selection_contract_version": 1,
+                 "nodes": [{"id": "frame", "model_profile": "top", "profile_demand": None,
+                            "profile_selection": selection}]}
+        self.path = Path(self.tmp.name) / "route.json"
+        self.path.write_text(json.dumps(route))
+        self.selection = selection
+
+    def launch(self, profile, **overrides):
+        values = dict(route_file=str(self.path), route_node="frame", automatic_retry_of="att-source",
+                      attempt_id="att-replacement", jobs="/tmp/never-read-jobs.log",
+                      resolved_model_settings={"profile": profile})
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def receipt(self, profile, reader, **overrides):
+        from unittest import mock
+        with mock.patch("dispatch_replacement.read_profile_transition", reader) as read:
+            return PROFILE.selection_receipt(self.launch(profile, **overrides)), read
+
+    def test_the_sealed_profile_never_asks_for_a_transition(self):
+        from unittest import mock
+        receipt, read = self.receipt("top", mock.Mock(side_effect=AssertionError("asked")))
+        read.assert_not_called()
+        self.assertEqual(receipt["profile_selection_source"], "explicit")
+
+    def test_a_verified_transition_admits_the_lower_launch_and_keeps_the_sealed_selection(self):
+        from unittest import mock
+        receipt, read = self.receipt("deep", mock.Mock(return_value=dict(self.TRANSITION)))
+        read.assert_called_once_with("/tmp/never-read-jobs.log", route=mock.ANY, node="frame",
+                                    attempt_id="att-replacement")
+        self.assertEqual(read.call_args.kwargs["route"]["route_id"], "rt-x")
+        self.assertEqual(receipt["profile_selection_source"], "explicit")
+        self.assertEqual(receipt["profile_selection_digest"], PROFILE._digest(self.selection))
+
+    def test_a_lower_launch_without_a_verified_claim_is_refused(self):
+        from unittest import mock
+        cases = {
+            "no claim": dict(reader=mock.Mock(return_value=None)),
+            "claim for another target": dict(reader=mock.Mock(return_value={**self.TRANSITION, "to": "balanced-deep"})),
+            "not an automatic retry": dict(reader=mock.Mock(return_value=dict(self.TRANSITION)),
+                                           automatic_retry_of=None),
+            "no registry named": dict(reader=mock.Mock(return_value=dict(self.TRANSITION)), jobs=None),
+        }
+        for label, case in cases.items():
+            with self.subTest(label), self.assertRaises(PROFILE.ModelProfileError) as refused:
+                self.receipt("deep", case.pop("reader"), **case)
+            self.assertEqual(refused.exception.reason, "profile-selection-mismatch")
+
+    def test_a_claim_that_fails_its_proof_refuses_typed(self):
+        import dispatch_contract as DC
+        from unittest import mock
+        reader = mock.Mock(side_effect=DC.DispatchContractError("replacement-not-silent-death"))
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            self.receipt("deep", reader)
+        self.assertEqual(refused.exception.reason, "profile-selection-mismatch")
+
+
 class FrameTierLadder(unittest.TestCase):
     def test_the_ladder_maps_every_owner_profile_to_its_frame_pair(self):
         expected = {
-            "top": {"anchor": "top", "others": "deep"},
-            "deep": {"anchor": "top", "others": "deep"},
-            "balanced-deep": {"anchor": "deep", "others": "deep"},
-            "balanced": {"anchor": "balanced-deep", "others": "balanced-deep"},
-            "light": {"anchor": "balanced", "others": "balanced"},
+            "top": {"anchor": "top", "others": "top"},
+            "deep": {"anchor": "top", "others": "top"},
+            "balanced-deep": {"anchor": "top", "others": "top"},
+            "balanced": {"anchor": "top", "others": "top"},
+            "light": {"anchor": "top", "others": "top"},
         }
         for owner, rungs in expected.items():
             with self.subTest(owner=owner):
@@ -539,6 +608,7 @@ class FrameTierLadder(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(PROFILE.frame_profile_for_owner(value),
                                  PROFILE.FRAME_PROFILE_LADDER["light"])
+                self.assertEqual(PROFILE.frame_profile_for_owner(value), {"anchor": "top", "others": "top"})
 
     def test_the_returned_mapping_cannot_mutate_the_table(self):
         rungs = PROFILE.frame_profile_for_owner("deep")

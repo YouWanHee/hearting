@@ -185,7 +185,7 @@ def main() -> int:
 
     manifest = harness_manifest.load()
     expected: dict[Path, str] = {}
-    for identifier, spec in manifest["capabilities"].items():
+    for identifier, spec in harness_manifest.skill_capabilities(manifest).items():
         capability_file = CAPABILITIES / f"{identifier}.md"
         identifier, body = render(identifier, spec, capability_file)
         expected[OUT / identifier / "SKILL.md"] = body

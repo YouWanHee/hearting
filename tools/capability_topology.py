@@ -86,18 +86,34 @@ def capability_registry_digest(registry, capability, extra_recipes=()):
     """
     recipes = list(extra_recipes)
     names = {capability}
+    used_parts = set()
     for recipe in recipes:
         meta = recipe.get("compose") if isinstance(recipe, dict) else None
         base = meta.get("base_capability") if isinstance(meta, dict) else None
         if isinstance(base, str):
             names.add(base)
+        if isinstance(meta, dict) and isinstance(meta.get("parts"), list):
+            used_parts.update(part for part in meta["parts"] if isinstance(part, str))
+    # SD-165: a borrowed part's origin recipe is part of what the route derives from.
+    names.update(part.partition(":")[0] for part in used_parts)
     recipes = [r for r in registry.get("recipes", []) if r.get("capability") in names] + recipes
     referenced = set()
     _string_values(recipes, referenced)
     contracts = registry.get("completion_gate_contracts") or {}
-    projection = {k: v for k, v in registry.items() if k not in ("recipes", "completion_gate_contracts")}
+    # The part catalog is never part of the shared projection: a route that uses
+    # no catalog data keeps the digest it had before the catalog existed. Only
+    # the rows a composed recipe actually used (`compose.parts`) are added.
+    projection = {k: v for k, v in registry.items()
+                  if k not in ("recipes", "completion_gate_contracts", "part_catalog")}
     projection["recipes"] = recipes
     projection["completion_gate_contracts"] = {k: v for k, v in contracts.items() if k in referenced}
+    if used_parts:
+        catalog = part_catalog(registry)
+        rows = catalog.get("parts") or {}
+        projection["part_catalog"] = {
+            "parts": {part: rows.get(part) for part in sorted(used_parts)},
+            "hosts": (catalog.get("hosts") or {}).get(capability),
+        }
     return "sha256:" + hashlib.sha256(canonical_registry_bytes(projection)).hexdigest()
 
 
@@ -108,12 +124,63 @@ def expected_recipe_keys(manifest=None):
     # the `entry` group) needs a recipe so a producer cycle can be issued for
     # it at direct/quick/standard+.
     return {(name, mode) for name, spec in manifest["capabilities"].items()
-            if spec.get("invocation", {}).get("class") == "entry-router"
+            if spec.get("invocation", {}).get("class") in ("entry-router", "compiler-internal")
             for mode in (spec["modes"] or ["default"])}
 
 
 def recipe_keys(registry):
     return {(r["capability"], mode) for r in registry["recipes"] for mode in r["modes"]}
+
+
+ROUTE_FRAME_CAPABILITY = "route-frame"
+ROUTE_DECISION_KIND = "runtime-terminal"
+ROUTE_FRAME_NODE_IDS = ["frame", "frame-alternative", "route-decision"]
+
+
+def is_route_frame_terminal(recipe, node):
+    """Whether ``node`` is the one model-less runtime terminal this registry accepts.
+
+    The runtime terminal is not a worker kind and is not in `worker_kinds`: it is
+    accepted only as the `route-decision` node of the `route-frame` recipe, and only
+    when the whole recipe has the exact shape checked by `_validate_route_frame_shape`.
+    Every other recipe that names such a node fails the ordinary worker-kind check.
+    """
+    return (isinstance(recipe, dict) and recipe.get("capability") == ROUTE_FRAME_CAPABILITY
+            and isinstance(node, dict) and node.get("id") == "route-decision"
+            and node.get("kind") == ROUTE_DECISION_KIND)
+
+
+def _validate_route_frame_shape(recipe):
+    """Exact shape of the compiler-internal framed route: two `top` frame legs and the terminal."""
+    cap = ROUTE_FRAME_CAPABILITY
+    graph = recipe["standard_plus"]
+    nodes = graph.get("nodes", [])
+    if [n.get("id") for n in nodes] != ROUTE_FRAME_NODE_IDS:
+        raise TopologyError(f"{cap}: nodes must be exactly {ROUTE_FRAME_NODE_IDS}")
+    frame, alternative, decision = nodes
+    for leg in (frame, alternative):
+        if (leg.get("kind") != "map-worker" or leg.get("unit") != "plan/frame"
+                or leg.get("worker_type") != "frame" or leg.get("dispatch_depth") != 1
+                or leg.get("depends_on") != [] or leg.get("launch_authority") != "depth-0"
+                or leg.get("continuation") != {"kind": "human-gate", "gate": "frame-review"}):
+            raise TopologyError(f"{cap}:{leg.get('id')}: frame leg shape mismatch")
+    expected_decision = {
+        "id": "route-decision", "kind": ROUTE_DECISION_KIND, "depends_on": ["frame", "frame-alternative"],
+        "dispatch_depth": 0, "execution_surface": "inline", "registered_worker": False,
+        "terminal": True, "terminal_gate": "route-decision", "completion_gate": "route-decision",
+        "commit_expected": False, "advance_class": "runtime-eligible", "resource_class": "normal",
+    }
+    if any(decision.get(key) != value for key, value in expected_decision.items()):
+        raise TopologyError(f"{cap}:route-decision: runtime terminal shape mismatch")
+    if any(key in decision for key in ("unit", "model_profile", "worker_type", "fallback_hops",
+                                       "continuation", "unit_choices", "role")):
+        raise TopologyError(f"{cap}:route-decision: a runtime terminal carries no unit, role or model")
+    if (recipe["human_gates"] != ["frame-review"]
+            or recipe["human_gate_bindings"] != [{"gate": "frame-review", "node": "route-decision",
+                                                  "position": "entry"}]):
+        raise TopologyError(f"{cap}: exactly one frame-review binding at the terminal entry is required")
+    if graph.get("parallel_groups") or recipe.get("conditional_extensions"):
+        raise TopologyError(f"{cap}: no parallel groups or extensions")
 
 
 def _scope_root(scope):
@@ -517,7 +584,10 @@ def _validate_gate_contracts(recipe, registry):
         kind = entry.get("kind")
         if kind == "unit-io":
             node = node_by_gate.get(gate)
-            if node is None or entry.get("unit") != node.get("unit"):
+            # SD-165: a node that declares `unit_choices` may run any of them
+            # under its one unit-io gate; the gate names the default choice.
+            if node is None or (entry.get("unit") != node.get("unit")
+                                and entry.get("unit") not in (node.get("unit_choices") or [])):
                 raise TopologyError(
                     f"{recipe['capability']}: unit-io gate {gate} must name the carrying node's unit"
                 )
@@ -862,6 +932,8 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
     if any(str(i).startswith("_") for i in ids):
         raise TopologyError(f"{recipe['capability']}: route-node-id-reserved-prefix")
     by_id = {n["id"]: n for n in nodes}
+    if recipe["capability"] == ROUTE_FRAME_CAPABILITY:
+        _validate_route_frame_shape(recipe)
     actual_max_dispatch_depth = max(
         (
             node.get("dispatch_depth", 0)
@@ -887,12 +959,16 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
             raise TopologyError(
                 f"{recipe['capability']}:{node['id']}: invalid runtime requirements"
             )
-        if node.get("kind") not in registry["worker_kinds"]:
+        runtime_terminal = is_route_frame_terminal(recipe, node)
+        if node.get("kind") not in registry["worker_kinds"] and not runtime_terminal:
             raise TopologyError(f"{recipe['capability']}:{node['id']}: invalid worker kind")
-        _validate_unit_ref(recipe, node, registry)
+        if not runtime_terminal:
+            _validate_unit_ref(recipe, node, registry)
         if "profile_demand" in node:
             PROFILE.resolve_profile_demand(node["profile_demand"])
-        if node["kind"] == "resource-runner":
+        if runtime_terminal:
+            pass  # exact shape is checked once for the whole recipe below
+        elif node["kind"] == "resource-runner":
             if "model_profile" in node:
                 raise TopologyError(
                     f"{recipe['capability']}:{node['id']}: resource runner cannot carry model_profile"
@@ -1343,6 +1419,304 @@ def _validate_producer_lifecycle(registry):
         raise TopologyError("artifact_buckets.shared-revision must declare the immutable shared layout")
 
 
+# ---------------------------------------------------------------------------
+# Part catalog (SD-165, stage-dispatch 13.64). A part is one stage addressed as
+# `<capability>:<stage>`. The catalog carries what recipe nodes do not: a
+# one-line summary, `shareable`, `start_approval`, widened `unit_choices`, input
+# name mapping, and optional parts that exist only in an explicit graph. Recipe
+# nodes, presets and `completion_gates` stay untouched; compose merges a catalog
+# value only when the graph actually calls for it.
+# ---------------------------------------------------------------------------
+PART_ID_RE = re.compile(r"^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$")
+PART_ROW_KEYS = frozenset({
+    "summary", "shareable", "hosts", "start_approval", "unit_choices",
+    "input_names", "optional_inputs", "optional",
+})
+PART_SHAREABLE_KINDS = ("map-worker", "pipeline-stage", "review-worker", "resource-runner")
+PART_ANCHOR_BY_KIND = {"map-worker": "map_anchor", "review-worker": "review_anchor"}
+FRAME_TEMPLATE_FIELDS = ("kind", "unit", "worker_type", "role", "dispatch_depth", "launch_authority")
+
+
+def part_catalog(registry):
+    catalog = registry.get("part_catalog")
+    return catalog if isinstance(catalog, dict) else {}
+
+
+def part_row(registry, part_id):
+    row = (part_catalog(registry).get("parts") or {}).get(part_id)
+    return row if isinstance(row, dict) else {}
+
+
+def part_recipe(registry, part_id):
+    """(origin recipe, node) of a part: a recipe node, else a catalog optional part."""
+    capability, _, stage = part_id.partition(":")
+    for recipe in registry.get("recipes", []):
+        if recipe.get("capability") != capability:
+            continue
+        for node in recipe["standard_plus"]["nodes"]:
+            if node.get("id") == stage:
+                return recipe, node
+    optional = part_row(registry, part_id).get("optional")
+    if isinstance(optional, dict):
+        modes = set(optional.get("modes") or [])
+        for recipe in registry.get("recipes", []):
+            if recipe.get("capability") == capability and modes & set(recipe.get("modes", [])):
+                return recipe, optional["node"]
+    return None
+
+
+def recipe_optional_parts(registry, recipe):
+    """Optional catalog parts of one recipe, as [(stage, row)] in catalog order."""
+    found = []
+    for part_id, row in (part_catalog(registry).get("parts") or {}).items():
+        optional = row.get("optional") if isinstance(row, dict) else None
+        capability, _, stage = part_id.partition(":")
+        if (isinstance(optional, dict) and capability == recipe.get("capability")
+                and set(optional.get("modes") or []) & set(recipe.get("modes", []))):
+            found.append((stage, row))
+    return found
+
+
+def relocate_part_path(scope, kind, capability, stage, path):
+    """Host paths of one borrowed part path: `<kind anchor>/parts/<capability>/<stage>/<path>`.
+
+    The whole origin path stays under the part directory, so a realized parallel
+    leg (`_parallel_path`) always lands inside `parts/<capability>/<stage>/`. A
+    literal host keeps every cycle anchor; the first result is the output path.
+    """
+    anchor = scope.get(PART_ANCHOR_BY_KIND[kind]) if kind in PART_ANCHOR_BY_KIND else None
+    relative = "/".join(segment for segment in (anchor, "parts", capability, stage, path) if segment)
+    if scope.get("anchor_mode", "implicit") == "literal" and scope.get("cycle_anchors"):
+        return [f"{cycle_anchor}/{relative}" for cycle_anchor in scope["cycle_anchors"]]
+    return [relative]
+
+
+def resolve_shared_part(registry, host_recipe, part_id):
+    """The borrowable part `part_id` for this host recipe, or None.
+
+    None covers every "cannot borrow" case alike -- unregistered, not
+    shareable, host not listed, or a map/review part whose host declares no
+    anchor -- so the caller keeps its one existing unknown-node answer.
+    """
+    row = part_row(registry, part_id)
+    if row.get("shareable") is not True:
+        return None
+    hosts = row.get("hosts")
+    if hosts is not None and host_recipe.get("capability") not in hosts:
+        return None
+    found = part_recipe(registry, part_id)
+    if found is None or (found[0].get("capability") == host_recipe.get("capability")
+                         and set(found[0].get("modes", [])) & set(host_recipe.get("modes", []))):
+        return None  # unregistered, or the host's own stage (not a borrow)
+    origin, node = found
+    scope = json.loads(json.dumps(host_recipe["artifact_scope"]))
+    needed = PART_ANCHOR_BY_KIND.get(node.get("kind"))
+    merged = None
+    if needed and not scope.get(needed):
+        declared = ((part_catalog(registry).get("hosts") or {}).get(host_recipe.get("capability")) or {}).get(needed)
+        if not declared:
+            return None
+        scope[needed] = declared
+        merged = needed
+    capability, _, stage = part_id.partition(":")
+    return {"part": part_id, "capability": capability, "stage": stage, "recipe": origin,
+            "node": node, "row": row, "scope": scope, "merged_anchor": merged}
+
+
+def borrowable_parts(registry, host_recipe):
+    """Part ids this host recipe can borrow, in catalog order."""
+    return [part_id for part_id in (part_catalog(registry).get("parts") or {})
+            if resolve_shared_part(registry, host_recipe, part_id) is not None]
+
+
+def frame_brief_inputs(registry, capability):
+    """Input names under which `capability`'s consumer node reads the frame briefs."""
+    row = ((part_catalog(registry).get("frame") or {}).get("briefs") or {}).get(capability)
+    return list(row["inputs"]) if isinstance(row, dict) else []
+
+
+def _validate_optional_part(registry, recipe, part_id, optional, owner_profile):
+    """An optional part must be a valid node of its recipe when selected alone."""
+    if not isinstance(optional, dict) or set(optional) != {"modes", "after", "before", "node"}:
+        raise TopologyError(f"part {part_id}: optional requires exactly modes, after, before, node")
+    node = optional["node"]
+    stage = part_id.partition(":")[2]
+    if not isinstance(node, dict) or node.get("id") != stage:
+        raise TopologyError(f"part {part_id}: optional node id must equal the stage id")
+    if node.get("kind") not in ("pipeline-stage", "review-worker", "map-worker"):
+        raise TopologyError(f"part {part_id}: optional part must be a pipeline, review, or map worker")
+    known = {n["id"] for n in recipe["standard_plus"]["nodes"]} | {
+        other for other, _row in recipe_optional_parts(registry, recipe)}
+    for key in ("after", "before"):
+        names = optional[key]
+        if not isinstance(names, list) or not set(names) <= known - {stage}:
+            raise TopologyError(f"part {part_id}: optional.{key} must name stages of its recipe")
+    alone = json.loads(json.dumps(node))
+    alone.update(depends_on=[], terminal=True, terminal_gate=alone.get("completion_gate"),
+                 advance_class="model-required", model_required_reason="terminal-report")
+    alone.pop("continuation", None)
+    probe = {key: json.loads(json.dumps(recipe[key])) for key in (
+        "capability", "modes", "topology_class", "direct_predicates", "promotion_signals",
+        "artifact_scope", "quick")}
+    probe.update({
+        "standard_plus": {"topology": recipe["standard_plus"].get("topology", recipe["topology_class"]),
+                          "owner_dispatch_depth": recipe["standard_plus"]["owner_dispatch_depth"],
+                          "max_dispatch_depth": alone.get("dispatch_depth", 0), "nodes": [alone]},
+        "completion_gates": [alone.get("completion_gate")], "human_gates": [],
+        "human_gate_bindings": [], "resume_retry_boundaries": [stage],
+    })
+    _validate_recipe(probe, registry, owner_profile)
+    _validate_gate_contracts(probe, registry)
+
+
+def _validate_part_catalog(registry, owner_profile):
+    """SD-165: the catalog may only describe, widen, or add -- never redefine a recipe node."""
+    if "part_catalog" not in registry:
+        return
+    catalog = registry["part_catalog"]
+    if not isinstance(catalog, dict) or set(catalog) != {"schema_version", "frame", "hosts", "parts"}:
+        raise TopologyError("part_catalog must declare exactly schema_version, frame, hosts, parts")
+    if catalog["schema_version"] != 1:
+        raise TopologyError("part_catalog.schema_version must be 1")
+    rows = catalog["parts"]
+    if not isinstance(rows, dict):
+        raise TopologyError("part_catalog.parts must be an object")
+    capabilities = {recipe["capability"] for recipe in registry["recipes"]}
+    node_ids = {}
+    for recipe in registry["recipes"]:
+        if recipe["capability"] == ROUTE_FRAME_CAPABILITY:
+            continue  # compiler-internal: never composable, so it has no catalog parts
+        for node in recipe["standard_plus"]["nodes"]:
+            key = f"{recipe['capability']}:{node['id']}"
+            if key in node_ids:
+                raise TopologyError(f"part id {key} is not unique across the capability's recipes")
+            if node["id"] in capabilities:
+                raise TopologyError(f"{key}: a stage id may not equal a capability id")
+            node_ids[key] = (recipe, node)
+    missing = sorted(set(node_ids) - set(rows))
+    if missing:
+        raise TopologyError(f"part_catalog.parts lacks a row for recipe stages {missing}")
+    outputs_by_capability = {}
+    for part_id, row in rows.items():
+        if not isinstance(part_id, str) or not PART_ID_RE.fullmatch(part_id):
+            raise TopologyError(f"invalid part id {part_id!r}")
+        if not isinstance(row, dict) or set(row) - PART_ROW_KEYS:
+            raise TopologyError(f"part {part_id}: unknown catalog fields {sorted(set(row) - PART_ROW_KEYS)}")
+        summary = row.get("summary")
+        if not isinstance(summary, str) or not summary.strip() or "\n" in summary:
+            raise TopologyError(f"part {part_id}: a one-line summary is required")
+        capability = part_id.partition(":")[0]
+        if part_id in node_ids:
+            if "optional" in row:
+                raise TopologyError(f"part {part_id}: a recipe stage cannot be declared optional")
+            recipe, node = node_ids[part_id]
+        else:
+            found = part_recipe(registry, part_id)
+            if found is None or "optional" not in row:
+                raise TopologyError(f"part {part_id}: not a recipe stage and no optional part declared")
+            recipe, node = found
+            _validate_optional_part(registry, recipe, part_id, row["optional"], owner_profile)
+        outputs_by_capability.setdefault(capability, set()).update(
+            out for out in node.get("outputs", []) if not _is_semantic_output(out))
+        if "start_approval" in row and (not isinstance(row["start_approval"], str) or not row["start_approval"]):
+            raise TopologyError(f"part {part_id}: start_approval must be a non-empty string")
+        if "optional_inputs" in row and (
+                not isinstance(row["optional_inputs"], list)
+                or any(not isinstance(name, str) or not name for name in row["optional_inputs"])):
+            raise TopologyError(f"part {part_id}: optional_inputs must be a list of names")
+        if "unit_choices" in row:
+            if "unit_choices" in node or node.get("kind") in ("capability-owner", "resource-runner"):
+                raise TopologyError(f"part {part_id}: catalog unit_choices cannot redefine the node's own")
+            widened = dict(node, unit_choices=row["unit_choices"])
+            _validate_unit_ref(recipe, widened, registry)
+        if "hosts" in row and row.get("shareable") is not True:
+            raise TopologyError(f"part {part_id}: hosts is only valid on a shareable part")
+        if "shareable" in row:
+            if not isinstance(row["shareable"], bool):
+                raise TopologyError(f"part {part_id}: shareable must be a boolean")
+            hosts = row.get("hosts")
+            if hosts is not None and (not isinstance(hosts, list) or not hosts or not set(hosts) <= capabilities):
+                raise TopologyError(f"part {part_id}: hosts must list known capabilities")
+            if row["shareable"]:
+                scope = recipe["artifact_scope"]
+                outside = set(scope.get("external_scopes", []))
+                root_anchors = scope.get("root_anchors", [])
+                paths = list(node["write_scope"]) + [
+                    out for out in node.get("outputs", []) if not _is_semantic_output(out)]
+                if node.get("kind") not in PART_SHAREABLE_KINDS:
+                    raise TopologyError(f"part {part_id}: kind {node.get('kind')} cannot be shared")
+                if scope.get("anchor_mode", "implicit") != "implicit":
+                    raise TopologyError(f"part {part_id}: only an implicit-anchor recipe's part can be shared")
+                for path in paths:
+                    root = _scope_root(path)
+                    if path in outside or any(root == a or root.startswith(a + "/") for a in root_anchors):
+                        # Source-tree and root-anchored writes never travel with a part.
+                        raise TopologyError(f"part {part_id}: write outside the cycle cannot be shared ({path})")
+    for part_id, row in rows.items():
+        names = row.get("input_names")
+        if names is None:
+            continue
+        _recipe, node = part_recipe(registry, part_id)
+        known_outputs = outputs_by_capability.get(part_id.partition(":")[0], set())
+        if not isinstance(names, dict) or not names or not set(names) <= set(node.get("inputs", [])) \
+                or not set(names.values()) <= known_outputs:
+            raise TopologyError(
+                f"part {part_id}: input_names must map the part's inputs to outputs of its capability")
+    hosts = catalog["hosts"]
+    if not isinstance(hosts, dict) or not set(hosts) <= capabilities:
+        raise TopologyError("part_catalog.hosts must be keyed by known capabilities")
+    for capability, anchors in hosts.items():
+        if not isinstance(anchors, dict) or not anchors or not set(anchors) <= set(PART_ANCHOR_BY_KIND.values()) \
+                or any(not isinstance(value, str) or not value for value in anchors.values()):
+            raise TopologyError(f"part_catalog.hosts[{capability!r}] must declare map_anchor and/or review_anchor")
+        for recipe in registry["recipes"]:
+            if recipe["capability"] == capability and any(recipe["artifact_scope"].get(k) for k in anchors):
+                raise TopologyError(f"part_catalog.hosts[{capability!r}] redeclares an anchor its recipe already has")
+    # Every shareable part must land validly in every host that can take it.
+    for part_id, row in rows.items():
+        if row.get("shareable") is not True:
+            continue
+        for host in registry["recipes"]:
+            part = resolve_shared_part(registry, host, part_id)
+            if part is None:
+                continue
+            kind = part["node"]["kind"]
+            probe = dict(host, artifact_scope=part["scope"])
+            scopes = [moved for path in part["node"]["write_scope"]
+                      for moved in relocate_part_path(part["scope"], kind, part["capability"], part["stage"], path)]
+            label = f"{part['capability']}-{part['stage']}"
+            _validate_bucket_anchor(probe, registry, scopes, kind, label)
+            _validate_guard_scope(probe, scopes, [], registry, label)
+    frame = catalog["frame"]
+    if not isinstance(frame, dict) or set(frame) != {"template", "aliases", "brief_outputs", "briefs"}:
+        raise TopologyError("part_catalog.frame must declare template, aliases, brief_outputs, briefs")
+    template = frame["template"]
+    if not isinstance(template, dict) or not set(FRAME_TEMPLATE_FIELDS) <= set(template):
+        raise TopologyError("part_catalog.frame.template lacks a template field")
+    aliases = frame["aliases"]
+    framed = {recipe["capability"] for recipe in registry["recipes"]
+              if recipe["capability"] != ROUTE_FRAME_CAPABILITY
+              and any(node["id"] in aliases for node in recipe["standard_plus"]["nodes"])}
+    if not isinstance(frame["briefs"], dict) or set(frame["briefs"]) != framed:
+        raise TopologyError("part_catalog.frame.briefs must cover exactly the recipes that carry a frame")
+    for recipe in registry["recipes"]:
+        if recipe["capability"] not in framed:
+            continue
+        by_id = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
+        for alias in aliases:
+            node = by_id.get(alias)
+            if node is None or any(node.get(field) != template[field] for field in FRAME_TEMPLATE_FIELDS):
+                raise TopologyError(
+                    f"{recipe['capability']}:{alias}: frame alias differs from the catalog template")
+        brief = frame["briefs"][recipe["capability"]]
+        consumer = by_id.get(brief.get("consumer")) if isinstance(brief, dict) else None
+        if consumer is None or not isinstance(brief.get("inputs"), list) \
+                or len(brief["inputs"]) != len(frame["brief_outputs"]) \
+                or not set(brief["inputs"]) <= set(consumer.get("inputs", [])):
+            raise TopologyError(
+                f"{recipe['capability']}: frame brief mapping does not match the consumer node inputs")
+
+
 def validate_registry(registry, manifest=None):
     if registry.get("schema_version") != 10:
         raise TopologyError("legacy topology registry is read-only")
@@ -1432,6 +1806,7 @@ def validate_registry(registry, manifest=None):
     for recipe in registry["recipes"]:
         _validate_recipe(recipe, registry, standard_plus_owner_profile)
         _validate_gate_contracts(recipe, registry)
+    _validate_part_catalog(registry, standard_plus_owner_profile)
     return {"capabilities": len({x[0] for x in actual}), "recipes": len(actual), "registry_digest": registry_digest(registry)}
 
 

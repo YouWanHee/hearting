@@ -424,22 +424,18 @@ def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) ->
 
 
 # The frame bootstrap tier ladder -- ONE function, ONE home.
-#
-# The frame pair runs one tier ABOVE the owner it frames, because framing is
-# the decision the rest of the route cannot revisit. The anchor leg takes that
-# raise; the alternative leg stays at the owner's own working tier so the pair
-# stays genuinely two-voiced rather than two copies of the same tier.
+# Both legs make the route's irreversible framing judgment and use `top`.
 #
 # Do not restate this table anywhere else -- not in `topologies.json`, not in
 # `dispatch-defaults.yaml`. `capability-route.py` stamps every frame node's
 # `model_profile` from this function at compile time, which is what makes any
 # static value in the recipe a placeholder rather than a second home.
 FRAME_PROFILE_LADDER = {
-    "top": {"anchor": "top", "others": "deep"},
-    "deep": {"anchor": "top", "others": "deep"},
-    "balanced-deep": {"anchor": "deep", "others": "deep"},
-    "balanced": {"anchor": "balanced-deep", "others": "balanced-deep"},
-    "light": {"anchor": "balanced", "others": "balanced"},
+    "top": {"anchor": "top", "others": "top"},
+    "deep": {"anchor": "top", "others": "top"},
+    "balanced-deep": {"anchor": "top", "others": "top"},
+    "balanced": {"anchor": "top", "others": "top"},
+    "light": {"anchor": "top", "others": "top"},
 }
 # `top` is not portable, so a frame anchor that lands on it cannot be sealed
 # through the legacy "explicit portable profile, no demand" path -- the
@@ -461,8 +457,8 @@ FRAME_ANCHOR_SHAPE_DEMAND = {
         "to re-open it"
     ),
     "execution_reason": (
-        "one direction brief, written once, with no multi-step execution of "
-        "its own"
+        "each perspective writes one direction brief, with no multi-step "
+        "execution of its own"
     ),
     "evidence_refs": ["roles/units/plan/frame.md"],
 }
@@ -478,6 +474,29 @@ def frame_profile_for_owner(owner_profile: str) -> dict:
 
     return dict(FRAME_PROFILE_LADDER.get(owner_profile or "light",
                                          FRAME_PROFILE_LADDER["light"]))
+
+
+def _lower_launch_verified(args, route, node_id, selection, profile):
+    """True only for the frame rule's one lower launch.
+
+    The node stays sealed at its own profile; a launch at another one is accepted here only when the
+    attempt is the exact replacement a verified `profile_transition` claim names for this route and
+    node (`dispatch_replacement.read_profile_transition`). Everything else, including a claim that
+    fails its proof, keeps the sealed-profile check.
+    """
+    sealed = selection.get("resolved_profile") if isinstance(selection, Mapping) else None
+    if (not node_id or sealed is None or sealed == profile
+            or not getattr(args, "automatic_retry_of", None) or not getattr(args, "attempt_id", None)
+            or not getattr(args, "jobs", None)):
+        return False
+    import dispatch_contract as DC
+    import dispatch_replacement as R
+    try:
+        transition = R.read_profile_transition(
+            args.jobs, route=route, node=node_id, attempt_id=args.attempt_id)
+    except (DC.DispatchContractError, OSError) as exc:
+        raise ModelProfileError("profile transition unproven", "profile-selection-mismatch") from exc
+    return bool(transition and transition["from"] == sealed and transition["to"] == profile)
 
 
 def selection_receipt(args):
@@ -500,8 +519,10 @@ def selection_receipt(args):
                 "profile_demand_digest": "-", "profile_judgment_floor": "unknown"}
     if type(route["profile_selection_contract_version"]) is not int or route["profile_selection_contract_version"] != 1:
         raise ModelProfileError("unsupported profile selection contract", "profile-selection-version-unsupported")
-    validate_profile_selection(selection, demand,
-        profile=args.resolved_model_settings["profile"], existing_versioned_stage=True)
+    profile = args.resolved_model_settings["profile"]
+    if _lower_launch_verified(args, route, node_id, selection, profile):
+        profile = selection["resolved_profile"]  # the sealed selection is still checked as sealed
+    validate_profile_selection(selection, demand, profile=profile, existing_versioned_stage=True)
     return {"profile_selection_source": selection["source"],
             "profile_resolver_version": selection["resolver_version"],
             "profile_demand_digest": selection["demand_digest"] or "-",

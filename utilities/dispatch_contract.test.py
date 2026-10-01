@@ -3233,10 +3233,9 @@ class DispatchContractTest(unittest.TestCase):
     self.assertEqual(foreign.read_only_state()["workflow_state"],"CREATED")
 
  def test_a_binding_no_node_raises_is_not_fenced(self):
-  """review round 1, B1: `intent-confirmation`, `direction-confirmation`,
-  `preview-disposition`, `explicit-handback` are bound at entry in the topology
-  but no node's continuation raises them -- the §0.4 card satisfies them, and
-  no command in the harness could release them. Only a gate that some node
+  """Historical routes may carry bindings that no node's continuation raises;
+  the §0.4 card satisfies them, and no command in the harness could release
+  them. Only a gate that some node
   raises (`continuation.kind == human-gate`) is fenced."""
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); route,path=self._gated_route(base)
@@ -3310,6 +3309,9 @@ class DispatchContractTest(unittest.TestCase):
    # (user decision 2026-09-10: an approval, not a direction, so not absorbed)
    ("autopilot-refine","preview-disposition","transaction","human-gate-not-raised"),
    ("autopilot-spec","frame-review","research","human-gate-not-raised"),
+   # the framed route (SD-164) binds the same gate at the entry of its model-less terminal,
+   # so the decision cannot be settled before the person has answered
+   ("route-frame","frame-review","route-decision","human-gate-not-raised"),
   ],seen)
   self.assertEqual({row[1] for row in fenced},set(D.FENCED_HUMAN_GATES))
   self.assertGreaterEqual(len(seen),5)

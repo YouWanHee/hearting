@@ -171,7 +171,7 @@ def parse_frontmatter(path):
 # ---------------------------------------------------------------------------
 def build_skills(canonical):
     rows = []
-    for identifier, spec in canonical["capabilities"].items():
+    for identifier, spec in harness_manifest.skill_capabilities(canonical).items():
         rows.append({
             "slug": "skill__%s" % identifier,
             "name": identifier,
@@ -535,6 +535,14 @@ def _capability_catalog(canonical):
     ]
     for identifier, spec in canonical["capabilities"].items():
         modes = ", ".join(spec["modes"]) or "-"
+        if spec["invocation"]["class"] == "compiler-internal":
+            # Documented, never projected: no Skill, no native command, no persona.
+            lines.append(
+                "| `%s` | %s | %s | [`%s.md`](%s.md) | %s | compiler-internal: none | compiler-internal: none | "
+                "compiler-internal: none |"
+                % (identifier, _md_cell(spec["group"]), _md_cell(modes), identifier, identifier,
+                   _md_cell(spec["summary"])))
+            continue
         lines.append(
             "| `%s` | %s | %s | [`%s.md`](%s.md) | %s | "
             "`adapters/claude/skills/%s/SKILL.md` | "

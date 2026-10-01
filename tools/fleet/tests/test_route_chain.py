@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -85,6 +86,80 @@ class LedgerPathTest(EnvTmpTestCase):
     def test_accepts_safe_session_id(self):
         path = route_chain.ledger_path("claude", "sess-a.1")
         self.assertEqual(path, os.path.join(self.chains_dir, "claude", "sess-a.1.jsonl"))
+
+
+class WriterIdentityTest(EnvTmpTestCase):
+    def test_depth_zero_single_native_session_is_the_anchor(self):
+        self.assertEqual(route_chain.writer_identity({"CLAUDE_CODE_SESSION_ID": "sess-a"}),
+                         ("claude", "sess-a"))
+        self.assertEqual(route_chain.writer_identity(
+            {"CODEX_THREAD_ID": "thr-1", "AGENT_DISPATCH_DEPTH": "0"}), ("codex", "thr-1"))
+
+    def test_workers_ambiguity_and_unsafe_ids_have_no_anchor(self):
+        self.assertIsNone(route_chain.writer_identity(
+            {"CLAUDE_CODE_SESSION_ID": "sess-a", "AGENT_DISPATCH_DEPTH": "1"}))
+        self.assertIsNone(route_chain.writer_identity(
+            {"CLAUDE_CODE_SESSION_ID": "sess-a", "OPENCODE_SESSION_ID": "oc-1"}))
+        self.assertEqual(route_chain.writer_identity(
+            {"CLAUDE_CODE_SESSION_ID": "sess-a", "OPENCODE_SESSION_ID": "oc-1",
+             "AGENT_DISPATCH_CALLER_HARNESS": "opencode"}), ("opencode", "oc-1"))
+        self.assertIsNone(route_chain.writer_identity({"CLAUDE_CODE_SESSION_ID": "../escape"}))
+        self.assertIsNone(route_chain.writer_identity({}))
+
+
+class ComposingAnchorTest(EnvTmpTestCase):
+    ROUTE = {"route_id": "rt-" + "a" * 32, "artifact_root": "/x", "campaign_key": "k"}
+
+    def put(self, session_id, event, route=None):
+        line = route_chain.build_line(route or self.ROUTE, event=event, harness="claude",
+                                      session_id=session_id, route_file="/x/r.json")
+        self.assertTrue(route_chain.append("claude", session_id, line))
+
+    def test_the_composing_ledger_names_the_anchor_for_any_asking_process(self):
+        self.put("sess-a", "compose")
+        for env in ({"CLAUDE_CODE_SESSION_ID": "sess-a"},
+                    {"CLAUDE_CODE_SESSION_ID": "worker-d", "AGENT_DISPATCH_DEPTH": "1"}, {}):
+            self.assertEqual(route_chain.composing_anchor(self.ROUTE["route_id"], env), ("claude", "sess-a"))
+
+    def test_start_only_unknown_and_contested_routes_have_no_anchor(self):
+        self.put("sess-a", "start")
+        self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}))
+        self.assertIsNone(route_chain.composing_anchor("rt-" + "b" * 32, {}))
+        self.assertIsNone(route_chain.composing_anchor(None, {}))
+        self.put("sess-a", "compose")
+        self.put("sess-b", "compose")
+        self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}))
+        self.assertEqual(route_chain.composing_anchor(
+            self.ROUTE["route_id"], {"CLAUDE_CODE_SESSION_ID": "sess-b"}), ("claude", "sess-b"))
+
+
+    def test_an_older_composing_ledger_is_found_past_any_number_of_newer_unrelated_ones(self):
+        """The route's creation time, not a count of recent ledgers, bounds the scan."""
+        created = time.time() - 10_000
+        self.put("composer", "compose")
+        self._age("composer", created + 100)                                  # after the route, before the rest
+        self.put("older-than-route", "compose")
+        self._age("older-than-route", created - 500)                          # cannot hold this route's compose
+        other = {"route_id": "rt-" + "c" * 32, "artifact_root": "/x", "campaign_key": "k"}
+        for n in range(route_chain.ANCHOR_SCAN_FILES + 6):
+            self.put(f"unrelated-{n}", "compose", route=other)
+            self._age(f"unrelated-{n}", created + 1_000 + n)
+        route_id = self.ROUTE["route_id"]
+        self.assertEqual(route_chain.composing_anchor(route_id, {}, not_before=created), ("claude", "composer"))
+        # without the route's creation time the old count bound stays, and misses it
+        self.assertIsNone(route_chain.composing_anchor(route_id, {}))
+        # a ledger last written before the route existed is not scanned, even when it carries the line
+        self.assertIsNone(route_chain.composing_anchor(route_id, {}, not_before=created + 200))
+
+    def test_two_newer_ledgers_claiming_the_route_still_give_no_anchor(self):
+        created = time.time() - 10_000
+        for sid in ("sess-a", "sess-b"):
+            self.put(sid, "compose")
+            self._age(sid, created + 50)
+        self.assertIsNone(route_chain.composing_anchor(self.ROUTE["route_id"], {}, not_before=created))
+
+    def _age(self, session_id, mtime):
+        os.utime(route_chain.ledger_path("claude", session_id), (mtime, mtime))
 
 
 class BuildLineTest(EnvTmpTestCase):

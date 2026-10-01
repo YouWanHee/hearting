@@ -95,8 +95,8 @@ tool to claim Codex parity.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1):
-`direct`/`solo`/`staged` use `preflight.sh compose` (defaults fill the rest;
+Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1; new non-direct work defaults to `framed`):
+`direct`/`solo`/`staged`/`framed` use `preflight.sh compose` (defaults fill the rest;
 `--graph` = stage subgraph); `preflight.sh route --capability …` only for the
 entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: one
 `[경로]` line unless destructive or external-facing (§0.4 SD-136); else the

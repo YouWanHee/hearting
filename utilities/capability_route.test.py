@@ -238,6 +238,8 @@ class TestRoute(unittest.TestCase):
    R.compile_route(**self.args(predicates=[],transport="interactive",inline_reason=None,registered_headless_evidence=self.registered_headless()))
  def test_every_recipe_mode_has_one_registered_headless_quick_owner(self):
   for recipe in R.TOPO.load_registry()["recipes"]:
+   if recipe["capability"]==R.ROUTE_FRAME_CAPABILITY:
+    continue  # compiler-internal: reached only through `compose --shape framed`, never as a preset
    for mode in recipe["modes"]:
     with self.subTest(capability=recipe["capability"],mode=mode):
      route=R.compile_route(
@@ -289,6 +291,8 @@ class TestRoute(unittest.TestCase):
   evidence=self.dispatch(self.nested())
   compiled=0
   for recipe in registry["recipes"]:
+   if recipe["capability"]==R.ROUTE_FRAME_CAPABILITY:
+    continue  # compiler-internal: owner-less by design, covered by framed_route.test.py
    expected_owner_ids=[
     node["id"] for node in recipe["standard_plus"]["nodes"]
     if node.get("kind")=="capability-owner" and node.get("unit")=="_kernel/owner"
@@ -449,7 +453,7 @@ class TestRoute(unittest.TestCase):
    self.assertNotIn("fallback_hops",leg)
    self.assertEqual((leg["unit"],leg["dispatch_depth"],leg["worker_type"]),("plan/frame",1,"frame"))
    self.assertEqual(leg["launch_authority"],"depth-0")
-  self.assertNotEqual(frame["model_profile"],frame_replica["model_profile"])
+  self.assertEqual((frame["model_profile"],frame_replica["model_profile"]),("top","top"))
   self.assertEqual(frame["outputs"],["shards/frame/direction-brief.md"])
   self.assertEqual(frame["write_scope"],["shards/frame/**"])
   self.assertEqual(frame_replica["outputs"],["shards/frame-alternative/direction-brief.md"])
@@ -6559,7 +6563,9 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(omitted["capability_mode"],"default")
   self.assertEqual(omitted["nodes"],explicit["nodes"])
   self.assertEqual([n["id"] for n in omitted["nodes"]],["release-setup","security-review","release-review","deploy","post-deploy-verify"])
-  self.assertEqual(omitted["human_gates"],["deploy-authorization"])
+  self.assertEqual(omitted["human_gates"],[])
+  self.assertEqual(omitted["human_gate_bindings"],[])
+  self.assertIn("시작 승인 deploy (autopilot-ship:deploy)",R.compose_card(omitted))
   R.verify_route(omitted,R.ROOT)
  def test_ship_package_cannot_select_deployment_nodes(self):
   with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node:deploy"):
@@ -6797,6 +6803,12 @@ class ComposeRouteTest(TestRoute):
   plan_node=next(n for n in block["nodes"] if n["id"]=="plan")
   self.assertIn("frame-review",plan_node["human_gates"])
   self.assertTrue(next(n for n in block["nodes"] if n["id"]=="report")["terminal"])
+  # SD-165: every stage is a part `capability:stage` with its catalog fields
+  self.assertEqual(execute_node["part"],"autopilot-code:execute")
+  self.assertFalse(execute_node["shareable"]); self.assertFalse(execute_node["optional"])
+  self.assertIsNone(execute_node["start_approval"]); self.assertTrue(execute_node["summary"])
+  self.assertEqual(execute_node["inputs"],["plan.md","checklist.md"])
+  self.assertIn("autopilot-research:synthesis",[n["part"] for n in block["borrowable"]])
   # every-capability form and the text rendering both work too
   result_all=subprocess.run([sys.executable,str(P),"stages"],text=True,capture_output=True,env=env)
   self.assertEqual(result_all.returncode,0,result_all.stderr)
@@ -7224,6 +7236,8 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   registry=R.TOPO.load_registry()
   framed=[]
   for recipe in registry["recipes"]:
+   if recipe["capability"]==R.ROUTE_FRAME_CAPABILITY:
+    continue  # compiler-internal: no quick shape
    route=self.quick(capability=recipe["capability"],capability_mode=recipe["modes"][0])
    R.verify_route(route,R.ROOT)
    frames=[n["id"] for n in route["nodes"] if n.get("worker_type")=="frame"]
@@ -7338,7 +7352,7 @@ class FrameBootstrapLayerTest(unittest.TestCase):
      self.assertNotIn("harness_affinity",leg)
      self.assertNotIn("parallel_group",leg)
      self.assertNotIn(leg["id"],[group["id"] for group in route["parallel_groups"]])
-    self.assertNotEqual(legs[0]["model_profile"],legs[1]["model_profile"])
+    self.assertEqual([leg["model_profile"] for leg in legs],["top","top"])
     work=[node for node in route["nodes"] if node["id"] not in self.FRAME_IDS]
     self.assertEqual(work[0]["depends_on"],["frame","frame-alternative"])
     # membership, not position: refine also binds its preview approval
@@ -7438,7 +7452,7 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   self.assertGreater(disagreeing,0,
    "the static placeholders match the ladder, so this test cannot prove the stamp happens")
 
-  # standard+: owner is `deep` at every intensity, so anchor `top` / other `deep`
+  # standard+: both frame perspectives use top at every intensity.
   for capability,mode in self.FRAME_CAPABILITIES:
    with self.subTest(capability=capability):
     route=self.standard(capability=capability,mode=mode)
@@ -7448,14 +7462,14 @@ class FrameBootstrapLayerTest(unittest.TestCase):
     self.assertEqual(by_id["frame-alternative"]["model_profile"],rungs["others"])
     R.verify_route(route,R.ROOT)
 
-  # quick: owner is `balanced-deep`, so both legs land on `deep`
+  # quick: owner is `balanced-deep`, so both legs still land on top.
   route=self.quick()
   rungs=ladder[route["owner_model_profile"]]
   by_id={n["id"]:n for n in route["nodes"]}
   self.assertEqual(route["owner_model_profile"],"balanced-deep")
   self.assertEqual(by_id["frame"]["model_profile"],rungs["anchor"])
   self.assertEqual(by_id["frame-alternative"]["model_profile"],rungs["others"])
-  self.assertEqual((rungs["anchor"],rungs["others"]),("deep","deep"))
+  self.assertEqual((rungs["anchor"],rungs["others"]),("top","top"))
   R.verify_route(route,R.ROOT)
 
  def test_a_top_anchor_carries_a_real_demand_rather_than_an_unsealed_label(self):
@@ -7471,10 +7485,10 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   self.assertEqual(anchor["profile_selection"]["source"],"explicit")
   self.assertEqual(anchor["profile_selection"]["reason"],"explicit-top-exception")
   self.assertEqual(anchor["profile_demand"],R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
-  # the sibling leg stays portable and needs no demand of its own
+  # the sibling leg has its own sealed top demand
   other=next(n for n in route["nodes"] if n["id"]=="frame-alternative")
-  self.assertEqual(other["model_profile"],"deep")
-  self.assertIsNone(other["profile_demand"])
+  self.assertEqual(other["model_profile"],"top")
+  self.assertEqual(other["profile_demand"],R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
   R.verify_route(route,R.ROOT)
 
  def test_the_owners_own_demand_is_reused_when_the_caller_supplied_one(self):

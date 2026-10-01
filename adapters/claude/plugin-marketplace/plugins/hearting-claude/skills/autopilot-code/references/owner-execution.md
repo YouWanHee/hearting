@@ -73,8 +73,11 @@ owner launch. Depth-0 joins them, builds
 `shards/frame/frame-summary.json` and the interview `shards/frame/interview.json`
 (schema `frame_interview_v1`, SD-129), asks the user, releases `frame-review`,
 and renders `shards/frame/intent.md` under the inherited cycle's
-`AGENT_ARTIFACT_OUTPUT_DIR`. Legacy sealed route bytes remain unchanged;
-consume the gate declarations of your assigned route.
+`AGENT_ARTIFACT_OUTPUT_DIR`. Both frame legs run `top` (a pin or explicit profile
+wins). A route composed from an approved proposal (`--route-plan`) has no frame
+nodes of its own: the direction was settled in its frame route's interview, and
+`intent.md` arrives as an input all the same. Legacy sealed route bytes remain
+unchanged; consume the gate declarations of your assigned route.
 
 1. **You receive `intent.md`'s path as an input.** Read it first. Do not raise
    `frame-review`, do not call `await-release` for it, and do not render the

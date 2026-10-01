@@ -145,6 +145,9 @@ STAGE_CAPABILITIES = (
     "design-init", "design-refs", "design-tokens", "design-components",
     "design-review", "design-handoff", "draft-strategy", "draft-refine",
 )
+# Compiler-internal capabilities: no Skill and no person invokes them, but the route
+# compiler seals routes for them and a producer cycle must be issuable for that route.
+INTERNAL_CAPABILITIES = ("route-frame",)
 CANONICAL_ROOTS = ("campaigns", "shared")
 # Legacy capability buckets (CORE.md §3 C-DUR) plus the undeclared containers.
 LEGACY_TOP_LEVEL = (
@@ -1419,20 +1422,88 @@ def _scan_cycle_artifacts(artifacts: Path) -> Optional[List[Tuple[str, bool]]]:
     return found
 
 
-def _campaign_latest_cycle(root: Path, campaign_id: str, before: Optional[str] = None) -> Optional[str]:
-    """Latest cycle of a campaign (or the one started just before `before`); unassigned containers have none."""
+def _session_cycle_ids(root: Path, campaign: Mapping[str, Any], route_chain_identity,
+                       begin_cycle: Mapping[str, str]) -> set:
+    """Cycles of the routes this session composed for the campaign, read from its route-chain ledger.
+
+    A ledger line names a route, never a cycle. A cycle record names its begin route, so a line
+    maps to a cycle directly when that route began one, and through its verified lineage when it is
+    a continuation of a route that did. The cycle's own audit copy of rebound routes is not read.
+    """
+    try:
+        harness, session_id = route_chain_identity[:2]
+        tools_dir = Path(__file__).resolve().parents[1] / "tools"
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import route_chain
+        if route_chain.WRITER_SUPPORT.get(harness) != "env":
+            return set()
+        resolved = Path(root).resolve()
+        composed = {line["route_id"]
+                    for line in route_chain.read_tail(harness, session_id, max_bytes=1024 * 1024)
+                    if line.get("event") in route_chain.COMPOSING_EVENTS
+                    and line.get("campaign_key") == campaign.get("key")
+                    and Path(str(line.get("artifact_root") or "")).resolve() == resolved}
+    except Exception:
+        return set()
+    cycles = set()
+    for route_id in composed:
+        found = begin_cycle.get(route_id)
+        if found is None:
+            try:
+                route = load_route(root, route_lineage.canonical_route_path(root, route_id))
+                for ancestor in route_lineage.verified_route_lineage(route, artifact_root=root):
+                    found = found or begin_cycle.get(ancestor["route_id"])
+            except Exception:
+                continue
+        if found is not None:
+            cycles.add(found)
+    return cycles
+
+
+def same_flow_source_cycle(root: Path, campaign_id: str, *, capability: str,
+                           route_chain_identity=None, before: Optional[str] = None) -> Optional[str]:
+    """The most recent cycle of the same flow, or None; never another flow's cycle.
+
+    Order: the composing session's own route cycle in this campaign, then the
+    latest cycle whose route capability is ``capability``. ``before`` keeps only
+    cycles that started earlier than that cycle.
+    """
     campaign = read_campaign(root, campaign_id)
     cycles = (campaign or {}).get("cycles")
-    if not campaign or campaign.get("degraded") is True or campaign.get("key") == UNASSIGNED_KEY \
-            or not isinstance(cycles, list) or not cycles:
+    if (not campaign or campaign.get("degraded") is True or campaign.get("key") == UNASSIGNED_KEY
+            or not isinstance(cycles, list) or not cycles):
         return None
-    if before is None:
-        return cycles[-1]
-    return cycles[cycles.index(before) - 1] if before in cycles[1:] else None
+    if before is not None:
+        if before not in cycles:
+            return None
+        cycles = cycles[:cycles.index(before)]
+    records = {row.get("cycle_id"): row for row in list_cycle_records(root)
+               if row.get("campaign_id") == campaign_id and row.get("cycle_id") in cycles}
+    begin_cycle = {rec["route_id"]: cycle_id for cycle_id, rec in records.items() if rec.get("route_id")}
+    session_cycles = (_session_cycle_ids(root, campaign, route_chain_identity, begin_cycle)
+                      if route_chain_identity else set())
+    for cycle_id in reversed(cycles):
+        if cycle_id in session_cycles:
+            return cycle_id
+    for cycle_id in reversed(cycles):
+        rec = records.get(cycle_id)
+        route_capability = rec.get("route_capability") if rec else None
+        if not route_capability and rec and rec.get("route_file"):
+            try:
+                route_file = Path(rec["route_file"]).resolve(strict=True)
+                if route_file.is_relative_to(Path(root).resolve()):
+                    route_capability = (_read_json(route_file) or {}).get("capability")
+            except Exception:
+                pass
+        if route_capability == capability:
+            return cycle_id
+    return None
 
 
 def input_source_cycle(root: Path, *, parent_cycle_id: Optional[str] = None,
-                       campaign_key: Optional[str] = None) -> Optional[str]:
+                       campaign_key: Optional[str] = None, capability: Optional[str] = None,
+                       route_chain_identity=None) -> Optional[str]:
     """The one source cycle: the parent, else the joined campaign's most recent cycle."""
     if parent_cycle_id:
         return parent_cycle_id
@@ -1441,11 +1512,14 @@ def input_source_cycle(root: Path, *, parent_cycle_id: Optional[str] = None,
     decision = classify_campaign_key(list_campaign_summaries(root, active_only=False), campaign_key)
     if decision.get("mode") not in ("join", "reopen"):
         return None
-    return _campaign_latest_cycle(root, decision["campaign_id"])
+    return (same_flow_source_cycle(root, decision["campaign_id"], capability=capability,
+                                   route_chain_identity=route_chain_identity)
+            if capability else None)
 
 
 def input_source_finder(root: Path, *, parent_cycle_id: Optional[str] = None,
-                        campaign_key: Optional[str] = None):
+                        campaign_key: Optional[str] = None, capability: Optional[str] = None,
+                        route_chain_identity=None):
     """Return find(name) -> {"cycle_id", "path"} | None, resolving the source lazily and once."""
     root = Path(root)
     memo: Dict[str, Optional[Dict[str, str]]] = {}
@@ -1454,7 +1528,8 @@ def input_source_finder(root: Path, *, parent_cycle_id: Optional[str] = None,
     def lookup(name: str) -> Optional[Dict[str, str]]:
         if not loaded:
             loaded["entries"] = None
-            cycle_id = input_source_cycle(root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key)
+            cycle_id = input_source_cycle(root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key,
+                                          capability=capability, route_chain_identity=route_chain_identity)
             artifacts = _cycle_artifacts_dir(root, cycle_id) if cycle_id else None
             if artifacts is not None:
                 loaded.update(cycle_id=cycle_id, artifacts=artifacts,
@@ -1485,7 +1560,28 @@ def input_source_finder(root: Path, *, parent_cycle_id: Optional[str] = None,
     return find
 
 
-def _parent_output_dir(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]]) -> Optional[str]:
+def _composing_anchor(route_id, root=None):
+    """The depth-0 session whose route-chain ledger says it composed ``route_id``, else None.
+
+    A route file is written once, so its mtime bounds the ledgers that can hold the compose line.
+    """
+    try:
+        created = None
+        try:
+            created = (Path(root) / ".runtime" / "routes" / f"{route_id}.json").stat().st_mtime if root else None
+        except OSError:
+            pass
+        tools_dir = Path(__file__).resolve().parents[1] / "tools"
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import route_chain
+        return route_chain.composing_anchor(route_id, not_before=created)
+    except Exception:
+        return None
+
+
+def _parent_output_dir(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]],
+                       route_chain_identity=None) -> Optional[str]:
     """Absolute artifacts/ of the source cycle: parent, else sealed input_sources, else the campaign's previous cycle."""
     try:
         cycle_id = record.get("parent_cycle_id")
@@ -1495,14 +1591,17 @@ def _parent_output_dir(root: Path, record: Mapping[str, Any], route: Optional[Ma
             sources = node.get("input_sources") if isinstance(node, Mapping) else None
             for source in (sources.values() if isinstance(sources, Mapping) else ()):
                 cycle_id = cycle_id or (source.get("cycle_id") if isinstance(source, Mapping) else None)
-        cycle_id = cycle_id or _campaign_latest_cycle(root, record["campaign_id"], before=record["cycle_id"])
+        cycle_id = cycle_id or same_flow_source_cycle(
+            root, record["campaign_id"], capability=(route or {}).get("capability") or record.get("route_capability"),
+            route_chain_identity=route_chain_identity, before=record["cycle_id"])
         directory = _cycle_artifacts_dir(root, cycle_id) if cycle_id and cycle_id != record["cycle_id"] else None
         return str(directory) if directory else None
     except Exception:  # SD-163: every lookup failure is "not found"
         return None
 
 
-def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str, Any]] = None,
+             route_chain_identity=None) -> Dict[str, str]:
     directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
     env = {
         "AGENT_ARTIFACT_ROOT": str(root),
@@ -1519,7 +1618,9 @@ def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str,
     group_id = artifact_workflow_groups.group_for_cycle(root, record["campaign_id"], record["cycle_id"])
     if group_id:
         env["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"] = group_id
-    parent_output = _parent_output_dir(root, record, route)
+    if route_chain_identity is None and route:
+        route_chain_identity = _composing_anchor(route.get("route_id"), root)
+    parent_output = _parent_output_dir(root, record, route, route_chain_identity)
     if parent_output:
         env["AGENT_ARTIFACT_PARENT_OUTPUT_DIR"] = parent_output
     return env
@@ -1936,7 +2037,7 @@ def _begin_cycle_record(
 ) -> Dict[str, Any]:
     dispatch_terminal_commit.require_current_cleanup("producer-begin", jobs=jobs)
     root = Path(root).resolve()
-    if capability not in ENTRY_CAPABILITIES + STAGE_CAPABILITIES:
+    if capability not in ENTRY_CAPABILITIES + STAGE_CAPABILITIES + INTERNAL_CAPABILITIES:
         raise ProducerError("capability-unknown", capability)
     if intensity not in INTENSITIES:
         raise ProducerError("intensity-unknown", intensity)
@@ -1953,7 +2054,7 @@ def _begin_cycle_record(
     if parent_cycle_id is not None and not artifact_identity.is_well_formed(parent_cycle_id, "cycle"):
         raise ProducerError("parent-cycle-invalid", str(parent_cycle_id))
     route_capability = route["capability"]
-    if capability in ENTRY_CAPABILITIES and route_capability != capability:
+    if capability in ENTRY_CAPABILITIES + INTERNAL_CAPABILITIES and route_capability != capability:
         raise ProducerError("route-capability-mismatch", f"{route_capability}!={capability}")
     if route["effective_intensity"] != intensity:
         raise ProducerError("route-intensity-mismatch", f"{route['effective_intensity']}!={intensity}")

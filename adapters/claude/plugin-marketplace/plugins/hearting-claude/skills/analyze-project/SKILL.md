@@ -1,7 +1,7 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
 name: analyze-project
-description: "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output. Not for conversational, read-only, or no-file analysis; orientation, context recovery, status, experiments, external research, source changes, or completed-work audits."
+description: "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output. Owns analysis; default preset. Not for conversational, read-only, or no-file analysis; orientation, context recovery, status, experiments, external research, source changes, or completed-work audits."
 argument-hint: "[--mode code|paper|doc] [<scope/target/input-folder>] [--skip-qa]"
 metadata:
   group: pre
@@ -9,7 +9,7 @@ metadata:
   invocation_class: entry-router
   modes: ["code", "paper", "doc"]
   blurb: "Creates persistent analysis of existing code, papers, or documents; initial analysis defaults here unless read-only/no-file or another primary applies."
-  use_when: "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output."
+  use_when: "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output. Owns analysis; default preset."
   not_for: "Not for conversational, read-only, or no-file analysis; orientation, context recovery, status, experiments, external research, source changes, or completed-work audits."
 ---
 

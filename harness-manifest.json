@@ -21,7 +21,7 @@
    "summary": "Creates persistent analysis of existing code, papers, or documents; initial analysis defaults here unless read-only/no-file or another primary applies.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output.",
+    "use_when": "Use when the user asks to analyze existing code, a paper, or a document and no usable persistent analysis exists, or to refresh stale analysis; default initial analysis to persistent output. Owns analysis; default preset.",
     "not_for": "Not for conversational, read-only, or no-file analysis; orientation, context recovery, status, experiments, external research, source changes, or completed-work audits."
    },
    "argument_shape": "[--mode code|paper|doc] [<scope/target/input-folder>] [--skip-qa]",
@@ -45,7 +45,7 @@
    "summary": "Create or update a cross-project user-preference profile from coding, writing, and analysis patterns.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when durable cross-project user preferences must be inferred from coding, writing, or analysis evidence and stored as a profile.",
+    "use_when": "Use when durable cross-project user preferences must be inferred from coding, writing, or analysis evidence and stored as a profile. Owns profile; default preset.",
     "not_for": "Not for one-project context recovery, casual preference acknowledgment, or ordinary task execution."
    },
    "argument_shape": "<aspect> [--source <path>] [--mode init|update] [--from discover|analyze|verify|qa|output|summary] [--user-refine]",
@@ -76,7 +76,7 @@
    "summary": "Read-oriented post-run inspection for artifact drift, inconsistency, and omissions.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims.",
+    "use_when": "Use when completed work or artifacts need a read-oriented inspection for drift, inconsistency, omissions, or unsupported claims. Owns audit report; default preset.",
     "not_for": "Not for implementing fixes, producing the primary artifact, or replacing execution-stage verification."
    },
    "argument_shape": "<artifact_path> [--scope auto|facts|style|structure|cross-ref|coverage|all] [--read-only] [--report-only] [--no-fact-check]",
@@ -94,7 +94,7 @@
    "summary": "Apply a cheatsheet draft to the real source artifact and verify the result.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when an approved cheatsheet or patching guide must be applied to the real source artifact and the applied result verified.",
+    "use_when": "Use when an approved cheatsheet or patching guide must be applied to the real source artifact and the applied result verified. Owns applied artifact; default preset.",
     "not_for": "Not for drafting or refining the cheatsheet, or for unrelated source implementation."
    },
    "argument_shape": "\"<cheatsheet hint / task>\" [--target latex] [--source <path-to-real-source>] [--isolation branch|worktree] [--from preflight|apply|verify|handback]",
@@ -117,7 +117,7 @@
    "summary": "Code-work entrypoint that detects spec context and closes the plan→execute→test→report loop.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when source code must be implemented, debugged, refactored, or code-audited through a plan, execution, test, and report loop.",
+    "use_when": "Use when source code must be implemented, debugged, refactored, or code-audited through a plan, execution, test, and report loop. Owns source changes; default preset.",
     "not_for": "Not for requirements-only changes, new empirical experiments, or document-only editing."
    },
    "argument_shape": "--mode dev|debug <task/plan/error description> [--from <step>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine]",
@@ -150,7 +150,7 @@
    "summary": "Visual-design pipeline coordinating references→tokens→components→review→handoff.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when a visual product surface needs references, design tokens, components or mockups, review, and development handoff.",
+    "use_when": "Use when a visual product surface needs references, design tokens, components or mockups, review, and development handoff. Owns design; default preset.",
     "not_for": "Not for implementing an already-approved design in code or for document prose work."
    },
    "argument_shape": "<design task or app path> [--scope ui|webapp|slide|icon|diagram|mixed] [--artifact standalone|project] [--from <phase>] [--intensity direct|quick|standard|strong|thorough|adversarial]",
@@ -183,7 +183,7 @@
    "summary": "Draft independent documents through strategy, verification, and editing.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when a new document has an independent audience and document goal.",
+    "use_when": "Use when a new document has an independent audience and document goal. Owns document; default preset.",
     "not_for": "Not for experiment reports (lab), existing-document edits, or code."
    },
    "argument_shape": "<task description> [--mode paper|presentation|doc] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine] [--no-clarify] [--from analyze|strategy|strategy-refine|draft|draft-refine|finalize]",
@@ -211,7 +211,7 @@
    "summary": "Set up experiments, evaluate, and report results, including fixed results.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements.",
+    "use_when": "Use when experiments need setup, evaluation/analysis, failure reproduction, or result reporting, including fixed results without new measurements. Owns experiments; default preset.",
     "not_for": "Not for reusable evaluation code, independent documents, or fixed-data document layout/caption edits."
    },
    "argument_shape": "<task description> [--mode setup|eval|auto] [--parent <slug>] [--ref <similar-model-path>] [--intensity direct|quick|standard|strong|thorough|adversarial] [--report] [--from spec|scaffold|run|eval|summary]",
@@ -236,7 +236,7 @@
    "summary": "Correct existing documents with snapshots and change history.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history.",
+    "use_when": "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history. Owns revision; default preset.",
     "not_for": "Not for new documents, empirical work, or evaluation/result reporting (lab)."
    },
    "argument_shape": "\"<prompt>\" [--intensity direct|quick|standard|strong|thorough|adversarial] [--review-only | --memo <file>] [--confirm] [--no-fact-check] [--no-style-audit]",
@@ -260,7 +260,7 @@
    "summary": "Shared upfront research that surveys academic, technology, or market sources before downstream routing.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production.",
+    "use_when": "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Owns research; default preset.",
     "not_for": "Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence."
    },
    "argument_shape": "<query> [--mode academic|technology|market] [--depth shallow|medium|deep] [--intensity direct|quick|standard|strong|thorough|adversarial] [--no-clarify] [--no-figures] [--from search|analyze|report]",
@@ -282,7 +282,7 @@
    "summary": "Prepare deployment/release setup or package existing artifacts.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when preparing deployment/release or a delivery archive (package mode).",
+    "use_when": "Use when preparing deployment/release or a delivery archive (package mode). Owns release; default preset.",
     "not_for": "Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
    },
    "argument_shape": "<task description (optional)> [--mode default|package] [--intensity direct|quick|standard|strong|thorough|adversarial]",
@@ -308,7 +308,7 @@
    "summary": "Create or update requirements/blueprints while keeping `prd.md` as the only spec-change path.",
    "invocation": {
     "class": "entry-router",
-    "use_when": "Use when product requirements, architecture, evaluation policy, or another blueprint must be created or materially updated before implementation.",
+    "use_when": "Use when product requirements, architecture, evaluation policy, or another blueprint must be created or materially updated before implementation. Owns specification; default preset.",
     "not_for": "Not for implementing an already-approved specification or for editing unrelated documents."
    },
    "argument_shape": "<task description> [--mode auto|app|library|api|cli|research|update (comma-separated for multiple)] [--intensity direct|quick|standard|strong|thorough|adversarial] [--user-refine]",
@@ -586,6 +586,24 @@
    "requires": {
     "capabilities": [],
     "units": []
+   }
+  },
+  "route-frame": {
+   "group": "sub",
+   "family": "sub",
+   "modes": [],
+   "summary": "Compiler-internal framed front end: two top-tier frame legs and a model-less runtime terminal that fixes the route decision.",
+   "invocation": {
+    "class": "compiler-internal",
+    "use_when": "Use only as the route compiler's own framed shape (compose --shape framed); no person or model invokes it by name.",
+    "not_for": "Not for direct invocation, a user-facing Skill, a native command, or any owner persona."
+   },
+   "argument_shape": "compose --shape framed --campaign-key <key> --start --prompt-file <task>",
+   "requires": {
+    "capabilities": [],
+    "units": [
+     "plan/frame"
+    ]
    }
   }
  },
