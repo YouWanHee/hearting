@@ -247,6 +247,8 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     if (meta.get('worker_type') == 'owner' and fields[1] == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
         return 'capacity'
+    if meta.get('worker_type') == 'owner' and fields[1] == 'done' and meta.get('note') == 'dead-runtime-exit':
+        return 'runtime'  # the owner's process crashed; only an explicit `start` replaces it
     return None
 
 
@@ -1125,8 +1127,11 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return advance(jobs, source['replacement_original_attempt_id'], run=run,
                        authority_check=authority_check, resume_capacity=resume_capacity)
     kind = death_kind(fields, source, jobs=jobs)
+    # A usage-limit resume is a pause, not the node's one silent replacement: when that
+    # resumed attempt dies silently, claim() still judges the node's silent budget.
     if (source.get('replacement_original_attempt_id') and fields[1] not in {'open','running'}
-            and not DC.verdict_pass(source) and kind != 'capacity'):
+            and not DC.verdict_pass(source) and kind != 'capacity'
+            and not _in_capacity_family(jobs, source)):
         return exhausted_attention(jobs, aid, source)
     # Avoid side effects or errors on ordinary success/live observations.
     if kind is None:
@@ -1134,6 +1139,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return {'state': 'not-applicable', 'parked_gate': parked} if parked else {'state':'not-applicable'}
     if kind == 'capacity' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return _capacity_wait(jobs, aid, source)
+    if kind == 'runtime' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
+        return {'state': 'not-applicable'}  # never a supervisor tick: no loop of relaunches
     try:
         if authority_check is None:
             _authorized(jobs, rows, source)
@@ -1156,8 +1163,10 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             replacement_fields, replacement_meta = rows[replacement]
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
-                    if death_kind(replacement_fields, replacement_meta) == 'capacity':
-                        # The replacement stopped at a limit too: it is the next source.
+                    next_kind = death_kind(replacement_fields, replacement_meta)
+                    if next_kind == 'capacity' or (next_kind and _is_capacity_record(record)):
+                        # The replacement stopped at a limit too, or a limit resume died on its
+                        # own: it is the next source, and claim() judges the node's budget.
                         return advance(jobs, replacement, run=run, authority_check=authority_check,
                                        resume_capacity=resume_capacity)
                     return exhausted_attention(jobs, replacement, replacement_meta)

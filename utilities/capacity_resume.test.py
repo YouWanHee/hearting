@@ -351,6 +351,39 @@ class CapacityResumeTest(unittest.TestCase):
         sealed = R.launch_input(self.jobs, replacement, self.rows()[replacement][1])
         self.assertEqual(sealed["launch_home"], str(self.root / "newer-release"))
 
+    def test_a_replacement_after_a_limit_that_dies_silently_is_replaced_once(self):
+        # BC rt-6a54b9aabafc81bd: the limit stop is a pause, not the node's one
+        # silent replacement. The resumed owner's own silent death is replaced once.
+        self.set_limit("att-owner", FREE)
+        self.assertEqual(self.start()["state"], "running")
+        resumed = self.replacement_id()
+        (self.root / (resumed + ".log")).write_text("")  # the crash left no result to settle
+        self.set_status(resumed, "done", note="dead-runtime-exit", failure_class="runtime")
+        self.statuses[resumed] = dict(verdict="FAIL", completion_proven=False, marker=None, marker_digest=None)
+        result = self.start()
+        second = self.replacement_id(resumed)
+        self.assertNotEqual(second, resumed)
+        self.assertEqual(len(self.calls), 2)
+        # A second silent death on the same node is the end of the automatic budget.
+        (self.root / (second + ".log")).write_text("")
+        self.set_status(second, "done", note="dead-runtime-exit", failure_class="runtime")
+        self.statuses[second] = dict(verdict="FAIL", completion_proven=False, marker=None, marker_digest=None)
+        result = self.start()
+        self.assertEqual(len(self.calls), 2, result)
+        self.assertIn("automatic-replacement-exhausted",
+                      json.dumps(result.get("replacement_attention") or result))
+
+    def test_a_crashed_owner_is_replaced_once_only_by_an_explicit_start(self):
+        # rt-6c92471ab05995bf: the owner's process exited 70 before any result.
+        self.reseed(note="dead-runtime-exit", failure_class="runtime")
+        self.statuses["att-owner"] = dict(verdict="FAIL", completion_proven=False, marker=None, marker_digest=None)
+        tick = R.advance(self.jobs, "att-owner", run=self.launcher, authority_check=lambda *a: True)
+        self.assertEqual(tick["state"], "not-applicable")
+        self.assertEqual(self.calls, [])
+        self.start()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.rows()[self.replacement_id()][1]["automatic_retry_of"], "att-owner")
+
     def test_claim_made_under_an_old_runtime_launches_under_the_installed_one(self):
         self._drift_setup()
         record = R.claim(self.jobs, "att-owner")
