@@ -1908,8 +1908,9 @@ def _clear_look(target, req):
         return "target-changed", agent
     if agent.get("harness") != req.get("harness"):
         return "target-changed", agent
-    if req.get("harness") in ("claude", "codex") and agent.get("session_id") not in (req.get("sid"), "-"):
+    if req.get("harness") in ("claude", "codex") and agent.get("session_id") != req.get("sid"):
         # herdr's pane record can lag a /clear; the process itself is the proof, never a guess.
+        # An unnamed session (`-`, empty) is not a confirmed match: only the process can vouch for it.
         if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid") \
                 and not _herdr_lags(req, agent.get("session_id")):
             return "target-changed", agent

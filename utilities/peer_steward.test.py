@@ -1977,6 +1977,21 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                 if not expect_typed:
                     self.assertIn("reason=target-changed", line)
 
+    def test_a_pane_record_without_a_session_id_is_cleared_only_when_the_process_names_the_booked_one(self):
+        # herdr names no session (`-`): not a confirmed match -- only the process can vouch for it.
+        for harness, collector in (("claude", "claude"), ("codex", "codex")):
+            for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
+                with self.subTest(harness=harness, process_says=proof):
+                    self.book(harness=harness)
+                    screen = CLAUDE_EMPTY if harness == "claude" else CODEX_EMPTY
+                    world = _ClearWorld(harness=harness, sid=None, new_sid=None, screens=[screen])
+                    with mock.patch(f"fleet.collectors.{collector}.session_id_of_process", return_value=proof), \
+                            mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                        rc, line = self.clear_cmd(world)
+                    self.assertEqual(len(world.typed()), expect_typed, line)
+                    if not expect_typed:
+                        self.assertEqual((rc, "reason=target-changed" in line), (3, True), line)
+
     def test_a_codex_pane_record_that_trails_the_seat_ledger_is_not_a_changed_target(self):
         # Shared app-server daemon: no rollout for the process check, herdr keeps the session
         # before the last clear.  The seat ledger (both sessions' hooks at this pane) orders them.
