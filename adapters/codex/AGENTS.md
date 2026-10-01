@@ -46,7 +46,7 @@ and `ADAPTATION.md`; command output is authoritative for current support.
 
 | Need | Command |
 |---|---|
-| lifecycle | `preflight.sh session-end`, `preflight.sh prompt-signal` |
+| lifecycle | `preflight.sh prompt-signal` |
 | workflow/context | `preflight.sh status`, `preflight.sh briefing`, `preflight.sh worklog` |
 | memory | `preflight.sh memory`, `preflight.sh recall-gate`, `preflight.sh recall` |
 | token/UI | `preflight.sh token-budget`, `preflight.sh ui-info`, `preflight.sh tui-config` |
@@ -95,8 +95,8 @@ tool to claim Codex parity.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1):
-`direct`/`solo`/`staged` use `preflight.sh compose` (defaults fill the rest;
+Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1; new non-direct work defaults to `framed`):
+`direct`/`solo`/`staged`/`framed` use `preflight.sh compose` (defaults fill the rest;
 `--graph` = stage subgraph); `preflight.sh route --capability …` only for the
 entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: one
 `[경로]` line unless destructive or external-facing (§0.4 SD-136); else the
@@ -186,7 +186,9 @@ bounded capsule headline-and-ID candidates. Ignore unrelated candidates and
 read a relevant record in full before use. If the prompt hook is unavailable,
 record `recall` or `skip` with `preflight.sh recall-gate <cwd> ...`. Retrieve
 full pending obligations before applying or consuming them. Workers do not run
-the main prompt probe or other main memory lifecycle.
+the main prompt probe or other main memory lifecycle. Call the `session-tidy`
+Skill when context is filling or before compact, before handing work to another
+session, and when a large task ends; a new session receives the seat's card once.
 
 `preflight.sh token-budget` exposes exact-session telemetry. The normal, unknown, repeated-band, and validated-native states inject zero bytes; a verified
 tight/critical transition may emit one directive of at most 240 UTF-8 bytes.

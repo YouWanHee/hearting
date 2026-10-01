@@ -2336,6 +2336,41 @@ class DispatchContractTest(unittest.TestCase):
     D.claim_attempt_row(jobs,attempt,conflict,launch=True)
    self.assertEqual(caught.exception.reason,"attempt-identity-conflict")
    self.assertEqual(jobs.read_bytes(),before)
+ def test_a_launcher_stopped_before_its_claim_is_replaced_by_the_next_launcher(self):
+  # A usage-limit resume registered the replacement owner, then its launcher was
+  # killed before the claim. The next launcher of the same attempt mints its own
+  # lease nonce (and may run from a newer release); it takes over the row.
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-relaunch00001"
+   def row(nonce,home,**extra):
+    tail="".join(f",{k}={v}" for k,v in extra.items())
+    return (f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\towner\t{CURRENT},route_id=rt-a,route_node=plan,"
+            f"parent_sid=sid-a,supervisor_lease_nonce={nonce},launch_home={home},attempt_id={attempt}{tail}")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row("aa","/rel/1")))
+   self.assertFalse(D.claim_attempt_row(jobs,attempt,row("bb","/rel/2")))
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row("cc","/rel/2"),launch=True))
+   rows=jobs.read_text().splitlines()
+   self.assertEqual(len(rows),1)
+   self.assertIn("supervisor_lease_nonce=cc",rows[0]); self.assertIn("launch_home=/rel/2",rows[0])
+   self.assertTrue(rows[0].endswith(",launch_claimed=1"))
+   # Once claimed, a different launch is a real conflict again.
+   before=jobs.read_bytes()
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.claim_attempt_row(jobs,attempt,row("dd","/rel/2"),launch=True)
+   self.assertEqual(caught.exception.reason,"attempt-identity-conflict")
+   self.assertEqual(jobs.read_bytes(),before)
+ def test_a_never_claimed_row_still_refuses_other_work(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-relaunch00002"
+   base=(f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\towner\t{CURRENT},route_id=rt-a,route_node=plan,"
+         f"parent_sid=sid-a,supervisor_lease_nonce=aa,attempt_id={attempt}")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,base))
+   before=jobs.read_bytes()
+   for change in (("parent_sid=sid-a","parent_sid=sid-b"),("route_node=plan","route_node=execute"),("\t/wt\t","\t/wt-b\t")):
+    with self.subTest(change=change),self.assertRaises(D.DispatchContractError) as caught:
+     D.claim_attempt_row(jobs,attempt,base.replace(*change).replace("=aa","=bb"),launch=True)
+    self.assertEqual(caught.exception.reason,"attempt-identity-conflict")
+   self.assertEqual(jobs.read_bytes(),before)
  def test_standard_route_candidate_requires_exact_checked_launch_tuple(self):
   with tempfile.TemporaryDirectory() as td:
    route_path=Path(td)/"route.json"
@@ -3198,10 +3233,9 @@ class DispatchContractTest(unittest.TestCase):
     self.assertEqual(foreign.read_only_state()["workflow_state"],"CREATED")
 
  def test_a_binding_no_node_raises_is_not_fenced(self):
-  """review round 1, B1: `intent-confirmation`, `direction-confirmation`,
-  `preview-disposition`, `explicit-handback` are bound at entry in the topology
-  but no node's continuation raises them -- the §0.4 card satisfies them, and
-  no command in the harness could release them. Only a gate that some node
+  """Historical routes may carry bindings that no node's continuation raises;
+  the §0.4 card satisfies them, and no command in the harness could release
+  them. Only a gate that some node
   raises (`continuation.kind == human-gate`) is fenced."""
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); route,path=self._gated_route(base)
@@ -3275,6 +3309,9 @@ class DispatchContractTest(unittest.TestCase):
    # (user decision 2026-09-10: an approval, not a direction, so not absorbed)
    ("autopilot-refine","preview-disposition","transaction","human-gate-not-raised"),
    ("autopilot-spec","frame-review","research","human-gate-not-raised"),
+   # the framed route (SD-164) binds the same gate at the entry of its model-less terminal,
+   # so the decision cannot be settled before the person has answered
+   ("route-frame","frame-review","route-decision","human-gate-not-raised"),
   ],seen)
   self.assertEqual({row[1] for row in fenced},set(D.FENCED_HUMAN_GATES))
   self.assertGreaterEqual(len(seen),5)

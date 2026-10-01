@@ -788,6 +788,16 @@ def _campaign_members(root: Path, records: list[dict], campaign_id: str | None) 
     return members
 
 
+def _decision_unfinished(route: Mapping[str, Any], home) -> bool:
+    """A framed route whose decision record is fixed while the route is still open: the
+    runtime is between fixing the decision and closing, so the sweep leaves it alone."""
+    import route_plan
+    if not route_plan.is_framed_route(route):
+        return False
+    directory = home()
+    return bool(directory) and (Path(directory) / "artifacts" / route_plan.RECORD_RELATIVE).is_file()
+
+
 class _Evidence:
     """The never-close evidence, gathered once and only when a route is due."""
 
@@ -799,7 +809,7 @@ class _Evidence:
         self.gate_roots = _gate_ledger_roots(registries)
         self.open_paths = _open_paths(root)
 
-    def kept(self, route_id: str, home) -> str | None:
+    def kept(self, route_id: str, home, route: Mapping[str, Any] | None = None) -> str | None:
         """Why this route stays open whatever the time; `home` yields its cycle
         directory and is asked only when the cheaper evidence is silent."""
         import inline_finish
@@ -815,6 +825,8 @@ class _Evidence:
             return "finish-pending"
         if _waits_on_human(route_id, self.gate_roots):
             return "human-gate"
+        if route is not None and _decision_unfinished(route, home):
+            return "decision-pending"
         if route_id in self.resource_routes:
             return "resource-run"
         directory = home()
@@ -891,7 +903,7 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
             continue
         record = cycles.get(route_id)
         home = _cycle_home(root, record) if record else None
-        why = gather().kept(route_id, lambda: home)
+        why = gather().kept(route_id, lambda: home, raw)
         if why is None:
             reason, why = _decide(holder, idle_since=_last_activity(
                 root, path, raw, holder, api, record, now, deep=True,

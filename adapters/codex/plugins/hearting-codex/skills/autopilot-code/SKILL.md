@@ -1,6 +1,6 @@
 ---
 name: autopilot-code
-description: "Use when source code must be implemented, debugged, refactored, or code-audited through a plan, execution, test, and report loop. Not for requirements-only changes, new empirical experiments, or document-only editing."
+description: "Use when source code must be implemented, debugged, refactored, or code-audited through a plan, execution, test, and report loop. Owns source changes; default preset. Not for requirements-only changes, new empirical experiments, or document-only editing."
 ---
 
 # autopilot-code

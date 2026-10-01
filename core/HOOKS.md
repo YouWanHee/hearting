@@ -47,6 +47,7 @@ preflight doctor path, without blurring the conformance/drill distinction above.
 | memory injection | `tools/memory/mem.py inject` | `portable-check` | Inject relevant DB memory at session start. | Run `tools/memory/mem.py inject` for text output, or `tools/memory/mem.py inject --hook` when the runtime accepts Claude-style `additionalContext`; adapters may keep automatic session-start injection opt-in when the runtime can fire start events on resume or compact. |
 | memory candidate exposure and agent-owned adoption | `hooks/mem-recall-inject.sh`, `tools/memory/mem.py candidates`, `tools/memory/mem.py recall` | `portable-check` | Every eligible main prompt gets a fail-open, capsule-only lookup: active current-project/global rows, headline plus ID, maximum six and 2,400 UTF-8 bytes, no bodies or access touch. The model decides relevance and reads the full record before applying it. The bridge records a same-turn receipt without blocking material work. | Register an adapter-native prompt bridge that supplies prompt, cwd, session, and native turn/message ID when available. Consume only the runtime's structured context field. Preserve the explicit `recall` helper for deeper search and hook-failure recovery. |
 | local evidence exposure | `hooks/local-evidence-inject.sh` | `portable-check` | Every eligible main session start gets a fail-open presence probe of the cwd's artifact root: research/documents/analysis counts plus nine newest paths, taken a bucket at a time so a busy one cannot hide an idle one and at most once per artifact, bounded to 2,400 UTF-8 bytes, no bodies read, no prompt classifier. Silent when empty; workers exempt. Cached and time-bounded: it may lag the store by minutes; a truncated walk reports `N+`. Realizes `roles/response-policy.md` "Local evidence before recall": questions they cover start there, not in recall. | Attach it to the runtime's session-start surface, or its nearest once-per-session equivalent (`--cwd <dir> --format text\|hook-json`), consume only the runtime's structured context field, and keep every failure as zero context. A start event that does not repeat on compaction leaves the block gone for the rest of the session, so that runtime must re-seat it by its own means. |
+| session card delivery | `hooks/session-card-inject.sh`, `utilities/session_tidy.py hook` | `portable-check` | Every eligible main session start and prompt asks the shared tidy state for the card and notice this seat is due, at most once per session and compaction round, 2,400 UTF-8 bytes, silent when none. It is independent of the memory candidate probe: a short or empty prompt, a missing memory tool or zero candidates still deliver it. Workers get and consume nothing; every failure is zero context. | Register a separate command on the runtime's session-start and prompt surfaces (`start` carries the start source such as compact; a runtime with no start event delivers at the first prompt and re-emits the kept text for every model call of that turn), never inside the candidate branch or behind the memory opt-in. A compact event only marks the round. |
 | oncall briefing injection | `hooks/mem-briefing-inject.sh` | `portable-check` | On the dedicated agent desk, inject daily oncall report once per day. | Run `hooks/mem-briefing-inject.sh --cwd <dir> [--format text]` before prompt handling, or attach it to a prompt-submit event. |
 | worklog state signal | `utilities/agent-worklog-state.sh` | `portable-check` | Surface configured `<agent-notes-root>` / `<worklog-board-app>` inventory without mutating data. | Run `utilities/agent-worklog-state.sh [cwd]` or an adapter wrapper before worklog-board or agent-notes work. |
 | runtime hook output protocol | adapter hook bridges | `adapter-payload-wrapper` | Hook stdout must match the owning runtime's hook protocol exactly. Context-injection hooks emit the runtime's structured context object; side-effect-only lifecycle hooks keep stdout empty unless that runtime explicitly accepts a structured success object. Portable helper text is never forwarded as raw hook stdout. | Each adapter must document its hook output contract, test the exact stdout shape for every native hook bridge, and route diagnostic/helper text to logs or stderr only when the runtime accepts it. |
@@ -93,8 +94,8 @@ Adapter hook bridges own the final runtime output protocol. A portable helper ca
 print human-readable status for explicit CLI use, but a native runtime hook must
 not forward that text unless the runtime accepts it for that hook event. For
 example, a context hook may emit `hookSpecificOutput.additionalContext` when the
-runtime supports it, while a lifecycle side-effect hook such as a session-end
-sync may need to perform the mutation with empty stdout or a minimal structured
+runtime supports it, while a lifecycle side-effect hook such as a summary or state refresh
+may need to perform the mutation with empty stdout or a minimal structured
 success object so the runtime does not attempt to parse helper text as hook
 JSON.
 
@@ -120,20 +121,10 @@ Use `adapters/codex/bin/preflight.sh worklog [cwd]` to inspect the configured
 agent-notes/worklog-board state read-only before touching that layer.
 Use `adapters/codex/bin/preflight.sh design <file>` after design HTML writes
 to run the same console verification without Claude hook JSON.
-Use `adapters/codex/bin/preflight.sh distill-delta <session-id>` for Codex
-transcript extraction. `CODEX_DISTILL_ENABLE=1 adapters/codex/bin/preflight.sh
-distill-propose <session-id> [cwd]` can generate a constrained proposal, but it
-is a manual preview surface and does not auto-apply unless the apply and
-contract-accepted env gates are explicit. Codex adapter-owned `session-end` and
-`turn-nudge` paths are the verified automatic realization: after the documented
-read-only `codex exec` tool-free proof, they default to automatic apply and opt
-out with `CODEX_DISTILL_ENABLE=0`. They run only for an interactive main;
-dispatch/title/distill/loop workers make both paths silent no-ops under D-42.
-Use `adapters/opencode/bin/preflight.sh distill-delta <session-id>` for
-OpenCode transcript extraction through `opencode export`. OpenCode's no-tools
-worker contract is verified (`opencode run --pure --agent <distiller>` with all
-tools disabled), so `distill-propose` runs the worker and the plugin
-`event`/`session.idle` trigger auto-distills via `preflight.sh session-end`
-(debounced, enabled by default for main sessions; opt out
-`OPENCODE_DISTILL_ENABLE=0`). Worker sessions keep spec-read observations and
-liveness heartbeats but skip automatic memory context and session-idle distill.
+Memory does nothing when a session ends (D-82). Claude `SessionEnd`, the Codex
+`SessionEnd` bridge and the OpenCode `session.idle` event keep only their
+non-memory work (Fleet/herdr state, the final summary, pane and heartbeat). Memory
+instead exchanges in the background after a successful write and after a read that
+finds the last receive older than ten minutes (`tools/memory/README.md`). Worker
+sessions keep spec-read observations and liveness heartbeats but skip automatic
+memory context.

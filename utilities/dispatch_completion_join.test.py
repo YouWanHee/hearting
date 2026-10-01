@@ -2935,6 +2935,107 @@ class CanonicalReceiptAndSealTest(unittest.TestCase):
             JOIN.unseal_delivery_receipt(base64.standard_b64encode(b"[1,2]").decode("ascii"))
 
 
+class NextLegReceiptTest(unittest.TestCase):
+    """The approved route plan's next leg rides a completed owner's child: information only."""
+
+    NEXT_LEG = {"index": 1, "leg": {"capability": "autopilot-code", "shape": "direct"},
+                "compose_command": "python3 capability-route.py compose --route-plan rec.json#1"}
+    OLD_CHILD_KEYS = frozenset({"attempt_id", "status", "readiness", "reason", "required_action", "harness",
+                                "delivery_classification"})
+
+    def _receipt(self, **child_extra):
+        child = {"attempt_id": "att-0000000000000000000000000000bbbb", "status": "done", "readiness": "ready",
+                 "reason": "registry-closed", "required_action": "advance-completed", "harness": "claude",
+                 "delivery_classification": "success", **child_extra}
+        return {"schema_version": 2, "state": "delivered", "parent_attempt_id": "att-0000000000000000000000000000aaaa",
+                "job_registry": "/tmp/x/jobs.log", "children": [child], "delivery_classification": "success"}
+
+    def test_a_receipt_without_the_field_keeps_exactly_its_old_identity(self):
+        receipt = self._receipt()
+        old_body = {k: v for k, v in receipt.items()}
+        old_body["children"] = [{k: v for k, v in c.items() if k in self.OLD_CHILD_KEYS} for c in receipt["children"]]
+        reference = hashlib.sha256(json.dumps(old_body, ensure_ascii=True, separators=(",", ":"),
+                                              sort_keys=True).encode()).hexdigest()
+        self.assertEqual(JOIN.canonical_receipt_digest(receipt), reference)
+        self.assertEqual(JOIN.canonical_delivery_receipt(receipt)["children"], old_body["children"])
+
+    def test_the_field_survives_the_canonical_projection_and_the_seal_and_joins_the_identity(self):
+        plain, with_leg = self._receipt(), self._receipt(next_leg=self.NEXT_LEG)
+        projected = JOIN.canonical_delivery_receipt(with_leg)
+        self.assertEqual(projected["children"][0]["next_leg"], self.NEXT_LEG)
+        self.assertEqual(JOIN.unseal_delivery_receipt(JOIN.seal_delivery_receipt(projected)), projected)
+        self.assertNotEqual(JOIN.canonical_receipt_digest(with_leg), JOIN.canonical_receipt_digest(plain))
+        self.assertEqual(JOIN.canonical_receipt_digest(with_leg),
+                         JOIN.canonical_receipt_digest(json.loads(json.dumps(with_leg))))
+
+    def test_the_observability_pass_adds_it_for_a_success_and_drops_it_otherwise(self):
+        from types import SimpleNamespace
+        jobs = Path("/tmp/next-leg-jobs.log")
+        state = lambda: SimpleNamespace(status="done", advanced=False)
+        with mock.patch.object(JOIN, "current_delivery_state", side_effect=lambda *a, **k: state()), \
+                mock.patch.object(JOIN, "delivery_classification", return_value="success"), \
+                mock.patch.object(JOIN, "delivery_required_action", return_value="advance-completed"), \
+                mock.patch.object(JOIN, "_completed_next_leg", return_value=dict(self.NEXT_LEG)) as found:
+            done = JOIN.receipt_with_delivery_observability(self._receipt(), jobs=jobs)
+        self.assertEqual(done["children"][0]["next_leg"], self.NEXT_LEG)
+        found.assert_called_once()
+        with mock.patch.object(JOIN, "current_delivery_state", side_effect=lambda *a, **k: state()), \
+                mock.patch.object(JOIN, "delivery_classification", return_value="success"), \
+                mock.patch.object(JOIN, "delivery_required_action", return_value="advance-completed"), \
+                mock.patch.object(JOIN, "_completed_next_leg", return_value=None):
+            stale = JOIN.receipt_with_delivery_observability(self._receipt(next_leg=self.NEXT_LEG), jobs=jobs)
+        self.assertNotIn("next_leg", stale["children"][0])
+        with mock.patch.object(JOIN, "current_delivery_state", side_effect=lambda *a, **k: state()), \
+                mock.patch.object(JOIN, "delivery_classification", return_value="attention"), \
+                mock.patch.object(JOIN, "delivery_required_action", return_value="inspect-done-failure"), \
+                mock.patch.object(JOIN, "_completed_next_leg", side_effect=AssertionError("asked for a failure")):
+            failed = JOIN.receipt_with_delivery_observability(self._receipt(next_leg=self.NEXT_LEG), jobs=jobs)
+        self.assertNotIn("next_leg", failed["children"][0])
+
+    def test_the_next_leg_of_a_bound_completed_owner_is_read_from_its_route_and_nothing_else(self):
+        from route_identity import route_hash, route_id_from_hash
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        route = {"artifact_root": str(base), "route_plan": {"decision": "d.json", "digest": "sha256:" + "0" * 64, "index": 0}}
+        route["route_hash"] = route_hash(route)
+        route["route_id"] = route_id_from_hash(route["route_hash"])
+        path = base / "route.json"
+        path.write_text(json.dumps(route))
+        jobs = base / "jobs.log"
+        jobs.write_text(row("done", "owner", "parent", "task", process_metadata={
+            "dispatch_depth": "1", "worker_type": "owner", "route_file": str(path),
+            "route_hash": route["route_hash"], "workflow_completion": "runtime-v1"}))
+        settled = mock.Mock(state="complete")
+        with mock.patch("dispatch_terminal_commit.owner_completion_state", return_value=settled), \
+                mock.patch("route_plan.next_leg_for_route", return_value=dict(self.NEXT_LEG)) as found:
+            self.assertEqual(JOIN._completed_next_leg(jobs, "owner"), self.NEXT_LEG)
+            found.assert_called_once()
+            with mock.patch("dispatch_terminal_commit.owner_completion_state", return_value=mock.Mock(state="pending")):
+                self.assertIsNone(JOIN._completed_next_leg(jobs, "owner"))
+            self.assertIsNone(JOIN._completed_next_leg(jobs, "missing"))
+        bare = {k: v for k, v in route.items() if k not in ("route_plan", "route_hash", "route_id")}
+        bare["route_hash"] = route_hash(bare)
+        bare["route_id"] = route_id_from_hash(bare["route_hash"])
+        path.write_text(json.dumps(bare))
+        with mock.patch("dispatch_terminal_commit.owner_completion_state", return_value=settled):
+            self.assertIsNone(JOIN._completed_next_leg(jobs, "owner"))      # no plan, no key
+
+    def test_the_followup_text_names_the_command_as_information_not_an_instruction(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        jobs = Path(tmp.name) / "jobs.log"
+        jobs.write_text(row("done", "owner", "parent", "task", process_metadata={
+            "dispatch_depth": "1", "worker_type": "owner", "workflow_completion": "runtime-v1"}))
+        receipt = {"children": [{"attempt_id": "owner", "required_action": "advance-completed",
+                                 "next_leg": self.NEXT_LEG}]}
+        text = JOIN.completion_followup_text(receipt, jobs=str(jobs), surface="/fixture/preflight.sh")
+        self.assertIn("requested work is complete", text)
+        self.assertIn(self.NEXT_LEG["compose_command"], text)
+        self.assertIn("nothing starts the next leg for you", text)
+        plain = JOIN.completion_followup_text({"children": [{"attempt_id": "owner", "required_action": "advance-completed"}]},
+                                              jobs=str(jobs), surface="/fixture/preflight.sh")
+        self.assertNotIn("next leg", plain)
+
+
 class MaterializePendingDeliveryTest(unittest.TestCase):
     """SD-111 P2 round 2 C-1: carrier-independent idempotent materializer.
 

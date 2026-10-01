@@ -11,17 +11,17 @@ status/timestamps to satisfy the eval label.
 
 > **Stage dispatch:** use the contract in `setup-procedure.md`. Apply the `WORKFLOW §0.3` pre-execution gate before E2. At standard+, group separable stages into workers by write ownership per the eval execution topology in `capabilities/autopilot-lab.md`, and dispatch them as dispatch-depth-2 headless sessions with file-only handoff. Each worker reads only artifact paths such as `metrics.jsonl`, `REPORT.md`, and research inputs, never earlier conversational context. Running a separable stage inline requires the recorded reason in `_RUNLOG` or the experiment `_internal/` (`OPERATIONS §5.10` inline exceptions).
 
-#### Eval stage-worker mapping
+#### Eval steps and their parts (stage list: `capability-route.py stages --capability autopilot-lab`)
 
-| Stage | Unit | Input artifacts | Output artifacts | Write class |
-|---|---|---|---|---|
-| E2 execution (eval worker) | `qa/test` unit, functional | `eval.py` and checkpoint | Metric values in `run.json best` plus `metrics.jsonl` | Dispatched dispatch depth 2 |
-| E3-2 plot / E3-5 media (media worker) | `material/figure-gen` unit | `metrics.jsonl`, audio outputs | `figures/*.{png,pdf}`, playback `report/*.html` | Dispatched dispatch depth 2 |
-| E3-3 compare | `research/research-survey` unit | `REPORT.md`, `research/`, and `analysis_project/paper/` | Comparison section in `REPORT.md` | Dispatched dispatch depth 2 |
-| E3-4/E3-5 report assembly (report worker) | lab's `editorial/report` unit | metrics, figures, STORY inputs | `REPORT.md`, `STORY.md`, `summary.md` | Dispatched dispatch depth 2 |
-| Independent verification | `qa/test` unit, read-only | Final artifacts | Verdict record under `_internal/` | Dispatched dispatch depth 2, read-only |
-| Bundle publication | owner, deterministic CLI | Verified staged `report/` plus explicit project/experiment/version | `bundle-publication.json` | Run `tools/report-bundle.py publish`; version is never inferred |
-| Optional artifact sink | `autopilot-spec` update when applicable, then app-neutral artifact emission | `bundle-publication.json` | Sink receipt v2 or typed skip | After terminal sync: available sends only bundle_id/version/report/index.html; unavailable records `skipped/extension-unavailable` |
+| Procedure step | Part | What the step adds to the part contract |
+|---|---|---|
+| E1 spec and smoke | optional `autopilot-lab:eval-spec`, `autopilot-lab:eval-smoke` | `eval-spec.md` and a hash-bound `reviews/smoke-attestation.json` that `eval-run` reads; without these parts the owner supplies both, or a partial graph fills them from the prior cycle |
+| E2 execution | `autopilot-lab:eval-run` → `autopilot-lab:metrics` | Detached evaluation of `eval.py` and the checkpoint, then metric values in `run.json best` plus `metrics.jsonl`; `metrics:qa/ml-debug` or the optional `autopilot-lab:diagnose` adds cause diagnosis (`reviews/diagnosis.md`) |
+| E3-2 plot / E3-5 media | `autopilot-lab:media` | `figures/*.{png,pdf}` and playback `report/*.html` from `metrics.jsonl` and audio outputs |
+| E3-3 compare | on request, the `research/research-survey` unit inside the report work | Comparison section in `REPORT.md` from `research/` and `analysis_project/paper/` |
+| E3-4/E3-5 report assembly | `autopilot-lab:report` | `REPORT.md`, `STORY.md`, `summary.md` from metrics, figures, and STORY inputs |
+| Independent verification | `autopilot-lab:independent-verify` | Read-only verdict record on the final artifacts |
+| Bundle publication and sync | `autopilot-lab:publish` → `autopilot-lab:sync` | Run `tools/report-bundle.py publish` with explicit project/experiment/version (never inferred) → `bundle-publication.json`; after terminal sync the optional artifact sink sends only bundle_id/version/report/index.html, or records `skipped/extension-unavailable` |
 
 The dispatch-depth-1 owner integrates worker outputs, resolves cross-stage conflicts, and stays in the flow: liveness watching and harvest belong to the same work (`OPERATIONS §5.10` SD-14), not a fire-and-forget dispatch.
 

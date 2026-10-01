@@ -1384,6 +1384,8 @@ def build_continuation_route(
         # embedded composed_recipe loses its hash seal. (`route_origin`/`shape`
         # live inside `selection`, inherited above.)
         "composed","composed_recipe",
+        # An approved route plan's leg keeps pointing at its plan when it resumes.
+        "route_plan",
     )
     route={key:json.loads(json.dumps(source_route[key]))
            for key in inherited_keys if key in source_route}
@@ -1750,6 +1752,10 @@ def _evidence_parent_dispatch_depth(nodes, owner_dispatch_depth):
     if a recipe ever seals evidence at another depth, and cross-checks the two
     structural facts the route already states about itself.
     """
+    if [n.get("id") for n in nodes] == list(TOPO.ROUTE_FRAME_NODE_IDS) and nodes[-1].get("kind") == TOPO.ROUTE_DECISION_KIND:
+        # The framed route has no depth-2 consumer: its checked tuples describe the runtime that
+        # launches the two frame legs, and it names the same parent depth as every recipe.
+        return owner_dispatch_depth
     if not any(node.get("dispatch_depth") == EVIDENCE_CONSUMER_DISPATCH_DEPTH for node in nodes):
         raise ValueError(
             "dispatch-evidence-without-consumer-node: checked tuples were sealed but no "
@@ -2059,6 +2065,10 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
                 leg["write_scope"] = [
                     _parallel_path(path, suffix) for path in base["write_scope"]
                 ]
+                if "part_io" in leg:  # SD-165: a borrowed leg's own outputs moved with it
+                    leg["part_io"] = {
+                        name: _parallel_path(path, suffix) if path in base["outputs"] else path
+                        for name, path in base["part_io"].items()}
             leg["model_profile"] = leg_spec["model_profile"]
             leg.pop("profile_demand", None)
             if "profile_demand" in leg_spec:
@@ -2281,6 +2291,11 @@ def _owner_node(node, effective):
             and node.get("dispatch_depth") == 1 and node.get("unit") == "_kernel/owner")
 
 
+def _no_model_node(node):
+    """Whether `node` runs no model: a detached resource run, or the framed route's runtime terminal."""
+    return node.get("kind") in ("resource-runner", TOPO.ROUTE_DECISION_KIND)
+
+
 def _frame_node(node):
     """Whether `node` is a frame bootstrap leg: the depth-1 direction-setting
     pair that the depth-0 session launches itself, ahead of any owner. Mirrors
@@ -2337,9 +2352,8 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
         if seal_persona:
             node.setdefault("perspective", "primary-frame" if node.get("id") == "frame"
                             else "alternative-frame")
-        # `frame` is the anchor leg (the one raised a tier); every other leg of
-        # the pair -- today only `frame-alternative` -- stays at the owner's
-        # working tier so the pair keeps two genuinely different voices.
+        # Both frame perspectives get the same top-tier default. Explicit
+        # route selections are applied later and retain precedence.
         profile = rungs["anchor" if node.get("id") == "frame" else "others"]
         node["model_profile"] = profile
         if profile == PROFILE.TOP_PROFILE:
@@ -2347,10 +2361,8 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
             # the legacy "explicit profile, no demand" path -- the resolver
             # refuses that with `profile-demand-required`. Give the anchor a
             # real explicit selection instead: the owner's own demand when the
-            # caller supplied one (same judgment, same evidence, one
-            # decision), otherwise the frame shape's intrinsic demand, whose
-            # reasons say in as many words that the shape is speaking rather
-            # than task-specific evidence somebody gathered.
+            # caller supplied one, otherwise the frame shape's intrinsic
+            # demand. Each leg seals its own selection and demand.
             node["profile_explicit"] = True
             node["profile_demand"] = json.loads(json.dumps(
                 owner_demand or PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
@@ -2371,11 +2383,21 @@ def _quick_gate_bindings(recipe):
     return bindings
 
 
+def _frameless_recipe(recipe):
+    """The recipe as a leg of an approved route plan sees it: the frame pair, its gate and its
+    binding are gone, exactly as for a capability that never had a frame layer."""
+    view=json.loads(json.dumps(recipe))
+    view["standard_plus"]["nodes"]=[n for n in view["standard_plus"]["nodes"] if not _frame_node(n)]
+    view["human_gates"]=[g for g in view["human_gates"] if g!="frame-review"]
+    view["human_gate_bindings"]=[b for b in view["human_gate_bindings"] if b.get("gate")!="frame-review"]
+    return view
+
+
 def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *, legacy=False):
     demands = profile_demands or {}
     explicit_profiles = explicit_profiles or {}
     for node in nodes:
-        if node.get("kind") == "resource-runner":
+        if _no_model_node(node):
             continue
         node_id = node["id"]
         demand = demands.get(node_id, node.get("profile_demand"))
@@ -2399,7 +2421,7 @@ def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *
 
 
 def _profile_input_maps(nodes, demands, explicit):
-    valid = {n["id"] for n in nodes if n.get("kind") != "resource-runner"} | {"__owner__"}
+    valid = {n["id"] for n in nodes if not _no_model_node(n)} | {"__owner__"}
     normalized = {}
     for label, values in (("profile_demands", demands), ("explicit_profiles", explicit)):
         if values is not None and (not isinstance(values, dict) or set(values) - valid):
@@ -2452,7 +2474,7 @@ def _verify_profile_contract(route):
         profile=route.get("owner_model_profile"), existing_versioned_stage=True,
     )
     for node in route.get("nodes", []):
-        if node.get("kind") == "resource-runner":
+        if _no_model_node(node):
             continue
         PROFILE.validate_profile_selection(node.get("profile_selection"), node.get("profile_demand"),
                                            profile=node.get("model_profile"), existing_versioned_stage=True)
@@ -2564,7 +2586,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                   registered_headless_evidence=None, slug=None,
                          route_origin="preset", shape=None, profile_demands=None,
-                         explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
+                         explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None,
+                         route_plan=None, frameless=False):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -2576,7 +2599,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         registered_headless_evidence=registered_headless_evidence, slug=slug,
         campaign_key=campaign_key, parent_cycle_id=parent_cycle_id,
         route_origin=route_origin, shape=shape, profile_demands=profile_demands,
-        explicit_profiles=explicit_profiles, profile=profile)
+        explicit_profiles=explicit_profiles, profile=profile,
+        route_plan=route_plan, frameless=frameless)
 
 # ---------------------------------------------------------------------------
 # compose: the preset-free work route (SD-135).
@@ -2589,8 +2613,11 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
 # through the SAME validator, sealer, verifier and guards as a preset route --
 # composition changes route shape only (WORKFLOW §7 compose-on-demand).
 # ---------------------------------------------------------------------------
-COMPOSE_SHAPES = ("direct", "solo", "staged")
-SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard"}
+COMPOSE_SHAPES = ("direct", "solo", "staged", "framed")
+SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard", "framed": "standard"}
+# The compiler-internal capability behind `--shape framed`. No person and no model names it; a
+# route of any other shape can never seal it (`compose-shape-invalid`).
+ROUTE_FRAME_CAPABILITY = TOPO.ROUTE_FRAME_CAPABILITY
 INTENSITY_SHAPE = {"direct": "direct", "quick": "solo"}
 ROUTE_ORIGINS = ("preset", "compose")
 COMPOSE_DEFAULT_CAPABILITY = "autopilot-code"
@@ -2611,8 +2638,14 @@ def shape_for_intensity(effective):
     return INTENSITY_SHAPE.get(effective, "staged")
 
 
-def parse_graph_spec(text):
-    """`execute,test,report` or `execute:dev/refactor,test` -> [(id, unit|None)]."""
+def parse_graph_spec(text, capabilities=None):
+    """`execute,test,report` or `execute:dev/refactor,test` -> [(id, unit|None)].
+
+    SD-165: when the first segment names a registered capability the token is a
+    part id, `autopilot-lab:diagnose` or `autopilot-lab:metrics:qa/ml-debug`,
+    and the returned key is `capability:stage`. Every other token parses as
+    before.
+    """
     if not isinstance(text, str) or not text.strip():
         raise ValueError("compose-graph-empty")
     rows = []
@@ -2624,6 +2657,12 @@ def parse_graph_spec(text):
         node_id = node_id.strip()
         if not re.fullmatch(r"[a-z][a-z0-9-]*", node_id):
             raise ValueError(f"compose-graph-node-invalid:{node_id}")
+        if unit and capabilities and node_id in capabilities:
+            stage, _, unit = unit.partition(":")
+            stage = stage.strip()
+            if not re.fullmatch(r"[a-z][a-z0-9-]*", stage):
+                raise ValueError(f"compose-graph-node-invalid:{node_id}:{stage}")
+            node_id = f"{node_id}:{stage}"
         rows.append((node_id, unit.strip() or None))
     ids = [row[0] for row in rows]
     if len(ids) != len(set(ids)):
@@ -2631,7 +2670,7 @@ def parse_graph_spec(text):
     return rows
 
 
-def _compose_inputs(base_nodes, base_node, kept, find_input=None):
+def _compose_inputs(base_nodes, base_node, kept, find_input=None, alternates=None):
     """Keep the base node's declared inputs wherever they can still exist.
 
     An input stays when it is not produced by any recipe node (an external
@@ -2644,6 +2683,10 @@ def _compose_inputs(base_nodes, base_node, kept, find_input=None):
     compose must yield exactly the preset's inputs. (Canary review round 1
     B1, round 2 M2.) SD-163: when `find_input(name)` finds a same-named prior
     output, the input stays and its source is returned in the second value.
+    SD-165: `alternates(name, dropped_producers | None)` names further prior
+    outputs to look for -- the relocated name of a borrowed part, or the part
+    output the catalog maps an external input to. The input's own name is
+    always tried first, so a sealed source replays through `sealed.get`.
     """
     producers = {}
     for candidate in base_nodes.values():
@@ -2655,7 +2698,13 @@ def _compose_inputs(base_nodes, base_node, kept, find_input=None):
         if owners is None or owners & kept or TOPO._is_semantic_output(item):
             if item not in inputs:
                 inputs.append(item)
-        elif find_input is not None and (source := find_input(item)) is not None:
+            names = alternates(item, None) if alternates is not None and owners is None else ()
+        else:
+            names = (item, *(alternates(item, owners) if alternates is not None else ()))
+        if find_input is None:
+            continue
+        source = next((found for name in names if (found := find_input(name)) is not None), None)
+        if source is not None:
             if item not in inputs:
                 inputs.append(item)
             sources[item] = source
@@ -2699,6 +2748,25 @@ def _compose_graph_order_violation(base_nodes, ids):
     return None
 
 
+def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
+    """Suffixes of a borrowed group's auxiliary legs that no selected node arbitrates.
+
+    Same rule `_validate_gate_contracts` applies to a recipe: a review anchor is
+    merged by the conductor; a map or pipeline anchor needs exactly one direct
+    consumer whose gate declares `auxiliary_arbiter`.
+    """
+    auxiliary = [leg["suffix"] for leg in group["legs"] if leg.get("leg_class") == "auxiliary"]
+    if not auxiliary or anchor["kind"] == "review-worker":
+        return []
+    if anchor["kind"] == "pipeline-stage":
+        consumers = [node for node in consumers if node["kind"] == "review-worker"]
+    contracts = registry.get("completion_gate_contracts") or {}
+    if len(consumers) == 1 and (contracts.get(consumers[0]["completion_gate"]) or {}).get(
+            "auxiliary_arbiter") is True:
+        return []
+    return auxiliary
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
@@ -2709,37 +2777,104 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     follows), and a parallel group survives only when its anchor is kept and is
     not the new terminal (G6). Validation stays with `_validate_recipe` --
     this function never re-implements a rule, it only assembles.
+
+    SD-165: a graph key is a host stage id, an optional catalog part of the host
+    recipe, or a registered shareable `capability:stage`. A borrowed part keeps
+    its unit, kind and gate and is relocated under `parts/<capability>/<stage>/`
+    inside the host's own artifact scope; the name mapping is sealed as
+    `part_io`. A graph that names none of these assembles exactly as before.
     """
+    host = base_recipe["capability"]
     base_nodes = {node["id"]: node for node in base_recipe["standard_plus"]["nodes"]}
-    ids = [node_id for node_id, _ in graph_spec]
-    unknown = [node_id for node_id in ids if node_id not in base_nodes]
+    optional = dict(TOPO.recipe_optional_parts(registry, base_recipe))
+    # `view` is what a key may resolve to locally; `order` carries the
+    # precedence edges used only by the caller-order check (sealed `depends_on`
+    # is always rewritten in the caller's order below).
+    view = dict(base_nodes)
+    view.update({stage: row["optional"]["node"] for stage, row in optional.items()})
+    order = {node_id: {"depends_on": list(node.get("depends_on") or [])} for node_id, node in view.items()}
+    for stage, row in optional.items():
+        order[stage]["depends_on"] = list(row["optional"]["after"])
+        for follower in row["optional"]["before"]:
+            order[follower]["depends_on"].append(stage)
+    rows, unknown = [], []
+    for key, unit in graph_spec:
+        capability, separator, stage = key.partition(":")
+        if separator and capability == host and stage in view:
+            key, separator = stage, ""
+        if not separator:
+            if key not in view:
+                unknown.append(key)
+                continue
+            rows.append((key, key, unit, None))
+            continue
+        part = TOPO.resolve_shared_part(registry, base_recipe, key)
+        if part is None:
+            unknown.append(key)
+            continue
+        rows.append((key, f"{capability}-{stage}", unit, part))
     if unknown:
         raise ValueError(
             "compose-graph-unknown-node:" + ",".join(unknown)
-            + " (available: " + ",".join(base_nodes) + ")"
+            + " (available: " + ",".join(view) + ")"
             + " (run `capability-route.py stages --capability "
             + base_recipe["capability"] + "` to list valid stage ids)"
         )
-    violation = _compose_graph_order_violation(base_nodes, ids)
+    ids = [row[1] for row in rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("compose-graph-duplicate-node")
+    source_of = {node_id: (part["node"] if part else view[node_id]) for _, node_id, _, part in rows}
+    for _, node_id, _, part in rows:
+        if part:
+            borrowed_ids = {p["stage"]: other for _, other, _, p in rows
+                            if p and p["recipe"] is part["recipe"]}
+            order[node_id] = {"depends_on": [borrowed_ids[dep] for dep in part["node"].get("depends_on") or []
+                                             if dep in borrowed_ids]}
+    violation = _compose_graph_order_violation(order, ids)
     if violation:
         consumer, producer = violation
         raise ValueError(
             f"compose-graph-order:{consumer}-before-{producer} "
-            "(recipe order: " + ",".join(base_nodes) + ")"
+            "(recipe order: " + ",".join(view) + ")"
         )
     def gate_group(node_id):
-        base = base_nodes[node_id]
+        base = source_of[node_id]
         continuation = base.get("continuation") or {}
         if continuation.get("kind") == "human-gate":
             return continuation["gate"], tuple(base.get("depends_on", []))
         return None
 
+    host_kept = {node_id for _, node_id, _, part in rows if part is None}
+    # The catalog's input-name lookup fills a SUBGRAPH; a full recipe graph and a
+    # preset never ask (stage-dispatch 13.64.3: "in a partial graph").
+    strict = len(host_kept & set(base_nodes)) < len(base_nodes)
+    selected_outputs = {out for node_id in ids for out in source_of[node_id].get("outputs") or []}
+
+    def producers_in(capability, name):
+        stages = [node["id"] for recipe in registry["recipes"] if recipe["capability"] == capability
+                  for node in recipe["standard_plus"]["nodes"] if name in (node.get("outputs") or [])]
+        stages += [part_id.partition(":")[2] for part_id, row in (TOPO.part_catalog(registry).get("parts") or {}).items()
+                   if part_id.partition(":")[0] == capability and isinstance(row.get("optional"), dict)
+                   and name in (row["optional"]["node"].get("outputs") or [])]
+        return sorted(set(stages))
+
+    scope = json.loads(json.dumps(base_recipe["artifact_scope"]))
     nodes = []
     overrides = {}
-    for index, (node_id, unit) in enumerate(graph_spec):
-        node = json.loads(json.dumps(base_nodes[node_id]))
+    used_parts = set()
+    meta = {}
+    for index, (key, node_id, unit, part) in enumerate(rows):
+        node = json.loads(json.dumps(source_of[node_id]))
+        part_id = key if part else f"{host}:{node_id}"
+        catalog_row = TOPO.part_row(registry, part_id)
+        capability = part["capability"] if part else host
         if unit:
             choices = node.get("unit_choices")
+            widened = catalog_row.get("unit_choices")
+            if choices is None and widened and unit != node.get("unit") and unit in widened:
+                # A widened choice is merged only when the graph actually picks it.
+                choices = node["unit_choices"] = list(widened)
+                used_parts.add(part_id)
             if choices is not None and unit not in choices:
                 raise ValueError(
                     f"compose-unit-not-in-choices:{node_id}:{unit} (choices: {','.join(choices)})"
@@ -2748,7 +2883,27 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
                 raise ValueError(f"compose-unit-override-reserved:{node_id}")
             node["unit"] = unit
             node["role"] = TOPO._unit_frontmatter(unit)["role"]
-            overrides[node_id] = unit
+            overrides[key] = unit
+        originals = list(node.get("outputs") or [])
+        moved = {}
+        if part:
+            kind = node["kind"]
+            def relocate(path, _kind=kind, _part=part):
+                return TOPO.relocate_part_path(_part["scope"], _kind, _part["capability"], _part["stage"], path)
+            node["id"] = node_id
+            node["write_scope"] = [target for path in node["write_scope"] for target in relocate(path)]
+            for out in originals:
+                if not TOPO._is_semantic_output(out):
+                    moved[out] = relocate(out)[0]
+            node["outputs"] = [moved.get(out, out) for out in originals]
+            node["part"] = key
+            if catalog_row.get("start_approval"):
+                node["start_approval"] = catalog_row["start_approval"]
+            if part["merged_anchor"]:
+                scope[part["merged_anchor"]] = part["scope"][part["merged_anchor"]]
+            used_parts.add(key)
+        elif node_id in optional:
+            used_parts.add(part_id)
         previous = nodes[-1] if nodes else None
         node["depends_on"] = [previous["id"]] if previous else []
         if previous and gate_group(previous["id"]):
@@ -2764,14 +2919,63 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
                         break
                     raisers.append(prior["id"])
                 node["depends_on"] = list(reversed(raisers))
-        node["inputs"], sources = _compose_inputs(base_nodes, base_nodes[node_id], set(ids), find_input)
+        input_names = catalog_row.get("input_names") or {}
+        if part:
+            origin_nodes = {n["id"]: n for n in part["recipe"]["standard_plus"]["nodes"]}
+            kept = {p["stage"] for _, _, _, p in rows if p and p["recipe"] is part["recipe"]}
+        else:
+            origin_nodes, kept = base_nodes, set(ids)
+
+        def alternates(name, owners, _capability=capability, _names=input_names):
+            if owners is not None:  # every recipe producer was dropped: also look under the borrowed name
+                return tuple(f"parts/{_capability}/{stage}/{name}" for stage in sorted(owners))
+            target = _names.get(name)
+            if not target or not strict or target in selected_outputs:
+                return ()
+            return (name, target, *(f"parts/{_capability}/{stage}/{target}"
+                                    for stage in producers_in(_capability, target)))
+
+        node["inputs"], sources = _compose_inputs(origin_nodes, source_of[node_id], kept, find_input, alternates)
         if sources:
             node["input_sources"] = sources
+            if set(sources) & set(input_names):
+                used_parts.add(part_id)
         node.pop("terminal", None)
         node.pop("terminal_gate", None)
         node.pop("continuation", None)
         node.pop("parallel_group", None)
         nodes.append(node)
+        meta[node_id] = {"part_id": part_id, "originals": originals, "moved": moved,
+                         "input_names": input_names, "catalog": bool(part) or node_id in optional}
+    # SD-165 name mapping, sealed as `part_io` (absent on a route that uses no catalog part).
+    produced = {}
+    for index, node in enumerate(nodes):
+        info = meta[node["id"]]
+        io = {}
+        inputs = []
+        for name in node["inputs"]:
+            target = produced.get(name, name)
+            if target != name:  # the nearest producer is a borrowed part: read its relocated path
+                io[name] = target
+            if target not in inputs:
+                inputs.append(target)
+        for name, target in info["input_names"].items():
+            if name in inputs and target in produced:  # catalog name mapping to a selected producer
+                io[name] = produced[target]
+                used_parts.add(info["part_id"])
+        if index and meta[nodes[index - 1]["id"]]["catalog"]:
+            # A catalog part's result reaches the next stage brief even when that
+            # stage's recipe inputs never named it.
+            handed = [out for out in nodes[index - 1]["outputs"] if not TOPO._is_semantic_output(out)]
+            if handed and not set(handed) & (set(inputs) | set(io.values())):
+                inputs.extend(handed)
+        node["inputs"] = inputs
+        io.update(info["moved"])
+        if io:
+            node["part_io"] = io
+        for original, sealed in zip(info["originals"], node["outputs"]):
+            if not TOPO._is_semantic_output(original):
+                produced[original] = sealed
     terminal = nodes[-1]
     terminal["terminal"] = True
     terminal["terminal_gate"] = terminal["completion_gate"]
@@ -2790,7 +2994,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     bindings, gates = [], []
     gate_anchor: dict[str, str] = {}
     for index, node in enumerate(nodes[:-1]):
-        base = base_nodes[node["id"]]
+        base = source_of[node["id"]]
         continuation = base.get("continuation") or {}
         if continuation.get("kind") == "human-gate":
             gate = continuation["gate"]
@@ -2811,13 +3015,20 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     kept_ids = set(ids)
     for row in base_recipe.get("human_gate_bindings") or []:
         node_id = row.get("node")
-        if (row.get("position") == "entry" and node_id in kept_ids
+        if (row.get("position") == "entry" and node_id in kept_ids and node_id in base_nodes
                 and not (base_nodes[node_id].get("depends_on") or [])
                 and row.get("gate") not in gates):
             bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
             gates.append(row["gate"])
+    declared_groups = [(group, False) for group in base_recipe["standard_plus"].get("parallel_groups") or []]
+    for _, node_id, _, part in rows:
+        if part:  # a borrowed anchor brings its own group, re-keyed to the borrowed node id
+            declared_groups.extend(
+                (dict(json.loads(json.dumps(group)), id=node_id, node=node_id), True)
+                for group in part["recipe"]["standard_plus"].get("parallel_groups") or []
+                if group["node"] == part["stage"])
     groups, omitted_groups = [], []
-    for group in base_recipe["standard_plus"].get("parallel_groups") or []:
+    for group, borrowed in declared_groups:
         anchor = next((n for n in nodes if n["id"] == group["node"]), None)
         if anchor is None or anchor is terminal:
             continue
@@ -2827,8 +3038,17 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
             # The preset's fan-out requires a review consumer. A caller who
             # selected a smaller graph did not select that fan-out obligation.
             omitted_groups.append({"id": group["id"], "reason": "review-consumer-not-selected"})
-        else:
-            groups.append(json.loads(json.dumps(group)))
+            continue
+        group = json.loads(json.dumps(group))
+        dropped = _unarbitrated_auxiliary_legs(registry, group, anchor, consumers) if borrowed else []
+        if dropped:
+            # Peer legs stay; an auxiliary leg nobody arbitrates is left out.
+            group["legs"] = [leg for leg in group["legs"] if leg["suffix"] not in dropped]
+            group["width_by_intensity"] = {
+                tier: min(width, len(group["legs"])) for tier, width in group["width_by_intensity"].items()}
+            omitted_groups.append({"id": group["id"], "reason": "auxiliary-arbiter-not-selected",
+                                   "legs": dropped})
+        groups.append(group)
     extensions = [
         json.loads(json.dumps(row))
         for row in base_recipe.get("conditional_extensions") or []
@@ -2841,7 +3061,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
         "topology_class": base_recipe["topology_class"],
         "direct_predicates": list(base_recipe["direct_predicates"]),
         "promotion_signals": list(base_recipe["promotion_signals"]),
-        "artifact_scope": json.loads(json.dumps(base_recipe["artifact_scope"])),
+        "artifact_scope": scope,
         "quick": json.loads(json.dumps(base_recipe["quick"])),
         "standard_plus": {
             "topology": base_recipe["standard_plus"].get("topology", base_recipe["topology_class"]),
@@ -2857,9 +3077,12 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
         "human_gates": sorted(set(gates)),
         "human_gate_bindings": bindings,
         "resume_retry_boundaries": list(ids),
-        "compose": {"origin": "compose", "shape": "staged", "graph": list(ids),
+        "compose": {"origin": "compose", "shape": "staged", "graph": [row[0] for row in rows],
                     "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
     }
+    if used_parts:
+        # Catalog rows this recipe derives from; `capability_registry_digest` reads it.
+        recipe["compose"]["parts"] = sorted(used_parts)
     if groups:
         recipe["standard_plus"]["parallel_groups"] = groups
     if omitted_groups:
@@ -3118,16 +3341,37 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
-                  selection_pins=None):
-    """Resolve every default, then compile through the ordinary sealer."""
+                  selection_pins=None, route_plan=None, frameless=False):
+    """Resolve every default, then compile through the ordinary sealer.
+
+    `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
+    and compiles without frame nodes; `frameless` alone is the same compile without the seal, the form
+    a proposal leg is validated in.
+    """
+    import route_plan as RP
+    sealed_plan = RP.sealed_form(route_plan) if route_plan is not None else None
+    frameless = frameless or route_plan is not None
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
+    routing_hints = None
+    if shape == "framed":
+        # The shape itself picks the compiler-internal capability. Whatever was typed for the
+        # ordinary shapes is only a hint for the work request: recorded, never sealed as the
+        # route's capability, never refused as an argument conflict, never applied to a model.
+        routing_hints = {key: value for key, value in (
+            ("capability", capability), ("capability_mode", capability_mode),
+            ("graph", graph), ("profile", profile)) if value}
+        capability, capability_mode, graph, profile = ROUTE_FRAME_CAPABILITY, "default", None, None
+        if intensity not in (None, "standard"):
+            raise ValueError("compose-shape-intensity-mismatch:framed")
     if shape != "staged" and graph:
         raise ValueError(f"compose-graph-only-staged:{shape}")
     registry = TOPO.load_registry()
     # A capability may own several recipes (autopilot-lab: setup, eval); the
-    # requested mode picks the recipe that declares it.
-    candidates = [r for r in registry["recipes"] if r["capability"] == capability]
+    # requested mode picks the recipe that declares it. The internal framed
+    # capability exists only for the framed shape.
+    candidates = [r for r in registry["recipes"] if r["capability"] == capability
+                  and (capability != ROUTE_FRAME_CAPABILITY or shape == "framed")]
     if not candidates:
         raise ValueError(f"compose-capability-unknown:{capability}")
     if capability_mode is None:
@@ -3158,7 +3402,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if campaign_key is None and parent_cycle_id is None and not unassigned:
         raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root))
     if tracking is None:
-        tracking = "tracked" if shape == "staged" else "untracked"
+        tracking = "tracked" if shape in ("staged", "framed") else "untracked"
     gate = {
         "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
         "drift_verdict": drift_verdict or "no-spec-impact: compose default (caller asserted no spec-significant change)",
@@ -3171,17 +3415,29 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         raise ValueError("compose-direct-signals-conflict")
     readiness = None
     find_input = None
-    if shape == "staged" and graph and not unassigned:
+    frame_ids = [n["id"] for n in base["standard_plus"]["nodes"] if _frame_node(n)]
+    planned_full = shape == "staged" and not graph and frameless and bool(frame_ids)
+    if shape == "staged" and (graph or planned_full) and not unassigned:
         try:
             import artifact_producer
             find_input = artifact_producer.input_source_finder(
-                artifact_root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key)
+                artifact_root, parent_cycle_id=parent_cycle_id, campaign_key=campaign_key,
+                capability=capability, route_chain_identity=_route_chain_identity("compose", None))
         except ImportError:
             find_input = None
-    selected_recipe = (compose_subgraph_recipe(registry, base, parse_graph_spec(graph), find_input)
-                       if shape == "staged" and graph else base)
+    capabilities = {recipe["capability"] for recipe in registry["recipes"]
+                    if recipe["capability"] != ROUTE_FRAME_CAPABILITY}
+    if find_input is not None and frameless:
+        find_input = _frame_brief_finder(registry, capability, find_input)
+    if planned_full:
+        # No graph: the recipe's own order, minus the frame nodes the plan already ran.
+        graph_spec = [(n["id"], None) for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
+    else:
+        graph_spec = parse_graph_spec(graph, capabilities) if shape == "staged" and graph else None
+    selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input)
+                       if graph_spec is not None else base)
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
-    if shape == "staged" and not owner_only and dispatch_evidence is None:
+    if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
                                        children or _compose_default_children(selection_pins))
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
@@ -3197,8 +3453,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         registered_headless_evidence=registered_headless_evidence,
         route_origin="compose", shape=shape,
         profile_demands=profile_demands, explicit_profiles=explicit_profiles, profile=profile,
+        route_plan=sealed_plan, frameless=frameless,
     )
-    if shape == "staged" and graph:
+    if graph_spec is not None:
         recipe = selected_recipe
         route = compile_composed_route(
             recipe, capability_mode, requested, cwd, artifact_root,
@@ -3212,6 +3469,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         route["campaign_unassigned"] = True
     if work_request is not None:
         from work_start import capture_request_context
+        if routing_hints:
+            work_request = {**work_request, "routing_hints": routing_hints}
         route["work_request"] = capture_request_context(work_request, route)
     if selection_pins:
         _apply_selection_pins(route, selection_pins)
@@ -3219,6 +3478,113 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
+
+
+def _frame_brief_finder(registry, capability, finder):
+    """Let a leg of an approved plan find the frame cycle's two briefs under the names its recipe reads.
+
+    A recipe that keeps its frame briefs under its own names (design, spec) maps them, through the
+    part catalogue's brief-name table, to the canonical `shards/<frame>/direction-brief.md` outputs
+    the framed route's cycle holds. Names that already match (code, draft, refine) need no mapping.
+    """
+    names = TOPO.frame_brief_inputs(registry, capability)
+    outputs = (TOPO.part_catalog(registry).get("frame") or {}).get("brief_outputs") or []
+    table = dict(zip(names, outputs)) if len(names) == len(outputs) else {}
+
+    def find(name):
+        return finder(name) or (finder(table[name]) if name in table else None)
+    return find
+
+
+def proposal_readiness(frame_route, jobs):
+    """One read-only readiness probe shared by every proposal leg's memory compile."""
+    from dispatch_parent_completion import default_parent_harness
+    return _compose_readiness(frame_route["cwd"], jobs, default_parent_harness("claude"),
+                              _compose_default_children(None))
+
+
+def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
+    spec = ((frame_route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source") or "auto"
+    return dict(
+        capability=leg_args["capability"], capability_mode=leg_args["capability_mode"], shape=leg_args["shape"],
+        graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug, cwd=frame_route["cwd"],
+        artifact_root=frame_route["artifact_root"],
+        spec_read="auto" if str(spec).startswith("compose-auto:") else spec,
+        campaign_key=frame_route.get("campaign_key"), parent_cycle_id=frame_cycle_id)
+
+
+def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
+    """Memory compile of one proposal leg in the frame-less form a `--route-plan` compile uses.
+
+    `readiness` is a zero-argument probe, called only for a leg that needs checked dispatch evidence.
+    Nothing is written, started or recorded: no route file, no route-chain line, no producer call.
+    The registry, graph, order, unit, scope and gate rules are the ones compose applies when it seals.
+    """
+    import route_plan as RP
+    return compose_route(
+        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                              slug=f"{frame_route.get('slug') or 'framed'}-leg{index}"),
+        **_leg_evidence(leg, readiness), frameless=True)
+
+
+def _leg_evidence(leg, readiness):
+    if leg["shape"] == "direct":
+        return {}
+    probe = readiness()
+    return {"dispatch_evidence": {"tuples": probe["tuples"], "native_subagent": []},
+            "registered_headless_evidence": {"candidates": probe["candidates"]}}
+
+
+def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness):
+    """The approved first leg, compiled in memory with its route-plan reference sealed.
+
+    Same arguments the printed compose command carries: the leg's shape, graph, capability, mode and
+    intensity, `--route-plan <record>#0`, the frame cycle as parent and the same campaign.
+    """
+    import route_plan as RP
+    return compose_route(
+        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                              slug=f"{context['slug']}-leg0"),
+        **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
+        parent_harness=context.get("owner") or "claude")
+
+
+def declared_start_approvals(leg, registry=None):
+    """`(start_approval, part id)` pairs a proposal leg declares in the part catalogue.
+
+    Read from the catalogue alone (no compile, no probe), so anything rendered from it is the same on
+    every replay. Only a staged leg carries stage parts.
+    """
+    if leg.get("shape") != "staged":
+        return []
+    registry = registry or TOPO.load_registry()
+    capability = leg["capability"]
+    recipes = [r for r in registry["recipes"] if r["capability"] == capability and capability != ROUTE_FRAME_CAPABILITY]
+    if not recipes:
+        return []
+    mode = leg.get("mode")
+    base = (next((r for r in recipes if "dev" in r["modes"]), recipes[0]) if mode is None
+            else next((r for r in recipes if mode in r["modes"]), None))
+    if base is None:
+        return []
+    known = {r["capability"] for r in registry["recipes"]} - {ROUTE_FRAME_CAPABILITY}
+    tokens = leg.get("graph") or [n["id"] for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
+    rows = []
+    for token in tokens:
+        head, _, rest = token.partition(":")
+        part = f"{head}:{rest.partition(':')[0]}" if rest and head in known else f"{base['capability']}:{head}"
+        approval = TOPO.part_row(registry, part).get("start_approval")
+        if approval:
+            rows.append((approval, part))
+    return rows
+
+
+def publish_composed_route(route, artifact_root, *, plan=None):
+    """The compose CLI's write tail for an already compiled route: canonical write-once,
+    owner binding and one route-chain line. Returns the canonical route path."""
+    shim = argparse.Namespace(command="compose", start=True, output=None, owner=None, full_record=False)
+    shim._route_chain_plan = (plan, "explicit" if plan else None)
+    return _emit_compiled_route(shim, route, artifact_root)
 
 
 COMPOSE_CAMPAIGN_LIST_CAP = 12
@@ -3296,11 +3662,32 @@ def _compose_campaign_line(selection):
     return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
-def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
+def route_start_approvals(route, registry=None):
+    """Start-approval marks of the parts a route carries (SD-165; stage-dispatch 13.63.7).
+
+    A declaration for the card, the frame catalog and the interview -- never a
+    gate, fence or wait. A borrowed node seals its mark; a host's own stage is
+    looked up in the part catalog as `<capability>:<stage>`.
+    """
+    registry = registry or TOPO.load_registry()
+    rows, seen = [], set()
+    for node in route.get("nodes") or []:
+        borrowed = node.get("part")
+        part = borrowed or f"{route.get('capability')}:{node.get('parallel_anchor') or node.get('id')}"
+        approval = node.get("start_approval") if borrowed else TOPO.part_row(registry, part).get("start_approval")
+        if approval and part not in seen:
+            seen.add(part)
+            rows.append({"node": node.get("parallel_anchor") or node.get("id"), "part": part,
+                         "start_approval": approval, "borrowed": bool(borrowed)})
+    return rows
+
+
+def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
-    graph = "→".join(ids) if route.get("composed") else (ids[0] if ids else "-")
+    framed = shape == "framed"
+    graph = "→".join(ids) if route.get("composed") or framed else (ids[0] if ids else "-")
     gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
     card = (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
@@ -3308,6 +3695,9 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
         f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
         + _compose_campaign_line(compose_campaign_selection(route))
     )
+    if framed:
+        card += ("\n  frame이 방향과 경로를 조립해 제안합니다"
+                 "\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회")
     sourced = {}
     for node in route["nodes"]:
         for name, source in (node.get("input_sources") or {}).items():
@@ -3316,6 +3706,11 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
         source_dir = os.path.commonpath([str(Path(source["path"]).parent) for source in sourced.values()])
         card += (f"\n  입력 {'·'.join(sourced)} ← {','.join(sorted({s['cycle_id'] for s in sourced.values()}))}"
                  f" {Path(route['artifact_root']) / source_dir}")
+    borrowed = list(dict.fromkeys(node["part"] for node in route["nodes"] if node.get("part")))
+    if borrowed:  # SD-165: parts taken from another recipe, written under parts/<capability>/<stage>/
+        card += f"\n  빌린 부품 {'·'.join(borrowed)}"
+    for row in route_start_approvals(route):
+        card += f"\n  시작 승인 {row['start_approval']} ({row['part']})"
     from artifact_producer import route_cycle_for, cycle_dir, default_bucket, ProducerError
     try:
         record = route_cycle_for(Path(route["artifact_root"]), route)
@@ -3327,6 +3722,8 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    if route_plan_unreadable:
+        card += "\n  경로 계획을 읽지 못함"
     notice = _compose_spec_read_notice(route)
     if notice:
         card += "\n" + notice
@@ -3359,9 +3756,12 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                          registered_headless_evidence=None, slug=None, composed=False,
                   route_origin="preset", shape=None, profile_demands=None,
-                  explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
+                  explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None,
+                  route_plan=None, frameless=False):
     dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
+    if (capability==ROUTE_FRAME_CAPABILITY) != (shape=="framed"):
+        raise ValueError(f"compose-shape-invalid:{shape}")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
     slug_fields={}
@@ -3407,6 +3807,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     elif effective=="quick":
         if transport not in (None, "headless"):
             raise ValueError(f"invalid quick transport: {transport!r}")
+        if frameless:
+            # A leg of an approved route plan was framed already: its one-shot runs without the quick frame pair.
+            recipe=_frameless_recipe(recipe)
         if (requested=="direct" and set(predicates)!=known_pred
                 and registered_headless_evidence is None):
             # H6: an explicit direct request whose predicates do not all hold
@@ -3508,7 +3911,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     if profile is not None:
         if profile not in PROFILE.PORTABLE_PROFILES:
             raise ValueError("profile-explicit-unknown:" + str(profile))
-        explicit_profiles = {**{n["id"]: profile for n in nodes if n.get("kind") != "resource-runner"},
+        explicit_profiles = {**{n["id"]: profile for n in nodes if not _no_model_node(n)},
                              "__owner__": profile, **(explicit_profiles or {})}
     profile_demands, explicit_profiles = _profile_input_maps(nodes, profile_demands, explicit_profiles)
     owner_demand = profile_demands.get("__owner__")
@@ -3632,6 +4035,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     if composed:
         payload["composed"]=True
         payload["composed_recipe"]=json.loads(json.dumps(recipe))
+    if route_plan is not None:
+        payload["route_plan"]=json.loads(json.dumps(route_plan))
     digest=route_hash(payload); payload["route_hash"]=digest; payload["route_id"]=ROUTE_IDENTITY.route_id_from_hash(digest)
     owner_attempt_id=_resolve_owner_attempt_id()
     payload["owner_attempt_id"]=owner_attempt_id
@@ -3768,6 +4173,11 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         from work_start import validate_request
         validate_request(route["work_request"])
     _verify_selection_pins(route)
+    if "route_plan" in route:
+        # Only the field's own format is verified; the record it names may be gone without
+        # making the route unverifiable (`next_leg` simply has nothing to read then).
+        import route_plan as RP
+        RP.validate_sealed(route["route_plan"])
     if route.get("schema_version") != ROUTE_SCHEMA_VERSION:
         raise ValueError(
             f"legacy route schema_version={route.get('schema_version')!r} rejected for mutating/resume use"
@@ -3886,6 +4296,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         route_recipe=TOPO.resolve_recipe(
             registry, route.get("capability"), route.get("capability_mode")
         )
+        if route.get("route_plan") is not None and route.get("effective_intensity")=="quick":
+            route_recipe=_frameless_recipe(route_recipe)
         if route.get("effective_intensity") not in ("direct", "quick"):
             expected_nodes=json.loads(json.dumps(route_recipe["standard_plus"]["nodes"]))
             expected_nodes=_expand_parallel_groups(
@@ -3902,7 +4314,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 by_id = {n["id"]: n for n in expected_nodes}
                 for node in route.get("nodes", []):
                     expected = by_id.get(node.get("id"))
-                    if expected and node.get("kind") != "resource-runner" and any(
+                    if expected and not _no_model_node(node) and any(
                         node.get(key) != expected.get(key)
                         for key in ("profile_demand", "profile_selection", "model_profile")):
                         raise ValueError("node-profile-declaration-mismatch:" + node["id"])
@@ -3912,6 +4324,17 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             if ([n.get("id") for n in route.get("nodes", [])]
                     != [n.get("id") for n in expected_nodes]):
                 raise ValueError("route nodes differ from the declared recipe")
+            if (route.get("capability") == ROUTE_FRAME_CAPABILITY
+                    and route.get("profile_selection_contract_version") == 1
+                    and [_node_identity(n) for n in route.get("nodes", [])]
+                    != [_node_identity(n) for n in expected_nodes]):
+                # The framed route's model-less terminal is accepted only as exactly the recipe's node.
+                raise ValueError("route-frame nodes differ from the sealed recipe")
+    if (route.get("capability") == ROUTE_FRAME_CAPABILITY) != (route.get("selection", {}).get("shape") == "framed"):
+        raise ValueError("route-frame-shape-mismatch")
+    if route.get("capability") == ROUTE_FRAME_CAPABILITY and (
+            route.get("composed") or route.get("effective_intensity") != "standard"):
+        raise ValueError("route-frame-shape-mismatch")
     expected_extensions=_realize_conditional_extensions(
         route_recipe, route.get("effective_intensity")
     )
@@ -4397,14 +4820,24 @@ def _owner_terminal_observation(route,node,*,jobs=None):
             fields=line.split("\t")
             if len(fields)!=6: continue
             meta=parse_registry_metadata(fields[5])
-            if (meta.get("worker_type")=="owner" and meta.get("dispatch_depth")=="1"
-                    and meta.get("owner_route_id")==route["route_id"]):
+            if meta.get("worker_type")!="owner" or meta.get("dispatch_depth")!="1": continue
+            try:
+                identity=ROUTE_IDENTITY.registered_node_identity(meta,node)
+            except ValueError:
+                continue
+            if identity==(route["route_id"],route["route_hash"],node["id"]):
                 owners.append((fields,meta))
         if not owners: return absent("owner-attempt-absent")
         fields,meta=owners[-1]
         binding,_=resolve_owner_route_lifecycle(jobs,owner_attempt_id=meta["attempt_id"])
-        if (binding is None or binding.route_id!=route["route_id"] or binding.route_hash!=route["route_hash"]
-                or meta.get("registered_worker")!="1"):
+        # A one-shot owner sealed by `route_*` fields alone (its supervisor closed the row
+        # before the marker writer ran) has no lifecycle binding; the quick node-bound
+        # contract that `dispatch_terminal_commit.validate_owner_route` enforces stands in.
+        node_bound=(binding is None and route.get("effective_intensity")=="quick"
+                    and not any(k in meta for k in ("owner_route_file","owner_route_id","owner_route_hash"))
+                    and Path(meta.get("route_file","")).resolve()==canonical_route_path(route["artifact_root"],route["route_id"]))
+        if not ((binding is not None and binding.route_id==route["route_id"] and binding.route_hash==route["route_hash"])
+                or node_bound) or meta.get("registered_worker")!="1":
             return absent("owner-route-identity-mismatch")
         if fields[1]!="done" or not verdict_pass(meta):
             return absent("owner-terminal-not-pass")
@@ -4876,6 +5309,12 @@ def route_status(artifact_root, *, diagnostics=None):
                 row["closed_at"]=closure.get("closed_at"); row["head_commit"]=closure.get("head_commit")
                 row["stale_closure"]=closure.get("route_hash")!=raw.get("route_hash")
                 row["registry_current"]=closure.get("registry_current",True)
+                if (raw.get("route_plan") is not None and closure.get("terminal_gate_proven") is True
+                        and not closure.get("autoclose") and not row["stale_closure"]):
+                    import route_plan as RP
+                    next_leg=RP.next_leg_for_route(raw)
+                    if next_leg is not None:
+                        row["next_leg"]=next_leg
             rows.append(row)
             by_route_id.setdefault(row["route_id"],[]).append(row["route_file"])
     for row in rows:
@@ -6519,6 +6958,10 @@ def complete_node(
     intent at all, so a quick one-shot owner's completion left no record and
     no carrier could ever deliver it.
     """
+    if node_id=="route-decision" and isinstance(node,dict) and node.get("kind")==TOPO.ROUTE_DECISION_KIND:
+        marker=_complete_framed_terminal(route,node,evidence,jobs)
+        _launch_open_cycle_checkpoint(route)
+        return marker,None
     artifact_root=route.get("artifact_root")
     route_id=route.get("route_id")
     pending=None
@@ -6550,6 +6993,29 @@ def complete_node(
             pass
     _launch_open_cycle_checkpoint(route)
     return marker, row
+
+
+def _complete_framed_terminal(route, node, evidence, jobs):
+    """The framed route's runtime terminal completes without a model attempt, once its two frame
+    legs are complete, the frame-review gate is released, and the evidence is this route's own
+    `route_decision_v1` record. The marker is the ordinary inline-axes marker."""
+    import route_plan
+    from dispatch_contract import completion_marker_gate
+    if not route_plan.is_framed_route(route):
+        raise ValueError("route-frame-shape-mismatch")
+    route_file=str(canonical_route_path(route["artifact_root"],route["route_id"]))
+    registry=Path(jobs) if jobs else Path(_compose_default_jobs())
+    try:
+        # The one gate every entry node passes: both frame legs have a current completion marker
+        # and the frame-review human gate bound at this node's entry is released.
+        completion_marker_gate(route_file,node["id"],"start",ROOT,registry)
+    except DispatchContractError as exc:
+        raise ValueError(f"framed-terminal-not-ready:{exc.reason}") from exc
+    frame_route=route_plan.read_record(evidence)["decision"]["frame_route"]
+    if (frame_route["route_id"],frame_route["route_hash"])!=(route["route_id"],route["route_hash"]):
+        raise ValueError("route-decision-invalid:frame_route")
+    marker,_row=_complete_node_locked(route,node,node["id"],evidence)
+    return marker
 
 
 def _launch_open_cycle_checkpoint(route):
@@ -7863,6 +8329,54 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     _launch_open_cycle_checkpoint(route)
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}
 
+def stages_block(registry, recipe):
+    """One recipe's parts for `stages` and the frame catalog (SD-165, 13.64.5).
+
+    Recipe stages in recipe order, then the recipe's optional catalog parts,
+    then the parts of other recipes this host can borrow. The catalog is the
+    only source: a frame assembles a graph from this output alone.
+    """
+    capability=recipe["capability"]
+    group_by_node={g.get("node"):g.get("id") for g in (recipe["standard_plus"].get("parallel_groups") or [])}
+    gate_by_node={}
+    for row in recipe.get("human_gate_bindings") or []:
+        gate_by_node.setdefault(row.get("node"), []).append(row.get("gate"))
+    aliases=(TOPO.part_catalog(registry).get("frame") or {}).get("aliases") or []
+    def part_view(part_id,node,origin,*,optional=False,local=True):
+        catalog_row=TOPO.part_row(registry,part_id)
+        placement=catalog_row.get("optional") or {}
+        produced={out for other in origin["standard_plus"]["nodes"] for out in other.get("outputs") or []}
+        return {
+            "id":node["id"] if local else part_id,"unit":node.get("unit"),
+            "unit_choices":node.get("unit_choices") or catalog_row.get("unit_choices") or [],
+            "parallel_group":group_by_node.get(node["id"]) if local else None,
+            "human_gates":gate_by_node.get(node["id"], []) if local else [],
+            "terminal":local and node.get("terminal") is True,
+            "part":part_id,"summary":catalog_row.get("summary",""),"kind":node.get("kind"),
+            "inputs":list(node.get("inputs") or []),
+            "external_inputs":[name for name in node.get("inputs") or []
+                               if name not in produced and not TOPO._is_semantic_output(name)],
+            "optional_inputs":list(catalog_row.get("optional_inputs") or []),
+            "outputs":list(node.get("outputs") or []),
+            "shareable":catalog_row.get("shareable") is True,
+            "start_approval":catalog_row.get("start_approval"),
+            "optional":optional,
+            "after":list(placement.get("after") or []),"before":list(placement.get("before") or []),
+            "frame_alias":local and node["id"] in aliases and node.get("unit")=="plan/frame",
+        }
+    nodes=[part_view(f"{capability}:{node['id']}",node,recipe) for node in recipe["standard_plus"]["nodes"]]
+    nodes+=[part_view(f"{capability}:{stage}",row["optional"]["node"],recipe,optional=True)
+            for stage,row in TOPO.recipe_optional_parts(registry,recipe)]
+    borrowable=[]
+    for part_id in TOPO.borrowable_parts(registry,recipe):
+        origin,node=TOPO.part_recipe(registry,part_id)
+        borrowable.append(part_view(part_id,node,origin,optional="optional" in TOPO.part_row(registry,part_id),
+                                    local=False))
+    return {"capability":capability,"modes":list(recipe["modes"]),
+            "topology_class":recipe["topology_class"],"nodes":nodes,"borrowable":borrowable,
+            "frame_brief_inputs":TOPO.frame_brief_inputs(registry,capability)}
+
+
 def _compose_artifact_root(cwd):
     script=ROOT/"utilities"/"artifact-root.sh"
     result=subprocess.run(["sh",str(script),str(cwd)],text=True,capture_output=True,check=False)
@@ -7955,16 +8469,13 @@ def _route_chain_identity(event, route):
             return None
         harness, sid = anchor
         return harness, sid, depth, os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
-    try:
-        from dispatch_parent_completion import interactive_parent_identity
-        harness, sid = interactive_parent_identity()
-    except Exception:
-        return None
-    if not harness or not sid:
-        return None
     rc = _route_chain_module()
-    if rc is None or rc.WRITER_SUPPORT.get(harness) != "env":
+    if rc is None:
         return None
+    anchor = rc.writer_identity()
+    if anchor is None:
+        return None
+    harness, sid = anchor
     return harness, sid, depth, None
 
 
@@ -8010,7 +8521,7 @@ def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None
             pass
 
 
-def _resolve_compose_plan(a):
+def _resolve_compose_plan(a, route_plan=None):
     """`(plan, plan_source)` for the compose CLI's `--plan` input (plan §3 B-1.5). An explicit
     `--plan` is validated eagerly — before any route work — and its failure is a normal
     `ValueError("compose-plan-invalid:...")`, never swallowed. With no explicit plan, an
@@ -8022,8 +8533,13 @@ def _resolve_compose_plan(a):
     if a.plan:
         if rc is None:
             raise ValueError("compose-plan-invalid:route-chain-unavailable")
-        known = {r["capability"] for r in TOPO.load_registry()["recipes"]}
+        known = {r["capability"] for r in TOPO.load_registry()["recipes"]
+                 if r["capability"] != ROUTE_FRAME_CAPABILITY}
         return rc.parse_plan(a.plan, known), "explicit"
+    if route_plan is not None:
+        # Display only: the approved legs' capability order, never a permission or a hash input.
+        import route_plan as RP
+        return RP.display_plan(route_plan["legs"]), "explicit"
     if rc is None:
         return None, None
     try:
@@ -8152,13 +8668,14 @@ def main():
     cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
     cp.add_argument("--plan",default=None,help="optional declared capability sequence for this session's route chain, e.g. research,draft,apply; shown in Fleet, not sealed into the route")
+    cp.add_argument("--route-plan",default=None,metavar="RECORD#INDEX",help="runtime-generated: leg INDEX of an approved route decision record; compiles without frame nodes and seals its reference")
     cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
                     help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
-    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph); default staged with --graph, else direct")
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default staged with --graph, else direct")
     cp.add_argument("--graph",default=None,help="optional staged subgraph in your order (see `capability-route.py stages --capability <cap>` for valid ids); incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
-    cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
+    cp.add_argument("--capability",default=None,help=f"default {COMPOSE_DEFAULT_CAPABILITY}; a hint only with --shape framed"); cp.add_argument("--capability-mode",default=None)
     cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
     cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
     cp.add_argument("--signal",action="append",default=[],
@@ -8179,7 +8696,7 @@ def main():
     cp.add_argument("--full-record",action="store_true",help="print all sealed evidence; default prints choices and the canonical route_file")
     cp.add_argument("--help-all",action="help",help="also show advanced/compatibility inputs")
     if "--help-all" not in sys.argv:
-        advanced = {"parent_cycle", "profile_demands", "explicit_profiles", "intensity", "artifact_root",
+        advanced = {"route_plan", "parent_cycle", "profile_demands", "explicit_profiles", "intensity", "artifact_root",
                     "drift_verdict", "tracking", "artifact_guard", "parent_harness", "jobs",
                     "dispatch_evidence", "registered_headless_evidence", "transport_evidence", "output", "full_record"}
         for option in cp._actions:
@@ -8270,38 +8787,34 @@ def main():
         dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="stages":
         registry=TOPO.load_registry()
-        rows=[r for r in registry["recipes"] if a.capability is None or r["capability"]==a.capability]
+        rows=[r for r in registry["recipes"] if r["capability"]!=ROUTE_FRAME_CAPABILITY
+              and (a.capability is None or r["capability"]==a.capability)]
         if not rows:
             raise ValueError(f"unknown capability: {a.capability}")
-        blocks=[]
-        for recipe in rows:
-            group_by_node={g.get("node"):g.get("id") for g in (recipe["standard_plus"].get("parallel_groups") or [])}
-            gate_by_node={}
-            for row in recipe.get("human_gate_bindings") or []:
-                gate_by_node.setdefault(row.get("node"), []).append(row.get("gate"))
-            blocks.append({
-                "capability":recipe["capability"],"modes":list(recipe["modes"]),
-                "topology_class":recipe["topology_class"],
-                "nodes":[{
-                    "id":node["id"],"unit":node.get("unit"),
-                    "unit_choices":node.get("unit_choices") or [],
-                    "parallel_group":group_by_node.get(node["id"]),
-                    "human_gates":gate_by_node.get(node["id"], []),
-                    "terminal":node.get("terminal") is True,
-                } for node in recipe["standard_plus"]["nodes"]],
-            })
+        blocks=[stages_block(registry,recipe) for recipe in rows]
         if a.json:
             print(json.dumps(blocks,sort_keys=True))
         else:
+            def line(node):
+                choices=f" unit_choices={','.join(node['unit_choices'])}" if node["unit_choices"] else ""
+                group=f" parallel_group={node['parallel_group']}" if node["parallel_group"] else ""
+                gates=f" human_gate={','.join(node['human_gates'])}" if node["human_gates"] else ""
+                terminal=" terminal=1" if node["terminal"] else ""
+                approval=f" start_approval={node['start_approval']}" if node["start_approval"] else ""
+                extra=f" optional_in={','.join(node['optional_inputs'])}" if node["optional_inputs"] else ""
+                if node["after"]: extra+=f" after={','.join(node['after'])}"
+                if node["before"]: extra+=f" before={','.join(node['before'])}"
+                return (f"{node['id']} unit={node['unit']}{choices}{group}{gates}{terminal}"
+                        f" part={node['part']} shareable={int(node['shareable'])} optional={int(node['optional'])}"
+                        f"{approval} in={','.join(node['inputs'])}{extra} out={','.join(node['outputs'])}"
+                        f" -- {node['summary']}")
             for block in blocks:
                 print(f"capability={block['capability']} modes={','.join(block['modes'])} "
                       f"topology={block['topology_class']}")
                 for node in block["nodes"]:
-                    choices=f" unit_choices={','.join(node['unit_choices'])}" if node["unit_choices"] else ""
-                    group=f" parallel_group={node['parallel_group']}" if node["parallel_group"] else ""
-                    gates=f" human_gate={','.join(node['human_gates'])}" if node["human_gates"] else ""
-                    terminal=" terminal=1" if node["terminal"] else ""
-                    print(f"  {node['id']} unit={node['unit']}{choices}{group}{gates}{terminal}")
+                    print("  "+line(node))
+                for node in block["borrowable"]:
+                    print("  borrow "+line(node))
         return 0
     if a.command=="compose":
         shape=a.shape or ("staged" if a.graph else "direct")
@@ -8309,13 +8822,22 @@ def main():
             raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
-        a._route_chain_plan = _resolve_compose_plan(a)
+        route_plan_binding, route_plan_unreadable = None, False
+        if a.route_plan:
+            # Unreadable, mismatched or out of range: the same compose as without the argument, plus one card line.
+            import route_plan as RP
+            try:
+                route_plan_binding = RP.read_route_plan(a.route_plan, artifact_root)
+            except (OSError, ValueError):
+                route_plan_unreadable = True
+        a._route_chain_plan = _resolve_compose_plan(a, route_plan_binding)
         DISPATCH_DEFAULTS_WARNINGS.clear()
         pins=_parse_selection_pins(a.pin,a.owner)
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         route=compose_route(
-            capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
+            capability=a.capability if shape=="framed" else (a.capability or COMPOSE_DEFAULT_CAPABILITY),
+            capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
             campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,unassigned=a.unassigned,
             spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
@@ -8330,13 +8852,14 @@ def main():
             explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             profile=a.profile,
             work_request={"text":a.prompt_file.read_text(),"owner_harness":owner_pin} if a.prompt_file else None,
-            selection_pins=pins or None,
+            selection_pins=pins or None,route_plan=route_plan_binding,
         )
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
         if a.explain:
-            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin),file=sys.stderr)
+            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
+                               route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
                               "effective_intensity":route["effective_intensity"],"shape":shape,
@@ -8354,7 +8877,8 @@ def main():
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
-        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin),file=sys.stderr)
+        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
+                           route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError

@@ -2144,47 +2144,17 @@ if "$CODEX" mode-info research/claim-verify >"$TMP/mode.out" 2>"$TMP/mode.err" \
 else
   bad "codex mode wrapper should report named claim verification contract"
 fi
-# 2026-09-09/10: session-end re-runs itself with CODEX_PREFLIGHT_DETACHED=1
-# and returns immediately, because the sync work is measured in tens of
-# seconds against a 3-second hook. Assert the two halves separately: the hook
-# call returns without doing the work, and the detached body syncs.
-AGENT_MODEL_GOVERNOR_ROOT="$TMP/session-end-hook-governor" \
-MEM_STORE="$TMP/store_session_end_hookcall" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_hookcall.out" 2>"$TMP/codex_se_hookcall.err"
-if [ "$?" -eq 0 ] && [ ! -s "$TMP/codex_se_hookcall.out" ]; then
-  ok "codex session-end returns inside the hook budget by detaching"
+# D-82: memory has no session-end step. The wrapper subcommand is gone, so the
+# call is refused and never opens a store.
+if MEM_STORE="$TMP/store_session_end_gone" "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_gone.out" 2>"$TMP/codex_se_gone.err"; then
+  bad "codex preflight session-end should no longer exist"
+elif [ ! -e "$TMP/store_session_end_gone" ] && ! grep -Fq 'session-end' "$ROOT/adapters/codex/bin/preflight.sh"; then
+  ok "codex preflight has no session-end memory sync (D-82)"
 else
-  bad "codex session-end should return inside the hook budget by detaching"
+  bad "codex preflight session-end must not touch memory"
 fi
-CODEX_PREFLIGHT_DETACHED=1 MEM_STORE="$TMP/store_session_end" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se.out" 2>"$TMP/codex_se.err"
-codex_se_status=$?
-# A fresh isolated MEM_STORE has no sealed seed epoch, so a real-world remote
-# policy can legitimately still exit 2 (hard-failure) even though the local
-# store synced; require the local side effect, not a specific remote outcome.
-if { [ "$codex_se_status" -eq 0 ] || [ "$codex_se_status" -eq 1 ] || [ "$codex_se_status" -eq 2 ]; } \
-  && [ -f "$TMP/store_session_end/memory.db" ]; then
-  ok "codex session-end syncs the memory store"
-else
-  bad "codex session-end should sync the memory store"
-fi
-# recursion guard: MEM_DISTILL=1 makes the whole session-end pipeline a no-op
-if MEM_DISTILL=1 MEM_STORE="$TMP/store_session_end_guard" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_guard.out" 2>"$TMP/codex_se_guard.err" \
-  && [ ! -e "$TMP/store_session_end_guard/memory.db" ]; then
-  ok "codex session-end no-ops under MEM_DISTILL=1 recursion guard"
-else
-  bad "codex session-end must no-op under MEM_DISTILL=1 recursion guard"
-fi
-# D-42: every worker path returns before sync/store/model work. Test both the
-# preflight defense and the native SessionEnd/UserPrompt/SessionStart bridges.
-if AGENT_SESSION_ROLE=worker MEM_STORE="$TMP/store_session_end_worker" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_worker.out" 2>"$TMP/codex_se_worker.err" \
-  && [ ! -e "$TMP/store_session_end_worker" ]; then
-  ok "codex preflight session-end no-ops before state/model work for workers"
-else
-  bad "codex preflight session-end must be main-session-only"
-fi
+# D-42: every worker path returns before store/model work. Test the native
+# SessionEnd/UserPrompt/SessionStart bridges.
 if printf '{"hook_event_name":"SessionEnd","session_id":"codex-worker-hook","cwd":"%s"}\n' "$TMP/flowproj" \
   | AGENT_SESSION_ROLE=worker MEM_STORE="$TMP/store_session_end_hook_worker" \
     python3 "$ROOT/adapters/codex/hooks/sessionend-lifecycle.py" \
@@ -2219,6 +2189,11 @@ D812_SE_STORE="$TMP/d812-se-store"
 if printf '{"hook_event_name":"SessionEnd","session_id":"d812-se","cwd":"%s"}\n' "$TMP/flowproj" \
   | PATH="$D812_NOSPAWN_PATH" MEM_STORE="$D812_SE_STORE" python3 "$ROOT/adapters/codex/hooks/sessionend-lifecycle.py" >/dev/null 2>"$TMP/d812_se.err"; then
   ok "codex main SessionEnd completes with no adapter-launcher binary on PATH (spawns no model worker)"
+  if [ ! -e "$D812_SE_STORE" ]; then
+    ok "codex main SessionEnd opens no memory store (D-82)"
+  else
+    bad "codex main SessionEnd must not touch memory"
+  fi
 else
   bad "codex main SessionEnd should not depend on a model-launcher binary [err=$(cat "$TMP/d812_se.err")]"
 fi
@@ -3502,21 +3477,17 @@ else
   bad "opencode mode wrapper should report named claim verification contract"
 fi
 
-echo "== opencode session-end memory sync =="
-# recursion guard: MEM_DISTILL=1 -> no sync even for session-end
-mkdir -p "$TMP/se-rec"
-if MEM_STORE="$TMP/se-rec" MEM_DISTILL=1 "$OPENCODE" session-end "$TMP/flowproj" se-rec-sid >/dev/null 2>&1 \
-  && [ ! -f "$TMP/se-rec/memory.db" ]; then
-  ok "opencode session-end no-ops under MEM_DISTILL=1 recursion guard"
-else
-  bad "opencode session-end should no-op under MEM_DISTILL=1"
-fi
+echo "== opencode session end has no memory sync (D-82) =="
 mkdir -p "$TMP/se-sync"
-if MEM_STORE="$TMP/se-sync" "$OPENCODE" session-end "$TMP/flowproj" se-sync-sid >/dev/null 2>&1 \
-  && [ -f "$TMP/se-sync/memory.db" ]; then
-  ok "opencode session-end syncs the memory store"
+if MEM_STORE="$TMP/se-sync" "$OPENCODE" session-end "$TMP/flowproj" se-sync-sid >/dev/null 2>&1; then
+  bad "opencode preflight session-end should no longer exist"
+elif [ ! -f "$TMP/se-sync/memory.db" ] \
+  && ! grep -Fq 'session-end' "$ROOT/adapters/opencode/bin/preflight.sh" \
+  && ! grep -Fq '"session-end"' "$ROOT/adapters/opencode/plugins/hearting-guards.js" \
+  && grep -Fq 'spawnSummary(eventSid, "final")' "$ROOT/adapters/opencode/plugins/hearting-guards.js"; then
+  ok "opencode session.idle keeps summary/pane/heartbeat and runs no memory sync"
 else
-  bad "opencode session-end should sync the memory store"
+  bad "opencode session end must not sync memory"
 fi
 
 echo "== SD-11b stage-dispatch gate (deny 상향 + opt-out + intensity 불명) =="

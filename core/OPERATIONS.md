@@ -857,6 +857,14 @@ remain command-based. Multiple processes on one GPU share that GPU item, and
 registered jobs/runs keep their existing presentation. An expired probe sample
 loses its session GPU items. This read-only projection neither creates a
 resource-run registry entry nor changes the process lifecycle.
+A live GPU process that no working registered resource run (same pid and start,
+or same process group on the Fleet host) and no drawn GPU line (session or
+dispatch job row) shows appears once under its `project_of(cwd)` project card,
+tagged `미등록` (or the owner's `job:`/`run:` label when the probe found owner
+evidence), with its GPU, VRAM, and running time; a process whose cwd cannot be read goes to
+`(unknown)`. The cwd only places the card and is never ownership evidence. The
+row uses the same probe sample, is read-only, adds no registry entry, and
+disappears with an expired sample.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
@@ -892,14 +900,21 @@ both is a resource job whose payload is a `compute-hosts run` invocation.
 
 Registered owner corrections belong to the execution supervisor, through
 `capability-route.py correct --attempt-id <id> --message-file <file>` (omit the
-file to inspect). The exact attempt and its live supervisor lease bind one
-durable input receipt; repeating a request ID returns that receipt. Codex uses
-its existing App Server connection to steer an active turn. CLI transports
-retain the input for the next turn in the same owner. Pending input takes
-precedence over automatic stage advancement and terminal closure. A transport
-receipt proves delivery, not implementation; an interrupted send remains
-unknown and is handed back through the existing supervision notice carrier.
-Old supervisors without this input contract report unsupported before queueing.
+file to inspect). The exact attempt binds one durable input receipt; repeating
+a request ID returns that receipt. Every registered dispatch-depth-1 owner —
+quick and solo as well as standard+ — runs under its harness supervisor, so the
+same command reaches all of them. Registration opens the input channel: a
+correction sent after `--register` and before the first consumer attaches is
+queued and handed to the first turn (a relaunch of a never-claimed row keeps
+that queue). Codex uses its existing App Server connection to steer an active
+turn; Claude and OpenCode retain the input for the next turn of the same
+session. Pending input takes precedence over automatic stage advancement and
+terminal closure. A transport receipt proves delivery, not implementation; an
+interrupted send remains unknown (`delivery-unknown`) and is handed back through
+the existing supervision notice carrier. A host whose supervisor probe does not
+report support runs the owner as the existing one-shot, creates no input state,
+and `correct` reports `owner-input-unsupported` before queueing; an owner
+already running under an older supervisor behaves the same way.
 Corrections preserve route, completion and cleanup evidence; completed-prefix
 reuse uses the existing `continuation` compiler rather than a fresh recipe.
 

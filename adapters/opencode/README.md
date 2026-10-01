@@ -96,7 +96,7 @@ full masking.
 | capability mapping | `adapters/opencode/bin/preflight.sh capability-info <capability>` reports OpenCode's native Skill/command realization and instruction-only or tool-contract status; root Skill compatibility references are not projected and report `compat_reference=not-projected` |
 | model role mapping | `adapters/opencode/bin/preflight.sh role <portable-role>` resolves portable model roles through OpenCode adapter environment variables |
 | mode mapping | `adapters/opencode/bin/preflight.sh mode-info <family/mode>` reports whether a mode is portable, tool-contract, or unsupported for OpenCode; tool-contract and unsupported adapter-coupled modes include machine-readable `tool_contract`, optional `tool_contract_check`, `runtime_surface`, and `fallback` fields |
-| memory sync | Plugin `event`/`session.idle` → detached `preflight session-end` → `mem sync --json`. No automatic distiller (D-78) |
+| memory sync | None at `session.idle` (D-82; `preflight session-end` is removed). `mem.py` exchanges in the background after writes and stale reads; `session.compacted` empties the candidate display history. No automatic distiller (D-78) |
 | memory store | `tools/memory/{mem.py,protocol_v2.py,git_exchange_v2.py,sync_v2.py}` are runtime-neutral |
 | permission model | OpenCode native `permission` config (`allow`/`ask`/`deny` per tool, per-agent override); adapter documents recommended rules, not a harness guard replacement |
 | statusline | OpenCode TUI footer is native; no user shell statusline surface in config schema; harness status signals stay instruction-only/preflight |
@@ -338,6 +338,19 @@ keys are realized node IDs or `__owner__`, values are full schema-v1 demands wit
 both axes, reasons and evidence references. `--explicit-profiles profiles.json`
 uses a matching map and cannot bypass the judgment floor. Custom unit recipes
 provide `profile_demand` on every ad-hoc unit. Missing fields fail closed.
+
+### SD-165 part tokens
+
+`stages [--capability <name>] [--json]` prints the part catalog a graph is
+assembled from: every stage as `capability:stage` with its one-line summary,
+inputs and outputs, `unit_choices`, `shareable`, `start_approval`, optional parts,
+and the parts of other recipes this host can borrow. `compose --graph` accepts a
+host stage id or a shareable `capability:stage` (for example
+`inspect,autopilot-research:retrieval,autopilot-research:synthesis,report`); a
+borrowed part is written under `parts/<capability>/<stage>/` inside the host's own
+artifact scope. Claude reaches both through `adapters/claude/bin/capability-route.py`,
+Codex and OpenCode through `preflight.sh compose|stages`; every surface forwards
+the arguments unmodified and prints the same output.
 
 The five portable profiles are deep, balanced-deep, balanced, light and mini.
 Concrete defaults and generated native agents come from this adapter's

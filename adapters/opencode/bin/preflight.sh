@@ -63,8 +63,7 @@ is_worker_session() {
     || [ "${AGENT_DISPATCH_CHILD:-}" = "1" ] \
     || [ -n "${AGENT_DISPATCH_DEPTH:-}" ] \
     || [ -n "${OPENCODE_DISPATCH_SLUG:-}" ] \
-    || [ "${FLEET_TITLE_REFRESH:-}" = "1" ] \
-    || [ "${MEM_DISTILL:-}" = "1" ]
+    || [ "${FLEET_TITLE_REFRESH:-}" = "1" ]
 }
 
 opencode_config_content_has_opencode_skills() {
@@ -103,6 +102,7 @@ usage() {
   cat <<'EOF'
 usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh read <file> [session-id]
+       preflight.sh stages [--capability <name>] [--json]
        preflight.sh capability <name> [cwd] [session-id]
        preflight.sh skill <name> [cwd] [session-id]
        preflight.sh memory [cwd]
@@ -787,22 +787,21 @@ portable_source=capabilities/autopilot-design.md
 note=OpenCode design capabilities have native Skill/Command guidance and an adapter-owned render/screenshot/console harness. Run it for every design HTML output, then inspect the screenshot before claiming visual completion.
 EOF
     ;;
-  session-end)
-    cwd=${2:-$PWD}
-    sid=${3:-opencode}
-    # D-42 defense in depth: workers never sync from session.idle/session-end.
-    is_worker_session && exit 0
-    (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || true
-    ;;
   role)
     [ "$#" -ge 2 ] || { echo "opencode preflight: role requires a portable role" >&2; exit 64; }
     shift
     "$ROOT/adapters/opencode/bin/role-map.sh" "$@"
     ;;
-  compose|route)
+  compose|route|stages)
     if [ "$1" = "compose" ]; then
       # SD-135: preset-free work route (shape/subgraph); same compiler.
+      # SD-165: `--graph` tokens, including `capability:stage` parts, pass through unmodified.
+      # SD-164: so do `--shape framed` with its hints and `--route-plan <record>#<i>`.
       subcommand=compose
+      shift
+    elif [ "$1" = "stages" ]; then
+      # SD-165: the part catalog a graph is assembled from; same output on every adapter.
+      subcommand=stages
       shift
     else
       if [ "${2:-}" != "--capability" ]; then

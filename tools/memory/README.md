@@ -64,13 +64,14 @@ python3 <agent-home>/tools/memory/mem.py <command>
 |---|---|
 | `add <tier> <type> "<body>" [--headline] [--alias] [--entity] [--topic] [--artifact-ref] …` | Add a record and bounded retrieval capsule after mechanical validation. Repeat capsule-list options as needed. |
 | `note "<body>" [--type] [--requires-consume]` | Shorthand for a working record. Use `--requires-consume` for delivery-bearing threads. |
-| `candidates "<prompt>" --session-id <id> [--turn-id <id>] [--hook]` | Main-prompt mechanical capsule lookup. Exposes at most six active current-project/global headline-and-ID candidates within 2,400 UTF-8 bytes, never bodies, and publishes a same-turn opportunity receipt on a successful probe. |
+| `candidates "<prompt>" --session-id <id> [--turn-id <id>] [--hook]` | Main-prompt mechanical capsule lookup. Exposes at most six active current-project/global headline-and-ID candidates within 2,400 UTF-8 bytes, never bodies, and publishes a same-turn opportunity receipt on a successful probe. A session is shown each record once: the ranked top six is chosen as before and the ones already shown are dropped, so a repeat prompt can print nothing (the receipt is still written). The history is `<runtime-state>/candidate-seen/`, one 0600 file per session hash and project (512 ids, 24 hours), and every failure to read or write it lets the candidate through. `--session-id` empty or a bridge placeholder means no session and no de-duplication. Compact and `/clear` empty the history; resume and start keep it. `MEM_CANDIDATE_BODY=1` (off by default) adds a body of at most 600 characters for one clearly leading new candidate, paid for by half of the bytes the session already saved. |
 | `recall-gate --decision recall\|skip --reason … [--query …]` | Record the work-start opportunity decision without raw prompts; recall executes immediately. Applied outcomes require `--gate-id` and at least one `--record-id`; miss has no record ID. |
 | `recall "<query>" [--topic] [--include-superseded] …` | Search active capsules first, then body/CJK/LIKE compatibility paths. Historical rows require explicit inclusion. |
 | `topics [topic] [--include-superseded]` | List normalized topics or visible records for one exact topic. |
 | `show <id> [--all] [--include-superseded]` | Show one visible record with capsule, temporal metadata, and full body. |
 | `consume <id>` | Move a pending handoff/thread to consumed. Retrieval and injection never consume records implicitly. |
 | `restore <id>` | Restore one record from the graveyard while preserving action/canonical metadata. |
+| `history <id> [--show N \| --restore N]` | A `--source` write with a different body replaces the record's body in place (same ID); the replaced body, headline, tags and metadata are kept in the local, append-only `<STORE>/source-history.jsonl` (mode 0600, not part of the dump or the exchange; rotated to `source-history.<timestamp>.jsonl` past 1 MiB, never trimmed). `history <id>` lists them newest first, `--show N` prints one, `--restore N` writes it back — that write keeps the body it displaces, so the change can be undone the same way. A repeated identical body keeps nothing. Only global records and the current project's own are visible. |
 | `index [--rebuild]` | Rebuild the FTS5 tables embedded in `memory.db`. |
 | `export [--target dump\|profile] [--apply]` | Export `dump.jsonl` or an on-demand human-readable profile cache. Profile export is dry-run unless `--apply` is supplied. |
 | `import <dump.jsonl>` | Compatibility import of the materialized v1 view. It cannot recreate v2 frontiers/conflicts/tombstones/quarantine or peer/outbox state, so normal and recovery imports both refuse once any v2 protocol state exists. |
@@ -82,8 +83,8 @@ python3 <agent-home>/tools/memory/mem.py <command>
 | `stats` | Print a grouped store snapshot. |
 | `log [--limit 20] [--action] [--tier] [--actor] [--json]` | Read the bounded write-event timeline (D-38), complementing the `stats` snapshot. |
 | `doctor` | Run bounded read-only local and v2 protocol checks covering integrity, schema/index invariants, pending/capacity/graveyard/dump consistency, outbox/peer/migration state, and worker health. Exit 0 is clean, 1 is WARN, and 2 is FAIL. |
-| `inject [--hook]` | Build bounded SessionStart context from working, durable, and profile records. Defaults to 2,000 characters and 15 bullets; `--hook` emits `additionalContext` JSON. |
-| `sync [--json]` | Run lifecycle maintenance, rebuild indexes, and write the compatibility projection. Does not absorb built-in file memory (D-79). With remote sync explicitly enabled, finalize/render/fetch/validate/integrate/fold/export/push/fresh-confirm immutable operations. `--json` emits the versioned status and phase outcomes described below. |
+| `inject [--hook]` | Build bounded SessionStart context from working, durable, and profile records. Defaults to 2,000 characters and 15 bullets; `--hook` emits `additionalContext` JSON and reads the SessionStart hook JSON on stdin without waiting for it: `source` `compact` or `clear` empties that session's candidate history. |
+| `sync [--json]` | Explicit full maintenance (nothing runs it at session end): lifecycle maintenance, index rebuild, and the compatibility projection. Does not absorb built-in file memory (D-79). With remote sync explicitly enabled, finalize/render/fetch/validate/integrate/fold/export/push/fresh-confirm immutable operations. `--json` emits the versioned status and phase outcomes described below. |
 | `conflicts` | List bounded unresolved conflict identities without adopting a provisional body. |
 | `show-conflict <id>` | Show every full concurrent variant with explicit labels. |
 | `resolve <id> …` | Create a new agent-authored operation that descends every current maximal head; field-wise automatic semantic merge is forbidden. |
@@ -101,6 +102,8 @@ python3 <agent-home>/tools/memory/mem.py <command>
 | `reattribute <id>` | Reassign a true orphan to the current project without deleting it. Reverse gates reject live, global, profile, or self targets. |
 | `supersede <old> --by <new>` | Preserve the older row as historical and route its canonical id to the newer active record. Cross-scope/project, pending, profile, and cycle cases fail closed. |
 | `activate <id>` | Guardedly reactivate a historical row only when its successor is no longer active and no canonical ambiguity exists. |
+| `tidy-apply <actions.json> [--input <input_v1.json>] [--cwd DIR]` | Apply a session-tidy action list through a closed set (add, supersede, reinforce; no delete, graveyard unchanged), after recording answered-question decisions. Prints a final `[tidy] 묶음 <id>: …` line with the undo command. Exit 0 applied, 1 partial, 2 input/state error. |
+| `tidy-undo <batch-id>` | Reverse one tidy batch from its journal; refuses without changing anything if a touched record changed after the batch. |
 | `register-postit <path>` | Deprecated legacy-migration-only registry command. Current post-its write DB working records directly. |
 
 ## Existing-store migration
@@ -165,6 +168,41 @@ persistent old-writer triggers only from DB-issued closed rollback evidence.
 The terminal state deliberately remains `writer_mode=fenced`: a verified old
 v1 binary without the v2 guard can resume after trigger removal, while this v2
 binary remains fail-closed until a new checked cutover.
+
+## Background exchange
+
+Nothing in memory runs when a session ends (D-82). Instead one background
+exchange does the pull, fold, push, dump export and local dump commit, and
+working-expiry, without a migrate, a full index rebuild or a duplicate scan:
+
+- **After a write.** A successful mutation records that the store is dirty and
+  schedules the exchange after a 20-second batching window. Several writes in
+  the window share one run; a write during a run asks for at most one follow-up.
+  Every role's writes count.
+- **On a stale read.** `inject`, `candidates` and `recall` in a main session
+  schedule an exchange when the remote is enabled and the last successful
+  receive is older than ten minutes (`MEM_SYNC_READ_INTERVAL_SECONDS`). The read
+  itself uses the local snapshot and never waits; the received records appear
+  from the next read. Worker sessions never start this.
+- **Remote off.** The run stops at the dump export and its local git commit and
+  makes no remote call.
+- **Failure.** The run keeps its reason in the state file and the next
+  foreground `mem` command prints one line about it, once; the same reason is
+  not repeated within six hours. Unsent changes retry on the next write or read.
+  Write and read exit codes never change.
+- **Emergency switch.** `MEM_EXCHANGE_AUTO=0` turns both triggers off;
+  `mem sync` still works.
+- **Files** at the top of the store, all mode 0600: `.exchange-state.json`,
+  `.exchange-run.lock` (one run per store) and `.exchange-schedule.lock`. They are
+  local state, never exchanged; `.sync-v2.lock` is separate. A store that is its
+  own git repository may list them, and `source-history*.jsonl`, in `.gitignore`.
+
+`replay-candidates.py --db <copy> (--prompts <file> | --transcript <jsonl>)`
+measures the candidate probe on a copy of a database: it replays one prompt
+sequence as (a) today's behaviour, (b) de-duplication only and (c) de-duplication
+plus the short body, and prints calls, injected bytes, distinct ids and the most
+repeated id per variant. Prompts stay in memory; only query hashes are printed.
+The short body should be switched on only when (c) injects no more than (b).
 
 ## Protocol-v2 synchronization
 
@@ -308,8 +346,14 @@ store; `harness memory status` reports the recorded policy.
   `MEM_INJECT_CLEANUP_LINES`, and `MEM_INJECT_SNIPPET_CHARS` tune bounded
   injection budgets. Defaults are 2,000 characters, 15 bullets, 8 working,
   4 durable, 2 cleanup lines, and 100 characters per snippet.
-- `MEM_DISTILL=1` remains a recognized D-42 worker marker for compatibility,
-  even though there is no automatic distiller to guard against (D-78).
+- `MEM_DISTILL=1` is only an actor label in `mem.py` and a Fleet/peer
+  classification now; no hook tests it (there is no distiller, D-78).
+- `MEM_EXCHANGE_AUTO=0` turns the automatic background exchange off (an emergency
+  switch). `MEM_SYNC_READ_INTERVAL_SECONDS` sets the read trigger's ten-minute
+  interval. `MEM_EXCHANGE_WINDOW_SECONDS` (default 20) is the batching window, for
+  tests. `MEM_CANDIDATE_BODY=1` enables the short candidate body (off by default).
+  `MEM_CANDIDATE_SEEN` moves the candidate history; `MEM_CANDIDATE_DEDUP=0`
+  disables it and exists only for the replay measurement.
 - `MEM_WRITE_EVENTS`, `MEM_ACTOR`, and `MEM_SID` override telemetry metadata.
 - `mem-recall-inject.sh` is the fail-open prompt bridge for `mem candidates`.
   It exposes only active current-project/global capsule headlines and IDs (at
@@ -332,8 +376,9 @@ store; `harness memory status` reports the recorded policy.
   exact v2 recovery requires protected immutable objects plus a consistent
   local backup or a separate lossless v2 bundle.
 - SessionStart injection may remain adapter opt-in when start events repeat on
-  resume or compact. SessionEnd uses `mem sync`; adapters pass the user's remote
-  opt-in environment unchanged and report the sync exit class plainly.
+  resume or compact. Nothing runs at SessionEnd; the background exchange above
+  covers writes and reads, and adapters pass the user's remote opt-in
+  environment unchanged.
 - `recall.sh` is a thin wrapper over explicit `mem recall`.
 - `register-postit` and `.postit-roots` exist only for legacy Markdown migration.
 

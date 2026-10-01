@@ -721,7 +721,8 @@ def main():
   worker_type=worker_type_for_kind(node["kind"])
  except ValueError as e:
   raise SystemExit(str(e))
- contract=assigned_contract(capability=route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)
+ # SD-165: a borrowed part reads its origin capability's contract; the route binding stays the host's.
+ contract=assigned_contract(capability=(node.get("part") or "").partition(":")[0] or route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)
  try:
   original_task=replacement_task(a,route,node,registry.path)
  except DispatchContractError as exc:

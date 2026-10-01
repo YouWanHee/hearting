@@ -16,7 +16,7 @@ This capability fills the gap between research, specification, and production co
 | **`autopilot-lab`** | Prototype a training setup or evaluate a checkpoint | `experiments/` |
 | `autopilot-code` | Refine, productionize, or package code | `plans/` |
 
-Heavy training and evaluation run in the user's compute environment, cluster, GPU queue, or scheduler. `autopilot-lab` prepares commands and scaffolds before the run, then analyzes and records results after the run. Do not claim that remote compute was executed unless the user explicitly places an executable environment in scope and the normal approval contract permits it.
+Heavy training and evaluation use the selected compute environment, cluster, GPU queue, or scheduler. At route start, the card obtains approval for any included `full-run` part. Execute it only in the environment included in that scope; otherwise provide the command and leave the part out for a later compose. Never infer access to a remote environment from approval to run training.
 
 ## Reference Index
 
@@ -25,8 +25,8 @@ Heavy training and evaluation run in the user's compute environment, cluster, GP
 | `auto-load-context.md` | Every invocation, Step 0 (required) | Context loading from project conventions, optional user-profile conventions, `_RUNLOG`, parent or prior experiments, similar models, and readiness checks |
 | `data-contract.md` | When writing machine-readable logs, `run.json`, dispatch data, or `report/` | Append-only `metrics.jsonl`, lifecycle manifest, parent-lineage source of truth, terminal dispatch event, and iframe report contract |
 | `config-provenance.md` | Before a full run or when reviewing config lineage | Resolution, sealing, manifest verification, smoke binding, and promotion handoff |
-| `setup-procedure.md` | `--mode setup` or auto→setup | S1 spec and review, S2 scaffold and logger, S3 run guidance, `_RUNLOG` pending state, `run.json` birth record, and smoke/debug options |
-| `eval-procedure.md` | `--mode eval` or auto→eval | E1 eval spec, E2 execution guidance, E3 analysis, figures, paper comparison, `REPORT.md`, `STORY.md`, `_RUNLOG` completion, `run.json` finalization, and dispatch event |
+| `setup-procedure.md` | `--mode setup` or auto→setup | S1 spec and review, S2 scaffold and logger, S3 run guidance, `_RUNLOG` pending state, `run.json` birth record, and smoke/debug options; its step table maps S1–S3 to part ids (`capability-route.py stages --capability autopilot-lab` is the stage list) |
+| `eval-procedure.md` | `--mode eval` or auto→eval | E1 eval spec, E2 execution guidance, E3 analysis, figures, paper comparison, `REPORT.md`, `STORY.md`, `_RUNLOG` completion, `run.json` finalization, and dispatch event; its step table maps E1–E3 to part ids, including the optional `eval-spec`, `eval-smoke`, and `diagnose` parts |
 | `outputs-and-examples.md` | When resolving output layout, graduation, handoff, return format, or examples | Supported experiment layouts, `pipeline_state.yaml`, graduation to spec/code, optional continuity notes, return format, and worked examples |
 
 ## Workflow Position
@@ -40,7 +40,7 @@ experiment readiness check
                   ↓
 optional reproducibility blueprint: autopilot-spec --mode research,cli
                   ↓
-autopilot-lab: setup → [user runs training] → eval
+autopilot-lab: setup → [approved full-run part] → eval
                   ↓
 graduate reusable code or winning configuration through autopilot-code
 ```
@@ -60,7 +60,7 @@ Keep orchestration in the parent session and edits or setup in the worktree. Res
 
 ## Experiment Lifecycle
 
-One experiment normally uses two invocations: **setup** → user-run training → **eval**. Together they fill one `_RUNLOG` entry.
+One experiment normally uses setup and eval invocations. When `full-run` is included in the start-approved setup route, its supervised run and verification fill the same `_RUNLOG` entry; otherwise compose that part separately after approval.
 
 | Mode | When | Work | Output/state |
 |---|---|---|---|
@@ -107,7 +107,7 @@ Follow an explicit artifact or audience language when provided. Otherwise, use t
 ### `--mode`
 
 - `auto`: infer `setup` or `eval` from the request and available artifacts
-- `setup`: define and scaffold a training experiment; the user runs heavy training
+- `setup`: define and scaffold a training experiment; run `full-run` only when its part is included in the start-approved scope
 - `eval`: evaluate and analyze a completed checkpoint, then summarize the result
 
 ### `--parent <slug>`

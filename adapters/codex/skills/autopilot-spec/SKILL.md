@@ -1,6 +1,6 @@
 ---
 name: autopilot-spec
-description: "Use when product requirements, architecture, evaluation policy, or another blueprint must be created or materially updated before implementation. Not for implementing an already-approved specification or for editing unrelated documents."
+description: "Use when product requirements, architecture, evaluation policy, or another blueprint must be created or materially updated before implementation. Owns specification; default preset. Not for implementing an already-approved specification or for editing unrelated documents."
 ---
 
 # autopilot-spec

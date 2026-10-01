@@ -238,6 +238,8 @@ class TestRoute(unittest.TestCase):
    R.compile_route(**self.args(predicates=[],transport="interactive",inline_reason=None,registered_headless_evidence=self.registered_headless()))
  def test_every_recipe_mode_has_one_registered_headless_quick_owner(self):
   for recipe in R.TOPO.load_registry()["recipes"]:
+   if recipe["capability"]==R.ROUTE_FRAME_CAPABILITY:
+    continue  # compiler-internal: reached only through `compose --shape framed`, never as a preset
    for mode in recipe["modes"]:
     with self.subTest(capability=recipe["capability"],mode=mode):
      route=R.compile_route(
@@ -289,6 +291,8 @@ class TestRoute(unittest.TestCase):
   evidence=self.dispatch(self.nested())
   compiled=0
   for recipe in registry["recipes"]:
+   if recipe["capability"]==R.ROUTE_FRAME_CAPABILITY:
+    continue  # compiler-internal: owner-less by design, covered by framed_route.test.py
    expected_owner_ids=[
     node["id"] for node in recipe["standard_plus"]["nodes"]
     if node.get("kind")=="capability-owner" and node.get("unit")=="_kernel/owner"
@@ -449,7 +453,7 @@ class TestRoute(unittest.TestCase):
    self.assertNotIn("fallback_hops",leg)
    self.assertEqual((leg["unit"],leg["dispatch_depth"],leg["worker_type"]),("plan/frame",1,"frame"))
    self.assertEqual(leg["launch_authority"],"depth-0")
-  self.assertNotEqual(frame["model_profile"],frame_replica["model_profile"])
+  self.assertEqual((frame["model_profile"],frame_replica["model_profile"]),("top","top"))
   self.assertEqual(frame["outputs"],["shards/frame/direction-brief.md"])
   self.assertEqual(frame["write_scope"],["shards/frame/**"])
   self.assertEqual(frame_replica["outputs"],["shards/frame-alternative/direction-brief.md"])
@@ -6559,7 +6563,9 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(omitted["capability_mode"],"default")
   self.assertEqual(omitted["nodes"],explicit["nodes"])
   self.assertEqual([n["id"] for n in omitted["nodes"]],["release-setup","security-review","release-review","deploy","post-deploy-verify"])
-  self.assertEqual(omitted["human_gates"],["deploy-authorization"])
+  self.assertEqual(omitted["human_gates"],[])
+  self.assertEqual(omitted["human_gate_bindings"],[])
+  self.assertIn("시작 승인 deploy (autopilot-ship:deploy)",R.compose_card(omitted))
   R.verify_route(omitted,R.ROOT)
  def test_ship_package_cannot_select_deployment_nodes(self):
   with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node:deploy"):
@@ -6797,6 +6803,12 @@ class ComposeRouteTest(TestRoute):
   plan_node=next(n for n in block["nodes"] if n["id"]=="plan")
   self.assertIn("frame-review",plan_node["human_gates"])
   self.assertTrue(next(n for n in block["nodes"] if n["id"]=="report")["terminal"])
+  # SD-165: every stage is a part `capability:stage` with its catalog fields
+  self.assertEqual(execute_node["part"],"autopilot-code:execute")
+  self.assertFalse(execute_node["shareable"]); self.assertFalse(execute_node["optional"])
+  self.assertIsNone(execute_node["start_approval"]); self.assertTrue(execute_node["summary"])
+  self.assertEqual(execute_node["inputs"],["plan.md","checklist.md"])
+  self.assertIn("autopilot-research:synthesis",[n["part"] for n in block["borrowable"]])
   # every-capability form and the text rendering both work too
   result_all=subprocess.run([sys.executable,str(P),"stages"],text=True,capture_output=True,env=env)
   self.assertEqual(result_all.returncode,0,result_all.stderr)
@@ -6900,6 +6912,132 @@ class ShipPackageOwnerCompletionTest(OwnerRegisteredCompletionTest):
  def fixture(self, **overrides):
   return super().fixture(capability="autopilot-ship",capability_mode="package",
    node_id="package",**overrides)
+
+
+class OwnerNodeBoundTerminalTest(unittest.TestCase):
+ """A one-shot owner row sealed by `route_*` fields still proves its terminal.
+
+ The supervisor may close the registered row (`completed-supervisor`) before
+ the marker writer runs. The no-marker reader then has only the row and its
+ exact handoff, so it must read the node-bound shape as well as `owner_route_*`.
+ """
+
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+  self.base=Path(self.tmp.name)
+  self.work=self.base/"work"; self.work.mkdir()
+  self.artifacts=self.base/"artifacts"; self.artifacts.mkdir()
+  self.jobs=self.base/"state"/"jobs.log"; self.jobs.parent.mkdir()
+  previous=os.environ.get("AGENT_ARTIFACT_ROOT")
+  os.environ["AGENT_ARTIFACT_ROOT"]=str(self.artifacts)
+  self.addCleanup(lambda: os.environ.pop("AGENT_ARTIFACT_ROOT",None) if previous is None
+                  else os.environ.__setitem__("AGENT_ARTIFACT_ROOT",previous))
+  self.route=R.compile_route(
+   "autopilot-code","dev","quick",self.work,self.artifacts,
+   predicates=[],transport=None,tracking="tracked",
+   tracked_gate_evidence={"spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+    "drift_verdict":"within-spec","workflow_mode":"tracked",
+    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"}},
+   registered_headless_evidence={"candidates":[
+    {"harness":harness,"transport":"headless","surface":"registered-headless",
+     "status":"supported","probe_source":"fixture-probe","probe_time":"2026-07-20T00:00:00Z"}
+    for harness in ("codex","claude")]})
+  self.node=next(n for n in self.route["nodes"] if n["id"]=="one-shot")
+  self.route_file=R.canonical_route_path(self.artifacts,self.route["route_id"])
+  self.route_file.parent.mkdir(parents=True); self.route_file.write_text(json.dumps(self.route))
+  self.evidence=self.artifacts/"report.md"; self.evidence.write_text("검증 완료\n")
+
+ def log(self,harness,name="owner.log"):
+  handoff=f"artifact: {self.evidence}\nverdict: PASS\nblocker: none"
+  if harness=="claude":
+   rows=[{"type":"result","subtype":"success","is_error":False,"result":handoff}]
+  else:
+   rows=[{"type":"item.completed","item":{"type":"agent_message","text":handoff}},
+         {"type":"turn.completed"}]
+  path=self.base/name
+  path.write_text("".join(json.dumps(row)+"\n" for row in rows)); return path
+
+ def row(self,harness="claude",attempt="att-node-bound",**overrides):
+  """One done owner row that carries no `owner_route_*` key."""
+  meta={"attempt_id":attempt,"worker_type":"owner","unit":"_kernel/owner","dispatch_depth":"1",
+   "registered_worker":"1","harness":harness,"route_file":str(self.route_file),
+   "route_id":self.route["route_id"],"route_hash":self.route["route_hash"],"route_node":"one-shot",
+   "workflow_completion":"runtime-v1","note":"completed-supervisor","failure_class":"pass",
+   "log_file":str(self.log(harness,f"{attempt}.log")),"artifact_root":str(self.artifacts),
+   "pid":"2147483647","pid_start":"1"}
+  meta.update(overrides)
+  return "\t".join(["2026-09-30T00:00:00Z","done",str(self.work),str(self.work),"owner",
+   ",".join(k+"="+v for k,v in meta.items() if v is not None)])
+
+ def observe(self,*rows,route=None):
+  self.jobs.write_text("".join(r+"\n" for r in rows))
+  route=route or self.route
+  with mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
+       mock.patch.object(R,"owner_terminal_prerequisites",return_value={}):
+   return R.terminal_gate_observation(route,jobs=self.jobs,exact_terminal=True)["one-shot"]
+
+ def assertProven(self,gate,attempt):
+  self.assertTrue(gate["passed"],gate)
+  self.assertEqual(gate["source"],"owner-terminal")
+  self.assertEqual(gate["attempt_id"],attempt)
+  self.assertEqual(gate["evidence"],str(self.evidence))
+  self.assertEqual(gate["reason"],"owner-terminal-verified")
+
+ def test_node_bound_owner_passes_without_a_marker_for_both_harnesses(self):
+  for harness in ("claude","codex"):
+   with self.subTest(harness=harness):
+    marker=R.completion_dir(self.route["route_id"],jobs=self.jobs)/"one-shot.json"
+    self.assertFalse(marker.exists())
+    self.assertProven(self.observe(self.row(harness,f"att-{harness}")),f"att-{harness}")
+
+ def test_owner_route_row_still_passes(self):
+  owner=self.row(attempt="att-owner-route",route_id=None,route_hash=None,route_node=None,
+   owner_route_id=self.route["route_id"],owner_route_hash=self.route["route_hash"],
+   owner_route_file=str(self.route_file))
+  self.assertProven(self.observe(owner),"att-owner-route")
+
+ def test_foreign_route_or_node_rows_are_never_the_proof(self):
+  good=self.row(attempt="att-good")
+  foreign=(self.row(attempt="att-other-route",route_id="rt-0000000000000000"),
+           self.row(attempt="att-other-hash",route_hash="sha256:"+"0"*64),
+           self.row(attempt="att-other-node",route_node="frame"))
+  for row in foreign:
+   with self.subTest(order="after",row=row.split("attempt_id=")[1].split(",")[0]):
+    self.assertProven(self.observe(good,row),"att-good")
+   with self.subTest(order="before",row=row.split("attempt_id=")[1].split(",")[0]):
+    self.assertProven(self.observe(row,good),"att-good")
+   with self.subTest(order="only",row=row.split("attempt_id=")[1].split(",")[0]):
+    gate=self.observe(row)
+    self.assertFalse(gate["passed"],gate)
+    self.assertEqual(gate["reason"],"owner-attempt-absent")
+
+ def test_incomplete_owner_binding_does_not_use_the_node_bound_path(self):
+  half=self.row(attempt="att-half",owner_route_id=self.route["route_id"],
+                owner_route_hash=self.route["route_hash"])
+  gate=self.observe(half)
+  self.assertFalse(gate["passed"],gate)
+  self.assertIn(gate["reason"],("owner-route-identity-mismatch","owner-terminal-evidence-unverified"))
+
+ def test_node_bound_owner_needs_a_quick_route(self):
+  gate=self.observe(self.row(),route=dict(self.route,effective_intensity="standard"))
+  self.assertFalse(gate["passed"],gate)
+  self.assertEqual(gate["reason"],"owner-route-identity-mismatch")
+
+ def test_node_bound_owner_needs_this_routes_file(self):
+  other=self.artifacts/".runtime"/"routes"/"rt-elsewhere.json"; other.write_text("{}")
+  gate=self.observe(self.row(route_file=str(other)))
+  self.assertFalse(gate["passed"],gate)
+  self.assertEqual(gate["reason"],"owner-route-identity-mismatch")
+
+ def test_owner_route_row_advanced_to_another_route_still_mismatches(self):
+  owner=self.row(attempt="att-advanced",route_id=None,route_hash=None,route_node=None,
+   owner_route_id=self.route["route_id"],owner_route_hash=self.route["route_hash"],
+   owner_route_file=str(self.route_file))
+  moved=mock.Mock(route_id="rt-0000000000000000",route_hash="sha256:"+"0"*64)
+  with mock.patch("owner_route_binding.resolve_owner_route_lifecycle",return_value=(moved,"advanced")):
+   gate=self.observe(owner)
+  self.assertFalse(gate["passed"],gate)
+  self.assertEqual(gate["reason"],"owner-route-identity-mismatch")
 
 
 class ExactFenceFailureModeTest(unittest.TestCase):
@@ -7098,6 +7236,8 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   registry=R.TOPO.load_registry()
   framed=[]
   for recipe in registry["recipes"]:
+   if recipe["capability"]==R.ROUTE_FRAME_CAPABILITY:
+    continue  # compiler-internal: no quick shape
    route=self.quick(capability=recipe["capability"],capability_mode=recipe["modes"][0])
    R.verify_route(route,R.ROOT)
    frames=[n["id"] for n in route["nodes"] if n.get("worker_type")=="frame"]
@@ -7212,7 +7352,7 @@ class FrameBootstrapLayerTest(unittest.TestCase):
      self.assertNotIn("harness_affinity",leg)
      self.assertNotIn("parallel_group",leg)
      self.assertNotIn(leg["id"],[group["id"] for group in route["parallel_groups"]])
-    self.assertNotEqual(legs[0]["model_profile"],legs[1]["model_profile"])
+    self.assertEqual([leg["model_profile"] for leg in legs],["top","top"])
     work=[node for node in route["nodes"] if node["id"] not in self.FRAME_IDS]
     self.assertEqual(work[0]["depends_on"],["frame","frame-alternative"])
     # membership, not position: refine also binds its preview approval
@@ -7312,7 +7452,7 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   self.assertGreater(disagreeing,0,
    "the static placeholders match the ladder, so this test cannot prove the stamp happens")
 
-  # standard+: owner is `deep` at every intensity, so anchor `top` / other `deep`
+  # standard+: both frame perspectives use top at every intensity.
   for capability,mode in self.FRAME_CAPABILITIES:
    with self.subTest(capability=capability):
     route=self.standard(capability=capability,mode=mode)
@@ -7322,14 +7462,14 @@ class FrameBootstrapLayerTest(unittest.TestCase):
     self.assertEqual(by_id["frame-alternative"]["model_profile"],rungs["others"])
     R.verify_route(route,R.ROOT)
 
-  # quick: owner is `balanced-deep`, so both legs land on `deep`
+  # quick: owner is `balanced-deep`, so both legs still land on top.
   route=self.quick()
   rungs=ladder[route["owner_model_profile"]]
   by_id={n["id"]:n for n in route["nodes"]}
   self.assertEqual(route["owner_model_profile"],"balanced-deep")
   self.assertEqual(by_id["frame"]["model_profile"],rungs["anchor"])
   self.assertEqual(by_id["frame-alternative"]["model_profile"],rungs["others"])
-  self.assertEqual((rungs["anchor"],rungs["others"]),("deep","deep"))
+  self.assertEqual((rungs["anchor"],rungs["others"]),("top","top"))
   R.verify_route(route,R.ROOT)
 
  def test_a_top_anchor_carries_a_real_demand_rather_than_an_unsealed_label(self):
@@ -7345,10 +7485,10 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   self.assertEqual(anchor["profile_selection"]["source"],"explicit")
   self.assertEqual(anchor["profile_selection"]["reason"],"explicit-top-exception")
   self.assertEqual(anchor["profile_demand"],R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
-  # the sibling leg stays portable and needs no demand of its own
+  # the sibling leg has its own sealed top demand
   other=next(n for n in route["nodes"] if n["id"]=="frame-alternative")
-  self.assertEqual(other["model_profile"],"deep")
-  self.assertIsNone(other["profile_demand"])
+  self.assertEqual(other["model_profile"],"top")
+  self.assertEqual(other["profile_demand"],R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
   R.verify_route(route,R.ROOT)
 
  def test_the_owners_own_demand_is_reused_when_the_caller_supplied_one(self):

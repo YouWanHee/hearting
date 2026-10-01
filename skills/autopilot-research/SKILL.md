@@ -1,7 +1,7 @@
 ---
 # GENERATED METADATA — edit harness-manifest.json, then run tools/generate.py.
 name: autopilot-research
-description: "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence."
+description: "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Owns research; default preset. Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence."
 argument-hint: "<query> [--mode academic|technology|market] [--depth shallow|medium|deep] [--intensity direct|quick|standard|strong|thorough|adversarial] [--no-clarify] [--no-figures] [--from search|analyze|report]"
 metadata:
   group: entry
@@ -9,7 +9,7 @@ metadata:
   invocation_class: entry-router
   modes: ["academic", "technology", "market"]
   blurb: "Shared upfront research that surveys academic, technology, or market sources before downstream routing."
-  use_when: "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production."
+  use_when: "Use when a task needs a durable survey of new academic, technology, or market evidence before downstream specification or production. Owns research; default preset."
   not_for: "Not for repository-only project analysis, a simple factual lookup, or work already grounded by sufficient current evidence."
 ---
 

@@ -50,6 +50,8 @@ ROUND_CAPPED_NODE_IDS = frozenset({
     "claim-verify", "critic-review", "fact-verify", "impl-review", "independent-verify",
     "inspect", "plan-check", "post-deploy-verify", "qa", "quality-review", "release-review",
     "review", "run-verify", "security-review", "smoke", "strategy-review", "verify",
+    # Optional review-worker parts in the stage catalog are dispatchable too.
+    "diagnose", "eval-smoke",
     "visual-verify",
     # Declared exception: kind is pipeline-stage, but `test` is the QA anchor
     # C-14 named. Every other exception must be explicit here too.

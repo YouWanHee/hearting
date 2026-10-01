@@ -46,11 +46,11 @@ need adapters/opencode/skills/autopilot-lab/SKILL.md 'capabilities/autopilot-lab
 need adapters/codex/skills/autopilot-refine/SKILL.md 'capabilities/autopilot-refine.md' 'Codex refine projection 에 owner pointer 존재'
 
 # 4. adapter bootstraps
-need adapters/claude/CLAUDE.md  'core/WORKFLOW.md §0.2'            'Claude bootstrap semantic routing 실현'
+need adapters/claude/CLAUDE.md 'new non-direct work defaults to .framed.' 'Claude bootstrap semantic routing 실현 (+ framed 기본)'
 need adapters/claude/CLAUDE.md  'headless worker dispatch'         'Claude bootstrap delegation-surface 실현'
-need adapters/codex/AGENTS.md   'core/WORKFLOW.md §0.2'            'Codex bootstrap semantic routing 실현'
+need adapters/codex/AGENTS.md 'new non-direct work defaults to .framed.' 'Codex bootstrap semantic routing 실현 (+ framed 기본)'
 need adapters/codex/AGENTS.md   'never silently extends'           'Codex bootstrap delegation-surface 실현'
-need adapters/opencode/AGENTS.md 'core/WORKFLOW.md §0.2'           'OpenCode bootstrap semantic routing 실현'
+need adapters/opencode/AGENTS.md 'new non-direct work defaults to .framed.' 'OpenCode bootstrap semantic routing 실현 (+ framed 기본)'
 
 # 5. Claude skill realization
 need skills/autopilot-lab/SKILL.md 'core/WORKFLOW.md §0.2'         'lab SKILL semantic routing 참조'

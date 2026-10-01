@@ -1,6 +1,6 @@
 ---
 name: autopilot-ship
-description: "Use when preparing deployment/release or a delivery archive (package mode). Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
+description: "Use when preparing deployment/release or a delivery archive (package mode). Owns release; default preset. Not for code, new inference/evaluation, report rewriting, or unauthorized deployment; package mode does not run the deployment/review loop."
 metadata:
   portable_source: capabilities/autopilot-ship.md
   adapter: opencode

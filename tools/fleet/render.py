@@ -40,6 +40,7 @@ import time
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
+from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump
 from .session_handle import display_name as _display_name
 from .session_handle import _cell_width as _session_handle_cell_width
@@ -3417,6 +3418,8 @@ def _visible_group_jobs(jobs, show_sessions, show_jobs):
 
 def _group_activity_rank(g):
     members_live = [s.liveness for s in g["sessions"]] + [j.liveness for j in g["jobs"]]
+    if g.get("gpu"):
+        members_live.append("working")
     if "working" in members_live:
         return 0
     elif "idle" in members_live:
@@ -4613,14 +4616,25 @@ def _gpu_process_rows(gpu, indent, width):
     return rows
 
 
+def _fresh_compute_hosts():
+    """`(snapshot, age_s)` of the cached host sample, or `(None, None)` once stale.
+
+    The refresh pump retains its last good host sample during a stall.
+    That sample no longer proves the process is still running.
+    """
+    if _COMPUTE_HOSTS is None or _COMPUTE_HOSTS_SET_AT is None:
+        return None, None
+    age = time.monotonic() - _COMPUTE_HOSTS_SET_AT
+    if age > 3 * _COMPUTE_HOST_INTERVAL:
+        return None, None
+    return _COMPUTE_HOSTS, max(0.0, age)
+
+
 def _gpu_session_resources(snapshot=None):
     """Exact full-session-id GPU relations, normalized once for every Fleet view."""
     if snapshot is None:
-        snapshot = _COMPUTE_HOSTS
-        # The refresh pump retains its last good host sample during a stall.
-        # That sample no longer proves the process is still running.
-        if (_COMPUTE_HOSTS_SET_AT is None or
-                time.monotonic() - _COMPUTE_HOSTS_SET_AT > 3 * _COMPUTE_HOST_INTERVAL):
+        snapshot, _age = _fresh_compute_hosts()
+        if snapshot is None:
             return {}
     if not isinstance(snapshot, dict):
         return {}
@@ -4729,6 +4743,40 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
     if sum(_dw(text) for text, _key in build(resources, False, False)) <= width:
         return [fit(resources)]
     return [fit([resource]) for resource in resources]
+
+
+_GPU_WORK_NAME_W = 48
+
+
+def _gpu_work_row(entry, term_width=None):
+    """F-104 card row for a live GPU process no run registry or session line shows."""
+    indent = _conn_indent(0, False)
+    width = max(20, int(term_width or 200))
+    command = _gpu_safe_text(entry.get("command"))
+    if command:
+        name = _gpu_process_label(command)
+    else:
+        name = os.path.basename(_gpu_safe_text(entry.get("process_name"))) or "process"
+    name = _clip_w(name, _GPU_WORK_NAME_W)
+    indexes = ",".join(str(i) for i in entry.get("gpu_indexes") or ())
+    identity = "GPU %s:%s" % (_gpu_safe_text(entry.get("host") or "?"), indexes)
+    elapsed = entry.get("elapsed_s")
+    tag = _gpu_safe_text(entry.get("owner_label")) or "미등록"
+
+    def build(show_time, show_tag):
+        pulse_key = "g_work" if _BLINK_ON else "g_work_off"
+        segs = [(indent, None), ("●", pulse_key), (" ", None), (identity, "name_dim"),
+                (" · ", "dim"), (name, "name_dim")]
+        if entry.get("used_memory_mib") is not None:
+            segs += [(" · " + _gpu_gib(entry["used_memory_mib"]) + " GB", "dim")]
+        if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
+            segs += [(" · " + fmt_min(elapsed // 60), "dim")]
+        if show_tag:
+            segs += [(" · ", "dim"), (tag, "lvl_y")]
+        return segs
+
+    return _fit_strip([lambda: build(True, True), lambda: build(True, False),
+                       lambda: build(False, False)], width)
 
 
 def _gpu_process_label(command):
@@ -5895,30 +5943,251 @@ def _resource_rows(resources, section):
     return rows
 
 
-def _group_emission(g, show_sessions, show_jobs):
+def _shown_group_sessions(group_sessions):
+    return (group_sessions if _SHOW_ALL else
+            [s for s in group_sessions if session_parent_visible(s)])
+
+
+def _classify_group_jobs(name, group_jobs, shown):
+    """Where each emitted dispatch job of a group is drawn (pure, no drawing).
+
+    The group loop draws exactly this classification, and `_drawn_group_jobs` derives the
+    F-104 dedup keys from the same result, so the two can never disagree.
+    """
+    shown_sids = set(s.session_id for s in shown if s.session_id)
+    shown_cwds = {}
+    ambiguous_cwds = set()
+    for s in shown:
+        if not s.cwd or not s.session_id:
+            continue
+        key_cwd = os.path.realpath(s.cwd)
+        if key_cwd in shown_cwds:
+            ambiguous_cwds.add(key_cwd)
+        else:
+            shown_cwds[key_cwd] = s.session_id
+    for key_cwd in ambiguous_cwds:
+        shown_cwds.pop(key_cwd, None)
+
+    # pre-assemble session -> child-jobs and job -> sub-job maps before emitting rows.
+    # Dispatch-depth-1 jobs can nest under an on-screen parent session; dispatch-depth-2 jobs nest under
+    # their capability-owner job via parent_slug. This keeps main-session context light
+    # while fleet still shows cross-harness orchestration shape.
+    children = {}      # session_id -> [jobs] (nested under an on-screen parent)
+    job_children = {}  # parent dispatch slug -> [dispatch-depth-2 jobs]
+    orphans = []       # project-level fallback (parent dead/off-screen/no-env)
+    loops_jobs = []    # no-parent-is-normal (cron loops) — no orphan marker
+    grace_jobs = []    # F-80 L2: confirmed edge, parent filtered off-screen this tick
+                        # (stale/app_server/absent) within grace — no orphan marker
+    recovered_session_ids = set()
+    visible_parent_slugs = {
+        j.slug for j in group_jobs
+        if j.slug and max(1, int(getattr(j, "depth", 1) or 1)) < 2
+    }
+    # A `drill:<case>` group is a self-contained regression fixture: the harness roots every
+    # case under a synthetic sentinel session id (`drill-<harness>-parent-session`) so it never
+    # depends on the launching session. Such a root's parent is UNRESOLVABLE by design, not lost,
+    # so a would-be-orphan here is the case's intended root — surface it as a standalone tree row
+    # (loops_jobs: "no-parent-is-normal", no `(orphan)` marker) instead of the orphan divider
+    # (user 2026-07-24: drill runs "orphan으로 잡히고 메인 세션은 연결도 안되고" — noise, since the
+    # fixture decouples on purpose). Non-drill groups keep the exact prior classification.
+    is_drill_case = str(name).startswith("drill:")
+    for j in group_jobs:
+        if getattr(j, "parent_slug", None) and getattr(j, "depth", 1) >= 2:
+            if j.parent_slug in visible_parent_slugs:
+                job_children.setdefault(j.parent_slug, []).append(j)
+            elif is_drill_case:
+                loops_jobs.append(j)
+            elif not _SHOW_ALL and j.liveness in _DETACHED_FINISHED_LIVENESS:
+                # 사용자 2026-08-19 ("done된것도 원래 박스 안에서 떴다니까"): while its owner
+                # was on screen this row lived inside that owner's card; the owner then
+                # aged off the board and only the finished child leaked back out, hours
+                # stale, floating between cards. Recovery exists so a LIVE depth-2 row
+                # cannot vanish behind a broken parent edge — it is not a reason to
+                # resurrect finished work whose owner already left. When the owner goes,
+                # its finished children go with it; `a`/--all still reveals them.
+                pass
+            elif getattr(j, "_parent_edge_promoted_orphan", False):
+                # impl-review gap (round 1 G1 close-out): the ledger's verdict is
+                # authoritative over shown_sids — a promoted orphan stays an orphan even
+                # when --all puts its dead parent on screen this tick.
+                orphans.append(j)
+            elif getattr(j, "_parent_edge_sid", None):
+                edge_sid = j._parent_edge_sid
+                if edge_sid in shown_sids:
+                    children.setdefault(edge_sid, []).append(j)
+                    recovered_session_ids.add(edge_sid)
+                else:
+                    # F-80 L2/C6: collector confirmed this exact edge and it is inside
+                    # grace — consume that verdict rather than re-deriving orphan status
+                    # from shown_sids. The parent row itself is filtered off-screen this
+                    # tick.
+                    grace_jobs.append(j)
+            elif (getattr(j, "is_child", False) and j.parent_sid
+                  and j.parent_sid in shown_sids):
+                # No ledger verdict reached this row (collector never ran
+                # resolve_parent_edges against it) — fall back to the pre-ledger check.
+                children.setdefault(j.parent_sid, []).append(j)
+                recovered_session_ids.add(j.parent_sid)
+            else:
+                # A malformed/stale parent edge must not make a live dispatch-depth-2 row
+                # disappear from Fleet. Surface it as a project-level orphan.
+                orphans.append(j)
+        elif getattr(j, "_parent_edge_promoted_orphan", False):
+            orphans.append(j)
+        elif getattr(j, "_parent_edge_sid", None):
+            edge_sid = j._parent_edge_sid
+            if edge_sid in shown_sids:
+                children.setdefault(edge_sid, []).append(j)
+            else:
+                # F-80 L2/C6: same grace consumption as above, for the depth-1 nesting path.
+                # Takes priority over the parent_managed_dir/parent_cwd fallbacks below so a
+                # confirmed edge is never re-resolved through a less precise cwd match.
+                grace_jobs.append(j)
+        elif j.is_child and j.parent_sid and j.parent_sid in shown_sids:
+            # No ledger verdict reached this row — fall back to the pre-ledger check.
+            children.setdefault(j.parent_sid, []).append(j)
+        elif getattr(j, "source", None) == "plugin-queue":
+            # F-50c: a plugin-queue job nests ONLY on an exact `sessionId` ==
+            # `Session.session_id` match (the branch above). Its `parent_cwd` is the
+            # plugin workspace root — nesting on it would attach the job to whatever
+            # session happens to sit in that directory, which is the misattribution the
+            # separate-surface rule exists to prevent. Unmatched → orphan.
+            orphans.append(j)
+        elif j.is_child and getattr(j, "parent_cwd", None):
+            sid = shown_cwds.get(os.path.realpath(j.parent_cwd))
+            if sid:
+                children.setdefault(sid, []).append(j)
+            elif j.key in _LOOPS_KEYS or is_drill_case:
+                loops_jobs.append(j)
+            else:
+                orphans.append(j)
+        elif j.key in _LOOPS_KEYS or is_drill_case:
+            loops_jobs.append(j)
+        else:
+            orphans.append(j)
+    if not _SHOW_ALL:
+        # F-83: the route-open dead owner exemption above exists so a LIVE session keeps
+        # its card; an owner whose session is gone is ordinary dead history and stays
+        # behind `a`/--all like every other dead row.
+        orphans = [j for j in orphans
+                   if not (j.liveness == "dead" and getattr(j, "_dead_terminal_owner", False))]
+
+    return {"children": children, "job_children": job_children, "orphans": orphans,
+            "loops_jobs": loops_jobs, "grace_jobs": grace_jobs,
+            "recovered_session_ids": recovered_session_ids}
+
+def _drawn_group_jobs(classified, shown):
+    """Dispatch jobs the group loop draws a row for, from `_classify_group_jobs`.
+
+    Walks the same buckets in the same way the loop does: a job under a shown
+    non-automation session, an orphan/loop/grace row, and the unfolded depth-2 children of
+    a drawn owner. A dropped row (dead owner without a session, a plugin row, a folded
+    child, a session dedup'd away) is not in the result.
+    """
+    drawn = []
+
+    def _walk(job):
+        drawn.append(job)
+        if max(1, int(getattr(job, "depth", 1) or 1)) != 1:
+            return
+        for sub in classified["job_children"].get(job.slug, []):
+            if (max(1, int(getattr(sub, "depth", 1) or 1)) >= 2 and not _SHOW_ALL
+                    and _fold_completed_child(sub)):
+                continue  # absorbed into the conductor breadcrumb
+            _walk(sub)
+
+    claimed = set()
+    for s in shown:
+        if getattr(s, "mem_worker", False):
+            continue  # a mem row draws no child jobs
+        if s.session_id in claimed:
+            continue  # ambiguous duplicate id: only the first row draws the dispatch tree
+        if s.session_id:
+            claimed.add(s.session_id)
+        for kid in classified["children"].get(s.session_id, []):
+            if not _is_plugin_agent(kid):  # a plugin row is drawn without a GPU strip
+                _walk(kid)
+    for job in classified["orphans"]:
+        if not _is_plugin_agent(job):
+            _walk(job)
+    for job in classified["loops_jobs"] + classified["grace_jobs"]:
+        _walk(job)
+    return drawn
+
+
+def _emitted_group_jobs(g, show_sessions, show_jobs):
+    group_jobs = _visible_group_jobs(g["jobs"], show_sessions, show_jobs)
+    if not _SHOW_ALL:
+        group_jobs = [j for j in group_jobs
+                      if j.liveness != "dead" or getattr(j, "_dead_terminal_owner", False)]
+    return group_jobs
+
+
+def _gpu_strip_keys(shown, gpu_resources, drawn_jobs=(), session_by_identity=None):
+    """Entities whose F-88 GPU strip is actually drawn (F-104 dedup source).
+
+    `shown` are the drawn sessions; `drawn_jobs` are the dispatch jobs the group loop
+    draws (`_drawn_group_jobs`), whose strip is keyed by `_runtime_session_id` (or the
+    exact pid/start child session) even when that hidden child session is not on the board.
+    """
+    keys = set()
+    for s in shown:
+        if getattr(s, "mem_worker", False):
+            continue  # a mem row is drawn by _mem_row alone, without a GPU strip
+        if _gpu_resources_for_session(s, gpu_resources):
+            keys.add((s.harness, s.session_id or getattr(s, "_runtime_session_id", None)))
+    for job in drawn_jobs:
+        owner = job if _gpu_resources_for_session(job, gpu_resources) else None
+        if owner is None and session_by_identity:
+            job_session = _session_for_job(session_by_identity, job)
+            if job_session is not None and _gpu_resources_for_session(job_session, gpu_resources):
+                owner = job_session
+        if owner is not None:
+            keys.add((owner.harness,
+                      getattr(owner, "session_id", None)
+                      or getattr(owner, "_runtime_session_id", None)))
+    return keys
+
+
+def _group_drawn_strip_keys(name, g, show_sessions, show_jobs, gpu_resources, session_by_identity):
+    """F-104 dedup keys of one group, from the classification its emitter draws."""
+    shown = _shown_group_sessions(g["sessions"]) if show_sessions else []
+    classified = _classify_group_jobs(
+        name, _emitted_group_jobs(g, show_sessions, show_jobs), shown)
+    return _gpu_strip_keys(shown, gpu_resources, _drawn_group_jobs(classified, shown),
+                           session_by_identity)
+
+
+def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
+                    session_by_identity=None, name=""):
     """Single source of truth for the session rows that the group loop emits.
 
     The earlier visible_order calculation is a conservative card-anchor approximation;
     it is intentionally separate from this exact emit predicate.
     """
     group_sessions = g["sessions"] if show_sessions else []
-    group_jobs = _visible_group_jobs(g["jobs"], show_sessions, show_jobs)
-    if not _SHOW_ALL:
-        group_jobs = [j for j in group_jobs
-                      if j.liveness != "dead" or getattr(j, "_dead_terminal_owner", False)]
-    empty = not group_sessions and not group_jobs
+    group_jobs = _emitted_group_jobs(g, show_sessions, show_jobs)
+    gpu = g.get("gpu") or []
+    empty = not group_sessions and not group_jobs and not gpu
     if empty:
         return {"group_sessions": group_sessions, "group_jobs": group_jobs,
-                "empty": True, "fold": False, "shown": [], "hidden": 0}
+                "empty": True, "fold": False, "shown": [], "hidden": 0,
+                "gpu": [], "gpu_strip_keys": set(), "classified": None}
     live_sessions = [s for s in group_sessions
                      if s.liveness not in ("stale", "dead") and not s.app_server]
     must_show_jobs = any(not getattr(j, "afterglow", False) for j in group_jobs)
-    fold = (not _SHOW_ALL) and (not live_sessions) and (not must_show_jobs)
-    shown = (group_sessions if _SHOW_ALL else
-             [s for s in group_sessions if session_parent_visible(s)])
+    shown = _shown_group_sessions(group_sessions)
+    classified = _classify_group_jobs(name, group_jobs, shown)
+    strip_keys = _gpu_strip_keys(shown, gpu_resources or {},
+                                 _drawn_group_jobs(classified, shown), session_by_identity)
+    # GPU work is live work: a card holding a GPU row or a drawn session/job GPU
+    # strip is never folded away.
+    fold = ((not _SHOW_ALL) and (not live_sessions) and (not must_show_jobs)
+            and (not gpu) and (not strip_keys))
     return {"group_sessions": group_sessions, "group_jobs": group_jobs,
             "empty": False, "fold": fold, "shown": shown,
-            "hidden": len(group_sessions) - len(shown)}
+            "hidden": len(group_sessions) - len(shown),
+            "gpu": gpu, "gpu_strip_keys": strip_keys, "classified": classified}
 
 
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
@@ -6091,6 +6360,21 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     show_sessions = section in ("fleet", "both")
     show_jobs = section in ("dispatch", "both")
 
+    # F-104: live GPU processes neither a registered run nor a drawn session/job GPU
+    # strip shows land on their cwd's project card (same rule as LAB RESOURCES).
+    gpu_work = {}
+    if show_jobs:
+        strip_keys = set()
+        for gname, g in groups.items():
+            strip_keys |= _group_drawn_strip_keys(
+                gname, g, show_sessions, show_jobs, gpu_resources, session_by_identity)
+        snapshot, age_s = _fresh_compute_hosts()
+        for entry in _compute_hosts.unregistered_gpu(
+                snapshot, resources or (), strip_keys, age_s or 0.0):
+            gpu_work.setdefault(entry["project"], []).append(entry)
+    for gk, entries in gpu_work.items():
+        groups.setdefault(gk, {"sessions": [], "jobs": []})["gpu"] = entries
+
     order = sorted(groups.keys(), key=lambda name: (
         0 if name == _SYSTEM_GROUP else 1, _group_sort_key(name, groups[name])))
 
@@ -6104,11 +6388,14 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             group_jobs = _visible_group_jobs(g["jobs"], show_sessions, show_jobs)
             if not _SHOW_ALL:
                 group_jobs = [j for j in group_jobs if j.liveness != "dead"]
-            if not group_sessions and not group_jobs:
+            group_gpu = g.get("gpu") or []
+            if not group_sessions and not group_jobs and not group_gpu:
                 continue
             live_sessions = [s for s in group_sessions
                              if s.liveness not in ("stale", "dead") and not s.app_server]
-            if (not _SHOW_ALL) and not live_sessions and not group_jobs:
+            if ((not _SHOW_ALL) and not live_sessions and not group_jobs and not group_gpu
+                    and not _group_drawn_strip_keys(
+                        name, g, show_sessions, show_jobs, gpu_resources, session_by_identity)):
                 continue
             visible_order.append(name)
         # Reconcile only card anchors, but retain folded/empty groups in the
@@ -6120,8 +6407,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         visible_tiers = {name: _group_activity_rank(groups[name]) for name in visible_order}
         order = live_order.reconcile_groups(visible_order, visible_tiers) + non_card_order
 
-    emission_by_group = {name: _group_emission(groups[name], show_sessions, show_jobs)
-                         for name in order}
+    emission_by_group = {
+        name: _group_emission(groups[name], show_sessions, show_jobs, gpu_resources,
+                              session_by_identity, name)
+        for name in order}
     tag_by_key = {}
     for emission in emission_by_group.values():
         for s in emission["shown"]:
@@ -6223,130 +6512,21 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # against (model.session_parent_visible) — single definition, not a parallel copy.
         shown = emission["shown"]
         hidden = emission["hidden"]
-        shown_sids = set(s.session_id for s in shown if s.session_id)
-        shown_cwds = {}
-        ambiguous_cwds = set()
-        for s in shown:
-            if not s.cwd or not s.session_id:
-                continue
-            key_cwd = os.path.realpath(s.cwd)
-            if key_cwd in shown_cwds:
-                ambiguous_cwds.add(key_cwd)
-            else:
-                shown_cwds[key_cwd] = s.session_id
-        for key_cwd in ambiguous_cwds:
-            shown_cwds.pop(key_cwd, None)
-
-        # pre-assemble session -> child-jobs and job -> sub-job maps before emitting rows.
-        # Dispatch-depth-1 jobs can nest under an on-screen parent session; dispatch-depth-2 jobs nest under
-        # their capability-owner job via parent_slug. This keeps main-session context light
-        # while fleet still shows cross-harness orchestration shape.
-        children = {}      # session_id -> [jobs] (nested under an on-screen parent)
-        job_children = {}  # parent dispatch slug -> [dispatch-depth-2 jobs]
-        orphans = []       # project-level fallback (parent dead/off-screen/no-env)
-        loops_jobs = []    # no-parent-is-normal (cron loops) — no orphan marker
-        grace_jobs = []    # F-80 L2: confirmed edge, parent filtered off-screen this tick
-                            # (stale/app_server/absent) within grace — no orphan marker
-        recovered_session_ids = set()
-        visible_parent_slugs = {
-            j.slug for j in group_jobs
-            if j.slug and max(1, int(getattr(j, "depth", 1) or 1)) < 2
-        }
-        # A `drill:<case>` group is a self-contained regression fixture: the harness roots every
-        # case under a synthetic sentinel session id (`drill-<harness>-parent-session`) so it never
-        # depends on the launching session. Such a root's parent is UNRESOLVABLE by design, not lost,
-        # so a would-be-orphan here is the case's intended root — surface it as a standalone tree row
-        # (loops_jobs: "no-parent-is-normal", no `(orphan)` marker) instead of the orphan divider
-        # (user 2026-07-24: drill runs "orphan으로 잡히고 메인 세션은 연결도 안되고" — noise, since the
-        # fixture decouples on purpose). Non-drill groups keep the exact prior classification.
-        is_drill_case = str(name).startswith("drill:")
-        for j in group_jobs:
-            if getattr(j, "parent_slug", None) and getattr(j, "depth", 1) >= 2:
-                if j.parent_slug in visible_parent_slugs:
-                    job_children.setdefault(j.parent_slug, []).append(j)
-                elif is_drill_case:
-                    loops_jobs.append(j)
-                elif not _SHOW_ALL and j.liveness in _DETACHED_FINISHED_LIVENESS:
-                    # 사용자 2026-08-19 ("done된것도 원래 박스 안에서 떴다니까"): while its owner
-                    # was on screen this row lived inside that owner's card; the owner then
-                    # aged off the board and only the finished child leaked back out, hours
-                    # stale, floating between cards. Recovery exists so a LIVE depth-2 row
-                    # cannot vanish behind a broken parent edge — it is not a reason to
-                    # resurrect finished work whose owner already left. When the owner goes,
-                    # its finished children go with it; `a`/--all still reveals them.
-                    pass
-                elif getattr(j, "_parent_edge_promoted_orphan", False):
-                    # impl-review gap (round 1 G1 close-out): the ledger's verdict is
-                    # authoritative over shown_sids — a promoted orphan stays an orphan even
-                    # when --all puts its dead parent on screen this tick.
-                    orphans.append(j)
-                elif getattr(j, "_parent_edge_sid", None):
-                    edge_sid = j._parent_edge_sid
-                    if edge_sid in shown_sids:
-                        children.setdefault(edge_sid, []).append(j)
-                        recovered_session_ids.add(edge_sid)
-                    else:
-                        # F-80 L2/C6: collector confirmed this exact edge and it is inside
-                        # grace — consume that verdict rather than re-deriving orphan status
-                        # from shown_sids. The parent row itself is filtered off-screen this
-                        # tick.
-                        grace_jobs.append(j)
-                elif (getattr(j, "is_child", False) and j.parent_sid
-                      and j.parent_sid in shown_sids):
-                    # No ledger verdict reached this row (collector never ran
-                    # resolve_parent_edges against it) — fall back to the pre-ledger check.
-                    children.setdefault(j.parent_sid, []).append(j)
-                    recovered_session_ids.add(j.parent_sid)
-                else:
-                    # A malformed/stale parent edge must not make a live dispatch-depth-2 row
-                    # disappear from Fleet. Surface it as a project-level orphan.
-                    orphans.append(j)
-            elif getattr(j, "_parent_edge_promoted_orphan", False):
-                orphans.append(j)
-            elif getattr(j, "_parent_edge_sid", None):
-                edge_sid = j._parent_edge_sid
-                if edge_sid in shown_sids:
-                    children.setdefault(edge_sid, []).append(j)
-                else:
-                    # F-80 L2/C6: same grace consumption as above, for the depth-1 nesting path.
-                    # Takes priority over the parent_managed_dir/parent_cwd fallbacks below so a
-                    # confirmed edge is never re-resolved through a less precise cwd match.
-                    grace_jobs.append(j)
-            elif j.is_child and j.parent_sid and j.parent_sid in shown_sids:
-                # No ledger verdict reached this row — fall back to the pre-ledger check.
-                children.setdefault(j.parent_sid, []).append(j)
-            elif getattr(j, "source", None) == "plugin-queue":
-                # F-50c: a plugin-queue job nests ONLY on an exact `sessionId` ==
-                # `Session.session_id` match (the branch above). Its `parent_cwd` is the
-                # plugin workspace root — nesting on it would attach the job to whatever
-                # session happens to sit in that directory, which is the misattribution the
-                # separate-surface rule exists to prevent. Unmatched → orphan.
-                orphans.append(j)
-            elif j.is_child and getattr(j, "parent_cwd", None):
-                sid = shown_cwds.get(os.path.realpath(j.parent_cwd))
-                if sid:
-                    children.setdefault(sid, []).append(j)
-                elif j.key in _LOOPS_KEYS or is_drill_case:
-                    loops_jobs.append(j)
-                else:
-                    orphans.append(j)
-            elif j.key in _LOOPS_KEYS or is_drill_case:
-                loops_jobs.append(j)
-            else:
-                orphans.append(j)
-        if not _SHOW_ALL:
-            # F-83: the route-open dead owner exemption above exists so a LIVE session keeps
-            # its card; an owner whose session is gone is ordinary dead history and stays
-            # behind `a`/--all like every other dead row.
-            orphans = [j for j in orphans
-                       if not (j.liveness == "dead" and getattr(j, "_dead_terminal_owner", False))]
+        classified = emission["classified"]
+        children = classified["children"]      # session_id -> [jobs] (nested under an on-screen parent)
+        job_children = classified["job_children"]  # parent dispatch slug -> [dispatch-depth-2 jobs]
+        orphans = classified["orphans"]        # project-level fallback (parent dead/off-screen/no-env)
+        loops_jobs = classified["loops_jobs"]  # no-parent-is-normal (cron loops) — no orphan marker
+        grace_jobs = classified["grace_jobs"]  # F-80 L2: confirmed edge, parent filtered off-screen
+        recovered_session_ids = classified["recovered_session_ids"]
 
         gcwd = "" if name in ("loops", _SYSTEM_GROUP) else (group_sessions[0].cwd if group_sessions else
                 (group_jobs[0].cwd if group_jobs else ""))
         # The section title has no indicator glyph; the title itself carries active state.
         # while the group works, plain bold otherwise. Doubles with the active card tint.
         n_work = sum(1 for s in live_sessions if s.liveness == "working") + \
-                 sum(1 for j in group_jobs if j.liveness == "working")
+                 sum(1 for j in group_jobs if j.liveness == "working") + \
+                 len(emission["gpu"])
         # cooling (round-6, user 2026-07-03): no active work, but the newest session transcript
         # A write within the cooling window indicates a directory that just finished.
         # state between hot (green ●) and cold (no glyph): a grey ring + time-since-done, so a
@@ -6730,6 +6910,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # is preserved exactly as the confirmed edge, not re-derived as project-level loss.
         for gj in _sort_group_jobs(grace_jobs):
             _emit_dispatch_tree(gj, orphan=False)
+
+        # F-104: live GPU work that no registry run or session GPU strip shows.
+        for entry in emission["gpu"]:
+            lines.append(_gpu_work_row(entry, term_width))
 
         # F-19 repo rows (사용자 확정 2026-07-16): this card's own today-mem events, below a
         # subtle in-band divider — entirely silent when the repo has none (healthy-silent,

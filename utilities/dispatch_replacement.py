@@ -30,6 +30,10 @@ DEATH_NOTES = frozenset({
     'dead-no-progress', 'dead-timeout',
 })
 SCHEMA = 'automatic-dead-replacement-v1'
+# D2: a frame leg whose `top` the frame rule assigned is replaced once, one profile lower, when it
+# stops at a usage limit. The claim carries exactly this value; nothing else may.
+FRAME_CAPACITY = 'frame-capacity'
+FRAME_TRANSITION = {'from': 'top', 'to': 'deep', 'reason': 'capacity', 'ordinal': 1, 'origin': 'frame-rule'}
 CONTINUATION_WAIT_NOTE = (
     'This route has already used its one automatic continuation. If you raise a human gate later, '
     'wait for the person: call the bounded workflow-supervisor.py await-release again after each timeout, '
@@ -159,8 +163,55 @@ def seal_launch_input(args, harness: str, task: str) -> str:
         'route_node': getattr(args, 'route_node', None) or '',
         'owner_route_id': getattr(getattr(args, 'owner_route_binding', None), 'route_id', ''),
     }
-    _once(_directory(jobs)/'inputs'/(aid+'.json'), payload)
+    path = _directory(jobs)/'inputs'/(aid+'.json')
+    try:
+        _once(path, payload)
+    except DC.DispatchContractError as exc:
+        if exc.reason != 'replacement-record-conflict' or not _reseal_allowed(jobs, aid, path, payload):
+            raise
+        _replace_record(path, payload)
     return ',replacement_input_digest='+_digest(payload)
+
+
+# A later launcher of the same attempt may run from a newer release and resolve
+# afresh (admission still checks that against the source). The work and the
+# permissions it is granted must not change.
+_RESEAL_STABLE_KEYS = ('schema', 'attempt_id', 'harness', 'jobs', 'worktree', 'argv', 'task',
+                       'route_id', 'route_node', 'owner_route_id', 'applied_permissions')
+
+
+def _reseal_allowed(jobs, aid, path, payload):
+    """A launcher stopped before its claim sealed this input; the next one may reseal it."""
+    previous = _read(path)
+    stored = json.loads(_bytes(payload))  # compare in the stored form: a tuple reads back as a list
+    if not previous or any(previous.get(key) != stored.get(key) for key in _RESEAL_STABLE_KEYS):
+        return False
+    rows = []
+    for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
+        fields = line.split('\t')
+        if len(fields) == 6:
+            meta = DC.parse_registry_metadata(fields[5])
+            if meta.get('attempt_id') == aid:
+                rows.append((fields[1], meta))
+    if not rows:
+        return True
+    if len(rows) != 1:
+        return False
+    status, meta = rows[0]
+    return (status == 'open' and meta.get('launch_claimed') == '0'
+            and meta.get('launch_started') != '1' and not meta.get('pid'))
+
+
+def _replace_record(path, value):
+    temporary = path.with_name('.'+path.name+'.'+os.urandom(8).hex()+'.tmp')
+    try:
+        with temporary.open('xb') as handle:
+            handle.write(_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def launch_input(jobs, aid, meta):
@@ -181,11 +232,38 @@ def _terminal_absent(fields, meta, *, capacity=False):
     return result.get('state') == 'absent'
 
 
+def _frame_rule_top(jobs, meta):
+    """Did the frame rule itself assign this leg's `top`, and did the leg run at it?
+
+    A `top` the person chose (a pin carrying a model or effort, or a per-node explicit profile) is
+    theirs and is never lowered automatically; a pin naming only a harness chooses no profile.
+    Anything unreadable answers no, which leaves the ordinary needs-attention in place."""
+    if (meta.get('worker_type') != 'frame' or meta.get('dispatch_depth') != '1'
+            or meta.get('model_profile') != 'top' or meta.get('replacement_original_attempt_id')
+            or not meta.get('route_file') or not meta.get('route_node')):
+        return False
+    try:
+        route = _read(Path(meta['route_file']))
+    except DC.DispatchContractError:
+        return False
+    if not route or route.get('route_id') != meta.get('route_id'):
+        return False
+    node = next((n for n in route.get('nodes') or [] if isinstance(n, dict) and n.get('id') == meta['route_node']), None)
+    if not node or node.get('model_profile') != 'top' or node.get('worker_type') != 'frame':
+        return False
+    if (route.get('explicit_profiles') or {}).get(meta['route_node']):
+        return False
+    pins = route.get('selection_pins') or {}
+    pin = pins.get('frame') or pins.get('owner') or {}
+    return not (pin.get('model') or pin.get('effort'))
+
+
 def death_kind(fields, meta, *, jobs=None, lines=None):
     """The one place that says why a terminal row may be replaced.
 
     'parked' is a released human gate, 'capacity' an owner stopped at a usage limit,
-    'silent' a proven silent death. Anything else, including a user cancel, is None.
+    'silent' a proven silent death, 'frame-capacity' a frame leg at its frame-rule `top` stopped at
+    a usage limit (replaced once at `deep`). Anything else, including a user cancel, is None.
     Only a route owner pauses on capacity: a stage worker's limit stays with its owner's
     own fallback, so one row never has two successors.
     """
@@ -201,6 +279,12 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     if (meta.get('worker_type') == 'owner' and fields[1] == 'done'
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
         return 'capacity'
+    if meta.get('worker_type') == 'owner' and fields[1] == 'done' and meta.get('note') == 'dead-runtime-exit':
+        return 'runtime'  # the owner's process crashed; only an explicit `start` replaces it
+    if (jobs is not None and meta.get('worker_type') == 'frame' and fields[1] == 'done'
+            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
+            and _frame_rule_top(jobs, meta)):
+        return FRAME_CAPACITY
     return None
 
 
@@ -216,7 +300,7 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
     proof = DC.attempt_process_quiescence(meta, terminal_receipt=True)
     if proof.state != 'quiescent':
         raise _process_error(proof, meta)
-    if kind != 'parked' and not _terminal_absent(fields, meta, capacity=kind == 'capacity'):
+    if kind != 'parked' and not _terminal_absent(fields, meta, capacity=kind in {'capacity', FRAME_CAPACITY}):
         raise DC.DispatchContractError('replacement-result-settlement-required')
     result = {'state': proof.state, 'reason': proof.reason, 'death_kind': kind,
               'note': meta.get('note', ''), 'cleanup_receipt_digest': meta.get('cleanup_receipt_digest', ''),
@@ -414,6 +498,51 @@ def source_binding(jobs, meta):
 
 def _is_capacity_record(record):
     return 'after_capacity' in ((record or {}).get('logical_node') or {})
+
+
+def _transition_of(record):
+    """The one profile transition a claim may carry, or None. A claim that says more or less than the
+    frame rule is refused: the value is also what lets a launch run below its sealed profile."""
+    kind = (record.get('proof') or {}).get('death_kind')
+    transition = record.get('profile_transition')
+    if transition is None:
+        if kind == FRAME_CAPACITY:
+            raise DC.DispatchContractError('replacement-profile-transition-invalid')
+        return None
+    if transition != FRAME_TRANSITION or kind != FRAME_CAPACITY or _is_capacity_record(record):
+        raise DC.DispatchContractError('replacement-profile-transition-invalid')
+    return dict(transition)
+
+
+def read_profile_transition(jobs, *, route, node, attempt_id, lines=None):
+    """The verified frame-rule `top`->`deep` transition this attempt is the replacement for, or None.
+
+    The one reader every seam that lets a launch run below its node's sealed profile asks. It finds the
+    claim through the source row's own binding, then runs the admission-time source proof
+    (`validate_claim_source`), so a claim only counts while its source still is a proven capacity death
+    on this exact route, node and claim. No claim means None and the sealed profile stays the only one
+    allowed; a malformed claim raises. Nothing is written."""
+    lines = Path(jobs).read_text().splitlines() if lines is None else lines
+    sources = [(fields, meta) for fields, meta in _rows(lines).values()
+               if meta.get('replacement_attempt_id') == attempt_id]
+    if len(sources) != 1:
+        return None
+    _, source = sources[0]
+    binding = source_binding(jobs, source)
+    if not binding or not binding[0]:
+        return None
+    record = _check_record(_read(_record_path(jobs, binding[0])), binding[0],
+                           {'replacement_claim_digest': binding[2] or None})
+    transition = _transition_of(record)
+    if transition is None:
+        return None
+    if (record['replacement_attempt_id'] != attempt_id
+            or (record.get('logical_node') or {}).get('node') != node
+            or (route or {}).get('route_id') != record['route_id']
+            or (route or {}).get('route_hash') != record['route_hash']):
+        raise DC.DispatchContractError('replacement-profile-transition-mismatch')
+    validate_claim_source(jobs, lines, record)
+    return transition
 
 
 def _replacement_in_flight(jobs, rows, source):
@@ -687,6 +816,8 @@ def claim(jobs: Path, aid: str) -> dict:
                   'route_file': str(path), 'route_id': route['route_id'], 'route_hash': route['route_hash'],
                   'input_digest': _digest(replay), 'proof': proof, 'proof_digest': _digest(proof),
                   'reuse': _reuse_snapshot(jobs, route, lines)}
+        if proof.get('death_kind') == FRAME_CAPACITY:
+            record['profile_transition'] = dict(FRAME_TRANSITION)
         # Index first: every retry admission sees the consumed budget after a crash.
         _reserve_source(jobs, aid, family)
         _once(_record_path(jobs, family), record)
@@ -881,7 +1012,7 @@ def admission(jobs, lines, metadata):
                     'attempt_id': source['attempt_id'], 'binding_digest': source['review_input_digest']}):
             raise DC.DispatchContractError('reviewed-evidence-replacement-mismatch')
     expected_task = _replacement_task(record, source, replay)
-    _check_tuple(candidate, replay)
+    _check_tuple(candidate, replay, _transition_of(record))
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
     expected_argv = _replacement_argv(record, source, replay)
@@ -911,8 +1042,13 @@ def _runtime_drift(replay):
     return ['launch_home']
 
 
-def _check_tuple(candidate, replay):
-    """The candidate must match the sealed input; only runtime-derived values may follow a new release."""
+# What a verified profile transition lets the candidate resolve differently from the sealed launch.
+PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolved_model_settings'})
+
+
+def _check_tuple(candidate, replay, transition=None):
+    """The candidate must match the sealed input; only runtime-derived values may follow a new release,
+    and only the profile-derived ones may follow a verified profile transition."""
     for key in ('harness', 'jobs', 'worktree'):
         if candidate.get(key) != replay.get(key):
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
@@ -923,6 +1059,11 @@ def _check_tuple(candidate, replay):
     old, new = replay.get('resolved') or {}, candidate.get('resolved') or {}
     for key in sorted(set(old) | set(new)):
         if old.get(key) != new.get(key):
+            if (transition and key in PROFILE_DERIVED_KEYS and old.get('model_profile') == transition['from']
+                    and new.get('model_profile') == transition['to']
+                    and (key != 'resolved_model_settings'
+                         or (new.get(key) or {}).get('profile') == transition['to'])):
+                continue  # the one lower launch the frame rule allows
             if drift and key in RUNTIME_DERIVED_KEYS:
                 from hearting_gates import same_work_or_refuse
                 same_work_or_refuse('replacement-runtime-drift', key)
@@ -1016,6 +1157,9 @@ def _replacement_task(record, source, replay):
 
 def _replacement_argv(record, source, replay):
     options = {}
+    transition = _transition_of(record)
+    if transition:
+        options['--model-profile'] = transition['to']
     if source.get('worker_type') != 'owner' or source.get('route_file'):
         options.update({'--route-file': record['route_file'], '--route-id': record['route_id'],
                         '--route-hash': record['route_hash']})
@@ -1040,6 +1184,10 @@ def _command(jobs, record, source, replay):
     return [sys.executable,str(root/f'adapters/{replay["harness"]}/bin/dispatch-headless.py'),*argv]
 
 
+# The detached launcher returns once the owner is claimed; slow shared storage needs room.
+LAUNCHER_TIMEOUT_SECONDS = 600
+
+
 def _capacity_wait(jobs, aid, source, hold=None):
     """Nothing is written: a usage limit is a pause the person resumes with `start`."""
     result = {'state': 'needs-attention', 'reason': 'replacement-capacity-wait',
@@ -1054,10 +1202,18 @@ def _capacity_wait(jobs, aid, source, hold=None):
     return result
 
 
-def _capacity_hold(jobs, source):
+def _capacity_hold(jobs, source, model=None):
     from dispatch_capacity_evidence import harness_hold
     harness = source.get('harness') or source.get('owner_harness')
-    return harness_hold(jobs, harness, model=source.get('model')) if harness else None
+    return harness_hold(jobs, harness, model=model or source.get('model')) if harness else None
+
+
+def _retry_model(source, kind):
+    """The model the replacement will run: the source's own, except a frame-rule transition's lower one."""
+    if kind != FRAME_CAPACITY:
+        return None
+    from model_profile import resolve_runtime_profile
+    return resolve_runtime_profile(source.get('harness'), FRAME_TRANSITION['to'])[0]['model']
 
 
 def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capacity=False):
@@ -1075,8 +1231,11 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return advance(jobs, source['replacement_original_attempt_id'], run=run,
                        authority_check=authority_check, resume_capacity=resume_capacity)
     kind = death_kind(fields, source, jobs=jobs)
+    # A usage-limit resume is a pause, not the node's one silent replacement: when that
+    # resumed attempt dies silently, claim() still judges the node's silent budget.
     if (source.get('replacement_original_attempt_id') and fields[1] not in {'open','running'}
-            and not DC.verdict_pass(source) and kind != 'capacity'):
+            and not DC.verdict_pass(source) and kind != 'capacity'
+            and not _in_capacity_family(jobs, source)):
         return exhausted_attention(jobs, aid, source)
     # Avoid side effects or errors on ordinary success/live observations.
     if kind is None:
@@ -1084,6 +1243,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return {'state': 'not-applicable', 'parked_gate': parked} if parked else {'state':'not-applicable'}
     if kind == 'capacity' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return _capacity_wait(jobs, aid, source)
+    if kind == 'runtime' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
+        return {'state': 'not-applicable'}  # never a supervisor tick: no loop of relaunches
     try:
         if authority_check is None:
             _authorized(jobs, rows, source)
@@ -1093,7 +1254,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         if not (binding and binding[1] in rows and (rows[binding[1]][0][1] not in {'open','running'}
                 or rows[binding[1]][1].get('launch_claimed') == '1')):
             # Nothing is launched yet: limit, drift and cleanup are judged before anything durable is written.
-            hold = _capacity_hold(jobs, source)
+            hold = _capacity_hold(jobs, source, _retry_model(source, kind))
             if hold:
                 return _capacity_wait(jobs, aid, source, hold)
             _runtime_drift(launch_input(jobs, aid, source))
@@ -1106,8 +1267,10 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             replacement_fields, replacement_meta = rows[replacement]
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
-                    if death_kind(replacement_fields, replacement_meta) == 'capacity':
-                        # The replacement stopped at a limit too: it is the next source.
+                    next_kind = death_kind(replacement_fields, replacement_meta)
+                    if next_kind == 'capacity' or (next_kind and _is_capacity_record(record)):
+                        # The replacement stopped at a limit too, or a limit resume died on its
+                        # own: it is the next source, and claim() judges the node's budget.
                         return advance(jobs, replacement, run=run, authority_check=authority_check,
                                        resume_capacity=resume_capacity)
                     return exhausted_attention(jobs, replacement, replacement_meta)
@@ -1136,7 +1299,18 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                                                       jobs=Path(jobs)))
             except (ProducerError, OSError, ValueError):
                 pass
-        completed = run(command,env=env,text=True,capture_output=True,check=False,timeout=120)
+        try:
+            completed = run(command,env=env,text=True,capture_output=True,check=False,
+                            timeout=LAUNCHER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            # A slow disk after a usage-limit reset can hold the launcher past its budget.
+            # The unclaimed successor row stays; the next `start` relaunches that same attempt.
+            output = ''.join(part.decode(errors='replace') if isinstance(part, bytes) else str(part or '')
+                             for part in (exc.stdout, exc.stderr))
+            return {'state':'needs-attention','reason':'replacement-launch-timeout',
+                    'attempt_id':replacement,'record':record,
+                    'launcher_diagnostic':'\n'.join(output.splitlines()[-20:]),
+                    'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         current = _rows(Path(jobs).read_text().splitlines()).get(replacement)
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}
@@ -1160,6 +1334,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                   'node': source.get('route_node') or '__owner__'}
         if reason.startswith('replacement-') and getattr(exc,'detail',reason) != reason:
             result['detail'] = str(exc.detail)[:240]
+        elif not isinstance(exc, DC.DispatchContractError):
+            result['detail'] = f'{type(exc).__name__}: {exc}'[:240]
         result.update(getattr(exc,'live',None) or {})
         return result
 

@@ -3,12 +3,14 @@
 route artifact env names that cycle's output folder (stage-dispatch §13.62)."""
 import contextlib
 import hashlib
+import json
 import importlib.util
 import io
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -327,6 +329,233 @@ class ParentOutputEnvTest(SourceBase):
             self.assertEqual(OWNER.main(["--dry-run", "--route-evidence", str(path), "--prompt-text", "probe"]), 0)
         self.assertEqual(len(seen), 1)
         self.assertNotIn(PARENT_VAR, seen[0])
+
+
+NATIVE_ENV = ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
+              "OPENCODE_SESSION_ID")
+
+
+class SameFlowLedgerTest(SourceBase):
+    """A163F-1..4: real route-chain ledger lines and real cycle records, no mocked selector."""
+
+    def setUp(self):
+        super().setUp()
+        self.ledger_dir = Path(self._tmp.name) / "route-chain"
+        self.tools = str(HERE.parent / "tools")
+        if self.tools not in sys.path:
+            sys.path.insert(0, self.tools)
+        from fleet import route_chain
+        self.chain = route_chain
+
+    @contextlib.contextmanager
+    def session(self, sid=None, depth=None):
+        """This process as one declared native session (or none); everything else inherited."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in NATIVE_ENV and not k.startswith("AGENT_DISPATCH_")
+               and k != "AGENT_DISPATCH_CHILD"}
+        env["FLEET_ROUTE_CHAIN_DIR"] = str(self.ledger_dir)
+        if sid:
+            env["CLAUDE_CODE_SESSION_ID"] = sid
+        if depth is not None:
+            env["AGENT_DISPATCH_DEPTH"] = str(depth)
+        with mock.patch.dict(os.environ, env, clear=True):
+            yield
+
+    def flow_cycle(self, sid, capability="autopilot-code", mode="dev", key="mixed", slug=None):
+        """A session composes a direct route (real ledger line) and begins its cycle with a marker plan.md."""
+        self.count += 1
+        slug = slug or f"flow-{self.count}"
+        with self.session(sid):
+            route, route_file = self.route("direct", capability, mode, slug=slug, campaign_key=key)
+            R._record_route_chain(route, str(route_file), "compose")
+            result = P.begin(self.root, route_file=route_file, capability=capability, intensity="direct")
+        for rel in ("plan.md", "checklist.md"):
+            self.write_output(result, rel=rel, data=f"{slug}\n".encode())
+        return result
+
+    def source_cycle(self, route):
+        sources = self.node(route, "execute")["input_sources"]
+        return {source["cycle_id"] for source in sources.values()}
+
+    def test_a163f_0_the_ledger_line_and_the_cycle_record_share_the_route_id(self):
+        y = self.flow_cycle("sess-A")
+        record = P.read_cycle_record(self.root, y["cycle_id"])
+        with self.session("sess-A"):
+            lines = self.chain.read_tail("claude", "sess-A")
+        self.assertEqual([line["event"] for line in lines], ["compose"])
+        self.assertEqual(lines[0]["route_id"], record["route_id"])
+        self.assertEqual(lines[0]["campaign_key"], "mixed")
+
+    def test_a163f_1_another_sessions_newer_cycle_loses_to_this_sessions_older_one(self):
+        y = self.flow_cycle("sess-A")
+        x = self.flow_cycle("sess-B")
+        with self.session("sess-A"):
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {y["cycle_id"]})
+        # control: a session with no ledger gets the newest cycle of the capability
+        with self.session("sess-C"):
+            self.assertEqual(self.source_cycle(self.compose(campaign_key="mixed")), {x["cycle_id"]})
+        with self.session(None):
+            self.assertEqual(self.source_cycle(self.compose(campaign_key="mixed")), {x["cycle_id"]})
+
+    def test_a163f_1b_the_sessions_own_cycle_wins_even_for_another_capability(self):
+        y = self.flow_cycle("sess-A")
+        self.flow_cycle("sess-B")
+        z = self.flow_cycle("sess-A", capability="autopilot-refine", mode="default")
+        with self.session("sess-A"):
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {z["cycle_id"]})
+        self.assertNotEqual(z["cycle_id"], y["cycle_id"])
+
+    def test_a163f_1c_a_ledger_line_of_another_campaign_or_root_is_not_this_flow(self):
+        self.flow_cycle("sess-A", key="elsewhere")
+        x = self.flow_cycle("sess-B")
+        with self.session("sess-A"):
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {x["cycle_id"]})
+
+    def test_a163f_1d_a_continuation_the_session_composed_maps_to_the_cycle_of_its_source_route(self):
+        """A ledger line names a route; a continuation's cycle is the one its verified source began."""
+        self.count += 1
+        with self.session("sess-B"):
+            source, source_file = self.route("standard", slug="cont-source", campaign_key="mixed")
+            R._record_route_chain(source, str(source_file), "compose")
+            began = P.begin(self.root, route_file=source_file, capability="autopilot-code", intensity="standard")
+        for rel in ("plan.md", "checklist.md"):
+            self.write_output(began, rel=rel, data=b"cont-source\n")
+        first = next(n for n in source["nodes"])
+        continuation = R.build_continuation_route(
+            source, resume_from_node=first["id"], requested_boundary=first["id"],
+            reason="same-flow-lineage", artifact_root=self.root)
+        continuation_file = R.canonical_route_path(self.root, continuation["route_id"])
+        R.publish_continuation_route(continuation, source, continuation_file)
+        with self.session("sess-A"):
+            R._record_route_chain(continuation, str(continuation_file), "continuation")
+        newer = self.flow_cycle("sess-C")
+        self.assertNotEqual(newer["cycle_id"], began["cycle_id"])
+        with self.session("sess-A"):
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {began["cycle_id"]})
+        with self.session("sess-D"):   # no ledger of its own: the capability rule names the newest code cycle
+            self.assertEqual(self.source_cycle(self.compose(campaign_key="mixed")), {newer["cycle_id"]})
+
+    def test_a163f_2_no_session_record_takes_the_same_capability_not_the_newest_cycle(self):
+        x = self.flow_cycle("sess-B")
+        self.flow_cycle("sess-B", capability="autopilot-refine", mode="default")
+        with self.session("sess-C"):
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {x["cycle_id"]})
+
+    def test_a163f_2b_no_same_capability_cycle_means_no_source_and_the_old_bytes(self):
+        self.flow_cycle("sess-B", capability="autopilot-refine", mode="default")
+        with self.session("sess-C"):
+            self.assert_not_found(campaign_key="mixed")
+        with self.session("sess-B"):
+            # the same campaign, but sess-B composed the refine cycle itself: its own flow
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {P.list_cycle_records(self.root)[0]["cycle_id"]})
+
+    def test_a163f_2c_an_unreadable_ledger_falls_to_the_capability_rule(self):
+        self.flow_cycle("sess-A")
+        x = self.flow_cycle("sess-B")
+        with self.session("sess-A"):
+            ledger = Path(self.chain.ledger_path("claude", "sess-A"))
+        ledger.write_text("{broken\n", encoding="utf-8")
+        with self.session("sess-A"):
+            route = self.compose(campaign_key="mixed")
+        self.assertEqual(self.source_cycle(route), {x["cycle_id"]})
+        ledger.unlink()
+        with self.session("sess-A"):
+            self.assertEqual(self.source_cycle(self.compose(campaign_key="mixed")), {x["cycle_id"]})
+
+    def test_a163f_2d_a_partial_graph_with_no_source_is_byte_identical_to_the_old_compose(self):
+        self.flow_cycle("sess-B", capability="autopilot-refine", mode="default")
+        with self.session("sess-C"):
+            route = self.compose(campaign_key="mixed")
+            baseline = self.without_finder(campaign_key="mixed")
+        self.assertEqual(route["route_hash"], baseline["route_hash"])
+        self.assertEqual(json.dumps(route, sort_keys=True), json.dumps(baseline, sort_keys=True))
+        self.assertEqual(self.inputs(route), FRESH)
+
+    def test_a163f_3_parent_cycle_beats_the_session_rule(self):
+        self.flow_cycle("sess-A")
+        x = self.flow_cycle("sess-B")
+        with self.session("sess-A"):
+            route = self.compose(parent_cycle_id=x["cycle_id"])
+        self.assertEqual(self.source_cycle(route), {x["cycle_id"]})
+
+    def test_a163f_4_the_parent_output_env_follows_the_same_rule_at_start(self):
+        y = self.flow_cycle("sess-A")
+        x = self.flow_cycle("sess-B")
+        with self.session("sess-A"):
+            route, route_file = self.route("direct", slug="next-a", campaign_key="mixed")
+            R._record_route_chain(route, str(route_file), "compose")
+            env = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+        self.assertEqual(env[PARENT_VAR], str((Path(y["cycle_dir"]) / "artifacts").resolve()))
+        # a route composed by nobody we can see falls to the capability rule: the newest code
+        # cycle before it, which is now sess-A's `next-a` -- not sess-A's older Y by session
+        with self.session("sess-C"):
+            other, other_file = self.route("direct", slug="next-c", campaign_key="mixed")
+            env = P.prepare_route_artifact_env(other_file, start=True, jobs=self.jobs)
+        record = P.read_cycle_record(self.root, env["AGENT_ARTIFACT_CYCLE_ID"])
+        previous = P.read_campaign(self.root, record["campaign_id"])["cycles"][-2]
+        self.assertNotIn(previous, (y["cycle_id"], x["cycle_id"]))
+        self.assertEqual(env[PARENT_VAR], str(P._cycle_artifacts_dir(self.root, previous)))
+
+    def test_a163f_4b_the_composing_anchor_is_the_same_whichever_process_prepares_the_env(self):
+        """Start (depth 0), an owner launch, a worker and a bare supervisor all read the composing session."""
+        y = self.flow_cycle("sess-A")
+        self.flow_cycle("sess-B")
+        with self.session("sess-A"):
+            route, route_file = self.route("direct", slug="next-a", campaign_key="mixed")
+            R._record_route_chain(route, str(route_file), "compose")
+        expected = str((Path(y["cycle_dir"]) / "artifacts").resolve())
+        seen = {}
+        for label, sid, depth in (("start", "sess-A", None), ("owner-launch", "sess-A", 0),
+                                  ("worker-session", "worker-D", 1), ("bare-supervisor", None, None),
+                                  ("other-session", "sess-B", None)):
+            with self.session(sid, depth):
+                seen[label] = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)[PARENT_VAR]
+        self.assertEqual(seen, {label: expected for label in seen})
+        with self.session("worker-D", 1):
+            self.assertIsNone(self.chain.writer_identity())
+            self.assertEqual(self.chain.composing_anchor(route["route_id"]), ("claude", "sess-A"))
+
+    def test_a163f_4d_an_older_composing_ledger_is_found_past_more_than_sixty_four_newer_unrelated_ones(self):
+        """The composing session is found by the route's own creation time, not by how many ledgers are newer."""
+        y = self.flow_cycle("sess-A")
+        self.flow_cycle("sess-B")                      # a newer same-capability cycle: the wrong answer if the anchor is missed
+        with self.session("sess-A"):
+            route, route_file = self.route("direct", slug="next-a", campaign_key="mixed")
+            R._record_route_chain(route, str(route_file), "compose")
+        now = time.time()
+        os.utime(route_file, (now - 2000, now - 2000))                         # the route was written long ago
+        with self.session("sess-A"):
+            os.utime(self.chain.ledger_path("claude", "sess-A"), (now - 1000, now - 1000))
+        unrelated = {"route_id": "rt-" + "9" * 32, "artifact_root": str(self.root), "campaign_key": "mixed"}
+        for n in range(self.chain.ANCHOR_SCAN_FILES + 6):
+            sid = f"busy-{n}"
+            with self.session(sid):
+                self.assertTrue(self.chain.append("claude", sid, self.chain.build_line(
+                    unrelated, event="compose", harness="claude", session_id=sid, route_file="/x/route.json")))
+        expected = str((Path(y["cycle_dir"]) / "artifacts").resolve())
+        with self.session(None):
+            self.assertEqual(P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)[PARENT_VAR], expected)
+
+    def test_a163f_4c_two_sessions_claiming_one_route_and_a_start_only_line_give_no_anchor(self):
+        route = {"route_id": "rt-" + "1" * 32, "artifact_root": str(self.root), "campaign_key": "mixed"}
+        for sid, event in (("sess-A", "compose"), ("sess-B", "compose"), ("sess-C", "start")):
+            with self.session(sid):
+                line = self.chain.build_line(route, event=event, harness="claude", session_id=sid,
+                                             route_file="/x/route.json")
+                self.assertTrue(self.chain.append("claude", sid, line))
+        with self.session("sess-C"):
+            self.assertIsNone(self.chain.composing_anchor(route["route_id"]))
+        lone = {**route, "route_id": "rt-" + "2" * 32}
+        with self.session("sess-A"):
+            self.assertTrue(self.chain.append("claude", "sess-A", self.chain.build_line(
+                lone, event="start", harness="claude", session_id="sess-A", route_file="/x/route.json")))
+            self.assertIsNone(self.chain.composing_anchor(lone["route_id"]))
 
 
 if __name__ == "__main__":

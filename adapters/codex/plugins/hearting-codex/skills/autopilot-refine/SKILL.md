@@ -1,6 +1,6 @@
 ---
 name: autopilot-refine
-description: "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history. Not for new documents, empirical work, or evaluation/result reporting (lab)."
+description: "Use when documents need factual, structural, stylistic, or review-driven correction; preserve history. Owns revision; default preset. Not for new documents, empirical work, or evaluation/result reporting (lab)."
 ---
 
 # autopilot-refine

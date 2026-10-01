@@ -437,6 +437,50 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             0,
         )
 
+    def test_input_queued_before_the_first_turn_reaches_that_turn(self):
+        import dispatch_owner_input as owner_input
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        owner_input.submit(self.jobs, PARENT, "early word", "early")
+        result = self.run_supervisor(FAKE_NO_CHILD="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(len(trace), 1)
+        self.assertIn("early word", trace[0]["prompt"])
+        receipt = owner_input.inspect(self.jobs, PARENT)
+        self.assertEqual(receipt["requests"][0]["state"], "turn-completed")
+        self.assertEqual(receipt["requests"][0]["thread_id"], "thread-1")
+        self.assertFalse(receipt["accepting"])
+
+    def test_runtime_v1_owner_without_route_arguments_finishes(self):
+        self.jobs.write_text(
+            owner_row(self.lease).replace("attempt_id=", "workflow_completion=runtime-v1,attempt_id="),
+            encoding="utf-8")
+        result = self.run_supervisor(FAKE_NO_CHILD="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_start_failure_before_the_first_consumer_leaves_the_input_undelivered(self):
+        import dispatch_owner_input as owner_input
+        broken = self.base / "broken.py"
+        broken.write_text(
+            "import json,sys\n"
+            "v=json.loads(sys.stdin.readline())\n"
+            "print(json.dumps({'id':v['id'],'result':{'ok':1}}),flush=True)\n",
+            encoding="utf-8",
+        )
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        owner_input.submit(self.jobs, PARENT, "early word", "early")
+        result = subprocess.run(
+            self.command(broken_app=broken), input="initial assignment", text=True,
+            capture_output=True, env={**os.environ, "FAKE_TRACE": str(self.trace)}, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("\tdone\t/repo\t/wt\towner\t", self.jobs.read_text(encoding="utf-8"))
+        receipt = owner_input.inspect(self.jobs, PARENT)
+        self.assertFalse(receipt["accepting"])
+        self.assertEqual(receipt["requests"][0]["delivery_observation"], "undelivered")
+        self.assertTrue(owner_input.unresolved(self.jobs, PARENT))
+
     def test_terminal_state_write_failure_does_not_replace_classified_exit(self):
         self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
         result = self.run_supervisor(

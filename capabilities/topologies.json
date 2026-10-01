@@ -166,8 +166,7 @@
             "unit": "qa/code-review",
             "model_profile": "light",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "explicit-handback"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -245,16 +244,8 @@
         "apply-verify",
         "apply-handback"
       ],
-      "human_gates": [
-        "explicit-handback"
-      ],
-      "human_gate_bindings": [
-        {
-          "gate": "explicit-handback",
-          "node": "handback",
-          "position": "entry"
-        }
-      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
       "resume_retry_boundaries": [
         "apply",
         "verify"
@@ -1808,8 +1799,7 @@
             "unit": "qa/ml-debug",
             "model_profile": "balanced-deep",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "full-run-authorization"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -2005,16 +1995,8 @@
         "lab-run-verify",
         "lab-setup-handoff"
       ],
-      "human_gates": [
-        "full-run-authorization"
-      ],
-      "human_gate_bindings": [
-        {
-          "gate": "full-run-authorization",
-          "node": "full-run",
-          "position": "entry"
-        }
-      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
       "resume_retry_boundaries": [
         "scaffold",
         "smoke",
@@ -3039,8 +3021,7 @@
             "unit": "qa/security-review",
             "model_profile": "balanced-deep",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "deploy-authorization"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -3075,8 +3056,7 @@
             "unit": "qa/code-review",
             "model_profile": "light",
             "continuation": {
-              "kind": "human-gate",
-              "gate": "deploy-authorization"
+              "kind": "inline-next"
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
@@ -3233,16 +3213,8 @@
         "ship-deploy",
         "ship-post-deploy-verify"
       ],
-      "human_gates": [
-        "deploy-authorization"
-      ],
-      "human_gate_bindings": [
-        {
-          "gate": "deploy-authorization",
-          "node": "deploy",
-          "position": "entry"
-        }
-      ],
+      "human_gates": [],
+      "human_gate_bindings": [],
       "resume_retry_boundaries": [
         "release-setup",
         "security-review",
@@ -4042,6 +4014,141 @@
         "target_relative": true,
         "review_anchor": "reviews"
       }
+    },
+    {
+      "capability": "route-frame",
+      "modes": [
+        "default"
+      ],
+      "topology_class": "staged",
+      "direct_predicates": [
+        "atomic-outcome"
+      ],
+      "promotion_signals": [],
+      "quick": {
+        "topology": "one-shot-owner",
+        "worker_kind": "capability-owner",
+        "write_scope": [
+          "shards/frame/**"
+        ],
+        "owner_dispatch_depth": 1,
+        "max_dispatch_depth": 1,
+        "model_profile": "balanced-deep"
+      },
+      "standard_plus": {
+        "topology": "staged",
+        "nodes": [
+          {
+            "id": "frame",
+            "kind": "map-worker",
+            "depends_on": [],
+            "role": "deep maker",
+            "inputs": [
+              "task"
+            ],
+            "outputs": [
+              "shards/frame/direction-brief.md"
+            ],
+            "write_scope": [
+              "shards/frame/**"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "route-frame",
+            "dispatch_depth": 1,
+            "launch_authority": "depth-0",
+            "worker_type": "frame",
+            "unit": "plan/frame",
+            "model_profile": "deep",
+            "continuation": {
+              "kind": "human-gate",
+              "gate": "frame-review"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          },
+          {
+            "id": "frame-alternative",
+            "kind": "map-worker",
+            "depends_on": [],
+            "role": "deep maker",
+            "inputs": [
+              "task"
+            ],
+            "outputs": [
+              "shards/frame-alternative/direction-brief.md"
+            ],
+            "write_scope": [
+              "shards/frame-alternative/**"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "route-frame",
+            "dispatch_depth": 1,
+            "launch_authority": "depth-0",
+            "worker_type": "frame",
+            "unit": "plan/frame",
+            "model_profile": "deep",
+            "continuation": {
+              "kind": "human-gate",
+              "gate": "frame-review"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          },
+          {
+            "id": "route-decision",
+            "kind": "runtime-terminal",
+            "depends_on": [
+              "frame",
+              "frame-alternative"
+            ],
+            "inputs": [
+              "shards/frame/direction-brief.md",
+              "shards/frame-alternative/direction-brief.md"
+            ],
+            "outputs": [
+              "shards/frame/route-decision.json"
+            ],
+            "write_scope": [
+              "shards/frame/route-decision.json"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "route-decision",
+            "dispatch_depth": 0,
+            "execution_surface": "inline",
+            "registered_worker": false,
+            "terminal": true,
+            "terminal_gate": "route-decision",
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          }
+        ],
+        "owner_dispatch_depth": 1,
+        "max_dispatch_depth": 1
+      },
+      "completion_gates": [
+        "route-frame",
+        "route-decision"
+      ],
+      "human_gates": [
+        "frame-review"
+      ],
+      "human_gate_bindings": [
+        {
+          "gate": "frame-review",
+          "node": "route-decision",
+          "position": "entry"
+        }
+      ],
+      "resume_retry_boundaries": [
+        "frame",
+        "frame-alternative"
+      ],
+      "artifact_scope": {
+        "cycle_anchors": [
+          "campaigns/<campaign-locator>/<cycle-locator>/artifacts"
+        ],
+        "map_anchor": "shards"
+      }
     }
   ],
   "execution_surfaces": [
@@ -4188,7 +4295,7 @@
     },
     "authorized-full-run": {
       "kind": "custom",
-      "doc": "human-gated detached resource run; not an agent gate"
+      "doc": "supervised detached resource run; approval is obtained at route start"
     },
     "hash-bound-eval": {
       "kind": "custom",
@@ -4331,6 +4438,22 @@
     "spec-frame": {
       "kind": "unit-io",
       "unit": "plan/frame"
+    },
+    "lab-diagnose": {
+      "kind": "unit-io",
+      "unit": "qa/ml-debug"
+    },
+    "lab-eval-spec": {
+      "kind": "unit-io",
+      "unit": "plan/plan-author"
+    },
+    "route-frame": {
+      "kind": "unit-io",
+      "unit": "plan/frame"
+    },
+    "route-decision": {
+      "kind": "custom",
+      "doc": "capabilities/route-frame.md: runtime terminal record route_decision_v1, fixed by the runtime after the single frame interview; no model attempt"
     }
   },
   "model_profiles": {
@@ -4564,5 +4687,435 @@
       "active": "denied"
     },
     "write_oracle": "utilities/artifact_producer.py check-write"
+  },
+  "part_catalog": {
+    "schema_version": 1,
+    "frame": {
+      "template": {
+        "kind": "map-worker",
+        "unit": "plan/frame",
+        "worker_type": "frame",
+        "role": "deep maker",
+        "dispatch_depth": 1,
+        "launch_authority": "depth-0",
+        "brief": "direction-brief.md: sections 1-7 plus section 8 (route assembly proposal)"
+      },
+      "aliases": [
+        "frame",
+        "frame-alternative"
+      ],
+      "brief_outputs": [
+        "shards/frame/direction-brief.md",
+        "shards/frame-alternative/direction-brief.md"
+      ],
+      "briefs": {
+        "autopilot-code": {
+          "consumer": "plan",
+          "inputs": [
+            "shards/frame/direction-brief.md",
+            "shards/frame-alternative/direction-brief.md"
+          ]
+        },
+        "autopilot-draft": {
+          "consumer": "material-strategy",
+          "inputs": [
+            "shards/frame/direction-brief.md",
+            "shards/frame-alternative/direction-brief.md"
+          ]
+        },
+        "autopilot-refine": {
+          "consumer": "review",
+          "inputs": [
+            "shards/frame/direction-brief.md",
+            "shards/frame-alternative/direction-brief.md"
+          ]
+        },
+        "autopilot-design": {
+          "consumer": "refs",
+          "inputs": [
+            "designs/<cycle>/01_refs/frame/direction-brief.md",
+            "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"
+          ]
+        },
+        "autopilot-spec": {
+          "consumer": "research",
+          "inputs": [
+            "spec/_internal/research/frame/direction-brief.md",
+            "spec/_internal/research/frame-alternative/direction-brief.md"
+          ]
+        }
+      }
+    },
+    "hosts": {
+      "audit": {
+        "map_anchor": "shards"
+      },
+      "analyze-project": {
+        "map_anchor": "shards"
+      }
+    },
+    "parts": {
+      "autopilot-apply:apply": {
+        "summary": "Apply the approved cheatsheet to the target artifact and log what changed."
+      },
+      "autopilot-apply:verify": {
+        "summary": "Check the applied artifact against the cheatsheet and write a verdict."
+      },
+      "autopilot-apply:handback": {
+        "summary": "Owner records the handback of the applied artifact.",
+        "start_approval": "handback"
+      },
+      "autopilot-code:frame": {
+        "summary": "Direction brief for this recipe; compatibility alias of the one frame part."
+      },
+      "autopilot-code:frame-alternative": {
+        "summary": "Alternative direction brief; compatibility alias of the one frame part."
+      },
+      "autopilot-code:plan": {
+        "summary": "Write the implementation plan and checklist."
+      },
+      "autopilot-code:plan-check": {
+        "summary": "Review the plan before implementation starts."
+      },
+      "autopilot-code:execute": {
+        "summary": "Implement the plan in the source tree and keep dev logs."
+      },
+      "autopilot-code:impl-review": {
+        "summary": "Review the implementation diff against the plan."
+      },
+      "autopilot-code:test": {
+        "summary": "Run the verification the plan names and record the evidence."
+      },
+      "autopilot-code:report": {
+        "summary": "Write the change report and pipeline summary."
+      },
+      "autopilot-design:frame": {
+        "summary": "Direction brief for this recipe; compatibility alias of the one frame part."
+      },
+      "autopilot-design:frame-alternative": {
+        "summary": "Alternative direction brief; compatibility alias of the one frame part."
+      },
+      "autopilot-design:refs": {
+        "summary": "Collect visual references and write the reference brief."
+      },
+      "autopilot-design:build": {
+        "summary": "Build design tokens, components and previews."
+      },
+      "autopilot-design:visual-verify": {
+        "summary": "Check renders against the token and component contract."
+      },
+      "autopilot-design:critic-review": {
+        "summary": "Critique the design for quality and breakage."
+      },
+      "autopilot-design:handoff": {
+        "summary": "Package the development handoff."
+      },
+      "autopilot-draft:frame": {
+        "summary": "Direction brief for this recipe; compatibility alias of the one frame part."
+      },
+      "autopilot-draft:frame-alternative": {
+        "summary": "Alternative direction brief; compatibility alias of the one frame part."
+      },
+      "autopilot-draft:material-strategy": {
+        "summary": "Map the source material to an evidence map and a document strategy."
+      },
+      "autopilot-draft:strategy-review": {
+        "summary": "Fact-check the evidence map and strategy."
+      },
+      "autopilot-draft:draft-production": {
+        "summary": "Write the draft from the approved strategy."
+      },
+      "autopilot-draft:quality-review": {
+        "summary": "Review the draft for structure and style."
+      },
+      "autopilot-draft:fact-verify": {
+        "summary": "Verify the draft's claims against the evidence map."
+      },
+      "autopilot-draft:finalize": {
+        "summary": "Produce the final document and the pipeline summary."
+      },
+      "autopilot-lab:scaffold": {
+        "summary": "Create the experiment scaffold and config from the setup contract."
+      },
+      "autopilot-lab:smoke": {
+        "summary": "Run a minimal smoke pass and write the hash-bound smoke attestation.",
+        "shareable": true,
+        "hosts": [
+          "autopilot-code",
+          "autopilot-lab"
+        ]
+      },
+      "autopilot-lab:full-run": {
+        "summary": "Detached full training or benchmark run bound to a smoke attestation.",
+        "shareable": true,
+        "hosts": [
+          "autopilot-code",
+          "autopilot-lab"
+        ],
+        "start_approval": "full-run"
+      },
+      "autopilot-lab:run-verify": {
+        "summary": "Check the finished run's record, logs and artifact."
+      },
+      "autopilot-lab:handoff": {
+        "summary": "Owner records the successor workflow for the finished run."
+      },
+      "autopilot-lab:eval-run": {
+        "summary": "Detached evaluation run bound to checkpoint, eval-spec and smoke attestation.",
+        "input_names": {
+          "smoke-attestation": "reviews/smoke-attestation.json",
+          "eval-spec": "eval-spec.md"
+        }
+      },
+      "autopilot-lab:metrics": {
+        "summary": "Compute metrics and summary statistics from raw results.",
+        "unit_choices": [
+          "material/data-script",
+          "qa/ml-debug"
+        ]
+      },
+      "autopilot-lab:media": {
+        "summary": "Generate figures and playable media for the report."
+      },
+      "autopilot-lab:report": {
+        "summary": "Assemble the experiment report, index page and manifest."
+      },
+      "autopilot-lab:independent-verify": {
+        "summary": "Independently verify the report against its evidence."
+      },
+      "autopilot-lab:publish": {
+        "summary": "Owner publishes the verified report bundle."
+      },
+      "autopilot-lab:sync": {
+        "summary": "Owner syncs spec and notes with the published result."
+      },
+      "autopilot-refine:frame": {
+        "summary": "Direction brief for this recipe; compatibility alias of the one frame part."
+      },
+      "autopilot-refine:frame-alternative": {
+        "summary": "Alternative direction brief; compatibility alias of the one frame part."
+      },
+      "autopilot-refine:review": {
+        "summary": "Review the target artifact against its source evidence and write the refine verdict."
+      },
+      "autopilot-refine:transaction": {
+        "summary": "Owner snapshots, previews and applies the revision."
+      },
+      "autopilot-research:retrieval": {
+        "summary": "Parallel source retrieval into shards.",
+        "shareable": true
+      },
+      "autopilot-research:synthesis": {
+        "summary": "Synthesize retrieval shards into an analysis summary and cards.",
+        "shareable": true
+      },
+      "autopilot-research:report": {
+        "summary": "Write the research report from the synthesis."
+      },
+      "autopilot-research:claim-verify": {
+        "summary": "Verify the report's claims against the cards."
+      },
+      "autopilot-ship:release-setup": {
+        "summary": "Owner prepares release configuration and the ship checklist."
+      },
+      "autopilot-ship:security-review": {
+        "summary": "Security review of the release configuration."
+      },
+      "autopilot-ship:release-review": {
+        "summary": "Release readiness review of the configuration and checklist."
+      },
+      "autopilot-ship:deploy": {
+        "summary": "Owner performs the authorized deployment and records it.",
+        "start_approval": "deploy"
+      },
+      "autopilot-ship:post-deploy-verify": {
+        "summary": "Verify the deployment from its record."
+      },
+      "autopilot-ship:package": {
+        "summary": "Owner assembles a delivery archive from existing artifacts."
+      },
+      "autopilot-spec:frame": {
+        "summary": "Direction brief for this recipe; compatibility alias of the one frame part."
+      },
+      "autopilot-spec:frame-alternative": {
+        "summary": "Alternative direction brief; compatibility alias of the one frame part."
+      },
+      "autopilot-spec:research": {
+        "summary": "Gather the evidence the specification change needs."
+      },
+      "autopilot-spec:review": {
+        "summary": "Review the research against the stated intent."
+      },
+      "autopilot-spec:prd-transaction": {
+        "summary": "Owner writes the PRD revision as one atomic transaction."
+      },
+      "analyze-project:analyze": {
+        "summary": "Analyze the source tree and write the project analysis."
+      },
+      "analyze-project:qa": {
+        "summary": "Check the analysis against the source."
+      },
+      "analyze-user:profile": {
+        "summary": "Infer and write the cross-project user profile."
+      },
+      "analyze-user:verify": {
+        "summary": "Fact-check the profile against its evidence."
+      },
+      "audit:inspect": {
+        "summary": "Inspect the target artifact for drift, omissions and unsupported claims."
+      },
+      "audit:report": {
+        "summary": "Write the audit report from the inspection findings.",
+        "unit_choices": [
+          "editorial/polish",
+          "research/research-survey"
+        ]
+      },
+      "autopilot-lab:diagnose": {
+        "summary": "Diagnose why results look the way they do: hypotheses, reproduction conditions, verdict, falsifying experiment.",
+        "shareable": true,
+        "optional_inputs": [
+          "field-samples",
+          "repro-conditions"
+        ],
+        "optional": {
+          "modes": [
+            "eval"
+          ],
+          "after": [
+            "metrics"
+          ],
+          "before": [],
+          "node": {
+            "id": "diagnose",
+            "kind": "review-worker",
+            "depends_on": [],
+            "role": "deep reviewer",
+            "inputs": [
+              "raw-results/**",
+              "summary-stats.json"
+            ],
+            "outputs": [
+              "reviews/diagnosis.md"
+            ],
+            "write_scope": [
+              "reviews/diagnosis/**",
+              "reviews/diagnosis.md"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "lab-diagnose",
+            "dispatch_depth": 2,
+            "fallback_hops": [
+              "same-harness-headless",
+              "cross-harness-headless",
+              "native-subagent",
+              "inline"
+            ],
+            "unit": "qa/ml-debug",
+            "model_profile": "balanced-deep",
+            "continuation": {
+              "kind": "inline-next"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          }
+        }
+      },
+      "autopilot-lab:eval-spec": {
+        "summary": "Write the evaluation contract: data, checkpoint, metrics and comparison baseline.",
+        "optional": {
+          "modes": [
+            "eval"
+          ],
+          "after": [],
+          "before": [
+            "eval-smoke",
+            "eval-run"
+          ],
+          "node": {
+            "id": "eval-spec",
+            "kind": "pipeline-stage",
+            "depends_on": [],
+            "role": "deep maker",
+            "inputs": [
+              "task",
+              "checkpoint"
+            ],
+            "outputs": [
+              "eval-spec.md"
+            ],
+            "write_scope": [
+              "eval-spec.md"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "lab-eval-spec",
+            "dispatch_depth": 2,
+            "fallback_hops": [
+              "same-harness-headless",
+              "cross-harness-headless",
+              "inline"
+            ],
+            "unit": "plan/plan-author",
+            "model_profile": "balanced-deep",
+            "continuation": {
+              "kind": "inline-next"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          }
+        }
+      },
+      "autopilot-lab:eval-smoke": {
+        "summary": "Small evaluation pass that writes a smoke attestation hash-bound to checkpoint, eval-spec and config snapshot.",
+        "input_names": {
+          "eval-spec": "eval-spec.md"
+        },
+        "optional": {
+          "modes": [
+            "eval"
+          ],
+          "after": [
+            "eval-spec"
+          ],
+          "before": [
+            "eval-run"
+          ],
+          "node": {
+            "id": "eval-smoke",
+            "kind": "review-worker",
+            "depends_on": [],
+            "role": "deep reviewer",
+            "inputs": [
+              "checkpoint",
+              "eval-spec",
+              "config"
+            ],
+            "outputs": [
+              "reviews/smoke-attestation.json"
+            ],
+            "write_scope": [
+              "reviews/smoke/**",
+              "reviews/smoke-attestation.json"
+            ],
+            "resource_class": "normal",
+            "completion_gate": "hash-bound-smoke",
+            "dispatch_depth": 2,
+            "fallback_hops": [
+              "same-harness-headless",
+              "cross-harness-headless",
+              "native-subagent",
+              "inline"
+            ],
+            "unit": "qa/ml-debug",
+            "model_profile": "balanced-deep",
+            "continuation": {
+              "kind": "inline-next"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          }
+        }
+      }
+    }
   }
 }

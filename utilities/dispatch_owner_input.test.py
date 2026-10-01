@@ -324,5 +324,169 @@ for line in sys.stdin:
         self.assertEqual(self.state()[0]['turn_id'], 'active-one')
 
 
+class RegisteredOwnerInputTest(unittest.TestCase):
+    """Input admitted between registration and the first consumer."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.jobs = self.root / 'jobs.log'
+        self.attempt = FIXTURE.PARENT
+        self.lease = supervisor_lease_path(self.jobs, self.attempt)
+        self.jobs.write_text(FIXTURE.owner_row(self.lease))
+        self.events = []
+
+    def close_row(self):
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
+
+    def state_file(self):
+        return I._path(self.jobs, self.attempt)
+
+    def test_initialize_is_idempotent_and_keeps_queued_input(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        first = json.loads(self.state_file().read_text())
+        self.assertEqual(first['thread_id'], I.PLACEHOLDER_THREAD)
+        self.assertNotIn('generation', first)
+        self.assertTrue(first['accepting'])
+        I.submit(self.jobs, self.attempt, 'before the first turn', 'early')
+        before = self.state_file().read_bytes()
+        I.initialize_owner_input(self.jobs, self.attempt, 'claude-next-turn')
+        self.assertEqual(self.state_file().read_bytes(), before)
+
+    def test_correction_before_first_consumer_is_accepted_and_observed_queued(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        receipt = I.submit(self.jobs, self.attempt, 'early word', 'early')
+        self.assertTrue(receipt['accepting'])
+        self.assertFalse(receipt['supervisor_live'])
+        observed = I.inspect(self.jobs, self.attempt)
+        self.assertTrue(observed['accepting'])
+        self.assertFalse(observed['supervisor_live'])
+        self.assertEqual(observed['requests'][0]['state'], 'queued')
+        self.assertEqual(observed['requests'][0]['delivery_observation'], 'queued')
+        self.assertFalse(I.unresolved(self.jobs, self.attempt))
+        again = I.submit(self.jobs, self.attempt, 'early word', 'early')
+        self.assertTrue(again['duplicate'])
+        with self.assertRaisesRegex(I.InputError, 'content-conflict'):
+            I.submit(self.jobs, self.attempt, 'other word', 'early')
+
+    def test_first_consumer_inherits_the_queue_for_any_real_thread(self):
+        for thread, transport in (('thread-real', 'codex-active-turn'),
+                                  ('11111111-2222-3333-4444-555555555555', 'claude-next-turn'),
+                                  (I.PLACEHOLDER_THREAD, 'opencode-next-turn')):
+            with self.subTest(thread=thread):
+                self.setUp()
+                I.initialize_owner_input(self.jobs, self.attempt, transport)
+                I.submit(self.jobs, self.attempt, 'early word', 'early')
+                with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+                    control = I.OwnerInput(self.jobs, self.attempt, thread, transport, self.events.append)
+                    self.assertEqual(I.inspect(self.jobs, self.attempt)['requests'][0]['state'], 'queued')
+                    self.assertIn('early word', control.prepare('first turn'))
+                    if thread == I.PLACEHOLDER_THREAD:
+                        control.bind_initial_thread('ses_real')
+                    control.started('turn-1')
+                    control.completed('turn-1')
+                    receipt = I.inspect(self.jobs, self.attempt)
+                    self.assertEqual(receipt['requests'][0]['state'], 'turn-completed')
+                    self.assertEqual(receipt['requests'][0]['thread_id'],
+                                     'ses_real' if thread == I.PLACEHOLDER_THREAD else thread)
+
+    def test_consumer_that_attached_and_died_does_not_reopen_admission(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+        # The consumer is gone but the row is still open.
+        with self.assertRaisesRegex(I.InputError, 'unavailable'):
+            I.submit(self.jobs, self.attempt, 'too late')
+        before = self.state_file().read_bytes()
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        self.assertEqual(self.state_file().read_bytes(), before)
+        with self.assertRaisesRegex(I.InputError, 'unavailable'):
+            I.submit(self.jobs, self.attempt, 'still too late')
+
+    def test_consumer_that_never_attached_leaves_an_unresolved_undelivered_input(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        I.submit(self.jobs, self.attempt, 'never delivered', 'early')
+        self.assertFalse(I.unresolved(self.jobs, self.attempt))
+        self.close_row()
+        self.assertTrue(I.unresolved(self.jobs, self.attempt))
+        observed = I.inspect(self.jobs, self.attempt)
+        self.assertFalse(observed['accepting'])
+        self.assertFalse(observed['supervisor_live'])
+        self.assertEqual(observed['requests'][0]['state'], 'queued')
+        self.assertEqual(observed['requests'][0]['delivery_observation'], 'undelivered')
+        with self.assertRaisesRegex(I.InputError, 'unavailable'):
+            I.submit(self.jobs, self.attempt, 'after the row closed')
+
+    def test_initialize_refuses_closed_non_owner_and_changed_identity(self):
+        self.close_row()
+        with self.assertRaisesRegex(I.InputError, 'unavailable'):
+            I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        self.assertFalse(self.state_file().exists())
+        self.setUp()
+        self.jobs.write_text(self.jobs.read_text().replace('worker_type=owner', 'worker_type=stage'))
+        with self.assertRaisesRegex(I.InputError, 'not-owner'):
+            I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        self.assertFalse(self.state_file().exists())
+        self.setUp()
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+        self.jobs.write_text(self.jobs.read_text().replace('d' * 64, 'e' * 64))
+        with self.assertRaisesRegex(I.InputError, 'target-changed'):
+            I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        with self.assertRaisesRegex(I.InputError, 'target-changed'):
+            I.submit(self.jobs, self.attempt, 'wrong nonce')
+
+    def test_relaunched_row_keeps_input_queued_before_the_first_consumer(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        I.submit(self.jobs, self.attempt, 'before the relaunch', 'early')
+        # The next launcher of the same never-claimed attempt mints its own lease nonce.
+        self.jobs.write_text(self.jobs.read_text().replace('d' * 64, 'e' * 64))
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        observed = I.inspect(self.jobs, self.attempt)
+        self.assertTrue(observed['accepting'])
+        self.assertEqual([item['state'] for item in observed['requests']], ['queued'])
+        I.submit(self.jobs, self.attempt, 'after the relaunch', 'late')
+        # A consumer binding after the row changed again inherits the same queue.
+        self.jobs.write_text(self.jobs.read_text().replace('e' * 64, 'f' * 64))
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            consumer = I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+            self.assertTrue(consumer.pending())
+        states = {item['id']: item['state'] for item in I.inspect(self.jobs, self.attempt)['requests']}
+        self.assertEqual(states, {'early': 'queued', 'late': 'queued'})
+
+    def test_unsupported_owner_creates_no_lock_or_state(self):
+        for call in (lambda: I.inspect(self.jobs, self.attempt),
+                     lambda: I.submit(self.jobs, self.attempt, 'text'),
+                     lambda: I.unresolved(self.jobs, self.attempt)):
+            try:
+                self.assertFalse(call())
+            except I.InputError as exc:
+                self.assertIn('unsupported', str(exc))
+        self.assertEqual(sorted(p.name for p in self.root.rglob('*.input.json*')), [])
+
+    def test_submissions_racing_the_first_consumer_are_all_kept(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        errors = []
+        def send(n):
+            try:
+                I.submit(self.jobs, self.attempt, 'word %d' % n, 'r%d' % n)
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=send, args=(n,)) for n in range(6)]
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            for t in threads[:3]: t.start()
+            control = I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+            for t in threads[3:]: t.start()
+            for t in threads: t.join()
+            self.assertEqual(errors, [])
+            prompt = control.prepare('first turn')
+            states = {r['id']: r['state'] for r in I.inspect(self.jobs, self.attempt)['requests']}
+            self.assertEqual(len(states), 6)
+            self.assertEqual(set(states.values()), {'sending'})
+            self.assertEqual(sum('"text": "word' in line for line in prompt.splitlines()), 6)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -61,7 +61,9 @@ if grep -q 'body-marker-korean' "$TMP/korean.out"; then exit 1; fi
 [ ! -s "$TMP/body-only.out" ]
 if grep -q "$body_only" "$TMP/body-only.out"; then exit 1; fi
 
-(cd "$TMP/project-a" && python3 "$MEM" candidates 'candidate cap shared' \
+# The six-record cap is checked with the display history off: session-a was already
+# shown some of these records by the queries above.
+(cd "$TMP/project-a" && MEM_CANDIDATE_DEDUP=0 python3 "$MEM" candidates 'candidate cap shared' \
   --limit 99 --max-bytes 99999 --session-id session-a --turn-id turn-d \
   > "$TMP/cap.out")
 [ "$(grep -c '^- \[' "$TMP/cap.out")" -eq 6 ]

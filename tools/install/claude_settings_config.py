@@ -8,6 +8,7 @@ removes retired harness hook registrations while preserving user settings.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import paths
@@ -74,6 +75,17 @@ _RETIRED_HOOKS = (
 )
 
 
+# The SessionEnd `mem.py sync` registration older releases shipped (D-82: memory
+# now exchanges after writes and reads, not at session end). Only the managed
+# spelling matches: the worker-guard `sh -c` wrapper around the harness's own
+# `$HOME/.claude/tools/memory/mem.py`. A user's own `mem sync` hook is left alone.
+_RETIRED_SESSION_END_MEM_SYNC = re.compile(
+    r"""^sh -c 'if \[ [^']*AGENT_SESSION_ROLE[^']* \]; then exit 0; fi; exec """
+    r"""(?:env MEM_DUMP_PUSH=1 )?python3 "\$HOME/\.claude/tools/memory/mem\.py" """
+    r"""sync(?: --json)?(?: >/dev/null)?'$"""
+)
+
+
 def retire_hook_registrations(path: Path, *, dry_run: bool = False) -> dict:
     """Remove only retired Hearting commands, retaining user settings and hooks."""
     import safe_fs
@@ -100,7 +112,6 @@ def retire_hook_registrations(path: Path, *, dry_run: bool = False) -> dict:
 
 def remove_retired_hooks(data: dict) -> bool:
     """Filter known retired harness registrations in a settings object in place."""
-    import re
     events = data.get("hooks", {})
     changed = False
     for event, groups in list(events.items()):
@@ -118,6 +129,8 @@ def remove_retired_hooks(data: dict) -> bool:
                 retired = any(re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', command)
                               for name in _RETIRED_HOOKS)
                 retired = retired or ('worker-state-compact.py' in command and 'guard-write' in command)
+                if event == "SessionEnd" and _RETIRED_SESSION_END_MEM_SYNC.match(command):
+                    owned = retired = True
                 if owned and retired:
                     changed = True
                 else:

@@ -46,7 +46,8 @@ closes route/cycle at success or once idle. The commands below remain low-level 
 
 Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
 capability that owns the artifacts; §0.2.1 then picks the **shape** of the
-work before any preset. `direct`, `solo`, and `staged` go through
+work before any preset: new non-direct work defaults to `framed` (exceptions
+there). `direct`, `solo`, `staged`, and `framed` go through
 `utilities/capability-route.py compose` (one command — cwd, artifact root,
 tracking, drift verdict, spec-read gate, and both eligibility probes default
 from the checkout; a staged `--graph execute,test,report` is your own stage
@@ -119,6 +120,9 @@ Ignore unrelated candidates and read a relevant record in full before use. If
 the prompt hook is unavailable, record `recall` or `skip` with
 `mem recall-gate`. Retrieve full pending obligations before applying or
 consuming them. Workers do not run this main-session probe.
+Call `/session-tidy` when context is filling or before compact, before handing
+work to another session, and when a large task ends; a new session receives the
+seat's card once.
 
 Context pressure is orthogonal to quality and stage graph. Ordinary hook states stay silent. Static bytes, code lines, and directive counts are footprint measures, not token or billing savings. `core/ADAPTATION.md §6.1` owns budgets; real savings claims require paired production sessions.
 

@@ -381,6 +381,12 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                         or state.get("receipt", {}).get("terminal_marker_digest") != marker_digest):
                     raise InlineFinishError("finish-seal-drift")
             result = dict(state["receipt"]); result["replay"] = replayed_at_entry
+            # Information only, projected fresh on the first finish and on every replay; the stored
+            # receipt and its identity are untouched, and nothing here starts the next leg.
+            import route_plan
+            next_leg = route_plan.next_leg_for_route(route)
+            if next_leg is not None:
+                result["next_leg"] = next_leg
             return result
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

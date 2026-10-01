@@ -44,12 +44,14 @@ count_links() {
 }
 
 # Expected counts are derived from harness-manifest.json, never hardcoded:
-# capability count, kernel-agent count, and non-internal mode count.
+# projected capability count, kernel-agent count, and non-internal mode count.
 EXPECT=$(python3 - "$ROOT" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 manifest = json.load(open(root / "harness-manifest.json"))
-capabilities = len(manifest["capabilities"])
+# A compiler-internal capability is documented but never projected as a Skill or command.
+capabilities = len([s for s in manifest["capabilities"].values()
+                    if s["invocation"]["class"] != "compiler-internal"])
 modes = len([m for m in manifest["modes"] if not m.split("/")[-1].startswith("_")])
 
 

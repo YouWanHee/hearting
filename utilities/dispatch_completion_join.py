@@ -755,8 +755,13 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
                 completion_harvest_command(child["attempt_id"], child["required_action"],
                     jobs=jobs, surface=surface) for child in receipt["children"]]
     if completed_work and all(child["attempt_id"] in completed_work for child in receipt["children"]):
+        notes = [f"The approved route plan names a next leg (index {child['next_leg']['index']}): "
+                 f"{child['next_leg']['compose_command']}" for child in receipt["children"] if child.get("next_leg")]
         return ("The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
-                "Report the result to the user. No harvest, next-stage launch, route restart, or manual finalization is required.")
+                "Report the result to the user. No harvest, next-stage launch, route restart, or manual finalization is required."
+                + ("".join("\n" + note for note in notes)
+                   + ("\nThat command is information, not an instruction: nothing starts the next leg for you; "
+                      "run it (with --start) only if you decide to continue." if notes else "")))
     if work_commands:
         text = "\n".join(dict.fromkeys(command for command in commands if command))
         return ("\n".join(parked_notes) + ("\n" if parked_notes else "")
@@ -841,6 +846,31 @@ def stamp_delivery_receipt(
     return stamped
 
 
+def _completed_next_leg(jobs: Path, attempt_id: str):
+    """`next_leg` of the route a completed registered owner ran, or None.
+
+    Only an owner whose workflow/route/cycle settlement is complete and whose bound route carries a
+    `route_plan` has one; any unreadable part means no key, never an error.
+    """
+    try:
+        row = exact_attempt_row(Path(jobs), attempt_id)
+        meta = row.metadata
+        if meta.get("worker_type") != "owner" or meta.get("dispatch_depth") != "1":
+            return None
+        from dispatch_terminal_commit import owner_completion_state
+        if owner_completion_state(Path(jobs), row.status, meta).state != "complete":
+            return None
+        from route_identity import route_hash
+        route = json.loads(Path(meta.get("owner_route_file") or meta.get("route_file") or "").read_text())
+        if (route.get("route_plan") is None or route.get("route_hash") != route_hash(route)
+                or route["route_hash"] != (meta.get("owner_route_hash") or meta.get("route_hash"))):
+            return None
+        import route_plan
+        return route_plan.next_leg_for_route(route)
+    except (OSError, ValueError, KeyError, TypeError, JoinContractError, DispatchContractError):
+        return None
+
+
 def receipt_with_delivery_observability(
     receipt: dict[str, object],
     *,
@@ -889,6 +919,12 @@ def receipt_with_delivery_observability(
             child["reason"] = "terminal-failure-or-unclosed"
         elif state.advanced:
             child["reason"] = "row-advanced"
+        # Information only: the approved route plan's next leg, never a launch or an action.
+        next_leg = _completed_next_leg(jobs, attempt_id) if classification == "success" else None
+        if next_leg is not None:
+            child["next_leg"] = next_leg
+        else:
+            child.pop("next_leg", None)
         children.append(child)
         classifications.append(classification)
     projected = dict(receipt)
