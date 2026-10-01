@@ -221,13 +221,12 @@ def prepare(args) -> int:
     if capability not in {"autopilot-refine","autopilot-draft"}:
         emit({"status":"skipped","reason":"capability-does-not-own-snapshots","target":str(target)})
         return 0
-    if capability == "autopilot-refine":
+    if capability == "autopilot-refine" and intensity == "quick":
         from artifact_producer import _quick_refine_write_gate, ProducerError
         try:
             _quick_refine_write_gate(artifact_root, target, route)
         except ProducerError as exc:
             raise SnapshotError(exc.code + ": " + exc.detail) from exc
-    if capability == "autopilot-refine" and intensity == "quick":
         # The preview is output of this same conductor, before approval. It is
         # not a target document and must not enter the target snapshot path.
         rel_parts = target.resolve().relative_to(artifact_root).parts
@@ -237,6 +236,15 @@ def prepare(args) -> int:
         if rel_parts[:2] == ("reviews", "refine") and "reviews/refine/**" in node.get("write_scope", []):
             emit({"status": "skipped", "reason": "quick-preview-artifact", "target": str(target)})
             return 0
+    if capability == "autopilot-refine" and intensity != "quick":
+        # The owner's own `transaction` changes the target after the person released the preview it
+        # raised: the fence the entry gate holds for a child launch, for the step that precedes the edit.
+        import dispatch_contract
+        if node.get("id") in {gated.get("id") for gated, _gate in dispatch_contract.owner_operation_gates(route)}:
+            try:
+                dispatch_contract.owner_operation_fence(route, node, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
+            except dispatch_contract.DispatchContractError as exc:
+                raise SnapshotError(exc.reason + ": " + exc.detail) from exc
     try:
         artifact_dir,relative=target_parts(artifact_root,target)
     except SnapshotError as exc:

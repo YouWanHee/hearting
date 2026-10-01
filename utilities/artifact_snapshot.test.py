@@ -174,10 +174,13 @@ class OwnerPreviewSnapshotTest(PRODUCER_FIXTURE.OwnerRefineBase):
         doc=self.target()
         refused=self.prepare(doc)
         self.assertEqual(refused.returncode,65,refused.stdout+refused.stderr)
-        self.assertIn("preview-approval-required",refused.stderr)
+        self.assertIn("human-gate-not-raised",refused.stderr)
+        self.assertNotIn("preview-approval-required",refused.stderr)
         self.assertFalse((doc.parent/"_internal").exists())
         self.raise_gate()
-        self.assertEqual(self.prepare(doc).returncode,65)
+        unreleased=self.prepare(doc)
+        self.assertEqual(unreleased.returncode,65)
+        self.assertIn("human-gate-unreleased",unreleased.stderr)
         self.assertEqual(self.release("proceed",worker=True).returncode,64)   # an owner cannot release it
         self.assertEqual(self.prepare(doc).returncode,65)
         self.assertEqual(self.release("proceed").returncode,0)
@@ -199,26 +202,70 @@ class OwnerPreviewSnapshotTest(PRODUCER_FIXTURE.OwnerRefineBase):
                         self.assertEqual(fixture.release(decision).returncode,0)
                     refused=fixture.prepare(doc,identity_gates=True)   # a changed preview is the opt-in identity check
                     self.assertEqual(refused.returncode,65,refused.stdout+refused.stderr)
-                    self.assertIn("preview-approval-required",refused.stderr)
+                    self.assertIn("human-gate-",refused.stderr)
+                    self.assertNotIn("preview-approval-required",refused.stderr)
                 finally:
                     fixture.doCleanups()
 
-    def test_the_write_guard_holds_the_owners_target_write_the_same_way(self):
+    def test_the_general_write_guard_never_carries_the_owner_operation_fence(self):
+        # The producer's write check is not where the owner's apply is held: a refine owner's support, draft,
+        # report or preview writes are not the apply, and the target mutation is fenced at its snapshot.
         import artifact_producer as producer
         self.build("claude",close=False)
         doc=self.target()
+        artifacts=Path(self.cycle["cycle_dir"])/"artifacts"
         owner_env={"AGENT_ROUTE_FILE":str(self.path),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_ARTIFACT_ROOT":str(self.root)}
         with mock.patch.dict(os.environ,owner_env):
             os.environ.pop("AGENT_ROUTE_NODE",None)
-            checked=producer.check_write(self.root,doc)
-            self.assertEqual((checked["verdict"],checked["reason"]),("deny","preview-approval-required"),checked)
-            self.assertNotEqual(producer.check_write(self.root,self.preview).get("layout"),"inline-gate")
-            self.raise_gate()
-            self.assertEqual(self.release("proceed").returncode,0)
-            self.assertNotEqual(producer.check_write(self.root,doc).get("layout"),"inline-gate")
-        # a child stage's own write is not the owner's apply: its node is not the gated one
-        with mock.patch.dict(os.environ,{**owner_env,"AGENT_ROUTE_NODE":"review"}):
-            self.assertNotEqual(producer.check_write(self.root,doc).get("layout"),"inline-gate")
+            for support in (artifacts/"documents"/"topic"/"draft.md",artifacts/"research"/"topic"/"notes.md",
+                            artifacts/"documents"/"topic"/"_internal"/"scratch.md",self.preview,self.report,doc):
+                with self.subTest(write=str(support.relative_to(artifacts))):
+                    checked=producer.check_write(self.root,support)
+                    self.assertNotEqual(checked.get("layout"),"inline-gate",checked)
+                    self.assertNotEqual(checked.get("reason"),"preview-approval-required",checked)
+            outside=Path(tempfile.gettempdir())/"outside-owner-write.md"
+            self.assertNotEqual(producer.check_write(self.root,outside).get("layout"),"inline-gate")
+
+    def test_a_support_or_draft_write_and_the_preview_precede_the_release(self):
+        import artifact_producer as producer
+        self.build("claude",close=False)
+        artifacts=Path(self.cycle["cycle_dir"])/"artifacts"
+        owner_env={"AGENT_ROUTE_FILE":str(self.path),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_ARTIFACT_ROOT":str(self.root)}
+        with mock.patch.dict(os.environ,owner_env):
+            os.environ.pop("AGENT_ROUTE_NODE",None)
+            for rel in ("documents/topic/draft.md","research/topic/notes.md"):
+                with self.subTest(support=rel):
+                    checked=producer.check_write(self.root,artifacts/rel)
+                    self.assertEqual(checked["verdict"],"allow",checked)
+            self.assertEqual(producer.check_write(self.root,self.preview)["verdict"],"allow")
+
+    def test_the_target_snapshot_follows_a_persons_proceed(self):
+        self.build("claude",close=False)
+        doc=self.target()
+        self.assertEqual(self.prepare(doc).returncode,65)
+        self.raise_gate()
+        self.assertEqual(self.release("proceed").returncode,0)
+        done=self.prepare(doc)
+        self.assertEqual(done.returncode,0,done.stderr)
+
+    def test_a_preview_binding_whose_owner_operation_does_not_mutate_the_target_snapshots_as_before(self):
+        self.build("claude",close=False)
+        doc=self.target()
+        route=json.loads(self.path.read_text())
+        for node in route["nodes"]:
+            if node.get("id")=="transaction":
+                node["write_scope"]=[s for s in node.get("write_scope",[]) if s!="target-artifact"]
+        other=Path(self.cycle["cycle_dir"]).parent/"nonmutating-route.json"
+        other.write_text(json.dumps(route))
+        for node in ("transaction",""):
+            with self.subTest(node=node):
+                env={**os.environ,"AGENT_ARTIFACT_ROOT":str(self.root),"AGENT_DISPATCH_JOBS":str(self.jobs)}
+                done=subprocess.run([sys.executable,str(HELPER),"prepare","--artifact-root",str(self.root),"--target",str(doc),
+                                     "--route",str(other),"--route-id",route["route_id"],"--node",node],
+                                    text=True,capture_output=True,env=env)
+                self.assertEqual(done.returncode,0,done.stderr)
+                self.assertIn("node-does-not-mutate-target",done.stdout)
+        self.assertFalse((doc.parent/"_internal").exists())
 
     def test_a_route_without_the_preview_binding_snapshots_as_before(self):
         with tempfile.TemporaryDirectory() as td:

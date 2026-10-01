@@ -447,6 +447,19 @@ class OwnerGateReachesEveryParentTest(OwnerRefineBase):
                 self.assertEqual(DR.death_kind(fields, meta, jobs=fixture.jobs), "parked")
                 self.assertEqual(fixture.continuation_calls[0]["attempt"], fixture.owner)
 
+    # Every `required_action` token `utilities/work_start.py` emitted at base 237a3e96 (the literals in it,
+    # plus `delivery_required_action`'s own). A receipt may only use one of these: a new token is a new
+    # thing every consumer would have to learn.
+    BASE_REQUIRED_ACTIONS = frozenset({
+        "advance-completed", "answer-human-gate", "ask-registered-question", "compose-again", "compose-route",
+        "execute-inline", "inspect-closed-route", "inspect-preparation", "inspect-recovery",
+        "prepare-frame-question", "report-capacity-wait", "report-gate-revision", "report-pending-work",
+        "report-unfinished-work", "report-unresolved-frame", "resume-after-capacity", "resume-inline-finish",
+        "revise-frame-question", "wait-for-first-frame-attempt", "wait-for-frame-results"})
+
+    def base_required_actions(self):
+        return self.BASE_REQUIRED_ACTIONS
+
     def test_a_raise_the_runtime_cannot_make_keeps_the_attention_receipt_and_asks_nothing(self):
         # The one case that still ends at `human-gate-not-raised`: the runtime tried to ask and the raise itself
         # was refused (a preview that stopped being provable at that moment, a ledger that cannot enter the
@@ -461,8 +474,10 @@ class OwnerGateReachesEveryParentTest(OwnerRefineBase):
                                        side_effect=ValueError("gate-carrier-refused: ledger cannot enter the gate")):
                     receipt = fixture.start(run=self.no_launch)
                 self.assertEqual((receipt["state"], receipt["reason"], receipt["required_action"], receipt["gate"]),
-                                 ("needs-attention", "human-gate-not-raised", "report-unapproved-apply",
+                                 ("needs-attention", "human-gate-not-raised", "report-unfinished-work",
                                   fixture.PREVIEW), receipt)
+                # no action token the base did not already emit (a new one is a new thing for consumers to learn)
+                self.assertIn(receipt["required_action"], self.base_required_actions())
                 self.assertEqual(Path(receipt["owner_report"]).name, "owner-report.md")
                 self.assertIn("ledger cannot enter the gate", receipt["next_step"])
                 self.assertNotIn("next_leg", receipt)

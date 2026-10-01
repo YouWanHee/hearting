@@ -1059,7 +1059,7 @@ def _owner_gate_response(route, path, jobs, aid, metadata, result):
         return None
     report = _owner_report(route, metadata)
     return {**result, "state": "needs-attention", "reason": "human-gate-not-raised",
-            "required_action": "report-unapproved-apply", "gate": unraised["gate"],
+            "required_action": "report-unfinished-work", "gate": unraised["gate"],
             **({"owner_report": report} if report else {}),
             "next_step": f"The owner exited on {unraised['node']} without ever raising human gate "
                 f"{unraised['gate']}, and the runtime could not raise it from a completed preview "
