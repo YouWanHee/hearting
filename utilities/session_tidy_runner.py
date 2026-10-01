@@ -635,8 +635,9 @@ def process_item(item: dict) -> None:
     try:
         bundle = assemble(item, batch, run_dir)
         if bundle.empty:
-            set_status(item, "notified", result="nothing-new")
+            # The notice goes first: a terminal status means "the notice was left".
             notify(item, "[정리] 새로 정리할 대화가 없습니다.")
+            set_status(item, "notified", result="nothing-new")
             return
         set_status(item, "dispatching")
         receipt = dispatch_worker(item, batch, run_dir, bundle)
@@ -647,18 +648,18 @@ def process_item(item: dict) -> None:
         set_status(item, "applying")
         line = apply_actions(item, run_dir, bundle)
         advance_watermarks(bundle)
-        set_status(item, "notified", result="applied")
         notify(item, line)
+        set_status(item, "notified", result="applied")
     except RunnerFailure as exc:
         _log(run_dir, f"failed: {exc}")
         applied = applied_writes(run_dir)
-        set_status(item, "failed", error=str(exc), applied=list(applied))
         notify(item, failure_line(str(exc), batch, applied))
+        set_status(item, "failed", error=str(exc), applied=list(applied))
     except BaseException as exc:  # noqa: BLE001 - nothing may leave an entry half-done
         _log(run_dir, f"failed: internal {type(exc).__name__}: {exc}")
         applied = applied_writes(run_dir)
-        set_status(item, "failed", error=f"internal {type(exc).__name__}", applied=list(applied))
         notify(item, failure_line(f"internal {type(exc).__name__}", batch, applied))
+        set_status(item, "failed", error=f"internal {type(exc).__name__}", applied=list(applied))
     finally:
         for name in ("input_v1.json", "prompt.md"):
             with contextlib.suppress(OSError):
