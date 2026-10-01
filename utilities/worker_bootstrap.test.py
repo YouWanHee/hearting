@@ -255,5 +255,63 @@ class NodeScopeTest(unittest.TestCase):
             self.assertNotIn(str(root / "artifact_root"), prompt)
 
 
+class OwnerGatePromptTest(unittest.TestCase):
+    """The owner's assignment names the approval gate on a node it executes itself.
+
+    Text only: the gate is still enforced by the runtime. The one shared renderer serves all
+    three adapters, so one rendering test plus a check that each adapter calls it covers them.
+    """
+
+    def _route(self, tmp: Path, *, bound=True, owner_node=True) -> Path:
+        node = {"id": "transaction", "kind": "capability-owner", "unit": "_kernel/owner",
+                "dispatch_depth": 1, "terminal": True} if owner_node else {
+                "id": "transaction", "kind": "review-worker", "unit": "editorial/review", "dispatch_depth": 2}
+        route_file = tmp / "rt-gate.json"
+        route_file.write_text(json.dumps({
+            "route_id": "rt-gate-prompt", "artifact_root": str(tmp / "artifact_root"),
+            "nodes": [{"id": "review", "dispatch_depth": 2, "unit": "editorial/review",
+                       "continuation": {"kind": "human-gate", "gate": "preview-disposition"}}, node],
+            "human_gate_bindings": ([{"gate": "preview-disposition", "node": "transaction", "position": "entry"}]
+                                    if bound else []),
+        }), encoding="utf-8")
+        return route_file
+
+    def _owner(self, route_file, *, via_binding=False):
+        binding = SimpleNamespace(route_file=str(route_file), route_id="rt-gate-prompt")
+        return SimpleNamespace(worker_type="owner", route_file=None if via_binding else str(route_file),
+                               route_node=None, owner_route_binding=binding if via_binding else None,
+                               jobs="/tmp/jobs.log")
+
+    def test_the_owner_is_told_to_raise_the_gate_before_applying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            route_file = self._route(Path(tmp))
+            for via_binding in (False, True):
+                with self.subTest(via_binding=via_binding):
+                    prompt = W.assignment_prompt(self._owner(route_file, via_binding=via_binding), "Refine it", {})
+                    self.assertIn("preview-disposition", prompt)
+                    self.assertIn("transaction", prompt)
+                    self.assertIn("workflow-supervisor.py gate --route", prompt)
+                    self.assertIn("--block", prompt)
+                    self.assertIn(str(route_file), prompt)
+                    self.assertIn("do not apply", prompt)
+                    self.assertIn("BLOCKED", prompt)
+
+    def test_a_route_without_the_binding_or_for_a_child_node_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = W.assignment_prompt(self._owner(self._route(Path(tmp), bound=False)), "Refine it", {})
+            self.assertNotIn("preview-disposition", plain)
+            self.assertNotIn("--block", plain)
+            child_node = W.assignment_prompt(self._owner(self._route(Path(tmp), owner_node=False)), "Refine it", {})
+            self.assertNotIn("--block", child_node)
+            stage = SimpleNamespace(worker_type="stage", route_file=str(self._route(Path(tmp))), route_node="review")
+            self.assertNotIn("--block", W.assignment_prompt(stage, "Review it", {}))
+
+    def test_all_three_adapters_render_the_assignment_through_the_shared_function(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                source = (ROOT / "adapters" / harness / "bin" / "dispatch-headless.py").read_text(encoding="utf-8")
+                self.assertIn("assignment_prompt(args, task, os.environ)", source)
+
+
 if __name__ == "__main__":
     unittest.main()

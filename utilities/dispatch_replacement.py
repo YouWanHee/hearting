@@ -394,13 +394,18 @@ def owner_parked_gate(jobs, aid, *, lines=None):
 
     A typed BLOCKED owner handoff is a pause, not a failure, when this owner raised
     a human gate after it started and the nodes the gate holds back have not begun.
+    So is a PASS owner whose gate still holds the operation it executed itself (refine's
+    `transaction` behind `preview-disposition`): its result is a proposal until the person
+    answers. That recognition only describes the wait; a passed owner is never replaced.
     Never raises; every unproven condition answers None.
     """
     try:
         rows = _rows(lines if lines is not None else Path(jobs).read_text().splitlines())
         fields, meta = rows[aid]
+        blocked = meta.get('note') == 'dead-worker-blocked'
+        proposal = (not blocked and DC.verdict_pass(meta) and meta.get('workflow_completion') == 'runtime-v1')
         if (fields[1] != 'done' or meta.get('worker_type') != 'owner'
-                or meta.get('note') != 'dead-worker-blocked' or DC.terminal_conflict_pending(meta)):
+                or not (blocked or proposal) or DC.terminal_conflict_pending(meta)):
             return None
         path, route = _route(jobs, aid, meta)
         import workflow_state as WS
@@ -427,6 +432,9 @@ def owner_parked_gate(jobs, aid, *, lines=None):
             return None
         _, gate, res, raisers = chosen
         gated = sorted({s for n in raisers for s in WS.route_successors(route, str(n['id']))})
+        if proposal and not any(DC._route_module().owner_executed_terminal(n) for n in route['nodes']
+                                if n.get('id') in gated):
+            return None
         inline = [str(n['id']) for n in raisers if gate in n.get('inline_human_gates', [])]
         completion = DC.dispatch_state_root(jobs)/'completion'/route['route_id']
         if any((completion/(node+'.json')).exists() for node in gated+inline):

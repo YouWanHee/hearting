@@ -7775,4 +7775,162 @@ class CompletionLockKilledHolderTest(unittest.TestCase):
    self.assertEqual(lock_path.stat().st_size,0,"the lock file is never written to, only held")
 
 
+class SealedFrameProfileCompatibilityTest(unittest.TestCase):
+ """D5: a sealed route whose frame nodes were declared under the one prior frame policy
+ (v2.167.1-v2.169.0) is still the same work today; fresh compiles stay top/top.
+
+ The prior policy is produced by the real compose/seal code with only the two policy inputs swapped
+ for the values read from `git show v2.169.0:utilities/model_profile.py` (spelled out here so no later
+ edit of the production table can move them)."""
+ PRIOR_LADDER={
+  "top":{"anchor":"top","others":"deep"},"deep":{"anchor":"top","others":"deep"},
+  "balanced-deep":{"anchor":"deep","others":"deep"},
+  "balanced":{"anchor":"balanced-deep","others":"balanced-deep"},
+  "light":{"anchor":"balanced","others":"balanced"}}
+ PRIOR_REASON="one direction brief, written once, with no multi-step execution of its own"
+ def setUp(self):
+  self.base=ComposeRouteTest("test_ship_unspecified_mode_keeps_default_deployment_recipe")
+  self.base.setUp(); self.addCleanup(self.base.doCleanups)
+ @contextlib.contextmanager
+ def prior_policy(self):
+  demand=json.loads(json.dumps(R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)); demand["execution_reason"]=self.PRIOR_REASON
+  def ladder(owner_profile,*,prior=False):
+   return dict(self.PRIOR_LADDER.get(owner_profile or "light",self.PRIOR_LADDER["light"]))
+  with mock.patch.object(R.PROFILE,"frame_profile_for_owner",ladder), \
+       mock.patch.object(R.PROFILE,"FRAME_ANCHOR_SHAPE_DEMAND",demand):
+   yield
+ def compose(self,*,prior,**kw):
+  kw.setdefault("graph",None)
+  if prior:
+   with self.prior_policy(): return self.base.compose(**kw)
+  return self.base.compose(**kw)
+ @staticmethod
+ def frames(route):
+  return [n for n in route["nodes"] if n["id"].startswith("frame")]
+ @staticmethod
+ def rehash(route):
+  route["route_hash"]=R.route_hash(route)
+  route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
+  return route
+ def verified_unchanged(self,route):
+  before=R.canonical(route)
+  verified=R.verify_route(json.loads(before),R.ROOT)
+  self.assertEqual(R.route_hash(route),route["route_hash"])
+  self.assertEqual(verified["route_id"],route["route_id"])
+  self.assertEqual(R.canonical(route),before)
+  return verified
+ def test_the_prior_policy_route_really_differs_from_a_fresh_one_and_verifies_unchanged(self):
+  fresh=self.compose(prior=False); old=self.compose(prior=True)
+  self.assertEqual([(n["id"],n["model_profile"]) for n in self.frames(fresh)],
+   [("frame","top"),("frame-alternative","top")])
+  self.assertEqual([(n["id"],n["model_profile"]) for n in self.frames(old)],
+   [("frame","top"),("frame-alternative","deep")])
+  self.assertEqual(self.frames(old)[0]["profile_demand"]["execution_reason"],self.PRIOR_REASON)
+  self.assertNotEqual(self.frames(fresh)[0]["profile_demand"]["execution_reason"],self.PRIOR_REASON)
+  self.verified_unchanged(fresh); self.verified_unchanged(old)
+ def test_every_owner_tier_and_explicit_profile_shape_verifies_under_the_policy_it_was_sealed_with(self):
+  demand=json.loads(json.dumps(R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
+  cases={"default-standard":{},"default-strong":{"intensity":"strong"},
+   "owner-balanced":{"profile":"balanced"},"owner-balanced-deep":{"profile":"balanced-deep"},
+   "owner-deep":{"profile":"deep"},"owner-light":{"profile":"light"},
+   "owner-demand":{"profile_demands":{"__owner__":demand}},
+   "explicit-alternative":{"explicit_profiles":{"frame-alternative":"balanced"}},
+   "explicit-anchor":{"explicit_profiles":{"frame":"deep"}}}
+  for name,kw in cases.items():
+   for prior in (True,False):
+    with self.subTest(case=name,prior=prior):
+     route=self.compose(prior=prior,**kw)
+     self.assertTrue(self.frames(route))
+     self.verified_unchanged(route)
+ def test_a_composed_graph_with_frame_nodes_is_accepted_under_the_prior_policy_too(self):
+  for prior in (True,False):
+   with self.subTest(prior=prior):
+    route=self.compose(prior=prior,graph="frame,plan,execute,test,report")
+    self.assertTrue(route["composed"]); self.assertTrue(self.frames(route))
+    self.verified_unchanged(route)
+ def test_a_fresh_compile_is_top_top_whatever_policy_verification_also_accepts(self):
+  for profile in (None,"deep","balanced","light"):
+   with self.subTest(profile=profile):
+    route=self.compose(prior=False,**({"profile":profile} if profile else {}))
+    for node in self.frames(route):
+     if profile is None: self.assertEqual(node["model_profile"],"top")
+     self.assertNotEqual(node.get("profile_demand",{}).get("execution_reason"),self.PRIOR_REASON)
+ def test_a_mix_of_both_policies_in_one_route_is_not_accepted(self):
+  fresh=self.compose(prior=False); old=self.compose(prior=True)
+  for anchor_from,alternative_from in ((old,fresh),(fresh,old)):
+   mixed=json.loads(R.canonical(old))
+   by_id={n["id"]:n for n in mixed["nodes"]}
+   for node_id,source in (("frame",anchor_from),("frame-alternative",alternative_from)):
+    donor=next(n for n in source["nodes"] if n["id"]==node_id)
+    by_id[node_id].update({k:json.loads(json.dumps(v)) for k,v in donor.items()
+     if k in ("model_profile","profile_demand","profile_selection","profile_explicit")})
+   self.rehash(mixed)
+   with self.assertRaisesRegex(ValueError,"node-profile-declaration-mismatch:frame"):
+    R.verify_route(mixed,R.ROOT)
+ def test_a_rehashed_frame_declaration_that_is_neither_policy_is_refused(self):
+  old=self.compose(prior=True)
+  edits={
+   "profile":lambda n:n.__setitem__("model_profile","light"),
+   "reason":lambda n:n["profile_demand"].__setitem__("execution_reason","invented rationale"),
+   "judgment":lambda n:n["profile_demand"].__setitem__("judgment_requirement","routine-clear"),
+   "selection":lambda n:n["profile_selection"].__setitem__("resolved_profile","light")}
+  for node_id in ("frame","frame-alternative"):
+   for name,edit in edits.items():
+    with self.subTest(node=node_id,edit=name):
+     route=json.loads(R.canonical(old))
+     node=next(n for n in route["nodes"] if n["id"]==node_id)
+     if name in ("reason","judgment") and not node.get("profile_demand"): continue  # deep carries no demand
+     edit(node)
+     self.rehash(route)
+     with self.assertRaises(ValueError):
+      R.verify_route(route,R.ROOT)
+ def test_the_bridge_covers_only_frame_defaults_not_graph_scope_or_gates(self):
+  old=self.compose(prior=True)
+  def drop_node(route): route["nodes"]=[n for n in route["nodes"] if n["id"]!="frame-alternative"]
+  def reorder(route): route["nodes"]=list(reversed(route["nodes"]))
+  def gate(route): route["human_gates"]=[]
+  def scope(route):
+   node=next(n for n in route["nodes"] if n["id"]=="frame"); node["write_scope"]=["shards/elsewhere/**"]
+  def binding(route): route["human_gate_bindings"]=[]
+  for name,edit in {"drop-node":drop_node,"reorder":reorder,"gate":gate,"scope":scope,"binding":binding}.items():
+   with self.subTest(edit=name):
+    route=json.loads(R.canonical(old)); edit(route); self.rehash(route)
+    with self.assertRaises(ValueError):
+     R.verify_route(route,R.ROOT)
+ def test_start_resumes_a_prior_policy_route_through_the_real_cli_path(self):
+  import work_start as W
+  with tempfile.TemporaryDirectory() as tmp:
+   route=self.compose(prior=True,artifact_root=tmp,registered_headless_evidence=self.base.registered_headless(),
+    work_request={"text":"task","owner_harness":"codex"})
+   path=R.canonical_route_path(tmp,route["route_id"]); R.write_once(path,route)
+   before=path.read_bytes()
+   jobs=Path(tmp)/"jobs.log"; jobs.touch()
+   launches=[]
+   def admit(command,**kwargs):
+    launches.append(command)
+    aid=command[command.index("--attempt-id")+1]
+    with jobs.open("a") as handle:
+     handle.write("now\topen\trepo\tworktree\towner\t"+
+      f"attempt_id={aid},worker_type=frame,parent_sid=parent,launch_started=1,"+
+      f"owner_route_id={route['route_id']},owner_route_hash={route['route_hash']},"+
+      "parent_completion_delivery=codex-managed-gateway\n")
+    return subprocess.CompletedProcess(command,0,"registered=1 started=1 child_spawned=1\n","")
+   real=W.start_work
+   def at_transport(*a,**k): return real(*a,run=admit,**k)
+   out=io.StringIO()
+   with mock.patch.object(W,"start_work",at_transport), \
+        mock.patch.object(W,"default_parent_session_id",return_value="parent"), \
+        mock.patch.object(W,"join_selected_attempts",return_value={"state":"timeout"}), \
+        mock.patch.object(sys,"argv",["capability-route.py","start","--route",str(path),"--jobs",str(jobs)]), \
+        contextlib.redirect_stdout(out):
+    R.main()
+   result=json.loads(out.getvalue())
+   self.assertEqual((result["state"],result["required_action"]),("preparing","wait-for-frame-results"),result)
+   self.assertEqual(result["route_id"],route["route_id"])
+   self.assertEqual(sorted(c[c.index("--route-node")+1] for c in launches),["frame","frame-alternative"])
+   self.assertEqual(path.read_bytes(),before,"resuming never rewrites the sealed route")
+   self.assertEqual([(n["id"],n["model_profile"]) for n in self.frames(json.loads(path.read_text()))],
+    [("frame","top"),("frame-alternative","deep")])
+
+
 if __name__=="__main__": unittest.main()

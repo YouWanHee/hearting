@@ -484,7 +484,51 @@ def display_plan(legs) -> list:
     return names
 
 
-def compose_argv(leg, *, context, route_plan_arg, parent_cycle, slug) -> list:
+_PIN_TARGETS = ("owner", "frame", "worker")
+
+
+def pin_tokens(pins) -> list:
+    """`target=harness[:model[@effort]]` for each pin of a sealed `selection_pins` map, in target order.
+
+    What `compose --pin` reads back; `contract_version` and anything malformed are left out, so a
+    route without pins gives `[]` and the printed command gains no token.
+    """
+    tokens = []
+    for target in _PIN_TARGETS:
+        pin = pins.get(target) if isinstance(pins, dict) else None
+        if not isinstance(pin, dict) or not isinstance(pin.get("harness"), str):
+            continue
+        model, effort = pin.get("model"), pin.get("effort")
+        token = f"{target}={pin['harness']}"
+        if isinstance(model, str) and model:
+            token += f":{model}" + (f"@{effort}" if isinstance(effort, str) and effort else "")
+        tokens.append(token)
+    return tokens
+
+
+def frame_selection_pins(decision, artifact_root) -> dict:
+    """The pins the decision's frame route was composed with, or `{}`.
+
+    Read from that frame's own route file and trusted only when its id and hash are the ones the
+    decision recorded and its bytes still hash to them; nothing is written or rewritten.
+    """
+    try:
+        import route_identity
+        reference = decision["frame_route"]
+        path = Path(artifact_root).resolve() / ".runtime" / "routes" / f"{reference['route_id']}.json"
+        if path.is_symlink():
+            return {}
+        frame = json.loads(path.read_text(encoding="utf-8"))
+        if ((frame.get("route_id"), frame.get("route_hash")) != (reference["route_id"], reference["route_hash"])
+                or route_identity.route_hash(frame) != reference["route_hash"]):
+            return {}
+        pins = frame.get("selection_pins")
+        return {target: dict(pins[target]) for target in _PIN_TARGETS if isinstance(pins, dict) and target in pins}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def compose_argv(leg, *, context, route_plan_arg, parent_cycle, slug, pins=None) -> list:
     """The `capability-route.py compose` argv for one leg; `--start` is left to the main session."""
     argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose", "--slug", slug,
             "--shape", leg["shape"], "--capability", leg["capability"]]
@@ -499,6 +543,8 @@ def compose_argv(leg, *, context, route_plan_arg, parent_cycle, slug) -> list:
     if context.get("spec_read") and context["spec_read"] != "auto":
         argv += ["--spec-read", context["spec_read"]]
     argv += ["--route-plan", route_plan_arg]
+    for token in pin_tokens(pins):
+        argv += ["--pin", token]
     if context.get("campaign_key"):
         argv += ["--campaign-key", context["campaign_key"]]
     argv += ["--parent-cycle", parent_cycle]
@@ -525,10 +571,12 @@ def project_next_leg(route, completed_cycle_id):
         if not Path(context["prompt_file"]).is_file():
             return None
         leg = binding["legs"][index]
+        # The leg's own sealed pins; a leg sealed before pins reached legs takes its frame's.
+        pins = route.get("selection_pins") or frame_selection_pins(binding["record"]["decision"], root)
         argv = compose_argv(
             leg, context={**context, "campaign_key": route.get("campaign_key") or context.get("campaign_key")},
             route_plan_arg=f"{root / sealed['decision']}#{index}", parent_cycle=completed_cycle_id,
-            slug=f"{context['slug']}-leg{index}")
+            slug=f"{context['slug']}-leg{index}", pins=pins)
         return {"index": index, "leg": leg, "compose_command": shlex.join(argv)}
     except (OSError, ValueError, KeyError, TypeError):
         return None
