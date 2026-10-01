@@ -142,12 +142,16 @@ RULES (the same criteria used for the 2026-09-29 full backfill):
 7. METADATA: for the campaign and for EVERY id in metadata_target_ids write title,
    summary, branches, kinds. Title: plain words that a person who did not do the work
    understands, 1-120 chars, one line; do not repeat a branch name or abbreviation
-   (the short ID carries the branch) and avoid internal jargon and tool names.
-   Summary: one line, <= 400 chars, what was done and how it turned out (the campaign
-   summary describes the whole campaign now, starting from campaign_meta.summary and
-   the newest targets). Use the language of the campaign's documents.
+   (the short ID carries the branch) and avoid internal jargon and tool names. A
+   campaign_meta.previous_title is the old display title: replace it with such a plain
+   title, keeping the facts it names (versions, counts).
+   Summary: ONE short sentence of about 80 characters (never over 400): what was done and
+   how it turned out (the campaign summary describes the whole campaign now, starting from
+   campaign_meta.summary and the newest targets). Use the language of the campaign's documents.
 8. branches: one or more codes, the FIRST is the representative; use the codes listed
-   in project_meta.branches. Prefer an existing code. Only when none fits, put up to
+   in project_meta.branches. Use the closest existing code; a survey, note, chore, or
+   one-off task takes the branch of the work it serves. A new branch is only for a lasting
+   line of work (its own model, dataset, or deliverable) that no listed branch covers; then put up to
    project_meta.new_branch_allowance new entries {"code": 2-5 uppercase ASCII letters,
    "label", "note"} in new_branches and use that code; if the project has no branches
    yet, propose a short starter list from the documents. kinds: zero or more of
@@ -706,7 +710,8 @@ def _view(root: Path, campaign_id: str, record: Mapping[str, Any], titles_by_id:
     return view
 
 
-def _meta_snapshot(root: Path, campaign_id: str, target_ids: Sequence[str], *, protect_title: bool):
+def _meta_snapshot(root: Path, campaign_id: str, target_ids: Sequence[str], *, protect_title: bool,
+                   replace_legacy_titles: bool = False):
     """(project_meta, campaign_meta, cycle_meta, protected_fields) as the model sees them."""
     project = M.read_project(root)
     if project.status == "invalid":
@@ -727,19 +732,27 @@ def _meta_snapshot(root: Path, campaign_id: str, target_ids: Sequence[str], *, p
 
     legacy, legacy_present = M.legacy_title(root, campaign_id)
     campaign_protected = M.protected_fields(campaign_entry)
-    if protect_title or (legacy_present and "title" not in campaign_entry):
+    renew = replace_legacy_titles and M.legacy_title_replaceable(campaign_entry, legacy)
+    if renew:
+        campaign_protected = [name for name in campaign_protected if name != "title"]
+    if protect_title or (legacy_present and "title" not in campaign_entry and not renew):
         campaign_protected = sorted({*campaign_protected, "title"})
     project_meta = {"display_name": (project.doc or {}).get("display_name"), "branches": branches,
                     "kinds": list(M.KINDS), "general_branch_limit": M.GENERAL_BRANCH_MAX,
                     "new_branch_allowance": allowance}
-    return (project_meta, view(campaign_entry),
+    campaign_view = view(campaign_entry)
+    if renew:
+        campaign_view.pop("title", None)
+        campaign_view["previous_title"] = legacy
+    return (project_meta, campaign_view,
             {cid: view(cycles.get(cid) or {}) for cid in target_ids},
             {"campaign": campaign_protected,
              "cycles": {cid: M.protected_fields(cycles.get(cid)) for cid in target_ids}}, allowance)
 
 
 def build_input(root: Path, campaign_id: str, target_ids: Sequence[str],
-                member_ids: Sequence[str] = (), *, protect_title: bool = False) -> ReviewInput:
+                member_ids: Sequence[str] = (), *, protect_title: bool = False,
+                replace_legacy_titles: bool = False) -> ReviewInput:
     """One bounded prompt for one campaign; raises ReviewError('apply-failed') on a bad declaration.
 
     `member_ids` are targets a declaration already covers: they get metadata but no group decision."""
@@ -749,7 +762,7 @@ def build_input(root: Path, campaign_id: str, target_ids: Sequence[str],
     except (W.WorkflowGroupError, producer.ProducerError, OSError) as exc:
         raise ReviewError("apply-failed", getattr(exc, "code", "io-error")) from exc
     project_meta, campaign_meta, cycle_meta, protected, allowance = _meta_snapshot(
-        root, campaign_id, target_ids, protect_title=protect_title)
+        root, campaign_id, target_ids, protect_title=protect_title, replace_legacy_titles=replace_legacy_titles)
     group_ids = [cid for cid in target_ids if cid not in set(member_ids)]
     titles_by_id = _display_titles(root)
     records = {cid: producer.read_cycle_record(root, cid) for cid in campaign.get("cycles", [])}
@@ -1229,7 +1242,8 @@ def _group_plan(root: Path, campaign_id: str, decision: ValidatedDecision):
 
 
 def apply_decision(root: Path, campaign_id: str, decision: ValidatedDecision, *, dry_run: bool,
-                   protect_title: bool = False, now: Optional[float] = None) -> Dict[str, Any]:
+                   protect_title: bool = False, replace_legacy_titles: bool = False,
+                   now: Optional[float] = None) -> Dict[str, Any]:
     """Write the groups and the metadata together: one admission lock, one set of checks, one history.
 
     A preimage conflict on the declaration re-plans once from what is on disk now, without asking the model again."""
@@ -1240,7 +1254,7 @@ def apply_decision(root: Path, campaign_id: str, decision: ValidatedDecision, *,
             written = M.apply_judgement(
                 root, campaign_id, campaign=decision.campaign_meta, cycles=decision.cycle_meta,
                 new_branches=decision.new_branches, group_plan=plan, protect_title=protect_title,
-                dry_run=dry_run, now=now)
+                replace_legacy_titles=replace_legacy_titles, dry_run=dry_run, now=now)
             outcome = {"dropped_relations": list(decision.dropped), "accepted_relations": 0, **outcome}
             outcome["metadata_changes"] = len(written["changes"])
             outcome["metadata_fields"] = [row["field"] for row in written["changes"] if row["kind"] == "meta"]
@@ -1277,7 +1291,8 @@ def apply_decision(root: Path, campaign_id: str, decision: ValidatedDecision, *,
 def _review_campaign(root: Path, campaign_id: str, ids: Sequence[str],
                      invoke: Callable[[str], Tuple[str, Optional[str]]], *, dry_run: bool, mode: str,
                      record_ok: bool, states: Mapping[str, str], now: Optional[float],
-                     member_ids: Sequence[str] = (), protect_title: bool = False) -> Dict[str, Any]:
+                     member_ids: Sequence[str] = (), protect_title: bool = False,
+                     replace_legacy_titles: bool = False) -> Dict[str, Any]:
     report: Dict[str, Any] = {"campaign_id": campaign_id, "targets": list(ids)}
     harness: Optional[str] = None
 
@@ -1288,12 +1303,14 @@ def _review_campaign(root: Path, campaign_id: str, ids: Sequence[str],
             root, outcomes, mode=mode, now=now) else "unwritable"
 
     try:
-        review_input = build_input(root, campaign_id, ids, member_ids, protect_title=protect_title)
+        review_input = build_input(root, campaign_id, ids, member_ids, protect_title=protect_title,
+                                   replace_legacy_titles=replace_legacy_titles)
         text, harness = invoke(review_input.prompt)
         if not isinstance(text, str) or not text.strip():
             raise ReviewError("unavailable", "empty-response")
         decision = validate_response(text, review_input)
-        result = apply_decision(root, campaign_id, decision, dry_run=dry_run, protect_title=protect_title, now=now)
+        result = apply_decision(root, campaign_id, decision, dry_run=dry_run, protect_title=protect_title,
+                                replace_legacy_titles=replace_legacy_titles, now=now)
     except ReviewError as err:
         report.update(status="failed", failure_class=err.failure_class, detail=err.detail)
         write([Outcome(cid, campaign_id, "failed", cycle_state=states.get(cid, "sealed"), harness=harness,
@@ -1338,13 +1355,16 @@ def sweep(root: Path, *, cycles: Sequence[str] = (), since: Optional[str] = None
           dry_run: bool = False, limit: Optional[int] = None, auto: bool = False,
           invoke: Optional[Callable[[str], Tuple[str, Optional[str]]]] = None,
           now: Optional[float] = None, campaign_ids: Sequence[str] = (),
-          missing_only: bool = False) -> Dict[str, Any]:
+          missing_only: bool = False, replace_legacy_titles: bool = False) -> Dict[str, Any]:
+    """`replace_legacy_titles` (explicit runs only) lets a supervised backfill renew campaign titles
+    that only the old display declaration holds; an automatic sweep never does."""
     root = Path(root).resolve()
     if auto and disabled():
         return {"status": "disabled"}
     invoke = invoke or _invoke_model
     options = dict(since=since, include_open=include_open, limit=limit, auto=auto, invoke=invoke, now=now,
-                   campaign_ids=tuple(campaign_ids), missing_only=missing_only)
+                   campaign_ids=tuple(campaign_ids), missing_only=missing_only,
+                   replace_legacy_titles=replace_legacy_titles and not auto)
     if dry_run:
         return {"status": "dry-run", **_pass(root, cycles=cycles, dry_run=True, attempted=set(), **options)}
     lock_path(root).parent.mkdir(parents=True, exist_ok=True)
@@ -1376,9 +1396,35 @@ def sweep(root: Path, *, cycles: Sequence[str] = (), since: Optional[str] = None
     return merged
 
 
+def _ensure_title_renewal(root: Path, selection: Selection, campaign_ids: Sequence[str],
+                          records: Sequence[Mapping[str, Any]]) -> None:
+    """An explicit backfill that renews old titles still asks once for a named campaign whose
+    cycles all have metadata already: its newest sealed cycle is re-judged (metadata only when
+    it is a group member), so the campaign title held only by the old declaration is renewed."""
+    for campaign_id in campaign_ids:
+        if selection.by_campaign.get(campaign_id):
+            continue
+        legacy, _present = M.legacy_title(root, campaign_id)
+        read = M.read_campaign_meta(root, campaign_id)
+        entry = ((read.doc or {}).get("campaign") or {}) if read.status == "ok" else {}
+        if read.status == "invalid" or not M.legacy_title_replaceable(entry, legacy):
+            continue
+        sealed = [row for row in records if row.get("campaign_id") == campaign_id
+                  and row.get("state") == "sealed" and isinstance(row.get("sealed_on"), str)]
+        if not sealed:
+            continue
+        newest = max(sealed, key=lambda row: (row["sealed_on"], row["cycle_id"]))["cycle_id"]
+        selection.by_campaign[campaign_id] = [newest]
+        if newest in selection.already_member:
+            selection.already_member.remove(newest)
+        if W.group_for_cycle(root, campaign_id, newest):
+            selection.member_targets.add(newest)
+
+
 def _pass(root: Path, *, cycles: Sequence[str], since: Optional[str], include_open: bool, dry_run: bool,
           limit: Optional[int], auto: bool, invoke, now: Optional[float], attempted: set,
-          campaign_ids: Sequence[str] = (), missing_only: bool = False) -> Dict[str, Any]:
+          campaign_ids: Sequence[str] = (), missing_only: bool = False,
+          replace_legacy_titles: bool = False) -> Dict[str, Any]:
     pending = _pending_ids(root) if auto and not dry_run else []
     trigger_ids = list(dict.fromkeys([*(cycles if auto else ()), *pending]))
     status, doc = read_record(root)
@@ -1396,8 +1442,10 @@ def _pass(root: Path, *, cycles: Sequence[str], since: Optional[str], include_op
                                pending=pending, campaign_ids=campaign_ids,
                                missing_only=missing_only,
                                limit=AUTO_LIMIT if limit is None and auto else limit)
-    states = {row["cycle_id"]: ("sealed" if row.get("state") == "sealed" else "open")
-              for row in producer.list_cycle_records(root)}
+    records = producer.list_cycle_records(root)
+    states = {row["cycle_id"]: ("sealed" if row.get("state") == "sealed" else "open") for row in records}
+    if replace_legacy_titles and not auto:
+        _ensure_title_renewal(root, selection, campaign_ids, records)
     protect_title = auto and M.title_auto_disabled()
     campaigns: List[Dict[str, Any]] = []
     handled = set(selection.considered)
@@ -1409,6 +1457,7 @@ def _pass(root: Path, *, cycles: Sequence[str], since: Optional[str], include_op
         report = _review_campaign(root, campaign_id, chunk, invoke, dry_run=dry_run,
                                   mode="auto" if auto else "explicit", record_ok=status != "unwritable",
                                   states=states, now=now, protect_title=protect_title,
+                                  replace_legacy_titles=replace_legacy_titles and not auto,
                                   member_ids=[cid for cid in chunk if cid in selection.member_targets])
         if tail:
             report["deferred"] = tail
@@ -1482,6 +1531,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command.add_argument("--dry-run", action="store_true")
     command.add_argument("--limit", type=int)
     command.add_argument("--auto", action="store_true")
+    command.add_argument("--campaign", action="append", default=[],
+                         help="explicit: every sealed cycle of this campaign (repeatable)")
+    command.add_argument("--replace-legacy-titles", action="store_true",
+                         help="explicit backfill only: renew titles held only by the old display declaration")
     args = parser.parse_args(argv)
     root = Path(args.artifact_root)
     problem = None
@@ -1491,6 +1544,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         problem = "limit-invalid"
     elif any(not identity.is_well_formed(cid, "cycle") for cid in args.cycle):
         problem = "cycle-id-invalid"
+    elif any(not identity.is_well_formed(cid, "campaign") for cid in args.campaign):
+        problem = "campaign-id-invalid"
+    elif args.auto and (args.replace_legacy_titles or args.campaign):
+        problem = "auto-explicit-only-option"
     elif not root.is_dir() or lifecycle.read_root_identity(root.resolve()) is None:
         problem = "root-invalid"
     if problem:
@@ -1498,7 +1555,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 65
     since = None if args.since is None else args.since[:19] + "Z"
     result = sweep(root, cycles=args.cycle, since=since, include_open=args.include_open,
-                   dry_run=args.dry_run, limit=args.limit, auto=args.auto)
+                   dry_run=args.dry_run, limit=args.limit, auto=args.auto, campaign_ids=args.campaign,
+                   replace_legacy_titles=args.replace_legacy_titles)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

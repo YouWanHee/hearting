@@ -379,6 +379,20 @@ def legacy_title(root: Path, campaign_id: str) -> Tuple[Optional[str], bool]:
     return None, False
 
 
+def legacy_title_replaceable(entry: Optional[Mapping[str, Any]], legacy: Optional[str]) -> bool:
+    """Whether an explicit backfill may renew this campaign title: none yet, or the person-sourced
+    copy of the old declaration title that an earlier review imported (a title a person set
+    through this tool differs from it and stays protected)."""
+    if not legacy:
+        return False
+    entry = entry or {}
+    if "title" not in entry:
+        return True
+    source = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+    by = (source.get("title") or {}).get("by") if isinstance(source.get("title"), dict) else None
+    return entry.get("title") == legacy and by in (None, "human")
+
+
 def protected_fields(entry: Optional[Mapping[str, Any]]) -> List[str]:
     """Fields a model never writes: a value whose source is human/agent, or whose source is unknown."""
     if not entry:
@@ -1168,7 +1182,7 @@ def _group_events(ws: Workspace, ready: Mapping[str, Any]) -> None:
 
 def op_judgement(ws: Workspace, campaign_id: str, *, campaign: Mapping[str, Any], cycles: Mapping[str, Mapping[str, Any]],
                  new_branches: Sequence[Mapping[str, str]], group_plan: Optional[Mapping[str, Any]],
-                 protect_title: bool) -> Dict[str, Any]:
+                 protect_title: bool, replace_legacy_titles: bool = False) -> Dict[str, Any]:
     """Merge one validated model answer into the current files: protected fields, the vocabulary,
     and the 12-branch cap are judged here, against what is on disk now."""
     if campaign_id not in ws.campaign_dirs:
@@ -1201,13 +1215,23 @@ def op_judgement(ws: Workspace, campaign_id: str, *, campaign: Mapping[str, Any]
 
     legacy, legacy_present = legacy_title(ws.root, campaign_id)
     campaign_entry = ws.entry(meta, None, create=True) or {}
+    legacy_start = replace_legacy_titles and bool(legacy) and legacy_title_replaceable(campaign_entry, legacy)
     if "title" not in campaign_entry and legacy and not protect_title:
-        ws.put(meta, None, "title", legacy, by="human", reason="기존 표시 선언의 제목을 사람 값으로 보존함",
-               event_by="rule")
+        if replace_legacy_titles:
+            # An explicit, supervised backfill renews old declaration titles (DESIGN §10): start from
+            # the old title so the history keeps it, and let the model's plain title replace it.
+            ws.put(meta, None, "title", legacy, by="model", reason="기존 표시 선언의 제목에서 시작함(소급 실행)",
+                   event_by="rule")
+        else:
+            ws.put(meta, None, "title", legacy, by="human", reason="기존 표시 선언의 제목을 사람 값으로 보존함",
+                   event_by="rule")
+    elif legacy_start and not protect_title:
+        ws.put_source_only(meta, None, "title", "model", reason="기존 표시 선언의 제목에서 시작함(소급 실행)")
     for cycle_id, proposal in [(None, campaign), *sorted(cycles.items())]:
         current = ws.entry(meta, cycle_id, create=cycle_id is not None) or {}
         locked = set(protected_fields(current))
-        if cycle_id is None and (protect_title or (legacy_present and "title" not in current)):
+        if cycle_id is None and (protect_title or (legacy_present and "title" not in current
+                                                   and not legacy_start)):
             locked.add("title")
         wanted = {"title": proposal["title"], "summary": proposal["summary"],
                   "branches": branches_of(proposal["branches"]), "kinds": list(proposal["kinds"])}
@@ -1236,11 +1260,13 @@ def op_judgement(ws: Workspace, campaign_id: str, *, campaign: Mapping[str, Any]
 def apply_judgement(root: Path, campaign_id: str, *, campaign: Mapping[str, Any],
                     cycles: Mapping[str, Mapping[str, Any]], new_branches: Sequence[Mapping[str, str]] = (),
                     group_plan: Optional[Mapping[str, Any]] = None, protect_title: bool = False,
+                    replace_legacy_titles: bool = False,
                     dry_run: bool = False, now: Optional[float] = None, lock_timeout: Optional[float] = None
                     ) -> Dict[str, Any]:
     def mutate(ws: Workspace) -> Dict[str, Any]:
         return op_judgement(ws, campaign_id, campaign=campaign, cycles=cycles, new_branches=new_branches,
-                            group_plan=None if dry_run else group_plan, protect_title=protect_title)
+                            group_plan=None if dry_run else group_plan, protect_title=protect_title,
+                            replace_legacy_titles=replace_legacy_titles)
 
     return run_write(root, mutate, dry_run=dry_run, actor_by="model", now=now, lock_timeout=lock_timeout,
                      reason="백그라운드 판정")

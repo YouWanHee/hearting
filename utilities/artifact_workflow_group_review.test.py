@@ -923,6 +923,51 @@ class UnifiedReviewTest(ReviewBase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(self.meta_doc(self.a1)["cycles"][self.a1["cycle_id"]]["title"], "쉬운 제목")
 
+    def test_an_explicit_backfill_shows_and_renews_the_old_declaration_title(self):
+        path = self.root / repair.DISPLAY_TITLE_REL
+        path.write_text(json.dumps({"schema": repair.DECLARATION_SCHEMA, "artifact_root_id": fixture.ROOT_ID, "entries": [{
+            "campaign_id": self.camp, "campaign_locator": "x", "display_title": "옛 선언 제목",
+            "manifest_bindings": [], "manifest_revision_ids": [], "manifest_digests": []}]}, ensure_ascii=False),
+            encoding="utf-8")
+        before = path.read_bytes()
+        invoke = Recorder()
+        R.sweep(self.root, cycles=[self.a1["cycle_id"]], invoke=invoke, replace_legacy_titles=True)
+        data = data_of(invoke.prompts[0])
+        self.assertEqual(data["campaign_meta"]["previous_title"], "옛 선언 제목")
+        self.assertNotIn("title", data["protected_fields"]["campaign"])
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("쉬운 제목", "model"))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_a_campaign_whose_cycles_all_have_metadata_is_still_asked_once_to_renew_the_title(self):
+        path = self.root / repair.DISPLAY_TITLE_REL
+        path.write_text(json.dumps({"schema": repair.DECLARATION_SCHEMA, "artifact_root_id": fixture.ROOT_ID, "entries": [{
+            "campaign_id": self.camp, "campaign_locator": "x", "display_title": "옛 선언 제목",
+            "manifest_bindings": [], "manifest_revision_ids": [], "manifest_digests": []}]}, ensure_ascii=False),
+            encoding="utf-8")
+        # a run without the option fills every sealed cycle and copies the old title as a person's
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=Recorder())
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("옛 선언 제목", "human"))
+        quiet = Recorder()
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=quiet, missing_only=True)
+        self.assertEqual(len(quiet.prompts), 0)
+        renew = Recorder()
+        R.sweep(self.root, campaign_ids=[self.camp], invoke=renew, missing_only=True, replace_legacy_titles=True)
+        self.assertEqual(len(renew.prompts), 1)
+        self.assertEqual(data_of(renew.prompts[0])["campaign_meta"].get("previous_title"), "옛 선언 제목")
+        campaign = self.meta_doc(self.a1)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("쉬운 제목", "model"))
+
+    def test_the_backfill_options_are_refused_on_an_automatic_run(self):
+        for extra in (["--replace-legacy-titles"], ["--campaign", self.camp]):
+            with self.subTest(extra):
+                err = io.StringIO()
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    code = R.main(["sweep", "--artifact-root", str(self.root), "--auto", *extra])
+                self.assertEqual(code, 65)
+                self.assertIn("auto-explicit-only-option", err.getvalue())
+
     def test_dry_run_still_asks_the_model_but_writes_nothing_anywhere(self):
         before = tree_snapshot(self.root)
         invoke = Recorder()

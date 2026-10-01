@@ -649,6 +649,47 @@ class ProvenanceTest(MetaBase):
         self.assertEqual(self.meta(self.B)["campaign"]["title"], "모델이 쓴 베타 제목")
         self.assertEqual(self.meta(self.B)["campaign"]["source"]["title"]["by"], "model")
 
+    def test_an_explicit_backfill_renews_an_old_declaration_title_and_keeps_a_persons(self):
+        declaration = write_declaration(self.root, {self.A["campaign_id"]: "옛날에 정한 제목",
+                                                    self.B["campaign_id"]: "베타 옛 제목"})
+        before = declaration.read_bytes()
+        cmd = [{"code": "CMD", "label": "명령어", "note": ""}]
+        # an automatic review first copies the old title as a person's title
+        self.judge(self.A, new_branches=cmd, title="자동 판정 제목")
+        self.assertEqual(self.meta(self.A)["campaign"]["title"], "옛날에 정한 제목")
+        # the supervised backfill renews it; the history keeps the old value
+        self.judge(self.A, title="쉬운 새 제목", replace_legacy_titles=True)
+        campaign = self.meta(self.A)["campaign"]
+        self.assertEqual((campaign["title"], campaign["source"]["title"]["by"]), ("쉬운 새 제목", "model"))
+        titles = [event for event in self.events()
+                  if event["field"] == "campaign.title" and event["target"]["id"] == self.A["campaign_id"]]
+        # history files are not in time order (random ids, same `at` here): look for the change itself
+        self.assertIn(({"value": "옛날에 정한 제목"}, {"value": "쉬운 새 제목"}),
+                      [(event["before"], event["after"]) for event in titles])
+        # a campaign with no meta yet starts from the old title and is renewed in one write
+        self.judge(self.B, title="베타 쉬운 제목", replace_legacy_titles=True)
+        self.assertEqual(self.meta(self.B)["campaign"]["source"]["title"]["by"], "model")
+        self.assertEqual(self.meta(self.B)["campaign"]["title"], "베타 쉬운 제목")
+        # a title a person set through this tool is never renewed
+        self.set(self.A, title="사람이 고친 제목")
+        self.judge(self.A, title="또 다른 모델 제목", replace_legacy_titles=True)
+        self.assertEqual(self.meta(self.A)["campaign"]["title"], "사람이 고친 제목")
+        self.assertEqual(declaration.read_bytes(), before)
+
+    def test_the_backfill_option_still_protects_titles_behind_a_bad_declaration(self):
+        path = self.root / ".runtime/artifact-producer/v1/campaign-display-titles.json"
+        cmd = [{"code": "CMD", "label": "명령어", "note": ""}]
+        for content in ("{broken", None):
+            with self.subTest(content=content):
+                if content is None:  # a declaration title that breaks the title rules
+                    write_declaration(self.root, {self.A["campaign_id"]: "가" * 200})
+                else:
+                    path.write_text(content, encoding="utf-8")
+                before = path.read_bytes()
+                self.judge(self.A, new_branches=cmd, title="모델 제목", replace_legacy_titles=True)
+                self.assertNotIn("title", self.meta(self.A)["campaign"])
+                self.assertEqual(path.read_bytes(), before)
+
     def test_an_unreadable_declaration_protects_every_title_instead_of_guessing(self):
         path = self.root / ".runtime/artifact-producer/v1/campaign-display-titles.json"
         path.write_text("{broken", encoding="utf-8")

@@ -141,9 +141,14 @@ history line for the source). A short ID fixed by a
 person also holds the model's change of the representative branch that would renumber it.
 
 An old display-declaration title carries no source, so it counts as a person's title: the
-first writer copies it into `meta.json` as `human` and the model never overwrites it
+first writer copies it into `meta.json` as `human` and the automatic review never overwrites it
 (`release` hands it back). A declaration that cannot be read protects every campaign's
-title the same way.
+title the same way. The one exception is the explicit, supervised backfill
+(`artifact_workflow_group_review.py sweep --campaign … --replace-legacy-titles`, refused with
+`--auto`): it shows the old title to the model as `previous_title` and lets a plain title
+replace a title that only the old declaration holds (none in `meta.json` yet, or the copied
+`human` value still equal to it). The history line keeps the old value; a title a person set
+through `artifact_meta.py` differs from it and stays protected.
 
 ## The history line: the one recorder
 
