@@ -804,6 +804,28 @@ class UnifiedReviewTest(ReviewBase):
             R.sweep(self.root, auto=True, cycles=[s["cycle_id"] for s in sealed], invoke=auto)
         self.assertEqual(len([p for p in auto.prompts if data_of(p)["campaign"]["campaign_id"] == self.camp]), 1)
 
+    def test_a_cycle_sealed_during_the_call_waits_for_the_next_sweep_instead_of_a_second_call(self):
+        late, asked = [], []
+
+        def invoke(prompt):
+            asked.append(prompt)
+            if not late:  # a seal of the same campaign lands while the model is answering
+                begun = self.seal(slug="late")
+                R._touch_pending(self.root, begun["cycle_id"])
+                late.append(begun["cycle_id"])
+            return none_for(prompt), "claude"
+
+        first = R.sweep(self.root, auto=True, cycles=[self.a1["cycle_id"]], campaign_ids=[self.camp], invoke=invoke)
+        self.assertEqual(len(asked), 1)  # one call for the campaign in the whole sweep
+        self.assertEqual(len(first["campaigns"]), 1)
+        self.assertEqual(R._pending_ids(self.root), late)  # kept, not dropped
+        self.assertNotIn(late[0], self.record()["cycles"])  # and not marked handled
+        second = Recorder()
+        R.sweep(self.root, auto=True, campaign_ids=[self.camp], invoke=second)
+        self.assertEqual(second.targets, [[late[0]]])
+        self.assertEqual(R._pending_ids(self.root), [])
+        self.assertIn(late[0], self.meta_doc(self.a1)["cycles"])
+
     def test_every_malformed_answer_rejects_the_campaign_and_writes_nothing(self):
         before = None
         for label, mutate in MUTATIONS.items():

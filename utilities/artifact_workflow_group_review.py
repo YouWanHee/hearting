@@ -1355,7 +1355,7 @@ def sweep(root: Path, *, cycles: Sequence[str] = (), since: Optional[str] = None
                 _touch_pending(root, cycle_id)
         return {"status": "busy"}
     merged: Dict[str, Any] = {"status": "ok", "passes": 0, "campaigns": [], "already_member": [], "skipped": []}
-    attempted: set = set()  # a campaign is asked once per sweep; failures wait for the next seal
+    attempted: set = set()  # campaign ids asked in this sweep; a later pass never asks one again
     try:
         while lock is not None and merged["passes"] < MAX_PASSES:
             merged["passes"] += 1
@@ -1393,7 +1393,7 @@ def _pass(root: Path, *, cycles: Sequence[str], since: Optional[str], include_op
                 _touch_pending(root, cycle_id)
         return {"campaigns": [], "already_member": [], "skipped": [], "record": "unwritable", "progress": False}
     selection = select_targets(root, doc, cycles=cycles, since=since, include_open=include_open, auto=auto,
-                               pending=pending, exclude=attempted, campaign_ids=campaign_ids,
+                               pending=pending, campaign_ids=campaign_ids,
                                missing_only=missing_only,
                                limit=AUTO_LIMIT if limit is None and auto else limit)
     states = {row["cycle_id"]: ("sealed" if row.get("state") == "sealed" else "open")
@@ -1402,8 +1402,10 @@ def _pass(root: Path, *, cycles: Sequence[str], since: Optional[str], include_op
     campaigns: List[Dict[str, Any]] = []
     handled = set(selection.considered)
     for campaign_id, ids in selection.by_campaign.items():
+        if campaign_id in attempted:  # sealed mid-sweep; stays pending for the next sweep
+            continue
         chunk, tail = ids[:MAX_TARGETS_PER_CALL], ids[MAX_TARGETS_PER_CALL:]
-        attempted.update(ids)  # one call per campaign per sweep; the tail waits for the next seal
+        attempted.add(campaign_id)  # one call per campaign per sweep; the tail waits for the next seal
         report = _review_campaign(root, campaign_id, chunk, invoke, dry_run=dry_run,
                                   mode="auto" if auto else "explicit", record_ok=status != "unwritable",
                                   states=states, now=now, protect_title=protect_title,
