@@ -604,8 +604,9 @@ class PartialApplyTest(RunnerCase):
             return item["id"], self.item(item["id"])
 
     @staticmethod
-    def journal(run_dir, done):
-        ops = [{"op": "add", "state": "done", "id": f"r{n}"} for n in range(done)] + [{"op": "add", "state": "intent"}]
+    def journal(run_dir, done, intent=1):
+        ops = ([{"op": "add", "state": "done", "id": f"r{n}"} for n in range(done)]
+               + [{"op": "add", "state": "intent"}] * intent + [{"op": "add", "state": "dropped"}])
         st.atomic_write_json(run_dir / "undo.json", {"ops": ops})
 
     def test_an_applier_that_stopped_halfway_is_reported_as_partial_with_the_undo_command(self):
@@ -614,28 +615,48 @@ class PartialApplyTest(RunnerCase):
             raise runner.RunnerFailure(f"묶음 {run_dir.name}: 부분 적용 2건 · RuntimeError: boom "
                                        f"— 되돌리기: mem tidy-undo {run_dir.name}")
         qid, item = self.run_item(stopped)
-        self.assertEqual((item["status"], item["applied"]), ("failed", 2))
+        self.assertEqual((item["status"], item["applied"]), ("failed", [2, 1]))
         notes = self.notices()
         self.assertEqual(len(notes), 1, notes)
-        self.assertRegex(notes[0], rf"^\[정리\] 기억 정리가 2건을 반영한 뒤 멈췄습니다\. .*RuntimeError: boom\) "
-                                   rf"— 되돌리기: mem tidy-undo {qid}$")
+        self.assertRegex(notes[0], rf"^\[정리\] 기억 정리가 중간에 멈췄습니다\(2건 반영, 1건은 반영 여부 불명\)\. "
+                                   rf".*RuntimeError: boom\) — 되돌리기: mem tidy-undo {qid}$")
         self.assertNotIn("그대로", notes[0])
         self.assertEqual(notes[0].count("mem tidy-undo"), 1)
 
     def test_a_failure_after_a_full_apply_still_names_the_writes_and_the_undo_command(self):
         def applied(item, run_dir, bundle):
-            self.journal(run_dir, 1)
+            self.journal(run_dir, 1, intent=0)
             return f"[tidy] 묶음 {run_dir.name}: 추가 1 — 되돌리기: mem tidy-undo {run_dir.name}"
         qid, item = self.run_item(applied, advance_watermarks=mock.Mock(side_effect=OSError("disk full")))
-        self.assertEqual((item["status"], item["applied"]), ("failed", 1))
-        self.assertRegex(self.notices()[0], rf"^\[정리\] 기억 정리가 1건을 반영한 뒤 멈췄습니다\. .*"
+        self.assertEqual((item["status"], item["applied"]), ("failed", [1, 0]))
+        self.assertRegex(self.notices()[0], rf"^\[정리\] 기억 정리가 중간에 멈췄습니다\(1건 반영\)\. .*"
                                             rf"— 되돌리기: mem tidy-undo {qid}$")
+
+    def test_a_write_that_landed_before_the_journal_could_mark_it_finished_is_not_called_untouched(self):
+        def unmarked(item, run_dir, bundle):
+            self.journal(run_dir, 0, intent=1)        # the store changed, the "done" flush did not
+            raise runner.RunnerFailure("apply stopped: OSError: journal write failed")
+        qid, item = self.run_item(unmarked)
+        self.assertEqual(item["applied"], [0, 1])
+        note = self.notices()[0]
+        self.assertRegex(note, rf"^\[정리\] 기억 정리가 중간에 멈췄습니다\(0건 반영, 1건은 반영 여부 불명\)\. .*"
+                               rf"— 되돌리기: mem tidy-undo {qid}$")
+        self.assertNotIn("그대로", note)
+
+    def test_an_unreadable_journal_is_reported_as_unknown_with_the_undo_command(self):
+        def garbled(item, run_dir, bundle):
+            (run_dir / "undo.json").write_text("{not json", encoding="utf-8")
+            raise runner.RunnerFailure("apply stopped")
+        qid, _item = self.run_item(garbled)
+        note = self.notices()[0]
+        self.assertRegex(note, rf"^\[정리\] 기억 정리가 중간에 멈췄습니다\(반영 여부를 확인하지 못했습니다\)\. .*"
+                               rf"— 되돌리기: mem tidy-undo {qid}$")
 
     def test_a_failure_before_any_write_still_says_memory_is_untouched(self):
         def refused(item, run_dir, bundle):
             raise runner.RunnerFailure("apply did not run: boom")
         _qid, item = self.run_item(refused)
-        self.assertEqual(item["applied"], 0)
+        self.assertEqual(item["applied"], [0, 0])
         self.assertRegex(self.notices()[0], r"^\[정리\] 기억 정리를 끝내지 못했습니다\. 카드와 기존 기억은 그대로")
 
 

@@ -401,6 +401,78 @@ class UndoTest(TidyApplyCase):
         self.assertEqual(replay.returncode, 0 if self.result_json(batch)["status"] == "applied" else 1)
 
 
+class UnconfirmedWriteTest(TidyApplyCase):
+    """The store write lands, then the journal's ``done`` flush fails: the step stays ``intent``."""
+
+    def apply_with_failing_done(self, kind, actions, batch):
+        path, _ = self.actions(actions, batch=batch)
+        with self.iso.patched_environ():
+            mem = load_fresh_mem("mem_unconfirmed")
+            import tidy_apply
+            real_done = tidy_apply.Journal.done
+
+            def flaky(journal, op, **fields):
+                if op["op"] == kind:
+                    raise OSError("journal flush failed")
+                return real_done(journal, op, **fields)
+
+            tidy_apply.Journal.done = flaky
+            try:
+                args = type("A", (), {"actions": str(path), "input": None, "cwd": str(self.proj)})()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(tidy_apply.apply_command(mem, args), 1)
+            finally:
+                tidy_apply.Journal.done = real_done
+                os.environ.pop("MEM_ACTOR", None)
+        return json.loads((self.state / "runs" / batch / "undo.json").read_text(encoding="utf-8"))
+
+    def assert_reported_with_undo(self, batch, expect_done):
+        import session_tidy_runner as runner
+        applied = runner.applied_writes(self.state / "runs" / batch)
+        self.assertEqual(applied, (expect_done, 1))
+        line = runner.failure_line("apply stopped: OSError: journal flush failed", batch, applied)
+        self.assertNotIn("그대로", line)
+        self.assertIn(f"되돌리기: mem tidy-undo {batch}", line)
+
+    def undo(self, batch):
+        undo = self.mem("tidy-undo", batch)
+        self.assertEqual(undo.returncode, 0, undo.stderr + undo.stdout)
+        return self.rows()
+
+    def test_an_add_left_as_intent_is_reported_and_undone(self):
+        before = self.rows()
+        journal = self.apply_with_failing_done("add", [self.add_action(1)], "u-add")
+        self.assertEqual([op["state"] for op in journal["ops"]], ["intent"])
+        landed = set(self.rows()) - set(before)
+        self.assertEqual(len(landed), 1)
+        self.assert_reported_with_undo("u-add", 0)
+        after = self.undo("u-add")
+        self.assertNotEqual(after[landed.pop()][0], "active")
+
+    def test_a_supersede_left_as_intent_is_reported_and_undone(self):
+        old = self.seed("durable", "lesson", "an old lesson whose supersede is not confirmed")
+        before = self.rows()
+        journal = self.apply_with_failing_done(
+            "supersede", [{"kind": "supersede", "old_id": old, "body": "the replacement written before the flush failed"}],
+            "u-sup")
+        self.assertEqual([(op["op"], op["state"]) for op in journal["ops"]], [("add", "done"), ("supersede", "intent")])
+        self.assertEqual(self.rows()[old][0], "superseded")
+        self.assert_reported_with_undo("u-sup", 1)
+        after = self.undo("u-sup")
+        self.assertEqual(after[old], before[old])
+        self.assertEqual([after[rid][6] for rid in set(after) - set(before) if after[rid][0] == "active"],
+                         ["tidy-undo"])
+
+    def test_a_reinforce_left_as_intent_is_reported_and_undone(self):
+        hot = self.seed("durable", "lesson", "a lesson whose reinforce is not confirmed")
+        before = self.rows()
+        journal = self.apply_with_failing_done("reinforce", [{"kind": "reinforce", "target_id": hot}], "u-rein")
+        self.assertEqual([op["state"] for op in journal["ops"]], ["intent"])
+        self.assertEqual(self.rows()[hot][1], before[hot][1] + 1)
+        self.assert_reported_with_undo("u-rein", 0)
+        self.assertEqual(self.undo("u-rein")[hot], before[hot])
+
+
 class WaitingDecisionTest(TidyApplyCase):
 
     def test_waiting_decisions_are_written_before_the_model_and_the_file_is_removed(self):

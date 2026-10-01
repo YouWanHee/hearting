@@ -14,9 +14,9 @@ once.  The detached runner:
    file, validates ``actions.json``, runs ``mem tidy-apply``, advances the watermarks and leaves one
    result line for the seat,
 3. on any failure leaves the card and the watermarks as they were and leaves one
-   failure line.  When the applier had already written part of the batch (its undo
-   journal says so) the line counts those writes and carries ``mem tidy-undo <batch>``
-   instead of claiming the memory is untouched.  There is no operator step: the next
+   failure line.  When the applier wrote, or may have written, part of the batch (its
+   undo journal has finished or unconfirmed steps, or cannot be read) the line says so
+   and carries ``mem tidy-undo <batch>`` instead of claiming the memory is untouched.  There is no operator step: the next
    scheduled tidy simply sees the same unprocessed conversation again (source keys and
    the duplicate check keep the writes that already landed from being made twice).
 
@@ -574,7 +574,7 @@ def apply_actions(item: dict, run_dir: Path, bundle: Bundle) -> str:
         done = _mem_cli("tidy-apply", str(run_dir / "actions.json"), "--input", str(bundle.path),
                         "--cwd", item["cwd"], cwd=item["cwd"], timeout=tunable("APPLY_TIMEOUT"))
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RunnerFailure(f"apply {'stopped' if applied_writes(run_dir) else 'did not run'}: {exc}") from exc
+        raise RunnerFailure(f"apply {'stopped' if any(applied_writes(run_dir)) else 'did not run'}: {exc}") from exc
     lines = [ln for ln in done.stdout.splitlines() if ln.strip()]
     summary = next((ln for ln in reversed(lines) if ln.startswith("[tidy]")), "")
     _log(run_dir, f"apply rc={done.returncode} {summary or (done.stderr.strip().splitlines() or [''])[-1]}")
@@ -594,19 +594,33 @@ def notify(item: dict, text: str) -> None:
         st.write_notice(st.Seat(**item["seat"]), text, author_harness=item["harness"], author_sid=item["sid"])
 
 
-def applied_writes(run_dir: Path) -> int:
-    """Writes the applier finished for this batch (its undo journal), 0 when it never wrote."""
-    with contextlib.suppress(Exception):
-        ops = (st.read_json(run_dir / "undo.json") or {}).get("ops") or []
-        return sum(1 for op in ops if isinstance(op, dict) and op.get("state") == "done")
-    return 0
+def applied_writes(run_dir: Path) -> tuple:
+    """``(finished, unconfirmed)`` writes of this batch, read from its undo journal.
+
+    The applier records each step before taking it, so no journal means nothing was
+    written: ``(0, 0)``.  A step left as ``intent`` may have landed before the journal
+    could say so, and an unreadable journal is ``(0, -1)`` -- both unknown, never
+    "untouched"; ``mem tidy-undo`` checks such steps against the store itself.
+    """
+    path = run_dir / "undo.json"
+    if not os.path.lexists(path):
+        return 0, 0
+    try:
+        ops = st.read_json(path)["ops"]
+        return (sum(1 for op in ops if op.get("state") == "done"),
+                sum(1 for op in ops if op.get("state") == "intent"))
+    except Exception:  # noqa: BLE001 - an unreadable journal is "unknown", not "nothing"
+        return 0, -1
 
 
-def failure_line(reason: str, batch: str = "", applied: int = 0) -> str:
+def failure_line(reason: str, batch: str = "", applied: tuple = (0, 0)) -> str:
     reason = " ".join(str(reason).split(" — 되돌리기")[0].split())[:80]
-    if applied and batch:
-        # Some writes already landed: say so and keep the undo command; never claim memory is untouched.
-        return (f"[정리] 기억 정리가 {applied}건을 반영한 뒤 멈췄습니다. 나머지는 다음 정리 때 이어서 처리됩니다. "
+    done, unconfirmed = applied
+    if batch and (done or unconfirmed):
+        # Something may have landed: say so and keep the undo command; never claim memory is untouched.
+        landed = ("반영 여부를 확인하지 못했습니다" if unconfirmed < 0
+                  else f"{done}건 반영" + (f", {unconfirmed}건은 반영 여부 불명" if unconfirmed else ""))
+        return (f"[정리] 기억 정리가 중간에 멈췄습니다({landed}). 나머지는 다음 정리 때 이어서 처리됩니다. "
                 f"(사유: {reason}) — 되돌리기: mem tidy-undo {batch}")
     return f"[정리] 기억 정리를 끝내지 못했습니다. 카드와 기존 기억은 그대로이고 다음 정리 때 이어서 처리됩니다. (사유: {reason})"
 
@@ -638,12 +652,12 @@ def process_item(item: dict) -> None:
     except RunnerFailure as exc:
         _log(run_dir, f"failed: {exc}")
         applied = applied_writes(run_dir)
-        set_status(item, "failed", error=str(exc), applied=applied)
+        set_status(item, "failed", error=str(exc), applied=list(applied))
         notify(item, failure_line(str(exc), batch, applied))
     except BaseException as exc:  # noqa: BLE001 - nothing may leave an entry half-done
         _log(run_dir, f"failed: internal {type(exc).__name__}: {exc}")
         applied = applied_writes(run_dir)
-        set_status(item, "failed", error=f"internal {type(exc).__name__}", applied=applied)
+        set_status(item, "failed", error=f"internal {type(exc).__name__}", applied=list(applied))
         notify(item, failure_line(f"internal {type(exc).__name__}", batch, applied))
     finally:
         for name in ("input_v1.json", "prompt.md"):

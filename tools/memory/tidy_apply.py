@@ -660,10 +660,16 @@ def _adopt(mem, con, op: dict, pkey: str) -> bool:
         return False
     if op["op"] == "supersede":
         now = _digest(con, op["old_id"])
-        return bool(now and now["status"] == "superseded" and now["superseded_by"] == op["new_id"])
+        if now and now["status"] == "superseded" and now["superseded_by"] == op["new_id"]:
+            op["after"] = {"old": now, "new": _digest(con, op["new_id"])}
+            return True
+        return False
     if op["op"] == "reinforce":
         now = _digest(con, op["id"])
-        return bool(now and now["strength"] == (op["before"]["strength"] + 1))
+        if now and now["strength"] == (op["before"]["strength"] + 1):
+            op["after"] = now
+            return True
+        return False
     return False
 
 

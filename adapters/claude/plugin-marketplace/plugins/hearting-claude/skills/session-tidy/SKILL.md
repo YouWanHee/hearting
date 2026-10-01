@@ -47,8 +47,8 @@ session). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    last tidy (plus recent untidied sessions of this seat), starts one registered memory
    worker, applies its proposal through `mem tidy-apply`, and leaves one result line for
    the next session of this seat — with the command that undoes it. A failure leaves the
-   card as it was and says so in one line; if some writes had already landed, that line
-   counts them and keeps the undo command.
+   card as it was and says so in one line; if some writes had landed or may have landed, that
+   line counts them and keeps the undo command.
 
 3. **Handoff only.** For `인계 <받을 세션>`:
 
