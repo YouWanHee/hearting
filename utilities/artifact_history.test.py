@@ -198,6 +198,10 @@ class EventFormatTest(HistoryBase):
                      after=H.value_ref({"campaign_id": "camp_b", "path": "campaigns/b/c"}))
         for field in ("campaign", "parent", "disposition", "path"):
             self.assertEqual(event(field_name=field, **moved)["field"], field)
+        # `cycle-mark --primary` re-points the representative artifact
+        self.assertEqual(event(field_name="primary", **dict(moved, operation="update",
+                                                           before=H.value_ref("plans/plan.md"),
+                                                           after=H.value_ref("reports/report.md")))["field"], "primary")
         self.assertEqual(event(field_name="state", **dict(moved, target_type="campaign", operation="update",
                                                          before=H.value_ref("open"), after=H.value_ref("closed")))
                          ["after"], {"value": "closed"})

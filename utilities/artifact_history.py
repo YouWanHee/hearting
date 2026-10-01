@@ -48,7 +48,7 @@ ACTOR_KEYS = ("by", "session", "harness", "route", "attempt")
 AGENT_ENV_MARKERS = ("AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_CURRENT_HARNESS", "AGENT_ROUTE_ID",
                      "AGENT_ROUTE_FILE", "AGENT_DISPATCH_PARENT_SESSION_ID")
 LIFECYCLE_TARGETS = frozenset(("cycle", "campaign"))
-LIFECYCLE_FIELDS = frozenset(("state", "campaign", "parent", "disposition", "path"))
+LIFECYCLE_FIELDS = frozenset(("state", "campaign", "parent", "disposition", "path", "primary"))
 CLOSE_STATES = frozenset(("completed", "abandoned"))
 CLOSE_KEYS = ("state", "manifest_digest", "revision_id", "files", "excluded")
 EVENT_ID = re.compile(r"hevt_[0-9a-f]{32}\Z")
@@ -201,7 +201,7 @@ def _count(value: Any) -> bool:
 
 
 def _check_lifecycle(event: Mapping[str, Any]) -> None:
-    """`lifecycle`: a cycle or campaign changing state, membership, parent, mark, or location.
+    """`lifecycle`: a cycle or campaign changing state, membership, parent, mark, location, or primary.
 
     A cycle close is `update` of `state` with the closed-manifest summary as the after value; a delete is
     `delete` of `state` with the removed manifest digest and path as the before value.  The other fields

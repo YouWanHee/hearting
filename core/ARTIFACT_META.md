@@ -191,7 +191,7 @@ Keys, in this order: `schema_version`, `contract`, `event_id`, `transaction_id`,
   root-relative POSIX `path`.
 - `lifecycle` (target `cycle` or `campaign`) has `field` = `state` | `campaign` (membership
   move) | `parent` | `disposition` (discard/supersede mark) | `path` (folder name or
-  location). A cycle close is `operation=update`, `field=state`, `after.value` =
+  location) | `primary` (representative artifact re-pointed, short `{value}` refs). A cycle close is `operation=update`, `field=state`, `after.value` =
   `{state: completed|abandoned, manifest_digest, revision_id, files, excluded}`; a campaign
   close/reopen is `update` of `state` with plain state names; a delete is `operation=delete`,
   `field=state`, `before.value` = `{manifest_digest: sha256:…|null, path}`, `after.value` null.
