@@ -1206,6 +1206,69 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.resolution()["status"], "not-raised")
 
+    def scope_question(self):
+        question = {**self.question, "questions": [{
+            "id": "q-scope", "topic": "How much to change",
+            "question": "Fix only the approval step, or the questions too?", "kind": "choice",
+            "options": [{"label": "Both (recommended)", "means": "Fix both."},
+                        {"label": "Approval only", "means": "Leave the questions."}],
+            "recommended": 0, "why": "Only you can weigh the wording against the schedule."}]}
+        self.question_file.write_text(json.dumps(question))
+        return question
+
+    def answers_for_scope(self):
+        path = self.base / "scope-answers.json"
+        path.write_text(json.dumps({"understanding_confirmed": True, "correction": "",
+                                    "answers": {"q-scope": {"choice": 0, "note": ""}},
+                                    "schema": "frame_interview_answers_v1", "route_id": self.route["route_id"], "round": 1}))
+        return path
+
+    def test_answers_without_the_envelope_release_the_registered_interview(self):
+        """REPORT3 §3-5: the runtime stamps schema/route_id/round on the interview; the
+        answers carry only what the person said, and the receipt says that shape."""
+        self.scope_question()
+        needs = self.step()
+        self.assertEqual(needs["state"], "needs-interview")
+        self.assertIn('"understanding_confirmed"', needs["next_step"])
+        self.assertIn('"choice"', needs["next_step"])
+        bare = self.base / "bare.json"
+        bare.write_text(json.dumps({"understanding_confirmed": True, "answers": {"q-scope": {"choice": 1}}}))
+        result = self.step(interview=self.question_file, answers=bare)
+        self.assertEqual(result["state"], "released")
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertEqual(self.resolution()["answers"]["answers"]["q-scope"]["choice"], 1)
+        self.assertIn("**Approval only** (user's own choice)", Path(result["intent_file"]).read_text())
+        self.assertEqual(self.step(answers=bare)["state"], "released")        # a lost reply replays
+        self.assertEqual(self.calls, ["gate", "release"])
+
+    def test_a_wrong_envelope_is_still_refused_and_says_what_to_put(self):
+        self.scope_question()
+        answer = self.base / "wrong.json"
+        for key, wrong in (("schema", "other/v1"), ("route_id", "rt-foreign"), ("round", 2)):
+            with self.subTest(key=key):
+                answer.write_text(json.dumps({key: wrong, "understanding_confirmed": True,
+                                              "answers": {"q-scope": {"choice": 0}}}))
+                with self.assertRaisesRegex(ValueError, "frame-input-invalid: " + key + ":") as caught:
+                    self.step(interview=self.question_file, answers=answer)
+                self.assertIn('"understanding_confirmed"' if key == "schema" else "omit " + key, str(caught.exception))
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.resolution()["status"], "not-raised")
+
+    def test_a_round_two_answer_without_the_envelope_is_that_rounds(self):
+        self.scope_question()
+        first = self.step(interview=self.question_file, answers=self.answers_for_scope(), decision="revise")
+        question = first["interview_template"]
+        question["understanding"] = "Run the two commands and keep both outputs in the report."
+        self.question_file.write_text(json.dumps(question))
+        self.assertEqual(self.step(interview=self.question_file)["state"], "needs-question")
+        answer = self.base / "round-two.json"
+        answer.write_text(json.dumps({"round": 1, "understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
+        with self.assertRaisesRegex(ValueError, "frame-input-invalid: round:"):
+            self.step(answers=answer)
+        answer.write_text(json.dumps({"understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
+        self.assertEqual(self.step(answers=answer)["state"], "released")
+        self.assertEqual(self.calls, ["gate", "release", "gate", "release"])
+
     def test_stop_does_not_render_an_agreed_intent_or_start_anything(self):
         result = self.step(interview=self.question_file,answers=self.answers(),decision="stop")
         self.assertEqual(result["state"], "cancelled")
