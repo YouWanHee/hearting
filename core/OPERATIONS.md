@@ -927,6 +927,13 @@ already running under an older supervisor behaves the same way.
 Corrections preserve route, completion and cleanup evidence; completed-prefix
 reuse uses the existing `continuation` compiler rather than a fresh recipe.
 
+Newly compiled owner continuation budgets use one finite workload formula that
+accounts for declared nodes, unique retry boundaries, the review-round cap and
+terminal nodes. The separate workload floor applies only to newly derived
+budgets; valid older sealed budgets remain valid. The reserved continuation is
+for terminal handoff after ordinary work is exhausted and does not itself
+guarantee an unfinished report node.
+
 A steward is informally depth −1; not a dispatch depth. This role carries no launch,
 gate, write, or approval authority over the session it addresses — its peer messages are
 advisory context between two already-running sessions, and the append-only ledger below
