@@ -740,7 +740,8 @@ def _leg_task_text(route, root, output, briefs, intent, approvals):
              (output / "shards/frame/intent.md").read_text(encoding="utf-8").rstrip(), "",
              "## Frame briefs (read-only input)", ""]
     lines += [f"- {root / row['path']} (sha256 {row['sha256']})" for row in briefs]
-    lines += ["", "## Start approvals given", ""]
+    lines += ["", "## Execution scope", "", approvals.get("execution_scope", "complete"),
+              "", "## Start approvals given", ""]
     lines += [f"- {row['key']} for leg {row['leg']} ({', '.join(row['parts']) or 'steps named in the question'}): "
               + ("approved" if row["accepted"] else "not approved") for row in approvals["given"]] or ["- none"]
     return "\n".join(lines) + "\n"
@@ -749,6 +750,7 @@ def _leg_task_text(route, root, output, briefs, intent, approvals):
 def _decide(route, jobs, root, record, output, briefs, intent):
     """The decision part for this frame route: the approved first leg, or `selected: none` with the reason."""
     import frame_interview as FI
+    module = _route_module()
     frame_route = {"route_id": route["route_id"], "route_hash": route["route_hash"], "cycle_id": record["cycle_id"]}
 
     def ended(reason, rows=None):
@@ -783,10 +785,15 @@ def _decide(route, jobs, root, record, output, briefs, intent):
         if item["leg"] == 0 and not any(row["accepted"] and row["leg"] == 0 and row["key"] == item["start_approval"]
                                         for row in given):
             return ended(f"approval-missing:{item['start_approval']}", shown)
-    approvals = {"given": given}
+    execution_scope = choice.get("execution_scope") or choice["proposal"].get("execution_scope", "complete")
+    if execution_scope not in ("complete", "report"):
+        return ended("proposal-not-verified", shown)
+    approvals = {"given": given, "execution_scope": execution_scope}
     prompt = _decision_home(root) / f"{route['route_id']}.leg-task.md"
     task = _keep_first(prompt, _leg_task_text(route, root, output, briefs, intent, approvals).encode("utf-8"))
     leg = match["proposal"]["legs"][0]
+    projected_leg = module.project_entry_execution_scope(leg, execution_scope)
+    execution_graph = list(projected_leg.get("graph") or [])
     source = ((route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source") or "auto"
     record_rel = (output / RP.RECORD_RELATIVE).relative_to(root).as_posix()
     compose = {
@@ -797,6 +804,8 @@ def _decide(route, jobs, root, record, output, briefs, intent):
                     "prompt_file": str(prompt), "prompt_sha256": hashlib.sha256(task).hexdigest(),
                     "spec_read": "auto" if str(source).startswith("compose-auto:") else source,
                     "owner": (route.get("work_request") or {}).get("owner_harness")}}
+    if execution_scope == "report" and leg.get("shape") == "staged":
+        compose["graph"] = execution_graph
     return RP.build_decision(frame_route=frame_route, selected=choice["label"], reason="", briefs=briefs,
                              intent=intent, proposal=match["proposal"], proposals=shown, approvals=approvals,
                              first_leg_compose=compose)

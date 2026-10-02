@@ -144,9 +144,10 @@ created: {YYYY-MM-DD}
          intensity: standard     # optional
          why: "one sentence"
      entry_approvals:            # optional; only for parts that carry start_approval
-       - key: full-run           # full-run | deploy | handback
+       - key: full-run           # full-run | deploy | handback | preview
          leg: 1                  # 0-based leg holding that part
-         question: run-approval  # the section 7 question id
+         question: route-choice  # reuse the existing route question
+     execution_scope: complete   # optional: complete (default) | report
    ```
 
    Anything that is not a valid proposal is read as "no proposal"; it never

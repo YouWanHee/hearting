@@ -5622,5 +5622,52 @@ class SealBackgroundJobTest(ProducerTestBase):
         popen.assert_called_once()
 
 
+class QuickPreviewApprovalWriteGuardTest(ProducerTestBase):
+    def test_bound_complete_scope_allows_quick_refine_target_write(self):
+        target = self.root / "documents" / "sample" / "draft.md"
+        target.parent.mkdir(parents=True)
+        route = {"capability": "autopilot-refine", "effective_intensity": "quick",
+                 "route_plan": {"decision": "decision.json", "digest": "sha256:" + "a" * 64, "index": 0},
+                 "entry_execution_scope": "complete", "entry_scope_contract_version": 1,
+                 "nodes": [{"id": "one-shot"}]}
+        P._quick_refine_write_gate(self.root, target, route)
+
+    def test_direct_report_scope_blocks_source_write_but_allows_its_preview_output(self):
+        target = self.root / "documents" / "sample" / "draft.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"original artifact bytes\n")
+        original = target.read_bytes()
+        report = {"capability": "autopilot-refine", "effective_intensity": "direct",
+                  "entry_scope_contract_version": 1, "entry_execution_scope": "report",
+                  "nodes": [{"id": "one-shot"}]}
+        with self.assertRaisesRegex(P.ProducerError, "legacy-top-level-write-denied"):
+            P._quick_refine_write_gate(self.root, target, report)
+        snapshot = self.root / "documents" / "sample" / "_internal" / "versions" / "1" / "draft.md"
+        with self.assertRaisesRegex(P.ProducerError, "legacy-top-level-write-denied"):
+            P._quick_refine_write_gate(self.root, snapshot, report)
+        history = self.root / "documents" / "sample" / "pipeline_summary.md"
+        with self.assertRaisesRegex(P.ProducerError, "legacy-top-level-write-denied"):
+            P._quick_refine_write_gate(self.root, history, report)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(history.exists())
+        preview = self.root / "reviews" / "refine" / "preview.md"
+        P._quick_refine_write_gate(self.root, preview, report)
+
+    def test_report_and_unreleased_old_route_remain_protected(self):
+        target = self.root / "documents" / "sample" / "draft.md"
+        target.parent.mkdir(parents=True)
+        binding = {"decision": "decision.json", "digest": "sha256:" + "a" * 64, "index": 0}
+        report = {"capability": "autopilot-refine", "effective_intensity": "quick",
+                  "route_plan": binding, "entry_execution_scope": "report", "entry_scope_contract_version": 1,
+                  "nodes": [{"id": "one-shot"}]}
+        with self.assertRaisesRegex(P.ProducerError, "legacy-top-level-write-denied"):
+            P._quick_refine_write_gate(self.root, target, report)
+        old = {"capability": "autopilot-refine", "effective_intensity": "quick",
+               "nodes": [{"id": "one-shot"}]}
+        with self.assertRaisesRegex(P.ProducerError, "inline-gate-binding-missing"):
+            P._quick_refine_write_gate(self.root, target, old)
+
+
 if __name__ == "__main__":
     unittest.main()

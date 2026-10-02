@@ -16,7 +16,7 @@ This capability fills the gap between research, specification, and production co
 | **`autopilot-lab`** | Prototype a training setup or evaluate a checkpoint | `experiments/` |
 | `autopilot-code` | Refine, productionize, or package code | `plans/` |
 
-Heavy training and evaluation use the selected compute environment, cluster, GPU queue, or scheduler. At route start, the card obtains approval for any included `full-run` part. Execute it only in the environment included in that scope; otherwise provide the command and leave the part out for a later compose. Never infer access to a remote environment from approval to run training.
+Heavy training and evaluation use the selected compute environment, cluster, GPU queue, or scheduler. The existing start choice may select complete or report; report ends after scaffold, smoke, and its hash-bound attestation. Execute `full-run` only in the environment included in the approved scope; never infer access to a remote environment from approval to run training.
 
 ## Reference Index
 

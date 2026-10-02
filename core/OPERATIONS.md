@@ -584,8 +584,11 @@ release. After `frame_interview.py validate-answers` and `render-intent`, run
 `workflow-supervisor.py release --route <route> --gate frame-review --decision
 proceed --answers <file>`, then launches the owner with `Intent: <absolute path>`.
 
-Quick refine's one conductor raises `preview-disposition` before apply.
-Target writes require user release of the current preview digest;
+New refine starts carry complete or report scope in the existing start choice.
+Report ends after review and the preview, before source snapshot or apply;
+complete proceeds through the existing review and verification without asking
+for a second entry approval. Older sealed quick routes retain their
+`preview-disposition` release and current-preview digest checks;
 `capabilities/autopilot-refine.md` owns the commands.
 
 ### §5.11. Commit and Push Policy for `<agent-home>`

@@ -8,7 +8,7 @@
   "autopilot-design": "sha256:a0d62cb63ec8bd255f254417241c97856fbeae4095cde072a878f65c313cecca",
   "autopilot-draft": "sha256:37c3b4a3fc45a5df8f199f220ef940dbc19ca8eae17e51b2b14f267053057af5",
   "autopilot-lab": "sha256:41e59b4c50376ae247eb110b8f830693f67203d482c5017210ed89a5ac0cc55c",
-  "autopilot-refine": "sha256:f97b337937dd64cb49ba675b9e19bda3a05077e9389a73e4ad99ffed91f46729",
+  "autopilot-refine": "sha256:1721bbf230492a6f2c1994924a938e2e4c451ea21b7d16165ab9647d6e5f5e7a",
   "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
   "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",
   "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb",
@@ -344,12 +344,12 @@
    "briefs": {
     "frame": "ccc1b905a66a5505c2ef",
     "frame-alternative": "4df946baee935721b951",
-    "review": "25154dc17d4ce425ae08",
+    "review": "4eb9dda5f8ce9fb5ee9c",
     "transaction": "d4edf84572c47178d810"
    },
-   "card": "[경로] autopilot-refine · staged(standard) frame→frame-alternative→review→transaction · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "card": "[경로] autopilot-refine · staged(standard) frame→frame-alternative→review→transaction · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 preview (autopilot-refine:transaction)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
    "completion_gates": "7be6ed6dacc44f9abedd",
-   "composed_recipe": "e5e01e92f315898a45fc",
+   "composed_recipe": "7ce62ff99de5b5b4e3a4",
    "conditional_extensions": "1c90d16dc25b0339d09a",
    "human_gate_bindings": "b017ed0c89377f6fbe31",
    "human_gates": "06cc065ba71874ba684f",
@@ -363,7 +363,7 @@
    "nodes": {
     "frame": "dbbcc81d050949a8b603",
     "frame-alternative": "c966f5736cd053a0e087",
-    "review": "fbfd888a48cf35110d6c",
+    "review": "a4b06aa3e7d827a7af35",
     "transaction": "d6732a9044ff372d85b5"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
@@ -1649,10 +1649,10 @@
    "briefs": {
     "frame": "ccc1b905a66a5505c2ef",
     "frame-alternative": "4df946baee935721b951",
-    "review": "25154dc17d4ce425ae08",
+    "review": "4eb9dda5f8ce9fb5ee9c",
     "transaction": "d4edf84572c47178d810"
    },
-   "card": "[경로] autopilot-refine · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "card": "[경로] autopilot-refine · staged(standard) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 preview (autopilot-refine:transaction)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
    "completion_gates": "7be6ed6dacc44f9abedd",
    "conditional_extensions": "1c90d16dc25b0339d09a",
    "human_gate_bindings": "b017ed0c89377f6fbe31",
@@ -1667,7 +1667,7 @@
    "nodes": {
     "frame": "dbbcc81d050949a8b603",
     "frame-alternative": "c966f5736cd053a0e087",
-    "review": "626bc93d343ee593237a",
+    "review": "4a9c8899f8b80cf3c4bb",
     "transaction": "d6732a9044ff372d85b5"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
@@ -1678,11 +1678,11 @@
    "briefs": {
     "frame": "5b31285cb0dd75170c61",
     "frame-alternative": "e142f4677d98210b1d49",
-    "review": "f54887521418236a733a",
-    "review-alternative": "ed1559d1daa99b8e5b94",
+    "review": "85737901c870acf41a3f",
+    "review-alternative": "f4ad5f9eb828e02f1cad",
     "transaction": "08e75147fdec0cd109d9"
    },
-   "card": "[경로] autopilot-refine · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "card": "[경로] autopilot-refine · staged(strong) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 preview (autopilot-refine:transaction)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
    "completion_gates": "7be6ed6dacc44f9abedd",
    "conditional_extensions": "1c90d16dc25b0339d09a",
    "human_gate_bindings": "b017ed0c89377f6fbe31",
@@ -1698,8 +1698,8 @@
    "nodes": {
     "frame": "dbbcc81d050949a8b603",
     "frame-alternative": "c966f5736cd053a0e087",
-    "review": "576a462c54e3767439d6",
-    "review-alternative": "75853cc015ba893895ae",
+    "review": "3546bb99b3c1432fccd4",
+    "review-alternative": "fd10fa3f99fb3b2884aa",
     "transaction": "73b0e6d83c97548f3441"
    },
    "parallel_groups": "7bfa940e962478a7fc1d",
@@ -1710,11 +1710,11 @@
    "briefs": {
     "frame": "e21bcfb728660bfed34d",
     "frame-alternative": "1d948efdcc5bbd70d3b4",
-    "review": "ace200342123da27f1a5",
-    "review-alternative": "95d0689df0b57777c72e",
+    "review": "61d1d2e2ba66e260bac1",
+    "review-alternative": "591a53644c0f0b072a5c",
     "transaction": "fe38c1c8a602e549ba2a"
    },
-   "card": "[경로] autopilot-refine · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
+   "card": "[경로] autopilot-refine · staged(thorough) frame · route <rt> · origin compose · 사람 게이트 frame-review,preview-disposition\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개\n  시작 승인 preview (autopilot-refine:transaction)\n  자동 선택에서 Codex owner의 workspace-write가 선택되면: <WORKTREE-SCOPE-ADVISORY>.",
    "completion_gates": "7be6ed6dacc44f9abedd",
    "conditional_extensions": "1c90d16dc25b0339d09a",
    "human_gate_bindings": "b017ed0c89377f6fbe31",
@@ -1730,8 +1730,8 @@
    "nodes": {
     "frame": "dbbcc81d050949a8b603",
     "frame-alternative": "c966f5736cd053a0e087",
-    "review": "576a462c54e3767439d6",
-    "review-alternative": "75853cc015ba893895ae",
+    "review": "3546bb99b3c1432fccd4",
+    "review-alternative": "fd10fa3f99fb3b2884aa",
     "transaction": "73b0e6d83c97548f3441"
    },
    "parallel_groups": "7bfa940e962478a7fc1d",

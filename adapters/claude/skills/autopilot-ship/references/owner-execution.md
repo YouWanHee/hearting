@@ -54,7 +54,7 @@ autopilot-spec --mode app
   ↻ autopilot-ship for environment, domain, or migration updates
 ```
 
-The route-start card obtains approval for the selected `deploy` part. Within that approved system and action scope, the owner may execute deployment and verify the result. DNS changes, billing, secret entry, and production database migrations remain outside scope unless the approval names those systems and actions.
+The existing start choice carries complete or report for the shown scope. Report ends after both preparation reviews and their required merge evidence; complete may execute deployment and verify only within the approved system and action scope. DNS changes, billing, secret entry, and production database migrations remain outside scope unless the approval names those systems and actions.
 
 ## Invocation
 

@@ -2482,7 +2482,8 @@
               "shards/frame-alternative/direction-brief.md"
             ],
             "outputs": [
-              "reviews/refine-verdict.json"
+              "reviews/refine-verdict.json",
+              "reviews/refine/preview.md"
             ],
             "write_scope": [
               "reviews/refine/**",
@@ -4899,7 +4900,8 @@
         "summary": "Review the target artifact against its source evidence and write the refine verdict."
       },
       "autopilot-refine:transaction": {
-        "summary": "Owner snapshots, previews and applies the revision."
+        "summary": "Owner snapshots, previews and applies the revision.",
+        "start_approval": "preview"
       },
       "autopilot-research:retrieval": {
         "summary": "Parallel source retrieval into shards.",
