@@ -28,6 +28,7 @@ another adapter.
   harness files are symlinks; do not use it as the managed `AGENT_HOME`.
 - Resolve the canonical artifact root with `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - Use portable model roles, never vendor model names, in shared artifacts.
+- Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
 - Repo-root `skills/` is the canonical Skill authoring tree; `tools/sync-entry-skill-layer.py` projects it into `adapters/claude/skills/` (generated — do not hand-edit the projection). Claude-native hooks, commands, settings, and kernel helper agents live under `adapters/claude/`; behavior personas live in the portable unit catalog `roles/units/`.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
 - Call the six runtime-root-sensitive utilities (`capability-route`, `artifact_producer`, `spec-transaction`, `dispatch-owner`, `dispatch-batch`, `dispatch-node`) through the installed `$AGENT_HOME`; a checkout-relative call to one of them is allowed only under dev activation (`AGENT_HOME` is that checkout itself).
