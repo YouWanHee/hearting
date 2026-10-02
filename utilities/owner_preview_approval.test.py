@@ -320,6 +320,39 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
         self.assertEqual(self.settle().result, "completed")
         self.assertEqual(self.workflow_state(), "COMPLETE")
 
+    def test_a_preview_removed_after_its_release_does_not_hold_the_closure(self):
+        # The preview is a file of its own, not the review marker's evidence: removing that one is a different refusal.
+        for label, released, gates in (("off", True, None), ("off-unreleased", False, None), ("on", True, "on")):
+            with self.subTest(gates=label):
+                fixture = OwnerPreviewApprovalTest(
+                    "test_a_preview_removed_after_its_release_does_not_hold_the_closure")
+                fixture.setUp()
+                try:
+                    env = {"HEARTING_GATES": gates} if gates else {}
+                    with mock.patch.dict(os.environ, env):
+                        if not gates:
+                            os.environ.pop("HEARTING_GATES", None)
+                        fixture.build("claude", close=False)
+                        preview = fixture.write_output(fixture.cycle, rel="documents/diff-preview.md",
+                                                       data=b"--- a/README\n+++ b/README\n")
+                        fixture.raise_gate(preview)
+                        if released:
+                            self.assertEqual(fixture.release("proceed").returncode, 0)
+                        preview.unlink()
+                        fixture.close_owner()
+                        settled = fixture.settle()
+                        if label == "off":
+                            self.assertEqual(settled.result, "completed", settled)
+                            receipt = fixture.start()
+                            self.assertEqual(receipt["state"], "completed", receipt)
+                            self.assertEqual(fixture.workflow_state(), "COMPLETE")
+                        else:
+                            # Only a person's `proceed` authorizes the close; the gate-off record never stands in for it.
+                            self.assertNotEqual(settled.result, "completed", settled)
+                            self.assertNotEqual(fixture.workflow_state(), "COMPLETE")
+                finally:
+                    fixture.doCleanups()
+
     def test_an_owner_that_raised_and_exited_without_a_release_is_waiting(self):
         self.build("claude", close=False)
         self.raise_gate()

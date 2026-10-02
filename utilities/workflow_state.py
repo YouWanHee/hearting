@@ -657,9 +657,9 @@ def node_raises_human_gate(node: dict, gate: str) -> bool:
 def require_gate_artifact_current(resolution: dict) -> None:
     digest = resolution.get("artifact_sha256")
     path = Path(str(resolution.get("artifact") or ""))
-    if not digest or not path.is_absolute() or not path.is_file():
+    if not digest or not path.is_absolute():
         raise WorkflowStateError("inline-gate-preview-changed-or-unbound")
-    if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         if gates_on():
             raise WorkflowStateError("inline-gate-preview-changed-or-unbound")
         same_work_or_refuse("inline-gate-preview-changed-or-unbound", str(path))
