@@ -55,7 +55,9 @@ from dispatch_contract import (
     owner_closure_shape,
     _diff_attribution_execute_launch_head,
     evidence_digest,
+    evidence_change_history,
     evidence_currency,
+    note_evidence_change,
     gate_currency,
     ROUTE_STATE_REFUSAL_REASONS,
     route_state_next_action,
@@ -1560,6 +1562,15 @@ def _verify_continuation_route(route):
     _validate_output_scopes(route.get("nodes",[]))
     return route
 
+def _note_evidence_changes(route,node_ids,*,jobs=None):
+    """Keep gates-off evidence edits of these completed nodes as history (`note_evidence_change`)."""
+    directory=completion_dir(route["route_id"],jobs=jobs)
+    by_id={str(node.get("id")):node for node in route.get("nodes",[])}
+    for node_id in node_ids:
+        node=by_id.get(str(node_id)); path=directory/f"{node_id}.json"
+        if node is not None and path.is_file():
+            note_evidence_change(route,node,path)
+
 def publish_continuation_route(route,source_route,output_path):
     """Recheck source bytes immediately before the one immutable publication."""
     if route.get("requested_boundary_blocker") or route.get("first_runnable_blocker"):
@@ -1585,6 +1596,9 @@ def publish_continuation_route(route,source_route,output_path):
         if not route_path_is_exact(path,route["artifact_root"],route["route_id"]):
             raise ValueError("route-output-alias-basename")
         write_once(path,route)
+        # The continuation proceeds on these completions: keep any gates-off
+        # edit of their evidence as history.
+        _note_evidence_changes(source_route,node_ids,jobs=_continuation_source_jobs(source_route))
         return path
     proof=route.get("ancestor_plan_refresh")
     if proof is None:
@@ -6532,9 +6546,7 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         # finding no marker for an unstarted node.
         raise ValueError("revision-target-marker-absent")
     currency = gate_currency(route, node, canonical_path, marker)
-    if currency.state == "current":
-        raise ValueError("revision-evidence-unchanged")
-    if currency.state != "revised-unrecorded":
+    if currency.state not in ("current", "revised-unrecorded"):
         # `superseded`, `completion-evidence-unreadable`, or any
         # `integrity-broken:*` -- every one of these is a kept refusal
         # (13.59.3 "유지되는 거부"), not something `revise` can record over.
@@ -6542,6 +6554,13 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
     evidence_path = Path(evidence).resolve()
     if not (evidence_path.is_file() or evidence_path.is_dir()):
         raise ValueError("completion-evidence-unreadable")
+    # "Unchanged" is the one comparison every reader makes: the evidence named
+    # here against the digest the marker recorded. With gates off a changed
+    # file still reads `current` (it is only history then), so the currency
+    # state alone cannot say whether there is anything to record.
+    evidence_sha = evidence_digest(evidence_path)
+    if evidence_sha == (marker.get("evidence") or {}).get("sha256"):
+        raise ValueError("revision-evidence-unchanged")
     # D-120: a revision's new evidence is bound by the same admitted cycle
     # write scope as an ordinary completion (`_publish_completion_locked`
     # already requires this) -- an open neighbouring cycle, or a
@@ -6552,7 +6571,6 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         require_cycle_output(Path(route["artifact_root"]), evidence_path, route_id=route["route_id"])
     except ProducerError as exc:
         raise ValueError(f"{exc.code}: {exc.detail}") from exc
-    evidence_sha = evidence_digest(evidence_path)
     # Basis verification runs (and can raise `revision-basis-unverified`)
     # before any write -- a refused revision must publish nothing.
     revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
@@ -6701,7 +6719,20 @@ def _route_revisions(route, *, jobs=None):
                 "recorded_by": revision.get("recorded_by"),
                 "recorded_at": revision.get("recorded_at"),
             })
-    revisions.sort(key=lambda row: (row["node"], row["sequence"] or 0))
+        # Gates off, an evidence edit after the marker is kept as history
+        # (`record_evidence_change`), not as a revision marker; list it too.
+        for change in evidence_change_history(directory / f"{node_id}.json", node_id):
+            revisions.append({
+                "node": node_id,
+                "sequence": change.get("marker_sequence"),
+                "author_attempt_id": change.get("observed_by"),
+                "basis": "automatic",
+                "of_evidence_sha256": change.get("previous_sha256"),
+                "evidence_sha256": change.get("sha256"),
+                "recorded_by": "runtime-auto",
+                "recorded_at": change.get("observed_at"),
+            })
+    revisions.sort(key=lambda row: (row["node"], row["sequence"] or 0, row["recorded_at"] or ""))
     return revisions
 
 
@@ -7053,6 +7084,8 @@ def complete_node(
             owner_operation_fence(route,node,jobs=jobs)
         except DispatchContractError as exc:
             raise ValueError(f"{exc.reason}:{exc.detail}") from exc
+    # This completion proceeds on its predecessors: keep any gates-off edit of their evidence as history.
+    _note_evidence_changes(route,node.get("depends_on",[]) if isinstance(node,dict) else [],jobs=jobs)
     artifact_root=route.get("artifact_root")
     route_id=route.get("route_id")
     pending=None
@@ -8570,6 +8603,47 @@ def _route_chain_identity(event, route):
     return harness, sid, depth, None
 
 
+def _current_owner_attempt(jobs, attempt_id):
+    """The newest launched owner in this attempt's replacement lineage (itself when none).
+
+    An answer sent with an older owner's id still reaches the owner doing the work now."""
+    try:
+        from dispatch_replacement import effective_attempts
+        current = attempt_id
+        for _ in range(32):
+            effective, mapping = effective_attempts(jobs, {current})
+            if not mapping:
+                return current
+            current = next(iter(effective))
+        return current
+    except (DispatchContractError, OSError, ValueError, StopIteration):
+        return attempt_id
+
+
+def _continue_after_answer(jobs, attempt_id, correction):
+    """Continue a route whose owner ended BLOCKED, now that its answer is kept.
+
+    The shared `start` does the work: its replacement owner receives the answer
+    first (`dispatch_replacement` 'corrected'). Its receipt, `parent_next`
+    included, is this command's receipt, so nothing else has to be run."""
+    import dispatch_replacement
+    from work_start import start_work, _rows as start_rows
+    try:
+        _, meta = start_rows(jobs)[attempt_id]
+        route_path, _ = dispatch_replacement._route(jobs, attempt_id, meta)
+        route = verify_route(json.loads(route_path.read_text()))
+    except (DispatchContractError, OSError, ValueError, KeyError) as exc:
+        return {**correction, "state": "retained", "reason": getattr(exc, "reason", None) or str(exc)[:200],
+                "next_step": "The answer is kept, but this owner's route cannot continue (it is closed or "
+                    "unreadable). Report that; compose the remaining work as a new route."}
+    _record_route_chain(route, str(route_path), "start")
+    receipt = start_work(route, route_path, jobs)
+    if receipt.get("reason") == "replacement-parent-identity-unproven":
+        receipt["next_step"] = ("The answer is kept. Only the session that started this route may launch its "
+            "replacement owner: that session continues it with resume_command, and the answer goes first.")
+    return {**receipt, "correction": correction}
+
+
 def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None):
     """Append one route-chain ledger line. Every failure is silent — route creation/start
     must never fail because of this sidecar (plan §3 B-1.3). Success/failure is only
@@ -8997,13 +9071,20 @@ def main():
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError
         jobs=Path(a.jobs or _compose_default_jobs())
+        attempt=_current_owner_attempt(jobs,a.attempt_id)
         try:
-            result=(submit(jobs,a.attempt_id,a.message_file.read_text(),a.request_id)
-                    if a.message_file else inspect(jobs,a.attempt_id))
+            result=(submit(jobs,attempt,a.message_file.read_text(),a.request_id)
+                    if a.message_file else inspect(jobs,attempt))
         except InputError as exc:
             print(json.dumps({"state":"not-admitted","reason":str(exc),
                               "next_step":"Retain the correction. Inspect the exact owner; do not restart it or treat a file edit as delivery."}))
             return 69
+        if attempt!=a.attempt_id:
+            result["redirected_from"]=a.attempt_id
+        if result.get("retained"):
+            # The owner had ended BLOCKED: its answer continues the route now, in the
+            # same call, through the one shared start (a replacement owner receives it).
+            result=_continue_after_answer(jobs,attempt,result)
         print(json.dumps(result,ensure_ascii=False))
         return 0
     if a.command=="start":

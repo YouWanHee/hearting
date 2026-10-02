@@ -421,6 +421,11 @@ stamp path in `core/HOOKS.md`.
   Claude wake and the shared completion follow-up describe a parked owner as
   paused at the gate, not failed. A revise or stop recorded while the owner is
   parked starts nothing automatically.
+  An owner that ended `BLOCKED` outside any declared gate is waiting for an answer:
+  `resume_command` reports `owner-blocked`, and `capability-route.py correct` keeps
+  the answer and continues the route in the same call. The continuation is a
+  replacement owner whose shared `recovery_instructions` carry the answer
+  (`dispatch_replacement` `corrected`), the same on every adapter.
   A Codex delivery uses a distinct strict `human-gate` receipt and `hg-dlv-*`
   gateway identity. It binds the route id/hash/file, gate raise epoch, exact
   live owner attempt and sealed batch, immutable registry, recipient thread and

@@ -762,6 +762,11 @@ automatic replacement, so a replacement or continuation owner, which its prompt'
 recovery context identifies, keeps calling the bounded `await-release` at a later
 gate instead of parking. A revise or stop recorded while the owner is parked keeps
 its meaning and starts nothing automatically.
+An owner that needs a person's answer at a node no declared gate covers ends
+`BLOCKED` and names the question in its handoff. `resume_command` reports it as
+`owner-blocked` with that report. The answer sent with `correct` starts one
+replacement owner that receives it and continues the route. No gate, close, or
+recompose is needed.
 
 A continuation route projects this contract onto its suffix. It drops a gate
 whose gated entry node was cut, never rebinds a retained raising continuation to

@@ -102,6 +102,13 @@ def _reachable(row, value, live):
     return live or (row.status in {"open", "running"} and _preconsumer(value))
 
 
+def _answers_blocked_owner(row, live):
+    """An owner that ended BLOCKED is waiting for an answer, not gone: a correction sent to it is
+    kept (`retained`) and the next start continues the route with it (dispatch_replacement)."""
+    return (not live and row.status == "done"
+            and row.metadata.get("note") == "dead-worker-blocked")
+
+
 def _owner_phase(attempt):
     """Read only the exact validated supervisor phase when its path is supplied."""
     raw = os.environ.get("AGENT_DISPATCH_COMPLETION_STATE_FILE")
@@ -174,18 +181,47 @@ def submit(jobs, attempt, text, request_id=None):
                     raise InputError("correction-id-content-conflict")
                 live = supervisor_lease_is_held(jobs, row.metadata)
                 return {**_public(value, live=live, reachable=_reachable(row, value, live)),
-                        "request_id": request_id, "duplicate": True}
+                        "request_id": request_id, "duplicate": True,
+                        **_retained_fields(item)}
         live = supervisor_lease_is_held(jobs, row.metadata)
+        retain = False
         if (not value["accepting"] or row.status not in {"open", "running"}
                 or not _reachable(row, value, live)):
-            raise InputError("owner-input-unavailable-retain-correction")
+            if not _answers_blocked_owner(row, live):
+                raise InputError("owner-input-unavailable-retain-correction")
+            retain = True
         item = {"id": request_id, "digest": digest, "text": text, "events": [],
                 "source_session": os.environ.get("CODEX_THREAD_ID") or
                 os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or "operator"}
-        _transition(item, "queued")
+        _transition(item, "retained" if retain else "queued")
         value["requests"].append(item)
         _write(path, value)
-        return {**_public(value, live=live, reachable=True), "request_id": request_id, "duplicate": False}
+        return {**_public(value, live=live, reachable=not retain), "request_id": request_id,
+                "duplicate": False, **_retained_fields(item)}
+
+
+def _retained_fields(item):
+    if item["state"] != "retained":
+        return {}
+    return {"retained": True,
+            "next_step": "The owner had ended BLOCKED; this answer is kept for it. Starting the route "
+                "continues the work in a replacement owner that receives this answer first."}
+
+
+def retained(jobs, attempt):
+    """Answers kept for an owner that ended BLOCKED, oldest first. Read-only."""
+    path = _path(jobs, attempt)
+    if path.is_symlink():
+        return []
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(value, dict) or value.get("schema_version") != 1 or value.get("attempt_id") != attempt:
+        return []
+    return [{"id": item["id"], "digest": item["digest"], "text": item["text"]}
+            for item in value.get("requests", [])
+            if isinstance(item, dict) and item.get("state") == "retained"]
 
 
 def initialize_owner_input(jobs, attempt, transport):
