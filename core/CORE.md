@@ -258,10 +258,6 @@ When the registered owner supplies a valid primary in its exact PASS handoff,
 terminal settlement uses that same artifact for the producer manifest and the
 sealed owner envelope. Without a valid owner primary, existing selection
 fallbacks continue to apply.
-When the registered owner supplies a valid primary in its exact PASS handoff,
-terminal settlement uses that same artifact for the producer manifest and the
-sealed owner envelope. Without a valid owner primary, existing selection
-fallbacks continue to apply.
 
 | Bucket | Meaning | Disposition class |
 |---|---|---|
