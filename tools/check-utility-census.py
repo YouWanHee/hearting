@@ -8,8 +8,9 @@ census row historically surfaced only on CI after push
 (2026-07-23 dispatch_parent_context_conformance.test.py incident — and the same
 class before it). This checker runs the SAME census membership rule in the
 standard ``generate.py --check`` battery, so the acting agent is asked to record
-its judgment BEFORE push. Single source of truth stays the boundary script: the
-lists are parsed from it, never duplicated here.
+its judgment BEFORE push. Nothing is duplicated here: the projected lists are
+parsed from the boundary script and the deferred lists are read from
+``tools/adaptation-census.tsv``, the same files the guard reads.
 """
 from __future__ import annotations
 
@@ -19,34 +20,44 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOUNDARY = ROOT / "tools" / "check-adaptation-boundary.sh"
+CENSUS = ROOT / "tools" / "adaptation-census.tsv"
 # Mirrors the boundary census: test files are DERIVED-deferred.
 TEST_PATTERNS = (".test.py", ".test.sh")
 
 
-def census_scopes(text: str) -> list[tuple[str, set[str]]]:
+def census_list(census: str, name: str) -> set[str]:
+    members = set()
+    for line in census.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 2 and fields[0] == name:
+            members.add(fields[1])
+    return members
+
+
+def census_scopes(text: str, census: str) -> list[tuple[str, set[str]]]:
     projected = re.findall(r'^\s*UTILITY_PROJECTED="([^"]*)"', text, re.M)
-    deferred = re.findall(r'^\s*UTILITY_DEFERRED="([^"]*)"', text, re.M)
-    shared = re.findall(
-        r'^\s*SHARED_UTILITY_DEFERRED="([^"]*)"', text, re.M
-    )
-    if len(projected) != 2 or len(deferred) != 2 or len(shared) != 1:
+    if len(projected) != 2:
         raise SystemExit(
-            "check-utility-census: expected exactly 2 UTILITY_PROJECTED and 2 "
-            "UTILITY_DEFERRED lists plus 1 SHARED_UTILITY_DEFERRED list in "
-            f"{BOUNDARY.name}, found {len(projected)}/{len(deferred)}/{len(shared)} "
-            "— realign this parser with the guard"
+            "check-utility-census: expected exactly 2 UTILITY_PROJECTED lists in "
+            f"{BOUNDARY.name}, found {len(projected)} — realign this parser with the guard"
         )
-    shared_members = set(shared[0].split())
+    deferred = census_list(census, "utility-deferred")
+    shared_members = census_list(census, "shared-utility-deferred")
+    if not deferred or not shared_members:
+        raise SystemExit(
+            f"check-utility-census: {CENSUS.name} has no utility-deferred or "
+            "shared-utility-deferred rows — realign this parser with the guard"
+        )
     scopes = []
-    for label, p, d in (("codex", projected[0], deferred[0]),
-                        ("opencode", projected[1], deferred[1])):
-        scopes.append((label, set(p.split()) | set(d.split()) | shared_members))
+    for label, p in (("codex", projected[0]), ("opencode", projected[1])):
+        scopes.append((label, set(p.split()) | deferred | shared_members))
     return scopes
 
 
 def main() -> int:
     # --check and write mode behave identically: this tool only verifies.
-    scopes = census_scopes(BOUNDARY.read_text(encoding="utf-8"))
+    scopes = census_scopes(BOUNDARY.read_text(encoding="utf-8"),
+                           CENSUS.read_text(encoding="utf-8"))
     missing: list[str] = []
     for path in sorted((ROOT / "utilities").iterdir()):
         if not path.is_file():
@@ -58,9 +69,9 @@ def main() -> int:
             if name not in members:
                 missing.append(f"  utilities/{name} — {label} census")
     if missing:
-        print("utility census rows missing (decide projected|deferred and add the", file=sys.stderr)
-        print("name to UTILITY_PROJECTED or UTILITY_DEFERRED in", file=sys.stderr)
-        print(f"{BOUNDARY.relative_to(ROOT)}; *.test.py/*.test.sh auto-defer):", file=sys.stderr)
+        print("utility census rows missing (decide projected|deferred: add the name to", file=sys.stderr)
+        print(f"UTILITY_PROJECTED in {BOUNDARY.relative_to(ROOT)} or a utility-deferred row in", file=sys.stderr)
+        print(f"{CENSUS.relative_to(ROOT)}; *.test.py/*.test.sh auto-defer):", file=sys.stderr)
         for row in missing:
             print(row, file=sys.stderr)
         return 1
