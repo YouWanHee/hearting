@@ -3303,7 +3303,9 @@ class DispatchContractTest(unittest.TestCase):
     with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()):
      self.assertEqual(verdict(release_proof=True),"ok")           # off (the default): only reported, as everywhere else
      preview.unlink()
-     self.assertEqual(verdict(release_proof=True),"human-gate-unreleased")   # a preview that is gone is unbound either way
+     self.assertEqual(verdict(release_proof=True),"ok")           # a preview that is gone is read as a changed one: only reported
+     with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):
+      self.assertEqual(verdict(release_proof=True),"human-gate-unreleased")   # on: a gone preview is still unbound
     preview.write_text("the edit")
     self.assertEqual(verdict(release_proof=True),"ok")
     for decision,event in (("revise",("RUNNING",{"released_gate":"preview-disposition","decision":"revise","actor_kind":"user"})),

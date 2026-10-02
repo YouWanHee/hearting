@@ -327,9 +327,9 @@ def _in_root_regular(path: Path, root: Path) -> bool:
 
 
 def _placed(candidate: Path) -> Path:
-    """Follow the producer's recorded placement: finalize may move a loose terminal
-    report (``artifacts/final_report.md`` -> ``artifacts/plans/final_report.md``) after
-    its completion marker named the old path."""
+    """Follow the producer's recorded placement: an earlier release's finalize may have
+    moved a loose terminal report (``artifacts/final_report.md`` ->
+    ``artifacts/plans/final_report.md``) after its completion marker named the old path."""
     try:
         from artifact_producer import resolve_placed_output
         return resolve_placed_output(candidate)

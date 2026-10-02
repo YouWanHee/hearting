@@ -641,11 +641,14 @@ def evaluate_cycle_completion(
     expected_root_id: Optional[str] = None,
     inline_finish_id: Optional[str] = None,
     preserved: Optional[Sequence[Mapping[str, Any]]] = None,
+    payload_verified: bool = False,
 ) -> Decision:
     """`preserved` marks a document the runtime has already refreshed after the
     close (§45 D-124): earlier documents of the cycle resolve its references,
     the first-close rules (required roles, payload bytes) are not asked again,
-    and what is proved is the terminal record the close left."""
+    and what is proved is the terminal record the close left.  `payload_verified`
+    says the caller built `document` from files it had just read in chunks and
+    confirmed unchanged, so the payload bytes are not read a second time."""
     publication_check = validate_publication(publication)
     if not publication_check.ok:
         return publication_check
@@ -692,7 +695,7 @@ def evaluate_cycle_completion(
         return Decision("reject", (_violation("completion-manifest-invalid", detail=details),))
     if document.get("cycle", {}).get("state") != "completed":
         return Decision("incomplete", (_violation("completion-cycle-not-completed"),))
-    if preserved is None:
+    if preserved is None and not payload_verified:
         payload_check = verify_published_payload(content_root, document)
         if not payload_check.ok:
             return payload_check

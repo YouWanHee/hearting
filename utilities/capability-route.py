@@ -5144,7 +5144,7 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         def decoded(value):
             return Path(base64.urlsafe_b64decode(value+"="*(-len(value)%4)).decode())
         # Bytes are read where the report lives now; the identity is the locator the owner named.
-        # A bucket organizer that moves a loose report is recorded by the producer and
+        # A move an earlier release made to a loose report is recorded by the producer and
         # surfaced as `artifact_origin_path_b64`, so placement never changes who the owner was.
         evidence=decoded(str(terminal["artifact_path_b64"]))
         origin=decoded(str(terminal["artifact_origin_path_b64"])) if terminal.get("artifact_origin_path_b64") else evidence
@@ -9278,10 +9278,12 @@ def main():
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
-        _route_autoclose(artifact_root,"compose",route)
         if a.start:
             from work_start import start_work
-            print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
+            print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False),flush=True)
+        # Bookkeeping runs after the work has started: the start does not depend on it (the sweep
+        # never closes this route, and a cycle it seals is never the one this route begins or continues).
+        _route_autoclose(artifact_root,"compose",route)
         print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
                            route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
         return 0

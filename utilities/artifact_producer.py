@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import fcntl
@@ -754,27 +755,108 @@ def _qualified_continuation(entry_stem: str, candidate: Any, route_id: Optional[
     return route_identity.route_hash(candidate) == candidate.get("route_hash")
 
 
+class _RouteEdges:
+    """What one read of a routes directory found: its sealed continuation edges by source.
+
+    `files` keeps, per file name, the (size, mtime_ns) it was parsed at and the edge it held, so a
+    rescan parses only what is new or changed.  `children` maps (source route id, source route
+    hash) to the edges naming it, in file-name order.  `trusted` says the whole answer may be
+    served again without listing the directory: its signature is the one before and after the read,
+    old enough that a write in the same clock tick cannot hide behind it, and every file parsed."""
+    __slots__ = ("signature", "files", "children", "trusted")
+
+    def __init__(self, signature, files, children, trusted) -> None:
+        self.signature, self.files, self.children, self.trusted = signature, files, children, trusted
+
+
+_ROUTE_EDGES: Dict[str, _RouteEdges] = {}
+_ROUTE_EDGES_SETTLE_NS = 2_000_000_000
+
+
+def _routes_dir_signature(directory: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        info = os.stat(str(directory))
+    except OSError:
+        return None
+    return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def _edge_stamps_hold(directory: Path, held: _RouteEdges) -> bool:
+    """The files that held an edge still have the size and mtime they were parsed at.
+
+    A file rewritten in place leaves the directory's signature as it was; route files are written
+    once (`write_once`), so this only looks at the few that held an edge."""
+    for name, (size, mtime_ns, edge) in held.files.items():
+        if edge is None:
+            continue
+        try:
+            info = os.stat(str(directory / name))
+        except OSError:
+            return False
+        if (info.st_size, info.st_mtime_ns) != (size, mtime_ns):
+            return False
+    return True
+
+
+def _route_edges(root: Path) -> Mapping[Tuple[str, Any], List[Dict[str, Any]]]:
+    """The routes directory's continuation edges, read at most once per process while it is unchanged.
+
+    D-120 allows a child index bound to the directory listing ("구현은 디렉터리 목록 digest에
+    결속된 자식 색인을 캐시로 둘 수 있다"); correctness never depends on one.  A directory whose
+    signature moved, or one too fresh to trust, is read again, and a file whose size and mtime
+    are what the last read saw is not parsed again.  A missing or unreadable cache is a fresh scan."""
+    directory = _routes_dir(root)
+    key = str(directory)
+    before = _routes_dir_signature(directory)
+    if before is None:
+        _ROUTE_EDGES.pop(key, None)
+        return {}
+    held = _ROUTE_EDGES.get(key)
+    if held is not None and held.trusted and held.signature == before and _edge_stamps_hold(directory, held):
+        return held.children
+    known = held.files if held is not None else {}
+    files: Dict[str, Tuple[int, int, Optional[Dict[str, Any]]]] = {}
+    children: Dict[Tuple[str, Any], List[Dict[str, Any]]] = {}
+    complete = True
+    try:
+        names = sorted(entry.name for entry in os.scandir(str(directory)) if entry.name.endswith(".json"))
+    except OSError:
+        _ROUTE_EDGES.pop(key, None)
+        return {}
+    for name in names:
+        entry = directory / name
+        try:
+            info = os.stat(str(entry))
+        except OSError:
+            complete = False
+            continue
+        stamp = (info.st_size, info.st_mtime_ns)
+        remembered = known.get(name)
+        if remembered is not None and remembered[:2] == stamp:
+            edge = remembered[2]
+        else:
+            candidate = _read_json(entry)
+            if candidate is None:
+                complete = False
+            edge = candidate if _qualified_continuation(entry.stem, candidate) else None
+        files[name] = (*stamp, edge)
+        if edge is not None:
+            children.setdefault((edge.get("source_route_id"), edge.get("source_route_hash")), []).append(edge)
+    after = _routes_dir_signature(directory)
+    trusted = (complete and after == before
+               and time.time_ns() - before[1] > _ROUTE_EDGES_SETTLE_NS)
+    if len(_ROUTE_EDGES) >= 8:
+        _ROUTE_EDGES.clear()   # a process rarely reads more than one root
+    _ROUTE_EDGES[key] = _RouteEdges(before, files, children, trusted)
+    return children
+
+
 def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
     """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
 
-    A digest-keyed memo is allowed by D-120 ("구현은 디렉터리 목록 digest에 결속된
-    자식 색인을 캐시로 둘 수 있다") but correctness never depends on one; this
-    reads the directory fresh, which is fine at the scale a single cycle's
-    lineage tree reaches.
-    """
-    directory = _routes_dir(root)
-    if not directory.is_dir():
-        return []
-    children: List[Dict[str, Any]] = []
-    for entry in sorted(directory.glob("*.json")):
-        if entry.stem == route_id:
-            continue
-        candidate = _read_json(entry)
-        if not isinstance(candidate, dict):
-            continue
-        if _qualified_continuation(entry.stem, candidate, route_id, route_hash_value):
-            children.append(candidate)
-    return children
+    The directory is read through `_route_edges` (once per process while it is unchanged); the
+    edges are copied out so a caller's edit never reaches the next one."""
+    return copy.deepcopy(_route_edges(root).get((route_id, route_hash_value), []))
 
 
 class LineageHandover(NamedTuple):
@@ -788,7 +870,7 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
     """Whether ``record``'s lineage is closed, and which routes it handed to other cycles.
 
     The tree is every material-input-qualifying continuation below the cycle's
-    begin route, read with one scan of the routes directory. It is closed only
+    begin route, read through `_route_edges` (one scan of the routes directory). It is closed only
     when every route in it has an outcome; a live tree keeps D-120's "which cycle
     continues" judgment untouched (`(False, frozenset())`). In a closed tree the
     routes that begin a *different* cycle belong to that cycle, so this cycle
@@ -797,14 +879,7 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
     begin_route = load_route(root, Path(record["route_file"]))
     if begin_route["route_hash"] != record["route_hash"]:
         raise ProducerError("route-hash-drift", record["cycle_id"])
-    children_of: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    directory = _routes_dir(root)
-    if directory.is_dir():
-        for entry in sorted(directory.glob("*.json")):
-            candidate = _read_json(entry)
-            if _qualified_continuation(entry.stem, candidate):
-                key = (candidate["source_route_id"], candidate.get("source_route_hash"))
-                children_of.setdefault(key, []).append(candidate)
+    children_of = _route_edges(root)
     tree = {begin_route["route_id"]}
     queue = [begin_route]
     while queue:
@@ -2584,6 +2659,20 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
     be a D-6 locator (a component longer than the locator limit or outside its
     alphabet), reported through `excluded` (W7E retrospective seal of relocated
     legacy trees)."""
+    paths, violations = _output_paths(directory, exclude_hidden=exclude_hidden, excluded=excluded,
+                                      excluded_symlinks=excluded_symlinks)
+    if violations:
+        return [], violations
+    return [(rel, entry.read_bytes()) for rel, entry in paths], violations
+
+
+def _output_paths(directory: Path, *, exclude_hidden: bool = False,
+                  excluded: Optional[List[str]] = None,
+                  excluded_symlinks: Optional[List[str]] = None) -> Tuple[List[Tuple[str, Path]], List[str]]:
+    """`_enumerate_output` without its reads: the kept `(path, file)` list and the violations.
+
+    Nothing is opened here (links and kinds are `lstat`-ed), so a first close can list a cycle
+    before the admission lock and read each file only once, in chunks."""
     paths: List[Tuple[str, Path]] = []
     violations: List[str] = []
     artifacts = directory / "artifacts"
@@ -2619,73 +2708,12 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
         paths.append((rel, entry))
     # Validate the whole collection before reading payload bytes. A rejected
     # path must not silently vanish, or surface only after manifest allocation.
-    if violations:
-        return [], violations
-    rows = [(rel, entry.read_bytes()) for rel, entry in paths]
-    return rows, violations
+    return ([], violations) if violations else (paths, violations)
 
 
 def _is_support_locator(rel: str) -> bool:
     """A path through a CORE §3 support name that is not a cycle bucket (`_internal/`, `shards/`)."""
     return any(part in SUPPORT_SEGMENTS for part in rel.split("/")[1:])
-
-
-def _place_loose_outputs(root: Path, record: Mapping[str, Any], directory: Path) -> List[Dict[str, str]]:
-    """Normalize visible payloads under the cycle lock without replacing files."""
-    output = directory / "artifacts"
-    if output.is_symlink() or not output.is_dir():
-        return []
-    sources = [p for p in sorted(output.iterdir())
-               if p.name not in BUCKET_TYPES and p.name not in SUPPORT_SEGMENTS
-               # Cutover snapshots are harness-owned staging, not user output.
-               and not (p.name == "shared-input" and
-                        (p / "_internal/migration-shared-bases.json").is_file())
-               and not p.name.startswith(".") and not p.is_symlink()
-               and (p.is_file() or p.is_dir())]
-    if not sources:
-        return []
-    target = output / default_bucket(str(record.get("capability", "")))
-    # A foreign file/link at the bucket name is preserved by the existing scanner.
-    if target.is_symlink() or (target.exists() and not target.is_dir()):
-        return []
-    target.mkdir(exist_ok=True)
-    if any(os.path.lexists(target / p.name) for p in sources):
-        ordinal = 1
-        while os.path.lexists(target / f"relocated-{ordinal}"):
-            ordinal += 1
-        target = target / f"relocated-{ordinal}"
-    moved = []
-    placement_path = producer_dir(root) / "bucket-placements" / f"{record['cycle_id']}.json"
-    placements = {row["from"]: row for row in _output_placements(root, record)}
-    for source in sources:
-        source_rel = source.relative_to(directory).as_posix()
-        prior = placements.get(source_rel)
-        destination = directory / prior["to"] if prior else target / source.name
-        if os.path.lexists(destination):
-            destination = target / source.name
-        if os.path.lexists(destination):
-            continue
-        if any(parent.is_symlink() for parent in destination.parents if parent != directory):
-            continue
-        row = {"from": source_rel, "to": destination.relative_to(directory).as_posix()}
-        placements[source_rel] = row
-        # Record the intended path before moving, so a retry can find the same
-        # destination after a crash between rename and checkpoint publication.
-        _ensure_dir(placement_path.parent)
-        _write_atomic(placement_path, _json_bytes({"moves": list(placements.values())}), 0o644)
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            source.rename(destination)
-        except OSError as exc:
-            placements.pop(source_rel, None)
-            _write_atomic(placement_path, _json_bytes({"moves": list(placements.values()),
-                          "pending": [{**row, "error": str(exc)}]}), 0o644)
-            continue
-        moved.append(row)
-    if moved:
-        print(f"artifact-buckets moved={len(moved)} paths=" + "; ".join(
-            f"{row['from']} -> {row['to']}" for row in moved), file=sys.stderr)
-    return moved
 
 
 def _output_placements(root: Path, record: Mapping[str, Any]) -> List[Dict[str, str]]:
@@ -3794,10 +3822,6 @@ def _checkpoint_commit(
             result["reason"] = reason
         return result
 
-    moved = _place_loose_outputs(root, fresh, directory)
-    if moved:
-        scan = _checkpoint_scan(directory, previous_stats, limits)
-        base = {**base, "moved_outputs": moved}
     if scan.get("skip"):
         detail = {key: value for key, value in scan.items() if key != "skip"}
         return settle("skipped", scan["skip"], limit_detail=detail)
@@ -4561,14 +4585,16 @@ def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id
         raise ProducerError("cleanup-scope-violation", exc.detail) from exc
 
 
-def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
+def _finalize_route(root: Path, record: Mapping[str, Any], *, deadline: Optional[float] = None) -> Dict[str, Any]:
     """D-120 finalize: R is the unique T(C) leaf -- the route with no
     material-input-qualifying continuation child. In a closed lineage the
     children that begin another cycle are that cycle's, so R stops before them
     (`closed_lineage_handover`). `--cycle`-only finalize has
     no other way to name R; a completion controller that already knows its
     exact route can seal it directly by checking `cycle_route_admission(...,
-    finalize=True)` itself instead of calling this walk.
+    finalize=True)` itself instead of calling this walk.  A background sweep passes its
+    `deadline` (`time.monotonic()`): the walk stops before a level it has no time for and
+    raises `scan-in-progress`, so the cycle stays open for the next sweep.
     """
     begin_route = load_route(root, Path(record["route_file"]))
     if begin_route["route_hash"] != record["route_hash"]:
@@ -4578,6 +4604,8 @@ def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
     handed_over: Optional[frozenset] = None  # computed once, and only when a child begins another cycle
     begin_ids: Optional[Set[Any]] = None
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProducerError("scan-in-progress")
         candidates = [c for c in _lineage_children(root, current["route_id"], current["route_hash"])
                       if c.get("capability") == record.get("capability")
                       and c.get("effective_intensity") == record.get("intensity")]
@@ -4626,9 +4654,12 @@ def finalize(
     _recovery_scope: str = "root",
     _prescan: Optional[_Prescan] = None,
     _last_try: bool = False,
+    _scan_budget: Optional["RefreshBudget"] = None,
 ) -> Dict[str, Any]:
-    """`lock_timeout` bounds both lock waits (default: the admission and
+    """`lock_timeout` bounds the lock waits (default: the refresh, admission and
     checkpoint defaults); a background sweep passes 0 so a held lock defers it.
+    The first close of an open cycle reads its files before the admission lock; `_scan_budget`
+    (a background sweep's time) lets it stop between files and answer `deferred`.
     Symbolic links are always left out of the manifest and recorded as
     `excluded_symlinks` on the result and the cycle record (`exclude_symlinks`
     is accepted for old callers and changes nothing)."""
@@ -4650,17 +4681,19 @@ def finalize(
     except dispatch_lock_order.LockOrderError as error:
         raise ProducerError("finalize-reentry-forbidden", error.detail or cycle_id) from error
     alloc = allocator or artifact_identity.IdAllocator()
-    # A closed cycle closed again is compared with its files by reading them here, before the
-    # admission lock: under the lock only `lstat` has to confirm what was read (§45 D-124).  A
-    # scan the lock then finds out of date is read once more (`_prescan` on that second call).
-    prescan = _prescan if _last_try else _prescan_cycle(root, cycle_id, unless_recorded=expected_binding)
+    # A cycle's files are read here, before the admission lock: a closed cycle closed again is
+    # compared with its manifest, an open one is read for its first close (named files being
+    # adopted are moved under the lock, so that close reads in it).  Under the lock only `lstat`
+    # has to confirm what was read (§45 D-124); a scan found out of date is read once more
+    # (`_prescan` on that second call).
+    prescan = _prescan if _last_try else _prescan_cycle(
+        root, cycle_id, unless_recorded=expected_binding, include_open=not adopt_root_outputs,
+        exclude_hidden=exclude_hidden, budget=_scan_budget)
     lock_fd = _admission_lock_fd
-    owns_lock = lock_fd is None
-    if owns_lock:
-        lock_fd = artifact_admission._acquire_lock(
-            root, artifact_admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout, now=now)
     interim_guard = contextlib.ExitStack()
     sweep_unresolved: List[Dict[str, Any]] = []
+    sealed: Optional[Dict[str, Any]] = None
+    kept_scan: Optional[_Prescan] = None
 
     def _finish(payload: Dict[str, Any]) -> Dict[str, Any]:
         # duplicate-copy: an unrelated campaign the recovery sweep had to
@@ -4671,6 +4704,26 @@ def finalize(
         return payload
 
     try:
+        if prescan is not None and prescan.open_cycle:
+            # First close.  The cycle's own refresh lock (before the admission lock, as a refresh
+            # takes them) holds off a second close of it while `lstat` confirms what was read; the
+            # admission lock then covers only the short write section below.
+            if not prescan.complete:
+                _keep_prescan_digests(root, cycle_id, prescan)
+                return {"status": "deferred", "reason": "scan-budget", "cycle_id": cycle_id}
+            interim_guard.enter_context(_refresh_lock(
+                root, cycle_id, timeout=CHECKPOINT_FINALIZE_LOCK_SECONDS if lock_timeout is None else lock_timeout))
+            misses = _prescan_misses(prescan.directory, prescan, prescan.paths)
+            if misses and not _last_try:
+                raise _StaleScan(cycle_id)
+            if misses and _scan_budget is not None:
+                _keep_prescan_digests(root, cycle_id, prescan)
+                return {"status": "deferred", "reason": "files-changed-during-read", "cycle_id": cycle_id}
+            if misses:
+                _reread_misses(prescan, misses)
+        if lock_fd is None:
+            lock_fd = artifact_admission._acquire_lock(
+                root, artifact_admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout, now=now)
         if (expected_binding and isinstance(expected_binding, Mapping)
                 and expected_binding.get("kind") == "inline_producer_binding_v1"):
             # The admission mutex is held. Check the actual route's verified
@@ -4742,6 +4795,9 @@ def finalize(
                     "storage_state": "sealed", "cycle_state": published})
         if record.get("state") != "open":
             raise ProducerError("cycle-not-open", record.get("state", "?"))
+        first_close_read = prescan is not None and prescan.open_cycle
+        if not first_close_read and not (_last_try or adopt_root_outputs):
+            raise _StaleScan(cycle_id)  # the cycle was not open when it was read: read it, lock released
         # The open-cycle checkpoint assigns IDs under this lock; holding it until
         # the interim document is removed keeps a concurrent checkpoint from
         # republishing IDs the sealed manifest did not take.
@@ -4779,7 +4835,15 @@ def finalize(
         # D-120: the route that seals this cycle is the unique T(C) leaf, not
         # necessarily the begin route -- an inherited (rebound) cycle's begin
         # route may long since have a continuation writing it.
-        route = _finalize_route(root, record)
+        try:
+            route = _finalize_route(root, record,
+                                    deadline=_scan_budget.deadline() if _scan_budget is not None else None)
+        except ProducerError as exc:
+            if exc.code != "scan-in-progress":
+                raise
+            if prescan is not None and prescan.open_cycle:
+                _keep_prescan_digests(root, cycle_id, prescan)   # the next try reads only what is left
+            return _finish({"status": "deferred", "reason": "scan-budget", "cycle_id": cycle_id})
         admission = cycle_route_admission(root, record, route, finalize=True)
         if not admission.allow:
             raise ProducerError(admission.reason, admission.detail)
@@ -4809,17 +4873,25 @@ def finalize(
         for name, source, target in adoption_moves:
             os.replace(source, target)
             adopted_root_outputs.append(name)
-        moved_outputs = _place_loose_outputs(root, record, directory)
         placements = _output_placements(root, record)
         primary = _placed_locator(_cycle_relative_primary(primary, directory), placements)
         support_locators = tuple(_placed_locator(value, placements) for value in support_locators)
         excluded_hidden: List[str] = []
         excluded_symlinks: List[str] = []
-        rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden,
-                                             excluded_symlinks=excluded_symlinks)
+        if first_close_read:
+            if prescan.error is not None:
+                raise prescan.error
+            violations, facts = prescan.violations, prescan.facts
+            excluded_hidden, excluded_symlinks = list(prescan.excluded), list(prescan.excluded_symlinks)
+        else:
+            # Only for files adopted just now (they were moved in under this lock) or a cycle
+            # whose first read could not be made: read here, as the close always did.
+            rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden,
+                                                 excluded_symlinks=excluded_symlinks)
+            facts = [(rel, _digest(data), len(data)) for rel, data in rows]
         if violations:
             raise ProducerError("output-invalid", ";".join(violations))
-        if not rows:
+        if not facts:
             # D-9: no durable output, no lineage. Unchanged except that an
             # abandoned empty cycle also carries its sealed abandon_reason
             # (E47-5: `_remove_empty_cycle` call and returned `status` stay
@@ -4850,11 +4922,11 @@ def finalize(
             attempts += [(_without_event_reuse(reserved), "events-fresh"), (None, "ids-fresh")]
         for candidate, rebuilt in attempts:
             document = build_manifest(
-                root, record, route, rows, state=state,
+                root, record, route, (), state=state,
                 primary=_cycle_relative_primary(primary, directory),
                 allow_open_route=allow_open_route, allocator=alloc, now=now,
                 abandon_reason=abandon_reason, support_locators=support_locators,
-                reserved=candidate,
+                reserved=candidate, facts=facts,
             )
             report = artifact_manifest.validate(document)
             if not report.ok:
@@ -4880,6 +4952,7 @@ def finalize(
                 publication=publication, expected_root_id=identity.artifact_root_id if identity else None,
                 inline_finish_id=(expected_binding.get("inline_finish_id")
                                   if isinstance(expected_binding, Mapping) else None),
+                payload_verified=first_close_read,  # read in chunks and `lstat`-confirmed above
             )
             if not completion.ok:
                 raise ProducerError(
@@ -4916,10 +4989,9 @@ def finalize(
             ) from exc
         sealed_result = {"excluded_hidden": excluded_hidden, "excluded_symlinks": excluded_symlinks,
             "adopted_root_outputs": adopted_root_outputs,
-            "moved_outputs": moved_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
-            "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
+            "artifact_count": len(facts), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
             "storage_state": "sealed",
         }
         if reservation != "absent":
@@ -4936,21 +5008,29 @@ def finalize(
         if document["cycle"]["state"] == "active":
             sealed_result["provisional"] = True
             sealed_result["warning"] = PROVISIONAL_SEAL_WARNING
-        return _finish(sealed_result)
+        sealed = _finish(sealed_result)
+        if first_close_read:
+            kept_scan = prescan
     except _StaleScan:
         pass  # read again below, with the lock released
     finally:
         interim_guard.close()
-        if owns_lock:
+        if lock_fd is not None:
             artifact_admission._release_lock(root, lock_fd)
+    if sealed is not None:
+        if kept_scan is not None:
+            _keep_prescan_digests(root, cycle_id, kept_scan)  # the first refresh need not hash it all again
+        return sealed
     return finalize(
         root, cycle_id=cycle_id, state=state, primary=primary, publication=publication,
         allow_open_route=allow_open_route, allocator=alloc, now=now, crash_after_manifest=crash_after_manifest,
         exclude_hidden=exclude_hidden, adopt_root_outputs=adopt_root_outputs, abandon_reason=abandon_reason,
         force_abandon_ignoring_lease=force_abandon_ignoring_lease, support_locators=support_locators,
         expected_binding=expected_binding, lock_timeout=lock_timeout, exclude_symlinks=exclude_symlinks,
-        _recovery_scope=_recovery_scope, _last_try=True,
-        _prescan=_prescan_cycle(root, cycle_id, unless_recorded=expected_binding))
+        _recovery_scope=_recovery_scope, _last_try=True, _scan_budget=_scan_budget,
+        _prescan=_prescan_cycle(root, cycle_id, unless_recorded=expected_binding,
+                                include_open=not adopt_root_outputs, exclude_hidden=exclude_hidden,
+                                budget=_scan_budget))
 
 
 def _finalize_deleted_locked(root: Path, record: Mapping[str, Any], *, state: str, now: Optional[float],
@@ -5397,27 +5477,46 @@ class _StaleScan(Exception):
 
 @dataclass
 class _Prescan:
-    """A closed cycle's files as they were read with no lock held: the manifest digest they were
-    compared with, the `(path, digest, size)` facts, and each file's fingerprint."""
+    """A cycle's files as they were read with no lock held: the manifest digest they were
+    compared with, the `(path, digest, size)` facts, and each file's fingerprint.
+
+    `open_cycle` marks the first close of a cycle with no manifest yet: `directory` and `paths`
+    (every file it listed) are what the refresh lock's `lstat` check walks, `violations` and
+    `error` are what listing it found (raised under the lock, where the close always raised them),
+    and `complete` is false when a budget stopped the reading."""
     manifest_digest: str
     facts: List[Tuple[str, str, int]]
     fingerprints: Dict[str, List[int]]
     excluded: List[str]
     excluded_symlinks: List[str]
+    open_cycle: bool = False
+    complete: bool = True
+    directory: Optional[Path] = None
+    paths: List[str] = field(default_factory=list)
+    violations: List[str] = field(default_factory=list)
+    error: Optional[ProducerError] = None
 
 
 def _prescan_cycle(root: Path, cycle_id: str, *,
-                   unless_recorded: Optional[Mapping[str, Any]] = None) -> Optional[_Prescan]:
-    """Walk and hash a closed cycle's files before any lock is taken (§45 D-124).
+                   unless_recorded: Optional[Mapping[str, Any]] = None,
+                   include_open: bool = False, exclude_hidden: bool = False,
+                   budget: Optional["RefreshBudget"] = None) -> Optional[_Prescan]:
+    """Walk and hash a cycle's files before any lock is taken (§45 D-124).
 
     An explicit `finalize` or `admit-shared` of a closed cycle compares its files with the manifest;
     reading them here means the admission lock only has to `lstat` what changed.  `None` when
     there is nothing to read (the cycle is not closed, has no manifest, or `unless_recorded` names
     a route the manifest already holds) or the read could not be made: an optimisation, never an
-    error."""
+    error.  With `include_open`, `finalize` reads an open cycle's files the same way for its first
+    close; `budget` then stops the reading between files (`complete` false), keeping the digests read."""
     try:
         record = read_cycle_record(root, cycle_id)
-        if record is None or record.get("state") != "sealed" or record.get("deleted_at"):
+        if record is None or record.get("deleted_at"):
+            return None
+        if record.get("state") == "open":
+            return _prescan_open_cycle(root, record, exclude_hidden=exclude_hidden, budget=budget) \
+                if include_open else None
+        if record.get("state") != "sealed":
             return None
         manifest_path = _record_cycle_manifest_path(root, record)
         if not _path_entry_present(manifest_path):
@@ -5436,21 +5535,127 @@ def _prescan_cycle(root: Path, cycle_id: str, *,
         return None
 
 
+def _prescan_open_cycle(root: Path, record: Mapping[str, Any], *, exclude_hidden: bool,
+                        budget: Optional["RefreshBudget"]) -> Optional[_Prescan]:
+    """The first close's read: list an open cycle, then read each file once, outside every lock.
+
+    A file whose fingerprint is the one an earlier look left in the refresh bookkeeping keeps
+    that digest.  A file that moves while it is read has no fingerprint here, so the `lstat`
+    check under the lock finds it.  A budget is looked at between files, never inside one, and
+    the first file read is always finished."""
+    cycle_id = record["cycle_id"]
+    directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
+    if _path_entry_present(directory / "manifest.json"):
+        return None  # a close that stopped after its manifest is for recovery to finish
+    scan = _Prescan("", [], {}, [], [], open_cycle=True, directory=directory)
+    try:
+        paths, scan.violations = _output_paths(directory, exclude_hidden=exclude_hidden, excluded=scan.excluded,
+                                               excluded_symlinks=scan.excluded_symlinks)
+    except ProducerError as error:
+        scan.error = error  # raised where the locked close always raised it
+        return scan
+    scan.paths = [rel for rel, _entry in paths]
+    known = _read_refresh_state(root, cycle_id).get("files", {})
+    for rel, entry in paths:
+        try:
+            before = os.lstat(str(entry))
+        except OSError:
+            continue
+        fingerprint = _fingerprint(before)
+        remembered = known.get(rel)
+        if remembered is not None and list(remembered[:3]) == fingerprint:
+            scan.facts.append((rel, remembered[3], before.st_size))
+            scan.fingerprints[rel] = fingerprint
+            continue
+        if budget is not None and budget.hashed_files and budget.hash_exhausted():
+            scan.complete = False
+            break
+        try:
+            digest, size = _stream_file_facts(entry)
+            after = os.lstat(str(entry))
+        except (ProducerError, OSError):
+            continue  # moved while it was read, or not a plain file now
+        if budget is not None:
+            budget.hashed_bytes += size
+            budget.hashed_files += 1
+        if _fingerprint(after) == fingerprint:
+            scan.facts.append((rel, digest, size))
+            scan.fingerprints[rel] = fingerprint
+    return scan
+
+
+def _keep_prescan_digests(root: Path, cycle_id: str, prescan: _Prescan) -> None:
+    """Leave the digests a first close read where the next look finds them (best effort).
+
+    A close that read only part of a big cycle continues from them, and the first refresh after
+    the close does not hash the whole cycle again.  `observed_at` is left as it was: this is no
+    refresh, so it starts no minimum interval."""
+    try:
+        state = _read_refresh_state(root, cycle_id)
+        files = dict(state.get("files", {}))
+        for rel, digest, _size in prescan.facts:
+            if rel in prescan.fingerprints:
+                files[rel] = [*prescan.fingerprints[rel], digest]
+        _write_refresh_state(root, cycle_id, cursor=None, files=files, observed_at=state.get("observed_at"))
+    except (OSError, ProducerError):
+        pass
+
+
+def _prescan_misses(directory: Path, prescan: _Prescan, rels: Sequence[str], *,
+                    absent: Sequence[str] = ()) -> List[str]:
+    """Under a lock, with `lstat` only: the files whose state is no longer what the scan saw.
+
+    `rels` are files the scan read (their fingerprint must be the same), `absent` are files it
+    found gone (they must still be)."""
+    misses: List[str] = []
+    for rel in rels:
+        try:
+            held = _fingerprint(os.lstat(str(directory / rel))) == prescan.fingerprints.get(rel)
+        except OSError:
+            held = False
+        if not held:
+            misses.append(rel)
+    for rel in absent:
+        try:
+            os.lstat(str(directory / rel))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            pass
+        misses.append(rel)
+    return misses
+
+
 def _prescan_holds(directory: Path, prescan: _Prescan, changes: Mapping[str, Sequence[str]]) -> bool:
     """Under the lock, with `lstat` only: is what the scan saw of the changed files still true?"""
-    try:
-        for rel in list(changes.get("added", [])) + list(changes.get("modified", [])):
-            if _fingerprint(os.lstat(str(directory / rel))) != prescan.fingerprints.get(rel):
-                return False
-        for rel in changes.get("removed", []):
-            try:
-                os.lstat(str(directory / rel))
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-            return False
-    except OSError:
-        return False
-    return True
+    return not _prescan_misses(directory, prescan, list(changes.get("added", [])) + list(changes.get("modified", [])),
+                               absent=changes.get("removed", []))
+
+
+def _reread_misses(prescan: _Prescan, misses: Sequence[str]) -> None:
+    """The first close's second look, for a scan that no longer held: read only the files that moved.
+
+    The refresh lock is held and the admission lock is not.  A file that is gone leaves the
+    facts; one that still moves while it is read fails the close with `output-changed-while-reading`."""
+    directory = prescan.directory
+    read = {rel: (digest, size) for rel, digest, size in prescan.facts}
+    gone = set()
+    for rel in misses:
+        path = directory / rel
+        try:
+            before = os.lstat(str(path))
+            read[rel] = _stream_file_facts(path)
+            after = os.lstat(str(path))
+        except (FileNotFoundError, NotADirectoryError):
+            read.pop(rel, None)
+            prescan.fingerprints.pop(rel, None)
+            gone.add(rel)
+            continue
+        if _fingerprint(after) != _fingerprint(before):
+            raise ProducerError("output-changed-while-reading", str(path))
+        prescan.fingerprints[rel] = _fingerprint(before)
+    prescan.paths = [rel for rel in prescan.paths if rel not in gone]
+    prescan.facts = [(rel, *read[rel]) for rel in prescan.paths if rel in read]
 
 
 def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optional[float] = None,
@@ -5631,6 +5836,10 @@ class RefreshBudget:
     def exhausted(self) -> bool:
         return self.walk_exhausted() or self.hash_exhausted()
 
+    def deadline(self) -> Optional[float]:
+        """The `time.monotonic()` value its time share ends at, `None` when it has none."""
+        return None if self.max_seconds == _UNLIMITED else self._started + self.max_seconds
+
 
 def _fingerprint(st: os.stat_result) -> List[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
@@ -5652,8 +5861,8 @@ def _refresh_cursor_path(root: Path) -> Path:
 
 @contextlib.contextmanager
 def _refresh_lock(root: Path, cycle_id: str, *, timeout: float):
-    """The cycle's refresh lock.  Only refreshes take it, so it can be held while
-    the admission lock is waited for; `finalize` never takes it."""
+    """The cycle's refresh lock.  Only a refresh and the first close of an open cycle take it, and
+    both take it before the admission lock, so it can be held while that lock is waited for."""
     path = _refresh_state_path(root, cycle_id).with_suffix(".lock")
     _ensure_dir(path.parent)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
@@ -5697,7 +5906,7 @@ def _read_refresh_state(root: Path, cycle_id: str) -> Dict[str, Any]:
 
 
 def _write_refresh_state(root: Path, cycle_id: str, *, cursor: Optional[str], files: Mapping[str, Sequence[Any]],
-                         observed_at: float) -> None:
+                         observed_at: Optional[float]) -> None:
     path = _refresh_state_path(root, cycle_id)
     _ensure_dir(path.parent)
     _write_atomic(path, _json_bytes({"schema_version": 1, "cycle_id": cycle_id, "cursor": cursor,
@@ -8366,6 +8575,70 @@ def _remove_folder(root: Path, directory: Path) -> None:
     _fsync_dir(directory.parent)
 
 
+def _reparent_children_locked(root: Path, deleted_ids: Sequence[str], *, command: str, stamp: str,
+                              reason: Optional[str], now: Optional[float], by: str,
+                              folders: Optional[Mapping[str, Path]] = None
+                              ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """No surviving cycle names a cycle that is gone as its parent (the admission lock is held).
+
+    Whoever names a deleted cycle (the ones deleted now, an earlier delete, or an ID with no record)
+    takes the nearest ancestor that is still there, or none, as `cycle-move --parent` would: the
+    record, a closed cycle's manifest (a new document) and the index follow and one history line is
+    left.  A child whose folder cannot be found has its record mended and nothing else; it is reported
+    with `folder: "missing"`.  Returns the rows `{cycle_id, before, after}` and the campaign IDs whose
+    locator index is now stale.  `folders` are the paths a reconcile already found."""
+    records = {record["cycle_id"]: record for record in list_cycle_records(root) if record.get("cycle_id")}
+    gone = set(deleted_ids)
+
+    def departed(cycle_id: str) -> bool:
+        record = records.get(cycle_id)
+        return cycle_id in gone or record is None or bool(record.get("deleted_at"))
+
+    def surviving_ancestor(child_id: str, start: str) -> Optional[str]:
+        seen: Set[str] = set()
+        node: Optional[str] = start
+        while node and node not in seen and node != child_id:
+            if not departed(node):
+                return node
+            seen.add(node)
+            node = (records.get(node) or {}).get("parent_cycle_id")
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    stale: List[str] = []
+    for child_id, child in sorted(records.items()):
+        before = child.get("parent_cycle_id")
+        if child.get("deleted_at") or not before or not departed(before):
+            continue
+        after = surviving_ancestor(child_id, before)
+        folder = (folders or {}).get(child_id)
+        if folder is None:
+            try:
+                folder = cycle_dir(root, child["campaign_id"], child_id, child)
+            except (ProducerError, artifact_locator.LocatorError):
+                folder = None
+        row: Dict[str, Any] = {"cycle_id": child_id, "before": before, "after": after}
+        if folder is not None and folder.is_dir() and (folder.parent / "campaign.json").is_file():
+            _written, touched = _adopt_location_locked(
+                root, child, folder, command=command, stamp=stamp, reason=reason, now=now, by=by, parent=after)
+            stale += touched
+        else:
+            updated = dict(child, parent_cycle_id=after)
+            if after is None:
+                updated.pop("parent_cycle_state_at_begin", None)
+            else:
+                updated["parent_cycle_state_at_begin"] = (records.get(after) or {}).get("state", "open")
+            line = _command_line(
+                command=command, stamp=stamp, target_type="cycle", target_id=child_id,
+                target_path=_last_known_path(root, child), operation="update", field="parent",
+                before={"value": before}, after={"value": after}, reason=reason, now=now, by=by)
+            _write_cycle_record(root, _with_cycle_lines(updated, [line]), exclusive=False)
+            row["folder"] = "missing"
+        _flush_cycle_pending_locked(root, child_id)
+        rows.append(row)
+    return rows, stale
+
+
 def delete_cycle(root: Path, cycle_id: str, *, reason: Optional[str] = None, now: Optional[float] = None) -> Dict[str, Any]:
     """D-126: delete a cycle's folder and take it out of the index and the lists.
 
@@ -8405,12 +8678,15 @@ def delete_cycle(root: Path, cycle_id: str, *, reason: Optional[str] = None, now
         if campaign is not None and cycle_id in campaign.get("cycles", []):
             _write_campaign(root, dict(campaign, cycles=[c for c in campaign["cycles"] if c != cycle_id]), exclusive=False)
         _retire_rows(root, [cycle_id])
-        artifact_locator.update_indexes(root, [campaign_id])
+        reparented, touched = _reparent_children_locked(
+            root, [cycle_id], command="delete", stamp=stamp, reason=reason, now=now, by="human")
+        artifact_locator.update_indexes(root, list(dict.fromkeys([campaign_id] + touched)))
         _flush_cycle_pending_locked(root, cycle_id)
     finally:
         artifact_admission._release_lock(root, lock_fd)
     _drop_group_membership(root, campaign_id, [cycle_id])
-    return {"status": "deleted", "cycle_id": cycle_id, "campaign_id": campaign_id}
+    done = {"status": "deleted", "cycle_id": cycle_id, "campaign_id": campaign_id}
+    return dict(done, reparented=reparented) if reparented else done
 
 
 def delete_campaign(root: Path, campaign: str, *, reason: Optional[str] = None,
@@ -8462,13 +8738,16 @@ def delete_campaign(root: Path, campaign: str, *, reason: Optional[str] = None,
         _write_campaign_runtime_record(root, runtime)
         _remove_folder(root, folder)
         _retire_rows(root, gone)
-        artifact_locator.update_indexes(root, [campaign_id])
+        reparented, touched = _reparent_children_locked(
+            root, gone, command="delete", stamp=stamp, reason=reason, now=now, by=by)
+        artifact_locator.update_indexes(root, list(dict.fromkeys([campaign_id] + touched)))
         for cycle_id in gone:
             _flush_cycle_pending_locked(root, cycle_id)
         _flush_campaign_pending_locked(root, campaign_id)
     finally:
         artifact_admission._release_lock(root, lock_fd)
-    return {"status": "deleted", "campaign_id": campaign_id, "cycle_ids": gone}
+    done = {"status": "deleted", "campaign_id": campaign_id, "cycle_ids": gone}
+    return dict(done, reparented=reparented) if reparented else done
 
 
 # -- a move or a deletion made by hand ---------------------------------------------------
@@ -8865,6 +9144,12 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             _retire_rows(root, gone_cycles)
             for cycle_id in gone_cycles:
                 _flush_cycle_pending_locked(root, cycle_id)
+            reparented, touched = _reparent_children_locked(
+                root, gone_cycles, command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
+                folders=scan.cycles)
+            stale += touched
+            if reparented:
+                result["reparented"] = reparented
         if stale:
             artifact_locator.update_indexes(root, list(dict.fromkeys(stale)))
     finally:
@@ -9357,7 +9642,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--cycle", required=True)
     p.add_argument("--state", default="completed", choices=["completed", "abandoned"])
     p.add_argument("--primary", help="primary artifact as a cycle-relative locator "
-                   "(artifacts/<bucket>/<file>); an absolute path inside this cycle's artifacts/ is accepted")
+                   "(artifacts/<file> or artifacts/<folder>/<file>); an absolute path inside this cycle's artifacts/ is accepted")
     p.add_argument("--publication", default="not-offered")
     p.add_argument("--allow-open-route", action="store_true")
     p.add_argument("--adopt-root-output", action="append", default=[])

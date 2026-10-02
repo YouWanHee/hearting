@@ -276,6 +276,104 @@ class RouteAutocloseTest(unittest.TestCase):
         sealed = self.cycle_record(record["cycle_id"])
         self.assertEqual((sealed["state"], sealed["cycle_state"]), ("sealed", "abandoned"))
 
+    def test_a_big_cycle_behind_a_closed_route_is_sealed_over_several_sweeps_and_no_sweep_waits_for_it(self):
+        import artifact_admission
+        import route_autoclose as RA
+        route_file, route = self.compose("big-closed", "codex", "session-1")
+        record = self.write_artifact(route)
+        scratch = self.cycle_dir(record) / "artifacts" / "plans" / "evidence" / "scratch" / "pytest-all"
+        for index in range(40):
+            target = scratch / f"test_k{index}0" / "out.json"
+            target.parent.mkdir(parents=True)
+            target.write_text(json.dumps({"case": index}) * 3, encoding="utf-8")
+        closed = self.run_as("codex", "session-1", "close", "--route", route_file, "--allow-unproven")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        old = time.time() - TWO_HOURS
+        os.utime(route_file.with_name(route_file.stem + ".outcome.json"), (old, old))
+        found = RA.campaign_of_route(self.root, route)
+        api = self._api()
+        real_monotonic, offset = time.monotonic, [0.0]
+        real_facts = artifact_producer._stream_file_facts
+        reads, held = [], []
+
+        def facts(path):
+            reads.append(str(path))
+            held.append(artifact_admission.holds_lock(self.root))
+            offset[0] += 1.0   # one second of slow storage per file
+            return real_facts(path)
+
+        def one_sweep():
+            before = len(reads)
+            with mock.patch.dict(os.environ, self.env):
+                summary = RA.sweep(self.root, api=api, trigger="compose", scope_campaign_id=found[0],
+                                   scope_dir=found[1], scope_key=RA.campaign_key_of(route), budget=5.0)
+            self.assertEqual(summary["errors"], [])
+            self.assertLessEqual(len(reads) - before, 6)    # one sweep never reads past its budget
+            return summary
+
+        cycle_id = record["cycle_id"]
+        with mock.patch.object(time, "monotonic", lambda: real_monotonic() + offset[0]), \
+                mock.patch.object(artifact_producer, "_stream_file_facts", facts):
+            first = one_sweep()
+            self.assertEqual([row["cycle"] for row in first["cycles"]], ["cycle-left-open:scan-in-progress"])
+            self.assertEqual(self.cycle_record(cycle_id)["state"], "open")
+            self.assertFalse(any(held))                     # nothing was read under the admission lock
+            # A file nobody read yet goes away between two sweeps: the manifest must not list it.
+            payload = sorted(scratch.glob("*/out.json"))
+            gone = next(path for path in reversed(payload) if str(path) not in reads)
+            gone.unlink()
+            for _ in range(12):
+                if self.cycle_record(cycle_id)["state"] == "sealed":
+                    break
+                one_sweep()
+        self.assertEqual(self.cycle_record(cycle_id)["state"], "sealed")
+        self.assertFalse(any(held))
+        self.assertEqual(len(reads), len(set(reads)))       # every file was read once, over all sweeps
+        directory = self.cycle_dir(self.cycle_record(cycle_id))
+        document = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        listed = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertEqual(len(listed), 40)                   # 41 files, one deleted
+        self.assertEqual(len(reads), 40)
+        self.assertNotIn("artifacts/plans/evidence/scratch/pytest-all/" + gone.parent.name + "/out.json", listed)
+        for rel, row in listed.items():
+            self.assertEqual(row["content_digest"], "sha256:" + hashlib.sha256((directory / rel).read_bytes()).hexdigest(), rel)
+        memory = self.root / ".runtime/route-autoclose/state.json"
+        remembered = json.loads(memory.read_text()) if memory.is_file() else {}
+        self.assertNotIn(cycle_id, remembered.get("unsealable", {}))   # a deferred cycle is never written off
+
+    def test_compose_launches_the_work_before_the_route_autoclose_sweep_starts(self):
+        import contextlib
+        import io
+        import work_start
+        api = self._api()
+        order, seen = [], {}
+
+        def start(route, path, jobs, **_kw):
+            order.append("start")
+            return {"state": "started", "route_id": route["route_id"]}
+
+        def autoclose(root, trigger, route=None):
+            order.append("autoclose")
+            seen["stdout"] = out.getvalue()
+
+        argv = ["capability-route.py", "compose", "--slug", "order", "--campaign-key", "k1", "--shape", "direct",
+                "--capability", "autopilot-code", "--capability-mode", "dev", "--intensity", "direct",
+                "--cwd", str(self.repo), "--artifact-root", str(self.root), "--tracking", "tracked",
+                "--prompt-file", str(self.prompt), "--spec-read", "fixture", "--drift-verdict", "within-spec",
+                "--artifact-guard", "fixture", "--owner", "codex", "--parent-harness", "codex",
+                "--start", "--jobs", str(self.jobs)]
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {**self.env, "CODEX_THREAD_ID": "order-session"}))
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            stack.enter_context(mock.patch.object(work_start, "start_work", start))
+            stack.enter_context(mock.patch.object(api, "_route_autoclose", autoclose))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            self.assertEqual(api.main(), 0)
+        self.assertEqual(order, ["start", "autoclose"])
+        self.assertIn('"state": "started"', seen["stdout"])   # the receipt was already printed
+
     def test_r7_interrupted_autoclose_is_finished_by_the_next_sweep(self):
         route_file, route = self.compose("interrupted", "codex", "session-1")
         record = self.write_artifact(route)
@@ -928,6 +1026,107 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
                                                   second["cycle_id"]: "cycle-abandoned"})
         self.assertEqual(self._manifest_routes(first), [x["route_id"]])
         self.assertEqual(self._manifest_routes(second), [y["route_id"]])
+
+    def test_a_lineage_walk_past_its_deadline_leaves_the_cycle_open_and_completes_without_one(self):
+        import route_autoclose
+        a = self._root_route("leftover-deadline")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycle = self._begin(a)
+        self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        for route in (a, b, c):
+            self._close_unproven(route)
+        record = self._record(cycle)
+        expired = time.monotonic() - 1.0
+        self.assertEqual(route_autoclose._seal_cycle(self.root, c, False, record=record, deadline=expired),
+                         "cycle-left-open:scan-in-progress")
+        self.assertEqual(self._record(cycle)["state"], "open")
+        self.assertFalse((self.P.cycle_dir(self.root, record["campaign_id"], cycle["cycle_id"], record)
+                          / "manifest.json").exists())
+        self.assertEqual(route_autoclose._seal_cycle(self.root, c, False, record=record), "cycle-abandoned")
+        self.assertEqual(self._record(cycle)["state"], "sealed")
+
+    def test_the_routes_directory_is_read_once_while_it_is_unchanged(self):
+        a = self._root_route("leftover-edges")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycle = self._begin(a)
+        directory = self.P._routes_dir(self.root)
+        stale = time.time() - 3600
+        os.utime(directory, (stale, stale))
+        reads, real_qualify = [], self.P._qualified_continuation
+
+        def spy(stem, candidate, *args, **kw):
+            reads.append(stem)   # once per route file the scan parsed
+            return real_qualify(stem, candidate, *args, **kw)
+
+        def walk():
+            record = self._record(cycle)
+            return (self.P._lineage_children(self.root, a["route_id"], a["route_hash"]),
+                    self.P._finalize_route(self.root, record)["route_id"],
+                    self.P.closed_lineage_handover(self.root, record))
+
+        with mock.patch.object(self.P, "_qualified_continuation", spy):
+            first = walk()
+            read_once = len(reads)
+            self.assertGreaterEqual(read_once, 3)            # the scan really parsed the routes
+            for _ in range(3):
+                self.assertEqual(walk(), first)
+            self.assertEqual(len(reads), read_once)          # an unchanged directory is not read again
+            self.assertEqual(first[1], c["route_id"])
+            d = self._continuation(c)                        # the listing changes: it is read again
+            os.utime(directory, (stale - 100, stale - 100))
+            before = len(reads)
+            self.assertEqual([row["route_id"] for row in
+                              self.P._lineage_children(self.root, c["route_id"], c["route_hash"])], [d["route_id"]])
+            self.assertEqual(len(reads) - before, 1)         # only the new route file was parsed
+            self.assertEqual(self.P._finalize_route(self.root, self._record(cycle))["route_id"], d["route_id"])
+
+    def test_an_edge_file_rewritten_in_place_is_read_again(self):
+        a = self._root_route("leftover-rewrite")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycle = self._begin(a)
+        directory = self.P._routes_dir(self.root)
+        stale = time.time() - 3600
+        os.utime(directory, (stale, stale))
+        self.assertEqual(self.P._finalize_route(self.root, self._record(cycle))["route_id"], c["route_id"])
+        # Rewritten in place (same inode, the directory's signature unchanged): its sealed hash no
+        # longer recomputes, so it is no longer a continuation of b.
+        path = directory / f"{c['route_id']}.json"
+        tampered = json.loads(path.read_text())
+        tampered["slug"] = "rewritten-in-place"
+        path.write_text(json.dumps(tampered))
+        os.utime(path, ns=(time.time_ns(), time.time_ns() + 1_000_000_000))
+        os.utime(directory, (stale, stale))
+        self.assertEqual(self.P._lineage_children(self.root, b["route_id"], b["route_hash"]), [])
+        self.assertEqual(self.P._finalize_route(self.root, self._record(cycle))["route_id"], b["route_id"])
+
+    def test_finalize_keeps_the_sweep_deadline_for_its_own_lineage_walk(self):
+        a = self._root_route("leftover-inner-walk")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycle = self._begin(a)
+        self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        for route in (a, b, c):
+            self._close_unproven(route)
+        record = self._record(cycle)
+        spent = self.P.RefreshBudget(float("inf"), float("inf"), 0.0)
+        result = self.P.finalize(self.root, cycle_id=cycle["cycle_id"], state="abandoned",
+                                 abandon_reason="route-unrecoverable", lock_timeout=0,
+                                 exclude_symlinks=True, _scan_budget=spent)
+        self.assertEqual((result["status"], result.get("reason")), ("deferred", "scan-budget"))
+        self.assertEqual(self._record(cycle)["state"], "open")
+        self.assertFalse((self.P.cycle_dir(self.root, record["campaign_id"], cycle["cycle_id"], record)
+                          / "manifest.json").exists())
+        # Without a time share the same close finishes.
+        self.assertEqual(self.P.finalize(self.root, cycle_id=cycle["cycle_id"], state="abandoned",
+                                         abandon_reason="route-unrecoverable", lock_timeout=0,
+                                         exclude_symlinks=True)["status"], "sealed")
 
     def test_index_duplicate_shape_seals_on_begin_route(self):
         a = self._root_route("leftover-index")

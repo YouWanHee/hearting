@@ -55,8 +55,9 @@ def _digest(value):
 
 
 def _placed(path):
-    """Follow the producer's recorded placement: a checkpoint may move a loose plan
-    (``artifacts/plan.md`` -> ``artifacts/plans/plan.md``) after its marker was written."""
+    """Follow the producer's recorded placement: an earlier release's checkpoint may have
+    moved a loose plan (``artifacts/plan.md`` -> ``artifacts/plans/plan.md``) after its
+    marker was written."""
     try:
         from artifact_producer import resolve_placed_output
         return resolve_placed_output(Path(path))

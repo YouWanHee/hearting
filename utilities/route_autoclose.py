@@ -46,7 +46,8 @@ output is withdrawn from its campaign's declaration in the same sweep.
 
 The sweep writes under the artifact root only and reads the checkout with
 `git rev-parse` alone.  It takes no lock it would wait for and spends at most
-`BUDGET_SECONDS`; whatever it did not reach waits for the next one.
+`BUDGET_SECONDS`; whatever it did not reach waits for the next one.  A cycle it cannot read
+within that budget stays open, and the next sweep continues from the digests already read.
 """
 from __future__ import annotations
 
@@ -459,11 +460,17 @@ def _closed_lineage(root: Path, record: Mapping[str, Any] | None) -> bool:
         return False
 
 
-def _seal_cycle(root: Path, route: Mapping[str, Any], proven, *, record: Mapping[str, Any] | None = None) -> str:
+def _seal_cycle(root: Path, route: Mapping[str, Any], proven, *, record: Mapping[str, Any] | None = None,
+                deadline: float | None = None) -> str:
     """Seal the route's open cycle with an existing state; never waits on a lock.
     A `record` whose lineage is closed is sealed as it is; otherwise the route
-    is asked which cycle it continues, and an ambiguous answer stops the seal."""
+    is asked which cycle it continues, and an ambiguous answer stops the seal.
+    With the sweep's `deadline` the read of the cycle's files and the walk of its
+    lineage stop when it passes: the cycle stays open and the next sweep goes on
+    from the digests already read."""
     import artifact_producer
+    budget = None if deadline is None else artifact_producer.RefreshBudget(
+        float("inf"), float("inf"), max(0.0, deadline - time.monotonic()))
     if _closed_lineage(root, record):
         pass
     else:
@@ -474,23 +481,26 @@ def _seal_cycle(root: Path, route: Mapping[str, Any], proven, *, record: Mapping
     if not record:
         return "no-open-cycle"
     try:
-        leaf = artifact_producer._finalize_route(root, record)
+        leaf = artifact_producer._finalize_route(root, record, deadline=deadline)
     except Exception as exc:
         return "cycle-left-open:" + str(exc)[:80]
     if leaf.get("route_id") != route.get("route_id"):
         return "cycle-held-by-continuation"
     if proven is True:
         try:
-            artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="completed", lock_timeout=0)
-            return "cycle-completed"
+            result = artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="completed",
+                                                lock_timeout=0, _scan_budget=budget)
+            return "cycle-left-open:scan-in-progress" if result.get("status") == "deferred" else "cycle-completed"
         except Exception:
             pass
     try:
         result = artifact_producer.finalize(root, cycle_id=record["cycle_id"], state="abandoned",
                                             abandon_reason="route-unrecoverable", lock_timeout=0,
-                                            exclude_symlinks=True)
+                                            exclude_symlinks=True, _scan_budget=budget)
     except Exception as exc:
         return "cycle-left-open:" + str(exc)[:80]
+    if result.get("status") == "deferred":
+        return "cycle-left-open:scan-in-progress"
     return "cycle-abandoned-empty" if result.get("status") == "no-lineage" else "cycle-abandoned"
 
 
@@ -501,7 +511,7 @@ def _summary_text(raw: Mapping[str, Any]) -> str:
 
 
 def close_one(root: Path, path: Path, raw: Mapping[str, Any], reason: str, api, *,
-              trigger: str, now: float) -> dict:
+              trigger: str, now: float, deadline: float | None = None) -> dict:
     """Close one route nobody works on, claiming no proof.  Idempotent: a rerun
     replays the existing closure and seals whatever is still open."""
     route = api.verify_route(dict(raw), None, allow_stale_registry=True)
@@ -511,7 +521,8 @@ def close_one(root: Path, path: Path, raw: Mapping[str, Any], reason: str, api, 
                    "proof": "not-claimed", "at": _iso(now)})
     proven = outcome.get("terminal_gate_proven")
     return {"route_id": route["route_id"], "reason": reason,
-            "closed": "proven" if proven else "unproven", "cycle": _seal_cycle(root, route, proven)}
+            "closed": "proven" if proven else "unproven",
+            "cycle": _seal_cycle(root, route, proven, deadline=deadline)}
 
 
 def _signature(path: Path) -> list | None:
@@ -669,7 +680,7 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
         if not quick.get("autoclose") and now - _mtime(begin_outcome) < QUIET_SECONDS:
             continue
         try:
-            leaf = artifact_producer._finalize_route(root, record)
+            leaf = artifact_producer._finalize_route(root, record, deadline=deadline)
             outcome_file = api.outcome_path(api.canonical_route_path(root, leaf["route_id"]))
             outcome = json.loads(outcome_file.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -681,7 +692,8 @@ def _seal_unsealed_cycles(root: Path, api, records: list[dict], evidence, memory
             if why:
                 memory.keep("cycle:" + cycle_id, why, now)
                 continue
-            result = _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"), record=record)
+            result = _seal_cycle(root, leaf, outcome.get("terminal_gate_proven"), record=record,
+                                 deadline=deadline)
         results.append({"cycle_id": cycle_id, "route_id": record["route_id"], "cycle": result})
         if _left_open(result) and not _transient(result):
             memory.unsealable[cycle_id] = {"signature": record["_signature"],
@@ -878,14 +890,15 @@ def sweep(artifact_root, *, api, trigger: str, campaign_id: str | None = None,
     return summary
 
 
-def _campaign_members(root: Path, records: list[dict], campaign_id: str | None) -> set[str]:
+def _campaign_members(root: Path, records: list[dict], campaign_id: str | None, *,
+                      deadline: float | None = None) -> set[str]:
     """Route ids that seal the named campaign's open cycles."""
     import artifact_producer
     members = set()
     for record in records:
         if campaign_id and record.get("campaign_id") == campaign_id:
             try:
-                members.add(artifact_producer._finalize_route(root, record)["route_id"])
+                members.add(artifact_producer._finalize_route(root, record, deadline=deadline)["route_id"])
             except Exception:
                 continue
     return members
@@ -973,7 +986,7 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
     cycle_scope = scope[:2] if scope is not None else None
     records = _open_cycles(root, memory, scope=cycle_scope)
     cycles = _cycles_by_route(records)
-    members = _campaign_members(root, records, campaign_id)
+    members = _campaign_members(root, records, campaign_id, deadline=deadline)
     files = sorted(_open_route_files(root, api), key=_mtime)
     evidence = []
 
@@ -1035,7 +1048,8 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
             kept(why)
             continue
         try:
-            summary["closed"].append(close_one(root, path, raw, reason, api, trigger=trigger, now=now))
+            summary["closed"].append(close_one(root, path, raw, reason, api, trigger=trigger, now=now,
+                                                 deadline=deadline))
         except Exception as exc:
             summary["errors"].append({"route_id": route_id, "error": str(exc)[:160]})
             if not _transient(str(exc)):
