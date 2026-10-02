@@ -91,7 +91,7 @@ def _within(path: Path, root: Path) -> bool:
 
 
 def _excluded(path: Path, env) -> bool:
-    if any(part in _ARTIFACT_DIRS or part == ".git" for part in path.parts):
+    if ".git" in path.parts:
         return True
     home = Path(env.get("HOME") or Path.home())
     data = Path(env.get("XDG_DATA_HOME") or home / ".local" / "share")
@@ -101,6 +101,12 @@ def _excluded(path: Path, env) -> bool:
 
 
 # ------------------------------------------------------------------- git layout
+
+
+def _artifact_path(path: Path, top: Path, root: str = "") -> bool:
+    """``path`` lies in the canonical root or in the work tree's own top-level root dirs."""
+    roots = [top / name for name in _ARTIFACT_DIRS] + ([Path(root)] if root else [])
+    return any(_within(path, Path(os.path.realpath(candidate))) for candidate in roots)
 
 
 def _work_tree(path: Path):
@@ -173,7 +179,7 @@ def _has_source_change(top: Path, root: str, env) -> bool:
         if len(entry) < 4 or entry[2] != " ":
             continue  # rename source half of a -z pair
         path = _real(entry[3:], top)
-        if _excluded(path, env) or (root and _within(path, Path(root))):
+        if _excluded(path, env) or _artifact_path(path, top, root):
             continue
         return True
     return False
@@ -449,7 +455,7 @@ def _triggers(payload: dict, env) -> list[tuple[str, Path, str]]:
         if _excluded(path, env):
             continue
         top = _work_tree(path)
-        if top is not None:
+        if top is not None and not _artifact_path(path, top):
             found.append(("edit", top, str(path)))
     if tool in _SHELL_TOOLS or tool.endswith(".exec_command"):
         command = _string(args, "command", "cmd", "script") or _string(payload, "command", "cmd")
@@ -484,7 +490,7 @@ def judge(harness: str, payload: dict, env=None) -> str:
             root = artifact_root(top, env)
             if not root or root in roots:
                 continue
-            if target and _within(Path(target), Path(root)):
+            if target and _artifact_path(Path(target), top, root):
                 continue
             if kind == "commit" and not _has_source_change(top, root, env):
                 continue

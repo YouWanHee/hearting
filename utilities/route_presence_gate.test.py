@@ -130,6 +130,21 @@ class EditTriggerTest(Fixture):
                      self.tmp / "not-a-repo" / "a.py"):
             self.assertEqual(self.judge(self.edit(path)), "", path)
 
+    def test_nested_dirs_named_like_artifact_roots_are_still_source(self):
+        for name in (".agent_reports", ".claude_reports"):
+            self.assertTrue(self.judge(self.edit(self.repo / "src" / name / "model.py")), name)
+        (self.repo / "src" / ".agent_reports").mkdir()
+        (self.repo / "src" / ".agent_reports" / "model.py").write_text("y = 1\n")
+        self.assertTrue(self.judge(self.bash("git add -A && git commit -m model")))
+
+    def test_an_overridden_canonical_root_passes(self):
+        override = self.repo / "out-reports"  # inside the work tree, so only the root rule exempts it
+        override.mkdir()
+        payload = self.edit(override / "notes.md")
+        self.assertEqual(self.judge(payload, AGENT_ARTIFACT_ROOT=str(override)), "")
+        self.assertTrue(self.judge(self.edit(self.repo / "src" / "engine.py"),
+                                   AGENT_ARTIFACT_ROOT=str(override)))
+
     def test_scratch_repo_in_the_temp_dir_passes(self):
         scratch_repo = Path(tempfile.gettempdir()) / "clone"
         scratch_repo.mkdir()
