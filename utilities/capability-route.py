@@ -8984,10 +8984,12 @@ def main():
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
-        _route_autoclose(artifact_root,"compose",route)
         if a.start:
             from work_start import start_work
-            print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
+            print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False),flush=True)
+        # Bookkeeping runs after the work has started: the start does not depend on it (the sweep
+        # never closes this route, and a cycle it seals is never the one this route begins or continues).
+        _route_autoclose(artifact_root,"compose",route)
         print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
                            route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
         return 0

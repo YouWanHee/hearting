@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import fcntl
@@ -754,27 +755,91 @@ def _qualified_continuation(entry_stem: str, candidate: Any, route_id: Optional[
     return route_identity.route_hash(candidate) == candidate.get("route_hash")
 
 
+class _RouteEdges:
+    """What one read of a routes directory found: its sealed continuation edges by source.
+
+    `files` keeps, per file name, the (size, mtime_ns) it was parsed at and the edge it held, so a
+    rescan parses only what is new or changed.  `children` maps (source route id, source route
+    hash) to the edges naming it, in file-name order.  `trusted` says the whole answer may be
+    served again without listing the directory: its signature is the one before and after the read,
+    old enough that a write in the same clock tick cannot hide behind it, and every file parsed."""
+    __slots__ = ("signature", "files", "children", "trusted")
+
+    def __init__(self, signature, files, children, trusted) -> None:
+        self.signature, self.files, self.children, self.trusted = signature, files, children, trusted
+
+
+_ROUTE_EDGES: Dict[str, _RouteEdges] = {}
+_ROUTE_EDGES_SETTLE_NS = 2_000_000_000
+
+
+def _routes_dir_signature(directory: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        info = os.stat(str(directory))
+    except OSError:
+        return None
+    return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def _route_edges(root: Path) -> Mapping[Tuple[str, Any], List[Dict[str, Any]]]:
+    """The routes directory's continuation edges, read at most once per process while it is unchanged.
+
+    D-120 allows a child index bound to the directory listing ("구현은 디렉터리 목록 digest에
+    결속된 자식 색인을 캐시로 둘 수 있다"); correctness never depends on one.  A directory whose
+    signature moved, or one too fresh to trust, is read again, and a file whose size and mtime
+    are what the last read saw is not parsed again.  A missing or unreadable cache is a fresh scan."""
+    directory = _routes_dir(root)
+    key = str(directory)
+    before = _routes_dir_signature(directory)
+    if before is None:
+        _ROUTE_EDGES.pop(key, None)
+        return {}
+    held = _ROUTE_EDGES.get(key)
+    if held is not None and held.trusted and held.signature == before:
+        return held.children
+    known = held.files if held is not None else {}
+    files: Dict[str, Tuple[int, int, Optional[Dict[str, Any]]]] = {}
+    children: Dict[Tuple[str, Any], List[Dict[str, Any]]] = {}
+    complete = True
+    try:
+        names = sorted(entry.name for entry in os.scandir(str(directory)) if entry.name.endswith(".json"))
+    except OSError:
+        _ROUTE_EDGES.pop(key, None)
+        return {}
+    for name in names:
+        entry = directory / name
+        try:
+            info = os.stat(str(entry))
+        except OSError:
+            complete = False
+            continue
+        stamp = (info.st_size, info.st_mtime_ns)
+        remembered = known.get(name)
+        if remembered is not None and remembered[:2] == stamp:
+            edge = remembered[2]
+        else:
+            candidate = _read_json(entry)
+            if candidate is None:
+                complete = False
+            edge = candidate if _qualified_continuation(entry.stem, candidate) else None
+        files[name] = (*stamp, edge)
+        if edge is not None:
+            children.setdefault((edge.get("source_route_id"), edge.get("source_route_hash")), []).append(edge)
+    after = _routes_dir_signature(directory)
+    trusted = (complete and after == before
+               and time.time_ns() - before[1] > _ROUTE_EDGES_SETTLE_NS)
+    if len(_ROUTE_EDGES) >= 8:
+        _ROUTE_EDGES.clear()   # a process rarely reads more than one root
+    _ROUTE_EDGES[key] = _RouteEdges(before, files, children, trusted)
+    return children
+
+
 def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
     """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
 
-    A digest-keyed memo is allowed by D-120 ("구현은 디렉터리 목록 digest에 결속된
-    자식 색인을 캐시로 둘 수 있다") but correctness never depends on one; this
-    reads the directory fresh, which is fine at the scale a single cycle's
-    lineage tree reaches.
-    """
-    directory = _routes_dir(root)
-    if not directory.is_dir():
-        return []
-    children: List[Dict[str, Any]] = []
-    for entry in sorted(directory.glob("*.json")):
-        if entry.stem == route_id:
-            continue
-        candidate = _read_json(entry)
-        if not isinstance(candidate, dict):
-            continue
-        if _qualified_continuation(entry.stem, candidate, route_id, route_hash_value):
-            children.append(candidate)
-    return children
+    The directory is read through `_route_edges` (once per process while it is unchanged); the
+    edges are copied out so a caller's edit never reaches the next one."""
+    return copy.deepcopy(_route_edges(root).get((route_id, route_hash_value), []))
 
 
 class LineageHandover(NamedTuple):
@@ -788,7 +853,7 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
     """Whether ``record``'s lineage is closed, and which routes it handed to other cycles.
 
     The tree is every material-input-qualifying continuation below the cycle's
-    begin route, read with one scan of the routes directory. It is closed only
+    begin route, read through `_route_edges` (one scan of the routes directory). It is closed only
     when every route in it has an outcome; a live tree keeps D-120's "which cycle
     continues" judgment untouched (`(False, frozenset())`). In a closed tree the
     routes that begin a *different* cycle belong to that cycle, so this cycle
@@ -797,14 +862,7 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
     begin_route = load_route(root, Path(record["route_file"]))
     if begin_route["route_hash"] != record["route_hash"]:
         raise ProducerError("route-hash-drift", record["cycle_id"])
-    children_of: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    directory = _routes_dir(root)
-    if directory.is_dir():
-        for entry in sorted(directory.glob("*.json")):
-            candidate = _read_json(entry)
-            if _qualified_continuation(entry.stem, candidate):
-                key = (candidate["source_route_id"], candidate.get("source_route_hash"))
-                children_of.setdefault(key, []).append(candidate)
+    children_of = _route_edges(root)
     tree = {begin_route["route_id"]}
     queue = [begin_route]
     while queue:
@@ -4510,14 +4568,16 @@ def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id
         raise ProducerError("cleanup-scope-violation", exc.detail) from exc
 
 
-def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
+def _finalize_route(root: Path, record: Mapping[str, Any], *, deadline: Optional[float] = None) -> Dict[str, Any]:
     """D-120 finalize: R is the unique T(C) leaf -- the route with no
     material-input-qualifying continuation child. In a closed lineage the
     children that begin another cycle are that cycle's, so R stops before them
     (`closed_lineage_handover`). `--cycle`-only finalize has
     no other way to name R; a completion controller that already knows its
     exact route can seal it directly by checking `cycle_route_admission(...,
-    finalize=True)` itself instead of calling this walk.
+    finalize=True)` itself instead of calling this walk.  A background sweep passes its
+    `deadline` (`time.monotonic()`): the walk stops before a level it has no time for and
+    raises `scan-in-progress`, so the cycle stays open for the next sweep.
     """
     begin_route = load_route(root, Path(record["route_file"]))
     if begin_route["route_hash"] != record["route_hash"]:
@@ -4527,6 +4587,8 @@ def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
     handed_over: Optional[frozenset] = None  # computed once, and only when a child begins another cycle
     begin_ids: Optional[Set[Any]] = None
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProducerError("scan-in-progress")
         candidates = [c for c in _lineage_children(root, current["route_id"], current["route_hash"])
                       if c.get("capability") == record.get("capability")
                       and c.get("effective_intensity") == record.get("intensity")]
