@@ -314,7 +314,9 @@ def cmd_arm(args):
     if args.predecessor_kind == "resource" and not args.resource_registry:
         raise SupervisorError("--resource-registry is required for a resource predecessor")
     if args.predecessor_kind == "registered" and not args.jobs:
-        args.jobs = str(default_jobs_path())
+        args.jobs = os.environ.get("AGENT_DISPATCH_JOBS")
+    if args.predecessor_kind == "registered" and not args.jobs:
+        raise SupervisorError("--jobs is required for a registered predecessor")
     successors = WS.route_successors(route, args.node)
     if not successors:
         raise SupervisorError(f"node {args.node} has no declared successor")
@@ -2005,7 +2007,7 @@ def cmd_complete(args):
 def cmd_recover_gate_delivery(args):
     """Preview, or explicitly apply, one exact unreleasable gate expiry."""
     route = load_route(args.route)
-    raw_jobs_path = Path(args.jobs or default_jobs_path()).expanduser()
+    raw_jobs_path = Path(args.jobs).expanduser()
     try:
         # Use the same authority validation as every workflow reader/writer;
         # importantly, inspect the caller's spelling before resolving it so a
@@ -2506,7 +2508,8 @@ def build_parser():
     recover.add_argument("--raise-epoch", required=True, type=int)
     recover.add_argument("--actor", required=True)
     recover.add_argument("--reason", required=True)
-    recover.add_argument("--jobs", help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
+    from dispatch_contract import inherited_jobs_argument
+    recover.add_argument("--jobs", **inherited_jobs_argument())
     recover.add_argument("--apply", action="store_true")
 
     survey = sub.add_parser("survey", help="read-only, root-scoped abandoned/stuck workflow report")
