@@ -22,6 +22,8 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # 2026-09-30 report-format-bootstrap: only node digests of the four reader-facing report nodes
 # (code report, design handoff, draft finalize, lab report) re-frozen for role `deep editor` +
 # `balanced-deep`; group digests and every other node field are unchanged.
+# 2026-10-02 entry approvals: only refine review's declared preview output changes;
+# all other node fields and parallel group digests remain at their pinned values.
 PRESERVED_FULL_FIELD_DIGESTS = {
     # Added with the compiler-internal framed recipe (v3.0 part 3): two `top` frame legs and the
     # model-less runtime terminal. No other entry moves.
@@ -65,11 +67,10 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "57a8d1b68a185d2c68aa2a67fd1a11ea0e928017b7cd30018c9ebb5edc544eb8",
         "0a81c46ba217f0b843cf8f2b2386c8fe1412c0029f59b3c112f13b1f7e19edda",
     ),
-    # refine re-frozen again the same cycle: `review` keeps its
-    # `preview-disposition` human-gate continuation (user decision 2026-09-10 --
-    # an approval before the edit applies, not a direction gate to absorb).
+    # The base recipe retains the legacy preview gate; scoped new compiles
+    # remove its wait and the review now produces the actual report preview.
     ("autopilot-refine", ('default',)): (
-        "f0aa0bf8bbbb0c9dff3ab060674bc0a9c7d23a40e46d823e48817aef0ae5206f",
+        "719b9c8854a41f7494a6fc3a6ed6e2bed2bff2367dbad37bf958d52345af03ec",
         "e3ccd3e7ac35fe27b3fa77ae5a9744d8dbee11c8ccf223a1c258aaaf905d889d",
     ),
     ("autopilot-research", ('academic', 'market', 'technology')): (
