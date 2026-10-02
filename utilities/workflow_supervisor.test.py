@@ -2772,6 +2772,43 @@ class TestLegacyPreviewGateRecovery(WorkflowFixture):
             self.assertEqual(detail, error.detail)
             transaction.assert_not_called()
 
+    def test_only_the_parents_own_raise_carries_the_receipt_delivery_option(self):
+        # A refused child start is raised by whoever launched it (an owner may be that process), so it keeps
+        # SD-OPEN-33; the parent's own `start` passes the internal option and its receipt is the delivery.
+        route, path = self.two_stage_route(human_gate="preview-disposition",
+            continuation={"kind": "human-gate", "gate": "preview-disposition"})
+        jobs, _recipient, _attempt = self.owner_registry(recipient_kind="opencode-turn")
+        jobs.write_text(jobs.read_text(encoding="utf-8").replace("\topen\t", "\tdone\t"), encoding="utf-8")
+        artifact = self.base / "preview.md"
+        artifact.write_text("Proposed edit for the person's review.")
+        marker_dir = DC.dispatch_state_roots(ROOT, jobs)[0] / "completion" / route["route_id"]
+        marker_dir.mkdir(parents=True)
+        (marker_dir / "run.json").write_text(json.dumps({"evidence": {"path": str(artifact)}}))
+        seen = []
+
+        def gate_transaction(argv, **kwargs):
+            seen.append((kwargs.get("env") or {}).get(DC.GATE_RECEIPT_DELIVERY_ENV))
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, kwargs.get("env") or {}), contextlib.redirect_stdout(output):
+                try:
+                    code = SUP.main(argv[2:])
+                except SUP.SupervisorError as exc:
+                    return subprocess.CompletedProcess(argv, 64, "", str(exc))
+            return subprocess.CompletedProcess(argv, code, output.getvalue(), "")
+        error = DC.DispatchContractError("human-gate-not-raised", "preview-disposition: old route has no record")
+        with mock.patch.object(DC, "completion_marker_is_current", return_value=True), \
+             mock.patch.object(DC, "completion_attempt_readiness", return_value=DC.AttemptReadiness("ready", "fixture")), \
+             mock.patch.object(DC.subprocess, "run", side_effect=gate_transaction):
+            detail = DC.recover_preview_gate_after_refusal(str(path), "verify", "start", ROOT, jobs, error)
+            self.assertIn("preview_gate_recovery=unavailable", detail)
+            self.assertIn("gate-carrier-unsupported", detail)
+            self.assertEqual(seen, [None])
+            delivery = DC.raise_preview_gate_for_node(str(path), "verify", jobs, ROOT, in_parent_receipt=True)
+        self.assertEqual((seen, delivery), ([None, "1"], "-"))
+        self.assertEqual(WS.human_gate_resolution(SUP.ledger_for(route, jobs).journal(),
+                                                  "preview-disposition")["status"], "blocked")
+        self.assertEqual(list((jobs.parent / "pending-delivery").rglob("*.json")), [])
+
 
 class TestInteractiveFrameGate(WorkflowFixture):
     def test_bootstrap_frame_cannot_replace_confirmation_with_plain_file(self):
@@ -3116,6 +3153,121 @@ class TestReleaseOwnerContinuation(WorkflowFixture):
              mock.patch.object(SUP, "start_owner_continuation", side_effect=AssertionError("other gate")):
             _, payload = self.release()
         self.assertNotIn("owner_continuation", payload)
+
+
+class TestGateDeliveredInParentReceipt(WorkflowFixture):
+    """The runtime's own raise inside the parent's `start` is delivered in the receipt it returns.
+
+    Only that call carries the internal option. An owner's own `gate --block` is refused
+    `gate-carrier-unsupported` for a recipient kind with no carrier, except `poll-fallback`: that parent
+    polls `capability-route.py start`, which reads the ledger, so the raise is taken and no record is
+    written (SD-OPEN-33 stays open for `opencode-turn` and `codex-stop-hook`).
+    """
+    GATE = "full-run-authorization"
+    OPTION = "AGENT_GATE_RECEIPT_DELIVERY"
+    NO_PUSH_CARRIER = ("opencode-turn", "codex-native-queue", "codex-managed-gateway")
+
+    def setUp(self):
+        super().setUp()
+        self.route, self.path = self.two_stage_route(
+            continuation={"kind": "human-gate", "gate": self.GATE}, human_gate=self.GATE)
+
+    def exited_owner(self, kind):
+        jobs, _session, _attempt = self.owner_registry(recipient_kind=kind)
+        jobs.write_text(jobs.read_text(encoding="utf-8").replace("\topen\t", "\tdone\t"), encoding="utf-8")
+        return jobs
+
+    def block(self, jobs, **env):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
+            code = SUP.main(["gate", "--route", str(self.path), "--gate", self.GATE, "--block",
+                             "--jobs", str(jobs), "--artifact", "/tmp/gate.md"])
+        return code, json.loads(out.getvalue())
+
+    def records(self, jobs):
+        directory = Path(jobs).parent / "pending-delivery"
+        return sorted(directory.rglob("*.json")) if directory.exists() else []
+
+    def state(self, jobs):
+        return SUP.ledger_for(self.route, jobs).state()["workflow_state"]
+
+    def test_a_kind_without_a_push_carrier_blocks_the_gate_and_writes_no_record(self):
+        for kind in self.NO_PUSH_CARRIER:
+            with self.subTest(kind=kind):
+                self.setUp()
+                jobs = self.exited_owner(kind)
+                code, payload = self.block(jobs, **{self.OPTION: "1"})
+                self.assertEqual((code, payload["action"], payload["workflow_state"]), (0, "blocked", "BLOCKED_HUMAN_GATE"))
+                self.assertIsNone(payload["delivery"])
+                self.assertFalse(payload["delivery_created"])
+                self.assertEqual(self.records(jobs), [])
+                self.assertEqual(self.state(jobs), "BLOCKED_HUMAN_GATE")
+                self.assertEqual(WS.human_gate_resolution(SUP.ledger_for(self.route, jobs).journal(), self.GATE)["status"],
+                                 "blocked")
+
+    def test_a_kind_with_a_push_carrier_keeps_its_record_whatever_the_option_says(self):
+        jobs, _session, _attempt = self.owner_registry(recipient_kind="claude-parent-runtime")
+        jobs.write_text(jobs.read_text(encoding="utf-8").replace("\topen\t", "\tdone\t"), encoding="utf-8")
+        code, payload = self.block(jobs, **{self.OPTION: "1"})
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["delivery_created"])
+        self.assertTrue(Path(payload["delivery"]).is_file())
+        self.assertEqual(len(self.records(jobs)), 1)
+
+    def test_without_the_option_every_kind_is_refused_as_before(self):
+        for kind in self.NO_PUSH_CARRIER:
+            with self.subTest(kind=kind):
+                self.setUp()
+                jobs = self.exited_owner(kind)
+                with self.assertRaises(SUP.SupervisorError) as caught:
+                    self.block(jobs)
+                self.assertIn("gate-carrier-", str(caught.exception))
+                if kind == "opencode-turn":
+                    self.assertIn("gate-carrier-unsupported", str(caught.exception))
+                self.assertEqual(self.records(jobs), [])
+                self.assertNotEqual(self.state(jobs), "BLOCKED_HUMAN_GATE")
+
+    def test_a_registered_worker_cannot_use_the_option_to_get_a_gate_nobody_is_told_about(self):
+        jobs = self.exited_owner("opencode-turn")
+        with self.assertRaises(SUP.SupervisorError) as caught:
+            self.block(jobs, **{self.OPTION: "1", "AGENT_DISPATCH_REGISTERED_WORKER": "1"})
+        self.assertIn("gate-carrier-unsupported", str(caught.exception))
+        self.assertEqual(self.records(jobs), [])
+
+    def test_a_polling_parent_kind_takes_the_owners_own_raise_with_no_record(self):
+        jobs, _session, _attempt = self.owner_registry(recipient_kind="poll-fallback")   # owner live
+        code, payload = self.block(jobs, AGENT_DISPATCH_REGISTERED_WORKER="1")           # the owner's own raise
+        self.assertEqual((code, payload["action"], payload["workflow_state"]), (0, "blocked", "BLOCKED_HUMAN_GATE"))
+        self.assertIsNone(payload["delivery"])
+        self.assertEqual(self.records(jobs), [])
+        self.assertEqual(WS.human_gate_resolution(SUP.ledger_for(self.route, jobs).journal(), self.GATE)["status"],
+                         "blocked")
+        # a kind with no push carrier and no polling start keeps the typed refusal
+        self.setUp()
+        jobs, _session, _attempt = self.owner_registry(recipient_kind="opencode-turn")
+        with self.assertRaises(SUP.SupervisorError) as caught:
+            self.block(jobs, AGENT_DISPATCH_REGISTERED_WORKER="1")
+        self.assertIn("gate-carrier-unsupported", str(caught.exception))
+        self.assertEqual(self.records(jobs), [])
+
+    def test_a_repeated_block_converges_and_the_persons_answer_works_without_a_record(self):
+        jobs = self.exited_owner("opencode-turn")
+        self.block(jobs, **{self.OPTION: "1"})
+        code, again = self.block(jobs, **{self.OPTION: "1"})
+        self.assertEqual((code, again["action"], again["delivery"]), (0, "blocked", None))
+        self.assertEqual(gate_epoch(SUP.ledger_for(self.route, jobs), self.GATE), 1)
+        out = io.StringIO()
+        with mock.patch.object(SUP, "start_owner_continuation", return_value=(0, {"state": "completed"})), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(0, SUP.main(["release", "--route", str(self.path), "--gate", self.GATE,
+                                          "--decision", "proceed", "--actor", "user", "--jobs", str(jobs)]))
+        released = json.loads(out.getvalue())
+        self.assertEqual((released["decision"], released["workflow_state"]), ("proceed", "RUNNING"))
+        self.assertEqual(self.state(jobs), "RUNNING")
+
+
+def gate_epoch(ledger, gate):
+    return SUP.gate_raise_epoch(ledger, gate)
 
 
 if __name__ == "__main__":

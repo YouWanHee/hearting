@@ -265,6 +265,38 @@ class ProposalValidationTest(ValidationBase):
         self.assertFalse(RP.wording_differs([first, none]))
         self.assertTrue(RP.same_proposal(first["proposal"], second["proposal"]))
         self.assertFalse(RP.same_proposal(first["proposal"], third["proposal"]))
+        # D11: an interview may copy either form the review shows -- the brief's own legs or their compiled legs
+        refine = self.evaluate([{"capability": "autopilot-refine", "shape": "staged", "graph": ["review", "transaction"]},
+                                {"capability": "autopilot-code", "shape": "staged", "graph": ["execute:dev/refactor", "test"]}])
+        shown = refine["facts"]["legs"]
+        self.assertEqual([(leg["mode"], leg["intensity"], leg["graph"]) for leg in shown],
+                         [("default", "standard", ["review", "transaction"]), ("dev", "standard", ["execute", "test"])])
+        self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown}))     # exact compare: the D11 ending
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": shown}, resolved=shown))
+        self.assertTrue(RP.same_proposal(refine["proposal"], refine["proposal"], resolved=shown))
+        for index, change in ((0, {"capability": "autopilot-draft"}), (0, {"mode": "dev"}), (1, {"mode": "debug"}),
+                              (0, {"shape": "solo"}), (0, {"graph": ["review"]}), (1, {"graph": ["execute:qa/ml-debug", "test"]}),
+                              (0, {"intensity": "strong"})):
+            with self.subTest(index=index, change=change):
+                legs = [dict(leg) for leg in shown]
+                legs[index].update(change)
+                self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": legs}, resolved=shown))
+        # a copy is one of the two complete legs, never a per-key blend of them
+        for index in (0, 1):
+            with self.subTest(index=index, blend="own+resolved"):
+                own = refine["proposal"]["legs"][index]
+                differing = [key for key in RP._LEG_KEYS if own.get(key) != shown[index].get(key)]
+                self.assertGreaterEqual(len(differing), 2, differing)
+                for key in differing:
+                    blend = [dict(leg) for leg in shown]
+                    blend[index][key] = own.get(key)
+                    self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": blend}, resolved=shown), key)
+        pure = [dict(own) for own in refine["proposal"]["legs"]]
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": pure}, resolved=shown))   # all own: still matches
+        pure[1] = dict(shown[1])
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": pure}, resolved=shown))   # one leg each: still matches
+        self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown[:1]}, resolved=shown))   # leg count
+        self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown + shown[:1]}, resolved=shown))
         # an omitted mode/intensity equals its explicit default once compiled
         implicit = self.evaluate([{"capability": "autopilot-code", "shape": "staged", "graph": ["execute", "test"]}])
         explicit = self.evaluate([{"capability": "autopilot-code", "mode": "dev", "shape": "staged",
@@ -535,6 +567,194 @@ class SecondLegCommandTest(PlanFixture):
         self.assertEqual(second["selection"]["shape"], "direct")
         self.assertEqual(second["work_request"]["text"], route["work_request"]["text"])
         self.assertNotIn("next_leg", json.dumps(receipt))
+
+
+class PinnedPlanFixture(S.PinnedStartBase):
+    """A framed route composed with pins, its decision record and its first leg, from the real flow."""
+
+    LEGS = [DIRECT, {"capability": "autopilot-code", "shape": "direct", "why": "second"},
+            {"capability": "autopilot-code", "shape": "direct", "why": "third"}]
+
+    def setUp(self):
+        super().setUp()
+        self.set_briefs(self.LEGS, self.LEGS)
+        self.set_interview({"legs": self.LEGS})
+        self.first = self.settle()
+        self.decision_path = self.record_path()
+        self.record_data = self.record()
+        self.parent = self.record_data["decision"]["frame_route"]["cycle_id"]
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_DISPATCH_")}
+
+    def leg_route(self):
+        return json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+
+    def printed(self, route, cycle="cyc_" + "b" * 32):
+        return shlex.split(RP.project_next_leg(route, cycle)["compose_command"])
+
+    def run_compose(self, argv):
+        done = subprocess.run(argv, text=True, capture_output=True, env=self.env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(Path(json.loads(done.stdout)["route_file"]).read_text(encoding="utf-8"))
+
+    @staticmethod
+    def pin_values(argv):
+        return [argv[i + 1] for i, token in enumerate(argv) if token == "--pin"]
+
+
+class SelectionPinContinuationTest(PinnedPlanFixture):
+    """The user's compose-time pins survive into every continuation leg (defect 1)."""
+
+    FRAME_PINS = {"owner=claude", "worker=claude:sonnet@high", "frame=claude"}
+
+    def test_the_printed_command_carries_every_pin_the_leg_was_sealed_with(self):
+        leg0 = self.leg_route()
+        self.assertEqual(leg0["selection_pins"], self.route["selection_pins"])
+        argv = self.printed(leg0)
+        self.assertEqual(set(self.pin_values(argv)), self.FRAME_PINS)
+        self.assertEqual(len(self.pin_values(argv)), 3)
+
+    def test_the_printed_command_seals_the_same_pins_on_the_next_leg_and_names_the_owner(self):
+        second = self.run_compose(self.printed(self.leg_route()))
+        self.assertEqual(second["selection_pins"], self.route["selection_pins"])
+        self.assertEqual(second["work_request"]["owner_harness"], "claude")
+        self.assertEqual(second["route_plan"]["index"], 1)
+
+    def test_a_command_without_pin_tokens_inherits_them_from_the_frame_the_plan_names(self):
+        argv = self.printed(self.leg_route())
+        bare = []
+        skip = False
+        for token in argv:
+            if skip:
+                skip = False
+            elif token == "--pin":
+                skip = True
+            else:
+                bare.append(token)
+        self.assertEqual(self.pin_values(bare), [])
+        second = self.run_compose(bare)
+        self.assertEqual(second["selection_pins"], self.route["selection_pins"])
+        self.assertEqual(second["work_request"]["owner_harness"], "claude")
+
+    def test_a_pin_given_on_the_command_replaces_only_its_own_target(self):
+        argv = [("worker=codex" if token == "worker=claude:sonnet@high" else token) for token in self.printed(self.leg_route())]
+        second = self.run_compose(argv)
+        pins = second["selection_pins"]
+        self.assertEqual(pins["worker"], {"harness": "codex", "model": None, "effort": None})
+        self.assertEqual(pins["owner"], self.route["selection_pins"]["owner"])
+        self.assertEqual(pins["frame"], self.route["selection_pins"]["frame"])
+        self.assertEqual(second["work_request"]["owner_harness"], "claude")
+
+    def test_a_command_that_repeats_only_some_pins_still_gets_the_rest_from_the_frame(self):
+        bare = shlex.split(" ".join(shlex.quote(t) for t in self.printed(self.leg_route())))
+        kept = []
+        index = 0
+        while index < len(bare):
+            if bare[index] == "--pin" and bare[index + 1] != "owner=claude":
+                index += 2
+                continue
+            kept.append(bare[index])
+            index += 1
+        second = self.run_compose(kept)
+        self.assertEqual(second["selection_pins"], self.route["selection_pins"])
+
+    def test_an_owner_flag_that_contradicts_the_inherited_owner_replaces_it(self):
+        argv = [t for t in self.printed(self.leg_route())]
+        argv += ["--owner", "codex"]
+        stripped, skip = [], False
+        for token in argv:
+            if skip:
+                skip = False
+            elif token == "--pin":
+                skip = True
+            else:
+                stripped.append(token)
+        second = self.run_compose(stripped)
+        self.assertEqual(second["selection_pins"]["owner"]["harness"], "codex")
+        self.assertEqual(second["selection_pins"]["worker"], self.route["selection_pins"]["worker"])
+
+    def test_the_chain_keeps_the_pins_through_three_legs(self):
+        second = self.run_compose(self.printed(self.leg_route()))
+        third = self.run_compose(self.printed(second, "cyc_" + "c" * 32))
+        self.assertEqual(third["selection_pins"], self.route["selection_pins"])
+        self.assertEqual(third["route_plan"]["index"], 2)
+        self.assertEqual(third["work_request"]["owner_harness"], "claude")
+        self.assertIsNone(RP.project_next_leg(third, "cyc_" + "d" * 32))
+
+    def test_a_leg_sealed_before_pins_were_inherited_projects_the_frames_pins_for_the_next_command(self):
+        old = {k: v for k, v in self.leg_route().items() if k != "selection_pins"}
+        self.assertEqual(set(self.pin_values(self.printed(old))), self.FRAME_PINS)
+
+    def test_a_forged_or_changed_frame_route_contributes_no_pin(self):
+        old = {k: v for k, v in self.leg_route().items() if k != "selection_pins"}
+        frame_file = self.root / ".runtime" / "routes" / f"{self.route['route_id']}.json"
+        frame = json.loads(frame_file.read_text(encoding="utf-8"))
+        frame["selection_pins"]["worker"]["harness"] = "codex"
+        frame_file.write_text(json.dumps(frame, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(self.pin_values(self.printed(old)), [])
+
+    def test_the_pin_tokens_are_shell_safe_and_leave_out_what_the_pin_does_not_name(self):
+        pins = {"owner": {"harness": "claude", "model": None, "effort": None},
+                "worker": {"harness": "codex", "model": "gpt-5.1/x:y", "effort": "high"},
+                "frame": {"harness": "claude", "model": "opus", "effort": None}}
+        tokens = RP.pin_tokens(pins)
+        self.assertEqual(tokens, ["owner=claude", "frame=claude:opus", "worker=codex:gpt-5.1/x:y@high"])
+        self.assertEqual(R._parse_selection_pins(shlex.split(shlex.join(tokens))), pins)
+        self.assertEqual(RP.pin_tokens(None), [])
+        self.assertEqual(RP.pin_tokens({}), [])
+
+
+class SelectionPinFilteredTopModelTest(PinnedPlanFixture):
+    PINS = ["worker=claude:opus@high", "frame=claude:opus@high"]
+
+    def setUp(self):
+        patch = mock.patch.object(R, "_main_session_only_models", return_value="opus")
+        patch.start()
+        self.addCleanup(patch.stop)
+        super().setUp()
+
+    def test_a_model_the_compose_filter_dropped_is_not_revived_by_the_next_leg(self):
+        self.assertEqual(self.route["selection_pins"]["worker"], {"harness": "claude", "model": None, "effort": None})
+        self.assertEqual(self.route["selection_pins"]["frame"]["model"], "opus")
+        argv = self.printed(self.leg_route())
+        self.assertEqual(set(self.pin_values(argv)), {"worker=claude", "frame=claude:opus@high"})
+        second = self.run_compose(argv)
+        self.assertEqual(second["selection_pins"], self.route["selection_pins"])
+
+
+class UnpinnedContinuationTest(PlanFixture):
+    LEGS = [DIRECT, {"capability": "autopilot-code", "shape": "direct", "why": "second"}]
+
+    def test_a_route_with_no_pin_prints_none_and_seals_none(self):
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertNotIn("selection_pins", route)
+        argv = shlex.split(RP.project_next_leg(route, self.record_data["decision"]["frame_route"]["cycle_id"])["compose_command"])
+        self.assertNotIn("--pin", argv)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_DISPATCH_")}
+        done = subprocess.run(argv, text=True, capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        second = json.loads(Path(json.loads(done.stdout)["route_file"]).read_text(encoding="utf-8"))
+        self.assertNotIn("selection_pins", second)
+
+
+class PinnedFourReceiptSurfacesTest(PinnedPlanFixture):
+    """Every place a finished leg reports its next leg prints the same command, pins included."""
+
+    def test_start_resume_and_the_route_plan_reader_print_the_same_pinned_command(self):
+        leg_path = self.leg_routes()[0]
+        route = json.loads(leg_path.read_text(encoding="utf-8"))
+        self.finish_leg(route, leg_path)
+        read = RP.next_leg_for_route(route)
+        self.assertIsNotNone(read)
+        resumed = S.W.start_work(route, leg_path, self.jobs)
+        self.assertEqual(resumed["state"], "completed")
+        self.assertEqual(resumed["next_leg"], read)
+        self.assertEqual(set(self.pin_values(shlex.split(read["compose_command"]))), SelectionPinContinuationTest.FRAME_PINS)
+
+    def test_the_other_receipt_surfaces_read_through_the_same_projection(self):
+        for name in ("capability-route.py", "dispatch_completion_join.py", "inline_finish.py", "work_start.py"):
+            text = (HERE / name).read_text(encoding="utf-8")
+            self.assertRegex(text, r"next_leg_for_route\(", name)
+            self.assertNotIn("compose_argv(", text, name)
 
 
 if __name__ == "__main__":

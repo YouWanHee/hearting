@@ -52,8 +52,14 @@ DEFAULT_JOBS = 4
 # its strict-doctor assertions depend on host load (the same GitHub runner
 # fingerprint has produced both ``exit-nonzero`` and ``assertion`` failures).
 # Keep it in the full corpus and report, but run it only after the profile's
-# parallel batch has drained.
-SERIAL_SUITES = frozenset({"tools/install/projection-completeness.test.sh"})
+# parallel batch has drained. ``generated-projections`` rewrites
+# harness-manifest.json and the generated projections in the checkout itself,
+# so a suite reading them beside it can parse a half-written manifest or seal a
+# route against a sentinel registry; it waits for the same drain.
+SERIAL_SUITES = frozenset({
+    "tools/install/projection-completeness.test.sh",
+    "tools/generated-projections.test.sh",
+})
 
 PRUNE_DIRS = {".git", ".dispatch", "__pycache__", "node_modules",
     # Artifact roots are never test corpus: a stale repo copy under
@@ -158,6 +164,8 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     env["HEARTING_GATES"] = "on"
     # A suite that seals a cycle must not start the background workflow-group review.
     env["HEARTING_WORKFLOW_GROUP_REVIEW"] = "off"
+    # ...nor the background campaign display-title job.
+    env["HEARTING_CAMPAIGN_TITLE_AUTO"] = "off"
     # Same for the memory exchange: no detached worker races the temp-dir cleanup;
     # the scheduler's own suite turns it back on.
     env["MEM_EXCHANGE_AUTO"] = "0"

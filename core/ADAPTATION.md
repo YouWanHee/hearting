@@ -328,7 +328,11 @@ prompt carries the carrier taxonomy (dispatch-complexity diagnosis
 - The native TUI owns questions and approvals. Default-mode unanswered questions
   may proceed with empty answers after 120 seconds; plan-mode questions remain
   pending. Empty answers are not user decisions. No gateway question rewriting
-  remains. Fleet uses rollout/panel evidence for question display.
+  remains. Fleet uses rollout/panel evidence for question display. Structured
+  async question acceptance is not an answer: retain its content-free wait
+  through ordinary activity and turn completion until every exact question ID
+  is replied to, the request fails, or its originating turn is interrupted.
+  A new turn or a completion message alone does not answer an async question.
 - Child runtime does not select the parent carrier: Codex parents use the native
   queue for every child harness, while Claude parents keep their existing
   runtime carrier. Stop continuation and model-owned parking remain retired.

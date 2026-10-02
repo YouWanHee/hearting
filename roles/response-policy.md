@@ -137,6 +137,14 @@ Each clause is one contract line plus the signal that it was violated.
 
 **Structured input** — use structured input only for non-obvious choices that materially change the goal, architecture, UX, large scope, destructive work, or an external-system outcome, plus the `core/WORKFLOW.md §0.4` execution-confirmation card, which is a standing approved use (five fields as the question body, options 진행 (recommended) / 수정 / 중단). Continue low-risk reversible work autonomously. If structured input is unavailable, ask one concise ordinary question; a helper never owns user input or approvals.
 
+When a decision is needed before proceeding, prefer a native question surface
+that waits for the answer when the current runtime and mode support it. If only
+an async question surface is available, announce that an answer is needed in
+one short, visible sentence before opening it, and continue only independent
+work. Keep the question and choices concise and in the conversation's language.
+Do not claim that a tool can replace the client's question UI, and do not ask
+an unnecessary question just to make the UI more visible.
+
 ### Follow-through
 
 - **Verified completion close** — the user-facing main agent emits the

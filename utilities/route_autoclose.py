@@ -3,7 +3,11 @@
 A compiled route is a lease the runtime holds for the session that composed
 it, not homework that session must remember.  `compose` and `campaign-status`
 run one bounded background sweep that closes an open route only when time says
-nobody works on it:
+nobody works on it.  `compose` sweeps only the composed route's own campaign,
+and finds that campaign's cycles from its folder's `.cycle.json` bindings
+without listing the root-wide cycle records; `campaign-status` sweeps the whole
+root.  So `compose` never begins another campaign's cleanup, and killing a slow
+`compose` cannot leave another campaign's seal half-done.  The rules:
 
 * session-ended -- this host holds positive evidence that the composing Claude
   session is gone (its own session record, whose process is dead) and nothing
@@ -559,35 +563,67 @@ class _Memory:
         os.replace(temporary, self.path)
 
 
-def _open_cycles(root: Path, memory: _Memory) -> list[dict]:
-    """Open cycle records, re-reading only records whose file changed."""
+def _open_cycle_entry(root: Path, directory: Path, name: str, memory: _Memory) -> dict | None:
+    """The open cycle record in `directory/name`, re-read only when its file changed."""
     import artifact_producer
-    directory = root / ".runtime" / "artifact-producer" / "v1" / "cycles"
-    records = []
+    signature = _signature(directory / name)
+    if signature is None or memory.settled.get(name) == signature:
+        return None
     try:
-        entries = [entry for entry in os.scandir(directory) if entry.name.endswith(".json")]
+        record = artifact_producer.read_cycle_record(root, name[:-len(".json")])
+    except Exception:
+        return None
+    if not record:
+        return None
+    if record.get("state") != "open":
+        memory.settled[name] = signature
+        memory.changed = True
+        return None
+    parent = record.get("parent_cycle_id")
+    if isinstance(parent, str) and parent:
+        # A parent sealed later is new evidence for a child that could not seal.
+        signature = signature + (_signature(directory / f"{parent}.json") or [])
+    return dict(record, _signature=signature)
+
+
+def _scoped_cycle_names(scope_campaign_id: str, scope_dir: Path) -> list[str]:
+    """Record names of the cycles bound to one campaign, from its own folder's `.cycle.json`
+    files; no other campaign's folder and no root-wide cycle listing is read."""
+    import artifact_locator
+    try:
+        with os.scandir(scope_dir) as listing:
+            children = [Path(entry.path) for entry in listing
+                        if not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False)]
     except OSError:
-        return records
-    for entry in entries:
-        signature = _signature(Path(entry.path))
-        if signature is None or memory.settled.get(entry.name) == signature:
-            continue
+        return []
+    names = []
+    for child in children:
         try:
-            record = artifact_producer.read_cycle_record(root, entry.name[:-len(".json")])
-        except Exception:
+            binding = artifact_locator.read_cycle_binding(child)
+        except (artifact_locator.LocatorError, OSError):
             continue
-        if not record:
-            continue
-        if record.get("state") != "open":
-            memory.settled[entry.name] = signature
-            memory.changed = True
-            continue
-        parent = record.get("parent_cycle_id")
-        if isinstance(parent, str) and parent:
-            # A parent sealed later is new evidence for a child that could not seal.
-            signature = signature + (_signature(directory / f"{parent}.json") or [])
-        record = dict(record, _signature=signature)
-        records.append(record)
+        if binding and binding.get("campaign_id") == scope_campaign_id:
+            names.append(f"{binding['cycle_id']}.json")
+    return names
+
+
+def _open_cycles(root: Path, memory: _Memory, *, scope: tuple[str, Path] | None = None) -> list[dict]:
+    """Open cycle records, re-reading only records whose file changed.  `scope` is
+    `(campaign_id, campaign folder)`: only that campaign's cycles are looked at, found
+    before any record is read.  Without it every record under the root is listed."""
+    directory = root / ".runtime" / "artifact-producer" / "v1" / "cycles"
+    if scope is not None:
+        names = _scoped_cycle_names(*scope)
+    else:
+        try:
+            names = [entry.name for entry in os.scandir(directory) if entry.name.endswith(".json")]
+        except OSError:
+            return []
+    records = []
+    for name in names:
+        record = _open_cycle_entry(root, directory, name, memory)
+        if record is not None:
+            records.append(record)
     return records
 
 
@@ -677,7 +713,21 @@ def _declared_members(path: Path) -> list[str]:
         return []
 
 
-def _withdraw_empty_members(root: Path, memory: _Memory, *, deadline, now) -> list[dict]:
+class _Folder:
+    """The one campaign folder a scoped sweep looks at, shaped like a `scandir` entry."""
+
+    def __init__(self, path: Path):
+        self.path, self.name = str(path), path.name
+
+    def is_symlink(self) -> bool:
+        return Path(self.path).is_symlink()
+
+    def is_dir(self) -> bool:
+        return Path(self.path).is_dir()
+
+
+def _withdraw_empty_members(root: Path, memory: _Memory, *, deadline, now,
+                            only_dir: Path | None = None) -> list[dict]:
     """Take workflow-group members that ended with no durable output out of their
     campaign's declaration, with the existing prepare -> apply -> verify, and
     record why.  A declaration that is missing or invalid, or a lock that is held,
@@ -689,10 +739,13 @@ def _withdraw_empty_members(root: Path, memory: _Memory, *, deadline, now) -> li
     import artifact_workflow_groups as groups
     rows: list[dict] = []
     records = root / ".runtime" / "artifact-producer" / "v1" / "cycles"
-    try:
-        entries = sorted(os.scandir(root / "campaigns"), key=lambda entry: entry.name)
-    except OSError:
-        return rows
+    if only_dir is not None:
+        entries = [_Folder(only_dir)]
+    else:
+        try:
+            entries = sorted(os.scandir(root / "campaigns"), key=lambda entry: entry.name)
+        except OSError:
+            return rows
     for entry in entries:
         if time.monotonic() >= deadline:
             break
@@ -757,17 +810,67 @@ def _withdraw_from(root: Path, path: Path, members: list[str], groups, review, a
             "result": "withdrawn"}
 
 
+def campaign_key_of(route: Mapping[str, Any]) -> str | None:
+    """The campaign key a composed route names; None for a route that joins its parent cycle's campaign."""
+    key = route.get("campaign_key")
+    if isinstance(key, str) and key:
+        return key
+    if route.get("campaign_unassigned"):
+        import artifact_producer
+        return artifact_producer.UNASSIGNED_KEY
+    return None
+
+
+def campaign_of_route(root, route: Mapping[str, Any]) -> tuple[str, Path] | None:
+    """`(campaign_id, campaign folder)` of the campaign a composed route belongs to, or None.
+
+    The folder is found from the `campaigns/` name list; only a folder whose name carries the
+    key's slug has its `campaign.json` read, so no unrelated campaign is opened.  A campaign the
+    names do not reveal (a new one, begun by `start`, or an old locator name) is None: nothing
+    of this route's campaign needs closing yet, and `campaign-status` still sweeps every one."""
+    try:
+        import artifact_campaign
+        import artifact_locator
+        import artifact_producer
+        key = campaign_key_of(route)
+        if key is None:
+            return None
+        slug = artifact_producer._campaign_naming(
+            None if key == artifact_producer.UNASSIGNED_KEY else str(key))[0]
+        root = Path(root)
+        for name in sorted(artifact_locator._campaign_entries(root)):
+            rest = name.partition("_")[2]
+            if rest != slug and not rest.startswith(slug + "-"):
+                continue
+            path = root / "campaigns" / name / "campaign.json"
+            record = artifact_producer._read_json(path)
+            if not record or record.get("key") != key:
+                continue
+            folded = artifact_campaign.fold_campaign(root, path, record)
+            if folded.get("state") == "active":
+                return str(folded["campaign_id"]), path.parent
+    except Exception:
+        return None
+    return None
+
+
 def sweep(artifact_root, *, api, trigger: str, campaign_id: str | None = None,
-          now: float | None = None, budget: float = BUDGET_SECONDS) -> dict:
+          now: float | None = None, budget: float = BUDGET_SECONDS,
+          scope_campaign_id: str | None = None, scope_dir: Path | None = None,
+          scope_key: str | None = None) -> dict:
     """Close what nobody works on under one artifact root.  Never raises.
-    `campaign_id` names the campaign `campaign-close` is closing."""
+    `campaign_id` names the campaign `campaign-close` is closing.  `scope_campaign_id` and
+    `scope_dir` (both from `campaign_of_route`) limit the sweep to that one campaign; `scope_key` is the
+    campaign key, which lets a route with no cycle yet be recognised as that campaign's."""
     summary: dict[str, Any] = {"closed": [], "cycles": [], "kept": {}, "errors": [], "deferred": 0}
     # Reading old routes prints lineage/registry advisories meant for their
     # owners; this bookkeeping pass reports one line of its own instead.
     with contextlib.redirect_stderr(io.StringIO()):
         try:
             _sweep(summary, Path(artifact_root).resolve(), api=api, trigger=trigger,
-                   campaign_id=campaign_id, now=time.time() if now is None else now, budget=budget)
+                   campaign_id=campaign_id, now=time.time() if now is None else now, budget=budget,
+                   scope=(scope_campaign_id, Path(scope_dir) if scope_dir else None, scope_key)
+                   if scope_campaign_id else None)
         except Unreadable as exc:
             summary["kept"]["evidence-unreadable:" + str(exc)] = 1
         except Exception as exc:
@@ -837,9 +940,12 @@ class _Evidence:
         return None
 
 
-def _sweep(summary, root: Path, *, api, trigger, campaign_id, now, budget) -> None:
+def _sweep(summary, root: Path, *, api, trigger, campaign_id, now, budget, scope=None) -> None:
     runtime = root / ".runtime"
     if not (runtime / "routes").is_dir():
+        return
+    if scope is not None and (scope[1] is None or not (scope[1] / "campaign.json").is_file()):
+        summary["kept"]["scope-campaign-unresolved"] = 1   # nothing to sweep; the next one asks again
         return
     deadline = time.monotonic() + budget
     with (runtime / "route-autoclose.lock").open("a+b") as lock:
@@ -851,19 +957,21 @@ def _sweep(summary, root: Path, *, api, trigger, campaign_id, now, budget) -> No
         memory = _Memory(runtime)
         try:
             _pass(summary, root, api, memory, trigger=trigger, campaign_id=campaign_id, now=now,
-                  deadline=deadline)
+                  deadline=deadline, scope=scope)
         finally:
             memory.save()
 
 
-def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, now, deadline) -> None:
+def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, now, deadline,
+          scope=None) -> None:
     def kept(reason):
         summary["kept"][reason] = summary["kept"].get(reason, 0) + 1
 
     _claude_state.cache_clear()   # one answer per session per sweep
     holders, activity = _composers(api)
     current = _current_identity()
-    records = _open_cycles(root, memory)
+    cycle_scope = scope[:2] if scope is not None else None
+    records = _open_cycles(root, memory, scope=cycle_scope)
     cycles = _cycles_by_route(records)
     members = _campaign_members(root, records, campaign_id)
     files = sorted(_open_route_files(root, api), key=_mtime)
@@ -893,12 +1001,26 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
         if reason is None:
             kept(why)
             continue
+        raw = None
+        if scope is not None and route_id not in cycles:
+            # No cycle of this campaign: a route that is due is read once to see whose it is, and a
+            # foreign one is left to `campaign-status`.  Not asked again within RECHECK_SECONDS.
+            if memory.recently_kept("foreign:" + route_id, now):
+                kept("other-campaign")
+                continue
+            raw = _read_route(path)
+            if raw is None:
+                continue
+            if scope[2] is None or campaign_key_of(raw) != scope[2]:
+                memory.keep("foreign:" + route_id, "other-campaign", now)
+                kept("other-campaign")
+                continue
         # campaign-close is the user's explicit end: judge its members now.
         remembered_why = None if route_id in members else memory.recently_kept("route:" + route_id, now)
         if remembered_why:
             kept(remembered_why)
             continue
-        raw = _read_route(path)
+        raw = raw or _read_route(path)
         if raw is None:
             continue
         record = cycles.get(route_id)
@@ -922,11 +1044,12 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
                 memory.changed = True
     if time.monotonic() < deadline:
         if summary["closed"]:
-            records = _open_cycles(root, memory)
+            records = _open_cycles(root, memory, scope=cycle_scope)
         summary["cycles"] = _seal_unsealed_cycles(root, api, records, gather, memory,
                                                   deadline=deadline, now=now, campaign_id=campaign_id)
     if time.monotonic() < deadline:
-        withdrawn = _withdraw_empty_members(root, memory, deadline=deadline, now=now)
+        withdrawn = _withdraw_empty_members(root, memory, deadline=deadline, now=now,
+                                            only_dir=scope[1] if scope is not None else None)
         if withdrawn:
             summary["withdrawn"] = withdrawn
 

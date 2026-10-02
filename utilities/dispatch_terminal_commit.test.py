@@ -1,6 +1,8 @@
+import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,12 +11,23 @@ from unittest import mock
 
 import dispatch_terminal_commit as T
 import owner_route_binding
+import artifact_admission
 import artifact_producer
 
 # The one already-loaded handle on capability-route.py; the quick-branch tests
 # below compile a real quick route rather than hand-rolling one, so the route
 # they verify against is the route the compiler actually emits.
 ROUTE = owner_route_binding.ROUTE
+
+
+import importlib.util
+import sys
+
+_PRODUCER_SPEC = importlib.util.spec_from_file_location(
+    "producer_fixture_for_terminal_commit", Path(__file__).with_name("artifact_producer.test.py"))
+PRODUCER_FIXTURE = importlib.util.module_from_spec(_PRODUCER_SPEC)
+_PRODUCER_SPEC.loader.exec_module(PRODUCER_FIXTURE)
+
 
 
 def seal_fixture_route(route, route_file, root, jobs, owner):
@@ -169,7 +182,6 @@ class ProducerBindingTests(unittest.TestCase):
             "child-not-terminal": "child-not-quiescent",
             "active-retry": "child-not-quiescent",
             "active-review-lease": "producer-finalize-failed",
-            "binding-cycle-not-open": "producer-binding-mismatch",
         }
         for detail, reason in expected.items():
             proof = T._proof_failure(detail)
@@ -239,6 +251,41 @@ class ProducerBindingTests(unittest.TestCase):
         after = sorted((str(path.relative_to(self.root)), path.read_bytes())
                        for path in self.root.rglob("*") if path.is_file())
         self.assertEqual(before, after)
+
+
+    def test_closed_or_moved_cycle_still_proves_the_binding(self):
+        # §45 D-123: the cycle's state and campaign are not part of its identity.
+        route = {"route_id": "rt-abcdef12", "route_hash": "sha256:" + "a" * 64,
+                 "capability": "autopilot-code", "capability_mode": "dev", "nodes": []}
+        seal_fixture_route(route, self.route_file, self.root, self.jobs, "att-owner")
+        owner = owner_route_binding.OwnerRouteBinding(str(self.route_file), route["route_id"], route["route_hash"])
+        cycle_id = "cyc_" + "d" * 32
+        bound = {"state": "open", "campaign_id": "camp_" + "1" * 32, "cycle_id": cycle_id,
+                 "producer_id": "prod_" + "2" * 32, "route_id": route["route_id"],
+                 "route_hash": route["route_hash"], "route_file": str(self.route_file)}
+        cycle_path = self.root / ".runtime/artifact-producer/v1/cycles" / f"{cycle_id}.json"
+        cycle_path.parent.mkdir(parents=True, exist_ok=True)
+        binding = SimpleNamespace(binding={
+            "route_hash": route["route_hash"], "cycle_id": cycle_id, "campaign_id": bound["campaign_id"],
+            "cycle_record_digest": T.cycle_identity_digest(bound)})
+
+        def prove(record):
+            cycle_path.write_text(json.dumps(record), encoding="utf-8")
+            with mock.patch.object(T, "validate_owner_route", return_value=owner), \
+                 mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
+                 mock.patch.object(T, "_route_module") as route_module, \
+                 mock.patch.object(T, "load_producer_binding", return_value=binding), \
+                 mock.patch.object(artifact_producer, "cycle_route_admission", return_value=SimpleNamespace(allow=True)), \
+                 mock.patch("artifact_producer._live_review_lease", return_value=None):
+                route_module.return_value.terminal_gate_observation.return_value = {"route": {"passed": True}}
+                return T.prove_terminal_authority(T.TerminalCommitRequest(
+                    self.route_file, "att-owner", self.jobs, self.root))
+
+        closed_and_moved = {**bound, "state": "sealed", "campaign_id": "camp_" + "9" * 32}
+        self.assertEqual(prove(closed_and_moved).status, "proved")
+        drifted = prove({**closed_and_moved, "producer_id": "prod_" + "8" * 32})
+        self.assertEqual((drifted.status, drifted.reason, drifted.detail),
+                         ("rejected", "producer-binding-mismatch", "cycle-identity-drift"))
 
 
 class ContinuationTerminalSettlementTests(unittest.TestCase):
@@ -663,6 +710,9 @@ class _TerminalCommitFixture(unittest.TestCase):
     def request(self):
         return T.TerminalCommitRequest(self.route_file, "att-a3fixture", self.jobs, self.root)
 
+    def _slot(self):
+        return T._commit_state_path(self.request()).parent
+
     def patch_settle(self, *, producer=False):
         proof = T.TerminalProof("proved")
         topology = mock.patch.object(T, "producer_lifecycle_applies", return_value=producer)
@@ -827,6 +877,45 @@ class ForwardRecoveryTest(_TerminalCommitFixture):
         self.assertEqual(calls.count("finalize"), 0)
 
 
+class HeldAdmissionLockTest(unittest.TestCase):
+    """A producer step that meets a busy admission lock is a recoverable finalize failure.
+
+    The settle path turns `producer-finalize-failed` into `recoverable` (the replay tests above),
+    so the reaper, join or an explicit `finish` try again; this pins the lock side with a real flock.
+    """
+
+    HOLDER = ("import fcntl, os, sys, time\n"
+              "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+              "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+              "print('held', flush=True)\n"
+              "time.sleep(30)\n")
+
+    def test_finalize_under_a_held_admission_lock_is_recoverable_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = artifact_admission._lock_file_path(root)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            holder = subprocess.Popen([sys.executable, "-c", self.HOLDER, str(lock_path)],
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                probe = os.open(str(lock_path), os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(probe)
+                with self.assertRaises(T.TerminalCommitError) as caught:
+                    T._producer_operation(artifact_admission._acquire_lock, root, 0.3)
+                self.assertEqual(caught.exception.code, "producer-finalize-failed")
+            finally:
+                holder.kill()
+                holder.wait()
+                holder.stdout.close()
+            fd = T._producer_operation(artifact_admission._acquire_lock, root, 0.3)  # the retry succeeds
+            artifact_admission._release_lock(root, fd)
+
+
 class ForwardRecoveryIdentityMismatchTest(_TerminalCommitFixture):
     """A82-7/§13.53.5: forward recovery re-entry recomputes the exact
     terminal identity instead of trusting a stored state string. If the
@@ -909,19 +998,36 @@ class EnvelopeReplayReverificationTest(_TerminalCommitFixture):
             second = T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
         self.assertEqual(second.result, "completed")
 
-    def test_primary_content_drift_after_seal_is_transaction_conflict_not_replay(self):
-        owner = self._seal_once()
-        # Mutate the sealed primary artifact's bytes after sealing.
-        self.artifact.write_text("tampered after seal\n", encoding="utf-8")
+    def _replay(self, owner):
         with mock.patch.object(T, "prove_terminal_authority", return_value=T.TerminalProof("proved")), \
              mock.patch.object(T, "validate_owner_route", return_value=owner), \
              mock.patch.object(T, "producer_lifecycle_applies", return_value=False), \
              mock.patch.object(T, "_route_module") as route_module:
             route_module.return_value.terminal_gate_observation.return_value = self.gates
-            second = T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
-        self.assertEqual(second.result, "recoverable")
-        self.assertEqual(second.reason, "transaction-conflict")
-        self.assertEqual(second.detail, "primary-content-drifted-after-seal")
+            return T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
+
+    def test_primary_content_change_after_seal_is_news_beside_the_stored_envelope(self):
+        """§45 D-127: the sealed envelope is delivered as stored; an edited report is information."""
+        owner = self._seal_once()
+        stored = (self._slot() / "owner-envelope.txt").read_text()
+        # Mutate the sealed primary artifact's bytes after sealing.
+        self.artifact.write_text("tampered after seal\n", encoding="utf-8")
+        second = self._replay(owner)
+        self.assertEqual((second.result, second.reason), ("completed", None))
+        self.assertEqual(second.detail, "primary-changed-after-seal")
+        self.assertEqual(second.envelope_text, stored)
+        # A report that went away is the other piece of news.
+        self.artifact.unlink()
+        third = self._replay(owner)
+        self.assertEqual((third.result, third.detail), ("completed", "primary-missing-after-seal"))
+        self.assertEqual(third.envelope_text, stored)
+
+    def test_a_tampered_stored_envelope_is_still_a_conflict(self):
+        owner = self._seal_once()
+        (self._slot() / "owner-envelope.txt").write_text("artifact: elsewhere\nverdict: PASS\nblocker: none\n")
+        second = self._replay(owner)
+        self.assertEqual((second.result, second.reason, second.detail),
+                         ("recoverable", "transaction-conflict", "envelope-content-mismatch"))
 
 
 class CleanupScopeDurabilityTest(_TerminalCommitFixture):
@@ -985,7 +1091,6 @@ class ProducerBindingMatrixTest(_TerminalCommitFixture):
         with mock.patch.object(T, "validate_owner_route", side_effect=T.TerminalCommitError("producer-binding-required")):
             self.assertEqual(T.prove_terminal_authority(request).reason, "producer-binding-required")
         self.assertEqual(T._proof_failure("owner-route-mismatch").reason, "route-identity-unverified")
-        self.assertEqual(T._proof_failure("binding-cycle-not-open").reason, "producer-binding-mismatch")
         self.assertEqual(T._proof_failure("producer-binding-mismatch").reason, "producer-binding-mismatch")
 
 
@@ -1387,6 +1492,82 @@ class ProveRouteChildrenDeferredTest(unittest.TestCase):
             proof = T._prove_route_children(self._request(jobs), route, gates)
         self.assertEqual(proof.status, "rejected")
         self.assertEqual(proof.detail, "terminal-attempt-not-pass")
+
+
+class OwnerTerminalPlacementReplayTest(unittest.TestCase):
+    """A loose owner report that the bucket organizer moves keeps one terminal identity."""
+
+    NATIVE = {
+        "claude": lambda text: [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
+        "codex": lambda text: [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+                               {"type": "turn.completed"}],
+        "opencode": lambda text: [{"type": "text", "sessionID": "ses_test", "part": {"type": "text", "text": text}},
+                                  {"type": "step_finish", "sessionID": "ses_test",
+                                   "part": {"type": "step-finish", "reason": "stop"}}],
+    }
+
+    def _settled(self, harness, rel):
+        terminal = T
+        from dispatch_completion_join import exact_attempt_row
+        fixture = PRODUCER_FIXTURE.TerminalTransactionIntegrationTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        route, path, jobs, owner, cycle, review, request = fixture._prepare_fixture(harness, "autopilot-spec")
+        report = fixture.write_output(cycle, rel=rel, data=b"verified transaction report\n")
+        text = f"artifact: {report}\nverdict: PASS\nblocker: none"
+        log = jobs.parent / "owner.jsonl"
+        log.write_text("\n".join(json.dumps(r) for r in self.NATIVE[harness](text)) + "\n")
+        jobs.write_text(jobs.read_text().replace(
+            "worker_type=owner", f"attempt_schema_version=2,worker_type=owner,log_file={log},workflow_completion=runtime-v1"))
+        fixture._closed_owner(jobs, owner)
+        meta = exact_attempt_row(jobs, owner).metadata
+        return fixture, terminal, route, path, jobs, owner, report, meta
+
+    def test_a_replayed_settlement_after_placement_completes_for_every_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                    first = terminal.settle_owner_completion(jobs, "done", meta)
+                    self.assertEqual(first.result, "completed", first)
+                    placed = Path(fixture.root).rglob("owner-report.md")
+                    moved = [p for p in placed if p != report]
+                    self.assertEqual(len(moved), 1, "the organizer must have placed the loose report")
+                    self.assertFalse(report.exists())
+                    request = terminal.TerminalCommitRequest(path, owner, jobs, fixture.root)
+                    state_path = terminal._commit_state_path(request)
+                    stored = json.loads(state_path.read_text())
+                    self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                    second = terminal.settle_owner_completion(jobs, "done", meta)
+                    self.assertEqual(second.result, "completed", second)
+                    self.assertEqual(json.loads(state_path.read_text())["terminal_commit_id"], stored["terminal_commit_id"])
+                    row = ROUTE.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)["prd-transaction"]
+                    self.assertTrue(row["passed"], row)
+                    self.assertEqual(row["evidence"], str(report))  # identity stays the worker's own locator
+                    self.assertEqual(row["evidence_digest"], ROUTE.evidence_digest(moved[0]))
+                    self.assertFalse((ROUTE.completion_dir(route["route_id"], jobs=jobs) / "prd-transaction.json").exists())
+
+    def test_a_report_already_in_its_bucket_is_unchanged(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "spec/_internal/owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+
+    def test_a_changed_or_missing_placed_report_still_fails_the_replay(self):
+        for harness in ("claude",):   # the damage is to the placed file, whatever shape the native result had
+            for damage in ("bytes", "missing"):
+                with self.subTest(harness=harness, damage=damage):
+                    fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                        self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+                        moved = next(p for p in Path(fixture.root).rglob("owner-report.md"))
+                        if damage == "bytes":
+                            moved.write_text("tampered after settlement")
+                        else:
+                            moved.unlink()
+                        self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                        self.assertNotEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
 
 
 if __name__ == "__main__":

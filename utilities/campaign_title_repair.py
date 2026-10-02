@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, apply, and verify producer-owned campaign display-title repairs.
+"""Prepare, apply, and verify producer-owned campaign display-title repairs; auto-title untitled campaigns.
 
 The mutable campaign record is updated for future producer runs, while the
 sealed cycle manifests are treated as immutable evidence.  Cairn consumes the
@@ -10,17 +10,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import artifact_admission  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
 
@@ -37,9 +40,20 @@ FORBIDDEN_GENERIC_TITLES = {
     "unassigned — cross-campaign residue",
     "_unassigned",
 }
+DEFAULT_RULESET = "convention-2026-09-11-cadf02"
+# Repair callers wait for the shared declaration lock this long; tests shorten it.
+REPAIR_LOCK_TIMEOUT = artifact_admission.LOCK_TIMEOUT_DEFAULT
+
+# Automatic display titles (see "automatic display titles" below).
+AUTO_DISABLE_ENV = "HEARTING_CAMPAIGN_TITLE_AUTO"
+CAIRN_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class RepairError(Exception):
+    pass
+
+
+class DeclarationLockBusy(RepairError):
     pass
 
 
@@ -97,6 +111,25 @@ def write_atomic_bytes(path: Path, payload: bytes) -> None:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
+
+
+@contextlib.contextmanager
+def _declaration_lock(root: Path, timeout: float | None = None):
+    """The per-root producer admission lock every declaration writer takes.
+
+    Held only across a read-decide-write of the declaration, never across a model call.
+    Acquisition failure is `DeclarationLockBusy`; the callers decide how to report it.
+    """
+    root = Path(root)
+    wait = REPAIR_LOCK_TIMEOUT if timeout is None else timeout
+    try:
+        fd = artifact_admission._acquire_lock(root, wait)
+    except (artifact_admission.AdmissionBusy, artifact_admission.dispatch_lock_order.LockOrderError) as exc:
+        raise DeclarationLockBusy("declaration-lock-busy") from exc
+    try:
+        yield
+    finally:
+        artifact_admission._release_lock(root, fd)
 
 
 def render_review(review: Mapping[str, Any]) -> str:
@@ -162,6 +195,7 @@ def manifest_rows(campaign_dir: Path) -> list[Dict[str, Any]]:
             "manifest_digest": digest_json(manifest),
             "campaign_id": campaign.get("campaign_id"),
             "campaign_title": campaign.get("title", ""),
+            "cycle_id": manifest["cycle"].get("cycle_id") if isinstance(manifest.get("cycle"), dict) else None,
         })
     return rows
 
@@ -398,6 +432,22 @@ def prepare(root_declaration: Path, proposals_path: Path, allow_unlisted: bool =
     }
 
 
+def _apply_drift_check(entry: Mapping[str, Any]) -> tuple[Path, Dict[str, Any]]:
+    campaign_json = Path(str(entry["campaign_json_path"])).resolve()
+    if digest_bytes(campaign_json.read_bytes()) != entry["campaign_json_digest"]:
+        raise RepairError(f"campaign-json-drift:{campaign_json}")
+    record = read_json(campaign_json)
+    if str(record.get("campaign_id")) != str(entry["campaign_id"]):
+        raise RepairError(f"campaign-id-drift:{campaign_json}")
+    if str(record.get("title", "")) != str(entry["old_campaign_title"]):
+        raise RepairError(f"campaign-title-drift:{campaign_json}")
+    manifests = manifest_rows(campaign_json.parent)
+    bindings, _revisions, _digests = manifest_binding_fields(manifests)
+    if not manifest_bindings_contain(bindings, entry_manifest_bindings(entry)):
+        raise RepairError(f"manifest-binding-drift:{campaign_json.parent}")
+    return campaign_json, record
+
+
 def apply(package: Mapping[str, Any]) -> Dict[str, Any]:
     if package.get("schema") != PACKAGE_SCHEMA:
         raise RepairError("package-schema-mismatch")
@@ -418,18 +468,7 @@ def apply(package: Mapping[str, Any]) -> Dict[str, Any]:
     # later drift must never leave an earlier root partially repaired.
     checked: list[tuple[Mapping[str, Any], Path, Dict[str, Any]]] = []
     for entry in entries:
-        campaign_json = Path(str(entry["campaign_json_path"])).resolve()
-        if digest_bytes(campaign_json.read_bytes()) != entry["campaign_json_digest"]:
-            raise RepairError(f"campaign-json-drift:{campaign_json}")
-        record = read_json(campaign_json)
-        if str(record.get("campaign_id")) != str(entry["campaign_id"]):
-            raise RepairError(f"campaign-id-drift:{campaign_json}")
-        if str(record.get("title", "")) != str(entry["old_campaign_title"]):
-            raise RepairError(f"campaign-title-drift:{campaign_json}")
-        manifests = manifest_rows(campaign_json.parent)
-        bindings, revisions, digests = manifest_binding_fields(manifests)
-        if not manifest_bindings_contain(bindings, entry_manifest_bindings(entry)):
-            raise RepairError(f"manifest-binding-drift:{campaign_json.parent}")
+        campaign_json, record = _apply_drift_check(entry)
         checked.append((entry, campaign_json, record))
 
     journal_path = Path(str(package.get("transaction_journal_path", ""))).resolve() if package.get("transaction_journal_path") else None
@@ -459,34 +498,40 @@ def apply(package: Mapping[str, Any]) -> Dict[str, Any]:
         for root_id, root_entries in grouped.items():
             root_path = Path(str(root_entries[0]["artifact_root_path"])).resolve()
             declaration_path = root_path / DISPLAY_TITLE_REL
-            declaration = read_json(declaration_path) if declaration_path.exists() else {
-                "schema": DECLARATION_SCHEMA, "artifact_root_id": root_id,
-            }
-            declaration_entries = {str(row["campaign_id"]): row for row in declaration.get("entries", [])}
-            for entry, campaign_json, record in sorted(
-                (row for row in checked if str(row[0]["artifact_root_id"]) == root_id),
-                key=lambda row: str(row[0]["campaign_id"]),
-            ):
-                updated = dict(record)
-                updated["title"] = str(entry["display_title"])
-                write_atomic(campaign_json, updated)
-                changed += int(str(entry["old_campaign_title"]) != str(entry["display_title"]))
-                declaration_entries[str(entry["campaign_id"])] = {
-                    "campaign_id": str(entry["campaign_id"]),
-                    "campaign_locator": str(entry["campaign_locator"]),
-                    "display_title": str(entry["display_title"]),
-                    "manifest_bindings": list(entry["manifest_bindings"]),
-                    "manifest_revision_ids": list(entry["manifest_revision_ids"]),
-                    "manifest_digests": list(entry["manifest_digests"]),
+            # Same per-root lock the automatic writer takes: the declaration is read,
+            # merged, and written without an automatic entry slipping in between, and a
+            # person's title always replaces an automatic one for the same campaign.
+            with _declaration_lock(root_path, REPAIR_LOCK_TIMEOUT):
+                root_checked = [
+                    (entry, *_apply_drift_check(entry))
+                    for entry in sorted((row[0] for row in checked if str(row[0]["artifact_root_id"]) == root_id),
+                                        key=lambda row: str(row["campaign_id"]))
+                ]
+                declaration = read_json(declaration_path) if declaration_path.exists() else {
+                    "schema": DECLARATION_SCHEMA, "artifact_root_id": root_id,
                 }
-            declaration = {
-                **declaration,
-                "schema": DECLARATION_SCHEMA,
-                "artifact_root_id": root_id,
-                "ruleset": str(package.get("ruleset", "")),
-                "entries": [declaration_entries[key] for key in sorted(declaration_entries)],
-            }
-            write_atomic(root_path / DISPLAY_TITLE_REL, declaration)
+                declaration_entries = {str(row["campaign_id"]): row for row in declaration.get("entries", [])}
+                for entry, campaign_json, record in root_checked:
+                    updated = dict(record)
+                    updated["title"] = str(entry["display_title"])
+                    write_atomic(campaign_json, updated)
+                    changed += int(str(entry["old_campaign_title"]) != str(entry["display_title"]))
+                    declaration_entries[str(entry["campaign_id"])] = {
+                        "campaign_id": str(entry["campaign_id"]),
+                        "campaign_locator": str(entry["campaign_locator"]),
+                        "display_title": str(entry["display_title"]),
+                        "manifest_bindings": list(entry["manifest_bindings"]),
+                        "manifest_revision_ids": list(entry["manifest_revision_ids"]),
+                        "manifest_digests": list(entry["manifest_digests"]),
+                    }
+                declaration = {
+                    **declaration,
+                    "schema": DECLARATION_SCHEMA,
+                    "artifact_root_id": root_id,
+                    "ruleset": str(package.get("ruleset", "")),
+                    "entries": [declaration_entries[key] for key in sorted(declaration_entries)],
+                }
+                write_atomic(root_path / DISPLAY_TITLE_REL, declaration)
             declarations += 1
         verify(package)
         if journal and journal_path:
@@ -601,20 +646,24 @@ def rollback(package: Mapping[str, Any]) -> Dict[str, Any]:
         if not expected.issubset(actual):
             raise RepairError(f"sidecar-ownership-mismatch:{declaration_path}")
 
-    for entry, campaign_json, record in checked:
-        restored = dict(record)
-        restored["title"] = str(entry.get("original_title", entry["old_campaign_title"]))
-        write_atomic(campaign_json, restored)
     for root_id, root_entries in grouped.items():
-        declaration_path = Path(str(root_entries[0]["artifact_root_path"])).resolve() / DISPLAY_TITLE_REL
-        declaration = read_json(declaration_path)
-        affected = {str(entry["campaign_id"]) for entry in root_entries}
-        declaration["entries"] = [row for row in declaration.get("entries", [])
-                                  if str(row.get("campaign_id")) not in affected]
-        if declaration["entries"]:
-            write_atomic(declaration_path, declaration)
-        else:
-            os.unlink(declaration_path)
+        root_path = Path(str(root_entries[0]["artifact_root_path"])).resolve()
+        declaration_path = root_path / DISPLAY_TITLE_REL
+        # The lock comes first so a busy root fails before any of its records change.
+        with _declaration_lock(root_path, REPAIR_LOCK_TIMEOUT):
+            for entry, campaign_json, record in checked:
+                if str(entry["artifact_root_id"]) == root_id:
+                    restored = dict(record)
+                    restored["title"] = str(entry.get("original_title", entry["old_campaign_title"]))
+                    write_atomic(campaign_json, restored)
+            declaration = read_json(declaration_path)
+            affected = {str(entry["campaign_id"]) for entry in root_entries}
+            declaration["entries"] = [row for row in declaration.get("entries", [])
+                                      if str(row.get("campaign_id")) not in affected]
+            if declaration["entries"]:
+                write_atomic(declaration_path, declaration)
+            else:
+                os.unlink(declaration_path)
     return {"status": "rolled-back", "rollback_kind": "full-original", "campaigns": len(entries), "declarations": len(grouped)}
 
 
@@ -674,8 +723,204 @@ def promote(review_path: Path, output: Path, confirmation: str) -> Dict[str, Any
     return {"status": "approved-package-prepared", "campaigns": len(entries), "package": str(output)}
 
 
+# ---------------------------------------------------------------------------
+# automatic display titles -- now one part of the unified background review
+#
+# Campaign titles, summaries, tags, and workflow groups are judged by ONE model call per
+# campaign in `artifact_workflow_group_review`, and written to `campaigns/<locator>/meta.json`
+# through `artifact_meta`.  This module keeps the explicit declaration repair above and thin
+# compatibility entry points (`auto_title`, `backfill_roots`, `launch_after_seal`) that run
+# that same job; it no longer owns a model call, a lock, a pending queue, or a detached
+# follow-up.  The old declaration file is only read, never written: a title a person set
+# there is respected by the unified writer.
+# ---------------------------------------------------------------------------
+
+
+class AutoTitleError(Exception):
+    def __init__(self, failure_class: str, code: str = "") -> None:
+        super().__init__(f"{failure_class}:{code}" if code else failure_class)
+        self.failure_class = failure_class
+        self.code = code
+
+
+def auto_disabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(AUTO_DISABLE_ENV, "")).strip().lower() in {"off", "0", "false", "no", "disabled"}
+
+
+def check_cairn_declaration(doc: Mapping[str, Any], root_id: str) -> None:
+    """Port of Cairn's declaration reader rules; Cairn drops a whole root's declaration on one miss."""
+    def fail(reason: str) -> None:
+        raise AutoTitleError("write-failed", f"cairn-contract:{reason}")
+
+    def text(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    if doc.get("schema") != DECLARATION_SCHEMA:
+        fail("schema")
+    if not text(doc.get("artifact_root_id")) or doc.get("artifact_root_id") != root_id:
+        fail("artifact-root-id")
+    entries = doc.get("entries")
+    if not isinstance(entries, list):
+        fail("entries-not-list")
+    seen: set = set()
+    for row in entries:
+        if not isinstance(row, dict):
+            fail("entry-not-object")
+        campaign_id, title = text(row.get("campaign_id")), text(row.get("display_title"))
+        if not campaign_id or not title:
+            fail("campaign-id-or-title-empty")
+        if campaign_id in seen:
+            fail("campaign-id-duplicate")
+        seen.add(campaign_id)
+        raw = row.get("manifest_bindings")
+        if not isinstance(raw, list) or not raw:
+            fail("bindings-empty")
+        pairs = [(text(item.get("manifest_revision_id")), text(item.get("manifest_digest")))
+                 if isinstance(item, dict) else ("", "") for item in raw]
+        if any(not revision or not CAIRN_DIGEST_RE.match(digest) for revision, digest in pairs) or pairs != sorted(pairs):
+            fail("bindings-invalid")
+        if len({revision for revision, _ in pairs}) != len(pairs) or len({digest for _, digest in pairs}) != len(pairs):
+            fail("bindings-duplicate")
+        revisions, digests = row.get("manifest_revision_ids"), row.get("manifest_digests")
+        if not isinstance(revisions, list) or not isinstance(digests, list) \
+                or len(revisions) != len(pairs) or len(digests) != len(pairs):
+            fail("binding-arrays-length")
+        if [text(item) for item in revisions] != [revision for revision, _ in pairs] \
+                or [text(item) for item in digests] != [digest for _, digest in pairs]:
+            fail("binding-arrays-mismatch")
+
+
+def _default_invoke(prompt: str) -> tuple[str, Optional[str]]:
+    import artifact_workflow_group_review as R
+    return R._invoke_model(prompt)
+
+
+def _campaign_locator(root: Path, campaign_id: str) -> str:
+    for directory in artifact_locator.iter_campaign_dirs(Path(root)):
+        try:
+            if read_json(directory / "campaign.json").get("campaign_id") == campaign_id:
+                return directory.name
+        except RepairError:
+            continue
+    return ""
+
+
+def _target_row(root: Path, report: Mapping[str, Any]) -> Dict[str, Any]:
+    """One old-shape `targets` row from the review's per-campaign report."""
+    campaign_id = str(report.get("campaign_id"))
+    row: Dict[str, Any] = {"campaign_id": campaign_id, "campaign_locator": _campaign_locator(root, campaign_id),
+                           "reason": "unified-review"}
+    if report.get("harness"):
+        row["harness"] = report["harness"]
+    if report.get("status") == "failed":
+        row.update(status="failed", failure_class=report.get("failure_class"), code=report.get("detail") or "")
+        return row
+    by_model = any(change["field"] == "campaign.title" and change["actor"] == "model"
+                   for change in report.get("metadata_diff", []))
+    title = ((report.get("metadata") or {}).get("campaign") or {}).get("title")
+    if by_model:
+        row.update(status="proposed" if report.get("status") == "dry-run" else "written", display_title=title)
+    else:
+        row.update(status="skipped", code="title-protected-or-unchanged")
+    return row
+
+
+def _latest_sealed(root: Path, campaign_ids: Sequence[str]) -> list[str]:
+    import artifact_producer
+    wanted = set(campaign_ids)
+    latest: Dict[str, tuple] = {}
+    for record in artifact_producer.list_cycle_records(Path(root)):
+        campaign_id = record.get("campaign_id")
+        if (campaign_id in wanted and artifact_producer.cycle_record_closed(record)
+                and isinstance(record.get("sealed_on"), str)):
+            stamp = (record["sealed_on"], str(record.get("cycle_id")))
+            if campaign_id not in latest or stamp > latest[campaign_id]:
+                latest[campaign_id] = stamp
+    return [cycle_id for _stamp, cycle_id in latest.values()]
+
+
+def auto_title(root: Path, *, campaign_ids: Sequence[str] = (), mode: str = "explicit", dry_run: bool = False,
+               invoke: Optional[Callable[[str], tuple]] = None, limit: int | None = None,
+               lock_timeout: float | None = None) -> Dict[str, Any]:
+    """Compatibility entry point: run the unified review sweep and report its campaigns in the old shape.
+
+    `mode="seal"` is the automatic sweep (enrollment, single-flight, pending, both kill switches) with
+    each named campaign's newest sealed cycle as its trigger; any other mode is an explicit fill-in sweep
+    over `campaign_ids`, or over everything when none are named, which skips cycles that already have
+    metadata.  `limit` bounds the cycles judged.  `lock_timeout` is unused: the sweep's own locks apply."""
+    import artifact_workflow_group_review as R
+    root = Path(root)
+    result: Dict[str, Any] = {"status": "dry-run" if dry_run else "ok", "artifact_root": str(root),
+                              "targets": [], "protected": 0, "waiting": 0}
+    auto = mode == "seal"
+    swept = R.sweep(root, auto=auto, dry_run=dry_run, limit=limit, invoke=invoke or _default_invoke,
+                    campaign_ids=() if auto else tuple(campaign_ids), missing_only=not auto,
+                    cycles=_latest_sealed(root, campaign_ids) if auto else (),
+                    since=None if (auto or campaign_ids) else R.MIN_STAMP)
+    if swept.get("status") in ("busy", "disabled"):
+        result["status"] = swept["status"]
+        if swept["status"] == "busy" and campaign_ids:
+            result["queued"] = list(campaign_ids)
+        return result
+    result["targets"] = [_target_row(root, report) for report in swept.get("campaigns", [])]
+    result["waiting"] = len(swept.get("skipped", []))
+    result["protected"] = sum(1 for row in result["targets"] if row["status"] == "skipped")
+    return result
+
+
+def backfill_roots(root_declaration: Path, *, dry_run: bool = False, limit: int | None = None,
+                   invoke: Optional[Callable[[str], tuple]] = None,
+                   lock_timeout: float | None = None) -> Dict[str, Any]:
+    """`auto_title` over every root a declaration lists; a root whose identity differs is skipped."""
+    import artifact_lifecycle
+    roots_doc = read_json(root_declaration)
+    listed = roots_doc.get("roots")
+    if not isinstance(listed, list):
+        raise RepairError("roots-required")
+    rows: list[Dict[str, Any]] = []
+    totals = {"targets": 0, "written": 0, "failed": 0, "proposed": 0, "skipped": 0, "protected": 0, "waiting": 0}
+    for item in listed:
+        item = item if isinstance(item, Mapping) else {}
+        root_id = str(item.get("artifact_root_id", ""))
+        path = Path(str(item.get("artifact_root_path", "")))
+        row: Dict[str, Any] = {"artifact_root_id": root_id}
+        if item.get("display_name"):
+            row["display_name"] = str(item["display_name"])
+        try:
+            identity = artifact_lifecycle.read_root_identity(path) if root_id and path.is_dir() else None
+        except artifact_lifecycle.LifecycleError:
+            identity = None
+        if identity is None or identity.artifact_root_id != root_id:
+            row.update(status="skipped", code="root-identity-mismatch")
+            rows.append(row)
+            continue
+        outcome = auto_title(path, mode="backfill", dry_run=dry_run, invoke=invoke, limit=limit,
+                             lock_timeout=lock_timeout)
+        counts = {name: sum(1 for target in outcome["targets"] if target["status"] == name)
+                  for name in ("written", "failed", "proposed", "skipped")}
+        row.update(status=outcome["status"], targets=len(outcome["targets"]), protected=outcome["protected"],
+                   waiting=outcome["waiting"], rows=outcome["targets"], **counts)
+        for name in totals:
+            totals[name] += int(row.get(name, 0))
+        rows.append(row)
+    return {"status": "dry-run" if dry_run else "ok", "roots": rows, "totals": totals}
+
+
+def launch_after_seal(root: Path, record: Mapping[str, Any]) -> bool:
+    """Compatibility: start the one background review (never a second job); never raises, waits, or reads."""
+    try:
+        import artifact_workflow_group_review as R
+        return R.launch_after_seal(root, record)
+    except Exception:  # noqa: BLE001 -- a trigger never fails its caller
+        return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 1)[0],
+        epilog="exit codes: 0 done; 65 blocked or refused (JSON on stdout); "
+               "2 usage error (a missing or unknown option, reported by argparse on stderr)")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("prepare")
     p.add_argument("--root-declaration", type=Path, required=True)
@@ -700,9 +945,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = sub.add_parser("report")
     p.add_argument("--review", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p = sub.add_parser("auto", allow_abbrev=False, help="write Korean display titles for one root's untitled campaigns")
+    p.add_argument("--artifact-root", type=Path, required=True)
+    p.add_argument("--campaign", action="append", default=[])
+    p.add_argument("--mode", choices=("seal", "explicit"), default="explicit")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--limit", type=int)
+    p = sub.add_parser("backfill", allow_abbrev=False, help="run `auto` over every root a declaration lists")
+    p.add_argument("--root-declaration", type=Path, required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--limit", type=int)
     args = parser.parse_args(argv)
     try:
-        if args.command == "prepare":
+        if args.command in ("auto", "backfill"):
+            import artifact_identity
+            import artifact_lifecycle
+            problem = None
+            if args.limit is not None and args.limit < 1:
+                problem = "limit-invalid"
+            elif args.command == "auto":
+                if any(not artifact_identity.is_well_formed(cid, "campaign") for cid in args.campaign):
+                    problem = "campaign-id-invalid"
+                else:
+                    try:
+                        valid = args.artifact_root.is_dir() and artifact_lifecycle.read_root_identity(args.artifact_root.resolve()) is not None
+                    except artifact_lifecycle.LifecycleError:
+                        valid = False
+                    problem = None if valid else "root-invalid"
+            if problem:
+                print(json.dumps({"status": "blocked", "code": problem}, ensure_ascii=False, sort_keys=True))
+                return 65
+            if args.command == "auto":
+                result = auto_title(args.artifact_root.resolve(), campaign_ids=args.campaign, mode=args.mode,
+                                    dry_run=args.dry_run, limit=args.limit)
+            else:
+                result = backfill_roots(args.root_declaration, dry_run=args.dry_run, limit=args.limit)
+        elif args.command == "prepare":
             package = prepare(args.root_declaration, args.proposals, allow_unlisted=args.allow_unlisted)
             write_atomic(args.output, package)
             result = {"status": "prepared", "campaigns": len(package["entries"]), "excluded": len(package["excluded_campaigns"]), "package": str(args.output)}

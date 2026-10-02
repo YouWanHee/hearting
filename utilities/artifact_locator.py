@@ -915,10 +915,13 @@ def _plan_update(root: Path, campaign_ids: Iterable[str]) -> Tuple[Rows, Dict[st
     skipped: List[Dict[str, str]] = []
     rescanned: List[str] = []
 
+    # Every rescanned campaign's published rows go first: a cycle that moved from one rescanned
+    # campaign to another (§45 D-126) must not collide with its own earlier row.
+    for rel in sorted(rescan_rels):
+        for identifier in _rel_prefix_rows(rows, f"campaigns/{rel}"):
+            del rows[identifier]
     for rel in sorted(rescan_rels):
         prefix = f"campaigns/{rel}"
-        for identifier in _rel_prefix_rows(rows, prefix):
-            del rows[identifier]
         touches_target = rel in touched_rels
         campaign_path = campaigns_dir(root) / rel
         if not _is_campaign_dir(campaign_path):

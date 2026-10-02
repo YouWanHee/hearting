@@ -622,7 +622,7 @@ class Bundle:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0], allow_abbrev=False)
     ap.add_argument("--artifact-root", required=True)
-    ap.add_argument("--bundle-dir", required=True, help="inside an open producer cycle's artifacts/")
+    ap.add_argument("--bundle-dir", required=True, help="inside a producer cycle's artifacts/")
     ap.add_argument("--cycle", action="append", required=True)
     ap.add_argument("--w7-evidence", required=True)
     ap.add_argument("--w7c-run", required=True)

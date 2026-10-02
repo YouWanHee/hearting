@@ -34,6 +34,9 @@ from pathlib import Path
 
 SCHEMA = "frame_interview_v1"
 ANSWERS_SCHEMA = "frame_interview_answers_v1"
+ANSWERS_SHAPE = ('answers file: {"understanding_confirmed": true, "answers": {"<question id>": {"choice": 0}}} '
+                 '-- choice is an option index or label ("none" plus a "note" when no option fits); '
+                 'add "correction" when understanding_confirmed is false')
 
 # Questions per raise, by intensity. `quick` now carries the `frame-review`
 # gate too (entry-bound at its `one-shot` node), so its cap is machine-checked
@@ -440,12 +443,14 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
         # interview schema.
         return [f"interview.schema: expected {SCHEMA!r}, got "
                 f"{(interview or {}).get('schema') if isinstance(interview, dict) else None!r}"]
-    if not isinstance(answers, dict) or answers.get("schema") != ANSWERS_SCHEMA:
-        return [f"schema: expected {ANSWERS_SCHEMA!r}"]
-    if answers.get("route_id") != interview.get("route_id"):
-        errors.append("route_id: answers do not belong to this interview")
-    if answers.get("round", 1) != interview.get("round", 1):
-        errors.append("round: answers belong to a different round")
+    if not isinstance(answers, dict):
+        return [f"answers: expected a JSON object; {ANSWERS_SHAPE}"]
+    if answers.get("schema", ANSWERS_SCHEMA) != ANSWERS_SCHEMA:
+        return [f"schema: expected {ANSWERS_SCHEMA!r} or no schema field; {ANSWERS_SHAPE}"]
+    if answers.get("route_id", interview.get("route_id")) != interview.get("route_id"):
+        errors.append("route_id: answers do not belong to this interview (omit route_id to answer this one)")
+    if answers.get("round", interview.get("round", 1)) != interview.get("round", 1):
+        errors.append("round: answers belong to a different round (omit round to answer this one)")
     try:
         size = len(json.dumps(answers, ensure_ascii=False).encode("utf-8"))
     except (TypeError, ValueError):
@@ -463,7 +468,7 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
         errors.append(f"correction: {len(_text(answers.get('correction')))} chars > {MAX_CORRECTION_CHARS}")
     given = answers.get("answers")
     if not isinstance(given, dict):
-        return errors + ["answers: must map question id -> {choice, note}"]
+        return errors + [f"answers: must map question id -> {{choice, note}}; {ANSWERS_SHAPE}"]
     questions = {_text(q.get("id")): q for q in interview.get("questions", []) if isinstance(q, dict)}
     for qid in given:
         if qid not in questions:

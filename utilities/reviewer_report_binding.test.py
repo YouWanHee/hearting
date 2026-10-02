@@ -522,7 +522,7 @@ class ReviewOutputWrapperBoundaryTest(unittest.TestCase):
                     self.assertIn("child_spawned=0", stdout)
                     self.assertEqual(jobs.read_text(), "")
 
-    def test_closed_cycle_and_route_bound_report_are_typed_preclaim_denials(self):
+    def test_closed_cycle_takes_a_review_report_and_route_bound_report_is_a_typed_preclaim_denial(self):
         output = Path(self.cycle["cycle_dir"]) / "artifacts/plans/closed.md"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("evidence\n", encoding="utf-8")
@@ -544,9 +544,11 @@ class ReviewOutputWrapperBoundaryTest(unittest.TestCase):
                 code, stdout, jobs = self._run(
                     harness, attempt=f"att-review-closed-{index}", output=output,
                 )
-                self.assertEqual(code, 65, stdout)
-                self.assertIn("reason=cycle-not-open", stdout)
-                self.assertEqual(jobs.read_text(), "")
+                # §45 D-123: a closed cycle takes a review report like an open one; the
+                # launch is registered and nothing refuses it as `cycle-not-open`.
+                self.assertEqual(code, 0, stdout)
+                self.assertNotIn("reason=cycle-not-open", stdout)
+                self.assertEqual(len(jobs.read_text().splitlines()), 1)
             with self.subTest(harness=harness, case="route-bound"):
                 code, stdout, jobs = self._run(
                     harness, attempt=f"att-review-route-{index}", output=output,

@@ -6378,7 +6378,8 @@ FENCED_HUMAN_GATES = frozenset({"frame-review", "preview-disposition"})
 
 
 def _human_gate_entry_fence(
-    route: dict, node: dict, jobs: Path | None = None
+    route: dict, node: dict, jobs: Path | None = None, *, release_proof: bool = False,
+    only: frozenset | None = None,
 ) -> None:
     """Refuse to start a node whose entry human gate is not released (SD-129).
 
@@ -6396,6 +6397,12 @@ def _human_gate_entry_fence(
     Both "never raised" and "raised, not released" are refusals: a route sealed
     with the binding must pass through the gate. `revise` and `stop` leave the
     gate unreleased too.
+
+    `release_proof` is the question an owner's own operation asks (the owner is
+    already running, so no launch ever reaches this fence for that node): a
+    `proceed` then also has to be a person's release of the preview that is still
+    current, the way a quick one-shot's inline gate already requires. The launch
+    callers leave it off and keep their meaning.
     """
 
     # Two conditions, both required (review rounds 1 and 2, B1):
@@ -6433,6 +6440,7 @@ def _human_gate_entry_fence(
         and (row.get("position") or "entry") == "entry" and row.get("gate")
         and str(row.get("gate")) in raised_gates
         and str(row.get("gate")) in FENCED_HUMAN_GATES
+        and (only is None or str(row.get("gate")) in only)
     ]
     if not bindings:
         return
@@ -6457,6 +6465,8 @@ def _human_gate_entry_fence(
         resolution = WS.human_gate_resolution(entries, gate)
         status = resolution["status"]
         if status == "proceed":
+            if release_proof:
+                _release_proof_or_refuse(WS, gate, resolution, where)
             continue
         if status == "not-raised":
             raise DispatchContractError(
@@ -6476,6 +6486,103 @@ def _human_gate_entry_fence(
 
 
 
+def _release_proof_or_refuse(WS, gate: str, resolution: dict, where: str) -> None:
+    """A `proceed` that did not come from a person, or that no longer matches the preview."""
+    if resolution.get("actor_kind") != "user":
+        raise DispatchContractError(
+            "human-gate-unreleased",
+            f"{gate}: the release was not recorded by a person ({where})")
+    if not resolution.get("artifact_sha256"):
+        return  # raised before the preview's bytes were recorded: nothing to compare against
+    try:
+        WS.require_gate_artifact_current(resolution)
+    except (WS.WorkflowStateError, OSError, ValueError) as exc:
+        raise DispatchContractError(
+            "human-gate-unreleased",
+            f"{gate}: the released preview is no longer the current one ({exc}; {where}); raise the gate again") from exc
+
+
+# The same rule asked for a node the owner executes itself (SD-129 + refine's preview approval).
+human_gate_entry_fence = _human_gate_entry_fence
+
+# The gates an owner's own operation answers to. `frame-review` is not one of them: it is
+# settled before the owner launches (`owner_frame_launch_gate`), so the operation never re-asks it.
+OWNER_OPERATION_GATES = frozenset({"preview-disposition"})
+
+
+def _owner_executed_node(node: dict) -> bool:
+    """`capability-route.owner_executed_terminal`, kept here so a write check never loads the route module."""
+    return (node.get("terminal") is True and node.get("kind") == "capability-owner"
+            and node.get("unit") == "_kernel/owner" and node.get("dispatch_depth") == 1)
+
+
+def owner_operation_gates(route: dict) -> list[tuple[dict, str]]:
+    """`(node, gate)` for each approval gate sealed on a node the owner executes itself."""
+    nodes = {n.get("id"): n for n in route.get("nodes") or [] if isinstance(n, dict)}
+    return [(nodes[row["node"]], str(row["gate"])) for row in route.get("human_gate_bindings") or []
+            if isinstance(row, dict) and row.get("node") in nodes and (row.get("position") or "entry") == "entry"
+            and str(row.get("gate")) in OWNER_OPERATION_GATES and _owner_executed_node(nodes[row["node"]])]
+
+
+def owner_operation_fence(route: dict, node: dict, jobs: Path | None = None) -> None:
+    """Refuse the owner's own operation until a person released the current preview."""
+    _human_gate_entry_fence(route, node, jobs, release_proof=True, only=OWNER_OPERATION_GATES)
+
+
+# Set by the runtime's own raise inside the parent's `start` (and nowhere else): the caller is the
+# parent session reading the receipt right now, so that receipt is the delivery. See
+# `workflow-supervisor.gate_delivered_in_receipt`.
+GATE_RECEIPT_DELIVERY_ENV = "AGENT_GATE_RECEIPT_DELIVERY"
+
+
+def raise_preview_gate_for_node(route_file, route_node, jobs, agent_home, *, in_parent_receipt=False) -> str:
+    """Raise the existing `preview-disposition` question from the completed preview node.
+
+    One body for two callers: a refused child start (`recover_preview_gate_after_refusal`) and
+    an owner that already applied its transaction without ever raising the gate. Only a
+    current completed review artifact can back the gate transaction; this never releases
+    anything. Returns the carrier's delivery id (`-` when the receipt itself is the delivery);
+    raises ValueError with the reason otherwise.
+
+    `in_parent_receipt` is for the parent's own `start` only: the question reaches the person in
+    the receipt that call returns, so a parent kind with no push carrier needs no pending record.
+    """
+    route = json.loads(Path(route_file).read_text())
+    bindings = [b for b in route.get("human_gate_bindings", [])
+                if b.get("gate") == "preview-disposition" and b.get("node") == route_node
+                and b.get("position", "entry") == "entry"]
+    raisers = [n for n in route.get("nodes", [])
+               if n.get("continuation") == {"kind": "human-gate", "gate": "preview-disposition"}]
+    target = next(n for n in route.get("nodes", []) if n.get("id") == route_node)
+    if len(bindings) != 1 or len(raisers) != 1 or raisers[0]["id"] not in target.get("depends_on", []):
+        raise ValueError("preview-predecessor-unverified")
+    predecessor = raisers[0]
+    paths = [r / "completion" / route["route_id"] / (predecessor["id"] + ".json")
+             for r in dispatch_state_roots(Path(agent_home), Path(jobs))]
+    marker_path = next(p for p in paths if p.is_file())
+    marker = json.loads(marker_path.read_text())
+    if not completion_marker_is_current(route, predecessor, marker_path, marker):
+        raise ValueError("preview-marker-unverified")
+    ready = completion_attempt_readiness(route, predecessor, marker, Path(jobs))
+    if ready.state != "ready":
+        raise ValueError("preview-attempt-" + ready.state)
+    artifact = Path(marker["evidence"]["path"])
+    if not artifact.is_absolute() or not artifact.is_file():
+        raise ValueError("preview-artifact-unreadable")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("workflow-supervisor.py")),
+         "gate", "--route", str(route_file), "--gate", "preview-disposition",
+         "--block", "--jobs", str(jobs), "--artifact", str(artifact)],
+        text=True, capture_output=True, timeout=15, check=False,
+        env={**os.environ, GATE_RECEIPT_DELIVERY_ENV: "1"} if in_parent_receipt else None)
+    if result.returncode:
+        raise ValueError("gate-carrier-refused: " + result.stderr.strip()[:240])
+    payload = json.loads(result.stdout)
+    if payload.get("action") != "blocked" or payload.get("workflow_state") != "BLOCKED_HUMAN_GATE":
+        raise ValueError("gate-block-unverified")
+    return str(payload.get("delivery") or "-")
+
+
 def recover_preview_gate_after_refusal(route_file, route_node, action, agent_home, jobs,
                                       error: DispatchContractError) -> str:
     """Outside the claim lock, turn a proved legacy preview into a real question.
@@ -6487,39 +6594,8 @@ def recover_preview_gate_after_refusal(route_file, route_node, action, agent_hom
             or not error.detail.startswith("preview-disposition:") or not route_file or not jobs):
         return error.detail
     try:
-        route = json.loads(Path(route_file).read_text())
-        bindings = [b for b in route.get("human_gate_bindings", [])
-                    if b.get("gate") == "preview-disposition" and b.get("node") == route_node
-                    and b.get("position", "entry") == "entry"]
-        raisers = [n for n in route.get("nodes", [])
-                   if n.get("continuation") == {"kind": "human-gate", "gate": "preview-disposition"}]
-        target = next(n for n in route.get("nodes", []) if n.get("id") == route_node)
-        if len(bindings) != 1 or len(raisers) != 1 or raisers[0]["id"] not in target.get("depends_on", []):
-            raise ValueError("preview-predecessor-unverified")
-        predecessor = raisers[0]
-        paths = [r / "completion" / route["route_id"] / (predecessor["id"] + ".json")
-                 for r in dispatch_state_roots(Path(agent_home), Path(jobs))]
-        marker_path = next(p for p in paths if p.is_file())
-        marker = json.loads(marker_path.read_text())
-        if not completion_marker_is_current(route, predecessor, marker_path, marker):
-            raise ValueError("preview-marker-unverified")
-        ready = completion_attempt_readiness(route, predecessor, marker, Path(jobs))
-        if ready.state != "ready":
-            raise ValueError("preview-attempt-" + ready.state)
-        artifact = Path(marker["evidence"]["path"])
-        if not artifact.is_absolute() or not artifact.is_file():
-            raise ValueError("preview-artifact-unreadable")
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("workflow-supervisor.py")),
-             "gate", "--route", str(route_file), "--gate", "preview-disposition",
-             "--block", "--jobs", str(jobs), "--artifact", str(artifact)],
-            text=True, capture_output=True, timeout=15, check=False)
-        if result.returncode:
-            raise ValueError("gate-carrier-refused: " + result.stderr.strip()[:240])
-        payload = json.loads(result.stdout)
-        if payload.get("action") != "blocked" or payload.get("workflow_state") != "BLOCKED_HUMAN_GATE":
-            raise ValueError("gate-block-unverified")
-        return error.detail + "; preview_gate_recovery=blocked delivery=" + str(payload.get("delivery", "-"))
+        delivery = raise_preview_gate_for_node(route_file, route_node, jobs, agent_home)
+        return error.detail + "; preview_gate_recovery=blocked delivery=" + delivery
     except (OSError, ValueError, KeyError, StopIteration, DispatchContractError, subprocess.TimeoutExpired) as exc:
         return error.detail + "; preview_gate_recovery=unavailable reason=" + str(exc)[:320]
 

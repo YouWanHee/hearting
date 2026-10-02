@@ -1743,11 +1743,18 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         # gate must not silence this, or a live timeout/bridge-error
         # diagnostic could vanish forever with no future trigger to recover
         # it. Regression guard for the claim-gate addition itself.
+        #
+        # A still-open owner is no longer announced as `attention` by a stale
+        # `ready` readout; the wait lapses at its deadline and the typed
+        # timeout notice goes out ungated, with the arm left re-armable.
         self._open_row()
-        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+        with mock.patch.dict(os.environ, {"AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "1",
+                                          "AGENT_CLAUDE_REWAKE_MAX_SECONDS": "1"}), \
+             mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
             code, stdout, stderr = self._run_main()
-        self.assertEqual(code, 2)
-        self.assertIn("state=attention", stdout)
+        self.assertEqual(code, 0)
+        self.assertIn("state=timeout", stdout)
+        self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
 
 
 class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
@@ -1850,6 +1857,135 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
             with self.assertRaises(RuntimeError):
                 self._run_main()
         self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "sent-ambiguous")
+
+
+class TransientAttentionCompletionTest(unittest.TestCase):
+    """A transient `attention`/`ready` readout while the exact owner row is
+    still open must not spend the arm's one wake or seal it `ended`: the real
+    completion still has to wake the session. The fixtures are borrowed from
+    the claim-gate suite so this class adds no inherited tests."""
+
+    ANCESTRY = CarrierOneClaimGateTest.ANCESTRY
+    setUp = CarrierOneClaimGateTest.setUp
+    payload = CarrierOneClaimGateTest.payload
+    _open_row = CarrierOneClaimGateTest._open_row
+    _close_and_materialize = CarrierOneClaimGateTest._close_and_materialize
+
+    def setUp(self) -> None:  # noqa: F811 -- extends the borrowed fixture
+        CarrierOneClaimGateTest.setUp(self)
+        env = mock.patch.dict(os.environ, {
+            "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "1",
+            "AGENT_CLAUDE_REWAKE_MAX_SECONDS": "5",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        self.sleeps = 0
+        self.on_sleep = None
+        self.offset = 0.0
+        real_monotonic = time.monotonic
+
+        def fake_sleep(seconds):
+            self.sleeps += 1
+            self.offset += seconds
+            if self.on_sleep is not None:
+                self.on_sleep(self.sleeps)
+
+        for patch in (
+            mock.patch.object(rewake.time, "sleep", fake_sleep),
+            mock.patch.object(rewake.time, "monotonic", lambda: real_monotonic() + self.offset),
+            mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _run(self, waits):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        wait = mock.Mock(side_effect=list(waits) if isinstance(waits, list) else None,
+                         return_value=None if isinstance(waits, list) else waits)
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", stdout), \
+             mock.patch.object(rewake.sys, "stderr", stderr), \
+             mock.patch.object(rewake, "wait_for_attempt", wait):
+            code = rewake.main()
+        return code, stdout.getvalue(), stderr.getvalue(), wait
+
+    def _arm_state(self):
+        return rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"]
+
+    def test_open_attention_never_seals_arm_ended(self):
+        self._open_row()
+        attention = ("attention", "terminal-failure-or-unclosed")
+        code, out, err, wait = self._run(attention)
+        # The owner never finished: keep waiting on the original deadline, then
+        # lapse with no completion notice, no claim, and no `ended` seal.
+        self.assertNotEqual(self._arm_state(), "ended")
+        self.assertEqual(self._arm_state(), "lapsed")
+        self.assertEqual(code, 0)
+        self.assertNotIn("state=attention", out + err)
+        self.assertGreater(wait.call_count, 1)
+        self.assertGreaterEqual(self.sleeps, 1)
+        self.assertLessEqual(self.sleeps, 6)   # bounded by the original deadline
+
+    def test_ready_snapshot_races_back_to_open_keeps_waiting(self):
+        # Readiness said terminal-quiescent, but the current delivery snapshot
+        # reads the row open again.
+        self._open_row()
+        code, out, err, wait = self._run(("ready", "terminal-quiescent"))
+        self.assertEqual(self._arm_state(), "lapsed")
+        self.assertEqual(code, 0)
+        self.assertNotIn("state=success", out + err)
+        self.assertGreater(wait.call_count, 1)
+
+    def test_transient_attention_then_terminal_wakes_once(self):
+        self._open_row()
+        record_path = []
+
+        def finish(count):
+            if count == 2 and not record_path:
+                record_path.append(self._close_and_materialize())
+
+        self.on_sleep = finish
+        attention = ("attention", "terminal-failure-or-unclosed")
+        code, out, err, wait = self._run(attention)
+        self.assertEqual(code, 2)
+        self.assertEqual(out.count('"systemMessage"'), 1)   # exactly one wake
+        self.assertIn("status=done", out)
+        self.assertEqual(self._arm_state(), "ended")
+        self.assertEqual(json.loads(record_path[0].read_text(encoding="utf-8"))["state"], "sent-ambiguous")
+        self.assertGreaterEqual(wait.call_count, 3)
+
+    def test_terminal_failure_still_wakes_and_ends(self):
+        self._open_row()
+        record_path = self._close_and_materialize()
+        code, out, err, wait = self._run(("attention", "terminal-failure-or-unclosed"))
+        self.assertEqual(code, 2)
+        self.assertIn("Hearting dispatch requires attention", err)
+        self.assertIn("status=done", out)
+        self.assertEqual(self._arm_state(), "ended")
+        self.assertEqual(wait.call_count, 1)
+        self.assertEqual(self.sleeps, 0)
+        self.assertEqual(json.loads(record_path.read_text(encoding="utf-8"))["state"], "sent-ambiguous")
+
+    def test_unreadable_evidence_is_never_sealed_ended(self):
+        self._open_row()
+        broken = mock.Mock(side_effect=rewake.DispatchContractError("snapshot-unreadable"))
+        with mock.patch.object(rewake, "current_delivery_state", broken):
+            code, out, err, wait = self._run(("attention", "terminal-failure-or-unclosed"))
+        self.assertEqual(self._arm_state(), "lapsed")   # the notice may go out, the arm stays re-armable
+        self.assertNotEqual(self._arm_state(), "ended")
+
+    def test_an_open_gate_still_wakes_while_the_owner_is_open(self):
+        self._open_row()
+
+        def notices(launch, *, announced, **_kwargs):
+            announced.append("delivery-gate-1")
+            return ["gate notice"]
+
+        with mock.patch.object(rewake, "_open_gate_pending", return_value=True), \
+             mock.patch.object(rewake, "_gate_notices", side_effect=notices):
+            code, out, err, wait = self._run(("attention", "terminal-failure-or-unclosed"))
+        self.assertEqual(code, 2)
+        self.assertEqual(self._arm_state(), "gate-wake-sent")
 
 
 class DispatchOwnerRewakeMaterializeAbsenceTest(unittest.TestCase):
@@ -1996,6 +2132,7 @@ class A12ArmingFailureFixture(unittest.TestCase):
             "tool_response": {"stdout": output, "stderr": ""},
         }
         with mock.patch.object(rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")) as wait, \
+             mock.patch.object(rewake, "_owner_status", return_value="done"), \
              mock.patch.dict(os.environ, {"AGENT_HOME": str(MODULE_PATH.parents[1])}):
             code, stdout, stderr = self._run_main_with(payload, env={"AGENT_DISPATCH_JOBS": str(self.jobs)})
         self.assertEqual(code, 2)
@@ -2438,6 +2575,7 @@ class GateCarrierTest(unittest.TestCase):
 
         with mock.patch.object(rewake.subprocess, "run", side_effect=[pending, ready]) as run, \
                 mock.patch.object(rewake, "_open_gate_pending", side_effect=[sweep_takes_it(), False]), \
+                mock.patch.object(rewake, "_owner_status", return_value="done"), \
                 mock.patch.object(rewake, "agent_home", return_value=self.root), \
                 mock.patch.object(rewake.time, "sleep"), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
@@ -2584,6 +2722,7 @@ class GateCloseRearmTest(GateCarrierTest):
         (self.root / "utilities").mkdir()
         (self.root / "utilities" / "dispatch-attempt-ready.py").write_text("", encoding="utf-8")
         with mock.patch.object(rewake.subprocess, "run", return_value=ready), \
+                mock.patch.object(rewake, "_owner_status", return_value="done"), \
                 mock.patch.object(rewake, "agent_home", return_value=self.root), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.call()))), \
                 mock.patch.object(sys, "stdout", io.StringIO()), \

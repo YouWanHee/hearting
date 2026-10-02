@@ -174,20 +174,22 @@ class CutoverTest(unittest.TestCase):
         receipt = Path(report["cycle_dir"]) / C.MIGRATION_SPEC_BASES
         before = receipt.read_bytes()
         receipt.write_text('{"schema_version":1,"spec":{}}')
-        with self.assertRaises(P.ProducerError) as ctx:
+        with self.assertRaises(C.CutoverError) as ctx:
             C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
-        # Finalize replay now verifies the sealed payload before shared admission.
-        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
-        self.assertEqual(ctx.exception.detail, "completion-evidence")
+        # §45 D-123: finalize replay re-closes the cycle with the file as it is (it no
+        # longer fails on a changed payload); the base the migration needs is judged by
+        # what the receipt now says, and this one names no base for the reference.
+        self.assertEqual(ctx.exception.code, "shared-base-reference-mismatch")
         receipt.write_bytes(before)
         with self.assertRaises(C.CutoverError) as ctx:
             C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference="ref_" + "f" * 32)
         self.assertEqual(ctx.exception.code, "shared-base-reference-mismatch")
         receipt.unlink()
-        with self.assertRaises(P.ProducerError) as ctx:
+        with self.assertRaises(C.CutoverError) as ctx:
             C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
-        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
-        self.assertEqual(ctx.exception.detail, "completion-evidence")
+        # The re-close no longer fails on the missing file (§45 D-123); the migration
+        # itself still needs the base it captured, and says so.
+        self.assertEqual(ctx.exception.code, "shared-base-required")
 
     def test_migration_support_receipt_invalid_before_seal_is_recoverable(self):
         route, route_file = self.route()
@@ -456,7 +458,9 @@ class CutoverTest(unittest.TestCase):
         with self.assertRaises(C.CutoverError) as ctx:
             C.seal_legacy_cycle(self.root, cycle_dir=cycle_dir, route_file=route_file)
         self.assertEqual(ctx.exception.code, "manifest-already-present")
-        self.assertEqual(P.check_write(self.root, cycle_dir / "artifacts" / "new.md")["reason"], "cycle-not-open")
+        # §45 D-123: a closed cycle takes writes; the manifest records the close, it does not lock the folder.
+        verdict = P.check_write(self.root, cycle_dir / "artifacts" / "new.md")
+        self.assertEqual((verdict["verdict"], verdict["reason"]), ("allow", "open-cycle-artifacts"))
 
     def test_seal_legacy_cycle_rejects_bad_shapes(self):
         route, route_file = self.route("debug")

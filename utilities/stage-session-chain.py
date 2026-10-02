@@ -27,6 +27,7 @@ from dispatch_contract import (  # noqa: E402
     resolve_model_governor_root,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
+from model_profile import pinned_launch_harness  # noqa: E402
 import dispatch_subsession_resume_record as RESUME_RECORD  # noqa: E402
 import parent_next_directive  # noqa: E402
 
@@ -37,6 +38,21 @@ if _BATCH_SPEC is None or _BATCH_SPEC.loader is None:
     raise ImportError("dispatch-batch.py could not be loaded")
 DISPATCH_BATCH = importlib.util.module_from_spec(_BATCH_SPEC)
 _BATCH_SPEC.loader.exec_module(DISPATCH_BATCH)  # type: ignore[union-attr]
+
+
+def _pin_harness_available(route: dict, node: dict, harness: str, jobs) -> bool:
+    """`dispatch-node`'s own hard availability test for a sealed worker pin (one helper, not a copy)."""
+    spec = importlib.util.spec_from_file_location(
+        "dispatch_node_for_stage_session_chain", ROOT / "utilities" / "dispatch-node.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("dispatch-node.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        jobs = jobs if jobs is not None else resolve_global_registry(ROOT, None, 2, "check").path
+    except DispatchContractError:
+        return False  # no registry to read the limits from: the request stands
+    return module.pin_harness_available(route, node, harness, jobs)
 
 
 def _resume_state_root(jobs: Path) -> Path:
@@ -308,6 +324,7 @@ _SLICE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 def plan_slices(
     *, route_path: Path, node_id: str, slices_path: Path,
     output_path: Path, worktree: Path | None = None, default_adapter: str = "claude",
+    jobs: Path | None = None,
 ) -> dict:
     """Build and prove a parallel sub-session manifest from a slice list.
 
@@ -369,7 +386,12 @@ def plan_slices(
         if not isinstance(narrow_verify, str) or not narrow_verify.strip() or "\n" in narrow_verify:
             raise StageSessionError(f"narrow-verify-invalid:{slice_id}")
         rounds = item.get("expected_round_trips", 2)
-        adapter = item.get("adapter") or default_adapter
+        # The manifest is the authority `dispatch-node` follows for a slice, so the route's sealed
+        # worker pin (CONVENTIONS §2.1) is applied here, once, when the manifest is written -- while
+        # the pinned harness can run this node, as at a direct launch; otherwise the request stands.
+        adapter, _requested = pinned_launch_harness(
+            route, worker_type="stage", requested=item.get("adapter") or default_adapter,
+            available=lambda harness: _pin_harness_available(route, node, harness, jobs))
         fixed = item.get("fixed_files")
         if not isinstance(fixed, list) or not fixed:
             raise StageSessionError(f"fixed-files-missing:{slice_id}")
@@ -446,6 +468,7 @@ def main() -> int:
                 route_path=Path(args.route), node_id=args.node,
                 worktree=Path(args.worktree) if args.worktree else None,
                 slices_path=Path(args.slices), output_path=Path(args.output), default_adapter=args.adapter,
+                jobs=Path(args.jobs) if args.jobs else None,
             ), sort_keys=True))
         except StageSessionError as exc:
             print(json.dumps({"planned": "refused", "reason": str(exc),

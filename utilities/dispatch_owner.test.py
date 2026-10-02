@@ -1703,6 +1703,37 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
         self.assertNotIn("--qa", cmd)
         self.assertNotIn("--route-evidence", cmd)
 
+    def test_owner_preparation_held_by_the_admission_lock_is_a_typed_error_not_a_traceback(self):
+        from unittest import mock
+        from contextlib import redirect_stdout
+        import artifact_admission
+        path = self._quick_route()
+        raw = json.loads(path.read_text())
+        raw["artifact_root"] = str(path.parent)
+        path.write_text(json.dumps(raw))
+        jobs = path.parent / "jobs.log"; jobs.touch()
+        binding = SimpleNamespace(route_file=str(path), route_id="rt-x", route_hash="sha256:x",
+                                  route_node="one-shot", registry_digest="sha256:r",
+                                  write_scope="source-scoped", completion_gate="quick-complete")
+        calls = []
+        buf = io.StringIO()
+        with mock.patch.object(OWNER.subprocess, "run", side_effect=lambda cmd, **kw: calls.append(cmd)), \
+             mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
+             mock.patch.object(OWNER._capacity, "capacity_scores", return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
+             mock.patch.object(OWNER, "derive_quick_owner_binding", return_value=binding), \
+             mock.patch("artifact_producer.load_route", return_value={"capability": "autopilot-code",
+                                                                      "effective_intensity": "quick"}), \
+             mock.patch("artifact_producer.begin", side_effect=artifact_admission.AdmissionBusy("busy")), \
+             mock.patch("artifact_producer.OWNER_LAUNCH_ADMISSION_WAIT_SECONDS", 0.0, create=True), \
+             mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
+             redirect_stdout(buf):
+            rc = OWNER.main(["--start", "--route-evidence", str(path), "--prompt-text", "probe"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 65, out)
+        self.assertRegex(out, r"(?m)^reason=admission-busy:.*run start again later")
+        self.assertIn("child_spawned=0", out)
+        self.assertEqual(calls, [])
+
     def test_receipt_says_none_when_the_caller_spelled_out_the_tuple(self):
         from unittest import mock
         from contextlib import redirect_stdout
@@ -1766,6 +1797,132 @@ class TopProfileOwnerTupleTest(unittest.TestCase):
                           "--prompt-file", "/p.md"])
         self.assertEqual(str(refused.exception), "invalid-model-profile")
         self.assertIn("top", OWNER.hint_for("invalid-model-profile"))
+
+
+class RouteOwnerPinTest(unittest.TestCase):
+    """A sealed owner pin beats an explicit `--adapter` while its harness is usable.
+
+    The unpinned / unsealed / limited cases are the contrast: they keep today's result,
+    so "always the pin", "always the flag" and "ignore availability" each fail one of them."""
+
+    def _route(self, pin=None, sealed=("claude", "codex")):
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        doc = {"effective_intensity": "standard", "slug": "probe", "capability": "autopilot-code",
+               "capability_mode": "dev", "cwd": str(ROOT), "owner_model_profile": "deep",
+               "dispatch_evidence": {"tuples": [{"parent_harness": h, "status": "supported"} for h in sealed]},
+               "owner_harness_policy": {"primary": ["claude", "codex"], "relief": ["opencode"],
+                                        "last_resort": [], "promote_relief_below": 0},
+               "dispatch_allocation": {"strategy": "balanced", "window": 30,
+                                       "harness_order": ["claude", "codex", "opencode"],
+                                       "usage_gate_used_percent": 90}}
+        if pin:
+            doc["selection_pins"] = {"contract_version": 1, "owner": {"harness": pin, "model": None, "effort": None}}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    def _launch(self, path, adapter, usage=None, extra=()):
+        jobs = path.parent / "jobs.log"
+        jobs.touch()
+        calls = []
+        binding = SimpleNamespace(route_file=str(path), route_id="rt-x", route_hash="sha256:x")
+        buf = io.StringIO()
+        with mock.patch.object(OWNER.subprocess, "run",
+                               side_effect=lambda cmd, **kw: (calls.append(cmd), SimpleNamespace(returncode=0))[1]), \
+             mock.patch.object(OWNER, "_usage", return_value=usage or {"claude": "ok", "codex": "ok", "opencode": "ok"}), \
+             mock.patch.object(OWNER._capacity, "capacity_scores",
+                               return_value={"claude": 3.0, "codex": 80.0, "opencode": 80.0}), \
+             mock.patch.object(OWNER, "validate_owner_route_binding", return_value=binding), \
+             mock.patch.object(OWNER, "export_owner_route_env", return_value=None), \
+             mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \
+             mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
+             contextlib.redirect_stdout(buf):
+            argv = ["--dry-run", "--route-evidence", str(path), "--prompt-text", "probe", *extra]
+            if adapter:
+                argv += ["--adapter", adapter]
+            rc = OWNER.main(argv)
+        out = buf.getvalue()
+        cmd = calls[0] if calls else []
+        wrapper = Path(cmd[0]).parts[-3] if cmd else None
+        flag = cmd[cmd.index("--explicit-adapter") + 1] if "--explicit-adapter" in cmd else None
+        return SimpleNamespace(rc=rc, out=out, wrapper=wrapper, flag=flag, calls=calls)
+
+    def test_owner_pin_beats_an_explicit_adapter_and_records_it(self):
+        # claude's headroom is 3 here: an automatic choice would have been codex
+        got = self._launch(self._route(pin="claude"), "codex")
+        self.assertEqual(got.wrapper, "claude", got.out)
+        self.assertEqual(got.flag, "codex")
+        self.assertRegex(got.out, r"(?m)^adapter=claude$")
+        self.assertRegex(got.out, r"(?m)^selection_source=route-pin$")
+        self.assertRegex(got.out, r"(?m)^explicit_adapter=codex$")
+
+    def test_owner_pin_beats_an_explicit_adapter_outside_the_route_evidence(self):
+        got = self._launch(self._route(pin="claude"), "opencode")
+        self.assertEqual((got.wrapper, got.flag), ("claude", "opencode"), got.out)
+        self.assertRegex(got.out, r"(?m)^selection_source=route-pin$")
+
+    def test_requesting_the_pinned_owner_records_no_override(self):
+        # what `work_start._start` actually does: the request is already the pin
+        got = self._launch(self._route(pin="claude"), "claude")
+        self.assertEqual((got.wrapper, got.flag), ("claude", None), got.out)
+        self.assertRegex(got.out, r"(?m)^selection_source=explicit$")
+
+    def test_an_owner_pin_without_any_request_is_followed_and_records_no_request(self):
+        got = self._launch(self._route(pin="claude"), None)
+        self.assertEqual((got.wrapper, got.flag), ("claude", None), got.out)
+        self.assertRegex(got.out, r"(?m)^selection_source=route-pin$")
+        self.assertRegex(got.out, r"(?m)^explicit_adapter=none$")
+        limited = self._launch(self._route(pin="claude"), None,
+                               usage={"claude": "limited", "codex": "ok", "opencode": "ok"})
+        self.assertNotEqual(limited.wrapper, "claude", limited.out)
+
+    def test_a_limited_owner_pin_keeps_the_request(self):
+        got = self._launch(self._route(pin="claude"), "codex",
+                           usage={"claude": "limited", "codex": "ok", "opencode": "ok"})
+        self.assertEqual((got.wrapper, got.flag), ("codex", None), got.out)
+        self.assertRegex(got.out, r"(?m)^selection_source=explicit$")
+
+    def test_an_unsealed_owner_pin_keeps_todays_refusal(self):
+        got = self._launch(self._route(pin="opencode"), "opencode")
+        self.assertNotEqual(got.rc, 0)
+        self.assertIn("reason=explicit-adapter-outside-route-evidence", got.out)
+        self.assertEqual(got.calls, [])
+
+    def test_a_limited_pin_does_not_launder_a_request_outside_the_route_evidence(self):
+        got = self._launch(self._route(pin="claude"), "opencode",
+                           usage={"claude": "limited", "codex": "ok", "opencode": "ok"})
+        self.assertNotEqual(got.rc, 0)
+        self.assertIn("reason=explicit-adapter-outside-route-evidence", got.out)
+        self.assertEqual(got.calls, [])
+
+    def test_no_owner_pin_keeps_the_explicit_adapter(self):
+        got = self._launch(self._route(), "codex")
+        self.assertEqual((got.wrapper, got.flag), ("codex", None), got.out)
+        self.assertRegex(got.out, r"(?m)^selection_source=explicit$")
+
+    def test_no_owner_pin_keeps_the_refusal_of_a_request_outside_the_route_evidence(self):
+        got = self._launch(self._route(), "opencode")
+        self.assertNotEqual(got.rc, 0)
+        self.assertIn("reason=explicit-adapter-outside-route-evidence", got.out)
+        self.assertEqual(got.calls, [])
+
+    def test_a_worker_or_frame_pin_does_not_steer_the_owner(self):
+        path = self._route()
+        doc = json.loads(path.read_text())
+        doc["selection_pins"] = {"contract_version": 1, "worker": {"harness": "claude", "model": None, "effort": None},
+                                 "frame": {"harness": "claude", "model": None, "effort": None}}
+        path.write_text(json.dumps(doc))
+        got = self._launch(path, "codex")
+        self.assertEqual((got.wrapper, got.flag), ("codex", None), got.out)
+
+    def test_the_caller_cannot_forge_the_override_record(self):
+        got_args = ["--start", "--route-evidence", str(self._route(pin="claude")), "--prompt-file", "/p.md"]
+        with self.assertRaises(OWNER.OwnerError) as refused:
+            OWNER._parse(got_args + ["--explicit-adapter", "codex"])
+        self.assertEqual(str(refused.exception), "forbidden-flag:--explicit-adapter")
+        got = self._launch(self._route(pin="claude"), "codex", extra=("--explicit-adapter", "codex"))
+        self.assertNotEqual(got.rc, 0)
+        self.assertIn("forbidden-flag", got.out)
+        self.assertEqual(got.calls, [])
 
 if __name__ == "__main__":
     unittest.main()

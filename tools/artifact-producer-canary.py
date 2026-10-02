@@ -205,9 +205,10 @@ class Canary:
         assert completion.status == "complete", completion.to_payload()
         assert begun["cycle_id"] in adm.load_index(self.root).manifests
         row["checks"].append("finalize-sealed-manifest-valid-index-applied")
+        # PRD A-14.1 (§45 D-123): a closed cycle takes writes; the close is a record, not a lock.
         after = P.check_write(self.root, target)
-        assert after["verdict"] == "deny" and after["reason"] == "cycle-not-open", after
-        row["checks"].append("sealed-cycle-denies-writes")
+        assert after["verdict"] == "allow" and after["cycle_id"] == begun["cycle_id"], after
+        row["checks"].append("closed-cycle-allows-writes")
         row["manifest_digest"] = sealed["manifest_digest"]
         row["artifact_count"] = sealed["artifact_count"]
         row["status"] = "pass"

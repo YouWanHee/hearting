@@ -40,6 +40,13 @@ def load_route(path: Path, route_id: str, node_id: str) -> tuple[dict,dict]:
         # node instead of letting `next()` raise StopIteration for a node id
         # that was never meant to exist.
         node=next(row for row in route["nodes"] if row["id"]==node_id) if node_id else {}
+        if not node_id:
+            # The owner executes the transaction itself, so it names no node. Resolve the
+            # route's one declared owner operation that mutates the target.
+            owned=[row for row in route["nodes"] if row.get("kind")=="capability-owner"
+                   and row.get("unit")=="_kernel/owner" and row.get("dispatch_depth")==1
+                   and "target-artifact" in (row.get("write_scope") or [])]
+            node=owned[0] if len(owned)==1 else {}
     except SnapshotError:
         raise
     except Exception as exc:
@@ -246,6 +253,16 @@ def prepare(args) -> int:
             emit({"status":"skipped","reason":"support-artifact","target":str(target)})
             return 0
         raise
+    if capability == "autopilot-refine" and intensity != "quick":
+        # The owner's own `transaction` changes the target after the person released the preview it
+        # raised: the fence the entry gate holds for a child launch, asked only once the path is known
+        # to be the bound target, for the step that precedes the edit.
+        import dispatch_contract
+        if node.get("id") in {gated.get("id") for gated, _gate in dispatch_contract.owner_operation_gates(route)}:
+            try:
+                dispatch_contract.owner_operation_fence(route, node, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
+            except dispatch_contract.DispatchContractError as exc:
+                raise SnapshotError(exc.reason + ": " + exc.detail) from exc
     if not target.exists():
         emit({"status":"skipped","reason":"new-target","target":str(target)})
         return 0

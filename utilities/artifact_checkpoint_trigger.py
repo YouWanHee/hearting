@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Best-effort launcher for open-cycle checkpoints.
+"""Best-effort launcher for cycle checkpoints.
 
 Automatic triggers -- a route node completing, a supervisor poll, a session
-turn ending -- call `launch_for_route` or `launch_for_session`.  They never
+turn ending (Claude Stop, Codex Stop, OpenCode `session.idle`), a `begin` naming a
+parent or resuming a cycle -- call `launch_for_route` or `launch_for_session`.  They never
 raise and never wait: a per-trigger-key stamp keeps a caller from spawning more
 than once per interval, and the detached `artifact_producer.py checkpoint`
-child applies the authoritative per-cycle gates (open cycle, route not closed,
-interval, size limits, staleness).
+child applies the authoritative per-cycle gates.  For an open cycle those are
+open cycle, route not closed, interval, size limits and staleness; for a closed
+one the child looks for files changed since the close (§45 D-124, bounded by one
+walk/hash/time budget and holding no lock while it reads), then spends what is
+left of the budget on the root's other closed cycles in cursor order.
 
 `AGENT_ARTIFACT_CHECKPOINT=off` disables every automatic trigger; the explicit
 `artifact_producer.py checkpoint` command is unaffected.  Nothing launches for a
@@ -34,7 +38,7 @@ CUTOVER_REL = Path(".runtime/artifact-producer/v1/cutover.json")
 DISABLE_ENV = "AGENT_ARTIFACT_CHECKPOINT"
 INTERVAL_ENV = "AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL"
 DEFAULT_INTERVAL_SECONDS = 900.0
-AUTOMATIC_TRIGGERS = ("stage-complete", "supervisor-poll", "turn-end")
+AUTOMATIC_TRIGGERS = ("stage-complete", "supervisor-poll", "turn-end", "begin")
 HARNESSES = ("claude", "codex", "opencode")
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 STAMP_MAX_AGE_SECONDS = 7 * 86400.0

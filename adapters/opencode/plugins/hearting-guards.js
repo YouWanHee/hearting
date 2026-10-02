@@ -13,6 +13,7 @@ const isHarnessRoot = (candidate) =>
 const root = isHarnessRoot(envRoot) ? envRoot : pluginRoot
 const preflight = path.join(root, "adapters", "opencode", "bin", "preflight.sh")
 const summaryTrigger = path.join(root, "utilities", "session_summary_trigger.py")
+const checkpointTrigger = path.join(root, "utilities", "artifact_checkpoint_trigger.py")
 const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
@@ -184,6 +185,29 @@ function spawnSummary(sid, phase) {
   }
 }
 
+// Turn-end cycle observation, shared with Claude and Codex Stop: the same trigger
+// launcher (utilities/artifact_checkpoint_trigger.py) takes the session id on stdin,
+// applies its own interval, off switch and cutover checks, and starts the detached
+// checkpoint child. Main and worker sessions both run it (a worker names its cycle in
+// its environment). Fire-and-forget: a turn never waits on it.
+function spawnCheckpoint(sid) {
+  if (/^(off|0|false|no|disabled)$/i.test((process.env.AGENT_ARTIFACT_CHECKPOINT || "").trim())) return
+  try {
+    const child = spawn("python3", [checkpointTrigger, "turn-end", "--harness", "opencode"], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+    })
+    child.on("error", () => {})
+    child.stdin.on("error", () => {})
+    child.stdin.end(JSON.stringify({ sessionID: sid || "" }))
+    child.unref()
+  } catch {
+    // best-effort; a turn never depends on the checkpoint observation
+  }
+}
+
 // Pane-header identity, shared with Claude and Codex (tools/fleet/herdr_projection.py).
 // OpenCode has no user-configurable status line, so the pane header is the only place
 // this session can say which session it is -- and it must say it in the same shape the
@@ -351,7 +375,8 @@ export const AgentHarnessGuards = async (ctx) => {
       forgetShownCandidates(event.properties && event.properties.sessionID)
     }
     // session.idle fires after each turn (the session is waiting for the user).
-    // It refreshes the summary and pane and touches the heartbeat; memory has no
+    // It refreshes the summary and pane, starts the cycle checkpoint observation and
+    // touches the heartbeat; memory has no
     // idle or session-end step (it exchanges after writes and reads, D-82/D-83).
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
@@ -359,6 +384,7 @@ export const AgentHarnessGuards = async (ctx) => {
         spawnSummary(eventSid, "final")
         projectPane(eventSid)
       }
+      spawnCheckpoint(eventSid)
       // Liveness side-channel: touch the heartbeat for the active dispatch slug
       // so dispatch-liveness.py can detect stale/crashed headless sessions even
       // when the OpenCode SQLite session mtime is inconclusive.

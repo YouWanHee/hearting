@@ -253,7 +253,7 @@ def _member_dir(root: Path, campaign: Mapping[str, Any], cycle_id: str) -> Path:
 
 def _manifest(root: Path, campaign: Mapping[str, Any], cycle_id: str, directory: Path) -> dict[str, Any]:
     record = producer.read_cycle_record(root, cycle_id)
-    path = directory / "manifest.json" if record and record.get("state") == "sealed" else (
+    path = directory / "manifest.json" if producer.cycle_record_closed(record) else (
         producer.producer_dir(root) / "open-manifests" / f"{cycle_id}.json")
     value = _json(_regular(path, cap=32 * 1024 * 1024) or b"")
     root_identity = lifecycle.read_root_identity(root)
@@ -672,110 +672,130 @@ def apply(root: Path, plan_value: Mapping[str, Any], *, lock_timeout: float | No
     """`lock_timeout` bounds the wait for the producer admission lock (default 30 seconds);
     a background caller passes 0, and a held lock raises `AdmissionBusy` unwrapped."""
     root = Path(root).resolve()
-    plan = _validate_plan(plan_value)
     lock = admission._acquire_lock(
         root, admission.LOCK_TIMEOUT_DEFAULT if lock_timeout is None else lock_timeout)
     try:
-        campaign, directory, root_id, repo_id = _context(root, plan["campaign_id"])
-        path = directory / NAME
-        doc = _validate_document(root, campaign, directory, root_id, repo_id, plan["document"])
-        _check_group_ids_elsewhere(root, directory, {group["group_id"] for group in doc["groups"]})
-        before_raw = _regular(path, missing=True)
-        current_digest = _digest(before_raw) if before_raw is not None else None
-        if current_digest == plan["after_sha256"]:
-            return {"status": "already-applied", **verify(root, plan["campaign_id"], expected=plan["after_sha256"])}
-        if current_digest != plan["before_sha256"]:
-            raise WorkflowGroupError("declaration-preimage-conflict")
-        if before_raw is None:
-            old = None
-        elif plan["mode"] == "replace":
-            old = _preimage(before_raw, campaign, root_id, repo_id)
-        else:
-            old = _validate_document(root, campaign, directory, root_id, repo_id, _json(before_raw))
-        if plan["mode"] == "merge":
-            old_groups = {group["group_id"]: group for group in (old["groups"] if old else [])}
-            for gid, group in old_groups.items():
-                current = next((row for row in doc["groups"] if row["group_id"] == gid), None)
-                if current is None or current["title"] != group["title"]:
-                    raise WorkflowGroupError("merge-removal-forbidden", gid)
-                current_members = {item["cycle_id"]: item for item in current["members"]}
-                if any(current_members.get(item["cycle_id"]) != item for item in group["members"]):
-                    raise WorkflowGroupError("merge-removal-forbidden", gid)
-                current_relations = {
-                    frozenset((item["from_cycle_id"], item["to_cycle_id"])): item
-                    for item in current["relations"]
-                }
-                if any(current_relations.get(frozenset((item["from_cycle_id"], item["to_cycle_id"]))) != item
-                       for item in group["relations"]):
-                    raise WorkflowGroupError("merge-removal-forbidden", gid)
-        expected_new: list[dict[str, Any]] = []
-        old_relations = {
-            (g["group_id"], r["from_cycle_id"], r["to_cycle_id"]): r
-            for g in (old["groups"] if old else []) for r in g["relations"]}
-        all_refs = [ref for group in doc["groups"] for relation in group["relations"]
-                    for ref in relation["evidence_refs"]]
-        if _evidence_size(root, all_refs) > MAX_EVIDENCE_TOTAL:
-            raise WorkflowGroupError("evidence-total-size-limit")
-        dirs = {member["cycle_id"]: _member_dir(root, campaign, member["cycle_id"])
-                for group in doc["groups"] for member in group["members"]}
-        bound_paths: dict[str, tuple[dict[str, str], Path]] = {}
-        unique_bytes = 0
-        for group in doc["groups"]:
-            for relation in group["relations"]:
-                key = (group["group_id"], relation["from_cycle_id"], relation["to_cycle_id"])
-                if old_relations.get(key) == relation:
-                    continue
-                source, target = relation["from_cycle_id"], relation["to_cycle_id"]
-                for ref in relation["evidence_refs"]:
-                    evidence_path = ref["path"]
-                    if evidence_path in bound_paths:
-                        bound, owner = bound_paths[evidence_path]
-                        _evidence_owner(root, evidence_path, (dirs[source], dirs[target]))
-                        if owner not in (dirs[source], dirs[target]) or bound != ref:
-                            raise WorkflowGroupError("evidence-binding-stale", str(evidence_path))
-                    else:
-                        size = _evidence_stat(root, _safe_relative(evidence_path)).st_size
-                        if unique_bytes + size > MAX_EVIDENCE_TOTAL:
-                            raise WorkflowGroupError("evidence-total-size-limit")
-                        bound = _bind_evidence(root, campaign, ref, ((source, dirs[source]), (target, dirs[target])),
-                                               remaining=MAX_EVIDENCE_TOTAL - unique_bytes)
-                        owner = _evidence_owner(root, evidence_path, (dirs[source], dirs[target]))[1]
-                        bound_paths[evidence_path] = (bound, owner)
-                        unique_bytes += size
-                    expected_new.append({"from_cycle_id": source, "to_cycle_id": target, **bound})
-        if expected_new != plan["new_evidence"]:
-            raise WorkflowGroupError("plan-evidence-mismatch")
-        if _evidence_size(root, all_refs) > MAX_EVIDENCE_TOTAL:
-            raise WorkflowGroupError("evidence-total-size-limit")
-        latest = _regular(path, missing=True)
-        if (_digest(latest) if latest is not None else None) != current_digest:
-            raise WorkflowGroupError("declaration-preimage-conflict")
-        # Evidence files are outside the producer admission lock. Rebind only
-        # newly authored relations after the final size check, as close as
-        # possible to the metadata replacement. Old historical refs may be
-        # stale and must not block an unrelated merge.
-        final_bytes = 0
-        final_paths: set[str] = set()
-        for expected in expected_new:
-            evidence_path = expected["path"]
-            if evidence_path in final_paths:
-                continue
-            source, target = expected["from_cycle_id"], expected["to_cycle_id"]
-            ref = {key: expected[key] for key in EVIDENCE_FIELDS}
-            size = _evidence_stat(root, _safe_relative(evidence_path)).st_size
-            if final_bytes + size > MAX_EVIDENCE_TOTAL:
-                raise WorkflowGroupError("evidence-total-size-limit")
-            _bind_evidence(root, campaign, ref, ((source, dirs[source]), (target, dirs[target])),
-                           remaining=MAX_EVIDENCE_TOTAL - final_bytes)
-            final_bytes += size
-            final_paths.add(evidence_path)
-        latest = _regular(path, missing=True)
-        if (_digest(latest) if latest is not None else None) != current_digest:
-            raise WorkflowGroupError("declaration-preimage-conflict")
-        producer._write_atomic(path, _bytes(doc))
-        return {"status": "applied", "campaign_id": plan["campaign_id"], "sha256": plan["after_sha256"]}
+        ready = _validated_apply_locked(root, plan_value)
+        if ready["status"] == "already-applied":
+            return {"status": "already-applied", **verify(root, ready["campaign_id"], expected=ready["sha256"])}
+        producer._write_atomic(ready["path"], ready["after_raw"])
+        return {"status": "applied", "campaign_id": ready["campaign_id"], "sha256": ready["sha256"]}
     finally:
         admission._release_lock(root, lock)
+
+
+def _validated_apply_locked(root: Path, plan_value: Mapping[str, Any]) -> dict[str, Any]:
+    """Every preimage, identity, merge, and evidence check of `apply`, up to the replacement itself.
+
+    The caller holds the producer admission lock (a second acquisition would deadlock), so a
+    caller that writes several files under one lock reuses exactly these checks.  Returns
+    ``{"status": "ready"|"already-applied", "campaign_id", "sha256", "path", "before_raw",
+    "after_raw"}``; the caller replaces ``path`` with ``after_raw`` while still holding the lock.
+    """
+    root = Path(root).resolve()
+    if not admission.holds_lock(root):
+        raise WorkflowGroupError("admission-lock-required")
+    plan = _validate_plan(plan_value)
+    campaign, directory, root_id, repo_id = _context(root, plan["campaign_id"])
+    path = directory / NAME
+    doc = _validate_document(root, campaign, directory, root_id, repo_id, plan["document"])
+    _check_group_ids_elsewhere(root, directory, {group["group_id"] for group in doc["groups"]})
+    before_raw = _regular(path, missing=True)
+    current_digest = _digest(before_raw) if before_raw is not None else None
+    if current_digest == plan["after_sha256"]:
+        return {"status": "already-applied", "campaign_id": plan["campaign_id"],
+                "sha256": plan["after_sha256"], "path": path, "before_raw": before_raw,
+                "after_raw": before_raw}
+    if current_digest != plan["before_sha256"]:
+        raise WorkflowGroupError("declaration-preimage-conflict")
+    if before_raw is None:
+        old = None
+    elif plan["mode"] == "replace":
+        old = _preimage(before_raw, campaign, root_id, repo_id)
+    else:
+        old = _validate_document(root, campaign, directory, root_id, repo_id, _json(before_raw))
+    if plan["mode"] == "merge":
+        old_groups = {group["group_id"]: group for group in (old["groups"] if old else [])}
+        for gid, group in old_groups.items():
+            current = next((row for row in doc["groups"] if row["group_id"] == gid), None)
+            if current is None or current["title"] != group["title"]:
+                raise WorkflowGroupError("merge-removal-forbidden", gid)
+            current_members = {item["cycle_id"]: item for item in current["members"]}
+            if any(current_members.get(item["cycle_id"]) != item for item in group["members"]):
+                raise WorkflowGroupError("merge-removal-forbidden", gid)
+            current_relations = {
+                frozenset((item["from_cycle_id"], item["to_cycle_id"])): item
+                for item in current["relations"]
+            }
+            if any(current_relations.get(frozenset((item["from_cycle_id"], item["to_cycle_id"]))) != item
+                   for item in group["relations"]):
+                raise WorkflowGroupError("merge-removal-forbidden", gid)
+    expected_new: list[dict[str, Any]] = []
+    old_relations = {
+        (g["group_id"], r["from_cycle_id"], r["to_cycle_id"]): r
+        for g in (old["groups"] if old else []) for r in g["relations"]}
+    all_refs = [ref for group in doc["groups"] for relation in group["relations"]
+                for ref in relation["evidence_refs"]]
+    if _evidence_size(root, all_refs) > MAX_EVIDENCE_TOTAL:
+        raise WorkflowGroupError("evidence-total-size-limit")
+    dirs = {member["cycle_id"]: _member_dir(root, campaign, member["cycle_id"])
+            for group in doc["groups"] for member in group["members"]}
+    bound_paths: dict[str, tuple[dict[str, str], Path]] = {}
+    unique_bytes = 0
+    for group in doc["groups"]:
+        for relation in group["relations"]:
+            key = (group["group_id"], relation["from_cycle_id"], relation["to_cycle_id"])
+            if old_relations.get(key) == relation:
+                continue
+            source, target = relation["from_cycle_id"], relation["to_cycle_id"]
+            for ref in relation["evidence_refs"]:
+                evidence_path = ref["path"]
+                if evidence_path in bound_paths:
+                    bound, owner = bound_paths[evidence_path]
+                    _evidence_owner(root, evidence_path, (dirs[source], dirs[target]))
+                    if owner not in (dirs[source], dirs[target]) or bound != ref:
+                        raise WorkflowGroupError("evidence-binding-stale", str(evidence_path))
+                else:
+                    size = _evidence_stat(root, _safe_relative(evidence_path)).st_size
+                    if unique_bytes + size > MAX_EVIDENCE_TOTAL:
+                        raise WorkflowGroupError("evidence-total-size-limit")
+                    bound = _bind_evidence(root, campaign, ref, ((source, dirs[source]), (target, dirs[target])),
+                                           remaining=MAX_EVIDENCE_TOTAL - unique_bytes)
+                    owner = _evidence_owner(root, evidence_path, (dirs[source], dirs[target]))[1]
+                    bound_paths[evidence_path] = (bound, owner)
+                    unique_bytes += size
+                expected_new.append({"from_cycle_id": source, "to_cycle_id": target, **bound})
+    if expected_new != plan["new_evidence"]:
+        raise WorkflowGroupError("plan-evidence-mismatch")
+    if _evidence_size(root, all_refs) > MAX_EVIDENCE_TOTAL:
+        raise WorkflowGroupError("evidence-total-size-limit")
+    latest = _regular(path, missing=True)
+    if (_digest(latest) if latest is not None else None) != current_digest:
+        raise WorkflowGroupError("declaration-preimage-conflict")
+    # Evidence files are outside the producer admission lock. Rebind only
+    # newly authored relations after the final size check, as close as
+    # possible to the metadata replacement. Old historical refs may be
+    # stale and must not block an unrelated merge.
+    final_bytes = 0
+    final_paths: set[str] = set()
+    for expected in expected_new:
+        evidence_path = expected["path"]
+        if evidence_path in final_paths:
+            continue
+        source, target = expected["from_cycle_id"], expected["to_cycle_id"]
+        ref = {key: expected[key] for key in EVIDENCE_FIELDS}
+        size = _evidence_stat(root, _safe_relative(evidence_path)).st_size
+        if final_bytes + size > MAX_EVIDENCE_TOTAL:
+            raise WorkflowGroupError("evidence-total-size-limit")
+        _bind_evidence(root, campaign, ref, ((source, dirs[source]), (target, dirs[target])),
+                       remaining=MAX_EVIDENCE_TOTAL - final_bytes)
+        final_bytes += size
+        final_paths.add(evidence_path)
+    latest = _regular(path, missing=True)
+    if (_digest(latest) if latest is not None else None) != current_digest:
+        raise WorkflowGroupError("declaration-preimage-conflict")
+    return {"status": "ready", "campaign_id": plan["campaign_id"], "sha256": plan["after_sha256"],
+            "path": path, "before_raw": latest, "after_raw": _bytes(doc)}
 
 
 def verify(root: Path, campaign_id: str, *, expected: str | None = None) -> dict[str, Any]:

@@ -443,6 +443,7 @@ class ResplitGateTests(WFixture, unittest.TestCase):
         record["state"] = "sealed"
         record.pop("superseded_by", None)
         record.pop("superseded_event_id", None)
+        record.pop("disposition", None)
         record_path.write_text(json.dumps(record))
         fields = G._resplit_fields(self.root)
         self.assertEqual(fields["lump_index_state"], "supersession-record-event-divergent")

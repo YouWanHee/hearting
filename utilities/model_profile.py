@@ -423,6 +423,28 @@ def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) ->
     return {"status": "applied", "model": model, "effort": pin.get("effort") or None}
 
 
+def sealed_pin_harness(route, *, worker_type: str | None) -> str | None:
+    """The harness this route sealed for the launch's pin target, or None."""
+
+    pins = route.get("selection_pins") if isinstance(route, dict) else None
+    pin = pins.get(pin_target(worker_type)) if isinstance(pins, dict) else None
+    return (pin.get("harness") or None) if isinstance(pin, dict) else None
+
+
+def pinned_launch_harness(route, *, worker_type: str | None, requested: str | None, available) -> tuple[str | None, str | None]:
+    """A sealed pin beats the requested harness while the pinned one is available.
+
+    Returns `(harness, overridden_request)`; the second item is the request the pin replaced
+    (None when nothing was replaced), so the caller can record it.  An unavailable pin, or no
+    pin, leaves the request alone.  `available` is the caller's own hard-eligibility test.
+    """
+
+    pinned = sealed_pin_harness(route, worker_type=worker_type)
+    if not pinned or (pinned != requested and not available(pinned)):
+        return requested, None
+    return pinned, (requested if requested not in (None, pinned) else None)
+
+
 # The frame bootstrap tier ladder -- ONE function, ONE home.
 # Both legs make the route's irreversible framing judgment and use `top`.
 #
@@ -464,16 +486,53 @@ FRAME_ANCHOR_SHAPE_DEMAND = {
 }
 
 
-def frame_profile_for_owner(owner_profile: str) -> dict:
+# The ONE prior frame policy (v2.167.1-v2.169.0), kept only so a verifier can still accept a sealed
+# route whose frame nodes were declared under it. It is never a compile default and not a release
+# selector: `frame_profile_for_owner(..., prior=True)` is read by the route verifier alone. Any later
+# policy generation needs its own evidence and its own entry; this is not an open-ended registry.
+PRIOR_FRAME_PROFILE_LADDER = {
+    "top": {"anchor": "top", "others": "deep"},
+    "deep": {"anchor": "top", "others": "deep"},
+    "balanced-deep": {"anchor": "deep", "others": "deep"},
+    "balanced": {"anchor": "balanced-deep", "others": "balanced-deep"},
+    "light": {"anchor": "balanced", "others": "balanced"},
+}
+# Same shape demand as `FRAME_ANCHOR_SHAPE_DEMAND`; only the execution rationale was worded differently.
+PRIOR_FRAME_ANCHOR_SHAPE_DEMAND = {
+    "schema_version": DEMAND_SCHEMA_VERSION,
+    "judgment_requirement": "difficult-uncertain",
+    "execution_scope": "short-local",
+    "judgment_reason": (
+        "framing is the route's one irreversible judgment: every later node "
+        "inherits the direction this leg picks, and no later stage is scoped "
+        "to re-open it"
+    ),
+    "execution_reason": (
+        "one direction brief, written once, with no multi-step execution of "
+        "its own"
+    ),
+    "evidence_refs": ["roles/units/plan/frame.md"],
+}
+
+
+def frame_profile_for_owner(owner_profile: str, *, prior: bool = False) -> dict:
     """Map an owner's resolved profile to its frame pair's two profiles.
 
     Returns `{"anchor": <profile>, "others": <profile>}`. Unknown or absent
     owner profiles fall back to the `light` rung rather than raising: this runs
     inside route compilation for every recipe, and a route that framed nothing
-    is worse than a route framed conservatively."""
+    is worse than a route framed conservatively. `prior` selects the one prior
+    policy, for verification of an already sealed route only."""
 
-    return dict(FRAME_PROFILE_LADDER.get(owner_profile or "light",
-                                         FRAME_PROFILE_LADDER["light"]))
+    ladder = PRIOR_FRAME_PROFILE_LADDER if prior else FRAME_PROFILE_LADDER
+    return dict(ladder.get(owner_profile or "light", ladder["light"]))
+
+
+def frame_anchor_shape_demand(*, prior: bool = False) -> dict:
+    """A private copy of the frame shape demand (current, or the one prior policy's)."""
+
+    return json.loads(json.dumps(
+        PRIOR_FRAME_ANCHOR_SHAPE_DEMAND if prior else FRAME_ANCHOR_SHAPE_DEMAND))
 
 
 def _lower_launch_verified(args, route, node_id, selection, profile):

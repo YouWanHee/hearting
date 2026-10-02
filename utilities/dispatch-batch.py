@@ -60,6 +60,7 @@ from dispatch_allocation import (  # noqa: E402
     attempt_counts,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
+from model_profile import sealed_pin_harness  # noqa: E402
 
 CAPACITY_SPEC = importlib.util.spec_from_file_location(
     "harness_capacity", ROOT / "utilities" / "harness-capacity.py"
@@ -700,6 +701,12 @@ def assign_harnesses(
     """
     options: list[list[tuple[str, str, int]]] = []
     exclusions: dict[str, set[str]] = {}
+    # A sealed `--pin worker=<harness>` leads the selection order (CONVENTIONS §2.1): a leg whose
+    # candidates (policy, usage limit, checked tuple) still include the pinned harness gets only that
+    # one. A pin the leg cannot use leaves the leg's candidates alone. `dispatch-node` applies the
+    # same rule at launch, so the two always agree on the harness.
+    worker_pin = sealed_pin_harness(route, worker_type="stage")
+    pinned_legs: set[int] = set()
     for node in nodes:
         choices = []
         # Scoped to this node only, so a later node's failure detail cannot
@@ -738,6 +745,9 @@ def assign_harnesses(
                 node_exclusions.setdefault(adapter, set()).add(exc.reason)
                 continue
             choices.append((adapter, selection.fallback_hop, selection.ordinal))
+        if worker_pin and any(choice[0] == worker_pin for choice in choices):
+            choices = [choice for choice in choices if choice[0] == worker_pin]
+            pinned_legs.add(len(options))
         if not choices:
             detail = f"node={node.get('id', '-')}"
             codes = _exclusion_codes(node_exclusions)
@@ -766,7 +776,11 @@ def assign_harnesses(
             index for index, node in enumerate(nodes)
             if node.get("leg_class") == "peer"
         ]
-        if peer_indices and not quality_peer:
+        if any(index in pinned_legs for index in peer_indices) and worker_pin not in quality_peer:
+            # The user's own pin chose a family outside the quality-peer set: a recorded
+            # degradation of the sole gate, never a refusal (the stage fallback does the same).
+            sole_gate = "degraded"
+        elif peer_indices and not quality_peer:
             # The user's policy defines no quality-peer family (for example an
             # OpenCode-only setup, or a `--profile light` route with no
             # balanced-deep policy). That is a policy shape, not a shortage,

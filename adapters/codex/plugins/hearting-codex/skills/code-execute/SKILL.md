@@ -61,7 +61,7 @@ public finish command and its exact receipt under `core/WORKFLOW.md §0.5`.
 The same section defines current-session OPEN-route reuse after a proved merge
 into an integration worktree. Registered owners and workers retain their
 runtime terminal path. Stage-dispatch §13.61 and artifact-path-contract §43
-govern the proof and exact cycle seal.
+govern the proof and the cycle's completion record; a finalized cycle's files stay editable (artifact-path-contract §45).
 
 ## Role Requirements
 

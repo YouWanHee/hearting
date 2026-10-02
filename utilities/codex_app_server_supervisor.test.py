@@ -906,6 +906,47 @@ def fake_run_result(returncode, stdout):
     )
 
 
+class ActiveTurnDeadlineParityTest(unittest.TestCase):
+    """The Codex App Server turn has no elapsed-time deadline: a live turn that
+    stays quiet across many read polls still completes on its own turn."""
+
+    def test_live_app_server_turn_is_not_interrupted_by_elapsed_time(self):
+        module = load_supervisor_module()
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "slow_app.py"
+            trace = Path(temp) / "trace"
+            script.write_text(textwrap.dedent(f"""\
+                import json, sys, time
+                def send(value):
+                    print(json.dumps(value), flush=True)
+                for line in sys.stdin:
+                    value = json.loads(line)
+                    with open({str(trace)!r}, 'a') as handle:
+                        handle.write(value.get('method', '?') + '\\n')
+                    if value.get('method') == 'turn/start':
+                        send({{'jsonrpc':'2.0','id':value['id'],'result':{{'turn':{{'id':'turn-1'}}}}}})
+                        time.sleep(1.4)   # well past several 0.2s read polls
+                        send({{'jsonrpc':'2.0','method':'item/completed','params':{{
+                            'threadId':'thread-1','turnId':'turn-1','item':{{
+                                'type':'agentMessage','id':'m1','text':'done'}}}}}})
+                        send({{'jsonrpc':'2.0','method':'turn/completed','params':{{
+                            'threadId':'thread-1','turn':{{'id':'turn-1','status':'completed'}}}}}})
+                """))
+            server = module.AppServer([sys.executable, str(script)], temp, dict(os.environ))
+            self.addCleanup(server.close)
+            args = SimpleNamespace(worktree=temp, writable_root=[], sandbox="danger-full-access",
+                                   network_access=False, approval="inherit", model=None,
+                                   reasoning=None, owner_input=None)
+            started = time.monotonic()
+            with mock.patch.object(module, "emit"):
+                text, item = module.run_turn(server, thread_id="thread-1", prompt="go", args=args)
+            self.assertGreater(time.monotonic() - started, 1.0)
+            self.assertEqual(text, "done")
+            self.assertIsNone(server.process.poll())   # same live server, never interrupted
+            self.assertEqual(trace.read_text().split().count("turn/start"), 1)
+            self.assertNotIn("turn/interrupt", trace.read_text())
+
+
 class SharedReceiptlessRecoveryTest(unittest.TestCase):
     """The former Codex-only recovery now belongs to the shared join."""
 

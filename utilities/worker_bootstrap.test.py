@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 
+import importlib.util
 import json
+import os
+import re
+import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +18,11 @@ import dispatch_terminal_commit as T
 import artifact_producer as AP
 
 ROOT = Path(__file__).resolve().parents[1]
+
+_OPA_SPEC = importlib.util.spec_from_file_location(
+    "owner_preview_for_bootstrap", Path(__file__).with_name("owner_preview_approval.test.py"))
+OPA = importlib.util.module_from_spec(_OPA_SPEC)
+_OPA_SPEC.loader.exec_module(OPA)
 
 
 class WorkerBootstrapTest(unittest.TestCase):
@@ -253,6 +264,125 @@ class NodeScopeTest(unittest.TestCase):
             prompt = W.assignment_prompt(args, "do the research", {})
             self.assertIn("no open cycle is bound", prompt)
             self.assertNotIn(str(root / "artifact_root"), prompt)
+
+
+class OwnerGatePromptTest(unittest.TestCase):
+    """The owner's assignment names the approval gate on a node it executes itself.
+
+    Text only: the gate is still enforced by the runtime. The one shared renderer serves all
+    three adapters, so one rendering test plus a check that each adapter calls it covers them.
+    """
+
+    def _route(self, tmp: Path, *, bound=True, owner_node=True) -> Path:
+        node = {"id": "transaction", "kind": "capability-owner", "unit": "_kernel/owner",
+                "dispatch_depth": 1, "terminal": True} if owner_node else {
+                "id": "transaction", "kind": "review-worker", "unit": "editorial/review", "dispatch_depth": 2}
+        route_file = tmp / "rt-gate.json"
+        route_file.write_text(json.dumps({
+            "route_id": "rt-gate-prompt", "artifact_root": str(tmp / "artifact_root"),
+            "nodes": [{"id": "review", "dispatch_depth": 2, "unit": "editorial/review",
+                       "continuation": {"kind": "human-gate", "gate": "preview-disposition"}}, node],
+            "human_gate_bindings": ([{"gate": "preview-disposition", "node": "transaction", "position": "entry"}]
+                                    if bound else []),
+        }), encoding="utf-8")
+        return route_file
+
+    def _owner(self, route_file, *, via_binding=False):
+        binding = SimpleNamespace(route_file=str(route_file), route_id="rt-gate-prompt")
+        return SimpleNamespace(worker_type="owner", route_file=None if via_binding else str(route_file),
+                               route_node=None, owner_route_binding=binding if via_binding else None,
+                               jobs="/tmp/jobs.log")
+
+    def test_the_owner_is_told_to_raise_the_gate_before_applying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            route_file = self._route(Path(tmp))
+            for via_binding in (False, True):
+                with self.subTest(via_binding=via_binding):
+                    prompt = W.assignment_prompt(self._owner(route_file, via_binding=via_binding), "Refine it", {})
+                    self.assertIn("preview-disposition", prompt)
+                    self.assertIn("transaction", prompt)
+                    self.assertIn("workflow-supervisor.py gate --route", prompt)
+                    self.assertIn("--block", prompt)
+                    self.assertIn(str(route_file), prompt)
+                    self.assertIn("do not apply", prompt)
+                    self.assertIn("BLOCKED", prompt)
+
+    def test_a_route_without_the_binding_or_for_a_child_node_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = W.assignment_prompt(self._owner(self._route(Path(tmp), bound=False)), "Refine it", {})
+            self.assertNotIn("preview-disposition", plain)
+            self.assertNotIn("--block", plain)
+            child_node = W.assignment_prompt(self._owner(self._route(Path(tmp), owner_node=False)), "Refine it", {})
+            self.assertNotIn("--block", child_node)
+            stage = SimpleNamespace(worker_type="stage", route_file=str(self._route(Path(tmp))), route_node="review")
+            self.assertNotIn("--block", W.assignment_prompt(stage, "Review it", {}))
+
+    def test_all_three_adapters_render_the_assignment_through_the_shared_function(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                source = (ROOT / "adapters" / harness / "bin" / "dispatch-headless.py").read_text(encoding="utf-8")
+                self.assertIn("assignment_prompt(args, task, os.environ)", source)
+
+
+class OwnerInlineMarkerPromptTest(OPA.OwnerRefineBase):
+    """The owner is told to finish its stage first and how to publish a stage it ran itself (D2, round 1).
+
+    The OpenCode r3 owner ran `review` inline because nothing told it that the inline run still
+    publishes a marker, and then could not settle. Text only: settlement still refuses an unmarked stage.
+    """
+
+    def prompt(self, **kw):
+        args = SimpleNamespace(worker_type="owner", route_file=str(self.path), jobs=str(self.jobs),
+                               attempt_id=self.owner, **kw)
+        return W.assignment_prompt(args, "Refine the README", {})
+
+    def test_the_refine_owner_is_told_review_first_and_the_named_command_publishes_the_marker(self):
+        self.build("opencode", review=False, close=False, parent="poll-fallback")
+        text = self.prompt()
+        self.assertIn("first finish stage review", text)
+        self.assertLess(text.index("first finish stage review"), text.index("--gate preview-disposition --block"))
+        command = re.search(r"`([^`]*capability-route\.py complete[^`]*)`", text).group(1)
+        for token in ("--execution-surface inline", "--registered-worker 0", "--fallback-hop inline",
+                      "--dispatch-depth 2", f"--route {self.path}"):
+            self.assertIn(token, command)
+        self.assertNotIn("--jobs", command)
+        # the rendered command, run as written, publishes the marker settlement asks for
+        verdict = self.write_output(self.cycle, rel="reviews/refine-verdict.md", data=b"verdict: PASS\n")
+        argv = [a.replace("<node>", "review") for a in shlex.split(
+            command.replace("<stage terminal artifact>", str(verdict)))]
+        env = {**os.environ, "AGENT_ARTIFACT_ROOT": str(self.root), "AGENT_DISPATCH_JOBS": str(self.jobs),
+               "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_ATTEMPT_ID": self.owner}
+        done = subprocess.run([sys.executable, *argv[1:]], text=True, capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        node = next(n for n in self.route["nodes"] if n["id"] == "transaction")
+        with self.env():
+            self.assertEqual(OPA.R.owner_terminal_prerequisites(self.route, node, self.jobs), {})
+
+    def test_the_text_is_one_rendering_for_every_harness(self):
+        self.build("claude", review=False, close=False)
+        texts = [self.prompt(adapter=harness) for harness in ("claude", "codex", "opencode")]
+        self.assertEqual(texts[0], texts[1])
+        self.assertEqual(texts[1], texts[2])
+        self.assertIn("first finish stage review", texts[0])
+
+    def test_no_text_without_a_route_or_for_a_stage_worker(self):
+        self.assertEqual(W.assignment_prompt(SimpleNamespace(worker_type="owner"), "T", {}), "Assignment:\nT\n\n")
+        self.assertEqual(W.owner_inline_marker_prompt(SimpleNamespace(worker_type="stage", route_file="x")), "")
+
+    def test_a_code_owner_gets_the_marker_line_and_no_gate_line(self):
+        os.environ["AGENT_HOME"] = str(OPA.R.ROOT)
+        self.activate()
+        route = OPA.R.compose_route(
+            capability="autopilot-code", capability_mode="dev", shape="staged", graph="plan,execute,test",
+            slug="code-owner", cwd=OPA.R.ROOT, artifact_root=self.root, intensity="standard",
+            dispatch_evidence={"tuples": [OPA.nested("claude", "codex")]}, unassigned=True,
+            work_request={"text": "Fix it", "owner_harness": "claude"})
+        path = Path(OPA.L.admit_runtime_route(self.root, route).route_file)
+        text = W.assignment_prompt(
+            SimpleNamespace(worker_type="owner", route_file=str(path), jobs=str(self.jobs), attempt_id="att-code"),
+            "Fix it", {})
+        self.assertIn("A declared stage (plan, execute, test)", text)
+        self.assertNotIn("Human gate", text)
 
 
 if __name__ == "__main__":

@@ -831,6 +831,43 @@ class ReplacementTest(unittest.TestCase):
                 self.assertEqual('Do not raise' in text,parked)
                 self.assertEqual(R.recovery_instructions(SimpleNamespace(**{**vars(args),'worker_type':'stage'})),'')
 
+    def _passed_owner(self,*journal,owner_executed=True,**changes):
+        """An owner whose terminal result was PASS while the gate it should have waited at is raised."""
+        self._parked_route()
+        if owner_executed:
+            self.route['nodes'][1].update(kind='capability-owner',unit='_kernel/owner',dispatch_depth=1,terminal=True)
+        self.owner={**self.meta,'worker_type':'owner','note':'completed-supervisor','failure_class':'pass',
+                    'workflow_completion':'runtime-v1',**changes}
+        self.write(self.owner,stamp=self.OWNER_STAMP)
+        self._journal(*journal)
+
+    def test_a_passed_owner_before_its_own_gated_operation_is_recognised_as_waiting_and_never_replaced(self):
+        for name,journal,status in (('raised-unreleased',(self._raise(),),'blocked'),
+                                    ('released',(self._raise(),self._proceed()),'proceed'),
+                                    ('revise',(self._raise(),('RUNNING',{'released_gate':self.GATE,'decision':'revise'},'2026-09-29T02:00:00Z')),'revise'),
+                                    ('stop',(self._raise(),('CANCELLED',{'gate':self.GATE,'abandon_reason':'operator-decision'},'2026-09-29T02:00:00Z')),'stop')):
+            with self.subTest(case=name):
+                self.tearDown_case()
+                self._passed_owner(*journal)
+                found=R.owner_parked_gate(self.jobs,'att-source')
+                self.assertEqual((found['gate'],found['status'],found['gated_nodes']),(self.GATE,status,['full-run']))
+                # a passed owner is never a death: no claim, no replacement, whatever the gate says
+                self.assertIsNone(R.death_kind(self.write_fields(),self.owner,jobs=self.jobs))
+                with self.assertRaises(D.DispatchContractError):self.claim()
+                self.assertEqual(R.advance(self.jobs,'att-source',authority_check=lambda *_:True)['state'],'not-applicable')
+                self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
+    def write_fields(self):
+        return self.jobs.read_text().splitlines()[-1].split('\t')
+
+    def test_a_passed_owner_with_no_owner_executed_gated_node_is_not_a_park(self):
+        self._passed_owner(self._raise(),owner_executed=False)
+        self.assertIsNone(R.owner_parked_gate(self.jobs,'att-source'))
+
+    def test_a_passed_owner_whose_gate_was_never_raised_is_not_a_park(self):
+        self._passed_owner()
+        self.assertIsNone(R.owner_parked_gate(self.jobs,'att-source'))
+
     def test_owner_parked_gate_is_read_only(self):
         self._parked_owner(self._raise(),self._proceed())
         def snapshot():return (self.jobs.read_bytes(),sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob('*')))
@@ -891,6 +928,28 @@ class ReplacementTest(unittest.TestCase):
                      (['now','done'],{**self.meta,'worker_type':'frame','note':'dead-capacity'}),
                      (['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity'})):
             self.assertIsNone(R.death_kind(*case),case)
+        # a runtime death (the process exited, or the runtime returned an error envelope) is the owner's alone
+        for note in ('dead-runtime-exit','dead-runtime-error'):
+            self.assertEqual(R.death_kind(*row(note,failure_class='runtime')),'runtime',note)
+        self.assertIsNone(R.death_kind(*row('dead-runtime-error',status='cancelled')))
+        self.assertIsNone(R.death_kind(['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-runtime-error'}))
+
+    def test_runtime_death_is_settled_by_its_own_error_envelope(self):
+        self.absent.stop()
+        meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime'}
+        fields=['now','done','',str(self.root)]
+        def seen(state,failure_class):
+            return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
+                              return_value={'state':state,'failure_class':failure_class})
+        # a runtime death needs no handoff: an error envelope or no result is the death itself ...
+        for state,failure,ok in (('invalid','runtime',True),('absent','',True),
+                                 ('invalid','contract-violation',False),('valid','pass',False),
+                                 ('invalid','capacity',False)):
+            with self.subTest(state=state,failure=failure),seen(state,failure):
+                self.assertEqual(R._terminal_absent(fields,meta,runtime=True),ok)
+        # ... a silent death is still settled only by an absent result
+        with seen('invalid','runtime'):
+            self.assertFalse(R._terminal_absent(fields,meta))
 
     def test_capacity_death_with_invalid_capacity_terminal_is_settled_absent(self):
         self.absent.stop()
@@ -993,6 +1052,69 @@ class ReplacementTest(unittest.TestCase):
             result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
         self.assertEqual(result.get('state'),'running',result)
         self.assertEqual(result['attempt_id'],record['replacement_attempt_id'])
+
+    # -- an owner its launcher closed before spawning: a pause the next `start` resumes ----------
+    def _unlaunched_owner(self,**changes):
+        self._owner(note='dead-producer-binding-failed',launch_outcome='never-launched',launch_claimed='0',
+                    log_file=str(self.root/'never-written.log'),**changes)
+
+    def test_owner_closed_before_spawn_is_an_unlaunched_pause(self):
+        self.absent.stop()   # the real settlement check: this attempt never wrote a log
+        self._unlaunched_owner()
+        fields,meta=R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertEqual(R.death_kind(fields,meta),'unlaunched')
+        record=self.claim()
+        self.assertIn('after_capacity',record['logical_node'])
+        self.assertEqual(record['proof']['death_kind'],'unlaunched')
+
+    def test_unlaunched_owner_is_relaunched_only_by_start(self):
+        self._unlaunched_owner()
+        def files():return sorted(str(p) for p in R._directory(self.jobs).rglob('*') if p.is_file())
+        before=(files(),self.jobs.read_bytes())
+        result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,run=lambda *a,**k:self.fail('launched'))
+        self.assertEqual(result,{'state':'not-applicable'})
+        self.assertEqual((files(),self.jobs.read_bytes()),before)
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+        commands=[]
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None),\
+                mock.patch('dispatch_replacement_batch.command',return_value=None):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True,
+                             run=lambda command,**kw:commands.append(command) or SimpleNamespace(returncode=0,stdout='',stderr=''))
+        self.assertEqual(len(commands),1)
+        self.assertEqual(result['reason'],'replacement-launch-pending')
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_unlaunched_replacement_that_again_never_started_opens_a_new_pause_family(self):
+        self._unlaunched_owner()
+        first=self.claim()
+        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),
+                      note='dead-producer-binding-failed',launch_outcome='never-launched',launch_claimed='0')
+        with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None),\
+                mock.patch('dispatch_replacement_batch.command',return_value=None):
+            result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True,resume_capacity=True,
+                             run=lambda *a,**k:SimpleNamespace(returncode=0,stdout='',stderr=''))
+        self.assertNotEqual(result.get('reason'),'automatic-replacement-exhausted')
+        second=R.claim(self.jobs,one['attempt_id'])
+        self.assertNotEqual(second['family_id'],first['family_id'])
+        self.assertEqual(second['logical_node']['after_capacity'],one['attempt_id'])
+
+    def test_launched_owner_rows_are_never_unlaunched(self):
+        base={**self.meta,'worker_type':'owner','note':'dead-producer-binding-failed',
+              'launch_outcome':'never-launched','launch_claimed':'0'}
+        self.assertEqual(R.death_kind(['now','done'],base),'unlaunched')
+        for changes in ({'launch_started':'1'},{'pid':'4242'},{'launch_claimed':'1'},
+                        {'worker_type':'stage','dispatch_depth':'2'},{'launch_outcome':''}):
+            with self.subTest(changes=changes):
+                self.assertNotEqual(R.death_kind(['now','done'],{**base,**changes}),'unlaunched')
+        self.assertNotEqual(R.death_kind(['now','open'],base),'unlaunched')
+
+    def test_unlaunched_recovery_text_says_it_never_started(self):
+        self._unlaunched_owner()
+        record=self.claim()
+        text=R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',
+                                     jobs_path=self.jobs,attempt_id=record['replacement_attempt_id']))
+        self.assertIn('never started',text)
+        self.assertNotIn('You replace exact-dead attempt',text)
 
     def test_stage_worker_capacity_death_is_not_a_replacement_source(self):
         self.write({**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity','failure_class':'capacity'})

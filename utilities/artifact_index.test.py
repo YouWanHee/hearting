@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import unittest
@@ -151,6 +152,63 @@ class TestIndex(unittest.TestCase):
         digest2 = m.manifest_digest(doc1_mutated)
         report = ix.check(index, doc1_mutated, idempotency_key=key1, manifest_digest=digest2)
         self.assertIn("manifest-revision-append-out-of-scope", {v.code for v in report.violations})
+
+    def _next_document(self, doc, *, drop_artifact=False):
+        """The same cycle's next document: a new revision of its file (or none), a new event, the old events kept."""
+        nxt = copy.deepcopy(doc)
+        nxt["manifest_revision_id"] = self.alloc.allocate("manifest_revision")
+        art_id = nxt["artifacts"][0]["artifact_id"]
+        if drop_artifact:
+            nxt["artifacts"], nxt["artifact_revisions"] = [], []
+            return nxt
+        nxt["artifact_revisions"][0]["artifact_revision_id"] = self.alloc.allocate("artifact_revision")
+        nxt["artifact_revisions"][0]["content_digest"] = _sha(3)
+        event = copy.deepcopy(nxt["events"][0])
+        event.update(event_id=self.alloc.allocate("event"), stream_id=self.alloc.allocate("stream"), target_id=art_id)
+        nxt["events"].append(event)
+        return nxt
+
+    def test_same_cycle_replacement_is_a_compare_and_swap_on_the_earlier_digest(self):
+        """§45 D-124: the cycle's next document swaps its row; nothing another cycle owns is ever taken."""
+        doc1 = _document(self.root_id, self.alloc)
+        index, digest1, key = self._apply(ix.empty(self.root_id), doc1)
+        doc2 = self._next_document(doc1)
+        digest2 = m.manifest_digest(doc2)
+        plain = ix.check(index, doc2, idempotency_key=key, manifest_digest=digest2)
+        self.assertIn("index-cycle-id-duplicate", {v.code for v in plain.violations})
+        wrong = ix.check(index, doc2, idempotency_key=key, manifest_digest=digest2,
+                         replaces_manifest_digest=_sha(9))
+        self.assertIn("manifest-revision-append-out-of-scope", {v.code for v in wrong.violations})
+        right = ix.check(index, doc2, idempotency_key=key, manifest_digest=digest2,
+                         replaces_manifest_digest=digest1)
+        self.assertTrue(right.ok, right.violations)
+        swapped = ix.apply(index, doc2, cycle_path="p/" + doc2["cycle"]["cycle_id"],
+                           manifest_digest=digest2, idempotency_key=key)
+        self.assertEqual(swapped.manifests[key]["manifest_digest"], digest2)
+        # The earlier document's IDs stay taken: a revision that was replaced is never reusable.
+        self.assertIn(doc1["artifact_revisions"][0]["artifact_revision_id"], swapped.stable_ids)
+        self.assertEqual(set(index.stable_ids) - set(swapped.stable_ids), set())
+        # Another cycle's IDs stay refused in a swap, and a second swap on the old digest is stale.
+        other = _document(self.root_id, self.alloc)
+        other["artifact_revisions"][0]["artifact_revision_id"] = doc1["artifact_revisions"][0]["artifact_revision_id"]
+        refused = ix.check(swapped, other, idempotency_key=other["manifest_id"],
+                           manifest_digest=m.manifest_digest(other),
+                           replaces_manifest_digest=_sha(9))
+        self.assertFalse(refused.ok)
+        stale = ix.check(swapped, doc2, idempotency_key=key, manifest_digest=_sha(8),
+                         replaces_manifest_digest=digest1)
+        self.assertIn("manifest-revision-append-out-of-scope", {v.code for v in stale.violations})
+
+    def test_build_keeps_ids_only_an_earlier_document_declared(self):
+        doc1 = _document(self.root_id, self.alloc)
+        doc2 = self._next_document(doc1, drop_artifact=True)
+        path = "p/" + doc1["cycle"]["cycle_id"]
+        rebuilt = ix.build([(doc2, path, m.manifest_digest(doc2), "key")], preserved={doc1["cycle"]["cycle_id"]: [doc1]})
+        self.assertIn(doc1["artifacts"][0]["artifact_id"], rebuilt.stable_ids)
+        self.assertIn(doc1["artifact_revisions"][0]["artifact_revision_id"], rebuilt.stable_ids)
+        self.assertEqual(rebuilt.manifests["key"]["manifest_digest"], m.manifest_digest(doc2))
+        bare = ix.build([(doc2, path, m.manifest_digest(doc2), "key")])
+        self.assertNotIn(doc1["artifacts"][0]["artifact_id"], bare.stable_ids)
 
     def test_rejects_cycle_id_duplicate(self):
         doc1 = _document(self.root_id, self.alloc)
@@ -394,19 +452,37 @@ class TestIndex(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertIn("index-self-parent-cycle", {v.code for v in report.violations})
 
-    def test_check_rejects_cross_campaign_parent_cycle(self):
+    def test_check_allows_cross_campaign_parent_cycle(self):
+        # §45 D-123: a parent is a reference, not a campaign constraint.
         doc1 = _document(self.root_id, self.alloc)
         index, _digest1, _key1 = self._apply(ix.empty(self.root_id), doc1)
         doc2 = _document(self.root_id, self.alloc)
+        self.assertNotEqual(doc1["campaign"]["campaign_id"], doc2["campaign"]["campaign_id"])
         doc2["cycle"]["parent_cycle_id"] = doc1["cycle"]["cycle_id"]
         digest2 = m.manifest_digest(doc2)
         report = ix.check(
             index, doc2, idempotency_key=doc2["manifest_id"], manifest_digest=digest2
         )
-        self.assertFalse(report.ok)
-        self.assertIn(
-            "index-parent-cycle-campaign-mismatch", {v.code for v in report.violations}
-        )
+        self.assertTrue(report.ok, report.violations)
+
+    def test_check_resolves_a_parent_that_is_only_a_producer_record(self):
+        # A parent still open (or deleted since) is not in the index; the caller
+        # names the cycles it knows from the root's producer records.
+        doc = _document(self.root_id, self.alloc)
+        parent_id = self.alloc.allocate("cycle")
+        doc["cycle"]["parent_cycle_id"] = parent_id
+        digest = m.manifest_digest(doc)
+        empty = ix.empty(self.root_id)
+        refused = ix.check(empty, doc, idempotency_key=doc["manifest_id"], manifest_digest=digest)
+        self.assertIn("index-orphan-parent-cycle", {v.code for v in refused.violations})
+        accepted = ix.check(empty, doc, idempotency_key=doc["manifest_id"], manifest_digest=digest,
+                            known_parent_cycle_ids=frozenset({parent_id}))
+        self.assertTrue(accepted.ok, accepted.violations)
+        rebuilt = ix.build([(doc, "campaigns/c/cyc", digest, doc["manifest_id"])],
+                           known_parent_cycle_ids=frozenset({parent_id}))
+        self.assertIn(doc["cycle"]["cycle_id"], rebuilt.cycles)
+        with self.assertRaises(ValueError):
+            ix.build([(doc, "campaigns/c/cyc", digest, doc["manifest_id"])])
 
     def test_build_refuses_circular_parent_chain(self):
         doc1 = _document(self.root_id, self.alloc)

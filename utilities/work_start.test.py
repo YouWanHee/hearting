@@ -507,6 +507,137 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual((result['state'],result['reason']),('waiting-capacity','owner-capacity-wait'))
         self.assertEqual(result['retry_at'],'2099-01-01T00:00:00Z')
 
+    # -- an owner its launcher closed before spawning: nothing ran, so say "start again later" ----
+    def _never_started_meta(self, aid):
+        return {"attempt_id": aid, "parent_sid": "parent", "worker_type": "owner", "dispatch_depth": "1",
+                "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                "owner_route_hash": self.route["route_hash"], "owner_route_file": str(self.path),
+                "launch_claimed": "0", "launch_outcome": "never-launched",
+                "note": "dead-producer-binding-failed", "failure_class": "contract"}
+
+    def _unstarted_run(self, reason="admission-busy"):
+        """A launcher that registers the owner, then closes it before spawning (exit 73)."""
+        def run(command, **kwargs):
+            self.calls.append(command)
+            meta = self._never_started_meta(command[command.index("--attempt-id") + 1])
+            with self.jobs.open("a") as stream:
+                stream.write("now\tdone\t12\tparent\ttask\t" + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+            return subprocess.CompletedProcess(
+                command, 73, f"check=failed\nreason={reason}\ndetail=admission lock busy\nchild_spawned=0\n", "")
+        return run
+
+    def test_owner_that_did_not_start_says_run_start_later_not_harvest(self):
+        self.route["nodes"] = []
+        result = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "owner-launch-not-started", "resume-later"), result)
+        self.assertEqual(result["launch_reason"], "admission-busy")
+        self.assertEqual(result["owner_attempt_id"], W.attempt_id(self.route, "owner"))
+        self.assertIn("capability-route.py", result["recovery_command"])
+        self.assertIn("start", result["recovery_command"])
+        self.assertNotIn("harvest", result["recovery_command"])
+        self.assertIn("again later", result["next_step"])
+        self.assertEqual(len(self.calls), 1)   # one launch per start, however it ended
+
+    def test_owner_preparation_busy_with_no_row_says_run_start_later(self):
+        """dispatch-owner failed before any row existed: the typed admission-busy error."""
+        self.route["nodes"] = []
+        calls = self.calls
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command, 65, "check=failed\nreason=admission-busy:admission lock held past 120s; "
+                "nothing started; run start again later\nchild_spawned=0\n", "")
+        result = W.start_work(self.route, self.path, self.jobs, run=run)
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "owner-launch-not-admitted", "resume-later"), result)
+        self.assertEqual(result["launch_reason"], "admission-busy")
+        self.assertEqual(result["recovery_command"], result["resume_command"])
+        self.assertIn("capability-route.py", result["recovery_command"])
+        self.assertNotIn("harvest", result["recovery_command"])
+        self.assertIn("Nothing ran", result["next_step"])
+        self.assertIn("again later", result["next_step"])
+        self.assertEqual(len(calls), 1)
+        # no row exists, so the next start launches the same owner again
+        again = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
+        self.assertEqual(again["reason"], "owner-launch-not-started", again)
+        self.assertEqual(len(calls), 2)
+
+    def test_owner_launch_refused_for_another_reason_keeps_needs_inspection(self):
+        self.route["nodes"] = []
+        result = W.start_work(self.route, self.path, self.jobs, run=lambda command, **kwargs:
+                              subprocess.CompletedProcess(command, 65, "check=failed\nreason=x\n", ""))
+        self.assertEqual((result["state"], result["reason"]), ("needs-attention", "owner-launch-not-admitted"))
+        self.assertNotEqual(result.get("required_action"), "resume-later")
+
+    def test_outcome_of_a_never_started_owner_points_at_start(self):
+        aid = W.attempt_id(self.route, "owner")
+        meta = self._never_started_meta(aid)
+        self.jobs.write_text("now\tdone\t12\tparent\ttask\t" + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+        command = W._outcome(self.jobs, aid)["recovery_command"]
+        self.assertIn("capability-route.py", command)
+        self.assertIn(str(self.path), command)
+        self.assertNotIn("harvest", command)
+
+    def test_next_start_relaunches_an_owner_that_never_started(self):
+        """The row shape of the stuck BC route: closed by its launcher, no log, sealed launch input."""
+        import dispatch_replacement as R
+        from dispatch_contract import parse_registry_metadata
+        self.route["nodes"] = []
+        self.route.update(artifact_root=self.tmp.name, cwd=self.tmp.name, capability="autopilot-code")
+        self.path.write_text(json.dumps(self.route))
+        aid = W.attempt_id(self.route, "owner")
+        args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=self.tmp.name,
+                               route_id=self.route["route_id"], route_node="",
+                               replacement_input_argv=["--start", "--attempt-id", aid, "--prompt-text", "the raw task"])
+        meta = {**self._never_started_meta(aid), "attempt_schema_version": "2", "transport": "headless",
+                "execution_surface": "registered-headless", "registered_worker": "1",
+                "fallback_hop": "same-harness-headless", "harness": "codex",
+                "log_file": str(Path(self.tmp.name) / "never-written.jsonl")}
+        meta.update(parse_registry_metadata(R.seal_launch_input(args, "codex", "the raw task")))
+        self.jobs.write_text("now\tdone\t" + self.tmp.name + "\t" + self.tmp.name + "\ttask\t"
+                             + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+        launched = []
+
+        def run(command, **kwargs):
+            launched.append(command)
+            replacement = command[command.index("--attempt-id") + 1]
+            record = R.claim(self.jobs, aid)   # the one claim `advance` already made, replayed
+            source = R._rows(self.jobs.read_text().splitlines())[aid][1]
+            replay = R.launch_input(self.jobs, aid, source)
+            sealed = SimpleNamespace(**vars(args))
+            sealed.attempt_id = replacement
+            sealed.replacement_input_argv = R._replacement_argv(record, source, replay)
+            row = {k: v for k, v in meta.items()
+                   if k not in ("note", "failure_class", "launch_outcome", "replacement_input_digest")}
+            row.update(attempt_id=replacement, automatic_retry_of=aid, launch_claimed="1", launch_started="1",
+                       replacement_family_id=record["family_id"], replacement_original_attempt_id=aid,
+                       replacement_ordinal="1", replacement_claim_digest=R._digest(record))
+            row.update(parse_registry_metadata(R.seal_launch_input(sealed, "codex", "the raw task")))
+            with self.jobs.open("a") as stream:
+                stream.write("now\topen\t" + self.tmp.name + "\t" + self.tmp.name + "\ttask\t"
+                             + ",".join(k + "=" + v for k, v in row.items()) + "\n")
+            return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
+
+        with mock.patch("dispatch_replacement._authorized"), \
+             mock.patch("dispatch_replacement._reuse_snapshot", return_value={
+                 "completed": [], "cycle_id": "cyc-test", "producer_id": "prod-test", "gate_releases": []}), \
+             mock.patch("dispatch_replacement._logical_key",
+                        side_effect=lambda r, m: {"root_route_id": "rt-root", "node": "__owner__"}), \
+             mock.patch("dispatch_replacement._route", return_value=(self.path, self.route)), \
+             mock.patch("dispatch_replacement._runtime_drift"), \
+             mock.patch("dispatch_replacement._terminal_absent", side_effect=AssertionError("no log to read")), \
+             mock.patch("dispatch_contract.attempt_process_quiescence",
+                        return_value=SimpleNamespace(state="quiescent", reason="process-absent")), \
+             mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None), \
+             mock.patch("dispatch_replacement_batch.command", return_value=None):
+            result = W.start_work(self.route, self.path, self.jobs, run=run)
+        self.assertEqual(len(launched), 1, result)
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual(self.calls, [])   # the fresh-owner launcher was not used: a replacement was
+        self.assertEqual([edge["original_attempt_id"] for edge in result["replacement_lineage"]], [aid])
+
     def _parked_owner_row(self):
         self.start();self.ready=self.released=True;self.start()
         owner=W.attempt_id(self.route,'owner')
@@ -534,6 +665,27 @@ class WorkStartTest(unittest.TestCase):
         self.assertNotIn('parent_next',result)
         self.assertIn('resume_command',result)
         self.assertEqual(len(self.calls),3)
+
+    def test_a_parked_receipt_points_at_the_owners_own_report_when_it_has_one(self):
+        import base64
+        self._parked_owner_row()
+        report=self.path.parent/'owner-report.md'
+        report.write_text('what the owner says it changed\n')
+        encoded=base64.urlsafe_b64encode(str(report).encode()).decode().rstrip('=')
+        readable={'state':'valid','verdict':'PASS','artifact_state':'readable','artifact_path_b64':encoded}
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('blocked')), \
+             mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',return_value=readable):
+            result=self.start()
+        self.assertEqual(result['state'],'waiting-human-gate')
+        self.assertEqual(result['owner_report'],str(report))
+        self.assertIn('owner_report',result['next_step'])
+        unreadable={'state':'invalid','verdict':'-','artifact_state':'missing','artifact_path_b64':''}
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=self._parked('blocked')), \
+             mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',return_value=unreadable):
+            result=self.start()
+        self.assertEqual(result['state'],'waiting-human-gate')
+        self.assertNotIn('owner_report',result)
+        self.assertNotIn('owner_report',result['next_step'])
 
     def test_stopped_gate_reports_without_replacement(self):
         self._parked_owner_row()
@@ -1069,6 +1221,69 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             self.step(interview=self.question_file, answers=answer)
         self.assertEqual(self.calls, [])
         self.assertEqual(self.resolution()["status"], "not-raised")
+
+    def scope_question(self):
+        question = {**self.question, "questions": [{
+            "id": "q-scope", "topic": "How much to change",
+            "question": "Fix only the approval step, or the questions too?", "kind": "choice",
+            "options": [{"label": "Both (recommended)", "means": "Fix both."},
+                        {"label": "Approval only", "means": "Leave the questions."}],
+            "recommended": 0, "why": "Only you can weigh the wording against the schedule."}]}
+        self.question_file.write_text(json.dumps(question))
+        return question
+
+    def answers_for_scope(self):
+        path = self.base / "scope-answers.json"
+        path.write_text(json.dumps({"understanding_confirmed": True, "correction": "",
+                                    "answers": {"q-scope": {"choice": 0, "note": ""}},
+                                    "schema": "frame_interview_answers_v1", "route_id": self.route["route_id"], "round": 1}))
+        return path
+
+    def test_answers_without_the_envelope_release_the_registered_interview(self):
+        """REPORT3 §3-5: the runtime stamps schema/route_id/round on the interview; the
+        answers carry only what the person said, and the receipt says that shape."""
+        self.scope_question()
+        needs = self.step()
+        self.assertEqual(needs["state"], "needs-interview")
+        self.assertIn('"understanding_confirmed"', needs["next_step"])
+        self.assertIn('"choice"', needs["next_step"])
+        bare = self.base / "bare.json"
+        bare.write_text(json.dumps({"understanding_confirmed": True, "answers": {"q-scope": {"choice": 1}}}))
+        result = self.step(interview=self.question_file, answers=bare)
+        self.assertEqual(result["state"], "released")
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertEqual(self.resolution()["answers"]["answers"]["q-scope"]["choice"], 1)
+        self.assertIn("**Approval only** (user's own choice)", Path(result["intent_file"]).read_text())
+        self.assertEqual(self.step(answers=bare)["state"], "released")        # a lost reply replays
+        self.assertEqual(self.calls, ["gate", "release"])
+
+    def test_a_wrong_envelope_is_still_refused_and_says_what_to_put(self):
+        self.scope_question()
+        answer = self.base / "wrong.json"
+        for key, wrong in (("schema", "other/v1"), ("route_id", "rt-foreign"), ("round", 2)):
+            with self.subTest(key=key):
+                answer.write_text(json.dumps({key: wrong, "understanding_confirmed": True,
+                                              "answers": {"q-scope": {"choice": 0}}}))
+                with self.assertRaisesRegex(ValueError, "frame-input-invalid: " + key + ":") as caught:
+                    self.step(interview=self.question_file, answers=answer)
+                self.assertIn('"understanding_confirmed"' if key == "schema" else "omit " + key, str(caught.exception))
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.resolution()["status"], "not-raised")
+
+    def test_a_round_two_answer_without_the_envelope_is_that_rounds(self):
+        self.scope_question()
+        first = self.step(interview=self.question_file, answers=self.answers_for_scope(), decision="revise")
+        question = first["interview_template"]
+        question["understanding"] = "Run the two commands and keep both outputs in the report."
+        self.question_file.write_text(json.dumps(question))
+        self.assertEqual(self.step(interview=self.question_file)["state"], "needs-question")
+        answer = self.base / "round-two.json"
+        answer.write_text(json.dumps({"round": 1, "understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
+        with self.assertRaisesRegex(ValueError, "frame-input-invalid: round:"):
+            self.step(answers=answer)
+        answer.write_text(json.dumps({"understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
+        self.assertEqual(self.step(answers=answer)["state"], "released")
+        self.assertEqual(self.calls, ["gate", "release", "gate", "release"])
 
     def test_stop_does_not_render_an_agreed_intent_or_start_anything(self):
         result = self.step(interview=self.question_file,answers=self.answers(),decision="stop")

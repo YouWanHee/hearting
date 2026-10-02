@@ -560,7 +560,7 @@ _GLYPH_KEY = {"working": "g_work", "idle": "g_work_off", "unused": "g_unused",
               "blocked": "g_blocked", "done": "green",   # F-60: red, on its own key
               "stale": "g_stale", "dead": "g_dead", "degraded": "lvl_y", "queued": "dim", "unknown": "dim"}
 _INTERACTION_LABEL = {
-    "decision": "decision",
+    "decision": "question",
     "approval": "approval",
     # Claude calls the runtime event a permission prompt while Codex calls the equivalent
     # user gate an approval request. Fleet keeps that producer evidence intact, but presents

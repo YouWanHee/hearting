@@ -1150,6 +1150,82 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(independence, "persona")
         self.assertNotIn("claude", {row[1] for row in rows})
 
+    def _pinned_balanced_route(self, pin=None, target="worker"):
+        route = json.loads(json.dumps(self.route))
+        route["dispatch_allocation"] = {
+            "strategy": "balanced", "window": 30, "usage_gate_used_percent": 90,
+            "harness_order": ["claude", "codex", "opencode"],
+        }
+        for node in route["nodes"]:
+            node["harness_affinity"] = "diverse"
+            node["harness_policy"] = {
+                "primary": ["claude", "codex"], "relief": ["opencode"],
+                "last_resort": [], "promote_relief_below": 0,
+            }
+            node["fallback_hops"][1]["candidates"].append(
+                {"child_harness": "opencode", "status": "supported"}
+            )
+        if pin:
+            route["selection_pins"] = {"contract_version": 1, target: {"harness": pin, "model": None, "effort": None}}
+        return route
+
+    def _assign_gated(self, route, limits=None):
+        with mock.patch.object(
+            BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
+        ), mock.patch.object(BATCH.CAPACITY, "capacity_scores", return_value={
+            "claude": 5.0, "codex": 60.0, "opencode": 80.0,
+        }), mock.patch("dispatch_capacity_evidence.active_limits", return_value=limits or {}):
+            return BATCH.assign_harnesses(route, route["nodes"], allow_degraded=False, jobs=self.jobs)
+
+    def test_a_sealed_worker_pin_is_placed_even_when_the_usage_gate_would_skip_it(self):
+        # claude has 5% headroom (gated, not at a limit). With `--pin worker=claude` it still takes
+        # every leg; without the pin, or with a pin for another target, today's placement avoids it.
+        rows, _independence, _diagnostics = self._assign_gated(self._pinned_balanced_route(pin="claude"))
+        self.assertEqual({row[1] for row in rows}, {"claude"})
+        for route in (self._pinned_balanced_route(), self._pinned_balanced_route(pin="claude", target="owner")):
+            with self.subTest(pins=route.get("selection_pins")):
+                rows, _independence, _diagnostics = self._assign_gated(route)
+                self.assertNotIn("claude", {row[1] for row in rows})
+
+    def test_a_sealed_worker_pin_at_its_limit_or_without_evidence_keeps_todays_placement(self):
+        route = self._pinned_balanced_route(pin="claude")
+        rows, _independence, diagnostics = self._assign_gated(
+            route, limits={"claude": {"reset_epoch": 9999999999}})
+        self.assertNotIn("claude", {row[1] for row in rows})
+        self.assertEqual(diagnostics["family_exclusions"]["claude"], ["quota-until-9999999999"])
+        unsupported = self._pinned_balanced_route(pin="claude")
+        for node in unsupported["nodes"]:
+            for hop in node["fallback_hops"]:
+                for row in hop["candidates"]:
+                    if row["child_harness"] == "claude":
+                        row["status"] = "unsupported"
+        rows, _independence, _diagnostics = self._assign_gated(unsupported)
+        self.assertNotIn("claude", {row[1] for row in rows})
+
+    def test_peer_legs_pinned_to_a_non_peer_family_are_a_degraded_sole_gate_not_a_refusal(self):
+        everything = ["claude", "codex", "opencode"]
+        nodes = self._quality_peer_nodes(peer_families=everything, aux_families=everything)
+        route = {
+            "route_id": "rt-fixture", "route_hash": "sha256:fixture",
+            "owner_harness_policy": {
+                "primary": ["claude", "codex"], "relief": ["opencode"],
+                "last_resort": [], "promote_relief_below": 0,
+            },
+        }
+        with mock.patch.object(BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect):
+            _rows, _independence, unpinned = BATCH.assign_harnesses(route, nodes, allow_degraded=False)
+            self.assertEqual(unpinned["sole_gate"], "ok")
+            route["selection_pins"] = {"contract_version": 1,
+                                       "worker": {"harness": "opencode", "model": None, "effort": None}}
+            rows, _independence, diagnostics = BATCH.assign_harnesses(route, nodes, allow_degraded=False)
+            self.assertEqual({row[1] for row in rows}, {"opencode"})
+            self.assertEqual(diagnostics["sole_gate"], "degraded")
+            # a pin on a quality-peer family is an ordinary, healthy gate
+            route["selection_pins"]["worker"]["harness"] = "codex"
+            rows, _independence, diagnostics = BATCH.assign_harnesses(route, nodes, allow_degraded=False)
+            self.assertEqual({row[1] for row in rows}, {"codex"})
+            self.assertEqual(diagnostics["sole_gate"], "ok")
+
     def test_balanced_batch_unknown_usage_is_not_gated_across_bands(self):
         route = json.loads(json.dumps(self.route))
         route["dispatch_allocation"] = {

@@ -39,6 +39,33 @@ class CodexPendingTest(unittest.TestCase):
     def output(self, call_id="c1"):
         return record({"type": "function_call_output", "call_id": call_id})
 
+    def async_call(self, call_id="async", count=1, **extra):
+        return record({"type": "function_call", "name": "request_user_input_async",
+                       "call_id": call_id, "arguments": json.dumps({
+                           "questions": [{"title": "PRIVATE QUESTION"}] * count,
+                       }), **extra})
+
+    def accepted(self, call_id="async", value=True):
+        return record({"type": "function_call_output", "call_id": call_id,
+                       "output": json.dumps({"accepted": value})})
+
+    def reply(self, call_id="async", index=0, answer="PRIVATE ANSWER", role="user"):
+        body = json.dumps([{"question": "PRIVATE QUESTION", "answer": answer,
+                            "questionItemId": json.dumps([
+                                "request_user_input_async", call_id, index])}])
+        return record({"type": "message", "role": role, "content": [{
+            "type": "input_text", "text": "<send_user_message_question_reply>\n" + body
+            + "\n</send_user_message_question_reply>",
+        }]})
+
+    def event(self, kind, turn="turn"):
+        return {"type": "event_msg", "payload": {"type": kind, "turn_id": turn}}
+
+    def append(self, *rows):
+        with open(self.path, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
     def append(self, *rows):
         with open(self.path, "a", encoding="utf-8") as handle:
             for row in rows:
@@ -76,6 +103,86 @@ class CodexPendingTest(unittest.TestCase):
 
     def test_absent_file_is_silent(self):
         self.assertIsNone(codex._tail_pending_request_user_input(self.path + ".missing"))
+
+    def test_live_async_acceptance_is_not_an_answer_and_exact_reply_clears(self):
+        # Observed 2026-10-01: the tool returns accepted:true immediately, while
+        # the reply arrives later as a user message with a JSON questionItemId.
+        self.write(self.event("task_started"), self.async_call(), self.accepted())
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+        self.append(self.event("task_complete"), self.event("task_started", "next"),
+                    self.call("exec", name="exec_command"), self.output("exec"))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+        self.append(self.reply())
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_partial_and_duplicate_replies_do_not_close_other_questions(self):
+        self.write(self.async_call(count=2), self.accepted(), self.reply(index=0))
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        self.append(self.reply(index=0), self.reply(call_id="foreign"), self.reply(index=9))
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        self.append(self.reply(index=1))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_empty_reply_resolves_display_without_implying_a_user_decision(self):
+        self.write(self.async_call(), self.accepted(), self.reply(answer=""))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_async_failure_clears_only_the_exact_call(self):
+        self.write(self.async_call("old"), self.accepted("old"),
+                   self.async_call("new"), self.accepted("new", value=False))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "old")
+        self.append(self.output("old"))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_only_originating_turn_interruption_clears_async_wait(self):
+        self.write(self.event("task_started"), self.async_call(), self.accepted(),
+                   self.event("turn_aborted", "foreign"))
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        self.append(self.event("turn_aborted"))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_turn_identity_from_native_metadata_beats_latest_lifecycle(self):
+        self.write(self.event("task_started", "unrelated"), self.async_call(
+            internal_chat_message_metadata_passthrough={"turn_id": "origin"}),
+            self.accepted(), self.event("turn_aborted", "unrelated"))
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        self.append(self.event("turn_aborted", "origin"))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_assistant_quotes_and_malformed_reply_envelopes_are_not_answers(self):
+        self.write(self.async_call(), self.accepted(), self.reply(role="assistant"))
+        malformed = self.reply()
+        malformed["payload"]["content"][0]["text"] = "<send_user_message_question_reply>oops</send_user_message_question_reply>"
+        self.append(malformed, record({"type": "message", "role": "user",
+                                      "content": [{"type": "input_text", "text": "yes"}]}))
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_cursor_keeps_no_question_or_answer_content(self):
+        self.write(self.async_call(count=2), self.accepted(), self.reply(index=0))
+        codex._tail_pending_request_user_input(self.path)
+        pending = codex._LIFECYCLE_CACHE[os.path.realpath(self.path)].pending_calls
+        self.assertNotIn("PRIVATE", repr(pending))
+        self.assertEqual(pending["async"].questions, frozenset({1}))
+
+    def test_namespaced_calls_and_malformed_async_requests(self):
+        self.write(self.async_call(name="functions.request_user_input_async"), self.accepted())
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        self.write(record({"type": "function_call", "name": "request_user_input_async",
+                           "call_id": "broken", "arguments": "{broken"}),
+                   record({"type": "function_call", "name": ["request_user_input_async"],
+                           "call_id": "invalid-name"}))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_partial_append_resolves_only_after_complete_reply(self):
+        self.write(self.async_call(), self.accepted())
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        reply = json.dumps(self.reply()) + "\n"
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(reply[:len(reply) // 2])
+        self.assertIsNotNone(codex._tail_pending_request_user_input(self.path))
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(reply[len(reply) // 2:])
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
 
     def test_question_outside_tail_survives_unrelated_activity_without_rescan(self):
         self.write(self.event("task_started"), self.call(),
