@@ -54,7 +54,7 @@ An adapter that supports role delegation must document:
 
 - how a role is invoked;
 - what tools are available to that role;
-- how mode personas under `roles/modes/` are loaded or approximated;
+- how unit personas under `roles/units/` are loaded or approximated;
 - how portable behavior roles and route-sealed execution profiles map independently to concrete model/effort or variant settings through the single adapter config source (`adapters/<adapter>/config/models.conf`), including reduced-granularity reporting and the substantive-`mini` deny;
 - where role output is written when a skill requires durable review logs;
 - what happens when a role is unavailable.

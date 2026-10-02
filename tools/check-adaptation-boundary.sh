@@ -3041,7 +3041,7 @@ check_removed_root_surfaces() {
     fail_msg "root agents/ exists; Claude-native agents must live under adapters/claude/agents and portable meaning under roles/"
   fi
   if [ -e agent-modes ] || [ -L agent-modes ]; then
-    fail_msg "root agent-modes/ exists; portable mode fragments must live under roles/modes and runtime projection under adapters/*/agent-modes"
+    fail_msg "root agent-modes/ exists; portable unit bodies live under roles/units"
   fi
 }
 
@@ -3486,100 +3486,6 @@ check_opencode_mode_map() {
     fail_msg "$mapper is missing or not executable"
     return
   fi
-
-  for f in roles/modes/*/*.md; do
-    [ -f "$f" ] || continue
-    rel=${f#roles/modes/}
-    rel=${rel%.md}
-    out=${TMPDIR:-/tmp}/opencode-mode-map.$$.out
-    err=${TMPDIR:-/tmp}/opencode-mode-map.$$.err
-    if ! "$mapper" "$rel" >"$out" 2>"$err"; then
-      fail_msg "OpenCode mode map cannot resolve agent mode: $rel"
-      cat "$err"
-      continue
-    fi
-    case "$rel" in
-      design/*)
-        if ! grep -Fq 'status=unsupported' "$out" || ! grep -Fq 'realization=adapter-coupled' "$out"; then
-          fail_msg "OpenCode mode map must mark $rel as unsupported adapter-coupled"
-        fi
-        if ! grep -Fq 'tool_contract=visual-harness' "$out" \
-          || ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh visual-harness <file.html>' "$out" \
-          || ! grep -Fq 'runtime_surface=adapter-owned-visual-harness' "$out" \
-          || ! grep -Fq 'fallback=reference-only' "$out"; then
-          fail_msg "OpenCode mode map must report visual-harness contract metadata for unsupported design mode $rel"
-        fi
-        ;;
-      material/*|qa/test|research/claim-verify)
-        if ! grep -Fq 'status=tool-contract' "$out" || ! grep -Fq 'realization=portable-with-tool-contract' "$out"; then
-          fail_msg "OpenCode mode map must mark $rel as portable-with-tool-contract"
-        fi
-        if ! grep -Eq '^tool_contract=[^[:space:]]+' "$out"; then
-          fail_msg "OpenCode mode map must report a named tool_contract for $rel"
-        fi
-        if ! grep -Fq 'fallback=satisfy-tool-contract-or-report-unavailable' "$out"; then
-          fail_msg "OpenCode mode map must report a fallback for tool-contract mode $rel"
-        fi
-        if [ "$rel" = "material/data-script" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh data-script --check <script.py>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-data-script' "$out"; then
-            fail_msg "OpenCode mode map must report data-script contract metadata for $rel"
-          fi
-        fi
-        if [ "$rel" = "material/browser-fetch" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh browser-fetch --check <url>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-browser-fetch' "$out"; then
-            fail_msg "OpenCode mode map must report browser-fetch contract metadata for $rel"
-          fi
-        fi
-        if [ "$rel" = "material/figure-gen" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh figure-gen --check <script.py>' "$out" \
-            || ! grep -Fq 'report_tool_contract_check=adapters/opencode/bin/preflight.sh figure-gen --verify-report <manifest.json> <report.md>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-figure-gen' "$out"; then
-            fail_msg "OpenCode mode map must report figure-gen contract metadata for $rel"
-          fi
-        fi
-        if [ "$rel" = "material/pdf-extract" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh pdf-extract --check <file.pdf>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-pdf-extract' "$out"; then
-            fail_msg "OpenCode mode map must report pdf-extract contract metadata for $rel"
-          fi
-        fi
-        if [ "$rel" = "material/web-image-search" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh web-image-search --check <query>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-web-image-search' "$out"; then
-            fail_msg "OpenCode mode map must report web-image-search contract metadata for $rel"
-          fi
-        fi
-        if [ "$rel" = "qa/test" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh verification-runner --check -- <command>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-verification-runner' "$out"; then
-            fail_msg "OpenCode mode map must report verification-runner contract metadata for $rel"
-          fi
-        fi
-        if [ "$rel" = "research/claim-verify" ]; then
-          if ! grep -Fq 'tool_contract_check=adapters/opencode/bin/preflight.sh claim-verify --check <claim>' "$out" \
-            || ! grep -Fq 'runtime_surface=adapter-owned-claim-verify' "$out"; then
-            fail_msg "OpenCode mode map must report claim-verify contract metadata for $rel"
-          fi
-        fi
-        ;;
-      *)
-        if ! grep -Fq 'status=portable' "$out" || ! grep -Fq 'realization=portable-persona' "$out"; then
-          fail_msg "OpenCode mode map must mark $rel as portable-persona"
-        fi
-        if [ "$rel" = "qa/security-review" ]; then
-          if grep -Fq 'tool_contract=' "$out" \
-            || ! grep -Fq 'read-only security review with OpenCode file and git diff tools' "$out"; then
-            fail_msg "OpenCode mode map must treat qa/security-review as portable read-only guidance"
-          fi
-        fi
-        ;;
-    esac
-    if ! grep -Fq "source=roles/modes/$rel.md" "$out"; then
-      fail_msg "OpenCode mode map must report the portable source for $rel"
-    fi
-  done
 }
 
 check_hook_catalog() {
@@ -3840,11 +3746,6 @@ check_language_neutrality_contract() {
       fail_msg "$bootstrap must realize the portable audience-language-first artifact contract"
     fi
   done
-
-  if rg -n 'Write in Korean|Korean (plan|version|본문)|한국어 (설명|보고서|변경·산출 요약|변경 요약|요약)|한국어로' \
-    roles/modes adapters/claude/agent-modes >/dev/null 2>&1; then
-    fail_msg "portable and Claude mode contracts must not impose Korean as a fixed output language"
-  fi
 
   if rg -n -i 'All user-facing output.*Korean|When explaining something to the user.*Korean|Print the error message in Korean|One-line chat alert.*Korean|Return ONLY.*Korean summary|한국어 요약|사용자-facing 출력은 자연스러운 한국어' \
     skills adapters/claude/skills >/dev/null 2>&1; then

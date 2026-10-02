@@ -8,7 +8,6 @@ This adapter maps the common agent harness onto Claude Code.
 |---|---|
 | Session bootstrap | `adapters/claude/CLAUDE.md` |
 | Runtime settings | `adapters/claude/settings.json` |
-| Slash commands | `adapters/claude/commands/` |
 | Runtime worker wrappers | `adapters/claude/bin/` |
 | Dispatch registry metadata | `adapters/claude/bin/dispatch-headless.py` records route/depth ownership plus SD-49 `attempt_id`, exact `parent_attempt_id`, PID/start/PGID identity, launch authority, fallback ordinal, checked nested tuple evidence, and the exact summary-owner identity in the inherited canonical global registry. The owner is attached before worker fence release and continues producing early/debounced/final sidecars with Fleet closed. |
 | Capabilities | `adapters/claude/skills/*/SKILL.md` |
@@ -63,7 +62,6 @@ $HOME/.claude/README.md      -> $HOME/hearting/claude_setting/README.md
 $HOME/.claude/core           -> $HOME/hearting/claude_setting/core
 $HOME/.claude/skills         -> $HOME/hearting/claude_setting/skills
 $HOME/.claude/agents         -> $HOME/hearting/claude_setting/agents
-$HOME/.claude/agent-modes    -> $HOME/hearting/claude_setting/agent-modes
 $HOME/.claude/hooks          -> $HOME/hearting/claude_setting/hooks
 $HOME/.claude/utilities      -> $HOME/hearting/claude_setting/utilities
 $HOME/.claude/tools          -> $HOME/hearting/claude_setting/tools
@@ -127,7 +125,7 @@ user copy naming `opus` today would deny `deep` and `general-purpose`. The same
 mismatch appears for one release cycle whenever the two files are changed and the
 new release is not yet installed.
 
-Two `CONVENTIONS §1.1` properties are intensity-independent and this adapter honors them: every review the `품질관리팀` runs carries the refute-by-default adversarial stance (anchored in `CONVENTIONS §1.1` / `roles/MODES.md`; `agent-modes/qa/_review_rules.md` is the single source for the code-review, plan-review, and test modes that load it), and every declared independent group records its realized independence. Registry-v6 groups launch 2–4 blind dispatch-depth-2 siblings atomically, use at least two harness families when `cross-harness` is required, and add asymmetric model profiles and perspectives to reduce correlated error. The hostile `external adversary` pass stays reserved for `adversarial`. If an explicitly requested cross-harness axis cannot be realized, fail loudly; an auto-selected group may use typed same-family degradation while preserving and reporting profile/perspective diversity.
+Two `CONVENTIONS §1.1` properties are intensity-independent and this adapter honors them: every review or verification unit carries the refute-by-default adversarial stance (anchored in `CONVENTIONS §1.1` / `roles/MODES.md`; `roles/units/_shared/stance.md` is the single source those units load), and every declared independent group records its realized independence. Registry-v6 groups launch 2–4 blind dispatch-depth-2 siblings atomically, use at least two harness families when `cross-harness` is required, and add asymmetric model profiles and perspectives to reduce correlated error. The hostile `external adversary` pass stays reserved for `adversarial`. If an explicitly requested cross-harness axis cannot be realized, fail loudly; an auto-selected group may use typed same-family degradation while preserving and reporting profile/perspective diversity.
 
 ## Compatibility
 

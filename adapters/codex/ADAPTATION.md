@@ -81,7 +81,7 @@ invariant.
 | Preflight wrappers | `adapters/codex/bin/` | `codex_setting/bin` |
 | Skills | `adapters/codex/skills/<name>/SKILL.md` generated from `capabilities/` | `codex_setting/codex-skills` |
 | Custom agents | `adapters/codex/agents/<role>.toml` generated from `roles/README.md` | `codex_setting/codex-agents` |
-| Mode guides | `adapters/codex/modes/*/*.md` generated from `roles/modes/` with Codex mode-info contracts | `codex_setting/codex-modes` |
+| Mode guides | `adapters/codex/modes/*/*.md` generated from `roles/units/` with Codex mode-info contracts | `codex_setting/codex-modes` |
 | Plugin marketplace | `adapters/codex/plugin-marketplace/.agents/plugins/marketplace.json` plus `adapters/codex/plugin-marketplace/plugins/hearting-codex` | `codex_setting/codex-plugin-marketplace` |
 | Hook bridge | `adapters/codex/hooks/hooks.json`, `adapters/codex/hooks/run-hook.sh`, `adapters/codex/hooks/sessionstart-lifecycle.py`, `adapters/codex/hooks/sessionend-lifecycle.py`, `adapters/codex/hooks/stop-lifecycle.py`, `adapters/codex/hooks/userprompt-lifecycle.py`, `adapters/codex/hooks/permissionrequest-lifecycle.py`, `adapters/codex/hooks/posttooluse-interaction-clear.py`, `adapters/codex/hooks/posttooluse-read-marker.py`, `adapters/codex/hooks/posttooluse-design-check.py` | `codex_setting/codex-hooks` |
 | Permission/sandbox contract | `adapters/codex/bin/preflight.sh permissions` | `codex_setting/bin/preflight.sh permissions` |
@@ -168,18 +168,18 @@ cannot run. All generated mode guides embed sanitized projected portable mode
 contracts so Codex sees the actual procedure while non-Codex runtime surfaces
 are rewritten to Codex preflight/tool-contract wording.
 
-`roles/modes/material/browser-fetch.md` has a Codex-owned executable
+`roles/units/material/browser-fetch.md` has a Codex-owned executable
 tool-contract surface:
 `adapters/codex/bin/preflight.sh browser-fetch --check <url>` verifies rendered
 browser access through `adapters/codex/tools/material/` and reports exit 69
 when the local Playwright browser stack is unavailable.
 
-`roles/modes/material/data-script.md` is the first material mode with a
+`roles/units/material/data-script.md` is the first material mode with a
 Codex-owned executable tool-contract surface:
 `adapters/codex/bin/preflight.sh data-script --check <script.py>` verifies
 generated Python analysis scripts through `adapters/codex/tools/material/`.
 
-`roles/modes/material/figure-gen.md` has a Codex-owned executable tool-contract
+`roles/units/material/figure-gen.md` has a Codex-owned executable tool-contract
 surface:
 `adapters/codex/bin/preflight.sh figure-gen --check <script.py>` verifies
 generated matplotlib/seaborn figure scripts through
@@ -187,30 +187,30 @@ generated matplotlib/seaborn figure scripts through
 `figure-gen --verify-report <manifest.json> <report.md>` and fail closed on
 metadata, scale, claim-evidence, or hash-bound visual-review drift.
 
-`roles/modes/material/pdf-extract.md` has a Codex-owned executable
+`roles/units/material/pdf-extract.md` has a Codex-owned executable
 tool-contract surface:
 `adapters/codex/bin/preflight.sh pdf-extract --check <file.pdf>` verifies
 local PDF text extraction through `adapters/codex/tools/material/` and reports
 exit 69 when the local extractor is unavailable.
 
-`roles/modes/material/web-image-search.md` has a Codex-owned executable
+`roles/units/material/web-image-search.md` has a Codex-owned executable
 tool-contract surface:
 `adapters/codex/bin/preflight.sh web-image-search --check <query>` verifies a
 configured image-search provider command through `adapters/codex/tools/material/`
 and reports exit 69 when no provider is configured.
 
-`roles/modes/qa/security-review.md` is portable read-only mode guidance for
+`roles/units/qa/security-review.md` is portable read-only mode guidance for
 Codex. It is consumed with Codex file and git diff tools and does not project
 or invoke Claude's `/security-review` slash command.
 
-`roles/modes/research/claim-verify.md` has a Codex-owned executable
+`roles/units/research/claim-verify.md` has a Codex-owned executable
 tool-contract surface:
 `adapters/codex/bin/preflight.sh claim-verify --check <claim>` verifies a
 configured external verification provider command through
 `adapters/codex/tools/research/` and reports exit 69 when no provider is
 configured.
 
-`roles/modes/qa/test.md` has a Codex-owned executable tool-contract surface:
+`roles/units/qa/test.md` has a Codex-owned executable tool-contract surface:
 `adapters/codex/bin/preflight.sh verification-runner --check -- <command>`
 checks explicit verification commands and the same wrapper can execute them
 with a bounded timeout. `capability-info code-test` exposes the same
@@ -315,7 +315,7 @@ Codex must not consume these Claude-native files as native configuration:
 | `adapters/claude/statusline.sh` | Not consumable; input schema is Claude statusline JSON |
 | `adapters/claude/CLAUDE.md` | Reference only; not bootstrap |
 | `adapters/claude/agents/*.md` | Reference only; Codex custom agents are generated from `roles/README.md` |
-| `roles/modes/*/*` | Portable source fragments; Codex consumes generated `adapters/codex/modes/*/*.md` guides plus `mode-info` metadata |
+| `roles/units/*/*` | Portable source fragments; Codex consumes generated `adapters/codex/modes/*/*.md` guides plus `mode-info` metadata |
 
 ## Status Surface Boundary
 
