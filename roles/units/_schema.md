@@ -3,8 +3,7 @@
 > A **unit** is the single declaration of one dispatchable behavior atom — the SoT that
 > replaces both the `roles/modes/*` / `adapters/*/agent-modes/*` persona double-copy and
 > the runtime team agents. Units are dispatched as dispatch-depth-2 nodes; they are never native
-> team subagents. `family:` is a grouping label only. Spec:
-> `.agent_reports/plans/2026-07-21_bootstrap-unit-architecture/architecture-spec-v3.md`.
+> team subagents. `family:` is a grouping label only.
 
 ## File layout
 

@@ -28,7 +28,7 @@ rebuttals, reviews, blogs, and memos). The mode is form-first; the natural
 language task describes purpose/genre without a subtype enum. Discover inputs
 from `<artifact-root>/{analysis_project,research}/*`; preprocess external
 materials with `/analyze-project --mode {paper|doc}`. Load matching format specs
-from `analysis_project/doc/{matching}/formats/` without a `--format-ref` flag.
+from `analysis_project/doc/{matching}/formats/` automatically.
 Mode conventions live under `## Mode-Specific Conventions` (common plus paper,
 presentation, or doc). Presentation mode produces Markdown only; PPTX export is
 unsupported, so use PowerPoint directly.
