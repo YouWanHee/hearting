@@ -1210,5 +1210,104 @@ class SubsessionChainSealTest(unittest.TestCase):
             SUBSESSION.chain_manifest_pointer_path(Path("/x/jobs.log"), "ssc-a"),
         )
 
+
+class SubsessionWorktreeLaunchTest(unittest.TestCase):
+    """A slice launches in the worktree its sealed manifest names; the route is
+    still verified at the route cwd, and every other worker keeps the route cwd."""
+
+    LINKED = "/tmp/fixture-linked-worktree"
+
+    def _launch(self, *, action="start", subsession=True, sealed_worktree=LINKED,
+                declared_worktree=LINKED, adapter_args=()):
+        node = dict(make_node(depth=1, dispatch_fallback=[]), id="plan-check",
+                    kind="review-worker", unit="qa/code-review",
+                    completion_gate="code-plan-check")
+        route = make_route(node, tuples=[])
+        route["effective_intensity"] = "direct"
+        printed, calls = [], []
+        code = None
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / ".dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("")
+            pointer = jobs.parent / "session_chains" / "ssc-fixture.json"
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_text(json.dumps({
+                "chain_id": "ssc-fixture", "mode": "parallel", "worktree": sealed_worktree,
+                "sessions": [{"subsession_id": "ss-fixture", "index": 1, "attempt_id": "att-sub-1"}],
+            }), encoding="utf-8")
+            route_path = Path(td) / "route.json"
+            route_path.write_text(json.dumps(route))
+            argv = ["dispatch-node.py", "--route", str(route_path), "--node", "plan-check",
+                    "--adapter", "claude", "--slug", "slug-sub", "--action", action,
+                    "--prompt-text", "Perform a fresh independent pass."]
+            if subsession:
+                argv += ["--subsession-id", "ss-fixture", "--subsession-index", "1",
+                         "--subsession-count", "2", "--subsession-mode", "parallel",
+                         "--session-chain-id", "ssc-fixture", "--phase-brief", "brief",
+                         "--narrow-verify", "true", "--expected-round-trips", "1",
+                         "--stage-authority", "0", "--attempt-id", "att-sub-1"]
+                if declared_worktree:
+                    argv += ["--subsession-worktree", declared_worktree]
+            argv += list(adapter_args)
+            def run(cmd, **_kw):
+                calls.append(list(cmd))
+                return mock.Mock(returncode=0)
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.dict(N.os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}, clear=True), \
+                 mock.patch.object(N.subprocess, "run", side_effect=run), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                try:
+                    N.main()
+                except SystemExit as exc:
+                    code = exc.code
+        return code, printed, calls
+
+    @staticmethod
+    def _value(command, flag):
+        return command[command.index(flag) + 1]
+
+    def test_subsession_start_launches_wrapper_in_sealed_manifest_worktree(self):
+        code, printed, calls = self._launch()
+        self.assertEqual(code, 0, printed)
+        wrapper = calls[-1]
+        self.assertTrue(wrapper[1].endswith("adapters/claude/bin/dispatch-headless.py"))
+        self.assertEqual(self._value(wrapper, "--worktree"), self.LINKED)
+
+    def test_subsession_start_verifies_route_at_route_cwd(self):
+        _code, _printed, calls = self._launch()
+        verify = [c for c in calls if "verify" in c and c[1].endswith("capability-route.py")]
+        self.assertEqual(len(verify), 1)
+        self.assertEqual(self._value(verify[0], "--cwd"), "/tmp/fixture-worktree")
+
+    def test_subsession_start_refuses_worktree_disagreeing_with_sealed_manifest(self):
+        code, printed, calls = self._launch(declared_worktree="/tmp/some-other-worktree")
+        self.assertEqual(code, 64)
+        self.assertIn("reason=subsession-worktree-mismatch", printed)
+        self.assertIn("child_spawned=0", printed)
+        self.assertFalse([c for c in calls if c[1].endswith("dispatch-headless.py")])
+
+    def test_subsession_start_without_declared_worktree_follows_the_sealed_one(self):
+        code, _printed, calls = self._launch(declared_worktree=None)
+        self.assertEqual(code, 0)
+        self.assertEqual(self._value(calls[-1], "--worktree"), self.LINKED)
+
+    def test_subsession_register_uses_the_declared_worktree(self):
+        code, _printed, calls = self._launch(action="register")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._value(calls[-1], "--worktree"), self.LINKED)
+
+    def test_subsession_worktree_is_a_protected_adapter_flag(self):
+        with self.assertRaises(N.DispatchNodeError) as ctx:
+            N.reject_generated_argument_overrides(["--", "--subsession-worktree", "/tmp/x"])
+        self.assertEqual(ctx.exception.reason, "dispatch-generated-argument-override")
+        self.assertEqual(ctx.exception.fields["flag"], "--subsession-worktree")
+
+    def test_non_subsession_launch_keeps_route_cwd(self):
+        code, _printed, calls = self._launch(subsession=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(self._value(calls[-1], "--worktree"), "/tmp/fixture-worktree")
+
 if __name__ == "__main__":
     unittest.main()

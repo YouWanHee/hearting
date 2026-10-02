@@ -498,5 +498,139 @@ class StartAdmittedBatchPartialFailureTest(AdmissionFixture):
         self.assertEqual([row["started"] for row in results], [1, 1])
 
 
+
+FENCE = "`" * 3
+
+
+def _plan_text(*blocks: str, prefix: str = "") -> str:
+    return "# plan\n" + prefix + "".join(f"\n{FENCE}slices\n{b}\n{FENCE}\n" for b in blocks)
+
+
+class ReadSlicesTest(unittest.TestCase):
+    def _read(self, text: str, name: str = "plan.md"):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / name
+            path.write_text(text, encoding="utf-8")
+            return SUBDIV.read_slices(path)
+
+    def test_read_slices_reads_exactly_one_fenced_block(self):
+        good = '[{"id": "a", "files": ["x.py"], "verify": "true"}, {"files": ["y.py"], "fixed_files": ["y.py"], "narrow_verify": "true"}]'
+        self.assertIsNone(self._read("# plan\nno block here\n"))
+        self.assertEqual(len(self._read(_plan_text(good))), 2)
+        self.assertEqual(len(self._read(_plan_text('{"slices": ' + good + "}"))), 2)
+        for bad in (_plan_text(good, good), _plan_text("[not json"), _plan_text('{"a": 1}'), _plan_text('"text"')):
+            with self.subTest(bad=bad[:40]), self.assertRaisesRegex(SUBDIV.StageSessionError, "plan-slices-invalid"):
+                self._read(bad)
+
+    def test_read_slices_ignores_blocks_nested_in_another_fence(self):
+        good = '[{"id": "a", "files": ["x.py"], "verify": "true"}]'
+        outer = "`" * 4
+        example = f"\n{outer}text\n{FENCE}slices\n[broken\n{FENCE}\n{outer}\n"
+        heredoc = f"\n{FENCE}bash\ncat <<'EOF'\n{FENCE}slices\n[broken\n{FENCE}\nEOF\n{FENCE}\n"
+        self.assertEqual(self._read(_plan_text(good, prefix=example + heredoc)), [{"id": "a", "files": ["x.py"], "verify": "true"}])
+        self.assertIsNone(self._read("# plan\n" + example + heredoc))
+
+    def test_read_slices_reads_a_json_file(self):
+        self.assertEqual(self._read('{"slices": []}', "slices.json"), [])
+        with self.assertRaisesRegex(SUBDIV.StageSessionError, "plan-slices-invalid"):
+            self._read("nope", "slices.json")
+        with self.assertRaisesRegex(SUBDIV.StageSessionError, "plan-slices-invalid"):
+            SUBDIV.read_slices(Path("/nonexistent/plan.md"))
+
+
+class SliceCommandTest(unittest.TestCase):
+    MANIFEST = {"route_file": "/r.json", "route_node": "execute", "mode": "parallel",
+                "chain_id": "ssc-execute-1", "worktree": "/work/linked"}
+    SESSION = {"adapter": "claude", "slug": "execute-a", "subsession_id": "ss-1", "index": 1, "count": 2,
+               "phase_brief": "/b.md", "narrow_verify": "true", "expected_round_trips": 2,
+               "attempt_id": "att-1", "fixed_files": ["a.py"]}
+
+    def test_dispatch_command_forwards_slice_worktree_and_inherited_parent_attempt(self):
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_ATTEMPT_ID": "att-owner-X"}):
+            command = SUBDIV.dispatch_command(self.MANIFEST, self.SESSION, "start", "owner", Path("/j.log"))
+        self.assertEqual(command[command.index("--subsession-worktree") + 1], "/work/linked")
+        self.assertEqual(command[-3:], ["--", "--parent-attempt-id", "att-owner-X"])
+        self.assertLess(command.index("--fixed-file"), command.index("--"))
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_DISPATCH_ATTEMPT_ID"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            command = SUBDIV.dispatch_command(self.MANIFEST, self.SESSION, "start", "owner", Path("/j.log"))
+        self.assertNotIn("--", command)
+        self.assertNotIn("--parent-attempt-id", command)
+
+    def test_start_env_sets_git_optional_locks_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "state" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.touch()
+            manifest = {"chain_id": "ssc-env-1", "sessions": [
+                {"subsession_id": "ss-e1", "attempt_id": "att-env-00001", "index": 1}]}
+            admission = SUBDIV.AdmissionResult(
+                tokens=["t1"], manifest=manifest, manifest_digest="sha256:0",
+                sessions=manifest["sessions"], node_id="execute", reservation_identity="r")
+            envs = []
+            def _run(cmd, env):
+                envs.append((cmd[cmd.index("--action") + 1], env.get("GIT_OPTIONAL_LOCKS"), env.get("TOKEN")))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(SUBDIV, "dispatch_command", side_effect=lambda m, s, a, p, j: ["x", "--action", a]):
+                SUBDIV.start_admitted_batch(admission, parent="o", jobs=jobs, governor_reservation_env="TOKEN", run=_run)
+            self.assertEqual(envs, [("register", None, None), ("start", "0", "t1")])
+
+
+class PlanSlicesBriefAndAdapterTest(unittest.TestCase):
+    def _plan(self, td, slices, **kwargs):
+        root = Path(td)
+        (root / "wt").mkdir()
+        route = {"route_id": "rt-b", "route_hash": "sha256:" + "4" * 64, "cwd": str(root / "wt"),
+                 "effective_intensity": "standard",
+                 "nodes": [{"id": "execute", "dispatch_depth": 2, "completion_gate": "code-execute",
+                            "kind": "pipeline-stage", "write_scope": ["source/**"],
+                            "subdivision": {"min_intensity": "standard", "max_slices": 4,
+                                            "disjointness": "exact-fixed-files"}}]}
+        (root / "route.json").write_text(json.dumps(route))
+        plan = root / "plan.md"
+        plan.write_text(_plan_text(json.dumps(slices)))
+        out = root / "out" / "chain.json"
+        receipt = SUBDIV.plan_slices(route_path=root / "route.json", node_id="execute", slices_path=plan,
+                                     output_path=out, worktree=root / "wt", jobs=root / "jobs.log", **kwargs)
+        return receipt, json.loads(out.read_text()), plan, root / "wt"
+
+    SLICES = [{"id": "a", "files": ["utilities/a.py"], "verify": "true"},
+              {"id": "b", "files": ["utilities/b.py"], "verify": "true", "brief": "only the b part"}]
+
+    def test_phase_brief_carries_plan_worktree_and_no_git_write_rule(self):
+        with tempfile.TemporaryDirectory() as td:
+            _receipt, manifest, plan, wt = self._plan(td, self.SLICES)
+            self.assertEqual(manifest["plan"], str(plan.resolve()))
+            texts = [Path(s["phase_brief"]).read_text() for s in manifest["sessions"]]
+            for text in texts:
+                self.assertIn(f"plan: {plan}", text)
+                self.assertIn(f"worktree: {wt.resolve()}", text)
+                self.assertIn("fixed_files (exhaustive", text)
+                self.assertIn("Never run git add, commit, checkout, restore, stash, reset or rollback", text)
+                self.assertIn("GIT_OPTIONAL_LOCKS=0", text)
+                self.assertIn("checklist.md", text)
+            self.assertNotIn("only the b part", texts[0])
+            self.assertIn("only the b part", texts[1])
+
+    def test_slice_adapter_follows_route_allocation_without_pin(self):
+        def adapters(loader, env, slices=None):
+            with tempfile.TemporaryDirectory() as td, mock.patch.object(SUBDIV, "_load_sibling", loader), \
+                    mock.patch.dict(os.environ, env, clear=False):
+                _r, manifest, _p, _w = self._plan(td, slices or self.SLICES)
+                return [s["adapter"] for s in manifest["sessions"]]
+        hops = [{"fallback_hop": "same-harness-headless", "candidates": [{"child_harness": "claude", "status": "unsupported"}]},
+                {"fallback_hop": "cross-harness-headless", "candidates": [{"child_harness": "codex", "status": "supported"}]}]
+        fallback = mock.Mock(ordered_fallback_hops=mock.Mock(return_value=(hops, None)))
+        self.assertEqual(adapters(lambda *a: fallback, {}), ["codex", "codex"])
+        # a slice's own adapter always wins
+        own = [dict(self.SLICES[0], adapter="opencode"), self.SLICES[1]]
+        self.assertEqual(adapters(lambda *a: fallback, {}, own), ["opencode", "codex"])
+        def broken(*_a):
+            raise ImportError("no loader")
+        self.assertEqual(adapters(broken, {"AGENT_DISPATCH_CURRENT_HARNESS": "opencode"}), ["opencode", "opencode"])
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_DISPATCH_CURRENT_HARNESS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(adapters(broken, {}), ["claude", "claude"])
+
 if __name__ == "__main__":
     unittest.main()

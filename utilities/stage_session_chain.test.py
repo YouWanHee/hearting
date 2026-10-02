@@ -443,6 +443,96 @@ class PlanSlicesTest(unittest.TestCase):
             receipt = json.loads(result.stdout)
             self.assertEqual(receipt["planned"], "refused"); self.assertEqual(receipt["fallback"], "single-session-required")
             self.assertIn("parallel-fixed-file-overlap", receipt["reason"])
+            self.assertIn("stage-dispatch-fallback.py", receipt["next_action"])
+            self.assertIn("--node execute", receipt["next_action"])
+
+    @staticmethod
+    def _git(*args, cwd):
+        import subprocess
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=cwd, check=True, capture_output=True)
+
+    def _linked(self, td, worktree):
+        self._git("commit", "--allow-empty", "-qm", "init", cwd=worktree)
+        linked = Path(td) / "linked"
+        self._git("worktree", "add", "-q", "-b", "linked-slice", str(linked), cwd=worktree)
+        return linked
+
+    def test_worktree_mutating_scope_admits_repo_files_outside_literal_source(self):
+        """F1: `source/**` means the whole worktree, so a repository file is in scope."""
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            slices_path.write_text(json.dumps([
+                {"id": "a", "files": ["utilities/x.py"], "verify": "true"},
+                {"id": "b", "files": ["docs/y.md"], "verify": "true"},
+            ]), encoding="utf-8")
+            receipt = CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                        slices_path=slices_path, output_path=output)
+            self.assertEqual(receipt["planned"], "ok")
+            # a literal scope is still enforced
+            route = json.loads(route_path.read_text())
+            route["nodes"][0]["write_scope"] = ["dev_logs/**"]
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            with self.assertRaisesRegex(CHAIN.StageSessionError, "parallel-fixed-file-outside-write-scope"):
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                  slices_path=slices_path, output_path=output)
+
+    def test_plan_slices_accepts_a_linked_worktree_of_the_route_repository(self):
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            linked = self._linked(td, worktree)
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}):
+                receipt = CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=linked,
+                                            slices_path=slices_path, output_path=output)
+            self.assertEqual(receipt["planned"], "ok")
+            self.assertEqual(json.loads(output.read_text())["worktree"], str(linked.resolve()))
+
+    def test_plan_slices_defaults_to_the_callers_linked_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            linked = self._linked(td, worktree)
+            cwd = os.getcwd()
+            try:
+                os.chdir(linked)
+                with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}):
+                    CHAIN.plan_slices(route_path=route_path, node_id="execute",
+                                      slices_path=slices_path, output_path=output)
+                self.assertEqual(json.loads(output.read_text())["worktree"], str(linked.resolve()))
+                with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
+                    CHAIN.plan_slices(route_path=route_path, node_id="execute",
+                                      slices_path=slices_path, output_path=output)
+                self.assertEqual(json.loads(output.read_text())["worktree"], str(worktree.resolve()))
+            finally:
+                os.chdir(cwd)
+
+    def test_plan_slices_refuses_a_foreign_repository(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            foreign = Path(td) / "foreign"
+            subprocess.run(["git", "init", "-q", str(foreign)], check=True)
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}), \
+                    self.assertRaisesRegex(CHAIN.StageSessionError, "plan-slices-worktree-mismatch"):
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=foreign,
+                                  slices_path=slices_path, output_path=output)
+            self.assertFalse(output.exists())
+
+    def test_linked_worktree_is_refused_when_gates_are_on(self):
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            linked = self._linked(td, worktree)
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}), \
+                    self.assertRaisesRegex(CHAIN.StageSessionError, "plan-slices-worktree-mismatch"):
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=linked,
+                                  slices_path=slices_path, output_path=output)
+            # and the common loader refuses a manifest naming the linked worktree
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}):
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=linked,
+                                  slices_path=slices_path, output_path=output)
+            route = json.loads(route_path.read_text()) | {"_route_file": str(route_path)}
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}), \
+                    self.assertRaisesRegex(CHAIN.StageSessionError, "manifest-worktree-mismatch"):
+                CHAIN.load_manifest(output, route=route, node=route["nodes"][0])
 
 
 class RuntimeJoinsCensusTest(unittest.TestCase):

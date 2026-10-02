@@ -492,21 +492,29 @@ def read_slices(path: Path | str) -> list | None:
     if path.suffix.lower() == ".md":
         blocks: list[str] = []
         fence: tuple[str, int] | None = None
+        depth = 0
         current: list[str] | None = None
         for line in text.splitlines():
+            match = _FENCE_OPEN.match(line)
             if fence is None:
-                match = _FENCE_OPEN.match(line)
                 if match:
-                    fence = (match.group(1)[0], len(match.group(1)))
+                    fence, depth = (match.group(1)[0], len(match.group(1))), 1
                     info = match.group(2).strip().split()
                     current = [] if info and info[0] == "slices" and fence[0] == "`" else None
                 continue
-            close = re.match(r"^ {0,3}(`+|~+)\s*$", line)
-            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= fence[1]:
-                if current is not None:
-                    blocks.append("\n".join(current))
-                fence, current = None, None
-            elif current is not None:
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= fence[1]:
+                if match.group(2).strip():
+                    # An example fence inside a fence (a heredoc writing a plan):
+                    # counted as nesting so its bare closer does not end the outer one.
+                    depth += 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        if current is not None:
+                            blocks.append("\n".join(current))
+                        fence, current = None, None
+                        continue
+            if current is not None:
                 current.append(line)
         if not blocks:
             return None

@@ -177,7 +177,15 @@ def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) ->
 def metadata(args: argparse.Namespace) -> str:
     if not getattr(args, "subsession_id", None):
         return ""
-    return (
+    # A parallel row must name the batch that admitted it (`validate_attempt_metadata`).
+    # A route-leg group's governor reservation supplies `parallel_group`; a subdivision
+    # slice belongs to no route-leg group, so its sealed chain id is the batch.
+    batch = (
+        f",batch_group={args.session_chain_id}"
+        if args.subsession_mode == "parallel" and not getattr(args, "replica_batch_reservation", None)
+        else ""
+    )
+    return batch + (
         f",subsession_id={args.subsession_id},stage_authority=0"
         f",session_chain_id={args.session_chain_id}"
         f",subsession_index={args.subsession_index},subsession_count={args.subsession_count}"

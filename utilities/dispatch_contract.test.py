@@ -1312,6 +1312,24 @@ class DispatchContractTest(unittest.TestCase):
     if proc.poll() is None:proc.kill()
     proc.wait()
 
+ def test_parent_lookup_worktree_remaps_only_for_slice_with_exact_attempt_id(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);primary=base/"primary";linked=base/"linked";foreign=base/"foreign"
+   for repo in (primary,foreign):
+    subprocess.run(["git","init","-q",str(repo)],check=True)
+   subprocess.run(["git","-C",str(primary),"-c","user.name=t","-c","user.email=t@t","commit","--allow-empty","-qm","seed"],check=True)
+   subprocess.run(["git","-C",str(primary),"worktree","add","-q","-b","linked",str(linked)],check=True)
+   route_file=base/"route.json";route_file.write_text(json.dumps({"cwd":str(primary)}))
+   lookup=lambda worktree,**kw:D.parent_lookup_worktree(worktree,str(route_file),**kw)
+   self.assertEqual(lookup(str(linked),subsession=True,parent_attempt_id="att-owner"),str(primary))
+   self.assertEqual(lookup(str(linked),subsession=True,parent_attempt_id=None),str(linked))
+   self.assertEqual(lookup(str(linked),subsession=True,parent_attempt_id=""),str(linked))
+   self.assertEqual(lookup(str(linked),subsession=False,parent_attempt_id="att-owner"),str(linked))
+   self.assertEqual(lookup(str(foreign),subsession=True,parent_attempt_id="att-owner"),str(foreign))
+   self.assertEqual(lookup(str(primary),subsession=True,parent_attempt_id="att-owner"),str(primary))
+   self.assertEqual(D.parent_lookup_worktree(str(linked),str(base/"missing.json"),subsession=True,parent_attempt_id="att-owner"),str(linked))
+   self.assertEqual(D.parent_lookup_worktree(str(linked),None,subsession=True,parent_attempt_id="att-owner"),str(linked))
+
  def test_observed_liveness_and_terminal_reconcile_are_exact_and_idempotent(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"

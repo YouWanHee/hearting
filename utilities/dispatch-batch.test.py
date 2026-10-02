@@ -3972,5 +3972,152 @@ class NodeLaunchCommandTest(unittest.TestCase):
     def test_unset_qa_is_omitted(self):
         self.assertNotIn("--qa", self.command(None))
 
+
+class SlicesOneCommandTest(unittest.TestCase):
+    """`--slices <plan.md>`: one command from a plan's `slices` block to started
+    slices, or the ordinary single-session receipt before any admission."""
+
+    FENCE = "`" * 3
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.primary = self.base / "primary"
+        self.primary.mkdir()
+        self.git("init", "-q", cwd=self.primary)
+        self.git("commit", "--allow-empty", "-qm", "init", cwd=self.primary)
+        self.route = {
+            "route_id": "rt-slices", "route_hash": "sha256:" + "5" * 64, "cwd": str(self.primary),
+            "effective_intensity": "standard",
+            "nodes": [{"id": "execute", "dispatch_depth": 2, "completion_gate": "code-execute",
+                       "kind": "pipeline-stage", "write_scope": ["source/**", "dev_logs/**"],
+                       "subdivision": {"min_intensity": "standard", "max_slices": 4,
+                                       "disjointness": "exact-fixed-files"}}],
+        }
+        self.route_path = self.base / "route.json"
+        self.route_path.write_text(json.dumps(self.route), encoding="utf-8")
+        self.jobs = self.base / "state" / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir(parents=True)
+        self.jobs.write_text("", encoding="utf-8")
+
+    @staticmethod
+    def git(*args, cwd):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=cwd, check=True, capture_output=True)
+
+    def plan(self, *blocks: str, name: str = "plan.md") -> Path:
+        path = self.base / name
+        path.write_text("# plan\n" + "".join(
+            f"\n{self.FENCE}slices\n{block}\n{self.FENCE}\n" for block in blocks), encoding="utf-8")
+        return path
+
+    GOOD = json.dumps([
+        {"id": "a", "files": ["utilities/a.py"], "verify": "true"},
+        {"id": "b", "files": ["utilities/b.py"], "verify": "true"},
+    ])
+
+    def run_slices(self, plan: Path, *, action="dry-run", extra=(), env=None, admit=None, start=None):
+        output = io.StringIO()
+        environment = {"AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-owner-slices"}
+        environment.update(env or {})
+        dropped = [key for key, value in environment.items() if value is None]
+        environment = {key: value for key, value in environment.items() if value is not None}
+        admission = BATCH.SUBDIVISION_ADMISSION
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(
+                BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)))
+            self.record = stack.enter_context(mock.patch.object(BATCH, "record_degradation"))
+            self.reserve = stack.enter_context(mock.patch.object(BATCH, "reserve_batch"))
+            self.admit = stack.enter_context(mock.patch.object(
+                admission, "admit_batch", side_effect=admit or AssertionError("admit_batch must not run")))
+            self.start = stack.enter_context(mock.patch.object(
+                admission, "start_admitted_batch", side_effect=start or AssertionError("start must not run")))
+            stack.enter_context(mock.patch.dict(os.environ, environment))
+            for key in dropped:
+                os.environ.pop(key, None)
+            argv = ["--route", str(self.route_path), "--parallel-group", "execute", "--slug-prefix", "pe",
+                    "--parent", "owner", "--slices", str(plan), "--action", action, *extra]
+            with contextlib.redirect_stdout(output), mock.patch.object(sys, "stderr", io.StringIO()):
+                rc = BATCH.main(argv)
+        return rc, output.getvalue()
+
+    def assert_single_session(self, rc, out, reason, *, ledger):
+        self.assertEqual(rc, 0, out)
+        receipt = json.loads(out)
+        self.assertEqual(receipt["state"], "single-session-required")
+        self.assertEqual(receipt["reason"], reason)
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertIn("stage-dispatch-fallback.py", receipt["next_action"])
+        self.assertIn("--node execute --slug pe --parent owner --start", receipt["next_action"])
+        self.admit.assert_not_called()
+        self.reserve.assert_not_called()
+        self.start.assert_not_called()
+        self.assertEqual(self.jobs.read_bytes(), b"")
+        self.assertEqual(self.record.call_count, 1 if ledger else 0)
+        return receipt
+
+    def test_slices_plan_without_block_prints_single_session_with_next_action(self):
+        plan = self.base / "plan.md"
+        plan.write_text("# plan\nno slices here\n", encoding="utf-8")
+        rc, out = self.run_slices(plan)
+        self.assert_single_session(rc, out, "plan-declared-no-slices", ledger=False)
+        self.assertFalse((self.jobs.parent / "subdivision").exists())
+
+    def test_slices_malformed_or_duplicate_block_falls_back_without_registration(self):
+        for blocks in ((self.GOOD, self.GOOD), ("[not json",), ('{"a": 1}',)):
+            with self.subTest(blocks=[b[:12] for b in blocks]):
+                rc, out = self.run_slices(self.plan(*blocks))
+                receipt = self.assert_single_session(rc, out, "plan-slices-invalid", ledger=True)
+                self.assertIn("detail", receipt)
+
+    def test_slices_without_inherited_attempt_id_falls_back_before_admission(self):
+        linked = self.base / "linked"
+        self.git("worktree", "add", "-q", "-b", "linked-s", str(linked), cwd=self.primary)
+        for extra in ((), ("--worktree", str(linked))):
+            with self.subTest(extra=extra):
+                rc, out = self.run_slices(self.plan(self.GOOD), extra=extra, env={"AGENT_DISPATCH_ATTEMPT_ID": None})
+                self.assert_single_session(rc, out, "parent-attempt-id-absent", ledger=False)
+
+    def test_slices_gates_on_linked_worktree_falls_back_to_single_session(self):
+        linked = self.base / "linked"
+        self.git("worktree", "add", "-q", "-b", "linked-s", str(linked), cwd=self.primary)
+        rc, out = self.run_slices(
+            self.plan(self.GOOD), extra=("--worktree", str(linked)), env={"HEARTING_GATES": "on"})
+        receipt = self.assert_single_session(rc, out, "subdivision-disjointness-unproven", ledger=True)
+        self.assertIn("plan-slices-worktree-mismatch", receipt["detail"])
+
+    def test_slices_unproven_records_ledger_and_falls_back(self):
+        overlap = json.dumps([
+            {"id": "a", "files": ["utilities/a.py"], "verify": "true"},
+            {"id": "b", "files": ["utilities/a.py"], "verify": "true"},
+        ])
+        rc, out = self.run_slices(self.plan(overlap))
+        receipt = self.assert_single_session(rc, out, "subdivision-disjointness-unproven", ledger=True)
+        self.assertIn("parallel-fixed-file-overlap", receipt["detail"])
+        self.assertEqual(self.record.call_args.kwargs["reason"], "subdivision-disjointness-unproven")
+
+    def test_slices_plan_builds_manifest_under_state_root_and_admits(self):
+        admitted = SimpleNamespace(reservation_identity="r" * 8, sessions=[{}, {}])
+        results = [{"started": 1, "registered": 1}, {"started": 1, "registered": 1}]
+        plan = self.plan(self.GOOD)
+        rc, out = self.run_slices(
+            plan, action="start", admit=lambda **kw: admitted, start=lambda *a, **kw: results)
+        self.assertEqual(rc, 0, out)
+        receipt = json.loads(out)
+        self.assertEqual(receipt["state"], "subdivision-batch-started")
+        self.assertEqual(receipt["slice_count"], 2)
+        manifest_path = Path(receipt["chain_manifest"])
+        self.assertEqual(manifest_path.parent, self.jobs.parent / "subdivision" / "rt-slices")
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["mode"], "parallel")
+        self.assertEqual(manifest["worktree"], str(self.primary.resolve()))
+        self.assertEqual(self.admit.call_args.kwargs["manifest_path"], manifest_path)
+        self.assertIn("capability-route.py complete --route", receipt["next_command"])
+        self.assertIn(f"--subsession-manifest {manifest_path}", receipt["next_command"])
+        self.assertIn("--node execute", receipt["next_command"])
+
 if __name__ == "__main__":
     unittest.main()
