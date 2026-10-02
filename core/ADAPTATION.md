@@ -138,7 +138,8 @@ Portable docs use role names, not vendor model names:
 |---|---|
 | `fast reviewer` | Broad, low-latency review: coverage, style, cross-reference, formatting, simple consistency |
 | `fast fact-checker` | Narrow source comparison: citations, years, metrics, verbatim matching |
-| `fast writer` | Assembly from verified artifacts |
+| `fast writer` | Short mechanical assembly from verified artifacts |
+| `deep editor` | Reader-facing prose written for a person to read: final reports, polish, translation |
 | `fast implementer` | Routine implementation and refactoring |
 | `deep reviewer` | Architecture, methodology, safety, domain correctness, high-risk review |
 | `deep maker` | High-judgment creation: planning, synthesis, visual/editorial craft |

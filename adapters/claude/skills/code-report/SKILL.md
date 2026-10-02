@@ -23,18 +23,18 @@ metadata:
 
 ## Writer and QA Policy
 
-Use one portable `fast writer` at every rigor tier. Prior stages already review the plan, implementation, and tests; this stage synthesizes their artifacts. The incoming intensity-derived rigor or plan-frontmatter `qa_level` is context only. It does not change the writer role, add parallel writers, or open a report-review loop.
+Use one portable `deep editor` at every rigor tier. Prior stages already review the plan, implementation, and tests; this stage synthesizes their artifacts. The incoming intensity-derived rigor or plan-frontmatter `qa_level` is context only. It does not change the writer role, add parallel writers, or open a report-review loop.
 
 | Rigor | Report action |
 |---|---|
-| Light | One fast writer |
-| Standard | One fast writer |
-| Thorough | One fast writer |
-| Adversarial | One fast writer; no external-adversary review of report prose |
+| Light | One deep editor |
+| Standard | One deep editor |
+| Thorough | One deep editor |
+| Adversarial | One deep editor; no external-adversary review of report prose |
 
 ## Generate the Report
 
-Run the `editorial/report` unit (portable `fast writer` role) with this task:
+Run the `editorial/report` unit (portable `deep editor` role) with this task:
 
 ```text
 Generate a final change report.

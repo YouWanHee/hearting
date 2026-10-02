@@ -44,6 +44,10 @@ io:
 tools: []
 branches: [search, analysis, chaining, code-search, compile, report]
 aliases: {}
+bootstrap:
+  memory: [report-format]
+  exemplar: deliverable
+  gates: [research-report]
 ---
 
 # Unit: research/research-survey
