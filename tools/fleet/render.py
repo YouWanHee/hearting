@@ -4718,6 +4718,8 @@ def _progress_epoch(epoch):
 
 
 def _progress_age(age_s):
+    # Only a stall is worth a suffix: a live run rewrites its log every few seconds,
+    # so a fresh age read "0s ago" on every frame and said nothing.
     if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) or age_s < 0:
         return None, None
     age_s = int(age_s)
@@ -4725,7 +4727,7 @@ def _progress_age(age_s):
         minutes = age_s // 60
         return ("stalled %dm" % minutes if minutes < 120
                 else "stalled %dh" % (minutes // 60)), "lvl_y"
-    return ("%ds ago" % age_s if age_s < 60 else "%dm ago" % (age_s // 60)), "dim"
+    return None, None
 
 
 def _gpu_progress_row(process, indent, width):
