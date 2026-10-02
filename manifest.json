@@ -880,6 +880,13 @@
       "hard_block": false
     },
     {
+      "slug": "hook__route-presence-gate.py__PreToolUse",
+      "name": "route-presence-gate.py",
+      "mono": "route-presence-gate.py",
+      "event": "PreToolUse",
+      "hard_block": false
+    },
+    {
       "slug": "hook__stage-dispatch-reminder__PreToolUse",
       "name": "stage-dispatch-reminder",
       "mono": "stage-dispatch-reminder",

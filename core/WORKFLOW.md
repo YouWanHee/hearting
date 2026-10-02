@@ -463,9 +463,22 @@ an earlier session's record, or a stale record from another cwd is not route
 participation. Hotfixes do not bypass this floor. This invariant was hardened
 after the 2026-07-24 Cairn incident in which a route card was shown but no
 route was entered and the feature was edited, committed, and deployed through
-silent no-route work. The runtime write gates are retired, so no command
-enforces or answers this invariant; it is the session's own obligation, and
-`capability-route.py verify`/`status` only inspect a route that exists.
+silent no-route work, and again on 2026-10-02 when a read-only question grew
+into source edits, commits and GPU runs without a route.
+
+One gate checks this, and only for existence: the route presence gate
+(`utilities/route_presence_gate.py`, `core/HOOKS.md`). Before a session's
+source edit inside a git work tree, `git commit` with non-artifact changes, or
+long-run launch (`compute-hosts run`, `nohup|setsid … python … train|run.py`), it
+asks whether this session's route-chain ledger names any route for that
+folder's canonical artifact root — composed, compiled, continued or started,
+open or closed. If not, it refuses that call and prints one paste-ready
+`capability-route.py compose --shape direct …` line; once any route exists
+there, every later call of that session×folder passes. It does not check which
+route, its freshness, lineage, stage or proof. Registered owners and workers,
+artifact roots, the temp directory, runtime homes, CI and dev activation pass;
+any judgement failure passes; `HEARTING_ROUTE_GATE=off` turns it off.
+`capability-route.py verify`/`status` still only inspect a route that exists.
 
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At

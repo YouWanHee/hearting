@@ -348,6 +348,22 @@ The first-level Claude adapter support surfaces above no longer use symlink
 passthrough entries back into the common root. `claude_setting/` remains the
 runtime projection layer and should continue to point at `adapters/claude/*`.
 
+## Route Presence Gate (2026-10-02)
+
+`settings.json` `PreToolUse` on `Edit|Write|MultiEdit|NotebookEdit|Bash` runs
+`hooks/route-presence-gate.py`, which calls the shared
+`utilities/route_presence_gate.py` (`core/HOOKS.md`). A refusal is exit 2 with
+the one-line compose instruction on stderr. The payload `session_id` is the
+transcript session id, the same value Claude exports to Bash as
+`CLAUDE_CODE_SESSION_ID`, which the route-chain writer records when the session
+runs `compose`; the gate reads both. Every `Bash` call starts the hook, which
+returns at once unless the command is a plain `git commit` or long-run launch.
+
+The native plugin channel (`plugin-marketplace/`) does not carry this hook: it
+is a self-contained copy without `utilities/` or `capability-route.py`, so a
+session there could never satisfy the gate. `HEARTING_ROUTE_GATE=off` (for
+example in `settings.json` `env`) turns the gate off.
+
 ## Model Mapping
 
 Claude Code maps portable roles as follows:
