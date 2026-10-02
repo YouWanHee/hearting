@@ -80,7 +80,7 @@ echo "$parent" | grep -q '^D1=real-thread:-$' \
 
 command -v git >/dev/null || { echo "(git 없음 — skip launch cases)"; exit $fails; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-AH="$tmp/agent_setting"; mkdir -p "$AH/.dispatch/logs"
+AH="$tmp/agent_setting"; mkdir -p "$AH/.dispatch/logs"; export AGENT_DISPATCH_JOBS="$AH/.dispatch/jobs.log"
 
 # Drive the ported SD-15 start-block helpers exactly as main()'s --start path does.
 drive=$(python3 - "$WRAP" "$AH" <<'PY'
@@ -149,19 +149,23 @@ echo "$drive" | grep -q 'early_death=-' \
 LIVE="$SCRIPT_DIR/dispatch-liveness.py"
 live=$(python3 - "$LIVE" "$AH" <<'PY'
 import importlib.util, sys
+import os
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("lv", sys.argv[1])
 lv = importlib.util.module_from_spec(spec); spec.loader.exec_module(lv)
 AH = Path(sys.argv[2])
+os.environ["AGENT_DISPATCH_JOBS"] = str(AH / ".dispatch" / "jobs.log")
 hit = lv.log_shows_limit(AH, "limit1")
 miss = lv.log_shows_limit(AH, "clean1")
 worktree = AH / "nested-worktree"
-local_sessions = worktree / ".dispatch" / "codex-home" / "sessions"
-stores = lv.sessions_dirs_for("", "nested", AH, AH / "default-sessions", str(worktree))
+external = AH / ".dispatch" / "homes" / "codex" / __import__("hashlib").sha256(str(worktree.resolve()).encode()).hexdigest()[:32] / "sessions"
+legacy_sessions = worktree / ".dispatch" / "codex-home" / "sessions"
+jobs = AH / ".dispatch" / "jobs.log"
+stores = lv.sessions_dirs_for("", "nested", AH, AH / "default-sessions", str(worktree), jobs=jobs)
 profile_stores = lv.sessions_dirs_for(
-    "profile=lab", "nested", AH, AH / "default-sessions", str(worktree)
+    "profile=lab", "nested", AH, AH / "default-sessions", str(worktree), jobs=jobs
 )
-paths_ok = stores == [local_sessions, AH / "default-sessions"]
+paths_ok = stores == [external, legacy_sessions, AH / "default-sessions"]
 profile_ok = profile_stores == [AH / ".dispatch" / "homes" / "nested.lab" / "sessions"]
 print(
     "LIVE_OK"

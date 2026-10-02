@@ -1407,6 +1407,21 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         current_route = json.loads(current_path.read_text())
         return _advance(current_route, current_path, jobs, result, wait=wait, interview=interview,
                         answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
+    status, metadata = _rows(jobs).get(aid, (status, metadata))
+    if (status == "done" and metadata.get("note") == "dead-worker-blocked"
+            and not replacement.get("parked_gate")
+            and (replacement.get("state") == "not-applicable"
+                 or replacement.get("reason") == "automatic-replacement-exhausted")):
+        # It stopped for an answer no declared gate carries. The answer, sent to it, is the way on
+        # (an answered stop is a pause, so a spent replacement budget does not end it).
+        report = _owner_report(route, metadata)
+        return {**result, "state": "needs-attention", "reason": "owner-blocked",
+                "required_action": "answer-blocked-owner", "result": _outcome(jobs, aid),
+                **({"owner_report": report} if report else {}),
+                "next_step": "The owner stopped BLOCKED and is waiting for an answer; owner_report says what it "
+                    "needs. Get the person's answer (or fix what it names), then run correction_command with "
+                    "--message-file <answer file>: that continues this route at once in a replacement owner that "
+                    "receives the answer. Do not close or recompose the route."}
     if replacement.get("state") == "needs-attention":
         result["replacement_attention"] = [replacement]
         if replacement["reason"] == "replacement-capacity-wait":

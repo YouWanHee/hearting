@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, unittest
+import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -325,8 +325,13 @@ class AdapterV11Test(unittest.TestCase):
             "--unit","_kernel/owner","--assigned-contract","autopilot-code",
             "--model","gpt-test","--reasoning","low","--log-dir",str(logs),
             "--jobs",str(jobs)]
+   fakebin=root/"bin"; fakebin.mkdir()
+   fake_codex=fakebin/"codex"
+   fake_codex.write_text("#!/bin/sh\n[ \"$1\" = app-server ] && [ \"$2\" = --help ]\n",encoding="utf-8")
+   fake_codex.chmod(0o755)
    env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
-        "CLAUDE_CONFIG_DIR":str(claude_config),"AGENT_DISPATCH_JOBS":str(jobs)}
+        "CLAUDE_CONFIG_DIR":str(claude_config),"AGENT_DISPATCH_JOBS":str(jobs),
+        "PATH":str(fakebin)+os.pathsep+os.environ.get("PATH","")}
    for runtime_key in (
     "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID",
     "OPENCODE_SESSION_ID", "AGENT_DISPATCH_CALLER_HARNESS",
@@ -431,7 +436,7 @@ class AdapterV11Test(unittest.TestCase):
     self.assertIn("REPLICA_RESERVATION_ROW_KEYS",source)
     self.assertIn("replica_batch_expectation",source)
     self.assertIn("expected_reservation=args.replica_batch_expectation",source)
- def test_nested_codex_home_links_auth_but_keeps_mutable_state_local(self):
+ def test_nested_codex_home_links_auth_but_keeps_mutable_state_external(self):
   # `prepare_nested_codex_home` runs the *installed* runtime's projection
   # installer on purpose: the nested home's identity must follow the canonical
   # AGENT_HOME, not the source worktree holding the wrapper. So the fixture has
@@ -454,13 +459,14 @@ class AdapterV11Test(unittest.TestCase):
    (source/"auth.json").write_text("{}\n",encoding="utf-8")
    (source/"config.toml").write_text("model = \"fixture\"\n",encoding="utf-8")
    fixture_home=root/"home"; fixture_home.mkdir()
+   state=root/"dispatch"; state.mkdir(); jobs=state/"jobs.log"; jobs.write_text("")
    spec=importlib.util.spec_from_file_location("codex_dispatch_home",ROOT/"adapters/codex/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
    env={"PATH":os.environ.get("PATH",""),"HOME":str(fixture_home),
-        "AGENT_HOME":str(ROOT),"CODEX_HOME":str(source),
+        "AGENT_HOME":str(ROOT),"CODEX_HOME":str(source),"AGENT_DISPATCH_JOBS":str(jobs),
         "PYTHONDONTWRITEBYTECODE":"1"}
    with mock.patch.dict(os.environ,env,clear=True):
-    home=wrapper.prepare_nested_codex_home(worktree,source)
+    home=wrapper.prepare_nested_codex_home(worktree,source,jobs=jobs)
     agent_home=wrapper.resolve_agent_home().resolve()
    self.assertEqual(agent_home,ROOT.resolve())
    self.assertTrue((home/"auth.json").is_symlink())
@@ -468,8 +474,8 @@ class AdapterV11Test(unittest.TestCase):
    self.assertTrue((home/"config.toml").is_symlink())
    self.assertTrue((home/"hearting").is_symlink())
    self.assertEqual((home/"hearting").resolve(),agent_home)
-   self.assertEqual(home.parent,worktree/".dispatch")
-   # Mutable runtime state stays inside the worktree: the credential is a link
+   self.assertTrue(home.is_relative_to(state/"homes"/"codex"))
+   # Mutable runtime state stays outside the source repository: the credential is a link
    # out, never a copy, nothing was written into the source home, and the
    # fixture HOME is still empty -- the launcher branch really was skipped.
    self.assertFalse((home/"auth.json").resolve().is_relative_to(worktree))
@@ -523,6 +529,45 @@ class AdapterV11Test(unittest.TestCase):
    self.assertTrue(chosen.is_relative_to(state))
    self.assertEqual(list(worktree.iterdir()),[])
    self.assertEqual(list(state.iterdir()),[])
+
+ def test_external_runtime_home_keeps_exact_attempt_session_and_repository_clean(self):
+  import hashlib
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,art=self.fixture(root); state=root/"dispatch"; state.mkdir()
+   jobs=state/"jobs.log"; jobs.write_text(""); default=root/"default-sessions"
+   wrapper=self.load_wrapper("codex")
+   before=subprocess.run(["git","-C",str(repo),"status","--porcelain","--untracked-files=all"],
+                         text=True,capture_output=True,check=True).stdout
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)},clear=False):
+    selected=wrapper.nested_codex_home_path(repo,jobs)
+    self.assertIsNone(wrapper.ensure_runtime_home_projection(repo))
+    live=importlib.util.spec_from_file_location("codex_liveness_external_fixture",
+         ROOT/"adapters/codex/bin/dispatch-liveness.py")
+    module=importlib.util.module_from_spec(live); live.loader.exec_module(module)
+    sid="session-exact-attempt-17"; attempt="att-exact-attempt-17"
+    session_dir=selected/"sessions"; session_dir.mkdir(parents=True)
+    transcript=session_dir/f"{sid}.jsonl"
+    transcript.write_text(json.dumps({"type":"session_meta","payload":{"id":sid,"cwd":str(repo),
+                           "attempt_id":attempt,"pid":os.getpid()}})+"\n",encoding="utf-8")
+    dirs=module.sessions_dirs_for("", "worker", ROOT, default, str(repo),jobs=jobs)
+    self.assertEqual(dirs[0],selected/"sessions")
+    self.assertEqual(dirs[1],repo/".dispatch"/"codex-home"/"sessions")
+    self.assertEqual(module.locate_latest_for_worktree_dirs(dirs,str(repo)),transcript)
+    observed=json.loads(transcript.read_text().splitlines()[0])["payload"]
+    self.assertEqual(transcript.stem,sid)
+    self.assertEqual(observed["attempt_id"],attempt)
+    self.assertEqual(observed["pid"],os.getpid())
+    self.assertEqual(module.transcript_cwd(transcript),str(repo))
+    exact=module.recorded_attempt_state({"attempt_id":attempt,"pid":str(os.getpid()),
+        "pid_start":module.process_start_ticks(os.getpid())},time.time(),ROOT)
+    self.assertEqual(exact["state"],"working")
+    self.assertEqual(exact["pid"],os.getpid())
+    self.assertEqual(module.sessions_dirs_for("profile=lab", "worker", ROOT, default,
+                     str(repo),jobs=jobs),[module.resolve_dispatch_state_root(ROOT,explicit_jobs=jobs)/"homes"/"worker.lab"/"sessions"])
+   after=subprocess.run(["git","-C",str(repo),"status","--porcelain","--untracked-files=all"],
+                        text=True,capture_output=True,check=True).stdout
+   self.assertEqual(after,before)
+   self.assertFalse((repo/".dispatch").exists())
 
  def test_nested_codex_home_foreign_fallback_and_symlink_escape_stay_untouched(self):
   with tempfile.TemporaryDirectory() as td:

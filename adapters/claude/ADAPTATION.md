@@ -136,7 +136,8 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   supervisor when the probe reports support (an explicit `poll`, `unsupported` or `indeterminate` probe keeps
   the one-shot launch without refusal); non-owner and dispatch-depth-2 one-shot workers keep
   `--no-session-persistence`. Owner corrections (`capability-route.py correct`) are accepted from
-  registration and delivered as the next turn of the same `--resume` session. `--completion-delivery auto` probes both CLI flags;
+  registration and delivered as the next turn of the same `--resume` session; one sent after the
+  owner ended BLOCKED continues the route through a replacement owner (shared `dispatch_replacement`). `--completion-delivery auto` probes both CLI flags;
   forced supervised mode fails before registration, and the checked legacy path
   is reported as `poll-fallback`. Before each supervised turn the bridge writes
   an atomic attempt-scoped delivered-set state and supplies a command-scoped

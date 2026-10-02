@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -272,14 +273,20 @@ def sessions_dirs_for(
     agent_home: Path,
     default_sessions: Path,
     worktree: str,
+    *,
+    jobs: Path | None = None,
 ) -> list[Path]:
     """Resolve all possible session stores without weakening profile isolation."""
     prof = parse_profile(pipe)
     if prof:
-        return [sessions_dir_for(pipe, slug, agent_home, default_sessions)]
+        state_root = resolve_dispatch_state_root(agent_home, explicit_jobs=jobs)
+        return [state_root / "homes" / f"{slug}.{prof}" / "sessions"]
 
+    canonical_home = (resolve_dispatch_state_root(agent_home, explicit_jobs=jobs) / "homes" / "codex"
+                      / hashlib.sha256(str(Path(worktree).resolve()).encode()).hexdigest()[:32])
     candidates = [
-        Path(worktree) / ".dispatch" / "codex-home" / "sessions",
+        canonical_home / "sessions",
+        Path(worktree) / ".dispatch" / "codex-home" / "sessions",  # legacy read-only observation
         default_sessions,
     ]
     result: list[Path] = []
@@ -468,11 +475,10 @@ def main(argv: list[str]) -> int:
                 )
                 suspect += 1
                 continue
-            # Profile jobs live under their isolated home. Non-profile nested workers
-            # may inherit a conductor's worktree-local CODEX_HOME, so inspect both that
-            # deterministic projection and the caller's default session store.
+            # Profile jobs use their isolated home. Non-profile jobs check the
+            # canonical external home, then the legacy link and default store.
             sessions_dirs = sessions_dirs_for(
-                pipe, slug, agent_home, default_sessions, worktree
+                pipe, slug, agent_home, default_sessions, worktree, jobs=jobs
             )
             transcript = locate_latest_for_worktree_dirs(sessions_dirs, worktree)
             if transcript is None:
