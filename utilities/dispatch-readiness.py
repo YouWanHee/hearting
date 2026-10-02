@@ -161,12 +161,15 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worktree", required=True, type=Path)
-    parser.add_argument("--jobs", required=True, type=Path)
+    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     parser.add_argument("--owner-harness", action="append", required=True)
     parser.add_argument("--child-harness", action="append", required=True)
     parser.add_argument("--disable-harness", action="append", default=[])
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = default_jobs_path()
     try:
         evidence = generate(
             worktree=args.worktree,

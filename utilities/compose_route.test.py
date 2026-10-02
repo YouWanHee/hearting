@@ -79,7 +79,7 @@ class TestComposeRoute(unittest.TestCase):
 
     def _run(self, units, *, tracking="tracked", spec_read="canonical-sha",
              workflow_mode="tracked", output=None, capability_mode="code", artifact_root=None,
-             slug="Compose Route"):
+             slug="Compose Route", gate_flags=True):
         """Invoke the compose-route.py CLI as a real caller would."""
         with tempfile.TemporaryDirectory() as tmp:
             evidence_path = Path(tmp) / "evidence.json"
@@ -93,9 +93,9 @@ class TestComposeRoute(unittest.TestCase):
                 "--capability", "analyze-project", "--capability-mode", capability_mode,
                 "--units-json", json.dumps(units),
                 "--cwd", str(ROOT), "--artifact-root", root,
-                "--tracking", tracking, "--spec-read", spec_read,
-                "--drift-verdict", "within-spec", "--workflow-mode", workflow_mode,
-                "--artifact-guard", "conductor-prechecked",
+                *(["--tracking", tracking, "--spec-read", spec_read,
+                   "--drift-verdict", "within-spec", "--workflow-mode", workflow_mode,
+                   "--artifact-guard", "conductor-prechecked"] if gate_flags else []),
                 "--dispatch-evidence", str(evidence_path),
                 "--cycle-anchor", "analysis_project", "--review-anchor", "reviews",
             ]
@@ -160,6 +160,17 @@ class TestComposeRoute(unittest.TestCase):
             output = Path(out_dir) / ".runtime" / "routes" / f"{route['route_id']}.json"
             self.assertEqual(json.loads(output.read_text()), route)
             R.verify_route(route, ROOT)
+
+    def test_omitted_gate_flags_take_compiles_defaults(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = self._run(UNITS, artifact_root=out_dir, gate_flags=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            route = json.loads(result.stdout)
+            self.assertEqual(route["tracking"], "tracked")
+            gate = route["tracked_gate_evidence"]
+            self.assertEqual(gate["drift_verdict"], R.DEFAULT_DRIFT_VERDICT)
+            self.assertEqual(gate["artifact_guard"]["source"], R.DEFAULT_ARTIFACT_GUARD)
+            self.assertTrue(gate["spec_read"]["satisfied"])
 
     def test_cli_requires_slug(self):
         result = self._run(UNITS, slug=None)

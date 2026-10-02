@@ -1539,12 +1539,10 @@ class TestRoute(unittest.TestCase):
    self.assertEqual(again["terminal_gate_proven"],False)
    # Idempotent re-close must not recompute: the sidecar's exact bytes are unchanged.
    self.assertEqual(R.outcome_path(path).read_bytes(),before)
- def test_close_before_complete_is_refused_by_default(self):
-  # C-25c: `close` used to seal `terminal_gate_proven=false` permanently for
-  # any route closed before its terminal node completed -- finalize could
-  # never prove the gate afterward even once `complete` actually ran. The
-  # default contract is now a typed refusal that writes no sidecar at all,
-  # so `complete` (which must run first) is not locked out by an early close.
+ def test_close_before_complete_records_unproven_without_refusing(self):
+  # `close` before the terminal node's `complete` is not refused: the refusal
+  # was bypassed almost every time it fired. The route closes, the sidecar
+  # records `terminal_gate_proven=false`, and one warning line says so.
   import subprocess,sys
   with tempfile.TemporaryDirectory() as tmp:
    artifact_root=Path(tmp)
@@ -1554,9 +1552,12 @@ class TestRoute(unittest.TestCase):
    route_path=R.canonical_routes_dir(artifact_root)/f"{route['route_id']}.json"
    result=subprocess.run([sys.executable,str(P),"close","--route",str(route_path)],
                          capture_output=True,text=True,cwd=str(R.ROOT))
-   self.assertEqual(result.returncode,64,result.stdout)
-   self.assertIn("route-close-before-complete",result.stderr)
-   self.assertFalse(R.outcome_path(route_path).exists())
+   self.assertEqual(result.returncode,0,result.stderr)
+   self.assertNotIn("route-close-before-complete",result.stderr)
+   self.assertFalse(json.loads(result.stdout)["terminal_gate_proven"])
+   warnings=[line for line in result.stderr.splitlines() if "terminal-gate-unproven" in line]
+   self.assertEqual(len(warnings),1,result.stderr)
+   self.assertTrue(R.outcome_path(route_path).exists())
  def test_close_records_false_and_warns_for_direct_unproven_gate_with_override(self):
   # Red before P2: schema 2 outcomes carry neither `terminal_gate_proven` nor
   # `terminal_gates`, and `close` never printed a warning at all -- this exercises the
@@ -1564,8 +1565,8 @@ class TestRoute(unittest.TestCase):
   # routes declare an `inline` terminal but nothing writes its marker in this test, so
   # the aggregate must be `False`, never `None` -- a direct/inline close that silently
   # reported "no terminal node" would hide every unproven direct closure.
-  # C-25c: this is now the explicit `--allow-unproven` override path; the
-  # default (no flag) is covered by test_close_before_complete_is_refused_by_default.
+  # `--allow-unproven` is still accepted (compatibility) and changes nothing; the
+  # no-flag form is covered by test_close_before_complete_records_unproven_without_refusing.
   import subprocess,sys
   with tempfile.TemporaryDirectory() as tmp:
    artifact_root=Path(tmp)
@@ -1788,6 +1789,28 @@ class TestRoute(unittest.TestCase):
   return subprocess.run(
    [sys.executable,str(P),"compile",*argv],capture_output=True,text=True,
    cwd=str(R.ROOT),env=child_env)
+ def test_compile_without_tracked_gate_flags_uses_compose_defaults(self):
+  # The five tracked-gate flags were required but accepted any value; compile now
+  # records the same defaults compose does, and an explicit value still wins.
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact_root=Path(tmp)
+   args=["--capability","autopilot-code","--capability-mode","dev","--slug","CLI Defaults",
+         "--intensity","direct","--cwd",str(R.ROOT),"--artifact-root",str(artifact_root)]
+   for predicate in ALL: args+=["--predicate",predicate]
+   compiled=self._run_compile_cli(args)
+   self.assertEqual(compiled.returncode,0,compiled.stderr)
+   route=json.loads(compiled.stdout)
+   self.assertEqual(route["tracking"],"tracked")
+   gate=route["tracked_gate_evidence"]
+   self.assertEqual(gate["workflow_mode"],"tracked")
+   self.assertEqual(gate["drift_verdict"],R.DEFAULT_DRIFT_VERDICT)
+   self.assertEqual(gate["artifact_guard"],{"satisfied":True,"source":R.DEFAULT_ARTIFACT_GUARD})
+   self.assertEqual(gate["spec_read"],R.compose_spec_read(str(R.ROOT),str(artifact_root),None))
+   explicit=self._run_compile_cli(args+["--spec-read","auto","--drift-verdict","within-spec"])
+   self.assertEqual(explicit.returncode,0,explicit.stderr)
+   gate=json.loads(explicit.stdout)["tracked_gate_evidence"]
+   self.assertEqual(gate["spec_read"],{"satisfied":True,"source":"auto"})
+   self.assertEqual(gate["drift_verdict"],"within-spec")
  def test_compile_output_omitted_writes_canonical_default(self):
   # F1: the previous version of this test never invoked the CLI at all -- it
   # called `write_once` on a path it built itself, so it exercised nothing
@@ -7076,6 +7099,142 @@ class OwnerRegisteredCompletionTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),before)
   self.assertFalse((R.completion_dir(route["route_id"])/(node["id"]+".json")).exists())
 
+
+class EnvironmentAttemptDefaultTest(unittest.TestCase):
+ """`complete` reads `--jobs`/`--attempt-id` from the environment a registered
+ worker already has, but only for its own node; every other form is unchanged."""
+ setUp=InlineStageCompletionRecipeTest.setUp
+ _restore=InlineStageCompletionRecipeTest._restore
+ fixture=OwnerRegisteredCompletionTest.fixture
+
+ def _main(self,command,env):
+  output=io.StringIO()
+  with mock.patch.dict(os.environ,env),mock.patch.object(sys,"argv",[str(P),*command]), \
+       contextlib.redirect_stdout(output):
+   R.main()
+  return [json.loads(line) for line in output.getvalue().splitlines()]
+
+ def test_registered_worker_completes_its_own_node_from_the_environment(self):
+  route,node,path,evidence=self.fixture()
+  marker,row=self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence)],
+   {"AGENT_DISPATCH_ATTEMPT_ID":"att-terminal-owner","AGENT_DISPATCH_JOBS":str(self.jobs)})
+  self.assertEqual(row["status"],"closed")
+  self.assertTrue(marker["registered_worker"])
+  self.assertEqual(marker["attempt_id"],"att-terminal-owner")
+
+ def test_stage_worker_completes_its_own_stage_from_the_environment(self):
+  artifact=self.base/"artifacts"
+  route=InlineStageCompletionRecipeTest._route(self,artifact)
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  out=artifact/"evidence"/"execute.md"; out.parent.mkdir(parents=True); out.write_text("ran\n")
+  meta={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":"1",
+   "fallback_hop":"same-harness-headless","attempt_id":"att-stage-execute",
+   "worker_type":"stage","unit":"dev/backend","route_id":route["route_id"],
+   "route_hash":route["route_hash"],"route_node":"execute","pid":"2147483647","pid_start":"1"}
+  self.jobs.write_text("\t".join(["2026-09-07T00:00:00Z","open","repo","worktree","stage",
+   ",".join(k+"="+v for k,v in meta.items())])+"\n")
+  env={"AGENT_DISPATCH_ATTEMPT_ID":"att-stage-execute","AGENT_DISPATCH_JOBS":str(self.jobs)}
+  marker,row=self._main(["complete","--route",str(path),"--node","execute","--evidence",str(out)],env)
+  self.assertEqual(row["status"],"closed")
+  self.assertTrue(marker["registered_worker"])
+  self.assertEqual(marker["attempt_id"],"att-stage-execute")
+  # An explicit `--jobs` with the attempt left to the environment reaches the same row.
+  marker,row=self._main(["complete","--route",str(path),"--node","execute","--evidence",str(out),
+   "--jobs",str(self.jobs)],env)
+  self.assertEqual(row["status"],"already-closed")
+  self.assertEqual(marker["attempt_id"],"att-stage-execute")
+
+ def test_explicit_attempt_wins_and_finds_the_registry_by_default(self):
+  route,node,path,evidence=self.fixture()
+  marker,row=self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
+   "--attempt-id","att-terminal-owner"],
+   {"AGENT_DISPATCH_ATTEMPT_ID":"att-someone-else","AGENT_DISPATCH_JOBS":str(self.jobs)})
+  self.assertEqual(row["status"],"closed")
+  self.assertEqual(marker["attempt_id"],"att-terminal-owner")
+
+ def test_an_attempt_bound_elsewhere_fills_nothing(self):
+  route,node,path,evidence=self.fixture()
+  other=next(n for n in route["nodes"] if n["id"]!=node["id"] and n.get("dispatch_depth")
+             and n.get("kind")!="resource-runner")
+  before=self.jobs.read_bytes()
+  for jobs in (str(self.jobs),str(self.base/"absent"/"jobs.log")):
+   with self.assertRaisesRegex(ValueError,"current dispatched completion requires exact attempt metadata"):
+    self._main(["complete","--route",str(path),"--node",other["id"],"--evidence",str(evidence)],
+     {"AGENT_DISPATCH_ATTEMPT_ID":"att-terminal-owner","AGENT_DISPATCH_JOBS":jobs})
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_depth0_inline_node_ignores_an_owner_environment(self):
+  route=R.compile_route(**TestRoute().args(artifact_root=self.base/"artifacts"))
+  node=route["nodes"][0]
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  evidence=self.base/"artifacts"/"report.md"; evidence.write_text("done\n")
+  # A live owner of this very route: its row is real, but not this node's attempt.
+  meta={"attempt_schema_version":"2","dispatch_depth":"1","transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":"1",
+   "fallback_hop":"same-harness-headless","attempt_id":"att-owner",
+   "worker_type":"owner","unit":"_kernel/owner","owner_route_id":route["route_id"],
+   "owner_route_hash":route["route_hash"],"owner_route_file":str(path),
+   "pid":"2147483647","pid_start":"1"}
+  self.jobs.write_text("\t".join(["2026-09-07T00:00:00Z","open","repo","worktree","owner",
+   ",".join(k+"="+v for k,v in meta.items())])+"\n")
+  before=self.jobs.read_bytes()
+  marker,=self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence)],
+   {"AGENT_DISPATCH_ATTEMPT_ID":"att-owner","AGENT_DISPATCH_JOBS":str(self.jobs)})
+  self.assertFalse(marker["registered_worker"])
+  self.assertIsNone(marker.get("attempt_id"))
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_inline_axes_form_stays_unregistered_with_the_environment_set(self):
+  artifact=self.base/"artifacts"
+  route=InlineStageCompletionRecipeTest._route(self,artifact)
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  out=artifact/"evidence"/"execute.md"; out.parent.mkdir(parents=True); out.write_text("ran inline\n")
+  marker,row=self._main(["complete","--route",str(path),"--node","execute","--evidence",str(out),
+   "--attempt-id","att-owner-execute-inline","--dispatch-depth","2","--transport","headless",
+   "--execution-surface","inline","--registered-worker","0","--fallback-hop","inline"],
+   {"AGENT_DISPATCH_ATTEMPT_ID":"att-owner","AGENT_DISPATCH_JOBS":str(self.jobs)})
+  self.assertEqual(row["status"],"unregistered-complete")
+  self.assertEqual(self.jobs.read_text(),"")
+
+ def test_resource_run_takes_nothing_from_the_environment(self):
+  t=TestRoute()
+  route=R.compile_route(**t.args(capability="autopilot-lab",capability_mode="setup",
+   artifact_root=self.base/"artifacts",requested_intensity="auto",predicates=[],signals=["resource-run"],
+   transport="headless",inline_reason=None,dispatch_evidence=t.dispatch(t.nested())))
+  node=next(n for n in route["nodes"] if n.get("kind")=="resource-runner")
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  evidence=self.base/"artifacts"/"run.md"; evidence.write_text("run\n")
+  with mock.patch.object(R,"complete_node",return_value=({},None)) as complete:
+   self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence)],
+    {"AGENT_DISPATCH_ATTEMPT_ID":"att-owner","AGENT_DISPATCH_JOBS":str(self.jobs)})
+  self.assertIsNone(complete.call_args.kwargs["jobs"])
+  self.assertIsNone(complete.call_args.kwargs["attempt_id"])
+
+ def test_subsession_gate_defaults_only_the_registry(self):
+  route,node,path,evidence=self.fixture()
+  manifest=self.base/"manifest.json"; manifest.write_text("{}")
+  with mock.patch.object(R,"complete_subsession_stage",return_value=({},None)) as complete:
+   self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
+    "--subsession-manifest",str(manifest)],
+    {"AGENT_DISPATCH_ATTEMPT_ID":"att-terminal-owner","AGENT_DISPATCH_JOBS":str(self.jobs)})
+  self.assertEqual(complete.call_args.args[5],str(self.jobs))
+
+ def test_check_reads_the_environment_and_keeps_its_refusals(self):
+  route,node,path,evidence=self.fixture()
+  env={"AGENT_DISPATCH_ATTEMPT_ID":"att-terminal-owner","AGENT_DISPATCH_JOBS":str(self.jobs)}
+  with mock.patch.object(R,"owner_closure_plan",return_value={}) as plan:
+   result,=self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
+    "--check"],env)
+   self.assertEqual(result["result"],"ready")
+   self.assertEqual(plan.call_args.args[3:],(str(self.jobs),"att-terminal-owner"))
+   with self.assertRaisesRegex(ValueError,"owner-closure-check-requires-exact-jobs-attempt-and-no-overrides"):
+    self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
+     "--check","--output",str(self.base/"out.json")],env)
 
 class ShipPackageOwnerCompletionTest(OwnerRegisteredCompletionTest):
  """The standard package owner uses existing registered completion and closure."""

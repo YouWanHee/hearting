@@ -3490,22 +3490,18 @@ else
   bad "opencode session end must not sync memory"
 fi
 
-echo "== SD-11b stage-dispatch gate (deny 상향 + opt-out + intensity 불명) =="
-# (i) conductor + standard + code-plan, NO opt-out → HARD DENY (CLI: exit 2, stderr ⛔)
-err=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill code-plan --dispatch-depth 1 --intensity standard 2>&1 >/dev/null); rc=$?
-if [ "$rc" -eq 2 ] \
-  && printf '%s' "$err" | grep -q 'stage-dispatch denied' \
-  && printf '%s' "$err" | grep -q 'dispatch-node.py' \
-  && printf '%s' "$err" | grep -q -- '--route <route-file>' \
-  && printf '%s' "$err" | grep -q -- '--jobs <canonical-jobs.log>' \
-  && printf '%s' "$err" | grep -q 'attempt_id'; then
-  ok "SDR hard-denies conductor+standard+code-plan without opt-out (exit 2)"
-else bad "SDR should deny conductor+standard+code-plan (rc=$rc) [$err]"; fi
-# (i-opt) same but STAGE_DISPATCH_INLINE_OK=1 → soft reminder (additionalContext, exit 0)
-out=$(CLAUDE_CODE_CHILD_SESSION=1 STAGE_DISPATCH_INLINE_OK=1 AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill code-plan --dispatch-depth 1 --intensity standard 2>/dev/null); rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"additionalContext"' && printf '%s' "$out" | grep -q 'stage-dispatch'; then
-  ok "SDR downgrades to reminder under STAGE_DISPATCH_INLINE_OK=1 opt-out"
-else bad "SDR should emit reminder (not deny) under opt-out [$out]"; fi
+echo "== SD-11 stage-dispatch reminder (안내만, 거부 없음) =="
+# (i) conductor + standard + code-plan → reminder only (additionalContext, exit 0), never a deny
+out=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill code-plan --dispatch-depth 1 --intensity standard 2>/dev/null); rc=$?
+if [ "$rc" -eq 0 ] \
+  && printf '%s' "$out" | grep -q '"additionalContext"' \
+  && ! printf '%s' "$out" | grep -q 'permissionDecision' \
+  && printf '%s' "$out" | grep -q 'dispatch-node.py' \
+  && printf '%s' "$out" | grep -q -- '--route <route-file>' \
+  && printf '%s' "$out" | grep -q -- '--jobs <canonical-jobs.log>' \
+  && printf '%s' "$out" | grep -q 'attempt_id'; then
+  ok "SDR reminds (no deny) for conductor+standard+code-plan"
+else bad "SDR should only remind for conductor+standard+code-plan (rc=$rc) [$out]"; fi
 # (i-unknown) conductor + code-plan but intensity empty (old wrapper) → reminder, NEVER deny
 out=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill code-plan --dispatch-depth 1 --intensity "" 2>/dev/null); rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"additionalContext"'; then
@@ -3526,11 +3522,16 @@ out=$("$SDR" --skill code-plan --dispatch-depth "" --intensity standard 2>&1); r
 # (vi) §5.10: a runtime child-session marker alone is a teammate session, not a conductor → no-op
 out=$(CLAUDE_CODE_CHILD_SESSION=1 "$SDR" --skill code-plan --dispatch-depth "" --intensity standard 2>&1); rc=$?
 [ "$rc" -eq 0 ] && [ -z "$out" ] && ok "SDR no-ops for teammate session (runtime marker, no depth)" || bad "SDR should no-op for teammate session [$out] rc=$rc"
-# (vii) depth is sufficient evidence without the runtime marker → still denies
-err=$(env -u CLAUDE_CODE_CHILD_SESSION AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill code-plan --dispatch-depth 1 --intensity standard 2>&1 >/dev/null); rc=$?
-[ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'stage-dispatch denied' \
-  && ok "SDR denies on harness depth marker alone (no runtime marker)" \
-  || bad "SDR should deny on depth alone (rc=$rc) [$err]"
+# (vii) depth is sufficient evidence without the runtime marker → still reminds
+out=$(env -u CLAUDE_CODE_CHILD_SESSION AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill code-plan --dispatch-depth 1 --intensity standard 2>/dev/null); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"additionalContext"' \
+  && ok "SDR reminds on harness depth marker alone (no runtime marker)" \
+  || bad "SDR should remind on depth alone (rc=$rc) [$out]"
+# (viii) hook (stdin) mode emits the same reminder and never a permissionDecision
+out=$(printf '%s' '{"tool_name":"Skill","tool_input":{"skill":"code-execute"}}' | AGENT_DISPATCH_DEPTH=1 AGENT_DISPATCH_INTENSITY=strong "$SDR" 2>/dev/null); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"additionalContext"' && ! printf '%s' "$out" | grep -q 'permissionDecision' \
+  && ok "SDR hook mode reminds without deny" \
+  || bad "SDR hook mode should remind only (rc=$rc) [$out]"
 
 echo "== §5.10 main-session lifecycle predicates: harness markers only =="
 # A runtime injects CLAUDE_CODE_CHILD_SESSION into every child process an ordinary

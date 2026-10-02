@@ -1,40 +1,26 @@
 #!/bin/sh
-# PreToolUse(Skill): SD-11 → SD-11b stage-dispatch gate.
-#   A dispatch-depth-1 conductor at standard+ intensity must dispatch each durable stage
+# PreToolUse(Skill): SD-11 stage-dispatch reminder (Claude hook; portable CLI elsewhere).
+#   A dispatch-depth-1 conductor at standard+ intensity normally dispatches each durable stage
 #   (code-plan/execute/test/report) as its own dispatch-depth-2 headless session
-#   (dev-pipeline Step 1~7), not invoke code-<stage> in-session.
+#   (dev-pipeline Step 1~7) instead of invoking code-<stage> in-session.
 #
-#   SD-11 shipped this as a *soft reminder* because the hook could not tell a
-#   legitimate inline fallback from a mistake. SD-11b (§8.6.3) closes that gap:
-#   the wrapper now injects AGENT_DISPATCH_INTENSITY into every child env
-#   (dispatch-headless.py, all 3 adapters), so [conductor + standard+ + code-<stage>]
-#   is a *deterministic* condition. The soft reminder failed twice in a row
-#   (a minimal-prompt conductor borrowed a self-modification exception and ran
-#   inline anyway), so at that deterministic condition we now **hard deny**.
+#   The hook only reminds; it never denies. It cannot tell a legitimate inline run (a checked
+#   runtime fallback, a full worker seat, a nonseparable edit) from a mistake: its one real deny
+#   in 30 days was a false positive that sent an owner into 24 retries against the same limit.
+#   Codex and OpenCode never had a deny here, so a reminder keeps the three harnesses equal.
 #
 #   Decision (else clean exit 0 / silent):
 #     conductor_code_stage = AGENT_DISPATCH_DEPTH=1 (harness-planted dispatch marker)
 #                            AND skill ∈ {code-plan,code-execute,code-test,code-report}
 #     · not conductor_code_stage        → silent (main, dispatch-depth-2 stage session, non-code)
 #     · intensity ∈ {direct,quick}      → silent (direct inline; quick is a dispatch-depth-1 one-shot worker)
-#     · intensity ∈ {standard,strong,thorough,adversarial}:
-#         · STAGE_DISPATCH_INLINE_OK=1   → soft reminder (orchestrator granted an explicit
-#                                          inline opt-out — e.g. a self-modification cycle
-#                                          editing the dispatch launch path itself, §8.6.3(c))
-#         · else                         → HARD DENY + dispatch-headless guidance
-#     · intensity unknown/empty          → soft reminder (old wrapper without the env; cannot
-#                                          confirm standard+, so never deny — no false positive)
-#
-#   Deny mechanism mirrors worktree-path-guard.sh (drill g3/g6 precedent):
-#     hook(stdin) mode → JSON permissionDecision=deny, exit 0
-#     CLI mode         → "⛔ ..." on stderr, exit 2
+#     · otherwise (standard+ or unknown) → reminder (additionalContext JSON on stdout), exit 0
 #
 #   Portable CLI (conformance): stage-dispatch-reminder.sh --skill <name>
 #     [--cwd <dir>] [--session <id>] [--dispatch-depth <n>] [--intensity <i>]
 #   Without args, reads Claude PreToolUse hook JSON from stdin.
 
 CODE_STAGES="code-plan code-execute code-test code-report"
-HOOK_MODE=1  # 0 = CLI (argv present), 1 = stdin hook JSON
 
 is_code_stage() {
   for s in $CODE_STAGES; do [ "$1" = "$s" ] && return 0; done
@@ -50,35 +36,17 @@ conductor_code_stage() { # $1=skill $2=depth ; env: AGENT_DISPATCH_DEPTH (via ca
   return 0
 }
 
-_json_wrap() { # $1=json-field-name $2=message ; emit PreToolUse hookSpecificOutput
-  printf '%s' "$2" | python3 -c 'import sys,json
-field=sys.argv[1]; msg=sys.stdin.read()
-out={"hookSpecificOutput":{"hookEventName":"PreToolUse"}}
-if field=="deny":
-    out["hookSpecificOutput"]["permissionDecision"]="deny"
-    out["hookSpecificOutput"]["permissionDecisionReason"]=msg
-else:
-    out["hookSpecificOutput"]["additionalContext"]=msg
-print(json.dumps(out, ensure_ascii=False))' "$1"
+_json_wrap() { # $1=message ; emit PreToolUse hookSpecificOutput additionalContext
+  printf '%s' "$1" | python3 -c 'import sys,json
+out={"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":sys.stdin.read()}}
+print(json.dumps(out, ensure_ascii=False))'
 }
 
 emit_reminder() { # $1=skill
   self="${AGENT_DISPATCH_SELF_SLUG:-\$AGENT_DISPATCH_SELF_SLUG}"
   node=${1#code-}
   msg="📌 stage-dispatch: this session is a dispatch-depth-1 conductor (intensity=${AGENT_DISPATCH_INTENSITY:-?}). Dispatch ${1} route-bound with dispatch-node.py --route <route-file> --node ${node} --adapter <adapter> --action start --slug <stage-slug> --parent ${self} -- --jobs <canonical-jobs.log>; capture the emitted attempt_id, then yield for the runtime-owned exact-batch join and harvest the typed receipt before completing that route/node/attempt (dev-pipeline steps 1-7). Use dispatch-wait only when the wrapper reports poll-fallback. Invoke the Skill in-session only for direct inline work, a quick one-shot worker, or a checked runtime fallback."
-  _json_wrap context "$msg"
-}
-
-emit_deny() { # $1=skill
-  self="${AGENT_DISPATCH_SELF_SLUG:-\$AGENT_DISPATCH_SELF_SLUG}"
-  node=${1#code-}
-  msg="⛔ stage-dispatch denied: a dispatch-depth-1 conductor (intensity=${AGENT_DISPATCH_INTENSITY:-?}) invoked ${1} in-session. At standard+ intensity, use dispatch-node.py --route <route-file> --node ${node} --adapter <adapter> --action start --slug <stage-slug> --parent ${self} -- --jobs <canonical-jobs.log>; capture attempt_id, yield for the runtime-owned exact-batch join, harvest the typed receipt, and complete that route/node/attempt. A legitimate inline case such as a self-modification cycle requires the orchestrator to set STAGE_DISPATCH_INLINE_OK=1 when launching; the conductor cannot grant itself an exception (§8.6.3)."
-  if [ "$HOOK_MODE" -eq 1 ]; then
-    _json_wrap deny "$msg"
-    exit 0
-  fi
-  printf '%s\n' "$msg" >&2
-  exit 2
+  _json_wrap "$msg"
 }
 
 # decide — single decision point; unmet conditions exit silently with status 0.
@@ -86,22 +54,12 @@ decide() { # $1=skill $2=depth $3=intensity
   conductor_code_stage "$1" "$2" || return 0
   case "$3" in
     direct|quick) return 0 ;;  # Direct inline / quick one-shot worker: stay silent.
-    standard|strong|thorough|adversarial)
-      if [ "${STAGE_DISPATCH_INLINE_OK:-}" = "1" ]; then
-        emit_reminder "$1"     # Explicit orchestrator opt-out: soft reminder.
-      else
-        emit_deny "$1"         # hard deny.
-      fi
-      ;;
-    *)  # Unknown intensity from an older wrapper: reminder only to avoid false-positive denial.
-      emit_reminder "$1"
-      ;;
+    *) emit_reminder "$1" ;;   # standard+ or unknown intensity: remind, never deny.
   esac
 }
 
 # --- CLI mode ---
 if [ "$#" -gt 0 ]; then
-  HOOK_MODE=0
   skill=""; depth="${AGENT_DISPATCH_DEPTH:-}"; intensity="${AGENT_DISPATCH_INTENSITY:-}"
   while [ "$#" -gt 0 ]; do
     case "$1" in

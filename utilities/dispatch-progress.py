@@ -728,7 +728,7 @@ def main(argv):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("operation", choices=("heartbeat", "inspect", "watchdog"))
     p.add_argument("--attempt-id", required=True); p.add_argument("--route-id", required=True)
-    p.add_argument("--route-node", required=True); p.add_argument("--jobs", type=Path, required=True)
+    p.add_argument("--route-node", required=True); p.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     p.add_argument("--agent-home", type=Path); p.add_argument("--phase", choices=PROGRESS_PHASES)
     p.add_argument("--kind", choices=sorted(KINDS)); p.add_argument("--evidence")
     p.add_argument("--progress-window-seconds", type=float, default=300.0)
@@ -737,6 +737,9 @@ def main(argv):
     p.add_argument("--if-absent", action="store_true",
                    help="heartbeat only: keep an existing heartbeat at any phase instead of failing phase regression")
     args = p.parse_args(argv[1:]); args.agent_home = (args.agent_home or resolve_agent_home()).resolve()
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = default_jobs_path(agent_home=args.agent_home)
     args.jobs = args.jobs.resolve(); now = args.now if args.now is not None else time.time()
     try:
         result = heartbeat(args, now) if args.operation == "heartbeat" else inspect(args, now) if args.operation == "inspect" else watchdog(args, now)

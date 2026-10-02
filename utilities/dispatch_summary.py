@@ -771,10 +771,13 @@ def main(argv: list[str] | None = None) -> int:
     supervise_parser.add_argument("--review-cycle-id")
     supervise_parser.add_argument("--review-lease-nonce")
     ensure_parser = commands.add_parser("ensure")
-    ensure_parser.add_argument("--jobs", required=True)
+    ensure_parser.add_argument("--jobs", help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     ensure_parser.add_argument("--attempt-id", required=True)
     args = parser.parse_args(argv)
     if args.command == "ensure":
+        if args.jobs is None:
+            from dispatch_contract import default_jobs_path
+            args.jobs = str(default_jobs_path())
         result = ensure_attempt_owner(args.jobs, args.attempt_id)
         print(json.dumps(result, sort_keys=True))
         return 0 if result["state"] in {"existing", "started", "skipped"} else 1
