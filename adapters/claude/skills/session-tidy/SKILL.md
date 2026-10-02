@@ -16,7 +16,8 @@ metadata:
 # session-tidy (정리)
 
 Write the handoff card yourself, queue the memory tidy, and let the window clear itself
-when it is safe. Nothing here is required input and nothing waits for a confirmation.
+when it is safe; the new session then picks the work up from the card by itself. Nothing
+here is required input and nothing waits for a confirmation.
 
 Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 <받을 세션>` (same
 work, then pass the card to a peer session; only this calling window is cleared, never the
@@ -37,11 +38,13 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    CARD
    ```
 
-2. **Queue the tidy.** Do not wait for it. For `정리만` add `--no-clear`.
+2. **Queue the tidy.** Do not wait for it. For `정리만` add `--no-clear`; when the user
+   asked to stop after tidying ("정리하고 끝"), add `--no-continue`.
 
    ```bash
-   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue            # 정리 / 인계
-   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue --no-clear # 정리만
+   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue               # 정리 / 인계
+   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue --no-clear    # 정리만
+   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue --no-continue # 정리하고 끝
    ```
 
    It prints one line and returns. A detached runner reads the conversation after the
@@ -56,9 +59,12 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    Inside herdr the same call books the window's clear (`clear=scheduled`): once this turn
    has ended and the window is idle, with no form open and an empty input box, the
    harness's own new-conversation command is typed once (Claude `/clear`, Codex `/clear`,
-   OpenCode `/new`) and the new session receives the card. It never waits for the memory
-   tidy. A prompt typed after the card cancels it (`clear=skipped`), and anything the helper
-   cannot decide leaves the window as it is plus one result line at the next prompt.
+   OpenCode `/new`) and the new session receives the card. Once the clear is confirmed and
+   the new session waits with an empty box and no message yet, the same helper types
+   `이어서해` once, so it carries on from the card. Neither step waits for the memory tidy.
+   A prompt typed after the card cancels the clear (`clear=skipped`); a prompt typed into the
+   new session first, a new card or a handoff cancels the `이어서해` quietly. Anything else
+   the helper cannot decide leaves the window as it is plus one result line at the next prompt.
 
 3. **Handoff only.** For `인계 <받을 세션>`, after step 2:
 
@@ -68,10 +74,13 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
 
    Report its one line as printed (`prompted=true|failed|queued|unverified` and the exit
    code); do not retry or send the card any other way. A failed handoff does not change the
-   clear of this window; they are separate results.
+   clear of this window; they are separate results. The work now belongs to the target, so
+   this window is cleared but not continued.
 
-4. **Report one line**, from the `clear=` word of step 2:
-   `clear=scheduled` → "곧 이 창이 자동으로 비워집니다." (do not start more work after it);
+4. **Report one line**, from the `clear=` word of step 2 (do not start more work after a
+   `clear=scheduled`):
+   `clear=scheduled` → "곧 이 창이 자동으로 비워지고, 새 세션이 카드를 받아 이어서 진행합니다.";
+   `clear=scheduled continue=off`, or `clear=scheduled` with a handoff → "곧 이 창이 자동으로 비워집니다.";
    `clear=off` → "이 창은 그대로 둡니다. 이제 /clear 하거나 닫아도 됩니다.";
    `clear=manual hint=<cmd>` or `clear=skipped` → "이제 <cmd> 하거나 닫아도 됩니다."
    (`<cmd>` is the hint, or `/clear` after `skipped`; OpenCode's is `/new`).

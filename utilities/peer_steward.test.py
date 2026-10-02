@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -2016,6 +2017,14 @@ OPENCODE_DRAFT = "     ▣  Build · Model\n\n  ┃  hello there\n  ┃\n  ┃  
 OPENCODE_HOME_BLANK = "\n" * 12 + "  /path/to/project:main\n\n"     # 1.18.34: nothing but the cwd line
 OPENCODE_HOME = "\n\n  ┃  Ask anything... \"Fix broken tests\"\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
 NO_BOX = "just some output\nwith no prompt box at all\n"
+OLD_T = "01a0fbf0-3ad5-7501-9838-eb440504686e"
+NEW_T = "01a0fbf0-d65e-7041-9744-c8f5300f35a3"
+
+
+def codex_screen(footer):
+    """A measured codex 0.160.0 bottom: the input box, one blank line, the status line, the hint line."""
+    return ("• recap of the last turn\n\n\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n  "
+            + footer + "\n  ← for agents · ? for shortcuts\n")
 
 
 class _ClearWorld:
@@ -2318,6 +2327,37 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
             rc = peer_steward.main(["clear", "w1:pX", "--request", str(self.path)])
         self.assertEqual((rc, printed[-1]), (1, "cleared=failed reason=herdr-not-found"))
 
+    def test_a_new_thread_on_the_codex_status_line_proves_the_clear(self):
+        self.book(harness="codex", sid=OLD_T)
+        world = _ClearWorld(harness="codex", sid=OLD_T, new_sid=None, screens=[codex_screen("proj · main · Fix it")],
+                            home_after=codex_screen(f"proj · main · Context 0% used · {NEW_T}"))
+        with mock.patch("fleet.collectors.codex.session_id_of_process", return_value=None), \
+                mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+            rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, f"new_session={NEW_T}" in line), (0, True), line)
+        self.assertEqual(len(world.typed()), 1)
+
+    def test_a_status_line_id_that_was_there_before_is_cut_or_ambiguous_proves_nothing(self):
+        other = "01a0fbf0-aaaa-7bbb-8ccc-dddddddddddd"
+        st = self.st
+        seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "codex", "")
+        with st.seat_lock(seat.key):
+            st.record_event(seat, "codex", other, "prompt", cwd="/w", now=time.time() - 300)
+        cases = ((f"proj · {NEW_T} · Fix it", f"proj · {NEW_T} · Fix it", "already shown"),
+                 ("proj · Fix it", f"proj · {NEW_T} · 01a0fbf0-eeee-7fff-8000-111111111111", "two new ids"),
+                 ("proj · Fix it", "proj · Context 0% used · 01a0fbf0-d65e-7041-9744-c8f5300f…", "cut id"),
+                 (f"proj · {OLD_T}", f"proj · {OLD_T} · {NEW_T}", "the cleared id still shown"),
+                 ("proj · Fix it", f"proj · {other}", "a session the seat already knows"))
+        for before, after, label in cases:
+            with self.subTest(label):
+                self.book(harness="codex", sid=OLD_T)
+                world = _ClearWorld(harness="codex", sid=OLD_T, new_sid=None, screens=[codex_screen(before)],
+                                    home_after=codex_screen(after))
+                with mock.patch("fleet.collectors.codex.session_id_of_process", return_value=None), \
+                        mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertEqual((rc, "cleared=unverified" in line), (5, True), line)
+
     def test_every_judged_call_leaves_one_notice_ledger_row_with_the_action(self):
         self.book()
         self.clear_cmd(_ClearWorld(screens=[CLAUDE_DRAFT]))
@@ -2339,6 +2379,251 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(draft("codex", lines("›\n")), "empty")
         self.assertEqual(draft("opencode", lines("  ┃  just text\n")), "unknown")      # a single bar line is no box
         self.assertEqual(draft("unheard-of", lines(CLAUDE_EMPTY)), "unknown")
+
+
+class _ContinueWorld(_ClearWorld):
+    """The window after a confirmed clear: herdr's session stays what it says, the prompt answers as told."""
+
+    def __init__(self, harness="claude", herdr_sid="sid-B", screens=None, reply=(0, ""), **kw):
+        super().__init__(harness=harness, sid=herdr_sid, new_sid=None, screens=screens or [CLAUDE_EMPTY], **kw)
+        self.reply = reply
+        self.on_prompt = self.on_wait = None
+
+    def run(self, argv, **kw):
+        if argv[:3] == ["herdr", "agent", "prompt"]:
+            self.calls.append(list(argv))
+            if self.on_prompt:
+                self.on_prompt()
+            rc, err = self.reply
+            return subprocess.CompletedProcess(argv, rc, stdout="{}" if rc == 0 else "", stderr=err)
+        if argv[:3] == ["herdr", "agent", "wait"] and self.on_wait:
+            self.on_wait()
+        return super().run(argv, **kw)
+
+
+TIMEOUT_REPLY = (1, json.dumps({"error": {"code": "timeout"}}))
+
+
+class ContinueTest(_TmpRootMixin, unittest.TestCase):
+    """`continue`: the one prompt after a confirmed clear (fake herdr, real booking files)."""
+
+    rows = ClearTest.rows
+
+    def setUp(self):
+        super().setUp()
+        import session_tidy as st
+        import session_tidy_clear as clear
+        self.st, self.clear = st, clear
+
+    def cleared(self, harness="claude", sid="sid-A", new="sid-B", pane="w1:pX", seq=0, receipt=True, window=120):
+        st, clear = self.st, self.clear
+        shutil.rmtree(st.state_root(), ignore_errors=True)       # every case starts from an empty seat
+        seat = st.Seat("pane", st._digest("pane", pane), pane, harness, "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, harness, sid, "card body", prompt_seq=seq)
+            if receipt and harness == "claude":
+                st._write_consumed(seat, generation=card["generation"], receipts=[f"claude:{new}:0"])
+            clear._write_reservation({
+                "schema": 1, "nonce": "n0nce", "status": "cleared", "created": now - 30, "deadline": now + 570,
+                "seat": {"kind": "pane", "key": seat.key, "pane": pane, "harness": harness, "project_key": ""},
+                "harness": harness, "sid": sid, "cwd": str(self.tmp_root), "new_session": new,
+                "card_generation": card["generation"], "prompt_seq": seq, "continue_off": False,
+                "continued": {"state": "pending", "deadline": now + window}})
+        self.seat_obj, self.path = seat, clear.reservation_path(seat.key)
+        return seat
+
+    def continue_cmd(self, world, nonce="n0nce", process=None):
+        argv = ["continue", world.pane, "--request", str(self.path), *(["--nonce", nonce] if nonce else [])]
+        printed = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+             mock.patch("fleet.collectors.claude.session_id_of_process", return_value=process), \
+             mock.patch("fleet.collectors.codex.session_id_of_process", return_value=process), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(argv)
+        return rc, (printed[-1] if printed else "")
+
+    def booking(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def rollout(self, thread):
+        path = self.tmp_root / "home" / ".codex" / "sessions" / "2026" / "10" / "02" / f"rollout-2026-10-02T18-27-39-{thread}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+
+    # -- the one prompt -----------------------------------------------------------------------
+
+    def test_a_cleared_claude_window_gets_the_continue_prompt_exactly_once(self):
+        self.cleared()
+        world = _ContinueWorld()
+        rc, line = self.continue_cmd(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("continued=true", line)
+        self.assertIn("verify=state-flip", line)
+        self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "이어서해",
+                                          "--wait", "--until", "working", "--timeout", "8000"]])  # no trailer
+        self.assertEqual(self.booking()["continued"]["state"], "sending")     # the helper writes the end
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("action=continue continued=true", rows[0]["delivery"]["receipt"])
+        rc, line = self.continue_cmd(world)                                  # asked again: nothing more
+        self.assertEqual((rc, "reason=superseded" in line, len(world.typed())), (3, True, 1), line)
+
+    def test_the_claude_session_is_the_process_one_when_herdr_still_names_the_cleared_one(self):
+        for process, expect in (("sid-B", "continued=true"), ("sid-A", "reason=target-changed"),
+                                (None, "reason=target-changed")):
+            with self.subTest(process=process):
+                self.cleared()
+                world = _ContinueWorld(herdr_sid="sid-A")
+                rc, line = self.continue_cmd(world, process=process)
+                self.assertIn(expect, line)
+                self.assertEqual(len(world.typed()), 1 if expect == "continued=true" else 0)
+
+    def test_claude_gets_a_bounded_while_for_its_start_hook_to_take_the_card(self):
+        st = self.st
+        seat = self.cleared(receipt=False)
+        world = _ContinueWorld()
+        waits = []
+
+        def hook_lands():
+            waits.append(1)
+            if len(waits) == 2:
+                with st.seat_lock(seat.key):
+                    st._write_consumed(seat, generation=1, receipts=["claude:sid-B:0"])
+        world.on_wait = hook_lands
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, len(world.typed())), (0, 1), line)
+        self.cleared(receipt=False)
+        world = _ContinueWorld()
+        with mock.patch.object(peer_steward, "_CONTINUE_LOOK_ROUNDS", 3):
+            rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "reason=card-not-delivered" in line, world.typed()), (3, True, []), line)
+
+    def test_a_busy_blocked_unreadable_form_or_draft_window_gets_nothing(self):
+        cases = (({"status": "working"}, "not-idle-working"), ({"status": "blocked"}, "form-open"),
+                 ({"screens": [None]}, "screen-unknown"), ({"screens": [CLAUDE_FORM]}, "form-open"),
+                 ({"screens": [CLAUDE_DRAFT]}, "draft"), ({"screens": [NO_BOX]}, "draft-unknown"),
+                 ({"screens": [CLAUDE_EMPTY, CLAUDE_DRAFT]}, "draft"))     # typing starts between the looks
+        for kwargs, reason in cases:
+            with self.subTest(reason=reason, kwargs=str(kwargs)[:40]):
+                self.cleared()
+                world = _ContinueWorld(**kwargs)
+                with mock.patch.object(peer_steward, "_CONTINUE_LOOK_ROUNDS", 2):
+                    rc, line = self.continue_cmd(world)
+                self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
+
+    def test_a_new_prompt_new_card_handoff_lapse_or_spent_booking_gets_nothing_and_no_row(self):
+        st, clear = self.st, self.clear
+
+        def bump(seat):
+            with st.seat_lock(seat.key):
+                st.bump_prompt_seq(seat, "claude", "sid-B", time.time())
+
+        def rewrite(seat):
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "claude", "sid-B", "new card")
+
+        def edit(**fields):
+            def apply(_seat):
+                data = self.booking()
+                data.update(fields)
+                self.path.write_text(json.dumps(data), encoding="utf-8")
+            return apply
+        cases = ((bump, "new-input"), (rewrite, "card-changed"), (st.mark_card_handed_off, "handed-off"),
+                 (edit(continued={"state": "pending", "deadline": time.time() - 1}), "expired"),
+                 (edit(continued={"state": "sending"}), "superseded"), (edit(status="reserved"), "superseded"),
+                 (edit(continue_off=True), "off"))
+        for change, reason in cases:
+            with self.subTest(reason=reason):
+                change(self.cleared())
+                world = _ContinueWorld()
+                rc, line = self.continue_cmd(world)
+                self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
+        self.cleared()
+        rc, line = self.continue_cmd(_ContinueWorld(), nonce="another")
+        self.assertEqual((rc, "reason=superseded" in line), (3, True))
+        self.assertEqual(self.rows(), [])                               # a dead request leaves no ledger row
+
+    def test_codex_needs_its_new_thread_on_the_status_line_and_no_rollout_yet(self):
+        screen = codex_screen(f"proj · main · Context 0% used · {NEW_T}")
+        self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
+        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[screen])
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, len(world.typed())), (0, 1), line)
+        self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
+        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[codex_screen("proj · main · Fix it")])
+        rc, line = self.continue_cmd(world)                              # a title instead: not provably that thread
+        self.assertEqual((rc, "reason=target-changed" in line, world.typed()), (3, True, []), line)
+        rc, line = self.continue_cmd(world, process=NEW_T)               # ... unless the process names it
+        self.assertEqual((rc, len(world.typed())), (0, 1), line)
+        self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
+        self.rollout(NEW_T)                                              # someone already wrote to it
+        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[screen])
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "reason=new-input" in line, world.typed()), (3, True, []), line)
+
+    def test_codex_and_opencode_skip_a_card_another_session_already_took(self):
+        st = self.st
+        seat = self.cleared(harness="codex", sid=OLD_T, new=NEW_T)
+        with st.seat_lock(seat.key):
+            st._write_consumed(seat, generation=1, receipts=["codex:someone:0"])
+        world = _ContinueWorld(harness="codex", herdr_sid=OLD_T, screens=[codex_screen(NEW_T)])
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "reason=card-taken" in line, world.typed()), (3, True, []), line)
+
+    def test_opencode_types_only_on_its_home_screen(self):
+        for screen, typed in ((OPENCODE_HOME_BLANK, 1), (OPENCODE_HOME, 1), (OPENCODE_EMPTY, 0), (OPENCODE_DRAFT, 0)):
+            with self.subTest(screen=screen[:24]):
+                self.cleared(harness="opencode", sid="ses_A", new="-")
+                world = _ContinueWorld(harness="opencode", herdr_sid=None, screens=[screen], status="done")
+                rc, line = self.continue_cmd(world)
+                self.assertEqual(len(world.typed()), typed, line)
+                if not typed:
+                    self.assertIn("reason=target-changed", line)
+
+    # -- after the send: evidence, never a second one ------------------------------------------
+
+    def test_a_send_herdr_cannot_confirm_needs_the_prompt_hook_or_the_transcript(self):
+        st = self.st
+        seat = self.cleared()
+        world = _ContinueWorld(reply=TIMEOUT_REPLY)
+
+        def hook():
+            with st.seat_lock(seat.key):
+                st.bump_prompt_seq(seat, "claude", "sid-B", time.time())
+        world.on_prompt = hook
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "verify=prompt-hook" in line), (0, True), line)
+        self.cleared()
+        world = _ContinueWorld(reply=TIMEOUT_REPLY)
+        transcript = self.tmp_root / "home" / ".claude" / "projects" / "p" / "sid-B.jsonl"
+
+        def arrives():
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 1))
+            transcript.write_text(json.dumps({"type": "user", "timestamp": stamp,
+                                              "message": {"content": "이어서해"}}) + "\n", encoding="utf-8")
+        world.on_prompt = arrives
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "verify=transcript-arrival" in line), (0, True), line)
+        transcript.unlink()
+        self.cleared()
+        world = _ContinueWorld(reply=TIMEOUT_REPLY)
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "continued=unverified" in line, len(world.typed())), (5, True, 1), line)  # no Enter
+        self.cleared()
+        world = _ContinueWorld(reply=(1, json.dumps({"error": {"code": "agent_prompt_stalled"}})))
+        rc, line = self.continue_cmd(world)
+        self.assertEqual((rc, "reason=agent-prompt-stalled" in line, len(world.typed())), (1, True, 1), line)
+
+    def test_herdr_missing_is_failed(self):
+        self.cleared()
+        printed = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value=None), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(["continue", "w1:pX", "--request", str(self.path)])
+        self.assertEqual((rc, printed[-1]), (1, "continued=failed reason=herdr-not-found"))
 
 
 if __name__ == "__main__":

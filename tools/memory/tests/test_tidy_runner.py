@@ -190,10 +190,16 @@ FAKE_CLEAR_STEWARD = textwrap.dedent('''\
     import json, os, pathlib, sys
     root = pathlib.Path(os.environ["FAKE_ROOT"])
     args = sys.argv[1:]
+    exits = {{"true": 0, "skipped": 3, "failed": 1, "unverified": 5}}
+    if args[0] == "continue":
+        with open(root / "continue.jsonl", "a") as handle:
+            handle.write(json.dumps({{"argv": args}}) + "\\n")
+        verdict = os.environ.get("FAKE_CONTINUE_VERDICT", "true")
+        print("continued=" + verdict + " target=" + args[1] + ("" if verdict == "true" else " reason=herdr-exit-1"))
+        sys.exit(exits[verdict])
     with open(root / "clear.jsonl", "a") as handle:
         handle.write(json.dumps({{"argv": args}}) + "\\n")
     verdict = os.environ.get("FAKE_CLEAR_VERDICT", "true")
-    exits = {{"true": 0, "skipped": 3, "failed": 1, "unverified": 5}}
     extra = " new_session=sid-NEW" if verdict == "true" else " reason=draft"
     print("cleared=" + verdict + " target=" + args[1] + extra)
     sys.exit(exits[verdict])
@@ -531,6 +537,38 @@ class AutoClearTest(RunnerCase):
         self.wait_status(qid, "notified")
         self.assertEqual(len(self.notices()), 1, self.notices())           # only the memory line: the clear was silent
         self.wait_for(self.helper_gone, "the helper to exit")
+
+    def test_a_cleared_window_with_a_card_is_continued_once_and_silently(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        card = self.cli("card", "--harness", "claude", "--session-id", "sid-A", "--text", "다음 할 일: 표식 쓰기")
+        self.assertEqual(card.returncode, 0, card.stderr)
+        line = self.enqueue_line("sid-A")
+        self.assertTrue(line.endswith("status=queued clear=scheduled"), line)
+        self.wait_for(lambda: ((self.reservation() or {}).get("continued") or {}).get("state") == "sent",
+                      "the continue")
+        calls = self.steps("continue.jsonl")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual((argv[0], argv[1]), ("continue", PANE))
+        self.assertEqual(argv[argv.index("--nonce") + 1], self.reservation()["nonce"])
+        self.assertEqual(len(self.steps("clear.jsonl")), 1)
+        self.wait_for(self.helper_gone, "the helper to exit")
+        self.assertEqual([n for n in self.notices() if "이어서해" in n], [])     # a success is silent
+
+    def test_no_continue_clears_and_types_nothing_after_it_and_a_failed_continue_says_so_once(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        self.cli("card", "--harness", "claude", "--session-id", "sid-A", "--text", "다음 할 일: 표식 쓰기")
+        line = self.enqueue_line("sid-A", "--no-continue")
+        self.assertTrue(line.endswith("status=queued clear=scheduled continue=off"), line)
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "cleared", "the clear")
+        self.wait_for(self.helper_gone, "the helper to exit")
+        self.assertEqual(self.steps("continue.jsonl"), [])
+        self.cli("card", "--harness", "claude", "--session-id", "sid-A", "--text", "다음 할 일: 다시")
+        self.enqueue_line("sid-A", FAKE_CONTINUE_VERDICT="failed")
+        self.wait_for(lambda: ((self.reservation() or {}).get("continued") or {}).get("state") == "failed",
+                      "the failed continue")
+        self.wait_for(lambda: any("이어서해" in n for n in self.notices()), "the one result line")
+        self.assertEqual(len(self.steps("continue.jsonl")), 1)
 
     def test_no_clear_starts_no_helper_and_cancels_a_pending_booking(self):
         self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
@@ -1197,6 +1235,17 @@ class HandoffTest(RunnerCase):
             self.assertEqual(len(row["argv"]), 4)
             self.assertEqual(row["body"].strip(), text.strip())
         self.assertEqual(list((self.state / "handoff").glob("*")), [])      # the body file does not linger
+
+    def test_a_handed_off_card_is_not_continued_in_this_window(self):
+        self.card()
+        result = self.cli("handoff", "peer-pane", "--harness", "claude", "--session-id", "sid-A",
+                          FAKE_PEER_VERDICT="failed")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        card = json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertTrue(card["handed_off"])                  # whatever the verdict: the work moved
+        self.card("진행 중: 새 카드")
+        card = json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertNotIn("handed_off", card)                 # a newer card starts unmarked
 
     def test_without_a_card_nothing_is_sent(self):
         result = self.cli("handoff", "peer-pane", "--harness", "claude", "--session-id", "sid-A")

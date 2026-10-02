@@ -985,6 +985,9 @@ def handoff(seat: "st.Seat", target: str) -> tuple[str, int]:
     card = st.read_latest_card(seat)
     if not card or not st.sanitize_body(card.get("body", "")):
         return "prompted=false reason=no-card", 1
+    # The work moves to the peer whatever the verdict: this window is cleared but not continued.
+    with contextlib.suppress(BaseException):
+        st.mark_card_handed_off(seat)
     path = st.state_root() / "handoff" / f"{new_id()}.md"
     st.atomic_write(path, (card["body"].rstrip() + "\n").encode("utf-8"))
     injected = injected_executable("HEARTING_TIDY_PEER_STEWARD")
