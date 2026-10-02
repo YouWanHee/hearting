@@ -455,6 +455,55 @@ class FallbackTest(unittest.TestCase):
    code,printed=self.run_review_inline(path)
   self.assertNotIn("reason=review-round-budget-exhausted",printed)
 
+ def test_a_correction_round_keeps_one_identity_across_dry_run_register_and_start(self):
+  # The round salt is part of the admission ticket: the row `--register` writes must not move the
+  # round its own `--start` derives, and the start must claim that row instead of refusing it as live.
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text())
+   self.seed_parent()
+   self.seed_review_rounds(route["route_id"],"plan-check",1)
+   self.seed_predecessor_markers(path,"plan-check")
+   self.seed_plan_marker(route)
+   real_run=subprocess.run
+   def act(action):
+    seen=[];printed=[]
+    def run(cmd,**kwargs):
+     if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
+      seen.append(cmd)
+      receipt=("check=ok\nregistered=1\nstarted=1\nchild_spawned=1\n" if action=="start"
+               else "check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n")
+      return SimpleNamespace(returncode=0,stdout=receipt,stderr="")
+     return real_run(cmd,**kwargs)
+    argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check","--slug","fallback-plan-check",
+          "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
+          "--model-role","fast reviewer","--jobs",str(self.jobs),"--"+action]
+    with mock.patch.object(sys,"argv",argv), \
+         mock.patch("builtins.print",side_effect=lambda *a,**k:printed.append(" ".join(map(str,a)))), \
+         mock.patch("subprocess.run",side_effect=run), \
+         mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})):
+     try:
+      code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+     except SystemExit as exc:
+      code=exc.code
+    self.assertEqual(code,0,printed)
+    self.assertTrue(seen,printed)
+    return seen[0][seen[0].index("--attempt-id")+1],seen[0]
+   dry,_=act("dry-run")
+   registered,command=act("register")
+   # What the adapter's --register leaves behind: one open row it never claimed for launch.
+   parent=command[command.index("--parent-attempt-id")+1] if "--parent-attempt-id" in command else "att-fallback-parent"
+   with self.jobs.open("a",encoding="utf-8") as fh:
+    fh.write(f"2026-08-29T00:01:00Z\topen\t{self.repo}\t{self.repo}\tfallback-plan-check\t"
+             "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+             f"route_id={route['route_id']},route_node=plan-check,parent_attempt_id={parent},"
+             f"launch_claimed=0,attempt_id={registered}\n")
+   started,_=act("start")
+  self.assertEqual(dry,registered)
+  self.assertEqual(registered,started)
+  first_round=F.attempt_identity(SimpleNamespace(slug="fallback-plan-check",parent="owner",parent_attempt_id=parent),
+                                 route,{"id":"plan-check"},{"child_harness":"codex"},1)
+  self.assertNotEqual(started,first_round)
  def test_review_round_cap_correction_round_attaches_protocol_block_to_prompt_file(self):
   # Plan-correction B2 (third surface): unlike dispatch-node.py (which builds
   # its own prompt) and dispatch-batch.py (which gets the block for free by

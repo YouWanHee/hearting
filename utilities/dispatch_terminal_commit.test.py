@@ -472,6 +472,17 @@ class RelatedOwnerDiscoveryTests(unittest.TestCase):
         self.jobs.write_text(latest + "\n" + claimed + "\n", encoding="utf-8")
         proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
         self.assertEqual((proof.status, proof.reason), ("rejected", "child-not-quiescent"))
+        # Any process identity keeps the ordinary quiescence check, whatever the launch flags say.
+        process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            identity = T.dispatch_contract.process_launch_identity(process.pid)
+            live = self.row("done", "att-unlaunched", **{**stage, **identity, "launch_outcome": "running"})
+            self.jobs.write_text(latest + "\n" + live + "\n", encoding="utf-8")
+            proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
+            self.assertEqual((proof.status, proof.reason), ("rejected", "child-not-quiescent"))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
 
     def test_a_poll_fallback_parent_gets_no_completion_notice_attempt(self):
         self.assertFalse(T._parent_has_notice_carrier(
