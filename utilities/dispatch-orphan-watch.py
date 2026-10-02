@@ -220,13 +220,16 @@ def watch(args) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--jobs", type=Path, required=True)
+    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     parser.add_argument("--agent-home", type=Path, required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--pid-start", required=True)
     parser.add_argument("--interval", type=float, default=2.0)
     args = parser.parse_args(argv)
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = default_jobs_path(agent_home=args.agent_home)
     if args.pid <= 0 or args.interval <= 0:
         parser.error("--pid and --interval must be positive")
     args.jobs = args.jobs.resolve()

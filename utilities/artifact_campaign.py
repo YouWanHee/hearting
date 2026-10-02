@@ -466,8 +466,8 @@ def _open_refusal_detail(pending):
         shown += f" +{len(entries) - 10} more"
     return (f"open={len(pending)} {shown} "
             "next=capability-route.py complete --route <route_file> --node <terminal node> "
-            "then close --route <route_file>; or close --route <route_file> --allow-unproven "
-            "(disclosed as unproven); then rerun campaign-status")
+            "then close --route <route_file> (closing without it records the route as unproven); "
+            "then rerun campaign-status")
 
 
 def _cycle_rows(root, path, campaign):

@@ -103,8 +103,6 @@ python3 "$AGENT_HOME/utilities/compose-route.py" \
   --slug "$TASK_SLUG" \
   --units-json '[{"id":"survey","unit":"research/research-survey","write_scope":["analysis_project/code/**"],"gate":"research-retrieval"}]' \
   --cwd "$PWD" --artifact-root "$ARTIFACT_ROOT" \
-  --tracking tracked --spec-read "$PRD_SHA" --drift-verdict within-spec \
-  --workflow-mode tracked --artifact-guard conductor-prechecked \
   --output "$ARTIFACT_ROOT/.runtime/routes/<route_id>.json"
 ```
 
@@ -112,8 +110,11 @@ python3 "$AGENT_HOME/utilities/compose-route.py" \
 - `gate` is required for a unit that backs several unit-io gates (e.g.
   `research/research-survey` → `research-retrieval` / `research-synthesis` /
   `research-report`); a single-gate unit (e.g. `qa/plan-review`) auto-derives it.
-- The tracked-gate fields (`--spec-read`, `--drift-verdict`, ...) are stated by
-  the caller and passed through unchanged; the helper never fabricates them.
+- The tracked-gate fields (`--tracking`, `--spec-read`, `--drift-verdict`,
+  `--workflow-mode`, `--artifact-guard`) are optional. A stated field passes
+  through unchanged; an omitted one takes `compile`'s default, the same one
+  `compose` records. With a `spec/prd.md` present, the default names that file
+  and asks for `--spec-read <source>` after you read it.
 - Dispatch evidence comes from the live nested-eligibility probe by default; pass
   `--dispatch-evidence <file>` when you already hold checked evidence. With no
   supported tuple the route fails closed.

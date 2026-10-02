@@ -1519,7 +1519,7 @@ def _attempt_rows_for_route(jobs: Path, route_id: str) -> list[AttemptSnapshot]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--jobs", type=Path, required=True)
+    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--route-file", type=Path, required=True)
     parser.add_argument("--resume-from-node", required=True)
@@ -1527,6 +1527,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reason", default="receipt-unavailable-recovery")
     parser.add_argument("--cancellation-wait", type=float, default=2.0)
     args = parser.parse_args(argv)
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = default_jobs_path()
     from dispatch_terminal_commit import require_current_cleanup
     require_current_cleanup('retry')
     request = RecoveryRequest(

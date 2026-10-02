@@ -110,6 +110,9 @@ python3 <agent-home>/utilities/capability-route.py complete \
   --jobs <canonical-jobs.log> --attempt-id <exact-attempt-id>
 ```
 
+A stage worker completing its own node may omit `--jobs` and `--attempt-id`: `complete` reads
+`AGENT_DISPATCH_JOBS` and `AGENT_DISPATCH_ATTEMPT_ID` when that row is this node's attempt.
+
 The marker lands at `<agent-home>/.dispatch/completion/<route_id>/<node_id>.json`. Evidence is
 the stage's contractual terminal artifact (`plan.md`, the final dev log, the test verdict,
 `final_report.md`). The pass judgement stays semantic and belongs to the conductor; the marker
@@ -136,8 +139,8 @@ what is blocking it — most often `capability-route.py revise --route <route> -
 changed after its marker published (opt-in gates only; with gates off, the default, the edit is
 kept as history and the node proceeds). For case 3, record reasoning in
 `plans/<slug>/_internal/metrics.md`; an unrecorded inline standard+ run violates the contract.
-Still parallelize separable census or disjoint file groups. Dispatch-infrastructure
-self-modification requires the explicit `STAGE_DISPATCH_INLINE_OK` opt-out.
+Still parallelize separable census or disjoint file groups. The Claude stage-dispatch hook
+only reminds you of this list; it does not deny the in-session run.
 
 **An inline stage still owes its marker, and the same command writes it.** A stage run
 in-session has no registry row, so the `--jobs --attempt-id` recipe above cannot apply — but

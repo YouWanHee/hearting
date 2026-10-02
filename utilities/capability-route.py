@@ -61,6 +61,7 @@ from dispatch_contract import (
     gate_currency,
     ROUTE_STATE_REFUSAL_REASONS,
     route_state_next_action,
+    default_jobs_path,
     dispatch_state_roots,
     ensure_global_registry_writable,
     parse_registry_metadata,
@@ -3204,6 +3205,9 @@ def _compose_readiness(cwd, jobs, parent_harness, children):
 
 
 SPEC_READ_SHARED_PREFIX = "compose-auto: shared spec present, read "
+# compose and compile record the same tracked-gate defaults when the caller states none.
+DEFAULT_DRIFT_VERDICT = "no-spec-impact: compose default (caller asserted no spec-significant change)"
+DEFAULT_ARTIFACT_GUARD = "compose-prechecked"
 
 
 def compose_spec_read(cwd, artifact_root, explicit):
@@ -3495,9 +3499,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         tracking = "tracked" if shape in ("staged", "framed") else "untracked"
     gate = {
         "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
-        "drift_verdict": drift_verdict or "no-spec-impact: compose default (caller asserted no spec-significant change)",
+        "drift_verdict": drift_verdict or DEFAULT_DRIFT_VERDICT,
         "workflow_mode": tracking,
-        "artifact_guard": {"satisfied": True, "source": artifact_guard or "compose-prechecked"},
+        "artifact_guard": {"satisfied": True, "source": artifact_guard or DEFAULT_ARTIFACT_GUARD},
     }
     predicates = list(base["direct_predicates"]) if shape == "direct" else []
     signals = sorted(set(signals or ()))
@@ -7998,6 +8002,28 @@ def _placed_artifact_false_negative(route, node, fields, metadata, evidence, lin
     )
     return proof
 
+def _bound_env_attempt(route, node, jobs):
+    """`AGENT_DISPATCH_ATTEMPT_ID` when its registry row is this route node's attempt.
+
+    A registered worker completing its own node may omit `--attempt-id`; the
+    environment already names it. Any other caller (an owner, a session that
+    completes an inline node) gets nothing filled in and keeps today's forms.
+    Fails open: an unreadable registry or an absent row fills nothing."""
+    attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    if not attempt_id: return None
+    try:
+        for line in Path(jobs).read_text(encoding="utf-8",errors="replace").splitlines():
+            fields=line.split("\t")
+            if len(fields)!=6: continue
+            metadata=parse_registry_metadata(fields[5])
+            if metadata.get("attempt_id")==attempt_id:
+                bound=ROUTE_IDENTITY.registered_node_identity(metadata,node)==(
+                    route["route_id"],route["route_hash"],node["id"])
+                return attempt_id if bound else None
+    except (OSError,ValueError,KeyError,TypeError):
+        return None
+    return None
+
 def _complete_node_locked(
     route,
     node,
@@ -9044,12 +9070,15 @@ def main():
     c.add_argument("--intensity",default="auto"); c.add_argument("--cwd",required=True); c.add_argument("--artifact-root",required=True)
     c.add_argument("--predicate",action="append",default=[]); c.add_argument("--signal",action="append",default=[])
     c.add_argument("--transport",default=None); c.add_argument("--transport-evidence",default="caller-selected")
-    c.add_argument("--inline-reason"); c.add_argument("--tracking",choices=sorted(TRACKING),required=True)
+    c.add_argument("--inline-reason"); c.add_argument("--tracking",choices=sorted(TRACKING),default="tracked")
     c.add_argument("--dispatch-evidence",help="JSON file with checked nested tuples/native evidence")
     c.add_argument("--registered-headless-evidence",help="JSON file with checked quick or single-owner candidates")
     c.add_argument("--composed-recipe",help="JSON file with a compose-on-demand recipe (sealed composed: true)")
-    c.add_argument("--spec-read",required=True); c.add_argument("--drift-verdict",required=True)
-    c.add_argument("--workflow-mode",choices=sorted(TRACKING),required=True); c.add_argument("--artifact-guard",required=True)
+    # The tracked-gate fields take compose's defaults; an explicit value is recorded as given.
+    c.add_argument("--spec-read",default=None,help="default: compose's spec check")
+    c.add_argument("--drift-verdict",default=DEFAULT_DRIFT_VERDICT)
+    c.add_argument("--workflow-mode",choices=sorted(TRACKING),default=None,help="default: --tracking")
+    c.add_argument("--artifact-guard",default=DEFAULT_ARTIFACT_GUARD)
     c.add_argument("--output")
     cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
     cp.add_argument("--slug",required=True)
@@ -9139,8 +9168,10 @@ def main():
     v.add_argument("--launch-phase",choices=("dry-run","register","start"))
     n=sub.add_parser("node"); n.add_argument("--route",required=True); n.add_argument("--node",required=True)
     d=sub.add_parser("complete"); d.add_argument("--route",required=True); d.add_argument("--node",required=True); d.add_argument("--evidence",required=True); d.add_argument("--output")
-    d.add_argument("--jobs",help="canonical registry path for a registered attempt")
-    d.add_argument("--attempt-id",help="exact current attempt, or an official continuation's blocking source review")
+    d.add_argument("--jobs",help="canonical registry path for a registered attempt (default AGENT_DISPATCH_JOBS, "
+                                 "else the canonical registry, once an attempt is named)")
+    d.add_argument("--attempt-id",help="exact current attempt, or an official continuation's blocking source review "
+                                       "(default AGENT_DISPATCH_ATTEMPT_ID when that row is this node's attempt)")
     d.add_argument("--check",action="store_true",help="read-only check of exact current or ancestor owner-closure authority; publishes nothing")
     d.add_argument("--dispatch-depth",type=int)
     d.add_argument("--transport")
@@ -9177,7 +9208,8 @@ def main():
     cl.add_argument("--commit",help="result commit; defaults to HEAD in the route cwd")
     cl.add_argument("--summary",help="one line naming what the route produced")
     cl.add_argument("--allow-unproven",action="store_true",
-                     help="permit sealing terminal_gate_proven=false for a route closed before its terminal node completed")
+                     help="accepted for compatibility; close always records terminal_gate_proven=false with a "
+                          "terminal-gate-unproven warning when the terminal node has not completed")
     st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     sg=sub.add_parser("stages",help="list a capability's (or every capability's) stage ids, in recipe order, for --graph")
@@ -9316,8 +9348,10 @@ def main():
                                    interview=a.interview,answers=a.answers,decision=a.decision),ensure_ascii=False))
         return 0
     if a.command=="compile":
-        gate={"spec_read":{"satisfied":a.spec_read.lower() not in ("0","false","no"),"source":a.spec_read},
-              "drift_verdict":a.drift_verdict,"workflow_mode":a.workflow_mode,
+        spec_read=(compose_spec_read(a.cwd,a.artifact_root,None) if a.spec_read is None else
+                   {"satisfied":a.spec_read.lower() not in ("0","false","no"),"source":a.spec_read})
+        gate={"spec_read":spec_read,
+              "drift_verdict":a.drift_verdict,"workflow_mode":a.workflow_mode or a.tracking,
               "artifact_guard":{"satisfied":a.artifact_guard.lower() not in ("0","false","no"),"source":a.artifact_guard}}
         dispatch_evidence=json.loads(Path(a.dispatch_evidence).read_text()) if a.dispatch_evidence else None
         registered_headless_evidence=(
@@ -9548,7 +9582,9 @@ def main():
             print(json.dumps(marker,sort_keys=True))
             print(f"tombstoned={','.join(result['tombstoned']) or '-'}",file=sys.stderr)
         elif a.command=="close":
-            outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=a.allow_unproven)
+            # An unproven terminal gate is recorded and warned about below, never refused:
+            # the refusal was bypassed almost every time it fired.
+            outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=True)
             print(json.dumps(outcome,sort_keys=True))
             if not created: print("capability-route: route already closed",file=sys.stderr)
             if outcome.get("review_independence_degraded"):
@@ -9597,27 +9633,40 @@ def main():
                         "registered_worker":a.registered_worker,
                         "fallback_hop":a.fallback_hop,
                     }
+                # A registered worker completing its own node may omit `--jobs` and
+                # `--attempt-id`: the environment already names both. A call that states
+                # attempt axes (the inline/unregistered form) or completes a resource run
+                # takes nothing implicitly; an explicit value always wins.
+                jobs,attempt_id=a.jobs,a.attempt_id
+                if explicit_attempt_metadata is None and node.get("kind")!="resource-runner":
+                    if a.subsession_manifest:
+                        jobs=jobs or str(default_jobs_path())
+                    else:
+                        if attempt_id is None:
+                            attempt_id=_bound_env_attempt(route,node,jobs or default_jobs_path())
+                        if attempt_id and not jobs:
+                            jobs=str(default_jobs_path())
                 if a.check:
-                    if not a.jobs or not a.attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
+                    if not jobs or not attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
-                    proof = owner_closure_plan(route, node, evidence, a.jobs, a.attempt_id)
+                    proof = owner_closure_plan(route, node, evidence, jobs, attempt_id)
                     print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],
                                       "node_id": a.node, "owner_closure_proof": proof}, sort_keys=True))
                     return
                 if a.subsession_manifest:
                     if review_claim:
                         raise ValueError("reviewer-claim-unsupported-on-subsession-gate")
-                    if not a.jobs or a.attempt_id or explicit_attempt_metadata is not None:
+                    if not jobs or attempt_id or explicit_attempt_metadata is not None:
                         raise ValueError("subsession completion requires --jobs and forbids attempt axes")
                     route["_route_file"]=str(Path(a.route).resolve())
                     marker,row=complete_subsession_stage(
-                        route,node,a.node,evidence,a.subsession_manifest,a.jobs,
+                        route,node,a.node,evidence,a.subsession_manifest,jobs,
                     )
                 else:
                     marker,row=complete_node(
                         route,node,a.node,evidence,
-                        jobs=a.jobs,
-                        attempt_id=a.attempt_id,
+                        jobs=jobs,
+                        attempt_id=attempt_id,
                         explicit_attempt_metadata=explicit_attempt_metadata,
                         review_claim=review_claim,
                     )

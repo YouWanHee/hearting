@@ -921,7 +921,7 @@ def _seal_terminal_handoff_or_raise(
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--worktree", required=True)
-    value.add_argument("--jobs", required=True)
+    value.add_argument("--jobs", help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     value.add_argument("--parent-attempt-id", required=True)
     value.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"), required=True)
     value.add_argument("--approval", choices=("untrusted", "on-request", "never", "inherit"), default="never")
@@ -962,6 +962,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = str(default_jobs_path())
     continuation_budget = resolve_continuation_budget(
         explicit=args.max_continuations,
         route_file=args.route_file,

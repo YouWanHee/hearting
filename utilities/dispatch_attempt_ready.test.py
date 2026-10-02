@@ -327,5 +327,23 @@ class RuntimeWaitSharedJoinTest(unittest.TestCase):
         self.assertEqual(self.jobs.read_bytes(), before)
 
 
+
+class OmittedJobsTest(unittest.TestCase):
+    def test_cli_without_jobs_reads_the_inherited_registry(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text("")
+            env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_")}
+            env["AGENT_DISPATCH_JOBS"] = str(jobs)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "utilities" / "dispatch-attempt-ready.py"), "--attempt-id", "att-none"],
+                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertNotEqual(receipt["state"], "contract-error", receipt)
+        self.assertEqual(receipt["children"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

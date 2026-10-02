@@ -659,6 +659,11 @@ python3 utilities/capability-route.py close --route <route.json> [--commit <sha>
 python3 utilities/capability-route.py status --artifact-root <dir> --open-only
 ```
 
+`close` does not refuse a route whose terminal node has not completed. It closes
+it, records `terminal_gate_proven=false`, and prints one `terminal-gate-unproven`
+line; the record cannot be proven later, so complete the terminal node first when
+you can. `--allow-unproven` is still accepted and changes nothing.
+
 For producer-backed work, the controller's transaction is **terminal proof →
 route close → cycle finalize (the completion record) → workflow COMPLETE**. Eligible direct inline
 work uses `finish`; legacy recovery uses complete, close and finalize in that
