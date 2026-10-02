@@ -2821,7 +2821,7 @@ def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
     return auxiliary
 
 
-def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
+def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
     The nodes keep their unit, kind, gate, write scope, profile and permissions;
@@ -2959,8 +2959,18 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
         elif node_id in optional:
             used_parts.add(part_id)
         previous = nodes[-1] if nodes else None
-        node["depends_on"] = [previous["id"]] if previous else []
-        if previous and gate_group(previous["id"]):
+        if preserve_base_dependencies:
+            if part:
+                borrowed_ids = {p["stage"]: other for _, other, _, p in rows
+                                if p and p["recipe"] is part["recipe"]}
+                declared_dependencies = (part["node"].get("depends_on") or [])
+                node["depends_on"] = [borrowed_ids[dep] for dep in declared_dependencies if dep in borrowed_ids]
+            else:
+                declared_dependencies = order.get(node_id, {}).get("depends_on") or []
+                node["depends_on"] = [dep for dep in declared_dependencies if dep in ids]
+        else:
+            node["depends_on"] = [previous["id"]] if previous else []
+        if not preserve_base_dependencies and previous and gate_group(previous["id"]):
             group = gate_group(previous["id"])
             if gate_group(node_id) == group:
                 # Independent raisers share their predecessor. Serializing
@@ -3030,12 +3040,19 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
         for original, sealed in zip(info["originals"], node["outputs"]):
             if not TOPO._is_semantic_output(original):
                 produced[original] = sealed
-    terminal = nodes[-1]
-    terminal["terminal"] = True
-    terminal["terminal_gate"] = terminal["completion_gate"]
-    if terminal.get("advance_class") != "model-required":
-        terminal["advance_class"] = "model-required"
-        terminal["model_required_reason"] = "terminal-report"
+    if preserve_base_dependencies:
+        terminal_ids = {node["id"] for node in nodes
+                        if not any(node["id"] in (other.get("depends_on") or []) for other in nodes)}
+    else:
+        terminal_ids = {nodes[-1]["id"]}
+    for terminal in nodes:
+        if terminal["id"] not in terminal_ids:
+            continue
+        terminal["terminal"] = True
+        terminal["terminal_gate"] = terminal["completion_gate"]
+        if terminal.get("advance_class") != "model-required":
+            terminal["advance_class"] = "model-required"
+            terminal["model_required_reason"] = "terminal-report"
     # Human gates: a base node whose continuation was `human-gate G` keeps G
     # only when a graph node follows it; G is rebound to that node's entry.
     # One binding per DISTINCT gate, not one per raiser. Sibling nodes can raise
@@ -3047,7 +3064,9 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     # raiser, so the gate opens only after every raiser has run.
     bindings, gates = [], []
     gate_anchor: dict[str, str] = {}
-    for index, node in enumerate(nodes[:-1]):
+    for index, node in enumerate(nodes):
+        if node["id"] in terminal_ids:
+            continue
         base = source_of[node["id"]]
         continuation = base.get("continuation") or {}
         if continuation.get("kind") == "human-gate":
@@ -3084,7 +3103,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None):
     groups, omitted_groups = [], []
     for group, borrowed in declared_groups:
         anchor = next((n for n in nodes if n["id"] == group["node"]), None)
-        if anchor is None or anchor is terminal:
+        if anchor is None or anchor.get("terminal") is True:
             continue
         consumers = [n for n in nodes if anchor["id"] in n.get("depends_on", [])]
         if anchor["kind"] == "pipeline-stage" and not any(
@@ -3408,7 +3427,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
-                  selection_pins=None, route_plan=None, frameless=False):
+                  selection_pins=None, route_plan=None, frameless=False, execution_scope=None):
     """Resolve every default, then compile through the ordinary sealer.
 
     `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
@@ -3418,6 +3437,10 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     import route_plan as RP
     sealed_plan = RP.sealed_form(route_plan) if route_plan is not None else None
     frameless = frameless or route_plan is not None
+    if execution_scope is None and route_plan is not None:
+        execution_scope = route_plan_execution_scope(route_plan)
+    if execution_scope is not None and execution_scope not in ("complete", "report"):
+        raise ValueError("compose-shape-invalid:execution-scope")
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
     routing_hints = None
@@ -3484,7 +3507,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     find_input = None
     frame_ids = [n["id"] for n in base["standard_plus"]["nodes"] if _frame_node(n)]
     planned_full = shape == "staged" and not graph and frameless and bool(frame_ids)
-    if shape == "staged" and (graph or planned_full) and not unassigned:
+    if shape == "staged" and (graph or planned_full or (execution_scope == "report" and frameless)) and not unassigned:
         try:
             import artifact_producer
             find_input = artifact_producer.input_source_finder(
@@ -3501,8 +3524,22 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         graph_spec = [(n["id"], None) for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
     else:
         graph_spec = parse_graph_spec(graph, capabilities) if shape == "staged" and graph else None
-    selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input)
+    if shape == "staged" and execution_scope == "report":
+        source_graph = ([f"{node}" + (f":{unit}" if unit else "") for node, unit in graph_spec]
+                        if graph_spec is not None else None)
+        projected = project_entry_execution_scope({"capability": capability, "mode": capability_mode,
+                                                   "shape": shape, "graph": source_graph}, "report", registry)
+        graph_spec = parse_graph_spec(",".join(projected.get("graph") or []), capabilities)
+    selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input,
+                                                preserve_base_dependencies=execution_scope == "report")
                        if graph_spec is not None else base)
+    if execution_scope == "report" and shape == "staged" and graph_spec is not None and profile is None:
+        # The narrowed graph is made only from existing recipe/catalog parts. Keep each
+        # stage's declared profile so a report boundary adds no new profile-demand input.
+        explicit_profiles = dict(explicit_profiles or {})
+        for node in selected_recipe["standard_plus"]["nodes"]:
+            if node.get("model_profile") and node["id"] not in explicit_profiles:
+                explicit_profiles[node["id"]] = node["model_profile"]
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
     if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
@@ -3541,7 +3578,13 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         route["work_request"] = capture_request_context(work_request, route)
     if selection_pins:
         _apply_selection_pins(route, selection_pins)
-    if unassigned or work_request is not None or selection_pins:
+    if execution_scope is not None:
+        route = _bind_entry_execution_scope(route, execution_scope)
+        if work_request is not None:
+            request = dict(route.get("work_request") or {})
+            request["text"] = request.get("text", "").rstrip() + f"\n\nExecution scope: {execution_scope}\n"
+            route["work_request"] = request
+    if unassigned or work_request is not None or selection_pins or execution_scope is not None:
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
@@ -3622,8 +3665,94 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     owner = context.get("owner") or ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness")
     if work_request is not None:
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
-    return compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
-                         parent_harness=owner or "claude")
+    route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
+                           parent_harness=owner or "claude")
+    scope = (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {}).get("execution_scope")
+    if scope in ("complete", "report"):
+        route = _bind_entry_execution_scope(route, scope)
+    return route
+
+
+def route_plan_execution_scope(binding):
+    """A frame's start choice scopes only its already-approved first leg."""
+    if not isinstance(binding, dict) or type(binding.get("index")) is not int or binding["index"] != 0:
+        return None
+    return (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {}).get("execution_scope")
+
+
+def _bind_entry_execution_scope(route, scope):
+    """Seal the already-selected entry scope and remove only the matching new-route preview wait."""
+    if scope not in ("complete", "report"):
+        return route
+    route = json.loads(json.dumps(route))
+    route["entry_execution_scope"] = scope
+    route["entry_scope_contract_version"] = 1
+    _project_entry_scope_nodes(route.get("nodes") or [], scope)
+    route["human_gate_bindings"] = [row for row in route.get("human_gate_bindings") or []
+                                    if row.get("gate") != "preview-disposition"]
+    route["human_gates"] = sorted({row["gate"] for row in route["human_gate_bindings"]})
+    route["workflow_contract"] = _workflow_contract(
+        TOPO.load_registry(), route.get("nodes") or [], route["human_gate_bindings"])
+    route["route_hash"] = route_hash(route)
+    route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+    return route
+
+
+def valid_entry_execution_scope_marker(version, scope):
+    """Whether optional scope metadata uses the one supported, typed contract."""
+    return (version is None and scope is None) or (type(version) is int and version == 1
+                                                   and scope in ("complete", "report"))
+
+
+def _project_entry_scope_nodes(nodes, scope):
+    if scope not in ("complete", "report"):
+        return nodes
+    for node in nodes:
+        if "inline_human_gates" in node:
+            remaining = [gate for gate in node.get("inline_human_gates", []) if gate != "preview-disposition"]
+            if remaining:
+                node["inline_human_gates"] = remaining
+            else:
+                node.pop("inline_human_gates", None)
+        if node.get("continuation") == {"kind": "human-gate", "gate": "preview-disposition"}:
+            node["continuation"] = {"kind": "inline-next"}
+    return nodes
+
+
+def project_entry_execution_scope(leg, scope, registry=None):
+    """Copy a proposed leg and, for report, stop a staged graph before its first catalog approval.
+
+    Catalog part ids are resolved before cutoff, so borrowed namespaced tokens share exactly the
+    same behavior as host stage ids. An explicit graph is only narrowed; an omitted graph expands
+    from its base recipe before the same cutoff is applied.
+    """
+    result = json.loads(json.dumps(leg))
+    if scope != "report" or result.get("shape") != "staged":
+        return result
+    registry = registry or TOPO.load_registry()
+    capability = result.get("capability")
+    recipes = [r for r in registry.get("recipes", []) if r.get("capability") == capability]
+    mode = result.get("mode")
+    base = next((r for r in recipes if mode in r.get("modes", [])), None) if mode else next(
+        (r for r in recipes if "dev" in r.get("modes", [])), recipes[0] if recipes else None)
+    if base is None:
+        return result
+    graph = list(result.get("graph") or [n["id"] for n in base.get("standard_plus", {}).get("nodes", [])
+                                          if not _frame_node(n)])
+    known = {row.get("capability") for row in registry.get("recipes", [])}
+    catalog = TOPO.part_catalog(registry).get("parts", {})
+    end = len(graph)
+    for index, token in enumerate(graph):
+        head, sep, tail = str(token).partition(":")
+        if sep and head in known:
+            part_id = f"{head}:{tail.partition(':')[0]}"
+        else:
+            part_id = f"{capability}:{head}"
+        if (catalog.get(part_id) or {}).get("start_approval"):
+            end = index
+            break
+    result["graph"] = graph[:end]
+    return result
 
 
 def declared_start_approvals(leg, registry=None):
@@ -3632,8 +3761,6 @@ def declared_start_approvals(leg, registry=None):
     Read from the catalogue alone (no compile, no probe), so anything rendered from it is the same on
     every replay. Only a staged leg carries stage parts.
     """
-    if leg.get("shape") != "staged":
-        return []
     registry = registry or TOPO.load_registry()
     capability = leg["capability"]
     recipes = [r for r in registry["recipes"] if r["capability"] == capability and capability != ROUTE_FRAME_CAPABILITY]
@@ -3644,6 +3771,17 @@ def declared_start_approvals(leg, registry=None):
             else next((r for r in recipes if mode in r["modes"]), None))
     if base is None:
         return []
+    if leg.get("shape") != "staged":
+        # A one-shot recipe still contains these internal approval-scoped parts.
+        # Keep the same catalogue keys so the entry choice can carry its scope.
+        internal = {
+            ("autopilot-lab", "setup"): ("full-run", "autopilot-lab:full-run"),
+            ("autopilot-ship", "default"): ("deploy", "autopilot-ship:deploy"),
+            ("autopilot-refine", None): ("preview", "autopilot-refine:transaction"),
+            ("autopilot-apply", None): ("handback", "autopilot-apply:handback"),
+        }
+        selected = internal.get((capability, mode)) or internal.get((capability, None))
+        return [selected] if selected and TOPO.part_row(registry, selected[1]).get("start_approval") else []
     known = {r["capability"] for r in registry["recipes"]} - {ROUTE_FRAME_CAPABILITY}
     tokens = leg.get("graph") or [n["id"] for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
     rows = []
@@ -3756,6 +3894,17 @@ def route_start_approvals(route, registry=None):
             seen.add(part)
             rows.append({"node": node.get("parallel_anchor") or node.get("id"), "part": part,
                          "start_approval": approval, "borrowed": bool(borrowed)})
+    if (route.get("selection") or {}).get("shape") in ("direct", "solo"):
+        internal = {
+            ("autopilot-lab", "setup"): ("full-run", "autopilot-lab:full-run"),
+            ("autopilot-ship", "default"): ("deploy", "autopilot-ship:deploy"),
+            ("autopilot-refine", None): ("preview", "autopilot-refine:transaction"),
+            ("autopilot-apply", None): ("handback", "autopilot-apply:handback"),
+        }
+        key, part = internal.get((route.get("capability"), route.get("capability_mode"))) or internal.get(
+            (route.get("capability"), None), (None, None))
+        if key and part not in seen and TOPO.part_row(registry, part).get("start_approval"):
+            rows.append({"node": "one-shot", "part": part, "start_approval": key, "borrowed": False})
     return rows
 
 
@@ -3786,8 +3935,12 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     borrowed = list(dict.fromkeys(node["part"] for node in route["nodes"] if node.get("part")))
     if borrowed:  # SD-165: parts taken from another recipe, written under parts/<capability>/<stage>/
         card += f"\n  빌린 부품 {'·'.join(borrowed)}"
-    for row in route_start_approvals(route):
-        card += f"\n  시작 승인 {row['start_approval']} ({row['part']})"
+    if valid_entry_execution_scope_marker(route.get("entry_scope_contract_version"),
+                                         route.get("entry_execution_scope")) and route.get("entry_scope_contract_version") == 1:
+        card += f"\n  실행 범위 {route['entry_execution_scope']}"
+    else:
+        for row in route_start_approvals(route):
+            card += f"\n  시작 승인 {row['start_approval']} ({row['part']})"
     from artifact_producer import route_cycle_for, cycle_dir, default_bucket, ProducerError
     try:
         record = route_cycle_for(Path(route["artifact_root"]), route)
@@ -4236,6 +4389,23 @@ def _sd160_legacy_registry(registry):
     return legacy if changed else None
 
 
+def _entry_scope_legacy_registry(registry):
+    """Reconstruct only the catalog immediately before the refine preview mark."""
+    legacy = json.loads(json.dumps(registry))
+    row = ((legacy.get("part_catalog") or {}).get("parts") or {}).get("autopilot-refine:transaction")
+    if not isinstance(row, dict) or row.get("start_approval") != "preview":
+        return None
+    recipe = next((item for item in legacy.get("recipes", [])
+                   if item.get("capability") == "autopilot-refine"), None)
+    review = next((node for node in ((recipe or {}).get("standard_plus") or {}).get("nodes", [])
+                   if node.get("id") == "review"), None)
+    if not isinstance(review, dict) or "reviews/refine/preview.md" not in review.get("outputs", []):
+        return None
+    del row["start_approval"]
+    review["outputs"] = [output for output in review["outputs"] if output != "reviews/refine/preview.md"]
+    return legacy
+
+
 def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     """Verify a route for mutating/resume use.
 
@@ -4294,6 +4464,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         same_work_or_refuse("route-cwd-mismatch", str(expected_cwd))
         route = dict(route, cwd=str(Path(expected_cwd).resolve()))
     _verify_profile_contract(route)
+    scope_version = route.get("entry_scope_contract_version")
+    entry_scope = route.get("entry_execution_scope")
+    if not valid_entry_execution_scope_marker(scope_version, entry_scope):
+        raise ValueError("route nodes differ from the declared recipe")
     basis=_check_validation_basis(route, allow_stale_registry=allow_stale_registry)
     if basis is _DEGRADE_VALIDATION_BASIS:
         # An unsupported basis_version is a legitimate newer harness's route;
@@ -4327,6 +4501,19 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 units_digest_now=unit_catalog_digest(),
                 registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
             )
+    if (classification["registry"]["verdict"] != "current"
+            and classification["unit_catalog"]["verdict"] == "current"):
+        legacy_registry = _entry_scope_legacy_registry(registry)
+        if legacy_registry is not None and route.get("registry_digest") == TOPO.registry_digest(legacy_registry):
+            extra = [route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"), dict) else ()
+            legacy_capability_digest = (TOPO.capability_registry_digest(legacy_registry, route["capability"], extra)
+                                       if route.get("capability_registry_digest") is not None else None)
+            classification = classify_validation_basis(
+                route, registry_digest_now=TOPO.registry_digest(legacy_registry),
+                units_digest_now=unit_catalog_digest(), registry_root_now=TOPO.ROOT,
+                unit_catalog_root_now=ROOT, capability_digest_now=legacy_capability_digest)
+            if classification["verdict"] == "current":
+                registry = legacy_registry
     if classification["verdict"] != "current":
         if not allow_stale_registry:
             if gates_on():
@@ -4360,6 +4547,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             route.get("effective_intensity"), route.get("capability"),
             auxiliary_check_units=registry.get("auxiliary_check_units"),
             persona_policy=persona_version == 1)
+        _project_entry_scope_nodes(expected_nodes, entry_scope)
         if route.get("profile_selection_contract_version") == 1:
             # Same ladder, same order as the compiler: stamp, then seal (under the policy the
             # route's frame nodes were declared with).
@@ -4385,6 +4573,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 route.get("effective_intensity"), route.get("capability"),
                 auxiliary_check_units=registry.get("auxiliary_check_units"),
             persona_policy=persona_version == 1)
+            _project_entry_scope_nodes(expected_nodes, entry_scope)
             if route.get("profile_selection_contract_version") == 1:
                 # Same ladder, same order as the compiler: stamp, then seal (under the policy the
                 # route's frame nodes were declared with).
@@ -4437,6 +4626,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         _quick_gate_bindings(route_recipe) if route.get("effective_intensity")=="quick"
         else route_recipe["human_gate_bindings"]
         if route.get("effective_intensity")!="direct" else []))
+    if scope_version == 1:
+        expected_bindings = [row for row in expected_bindings if row.get("gate") != "preview-disposition"]
     if route.get("human_gate_bindings") != expected_bindings:
         raise ValueError("route human gate bindings differ from the sealed recipe")
     if route.get("workflow_contract") != _workflow_contract(
@@ -4444,7 +4635,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         raise ValueError("route workflow contract differs from the realized stage graph")
     if {row["gate"] for row in expected_bindings} - set(route.get("human_gates") or []):
         raise ValueError("route binds an undeclared human gate")
-    if route.get("effective_intensity") != "direct" and "preview-disposition" in (route.get("human_gates") or []):
+    if (scope_version != 1 and route.get("effective_intensity") != "direct"
+            and "preview-disposition" in (route.get("human_gates") or [])):
         preview_raisers = [n for n in route.get("nodes", [])
                            if n.get("continuation") == {"kind": "human-gate", "gate": "preview-disposition"}
                            or "preview-disposition" in n.get("inline_human_gates", [])]
@@ -4688,7 +4880,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         node=next((n for n in route["nodes"] if n.get("id")=="one-shot"), None)
         if node is None:
             raise ValueError("quick route shape mismatch")
-        if node.get("inline_human_gates", []) != route_recipe["quick"].get("inline_human_gates", []):
+        expected_inline_gates = list(route_recipe["quick"].get("inline_human_gates", []))
+        if scope_version == 1:
+            expected_inline_gates = [gate for gate in expected_inline_gates if gate != "preview-disposition"]
+        if node.get("inline_human_gates", []) != expected_inline_gates:
             raise ValueError("quick-inline-human-gates-mismatch")
         if node.get("write_scope") != route_recipe["quick"]["write_scope"]:
             raise ValueError("quick-write-scope-mismatch")
@@ -6873,6 +7068,23 @@ def arbitrate_group(route, group_id, evidence):
     return record
 
 
+def _require_entry_scope_review_preview(route, node, artifact_output):
+    """Scoped refine completion carries a real preview file before its existing node gate can close."""
+    if (type(route.get("entry_scope_contract_version")) is not int
+            or route.get("entry_scope_contract_version") != 1
+            or route.get("capability") != "autopilot-refine"
+            or node.get("id") not in {"review", "one-shot"}):
+        return None
+    preview = Path(artifact_output) / "reviews/refine/preview.md"
+    if preview.is_symlink() or not preview.is_file():
+        raise ValueError("completion-evidence-unreadable")
+    try:
+        preview.resolve(strict=True).relative_to(Path(artifact_output).resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ValueError("completion-evidence-unreadable") from exc
+    return preview
+
+
 def _publish_completion_locked(
     route,
     node,
@@ -6895,9 +7107,11 @@ def _publish_completion_locked(
     # An open neighbouring cycle cannot certify this route's completed work.
     from artifact_producer import ProducerError, require_cycle_output
     try:
-        require_cycle_output(Path(route["artifact_root"]), Path(evidence), route_id=route["route_id"])
+        artifact_output = require_cycle_output(Path(route["artifact_root"]), Path(evidence), route_id=route["route_id"])
     except ProducerError as exc:
         raise ValueError(f"{exc.code}: {exc.detail}") from exc
+    if artifact_output is not None:
+        _require_entry_scope_review_preview(route, node, artifact_output)
     _validate_auxiliary_arbiter(route, node, evidence)
     axes=_marker_attempt_axes(node,attempt_id,attempt_metadata)
     evidence_sha=evidence_digest(evidence)
@@ -8858,6 +9072,8 @@ def main():
                     help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
     cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default staged with --graph, else direct")
     cp.add_argument("--graph",default=None,help="optional staged subgraph in your order (see `capability-route.py stages --capability <cap>` for valid ids); incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
+    cp.add_argument("--execution-scope", choices=("complete", "report"), default=None,
+                    help="optional scope already selected in the existing start confirmation; it is not approval evidence")
     cp.add_argument("--capability",default=None,help=f"default {COMPOSE_DEFAULT_CAPABILITY}; a hint only with --shape framed"); cp.add_argument("--capability-mode",default=None)
     cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
     cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
@@ -9041,6 +9257,7 @@ def main():
             profile=a.profile,
             work_request={"text":a.prompt_file.read_text(),"owner_harness":owner_pin} if a.prompt_file else None,
             selection_pins=pins or None,route_plan=route_plan_binding,
+            execution_scope=a.execution_scope,
         )
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
@@ -9253,6 +9470,13 @@ def main():
     elif a.command=="finish":
         raw=json.loads(a.route.read_text(encoding="utf-8"))
         route=verify_route(raw, raw.get("cwd"))
+        if (route.get("capability") == "autopilot-refine"
+                and route.get("entry_scope_contract_version") == 1):
+            import artifact_producer
+            output = artifact_producer.require_cycle_output(
+                Path(route["artifact_root"]), Path(a.summary_file), route_id=route["route_id"])
+            if output is not None:
+                _require_entry_scope_review_preview(route, {"id": "one-shot"}, output)
         import inline_finish
         receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
         print(json.dumps(receipt,sort_keys=True))

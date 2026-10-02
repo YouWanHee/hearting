@@ -449,7 +449,7 @@
   "manifest_version": "2.0.0",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:645ff3cf19a3c187a5150b6a7617c8226ed14561abbccd10d5a8f0807f08a1ac",
+    "digest": "sha256:f50e45034b95a948bba152a0939df241cb0484036a405277784c40720dd4bb87",
     "capabilities": 13,
     "recipes": 29
   },
@@ -949,6 +949,13 @@
       "slug": "hook__herdr-agent-state__PreToolUse",
       "name": "herdr-agent-state working",
       "mono": "herdr-agent-state",
+      "event": "PreToolUse",
+      "hard_block": false
+    },
+    {
+      "slug": "hook__route-presence-gate.py__PreToolUse",
+      "name": "route-presence-gate.py",
+      "mono": "route-presence-gate.py",
       "event": "PreToolUse",
       "hard_block": false
     },

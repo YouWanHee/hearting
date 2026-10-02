@@ -160,6 +160,50 @@ class StartBase(F.EndingBase):
         return record["cycle_id"]
 
 
+class EntryExecutionScopeTest(StartBase):
+    def test_report_choice_compiles_first_leg_instead_of_becoming_none(self):
+        approvals = [{"key": "full-run", "leg": 0, "question": "route"}]
+        self.set_briefs(LAB_SETUP, LAB_SETUP, approvals=approvals)
+        self.set_interview({"legs": [LAB_SETUP], "execution_scope": "report", "entry_approvals": approvals})
+        result = self.settle()
+        self.assertNotEqual(result.get("state"), "none", result)
+        record = self.record()
+        self.assertEqual(record["decision"]["selected"], ROUTE_LABELS[0])
+        self.assertEqual(record["decision"]["approvals"]["execution_scope"], "report")
+        self.assertTrue(record.get("first_leg"))
+        self.assertEqual(record["decision"]["first_leg_compose"]["graph"], ["scaffold", "smoke"])
+
+    def test_quick_refine_complete_and_report_compile_without_the_new_preview_wait(self):
+        for scope in ("complete", "report"):
+            with self.subTest(scope=scope):
+                self.tearDown()
+                self.setUp()
+                approvals = [{"key": "preview", "leg": 0, "question": "route"}]
+                refine = {"capability": "autopilot-refine", "shape": "solo", "why": "preview and refine"}
+                self.set_briefs(refine, refine, approvals=approvals)
+                self.set_interview({"legs": [refine], "execution_scope": scope, "entry_approvals": approvals})
+                self.settle()
+                route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+                self.assertEqual(route["entry_execution_scope"], scope)
+                self.assertNotIn("preview-disposition", route.get("human_gates", []))
+                self.assertFalse(any("preview-disposition" in node.get("inline_human_gates", [])
+                                     for node in route["nodes"]))
+                self.assertEqual(R.verify_route(route)["entry_execution_scope"], scope)
+
+    def test_staged_refine_report_stops_at_review_and_complete_keeps_the_full_graph(self):
+        approvals = [{"key": "preview", "leg": 0, "question": "route"}]
+        refine = {"capability": "autopilot-refine", "shape": "staged",
+                  "graph": ["review", "transaction"], "why": "review and refine"}
+        self.set_briefs(refine, refine, approvals=approvals)
+        self.set_interview({"legs": [refine], "execution_scope": "report", "entry_approvals": approvals})
+        self.settle()
+        record = self.record()
+        self.assertEqual(record["decision"]["first_leg_compose"]["graph"], ["review"])
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertNotIn("preview-disposition", route.get("human_gates", []))
+        self.assertEqual(R.verify_route(route)["entry_execution_scope"], "report")
+
+
 class SelectedLegTest(StartBase):
     def test_a164_2_a_direct_proposal_starts_one_first_leg_and_closes_the_frame_route(self):
         result = self.settle()

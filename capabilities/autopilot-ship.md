@@ -52,6 +52,12 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 ## Artifact Ownership
 
+The existing start choice carries `complete` or `report`. Report ends after
+both security and release preparation reviews, including their required merge
+evidence, and never starts deploy or post-deploy verification. Complete follows
+the shown deployment scope and existing safety restrictions. Older sealed
+routes retain their original gate and continuation.
+
 Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.
 
 ## Artifact Producer Lifecycle

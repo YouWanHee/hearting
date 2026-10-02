@@ -8911,7 +8911,7 @@ def _quick_refine_write_gate(root: Path, target: Path, route=None) -> None:
         if len(parts) <= index or parts[index] != "artifacts":
             return
         parts = parts[index + 1:]
-    if len(parts) < 2 or parts[0] not in {"documents", "research"} or "_internal" in parts:
+    if len(parts) < 2 or parts[0] not in {"documents", "research"}:
         return
     if route is None:
         path = os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_OWNER_ROUTE_FILE")
@@ -8920,7 +8920,18 @@ def _quick_refine_write_gate(root: Path, target: Path, route=None) -> None:
         route = _read_json(Path(path))
         if not isinstance(route, dict):
             raise ProducerError("inline-gate-route-unreadable")
-    if route.get("capability") != "autopilot-refine" or route.get("effective_intensity") != "quick":
+    if route.get("capability") != "autopilot-refine":
+        return
+    scoped = (type(route.get("entry_scope_contract_version")) is int
+              and route.get("entry_scope_contract_version") == 1
+              and route.get("entry_execution_scope") in {"complete", "report"})
+    if scoped and route.get("entry_execution_scope") == "report":
+        raise ProducerError("legacy-top-level-write-denied", "report scope is read-only")
+    if scoped and route.get("entry_execution_scope") == "complete":
+        return
+    if "_internal" in parts:
+        return
+    if route.get("effective_intensity") != "quick":
         return
     node = next((n for n in route.get("nodes", []) if n.get("id") == "one-shot"), {})
     if node.get("inline_human_gates") != ["preview-disposition"]:
