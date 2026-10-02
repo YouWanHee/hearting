@@ -3601,6 +3601,56 @@ def _fold_completed_child(job):
         and getattr(projection, "source", None) == "route-exact"
         and getattr(projection, "node_state", None) in _FOLD_CHILD_ROUTE_STATES
     )
+
+
+def _fold_finished_frame_child(job):
+    """Whether one frame leg is finished (fold-candidate, not the fold decision).
+
+    F-105 (backlog O2, user 2026-10-01): a completed frame branch (frame /
+    frame-alternative) kept a full dispatch row on the parent session card,
+    sitting next to the next round's live rows. Only genuinely finished legs
+    qualify — a terminal `done` registry word, or a stale row the exact route
+    projection settles as done / reconciling. Anything else (working, queued,
+    unknown, or stale without route proof) may be live or failed work and is
+    never a candidate. Non-frame rows (owners, stages) never qualify here; they
+    keep their own cards. Whether a candidate actually folds is decided per
+    route group by `_finished_frame_fold_ids`, and `a` / --all reveals folded
+    legs, like every other fold.
+    """
+    if getattr(job, "worker_type", None) != "frame":
+        return False
+    if getattr(job, "liveness", None) in _FOLD_CHILD_LIVENESS:
+        return True
+    projection = getattr(job, "work_projection", None)
+    return (
+        getattr(job, "liveness", None) == "stale"
+        and getattr(projection, "source", None) == "route-exact"
+        and getattr(projection, "node_state", None) in _FOLD_CHILD_ROUTE_STATES
+    )
+
+
+def _finished_frame_fold_ids(kids):
+    """Ids of frame legs to fold, grouped by route.
+
+    A finished leg folds only together with its whole route group: while any
+    leg of the same route still runs, the pair stays on screen (that is the
+    phase the operator watches). Once every leg of the route is finished, the
+    whole group folds at once — so a previous round never sits next to the
+    next round's live rows, and an owner card never shares its card with stale
+    frame boxes. A killed leg leaves no registry row, so an absent sibling
+    never blocks the fold; a stale leg without route proof does (it may be a
+    failure and keeps its context visible).
+    """
+    by_route = {}
+    for kid in kids:
+        if _is_plugin_agent(kid) or getattr(kid, "worker_type", None) != "frame":
+            continue
+        by_route.setdefault(getattr(kid, "route_id", None), []).append(kid)
+    fold = set()
+    for group in by_route.values():
+        if group and all(_fold_finished_frame_child(kid) for kid in group):
+            fold.update(id(kid) for kid in group)
+    return fold
 # The detached (owner-off-screen) variant of the fold above. Wider than in-card `done` on
 # purpose: inside a card, `stale`/`dead` still read against their owner's context, but with
 # the owner gone there is nothing to monitor and no card to belong to — done, stale and dead
@@ -6104,8 +6154,13 @@ def _drawn_group_jobs(classified, shown):
             continue  # ambiguous duplicate id: only the first row draws the dispatch tree
         if s.session_id:
             claimed.add(s.session_id)
-        for kid in classified["children"].get(s.session_id, []):
+        session_kids = classified["children"].get(s.session_id, [])
+        folded_frame_ids = (set() if _SHOW_ALL
+                            else _finished_frame_fold_ids(session_kids))
+        for kid in session_kids:
             if not _is_plugin_agent(kid):  # a plugin row is drawn without a GPU strip
+                if id(kid) in folded_frame_ids:
+                    continue  # F-105: finished route group, folded with its siblings
                 _walk(kid)
     for job in classified["orphans"]:
         if not _is_plugin_agent(job):
@@ -6798,7 +6853,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             elif s.session_id:
                 rendered_parent_sids.add(s.session_id)
             plugin_kids = [kid for kid in kids if _is_plugin_agent(kid)]
-            dispatch_kids = [kid for kid in kids if not _is_plugin_agent(kid)]
+            # F-105: finished frame legs fold away in whole route groups (see
+            # `_finished_frame_fold_ids`). Filter them out of the drawn kids
+            # once, so the child count, the card check below, and the
+            # dispatch-tree walk all see the same visible set.
+            folded_frame_ids = (set() if _SHOW_ALL
+                                else _finished_frame_fold_ids(kids))
+            dispatch_kids = [kid for kid in kids
+                             if not _is_plugin_agent(kid)
+                             and id(kid) not in folded_frame_ids]
             nested_n = (len(dispatch_kids)
                         + sum(len(job_children.get(k.slug, [])) for k in dispatch_kids))
             if s.liveness == "stale":
