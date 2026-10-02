@@ -899,6 +899,25 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(changed, [str(config)])
             self.assertEqual(config.read_text(encoding="utf-8"), original)
 
+    def test_deactivate_removes_a_config_activation_created(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "home" / "config.toml"
+            result = self._merge(config, self._release(root))
+            changed = self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(changed, [str(config)])
+            self.assertFalse(config.exists())
+
+    def test_deactivate_keeps_an_empty_config_the_user_had(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            config.write_text("", encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertTrue(config.is_file())
+            self.assertEqual(config.read_text(encoding="utf-8"), "")
+
     def test_deactivate_leaves_a_block_the_user_edited(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
