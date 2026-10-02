@@ -61,7 +61,6 @@ from dispatch_contract import (
     gate_currency,
     ROUTE_STATE_REFUSAL_REASONS,
     route_state_next_action,
-    default_jobs_path,
     dispatch_state_roots,
     ensure_global_registry_writable,
     parse_registry_metadata,
@@ -9176,8 +9175,8 @@ def main():
     v.add_argument("--launch-phase",choices=("dry-run","register","start"))
     n=sub.add_parser("node"); n.add_argument("--route",required=True); n.add_argument("--node",required=True)
     d=sub.add_parser("complete"); d.add_argument("--route",required=True); d.add_argument("--node",required=True); d.add_argument("--evidence",required=True); d.add_argument("--output")
-    d.add_argument("--jobs",help="canonical registry path for a registered attempt (default AGENT_DISPATCH_JOBS, "
-                                 "else the canonical registry, once an attempt is named)")
+    d.add_argument("--jobs",help="canonical registry path for a registered attempt "
+                                 "(default AGENT_DISPATCH_JOBS once an attempt is named)")
     d.add_argument("--attempt-id",help="exact current attempt, or an official continuation's blocking source review "
                                        "(default AGENT_DISPATCH_ATTEMPT_ID when that row is this node's attempt)")
     d.add_argument("--check",action="store_true",help="read-only check of exact current or ancestor owner-closure authority; publishes nothing")
@@ -9646,14 +9645,15 @@ def main():
                 # attempt axes (the inline/unregistered form) or completes a resource run
                 # takes nothing implicitly; an explicit value always wins.
                 jobs,attempt_id=a.jobs,a.attempt_id
+                inherited_jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None
                 if explicit_attempt_metadata is None and node.get("kind")!="resource-runner":
                     if a.subsession_manifest:
-                        jobs=jobs or str(default_jobs_path())
+                        jobs=jobs or inherited_jobs
                     else:
-                        if attempt_id is None:
-                            attempt_id=_bound_env_attempt(route,node,jobs or default_jobs_path())
+                        if attempt_id is None and (jobs or inherited_jobs):
+                            attempt_id=_bound_env_attempt(route,node,jobs or inherited_jobs)
                         if attempt_id and not jobs:
-                            jobs=str(default_jobs_path())
+                            jobs=inherited_jobs
                 if a.check:
                     if not jobs or not attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")

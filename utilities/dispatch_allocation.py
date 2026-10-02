@@ -129,14 +129,12 @@ def rank_harnesses(
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=("counts", "rank"))
-    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
+    from dispatch_contract import inherited_jobs_argument
+    parser.add_argument("--jobs", type=Path, **inherited_jobs_argument())
     parser.add_argument("--window", type=int, default=30)
     parser.add_argument("--candidates", default=",".join(HARNESSES))
     parser.add_argument("--declared-order", default=",".join(HARNESSES))
     args = parser.parse_args(argv)
-    if args.jobs is None:
-        from dispatch_contract import default_jobs_path
-        args.jobs = default_jobs_path()
     candidates = [item for item in args.candidates.split(",") if item]
     declared = [item for item in args.declared_order.split(",") if item]
     try:

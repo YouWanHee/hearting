@@ -12,12 +12,10 @@ from dispatch_contract import observed_attempt_liveness, parse_registry_metadata
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
+    from dispatch_contract import inherited_jobs_argument
+    parser.add_argument("--jobs", type=Path, **inherited_jobs_argument())
     parser.add_argument("--attempt-id", required=True)
     args = parser.parse_args()
-    if args.jobs is None:
-        from dispatch_contract import default_jobs_path
-        args.jobs = default_jobs_path()
     try:
         lines = args.jobs.read_text(
             encoding="utf-8", errors="replace"

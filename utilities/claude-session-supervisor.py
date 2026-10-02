@@ -1243,7 +1243,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--opencode-agent", default="build")
     value.add_argument("--variant")
     value.add_argument("--worktree", required=True)
-    value.add_argument("--jobs", help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
+    from dispatch_contract import inherited_jobs_argument
+    value.add_argument("--jobs", **inherited_jobs_argument())
     value.add_argument("--parent-attempt-id", required=True)
     value.add_argument("--add-dir", action="append", default=[])
     value.add_argument("--model")
@@ -1295,9 +1296,6 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if args.jobs is None:
-        from dispatch_contract import default_jobs_path
-        args.jobs = str(default_jobs_path())
     continuation_budget = resolve_continuation_budget(
         explicit=args.max_continuations,
         route_file=args.route_file,

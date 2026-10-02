@@ -373,7 +373,8 @@ def watch(args: argparse.Namespace) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
+    from dispatch_contract import inherited_jobs_argument
+    parser.add_argument("--jobs", type=Path, **inherited_jobs_argument())
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--pid-start", required=True)
@@ -396,9 +397,6 @@ def main(argv=None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    if args.jobs is None:
-        from dispatch_contract import default_jobs_path
-        args.jobs = default_jobs_path()
     if args.pid <= 0 or args.pgid <= 0 or args.interval <= 0:
         parser.error("--pid, --pgid, and --interval must be positive")
     if args.parent_recheck_interval <= 0:

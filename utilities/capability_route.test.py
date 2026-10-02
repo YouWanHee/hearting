@@ -7154,6 +7154,20 @@ class EnvironmentAttemptDefaultTest(unittest.TestCase):
   self.assertEqual(row["status"],"closed")
   self.assertEqual(marker["attempt_id"],"att-terminal-owner")
 
+ def test_without_an_inherited_registry_nothing_is_guessed(self):
+  # No AGENT_DISPATCH_JOBS: no registry is assumed, so both forms keep main's refusals.
+  route,node,path,evidence=self.fixture()
+  before=self.jobs.read_bytes()
+  with mock.patch.dict(os.environ):
+   os.environ.pop("AGENT_DISPATCH_JOBS",None)
+   with self.assertRaisesRegex(ValueError,"current dispatched completion requires exact attempt metadata"):
+    self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence)],
+     {"AGENT_DISPATCH_ATTEMPT_ID":"att-terminal-owner"})
+   with self.assertRaisesRegex(ValueError,"unregistered completion requires explicit attempt metadata"):
+    self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
+     "--attempt-id","att-terminal-owner"],{})
+  self.assertEqual(self.jobs.read_bytes(),before)
+
  def test_an_attempt_bound_elsewhere_fills_nothing(self):
   route,node,path,evidence=self.fixture()
   other=next(n for n in route["nodes"] if n["id"]!=node["id"] and n.get("dispatch_depth")
