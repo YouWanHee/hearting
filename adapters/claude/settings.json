@@ -1,5 +1,11 @@
 {
   "autoMemoryEnabled": false,
+  "env": {
+    "AGENT_DISPATCH_CALLER_HARNESS": "",
+    "CODEX_THREAD_ID": "",
+    "CODEX_SESSION_ID": "",
+    "OPENCODE_SESSION_ID": ""
+  },
   "permissions": {
     "allow": [
       "Bash",

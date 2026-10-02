@@ -183,8 +183,10 @@ class NoticeWatcher:
                 if len(values) != 1:
                     raise CompletionError("native-queue-notice-context-invalid")
                 sent = True
+                # Claim and ack stay with the registered recipient; the queue is the successor's after a /clear.
+                target = queue_target(self.args.jobs, self.attempts, self.recipient)
                 queue_result = codex_queue_delivery.send_at_least_once(
-                    queue_socket, thread_id=self.recipient,
+                    queue_socket, thread_id=target,
                     client_message_id=claimed["delivery_id"], message=values[0],
                     timeout=5.0,
                 )
@@ -193,13 +195,13 @@ class NoticeWatcher:
                                          acked_by=self.owner)
                     return
                 queued = codex_queue_delivery.list_queue(
-                    queue_socket, self.recipient, timeout=5.0
+                    queue_socket, target, timeout=5.0
                 )
                 pending_item = next((item for item in queued
                                      if item.get("clientUserMessageId") == claimed["delivery_id"]), None)
                 if pending_item is None:
                     turn = codex_queue_delivery.find_turn_by_client_message_id(
-                        queue_socket, self.recipient, claimed["delivery_id"], timeout=5.0
+                        queue_socket, target, claimed["delivery_id"], timeout=5.0
                     )
                     if turn is not None:
                         pending_delivery.ack(
@@ -645,6 +647,22 @@ def deliver_with_retry(
         time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
 
 
+def queue_target(jobs: Path, attempts: set[str], registered: str) -> str:
+    """The Codex thread that receives a completion: the registered parent, or its same-seat
+    successor after a /clear.  Storage, claim and ack stay under the registered parent (the
+    record's own signature and digest); only the queue the item is put into changes.  Looked up
+    again on every pass, so a handover that happens while waiting is seen before the send."""
+    try:
+        import dispatch_seat_handover as handover
+        rows = handover.latest_rows(jobs)
+        owners = {handover.effective_parent(rows[a][1], jobs) for a in attempts if a in rows}
+        if len(owners) == 1:
+            return owners.pop() or registered
+    except Exception:  # noqa: BLE001 - the registered parent is always a valid target
+        pass
+    return registered
+
+
 def _native_queue_delivery_once(
     args: argparse.Namespace,
     receipt: dict[str, Any],
@@ -655,10 +673,11 @@ def _native_queue_delivery_once(
     path = args.queue_socket or resolve_queue_socket()
     if not path.is_absolute():
         raise CompletionError("native-queue-endpoint-path-invalid")
+    target = queue_target(args.jobs, attempts, args.thread_id)
     thread = codex_queue_delivery._rpc(
-        path, "thread/read", {"threadId": args.thread_id}, timeout=5.0
+        path, "thread/read", {"threadId": target}, timeout=5.0
     ).get("thread")
-    if not isinstance(thread, dict) or thread.get("id") != args.thread_id:
+    if not isinstance(thread, dict) or thread.get("id") != target:
         raise CompletionError("native-queue-thread-identity-invalid")
     if thread.get("cwd") and not isinstance(thread.get("cwd"), str):
         raise CompletionError("native-queue-thread-cwd-invalid")
@@ -741,16 +760,22 @@ def _native_queue_delivery_once(
             pending_delivery.claim(root, args.thread_id, delivery_id,
                                    claim_owner=claim_owner, lease_seconds=60.0)
             claimed.append(delivery_id)
-        if allow_enqueue:
+        if target != args.thread_id and codex_queue_delivery._known_consumed(
+                path, args.thread_id, client_message_id, timeout=5.0) is not None:
+            # The item already reached the cleared window's thread before the handover.
+            result = {"status": "consumed"}
+        elif allow_enqueue:
             result = codex_queue_delivery.send_at_least_once(
-                path, thread_id=args.thread_id, client_message_id=client_message_id,
+                path, thread_id=target, client_message_id=client_message_id,
                 message=context, timeout=5.0)
         elif codex_queue_delivery._known_consumed(
-                path, args.thread_id, client_message_id, timeout=5.0) is not None:
+                path, target, client_message_id, timeout=5.0) is not None:
             result = {"status": "consumed"}
         else:
+            # An item still waiting in the old thread's queue cannot be moved (the local queue API
+            # has no move/remove): it is never restarted there; the successor gets the same record.
             result = codex_queue_delivery.poll_owned_item(
-                path, thread_id=args.thread_id, client_message_id=client_message_id, timeout=5.0)
+                path, thread_id=target, client_message_id=client_message_id, timeout=5.0)
             result["status"] = "queued"
 
         if result["status"] == "consumed":

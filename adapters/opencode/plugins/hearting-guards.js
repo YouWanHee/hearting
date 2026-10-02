@@ -361,6 +361,18 @@ function promptText(output) {
     .join("\n")
 }
 
+// The inherited caller name and the other harnesses' session identity variables, blanked in
+// OpenCode tool commands. The worker marker AGENT_DISPATCH_CURRENT_HARNESS is left alone.
+const inheritedIdentityEnv = [
+  "AGENT_DISPATCH_CALLER_HARNESS",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_SESSION_ID",
+  "CLAUDECODE",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CODEX_THREAD_ID",
+  "CODEX_SESSION_ID",
+]
+
 export const AgentHarnessGuards = async (ctx) => {
   // Record plugin-load marker once per plugin init. In a headless dispatch the
   // runtime child inherits OPENCODE_DISPATCH_SLUG, so this proves the plugin
@@ -467,13 +479,17 @@ export const AgentHarnessGuards = async (ctx) => {
     runWorkerState("compact-before", input || {})
   },
   "shell.env": async (input, output) => {
-    // Sessionless compiles/binds are a real runtime state (undocumented
-    // sessionID, only typed optional upstream), not a theoretical one — never
-    // throw here, and set nothing when input.sessionID is absent.
-    const sid = input && input.sessionID
-    if (!sid || !output) return
+    // A harness clears the inherited caller name and every other harness's session id from
+    // its own tool commands (core/OPERATIONS.md); its own session id is then the only
+    // identity evidence and nothing exported here names a harness. The plugin env is merged
+    // over the inherited one. Sessionless compiles/binds are a real runtime state (undocumented sessionID,
+    // only typed optional upstream), not a theoretical one — never throw here, and set
+    // OPENCODE_SESSION_ID only when input.sessionID is present.
+    if (!output) return
     if (!output.env) output.env = {}
-    output.env.OPENCODE_SESSION_ID = sid
+    for (const key of inheritedIdentityEnv) output.env[key] = ""
+    const sid = input && input.sessionID
+    if (sid) output.env.OPENCODE_SESSION_ID = sid
   },
   // The two kept write gates (hooks/core-write-guard.py): installed release copies
   // and the shared checkout seen from a linked worktree. Anything else is allowed.

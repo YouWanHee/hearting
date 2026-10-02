@@ -352,7 +352,17 @@ def _current_parent_session_id():
     return default_parent_session_id()
 
 
-def _slot(route, node, rows):
+def _owns(meta, parent, jobs):
+    """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
+    if parent and meta.get("parent_sid") == parent:
+        return True
+    if not parent or jobs is None:
+        return False
+    from dispatch_seat_handover import owns
+    return owns(meta, parent, jobs)
+
+
+def _slot(route, node, rows, jobs=None):
     matches = [aid for aid, (_, meta) in rows.items()
                if ((node == "owner" and meta.get("worker_type") == "owner"
                     and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")})
@@ -368,7 +378,7 @@ def _slot(route, node, rows):
         # the session a supervisor handed the route to may harvest it.
         if status != "done":
             parent = _current_parent_session_id()
-            if not parent or meta.get("parent_sid") != parent:
+            if not _owns(meta, parent, jobs):
                 raise DispatchContractError("work-parent-recovery-required", aid)
         digest = (meta.get("owner_route_hash") or meta.get("route_hash")) if node == "owner" else meta.get("route_hash")
         if digest != route["route_hash"]:
@@ -1223,7 +1233,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                 "task": request["text"],
                 "artifact_env": prepare_route_artifact_env(path, start=True, jobs=jobs)}
     rows = _rows(jobs)
-    existing_owner = _slot(route, "owner", rows)
+    existing_owner = _slot(route, "owner", rows, jobs)
     frames = ([] if existing_owner in rows and not (interview or answers) else
               [n for n in route["nodes"] if n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1])
     if frames:
@@ -1244,7 +1254,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             frame_pin = None
         attempts = set()
         # Validate every reused identity before starting any missing sibling.
-        slots = [_slot(route, node["id"], rows) for node in frames]
+        slots = [_slot(route, node["id"], rows, jobs) for node in frames]
         for node, aid in zip(frames, slots):
             if aid not in rows:
                 # Readiness proves runtime support, not remaining usage. Passing
@@ -1333,7 +1343,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     if RP.is_framed_route(route):
         return _framed_settle(route, path, jobs, result, wait=wait, run=run, sleep=sleep, clock=clock)
     rows = _rows(jobs)
-    aid = _slot(route, "owner", rows)
+    aid = _slot(route, "owner", rows, jobs)
     refusal = None
     launched_now = aid not in rows
     if aid not in rows:
@@ -1475,7 +1485,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
             rows = _rows(Path(jobs))
             parent = _current_parent_session_id()
             owned = {aid for aid, (status, meta) in rows.items() if status in {"open", "running"}
-                     and parent and meta.get("parent_sid") == parent
+                     and _owns(meta, parent, jobs)
                      and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")}}
             if owned:
                 result["registered_attempts"] = sorted(owned)

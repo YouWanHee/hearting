@@ -68,10 +68,15 @@ class ProducerBindingTests(unittest.TestCase):
                                return_value=SimpleNamespace(allow=True)):
             first = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
                                                owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+            stored = json.loads(first.path.read_text())
+            stored["primary"] = str(self.root / "owner-report.md")
+            (self.root / "owner-report.md").write_text("primary\n")
+            first.path.write_text(json.dumps(stored, sort_keys=True, separators=(",", ":")) + "\n")
             second = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
                                                 owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
-        self.assertEqual(first.digest, second.digest)
+        self.assertNotEqual(first.digest, second.digest)
         self.assertTrue(second.replay)
+        self.assertEqual(second.binding["primary"], str(self.root / "owner-report.md"))
         with self.assertRaises(T.TerminalCommitError) as caught:
             T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
                                        owner_attempt_id="att-owner", cycle_id="cyc_" + "d" * 32, owner_begin=True)
@@ -148,9 +153,14 @@ class ProducerBindingTests(unittest.TestCase):
         (directory/"run.1.json").write_text(json.dumps(marker))
         self.assertEqual(ROUTE.owner_terminal_prerequisites(route,terminal,self.jobs),{})
         self.assertEqual(self.jobs.read_text(),"")
-        evidence.write_text('{"exit_code":1}')
-        self.assertEqual(ROUTE.owner_terminal_prerequisites(route,terminal,self.jobs),
-                         {"run":"completion-evidence-revised-unrecorded"})
+        # Use a different-size payload so stat-based digest caches cannot turn
+        # this same-test rewrite into a false unchanged-content observation.
+        evidence.write_text('{"exit_code":10}')
+        # This test targets the checked gate-on classification while preserving
+        # the user's runtime gate-off behavior tested by the default call above.
+        with mock.patch.object(T.dispatch_contract, "gates_on", return_value=True):
+            self.assertEqual(ROUTE.owner_terminal_prerequisites(route,terminal,self.jobs),
+                             {"run":"completion-evidence-revised-unrecorded"})
 
     def test_route_children_consumes_exact_owner_and_inline_gate_proofs(self):
         route = {"route_id": "rt-gate-proof", "route_hash": "sha256:" + "a" * 64,
@@ -1537,6 +1547,27 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     request = terminal.TerminalCommitRequest(path, owner, jobs, fixture.root)
                     state_path = terminal._commit_state_path(request)
                     stored = json.loads(state_path.read_text())
+                    envelope = json.loads((state_path.parent / "owner-envelope.json").read_text())
+                    self.assertEqual(envelope["primary_path"], str(moved[0].resolve()))
+                    producer_binding = terminal.load_producer_binding(
+                        artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+                    cycle_record = artifact_producer.read_cycle_record(fixture.root, producer_binding["cycle_id"])
+                    cycle_dir = artifact_producer.cycle_dir(fixture.root, cycle_record["campaign_id"],
+                                                            producer_binding["cycle_id"], cycle_record)
+                    manifest = json.loads((cycle_dir / "manifest.json").read_text())
+                    primary_rows = [row for row in manifest["artifacts"] if row.get("role") == "primary"]
+                    self.assertEqual(len(primary_rows), 1)
+                    primary_id = primary_rows[0]["artifact_id"]
+                    primary_revision = next(row for row in manifest["artifact_revisions"]
+                                            if row["artifact_id"] == primary_id)
+                    self.assertEqual(primary_revision["locator"]["path"],
+                                     "artifacts/" + moved[0].relative_to(cycle_dir / "artifacts").as_posix())
+                    handoff = terminal.completed_owner_handoff(jobs, "done", meta)
+                    self.assertIn(f"artifact: {moved[0].resolve()}", handoff)
+                    import work_start
+                    consumed = work_start._outcome(jobs, owner)
+                    self.assertIn("handoff", consumed)
+                    self.assertIn(f"artifact: {moved[0].resolve()}", consumed["handoff"])
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                     second = terminal.settle_owner_completion(jobs, "done", meta)
                     self.assertEqual(second.result, "completed", second)
@@ -1554,6 +1585,110 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
             self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
 
+    def test_explicit_owner_handoff_primary_precedes_exact_owner_log_artifact(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
+        producer_binding = terminal.load_producer_binding(
+            artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+        cycle_record = artifact_producer.read_cycle_record(fixture.root, producer_binding["cycle_id"])
+        cycle_dir = artifact_producer.cycle_dir(fixture.root, cycle_record["campaign_id"],
+                                                producer_binding["cycle_id"], cycle_record)
+        chosen = cycle_dir / "artifacts" / "plans" / "z-user-report.md"
+        chosen.parent.mkdir(parents=True, exist_ok=True)
+        chosen.write_bytes(b"explicit owner handoff\n")
+        meta = {**meta, "owner_handoff": {"primary": str(chosen)}}
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            result = terminal.settle_owner_completion(jobs, "done", meta)
+            self.assertEqual(result.result, "completed", result)
+            request = terminal._completion_request(jobs, "done", meta)
+            envelope = json.loads((terminal._commit_state_path(request).parent / "owner-envelope.json").read_text())
+        self.assertNotEqual(report.resolve(), chosen.resolve())
+        self.assertEqual(envelope["primary_path"], str(chosen.resolve()))
+
+    def test_private_cycle_hint_is_ignored_during_real_producer_settlement(self):
+        fixture, terminal, route, path, jobs, owner, owner_report, meta = self._settled("claude", "owner-report.md")
+        producer_binding = terminal.load_producer_binding(
+            artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner)
+        original_primary = str(owner_report.resolve())
+        terminal._atomic_json(producer_binding.path, {**producer_binding.binding, "primary": original_primary})
+        cycle_record = artifact_producer.read_cycle_record(fixture.root, producer_binding.binding["cycle_id"])
+        cycle_dir = artifact_producer.cycle_dir(fixture.root, cycle_record["campaign_id"],
+                                                producer_binding.binding["cycle_id"], cycle_record)
+        private = cycle_dir / ".cycle.json"
+        self.assertTrue(private.is_file())
+        meta = {**meta, "owner_handoff": {"primary": str(private)}}
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            result = terminal.settle_owner_completion(jobs, "done", meta)
+            self.assertEqual(result.result, "completed", result)
+            request = terminal._completion_request(jobs, "done", meta)
+            envelope = json.loads((terminal._commit_state_path(request).parent / "owner-envelope.json").read_text())
+            binding = terminal.load_producer_binding(
+                artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+        self.assertEqual(binding.get("primary"), original_primary)
+        envelope_primary = Path(envelope["primary_path"]).resolve()
+        self.assertTrue(envelope_primary.is_relative_to((cycle_dir / "artifacts").resolve()),
+                        f"envelope={envelope_primary} artifacts={cycle_dir / 'artifacts'}")
+        manifest = json.loads((cycle_dir / "manifest.json").read_text())
+        primary_rows = [row for row in manifest["artifacts"] if row.get("role") == "primary"]
+        self.assertEqual(len(primary_rows), 1)
+        primary_id = primary_rows[0]["artifact_id"]
+        revision = next(row for row in manifest["artifact_revisions"] if row["artifact_id"] == primary_id)
+        self.assertEqual(revision["locator"]["path"],
+                         "artifacts/" + envelope_primary.relative_to(cycle_dir / "artifacts").as_posix())
+        self.assertNotEqual(envelope["primary_path"], str(private.resolve()))
+
+    def test_existing_exact_claim_without_local_state_replays_bound_primary(self):
+        fixture, terminal, route, path, jobs, owner, original, meta = self._settled("claude", "owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            request = terminal._completion_request(jobs, "done", meta)
+            interrupted = terminal.settle_terminal_commit(
+                request, terminal.TerminalCommitServices(crash_after="claim-after"))
+            self.assertEqual(interrupted.result, "recoverable")
+            selected = terminal.load_producer_binding(
+                artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding["primary"]
+            claim = terminal.dispatch_contract.terminal_claim_observation(jobs, route["route_id"], owner)
+            self.assertIsNotNone(claim)
+            state_path = terminal._commit_state_path(request)
+            state_path.unlink()
+            # Resolve the cycle from the exact producer binding; the later hint
+            # is a distinct, otherwise-valid payload artifact.
+            binding = terminal.load_producer_binding(
+                artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+            cycle_record = artifact_producer.read_cycle_record(fixture.root, binding["cycle_id"])
+            cycle_dir = artifact_producer.cycle_dir(
+                fixture.root, cycle_record["campaign_id"], binding["cycle_id"], cycle_record)
+            alternate = cycle_dir / "artifacts" / "alternate-owner-report.md"
+            alternate.parent.mkdir(parents=True, exist_ok=True)
+            alternate.write_text("later valid alternative\n")
+            self.assertEqual(terminal._valid_cycle_primary(
+                str(alternate), root=fixture.root, binding=binding), alternate.resolve())
+            late_request = terminal.TerminalCommitRequest(
+                path, owner, jobs, fixture.root, {"primary": str(alternate)})
+            replay = terminal.settle_terminal_commit(late_request)
+            self.assertEqual(replay.result, "completed", replay)
+            envelope = json.loads((state_path.parent / "owner-envelope.json").read_text())
+            binding_after = terminal.load_producer_binding(
+                artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+        self.assertEqual(binding_after["primary"], selected)
+        self.assertEqual(Path(envelope["primary_path"]).name, Path(selected).name)
+        self.assertNotEqual(envelope["primary_path"], str(alternate.resolve()))
+        self.assertNotEqual(original.resolve(), alternate.resolve())
+
+    def test_primary_binding_survives_crash_after_claim_and_exact_replay(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            request = terminal._completion_request(jobs, "done", meta)
+            interrupted = terminal.settle_terminal_commit(
+                request, terminal.TerminalCommitServices(crash_after="claim-after"))
+            self.assertEqual((interrupted.result, interrupted.reason), ("recoverable", "recovery-unavailable"))
+            binding = terminal.load_producer_binding(
+                artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+            self.assertEqual(binding["primary"], str(report.resolve()))
+            replay = terminal.settle_terminal_commit(request)
+            self.assertEqual(replay.result, "completed", replay)
+            handoff = terminal.completed_owner_handoff(jobs, "done", meta)
+            placed = next(Path(fixture.root).rglob("owner-report.md"))
+        self.assertIn(f"artifact: {placed.resolve()}", handoff)
+
     def test_a_changed_or_missing_placed_report_still_fails_the_replay(self):
         for harness in ("claude",):   # the damage is to the placed file, whatever shape the native result had
             for damage in ("bytes", "missing"):
@@ -1568,6 +1703,43 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                             moved.unlink()
                         self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                         self.assertNotEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+
+
+class OwnerFinishPrimaryRegressionTest(_TerminalCommitFixture):
+    def test_request_carries_optional_owner_handoff_primary(self):
+        request = self.request()
+        self.assertTrue(hasattr(request, "owner_handoff"))
+        self.assertIsNone(request.owner_handoff)
+
+    def test_explicit_owner_primary_wins_envelope_fallback_for_nonproducer_route(self):
+        owner_report = self.root / "z-user-report.md"
+        owner_report.write_text("owner report\n")
+        request = T.TerminalCommitRequest(self.route_file, "att-a3fixture", self.jobs,
+                                          self.root, {"primary": str(owner_report)})
+        services, _ = self.services()
+        with mock.patch.object(T, "prove_terminal_authority", return_value=T.TerminalProof("proved")), \
+             mock.patch.object(T, "producer_lifecycle_applies", return_value=False), \
+             mock.patch.object(T, "_route_module") as route_module:
+            route_module.return_value.terminal_gate_observation.return_value = self.gates
+            result = T.settle_terminal_commit(request, services)
+        self.assertEqual(result.result, "completed", (result.reason, result.detail))
+        envelope = json.loads((T._commit_state_path(request).parent / "owner-envelope.json").read_text())
+        self.assertEqual(envelope["primary_path"], str(owner_report.resolve()))
+
+    def test_outside_owner_hint_is_ignored_and_existing_terminal_fallback_remains(self):
+        foreign = self.root.parent / "foreign-owner-report.md"
+        foreign.write_text("outside root\n")
+        request = T.TerminalCommitRequest(self.route_file, "att-a3fixture", self.jobs,
+                                          self.root, {"primary": str(foreign)})
+        services, _ = self.services()
+        with mock.patch.object(T, "prove_terminal_authority", return_value=T.TerminalProof("proved")), \
+             mock.patch.object(T, "producer_lifecycle_applies", return_value=False), \
+             mock.patch.object(T, "_route_module") as route_module:
+            route_module.return_value.terminal_gate_observation.return_value = self.gates
+            result = T.settle_terminal_commit(request, services)
+        self.assertEqual(result.result, "completed", (result.reason, result.detail))
+        envelope = json.loads((T._commit_state_path(request).parent / "owner-envelope.json").read_text())
+        self.assertEqual(envelope["primary_path"], str(self.artifact.resolve()))
 
 
 if __name__ == "__main__":

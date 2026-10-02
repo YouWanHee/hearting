@@ -3,23 +3,17 @@
 # any source directory: git ignores it and a release is `git archive`, so it
 # is never part of a projection or a release (2026-09-10, after five false
 # failures in one night). This test seeds a cache into every tracked Python
-# directory, runs the checkers that walk those trees, and removes only what
-# it seeded.
+# directory of a private checkout copy (tools/checkout-copy.sh) and runs the
+# checkers that walk those trees there.
 set -u
-cd "$(dirname "$0")/.."
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
-# These checkers read the live tree, and two peer suites rewrite files in it
-# (the adaptation exemptions TSV among them -- a boundary check run mid-rewrite
-# reports `field 4='-'`, which is how this suite went red in CI 2026-09-10).
-. "$PWD/tools/worktree-lock.sh"
-worktree_lock_acquire "$PWD" 900 || exit 70
+COPY_PARENT=$(mktemp -d)
+trap 'rm -rf "$COPY_PARENT"' EXIT
+. "$ROOT/tools/checkout-copy.sh"
+checkout_copy "$ROOT" "$COPY_PARENT/repo" || { echo "FAIL - checkout copy"; exit 1; }
+cd "$COPY_PARENT/repo"
 seeded=()
-cleanup() {
-  for d in "${seeded[@]:-}"; do
-    [ -n "$d" ] && rm -rf "$d"
-  done
-}
-trap cleanup EXIT
 while IFS= read -r dir; do
   cache="$dir/__pycache__"
   if [ ! -e "$cache" ]; then

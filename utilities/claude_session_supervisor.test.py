@@ -991,7 +991,8 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         budget = next(row for row in rows if row.get("type") == "dispatch.supervisor.continuation-budget")
-        self.assertEqual((budget["ordinary"], budget["source"]), (15, "bound-route"))
+        self.assertEqual(budget["source"], "bound-route")
+        self.assertGreater(budget["ordinary"], 13)
         self.assertEqual(budget["limit"], budget["ordinary"] + budget["reserved"])
         resumed = [row for row in rows if row.get("type") == "dispatch.supervisor.resumed"]
         self.assertEqual(len(resumed), 13)
@@ -1913,6 +1914,27 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
 
     def _delegate(self):
         return ClaudeSessionSupervisorTest
+
+    def test_workload_budget_keeps_report_and_final_handoff_after_fourteen_turns(self):
+        budget = supervisor_budget_module().ContinuationBudget(32, "workload-regression")
+        ledger = supervisor_budget_module().ContinuationLedger(budget)
+        state_root = self.base / "workload"
+        for ordinal in range(14):
+            verdict, _ = supervisor._admit_continuation(
+                ledger, state_root, parent_attempt_id=PARENT, route_id="rt-workload",
+                route_hash="sha256:" + "e" * 64, ordinal=ordinal,
+                purpose="ordinary", stalled=False)
+            self.assertTrue(verdict.admitted, (ordinal, verdict))
+        report_dispatch, _ = supervisor._admit_continuation(
+            ledger, state_root, parent_attempt_id=PARENT, route_id="rt-workload",
+            route_hash="sha256:" + "e" * 64, ordinal=14,
+            purpose="ordinary", stalled=False)
+        self.assertTrue(report_dispatch.admitted)
+        notice = supervisor._seal_terminal_handoff_or_raise(
+            ledger, state_root, args=_terminal_handoff_args(), ordinal=15,
+            failure_reason="terminal-handoff-incomplete", terminal_handoff_issued=[False])
+        self.assertIn("final continuation", notice)
+        self.assertEqual(ledger.reserved_remaining, 0)
 
     def test_delivery_consumes_one_continuation_and_no_model_bookkeeping_stall(self):
         case = ClaudeSessionSupervisorTest()

@@ -33,7 +33,7 @@ surfaces rewritten to Codex-native preflight/tool-contract wording.
 ---
 unit: editorial/report
 family: editorial
-role: fast writer
+role: deep editor
 worker_type: stage
 floor: low
 read_only: false
@@ -44,13 +44,16 @@ io:
 tools: []
 branches: [pipeline]
 aliases: {}
+bootstrap:
+  memory: [report-format]
+  exemplar: deliverable
 ---
 
 # Unit: editorial/report
 
 Assemble already-verified artifacts into one final user-facing report. This unit is the
-low-cost assembly stage at the end of a pipeline (code report, design handoff, lab eval
-report, draft finalize) — it writes, it does not judge.
+assembly stage at the end of a pipeline (code report, design handoff, lab eval
+report, draft finalize) — it writes for the reader, it does not judge.
 
 ## Contract
 
@@ -67,5 +70,8 @@ report, draft finalize) — it writes, it does not judge.
 - **Remaining risk is part of the report.** Carry forward unresolved warnings, skipped
   checks, and open decision points from the inputs verbatim-faithfully; a clean-looking
   summary that drops a known risk is a contract violation.
+- **Format follows precedent.** When the runtime supplies a format exemplar or saved preferences, match their section
+  order, layout, tone, and visualization style; content still comes only from the inputs. If they disagree, content follows the
+  inputs and format follows the conventions.
 - Write the report to the assigned artifact path (node-owned scope); return per
   `_shared/dual-io.md`.

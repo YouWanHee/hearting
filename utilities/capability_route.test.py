@@ -5654,6 +5654,46 @@ class ContinuationBudgetSealedBlockTest(unittest.TestCase):
   self.assertEqual(route["continuation_budget"]["limit"],budget.limit)
 
 
+class OwnerFinishBudgetRegressionTest(unittest.TestCase):
+ def test_compiler_and_resolver_share_workload_formula(self):
+  import dispatch_continuation_budget as BUDGET
+  route=R.compile_route(**TestRoute().args())
+  block=route["continuation_budget"]
+  self.assertGreaterEqual(block["ordinary"],32)
+  self.assertEqual(block["ordinary"],BUDGET.derive_workload_ordinary(
+   declared_nodes=block["declared_nodes"], retry_slots=block["retry_slots"],
+   review_round_cap=block["review_round_cap"], terminal_nodes=block["terminal_nodes"]))
+
+ def test_correct_cli_prints_the_shared_correction_delivery_notice(self):
+  sys.path.insert(0, str(P.parent))
+  import dispatch_owner_input as owner_input
+  import dispatch_contract
+  attempt="att-parent"
+  jobs=Path(tempfile.mkdtemp())/"jobs.log"
+  lease=dispatch_contract.supervisor_lease_path(jobs,attempt)
+  jobs.parent.mkdir(parents=True,exist_ok=True)
+  jobs.write_text("2026-10-02T00:00:00Z\topen\t/repo\t/wt\towner\t"
+   +"attempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,"
+   +"registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=codex,"
+   +"completion_delivery=app-server-supervised,supervisor_lease=flock-v1,"
+   +f"supervisor_lease_file={lease},supervisor_lease_nonce={'d'*64},attempt_id={attempt},"
+   +"owner_route_id=rt-fixture,owner_route_hash=sha256:"+"a"*64+",route_id=rt-fixture,route_hash=sha256:"+"a"*64+",parent_sid=fixture\n")
+  with dispatch_contract.hold_supervisor_lease(jobs,attempt,lease):
+   owner_input.OwnerInput(jobs,attempt,"thread-fixture","codex-active-turn",lambda _event:None)
+   owner_input.submit(jobs,attempt,"private", "request-cli")
+   result=subprocess.run([sys.executable,str(P),"correct","--attempt-id",attempt,"--jobs",str(jobs)],
+    capture_output=True,text=True,check=False)
+  self.assertEqual(0,result.returncode,result.stderr)
+  value=json.loads(result.stdout)
+  self.assertIn("delivery_notice",value)
+  self.assertIn("does not wake or cancel",value["delivery_notice"])
+
+
+class OwnerFinishCorrectionRegressionTest(OwnerFinishBudgetRegressionTest):
+ def test_cli_delivery_notice_regression(self):
+  self.test_correct_cli_prints_the_shared_correction_delivery_notice()
+
+
 class FrameSummaryContractTest(unittest.TestCase):
  """A50-9 / N3 / R2-3: shards/frame/frame-summary.json contract, documented in
  skills/autopilot-code/references/owner-execution.md and
@@ -6332,8 +6372,23 @@ class ComposeRouteTest(TestRoute):
  def test_old_refine_route_uses_exact_git_show_catalog_and_unrelated_digest_drift_stays_stale(self):
   import subprocess
   current = R.TOPO.load_registry()
+  # Keep the pre-entry-scope catalog in a private repository: this checkout's
+  # HEAD already includes the change once committed, and moves again on merge.
+  old_catalog = json.loads(json.dumps(current))
+  transaction = old_catalog["part_catalog"]["parts"]["autopilot-refine:transaction"]
+  self.assertEqual(transaction.pop("start_approval"), "preview")
+  recipe = next(row for row in old_catalog["recipes"] if row["capability"] == "autopilot-refine")
+  review = next(node for node in recipe["standard_plus"]["nodes"] if node["id"] == "review")
+  review["outputs"].remove("reviews/refine/preview.md")
+  repo = Path(self._tmp_home.name) / "old-catalog-repo"
+  (repo / "capabilities").mkdir(parents=True)
+  (repo / "capabilities/topologies.json").write_text(json.dumps(old_catalog, indent=2) + "\n")
+  subprocess.run(["git", "init", "-q", str(repo)], check=True)
+  subprocess.run(["git", "add", "capabilities/topologies.json"], cwd=repo, check=True)
+  subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                  "commit", "-qm", "Before entry scope"], cwd=repo, check=True)
   git_show_registry = json.loads(subprocess.check_output(
-   ["git","show","HEAD:capabilities/topologies.json"],cwd=R.ROOT,text=True))
+   ["git","show","HEAD:capabilities/topologies.json"],cwd=repo,text=True))
   reconstructed = R._entry_scope_legacy_registry(current)
   self.assertEqual(R.TOPO.registry_digest(git_show_registry),R.TOPO.registry_digest(reconstructed))
   with mock.patch.object(R.TOPO,"load_registry",return_value=git_show_registry):
@@ -7746,6 +7801,57 @@ class RouteChainWriterTest(ComposeRouteTest):
    route=self.compose(artifact_root=tmp)
    err=self._emit(route,tmp)
    self.assertIn("route_chain_written=1 harness=codex",err)
+ def _tool_shell_env(self,parent,child,sid):
+  """The child harness's tool-command env, built from the shipped adapter configs."""
+  fixtures=str(P.parent/"fixtures")
+  if fixtures not in sys.path: sys.path.insert(0,fixtures)
+  import harness_tool_env as E
+  try:
+   inherited=E.daemon_started_from(E.tool_shell_env(parent,{},"parent-sid-"+parent))
+   return E.tool_shell_env(child,inherited,sid)
+  except E.ToolMissing as exc:
+   self.skipTest(str(exc))
+ def test_compose_records_codex_ledger_in_claude_started_daemon_env(self):
+  # A Codex thread served by the shared daemon that a Claude tool shell started: its tool
+  # commands carry the thread id AND the starter's Claude session id (the SR_CorrNet incident).
+  env=self._tool_shell_env("claude","codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1")
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{**env,"AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=1 harness=codex",err)
+   self.assertNotIn("reason=no-identity",err)
+   self.assertEqual([line["route_id"] for line in self.RC.read_tail("codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1")],
+                    [route["route_id"]])
+   self.assertEqual(self.RC.read_tail("claude","parent-sid-claude"),[])
+ def test_compose_never_records_claude_when_the_codex_block_is_not_installed(self):
+  # Partial rollout: Claude's env is installed, Codex's block is not. The Claude-started daemon's
+  # Codex thread carries its own id next to the stale Claude one and NO exported harness name, so
+  # the writer finds it ambiguous and records nothing -- never a Claude ledger line.
+  fixtures=str(P.parent/"fixtures")
+  if fixtures not in sys.path: sys.path.insert(0,fixtures)
+  import harness_tool_env as E
+  try:
+   inherited=E.daemon_started_from(E.tool_shell_env("claude",{},"parent-sid-claude"))
+   env=E.tool_shell_env("codex",inherited,"01a0f6a2-785d-7503-bb78-368d1a1eaab1",installed=False)
+  except E.ToolMissing as exc:
+   self.skipTest(str(exc))
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{**env,"AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=0",err)
+   self.assertNotIn("harness=claude",err)
+   self.assertEqual(self.RC.read_tail("claude","parent-sid-claude"),[])
+   self.assertEqual(self.RC.read_tail("codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1"),[])
+ def test_compose_caller_follows_tool_shell_harness(self):
+  from dispatch_parent_completion import default_parent_harness
+  for parent,child in (("claude","codex"),("codex","claude"),("claude","opencode"),("opencode","codex")):
+   with self.subTest(parent=parent,child=child):
+    env=self._tool_shell_env(parent,child,"child-sid-"+child)
+    with mock.patch.dict(os.environ,env):
+     # the expression compose evaluates for `--parent-harness` (capability-route.py)
+     self.assertEqual(default_parent_harness("claude"),child)
  def test_plan_invalid_refuses_before_route_write(self):
   import types
   with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-plan-invalid"}):

@@ -22,8 +22,9 @@ roles/units/
                         #   found no home — must be reviewed, never silently dropped
 ```
 
-## Frontmatter (YAML; machine contract, parsed at build/route-compile time only — the
-## dispatch hot path reads the BODY as a plain .md and stays stdlib-only)
+## Frontmatter (YAML; machine contract, parsed at build/route-compile time — the dispatch hot
+## path reads the BODY plus the one flat `bootstrap:` block with the same stdlib regex technique,
+## no YAML dependency)
 
 ```yaml
 ---
@@ -49,6 +50,10 @@ tools: []                     # tool-contract refs — relocated domain LAW (e.g
 branches: []                  # surviving execution branches (e.g. [direct, pipeline]);
                               # structural pruning requires usage evidence
 aliases: {}                   # per-surface name aliases; empty in the end state
+bootstrap:                    # OPTIONAL runtime bootstrap material; absent = nothing attached
+  memory: [report-format]     #   memory topics (topic table in utilities/worker_bootstrap.py)
+  exemplar: deliverable       #   prior completed deliverable of this node's gate
+  gates: [research-report]    #   optional node limit; absent = every node of this unit
 ---
 ```
 
@@ -72,7 +77,7 @@ from the retired team agent file. Nothing load-bearing drops silently → `_NOTE
 
 ## Guard contract
 
-`check-unit-config.py` (fail-closed) forbids: model literals in units; persona/stance
+`check-unit-config.py` (fail-closed) validates the `bootstrap` sub-keys and vocabulary and forbids: model literals in units; persona/stance
 text restated outside the catalog or `_shared/`; a unit declaring a concrete write_scope.
 `capability_topology.py` validates every topology node's `unit` ref: unit exists ∧
 `node.kind` compatible with `worker_type` ∧ role consistency.

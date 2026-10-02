@@ -2394,12 +2394,16 @@ class GateCarrierTest(unittest.TestCase):
         with mock.patch.object(rewake, "_recipient_gate_records") as scan:
             self.assertFalse(rewake._open_gate_pending(launch))     # no write: no scan
             scan.assert_not_called()
-        rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
-                                      claim_owner="session-sweep:x:1:1", lease_seconds=0.05)
+        claimed = rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
+                                                claim_owner="session-sweep:x:1:1",
+                                                lease_seconds=120.0)
         self.assertFalse(rewake._open_gate_pending(launch))         # write: scanned, lease live
-        time.sleep(0.08)
-        # no directory write since, but the lease seen at the last scan expired
-        self.assertTrue(rewake._open_gate_pending(launch))
+        # no directory write since, but the lease seen at the last scan expired;
+        # the clock is stepped past the deadline, not slept past a short lease
+        # that a stalled claim fsync can outlive before the scan above runs
+        with mock.patch.object(rewake.time, "monotonic_ns",
+                               return_value=claimed["claim_deadline_ns"] + 1):
+            self.assertTrue(rewake._open_gate_pending(launch))
         # the registry was read once for the whole sequence
         with mock.patch.object(rewake, "current_attempt_row") as row:
             rewake._open_gate_pending(launch)
@@ -2860,6 +2864,69 @@ class FrameWorkerTypeArmingTest(unittest.TestCase):
                 self.assertEqual(rewake._session_owner_rows(self.jobs, "session-1"), [])
                 stdout_launch = rewake.parse_launch(self.stdout_payload(worker_type=worker_type))
                 self.assertIsNone(stdout_launch)
+
+
+class SeatHandoverRewakeTest(unittest.TestCase):
+    """After a /clear the same pane's successor takes over an owner's wake; the old hook goes quiet."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.jobs = Path(self.temporary.name) / "jobs.log"
+        self.jobs.write_text(DispatchOwnerRewakeTest.row(attempt_schema_version="2"), encoding="utf-8")   # parent_sid=session-1 (the old window)
+        environment = mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def handed_to(self, successor):
+        resolver = lambda meta, jobs=None: successor if meta.get("parent_sid") == "session-1" else meta.get("parent_sid")
+        return (mock.patch.object(rewake.seat_handover, "effective_parent", side_effect=resolver),
+                mock.patch.object(rewake.seat_handover, "owns",
+                                  side_effect=lambda meta, session, jobs=None: meta.get("parent_sid") == session
+                                  or resolver(meta, jobs) == session))
+
+    def test_the_successor_arms_the_row_the_old_window_launched_and_a_stranger_does_not(self) -> None:
+        self.assertEqual(rewake._session_owner_rows(self.jobs, "session-2"), [])
+        effective, owns = self.handed_to("session-2")
+        with effective, owns:
+            self.assertEqual([a for a, _ in rewake._session_owner_rows(self.jobs, "session-2")], ["att-owner-1"])
+            self.assertEqual(rewake._session_owner_rows(self.jobs, "session-9"), [])
+            self.assertEqual([a for a, _ in rewake._session_owner_rows(self.jobs, "session-1")], ["att-owner-1"])
+
+    def test_the_successor_takes_the_wait_over_even_while_the_old_hook_is_alive(self) -> None:
+        old = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        assert isinstance(old, rewake.ArmClaim)            # this very process stands in for the old hook: alive
+        self.assertEqual(rewake.claim_arm(self.jobs, "att-owner-1", "session-2", fresh=True).reason, "foreign-session")
+        effective, owns = self.handed_to("session-2")
+        with effective, owns:
+            self.assertTrue(rewake._holds_arm(old))
+            new = rewake.claim_arm(self.jobs, "att-owner-1", "session-2", fresh=True)
+            self.assertIsInstance(new, rewake.ArmClaim)
+            self.assertEqual((new.session_id, new.arms), ("session-2", 2))
+            held = json.loads(rewake.arm_path(self.jobs, "att-owner-1").read_text(encoding="utf-8"))
+            self.assertEqual(held["session_id"], "session-2")
+            # The old hook no longer holds the claim, so it must not speak into the new conversation.
+            # (Same process here: only the session differs.)
+            self.assertFalse(rewake._holds_arm(old))
+
+    def test_the_old_hook_is_quiet_once_the_attempt_belongs_to_another_session(self) -> None:
+        launch = rewake.Launch(attempt_id="att-owner-1", jobs=self.jobs, session_id="session-1", armed="registry")
+        self.assertFalse(rewake._handed_away(launch))
+        effective, owns = self.handed_to("session-2")
+        with effective, owns:
+            self.assertTrue(rewake._handed_away(launch))
+            self.assertFalse(rewake._handed_away(replace_session(launch, "session-2")))
+
+    def test_the_wake_still_belongs_to_the_registered_session_without_a_handover(self) -> None:
+        claim = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        assert isinstance(claim, rewake.ArmClaim)
+        launch = rewake.Launch(attempt_id="att-owner-1", jobs=self.jobs, session_id="session-1", armed="registry")
+        self.assertTrue(rewake._holds_arm(claim))
+        self.assertFalse(rewake._handed_away(launch))
+
+
+def replace_session(launch, session):
+    return rewake.Launch(attempt_id=launch.attempt_id, jobs=launch.jobs, session_id=session, armed=launch.armed)
 
 
 if __name__ == "__main__":

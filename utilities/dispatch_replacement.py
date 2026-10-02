@@ -1161,8 +1161,9 @@ def _authorized(jobs, rows, meta):
         if fields[1] not in {'open','running'} or not DC._parent_liveness_evidence(Path(jobs), parent_meta)[0]:
             raise DC.DispatchContractError('replacement-parent-not-live')
     else:
-        from work_start import _current_parent_session_id
-        if not meta.get('parent_sid') or _current_parent_session_id() != meta['parent_sid']:
+        from work_start import _current_parent_session_id, _owns
+        # The launching session, or its confirmed same-seat successor after a /clear.
+        if not meta.get('parent_sid') or not _owns(meta, _current_parent_session_id(), jobs):
             raise DC.DispatchContractError('replacement-parent-identity-unproven')
 
 
