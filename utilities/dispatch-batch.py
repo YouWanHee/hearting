@@ -2781,7 +2781,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.review_inputs:
             args.reviewed_evidence = next(iter(args.review_inputs.values()))["path"]
         if args.reviewed_evidence and not any(is_review_node(node) for node in nodes):
-            raise DispatchContractError("reviewed-evidence-node-invalid", args.parallel_group)
+            # Optional and meaningless for a group with no plan/spec review: ignore it, do not refuse.
+            print(f"reviewed_evidence_ignored={args.parallel_group}")
+            args.reviewed_evidence = None
     except DispatchContractError as exc:
         return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
 

@@ -520,6 +520,24 @@ def _launch_admitted(route, path, jobs, node, harness, run, result, *, wait, sle
     return rows, _capacity_refusal(launch) or refusal
 
 
+def _wait_budget(result):
+    """What one `start --wait` call still has of its single start window.
+
+    A replacement re-enters the same call, so its join spends only what the earlier capacity
+    sleep and joins left instead of opening a new window (OpenCode r4: one call ran past its
+    caller's own timeout and returned nothing).
+    """
+    return max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)
+               - result.get("join_waited_seconds", 0))
+
+
+def _timed_join(result, clock, **kwargs):
+    began = clock()
+    joined = join_selected_attempts(**kwargs)
+    result["join_waited_seconds"] = round(result.get("join_waited_seconds", 0) + max(0, clock() - began), 1)
+    return joined
+
+
 def _capacity_wait(result, aid, node, refusal, resume, clock):
     """§3.0(e): a typed, retryable capacity refusal with no admitted row.
 
@@ -926,7 +944,10 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
 
 
 def _first_leg_state(root, decision_record, jobs, receipt):
-    """The first leg's state as it is now, for a frame route read again after its first start.
+    """The plan's current leg state, for a frame route read again after its first start.
+
+    Once a later leg of the same decision has started, the furthest one answers through its own
+    `start` (`route_plan.latest_leg_route`); until then the first leg answers as below.
 
     The stored `start_receipt` is the launch's own history, so it answers only while the leg is
     still what it describes. A closed leg, or one with an inline finish pending, is answered by
@@ -944,6 +965,12 @@ def _first_leg_state(root, decision_record, jobs, receipt):
             or _route_module().route_hash(published) != bound["route_hash"]):
         raise ValueError("route-decision-conflict: the published first leg differs from the one the record bound")
     leg_route = _route_module().verify_route(published)
+    latest = RP.latest_leg_route(leg_route)
+    if latest.get("route_id") != leg_route["route_id"]:
+        # A later leg of the same decision has started: answer for the furthest one, as its own
+        # `start` would (a closed last leg is completed with no next leg).
+        latest_path = Path(_route_module().canonical_route_path(str(root), latest["route_id"]))
+        return start_work(_route_module().verify_route(latest), latest_path, jobs)
     from dispatch_notice_state import closed_outcome
     import inline_finish
     pending = inline_finish.pending_state(root, leg_route["route_id"])
@@ -1222,9 +1249,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         for aid, (status, meta) in rows.items():
             if meta.get("workflow_completion") == "runtime-v1" and (
                     aid == owner or route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}):
+                # An owner with nothing to settle (`not-applicable`: replaced, stopped at a gate or not
+                # passed) does not hold the closed route back; every other unfinished settlement does.
                 from dispatch_terminal_commit import owner_completion_state
-                settlement = owner_completion_state(jobs, status, meta)
-                if settlement.state != "complete":
+                if owner_completion_state(jobs, status, meta).state not in {"complete", "not-applicable"}:
                     return {**result, "state": "needs-attention", "reason": "workflow-completion-pending",
                             "required_action": "inspect-recovery", "outcome": closed}
         return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
@@ -1288,16 +1316,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             attempts.add(aid)
             result["frame_attempts"] = sorted(attempts)
             result.update(_wait_fields(attempts, rows, resume))
-        joined = join_selected_attempts(
-            jobs=jobs, expected_attempts=attempts,
-            timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
-            recover=True)
+        joined = _timed_join(
+            result, clock, jobs=jobs, expected_attempts=attempts,
+            timeout=_wait_budget(result) if wait else 0, recover=True)
         result["observation"] = joined
         from dispatch_replacement import advance_batch
         effective, lineage, attention = advance_batch(jobs, attempts, run=run)
         if lineage and effective != attempts:
             result["replacement_lineage"] = lineage
-            return _advance(route, path, jobs, result, wait=wait, interview=interview,
+            return _advance(route, path, jobs, result, wait=wait and _wait_budget(result) > 0, interview=interview,
                             answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
         if attention:
             result["replacement_attention"] = attention
@@ -1391,10 +1418,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "next_step": "The owner exited before the declared stages completed. Preserve its report "
                         "and committed result, and report these missing stages. Waiting or repeating finalization "
                         "cannot execute them. No automatic retry or replacement is authorized by this observation."}
-    joined = join_selected_attempts(
-        jobs=jobs, expected_attempts={aid},
-        timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
-        recover=True)
+    joined = _timed_join(
+        result, clock, jobs=jobs, expected_attempts={aid},
+        timeout=_wait_budget(result) if wait else 0, recover=True)
     if status != "done" and _rows(jobs).get(aid, (status,))[0] == "done":
         # The owner exited while this call waited: its receipt asks the same question the next start would.
         gate_response = _owner_gate_response(route, path, jobs, aid, _rows(jobs)[aid][1], result)
@@ -1407,8 +1433,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         result["replacement_lineage"] = effective_attempts(jobs, {aid})[1]
         current_path = Path(replacement["record"]["route_file"])
         current_route = json.loads(current_path.read_text())
-        return _advance(current_route, current_path, jobs, result, wait=wait, interview=interview,
-                        answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
+        return _advance(current_route, current_path, jobs, result, wait=wait and _wait_budget(result) > 0,
+                        interview=interview, answers=answers, decision=decision, run=run, sleep=sleep,
+                        clock=clock)
     status, metadata = _rows(jobs).get(aid, (status, metadata))
     if (status == "done" and metadata.get("note") == "dead-worker-blocked"
             and not replacement.get("parked_gate")

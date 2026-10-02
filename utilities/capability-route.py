@@ -3677,10 +3677,28 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
 
 
 def route_plan_execution_scope(binding):
-    """A frame's start choice scopes only its already-approved first leg."""
-    if not isinstance(binding, dict) or type(binding.get("index")) is not int or binding["index"] != 0:
+    """The start choice every leg of one frame decision carries.
+
+    The first leg was only selected with all of its start approvals given. A later leg keeps
+    `complete` only when each start approval it declares was also given for that leg in the same
+    interview; a part the person did not approve keeps its gate. `report` carries as it is, except
+    to a staged leg that would have no step left before its first approval (that leg keeps its gate).
+    """
+    if not isinstance(binding, dict) or type(binding.get("index")) is not int:
         return None
-    return (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {}).get("execution_scope")
+    approvals = (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {})
+    scope = approvals.get("execution_scope")
+    if binding["index"] == 0 or scope not in ("complete", "report"):
+        return scope
+    legs = binding.get("legs")
+    if not isinstance(legs, list) or not 0 <= binding["index"] < len(legs) or not isinstance(legs[binding["index"]], dict):
+        return None
+    leg = legs[binding["index"]]
+    if scope == "report":
+        return scope if leg.get("shape") != "staged" or project_entry_execution_scope(leg, "report").get("graph") else None
+    given = {(row.get("key"), row.get("leg")) for row in approvals.get("given") or []
+             if isinstance(row, dict) and row.get("accepted") is True}
+    return scope if all((key, binding["index"]) in given for key, _part in declared_start_approvals(leg)) else None
 
 
 def _bind_entry_execution_scope(route, scope):
@@ -9639,6 +9657,13 @@ def main():
                 if a.check:
                     if not jobs or not attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
+                    if node.get("kind") != "review-worker":
+                        # Owner closure only answers a blocking review; this read-only question has no
+                        # answer elsewhere. Say so instead of refusing with an unrelated reason.
+                        print(json.dumps({"result": "not-applicable", "read_only": True, "route_id": route["route_id"],
+                                          "node_id": a.node, "reason": "owner-closure-review-nodes-only"},
+                                         sort_keys=True))
+                        return
                     proof = owner_closure_plan(route, node, evidence, jobs, attempt_id)
                     print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],
                                       "node_id": a.node, "owner_closure_proof": proof}, sort_keys=True))

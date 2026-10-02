@@ -629,7 +629,7 @@ def replacement_task(args, route, node, jobs):
 
 def main():
  p=argparse.ArgumentParser(); p.add_argument("--route",required=True); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--slug",required=True); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
- from review_input import add_arguments, resolve_input
+ from review_input import add_arguments, drop_inapplicable, resolve_input
  add_arguments(p)
  a=p.parse_args(); route=json.loads(Path(a.route).read_text())
  verify=subprocess.run(
@@ -646,6 +646,7 @@ def main():
   raise SystemExit(65)
  node=next((x for x in route["nodes"] if x["id"]==a.node),None)
  if not node: raise SystemExit("unknown route node")
+ a.reviewed_evidence=drop_inapplicable(node,a.reviewed_evidence)
  # A subsession declaration stays all-or-nothing and still requires the exact
  # attempt identity; a standalone --attempt-id is a batch-reserved leg identity
  # and is valid without any subsession axis (2026-08-06 eiren-m4-r2 frame batch).

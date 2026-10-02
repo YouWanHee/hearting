@@ -530,7 +530,7 @@ class NextLegFinishTest(PublicInlineFinishTest):
         self.assertEqual(argv[argv.index("--parent-cycle") + 1], self.cycle["cycle_id"])
         self.assertEqual(argv[argv.index("--campaign-key") + 1], "inline-finish-test")
         self.assertEqual(argv[argv.index("--graph") + 1], "execute,test")
-        self.assertNotIn("--start", argv)
+        self.assertIn("--start", argv)
         replay = json.loads(self.finish().stdout)
         self.assertTrue(replay["replay"])
         self.assertEqual(replay["next_leg"], next_leg)

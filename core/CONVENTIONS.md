@@ -560,9 +560,11 @@ alert. Code history uses git rather than `autopilot-refine` by default.
 For a new or empty directory, create the modern layout. On re-entry, the presence of `_internal/` selects modern behavior; otherwise main-level review directories or sibling `_v{N}.md` files select legacy behavior. Preserve the detected shape. Migrate only on an explicit user request through a one-off helper.
 
 New route-owned output may be created only in the capability buckets listed in
-§6.5. `autopilot-refine`'s `target-artifact` scope resolves only to
-`documents/<artifact>/**` or `research/<artifact>/**`; an ad-hoc top-level
-folder such as `rebuttal/` is input or legacy state, never a new output target.
+§6.5. `autopilot-refine`'s `target-artifact` scope resolves to
+`documents/<artifact>/**` or `research/<artifact>/**`, or to an existing document
+in the route's working-tree repository (its snapshot stays in the route's cycle);
+an ad-hoc top-level artifact folder such as `rebuttal/` is input or legacy state,
+never a new output target.
 
 ### §5.6. Authoring `SKILL.md`
 

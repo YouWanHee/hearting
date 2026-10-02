@@ -599,6 +599,20 @@ def registry_rows(jobs: Path, route_id: str, node_id: str) -> list[dict[str, str
             if row.get("route_node") == node_id]
 
 
+def own_registered_attempt(args: argparse.Namespace, route: dict, node: dict) -> str | None:
+    """The one open row this command registered and never launched, which its `--start` claims.
+
+    Nothing runs for it yet, so it is not a live round: counting it refused the very start that
+    launches it (`prior-attempt-still-live`).
+    """
+    if args.action != "start":
+        return None
+    rows = [row for row in registry_rows(args.jobs, route["route_id"], node["id"])
+            if row["_status"] == "open" and row.get("launch_claimed") == "0" and not row.get("pid")
+            and row["_slug"] == args.slug and row.get("parent_attempt_id", "") == (args.parent_attempt_id or "")]
+    return rows[0].get("attempt_id") if len(rows) == 1 else None
+
+
 def metadata_tuple_key(metadata: dict[str, str]) -> str:
     required = ("parent_harness", "parent_transport", "parent_sandbox",
                 "child_harness", "launch_authority")
@@ -842,8 +856,14 @@ def parent_runtime_failure(args, route: dict, row: dict, parent_identity) -> str
     return ""
 
 
-def attempt_identity(args: argparse.Namespace, route: dict, node: dict, row: dict, ordinal: int) -> str:
-    """Stable across dry-run/register/start and concurrent conductor retries."""
+def attempt_identity(args: argparse.Namespace, route: dict, node: dict, row: dict, ordinal: int,
+                     round_number: int = 1) -> str:
+    """Stable across dry-run/register/start and concurrent conductor retries.
+
+    A later round of a round-capped node names its round, so it gets its own identity on the
+    same (pinned) harness instead of colliding with the finished first round and falling through
+    to the next hop's harness. The first round's identity is unchanged.
+    """
 
     payload = {
         "route_id": route["route_id"],
@@ -854,6 +874,8 @@ def attempt_identity(args: argparse.Namespace, route: dict, node: dict, row: dic
         "target_harness": row["child_harness"],
         "fallback_ordinal": ordinal,
     }
+    if round_number > 1:
+        payload["round"] = round_number
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1459,7 +1481,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p.add_argument("--worker-role")
     p.add_argument("--model-role")
     p.add_argument("--prompt-file", type=Path)
-    from review_input import add_arguments, resolve_input
+    from review_input import add_arguments, drop_inapplicable, resolve_input
     add_arguments(p)
     p.add_argument("--jobs", type=Path)
     p.add_argument("--broker-root", type=Path, help=argparse.SUPPRESS)
@@ -1509,6 +1531,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 contract_version=str(raw_contract or 1),child_spawned="0",
             )
         route, node = load_node(args.route, args.node, args.action)
+        args.reviewed_evidence = drop_inapplicable(node, args.reviewed_evidence)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         detail = str(exc)
         if "launch-runtime-root-mismatch" in detail:
@@ -1599,14 +1622,16 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # auto-revision copy, any more.
     node_round_admission = None
     if DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node):
+        own_registration = own_registered_attempt(args, route, node)
         round_rows = DISPATCH_NODE.prior_round_attempts(
-            args.jobs, route["route_id"], node["id"],
+            args.jobs, route["route_id"], node["id"], exclude_attempt=own_registration,
             route=route if node.get("kind") == "review-worker" else None,
         )
         admission_options = {"record_auto_revisions": False} if args.action == "dry-run" else {}
         try:
             node_round_admission = DISPATCH_NODE.admit_round(
                 route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
+                exclude_attempt=own_registration,
                 reviewed_evidence=args.reviewed_evidence,
                 **admission_options,
             )
@@ -1832,7 +1857,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         )
                     failed_tuples.add(key)
                     continue
-                attempt_id = attempt_identity(args, route, node, row, ordinal)
+                attempt_id = attempt_identity(
+                    args, route, node, row, ordinal,
+                    node_round_admission.budget.next_round if node_round_admission is not None else 1)
                 legacy_reason = legacy_parent_generation_conflict(
                     args.jobs,
                     legacy_attempt_identity(args, route, node, row, ordinal),

@@ -455,6 +455,43 @@ class RelatedOwnerDiscoveryTests(unittest.TestCase):
         proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
         self.assertEqual((proof.status, proof.reason), ("proved", None))
 
+    def test_a_registered_row_closed_without_ever_launching_does_not_block_settlement(self):
+        # OpenCode r4 leg1: a `test` row was registered, never claimed, then closed by a marker;
+        # it has no process identity because nothing was ever spawned.
+        latest = self.row("done", "att-latest", owner_route_id=self.route["route_id"],
+                          owner_route_hash=self.route["route_hash"],
+                          note="completed-marker", failure_class="pass", launch_outcome="never-launched")
+        stage = {"worker_type": "stage", "dispatch_depth": "2", "parent_attempt_id": "att-latest",
+                 "launch_claimed": "0", "note": "completed-marker", "failure_class": "pass", "launch_outcome": ""}
+        unlaunched = self.row("done", "att-unlaunched", **stage)
+        self.jobs.write_text(latest + "\n" + unlaunched + "\n", encoding="utf-8")
+        proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
+        self.assertEqual((proof.status, proof.reason), ("proved", None))
+        # A row that did claim its launch but has lost its process identity still blocks.
+        claimed = self.row("done", "att-unlaunched", **{**stage, "launch_claimed": "1"})
+        self.jobs.write_text(latest + "\n" + claimed + "\n", encoding="utf-8")
+        proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
+        self.assertEqual((proof.status, proof.reason), ("rejected", "child-not-quiescent"))
+        # Any process identity keeps the ordinary quiescence check, whatever the launch flags say.
+        process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            identity = T.dispatch_contract.process_launch_identity(process.pid)
+            live = self.row("done", "att-unlaunched", **{**stage, **identity, "launch_outcome": "running"})
+            self.jobs.write_text(latest + "\n" + live + "\n", encoding="utf-8")
+            proof = T._prove_route_children(self.request(), self.route, self.owner_gate())
+            self.assertEqual((proof.status, proof.reason), ("rejected", "child-not-quiescent"))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+    def test_a_poll_fallback_parent_gets_no_completion_notice_attempt(self):
+        self.assertFalse(T._parent_has_notice_carrier(
+            {"parent_sid": "ses", "parent_completion_delivery": "poll-fallback"}))
+        self.assertFalse(T._parent_has_notice_carrier({"parent_completion_delivery": "opencode-turn"}))
+        self.assertTrue(T._parent_has_notice_carrier(
+            {"parent_sid": "ses", "parent_completion_delivery": "opencode-turn"}))
+        self.assertTrue(T._parent_has_notice_carrier({"parent_attempt_id": "att-owner"}))
+
     def test_reaped_failed_owner_allows_valid_inline_fallback(self):
         failed = self.row("done", "att-reaped", owner_route_id=self.route["route_id"],
                           owner_route_hash=self.route["route_hash"])

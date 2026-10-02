@@ -603,6 +603,37 @@ class FirstLegStateReplayTest(StartBase):
         self.assertEqual(shlex.split(again["next_leg"]["compose_command"])[shlex.split(again["next_leg"]["compose_command"]).index("--parent-cycle") + 1], cycle)
         self.untouched(before)
 
+    def test_the_frame_answers_for_the_furthest_started_leg_and_no_next_leg_after_the_last(self):
+        third = {**self.SECOND, "why": "then the third"}
+        self.set_briefs([DIRECT, self.SECOND, third], [DIRECT, self.SECOND, third])
+        self.set_interview({"legs": [DIRECT, self.SECOND, third]})
+        self.settle()
+        route, leg_path = self.leg()
+        self.finish_leg(route, leg_path)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_DISPATCH_")}
+        expected_index, current = 1, route
+        for _ in range(2):
+            again = self.replay()
+            self.assertEqual((again["state"], again["route_id"]), ("completed", current["route_id"]), again)
+            self.assertEqual(again["next_leg"]["index"], expected_index)
+            # The fixture begins the leg's cycle itself, so only the compose part of the printed command runs.
+            argv = [token for token in shlex.split(again["next_leg"]["compose_command"]) if token != "--start"]
+            done = subprocess.run(argv, text=True, capture_output=True, env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            path = Path(json.loads(done.stdout)["route_file"])
+            composed = json.loads(path.read_text(encoding="utf-8"))
+            # Composed but not started: the frame still points at the same next leg.
+            self.assertEqual(self.replay()["next_leg"]["index"], expected_index)
+            self.finish_leg(composed, path)
+            expected_index, current = expected_index + 1, composed
+        before = self.snapshot()
+        last = self.replay()
+        self.assertEqual((last["state"], last["required_action"]), ("completed", "advance-completed"), last)
+        self.assertEqual((last["route_id"], current["route_plan"]["index"]), (current["route_id"], 2))
+        self.assertEqual(last["route_decision"]["frame_route_id"], self.route["route_id"])
+        self.assertNotIn("next_leg", last)
+        self.untouched(before)
+
     def test_a_finished_staged_owner_leg_answers_completed(self):
         first = self.staged_leg()
         self.assertEqual(first["state"], "running")

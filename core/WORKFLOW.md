@@ -280,9 +280,12 @@ With no valid, chosen and approved proposal it records `selected: none` and
 ends with `required_action=compose-route`; the session then picks the route as
 as before. When a route made from a proposal closes, its completion receipt,
 a replayed `start`, a direct `finish` receipt and route status carry `next_leg`
-(`index`, the leg, a `compose_command` without `--start`). It is information: the
+(`index`, the leg, a `compose_command` that includes `--start`). It is information: the
 runtime starts nothing from it and leaves it out of `parent_next`. The main session runs
-the command, changes the plan, or stops; §0.4 says when a card comes first.
+the command as printed, changes the plan, or stops; §0.4 says when a card comes first.
+A replayed `start` of the closed frame route answers for the furthest leg already
+started from its decision, so after the last leg it reports that leg's completion
+and no `next_leg`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
 <task>` with the selected shape/graph (the campaign choice is required:
@@ -569,7 +572,9 @@ per route (`round` ≤ 2).
 the interview above replaces the §0.4 card and the `[방향 확인]` card: one route
 question and the start-approval questions sit inside the same interview. Its
 answers cover the route and the start approvals of the parts the person actually
-saw in it, for the first leg only. A later leg's unapproved part, a `next_leg`
+saw in it, for every leg of the selected proposal: each leg composed from the
+same decision seals the same execution scope, and a start approval given for that
+leg removes its intermediate wait. A later leg's unapproved part, a `next_leg`
 the main session changed, and a deploy under `small_work_confirmation=notice`
 still go through the card above; neither the owner nor a worker waits for an entry
 approval mid-run.

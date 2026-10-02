@@ -7242,10 +7242,12 @@ class EnvironmentAttemptDefaultTest(unittest.TestCase):
   route,node,path,evidence=self.fixture()
   env={"AGENT_DISPATCH_ATTEMPT_ID":"att-terminal-owner","AGENT_DISPATCH_JOBS":str(self.jobs)}
   with mock.patch.object(R,"owner_closure_plan",return_value={}) as plan:
+   # No --jobs/--attempt-id: the environment fills both, so the check gets past its exact-attempt
+   # refusal and answers this non-review node `not-applicable` (owner closure answers review nodes only).
    result,=self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
     "--check"],env)
-   self.assertEqual(result["result"],"ready")
-   self.assertEqual(plan.call_args.args[3:],(str(self.jobs),"att-terminal-owner"))
+   self.assertEqual(result["result"],"not-applicable")
+   plan.assert_not_called()
    with self.assertRaisesRegex(ValueError,"owner-closure-check-requires-exact-jobs-attempt-and-no-overrides"):
     self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
      "--check","--output",str(self.base/"out.json")],env)
@@ -8353,11 +8355,25 @@ class EntryExecutionScopeTest(unittest.TestCase):
     self.assertEqual(projected["graph"], expected)
     self.assertEqual(leg["graph"], original)
 
- def test_route_plan_scope_applies_to_first_leg_only(self):
-  record={"decision":{"approvals":{"execution_scope":"report"}}}
-  self.assertEqual(R.route_plan_execution_scope({"index":0,"record":record}),"report")
-  self.assertIsNone(R.route_plan_execution_scope({"index":1,"record":record}))
-  self.assertIsNone(R.route_plan_execution_scope({"index":True,"record":record}))
+ def test_route_plan_scope_carries_to_every_leg_of_the_same_decision(self):
+  code={"capability":"autopilot-code","mode":"dev","shape":"staged","graph":["plan","execute","test","report"]}
+  refine={"capability":"autopilot-refine","mode":None,"shape":"staged","graph":["review","transaction"]}
+  legs=[code,refine]
+  def binding(index, scope, given):
+   record={"decision":{"approvals":{"execution_scope":scope,"given":given}}}
+   return {"index":index,"record":record,"legs":legs}
+  approved=[{"key":"preview","leg":1,"accepted":True}]
+  self.assertEqual(R.route_plan_execution_scope(binding(0,"report",[])),"report")
+  self.assertEqual(R.route_plan_execution_scope(binding(1,"report",[])),"report")
+  self.assertEqual(R.route_plan_execution_scope(binding(1,"complete",approved)),"complete")
+  # A part the person did not approve for that leg keeps its gate.
+  self.assertIsNone(R.route_plan_execution_scope(binding(1,"complete",[])))
+  self.assertIsNone(R.route_plan_execution_scope(binding(1,"complete",[{**approved[0],"accepted":False}])))
+  self.assertIsNone(R.route_plan_execution_scope(binding(1,"complete",[{**approved[0],"leg":0}])))
+  # Report stops before the first approval; a later leg with no step before it keeps its gate.
+  only_transaction=[code,{**refine,"graph":["transaction"]}]
+  self.assertIsNone(R.route_plan_execution_scope({**binding(1,"report",[]),"legs":only_transaction}))
+  self.assertIsNone(R.route_plan_execution_scope({**binding(0,"report",[]),"index":True}))
 
  def test_scope_marker_rejects_boolean_and_unversioned_markers(self):
   for version, scope in ((True, "report"), (1, "x"), (None, "report")):

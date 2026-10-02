@@ -145,7 +145,10 @@ artifacts. A direct minor edit updates history without a snapshot. Every
 non-direct major rewrite of an existing file is pre-snapshotted by the artifact
 write guard into one route-bound `_internal/versions/v{N}/` directory; the
 model does not allocate or copy versions. The abstract `target-artifact` write
-scope resolves only to `documents/<artifact>/**` and `research/<artifact>/**`.
+scope resolves to `documents/<artifact>/**` and `research/<artifact>/**`, or to
+an existing document in the route's own working-tree repository (a README, for
+example), whose pre-change copy is kept in the route's cycle under
+`artifacts/_internal/versions/v{N}/`.
 It never owns new empirical work: under `WORKFLOW §0.2`, a request
 that also requires reevaluation, new metrics, or figures/media from new empirical analysis
 routes that work to `autopilot-lab` (or the owning execution capability) as

@@ -546,7 +546,8 @@ class NextLegTest(PlanFixture):
         self.assertEqual(argv[argv.index("--campaign-key") + 1], "framed-key")
         self.assertEqual(argv[argv.index("--graph") + 1], "execute,test,report")
         self.assertEqual(argv[argv.index("--shape") + 1], "staged")
-        self.assertNotIn("--start", argv)
+        # Run as printed, the command seals and starts the leg.
+        self.assertEqual(argv[argv.index("compose") + 1], "--start")
         self.assertTrue(Path(argv[argv.index("--prompt-file") + 1]).is_file())
 
     def test_the_last_leg_an_unreadable_record_and_a_lost_prompt_have_no_key(self):
@@ -578,13 +579,13 @@ class SecondLegCommandTest(PlanFixture):
         self.assertEqual(second["route_plan"], {**route["route_plan"], "index": 1})
         self.assertEqual((second["parent_cycle_id"], second["campaign_key"]), (parent, "framed-key"))
         self.assertEqual(second["selection"]["shape"], "direct")
-        # Carry the frozen task, while the entry scope applies only to leg 0.
-        task = Path(self.record()["decision"]["first_leg_compose"]["context"]["prompt_file"])
-        self.assertEqual(second["work_request"]["text"], task.read_text(encoding="utf-8"))
+        # Every leg of the same decision carries the frozen task and the start's execution scope.
+        self.assertEqual(second["work_request"]["text"], route["work_request"]["text"])
         self.assertEqual(route["entry_execution_scope"], "complete")
-        self.assertNotIn("entry_execution_scope", second)
-        self.assertNotIn("entry_scope_contract_version", second)
+        self.assertEqual((second["entry_execution_scope"], second["entry_scope_contract_version"]), ("complete", 1))
         self.assertNotIn("next_leg", json.dumps(receipt))
+        # The printed command also started the leg: a direct leg answers with its inline task.
+        self.assertEqual((receipt["state"], receipt["required_action"]), ("inline", "execute-inline"))
 
 
 class PinnedPlanFixture(S.PinnedStartBase):
@@ -610,6 +611,9 @@ class PinnedPlanFixture(S.PinnedStartBase):
         return shlex.split(RP.project_next_leg(route, cycle)["compose_command"])
 
     def run_compose(self, argv):
+        # The printed command also starts the leg; these fixtures name a placeholder parent
+        # cycle, so they run only the compose part and check what it seals.
+        argv = [token for token in argv if token != "--start"]
         done = subprocess.run(argv, text=True, capture_output=True, env=self.env)
         self.assertEqual(done.returncode, 0, done.stderr)
         return json.loads(Path(json.loads(done.stdout)["route_file"]).read_text(encoding="utf-8"))
