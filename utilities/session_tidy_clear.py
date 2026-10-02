@@ -18,9 +18,19 @@ the card (the seat's ``prompt_seq``), the card is still the one booked, and
 Anything it cannot decide is "not cleared" plus one result line (``write_notice``); a
 success is silent.  The command is typed at most once and is never repeated.
 
+A confirmed clear is followed by the continue prompt (:data:`CONTINUE_TEXT`, what the user
+used to type by hand): the same helper asks ``peer-steward.py continue`` once, which types it
+into the new session only when that session is the one the clear started, has no message yet,
+is idle, shows no form and an empty input box, no prompt was submitted since the card and the
+card is the booked one and was not handed to a peer.  The booking's ``continued`` record moves
+``pending`` -> ``sending`` (by the steward, right before it types) -> its end, so the prompt is
+typed at most once.  ``enqueue --no-continue`` books the clear alone.  A skip the person caused
+(a prompt of their own, a draft, a new card) is silent; any other miss leaves one result line.
+
 Test hooks (only inside ``HEARTING_TIDY_TEST_ROOT``, see ``session_tidy_runner``):
 ``HEARTING_TIDY_HERDR`` / ``HEARTING_TIDY_PEER_STEWARD`` stand in for the checked
-commands, ``HEARTING_TIDY_CLEAR_DEADLINE`` / ``HEARTING_TIDY_CLEAR_OBSERVE`` for the timings.
+commands, ``HEARTING_TIDY_CLEAR_DEADLINE`` / ``HEARTING_TIDY_CLEAR_OBSERVE`` /
+``HEARTING_TIDY_CONTINUE_WINDOW`` for the timings.
 """
 
 from __future__ import annotations
@@ -50,6 +60,9 @@ OBSERVE_WAIT_SEC = 20.0
 STEWARD_TIMEOUT_SEC = 180.0
 # The built-in command that starts a fresh conversation in each harness.
 CLEAR_COMMAND = {"claude": "/clear", "codex": "/clear", "opencode": "/new"}
+# What the user typed by hand after a clear; the new session continues from the card it received.
+CONTINUE_TEXT = "이어서해"
+CONTINUE_WINDOW_SEC = 120.0
 
 REASON_TEXT = {
     "new-input": "새 입력이 있었습니다",
@@ -63,7 +76,12 @@ REASON_TEXT = {
     "target-changed": "그 자리의 세션이 바뀌었습니다",
     "herdr-not-found": "herdr를 찾지 못했습니다",
     "agent-not-found": "창을 찾지 못했습니다",
+    "card-not-delivered": "새 세션이 카드를 받지 못했습니다",
+    "card-taken": "카드가 이미 다른 세션에 전달됐습니다",
+    "new-session-unknown": "새 세션을 확인하지 못했습니다",
 }
+# Continue skips the person caused (or chose) themselves: no result line for these.
+CONTINUE_QUIET = frozenset({"new-input", "draft", "card-changed", "handed-off", "no-card", "superseded", "off"})
 
 
 # ---------------------------------------------------------------------------
@@ -175,10 +193,11 @@ def _start_helper(seat_key: str, nonce: str) -> int:
 
 
 def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, opt_out: bool = False,
-                         now: Optional[float] = None) -> str:
+                         no_continue: bool = False, now: Optional[float] = None) -> str:
     """Book the clear and start its helper; the ``clear=...`` words ``enqueue`` prints.
 
-    ``clear=scheduled``      the window is cleared by itself once it is idle;
+    ``clear=scheduled``      the window is cleared by itself once it is idle, then continued;
+    ``clear=scheduled continue=off``  ``--no-continue``: cleared, nothing typed after it;
     ``clear=off``            ``--no-clear``: a pending booking is cancelled too;
     ``clear=skipped reason`` a prompt was submitted after the card: nothing is booked;
     ``clear=manual hint=C``  outside herdr (no pane, no herdr): the user types ``C``.
@@ -207,7 +226,8 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
             "seat": {"kind": seat.kind, "key": seat.key, "pane": seat.pane,
                      "harness": seat.harness, "project_key": seat.project_key},
             "harness": harness, "sid": sid, "cwd": cwd,
-            "card_generation": int(card["generation"]) if card else 0, "prompt_seq": seq})
+            "card_generation": int(card["generation"]) if card else 0, "prompt_seq": seq,
+            "continue_off": bool(no_continue)})
     try:
         pid = _start_helper(seat.key, nonce)
     except (OSError, subprocess.SubprocessError):
@@ -221,7 +241,7 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
         if held and held.get("nonce") == nonce:
             held["helper"] = {"pid": pid, "pid_start": _proc_start(pid)}
             _write_reservation(held)
-    return "clear=scheduled"
+    return "clear=scheduled continue=off" if no_continue else "clear=scheduled"
 
 
 def note_start_locked(seat: "st.Seat", harness: str, sid: str, now: float) -> None:
@@ -258,6 +278,34 @@ def _drop_unverified_notice(seat: "st.Seat", req: dict) -> None:
         st.atomic_write_json(path, {"schema": st.SCHEMA, "items": kept})
 
 
+def _booking_at(path: Path):
+    """``(booking, seat, "")`` for the seat's own booking file at ``path``, else ``(None, None, reason)``."""
+    req = st.read_json(path)
+    if not isinstance(req, dict) or req.get("schema") != SCHEMA or not isinstance(req.get("seat"), dict):
+        return None, None, "request-unreadable"
+    seat_fields = req["seat"]
+    key = str(seat_fields.get("key") or "")
+    try:
+        in_place = path.parent.resolve() == clear_dir().resolve()
+    except OSError:
+        in_place = False
+    if not re.fullmatch(r"[0-9a-f]{8,64}", key) or path.name != f"{key}.json" or not in_place:
+        return None, None, "request-unreadable"
+    seat = st.Seat(str(seat_fields.get("kind") or ""), key, str(seat_fields.get("pane") or ""),
+                   str(seat_fields.get("harness") or ""), str(seat_fields.get("project_key") or ""))
+    return req, seat, ""
+
+
+def _unchanged_since_card(req: dict, seat: "st.Seat") -> str:
+    """"" while no prompt was submitted since the booking and the card is the booked one, else the reason."""
+    if st.read_prompt_seq(seat) != int(req.get("prompt_seq", -1)):
+        return "new-input"
+    card = st.read_latest_card(seat)
+    if (int(card["generation"]) if card else 0) != int(req.get("card_generation", -1)):
+        return "card-changed"
+    return ""
+
+
 def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] = None):
     """``(booking, "")`` when the booking at ``path`` still allows a clear, else ``(None, reason)``.
 
@@ -267,29 +315,61 @@ def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] 
     prompt was submitted since it was made, and the card is still the booked generation.
     """
     now = st.now_epoch() if now is None else now
-    path = Path(path)
-    req = st.read_json(path)
-    if not isinstance(req, dict) or req.get("schema") != SCHEMA or not isinstance(req.get("seat"), dict):
-        return None, "request-unreadable"
-    seat_fields = req["seat"]
-    key = str(seat_fields.get("key") or "")
-    try:
-        in_place = path.parent.resolve() == clear_dir().resolve()
-    except OSError:
-        in_place = False
-    if not re.fullmatch(r"[0-9a-f]{8,64}", key) or path.name != f"{key}.json" or not in_place:
-        return None, "request-unreadable"
+    req, seat, reason = _booking_at(Path(path))
+    if req is None:
+        return None, reason
     if (nonce and req.get("nonce") != nonce) or req.get("status") != "reserved":
         return None, "superseded"
     if now > float(req.get("deadline", 0) or 0):
         return None, "expired"
-    seat = st.Seat(str(seat_fields.get("kind") or ""), key, str(seat_fields.get("pane") or ""),
-                   str(seat_fields.get("harness") or ""), str(seat_fields.get("project_key") or ""))
-    if st.read_prompt_seq(seat) != int(req.get("prompt_seq", -1)):
-        return None, "new-input"
+    reason = _unchanged_since_card(req, seat)
+    return (None, reason) if reason else (req, "")
+
+
+def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float] = None):
+    """``(booking, "")`` when the cleared window may still get the continue prompt, else ``(None, reason)``.
+
+    Shared by the helper and ``peer-steward.py continue``: the seat's own booking, cleared, its
+    continue still ``pending`` and in time, no prompt submitted since the card (``/clear`` itself
+    is none: measured on Claude 2.1.287 and Codex 0.160.0), the card still the booked generation
+    and not handed to a peer.  ``superseded`` and ``off`` mean nothing is pending.
+    """
+    now = st.now_epoch() if now is None else now
+    req, seat, reason = _booking_at(Path(path))
+    if req is None:
+        return None, reason
+    if (nonce and req.get("nonce") != nonce) or req.get("status") != "cleared":
+        return None, "superseded"
+    if req.get("continue_off"):
+        return None, "off"
+    held = req.get("continued") if isinstance(req.get("continued"), dict) else {}
+    if held.get("state") != "pending":
+        return None, "superseded"
+    if now > float(held.get("deadline", 0) or 0):
+        return None, "expired"
+    reason = _unchanged_since_card(req, seat)
+    if reason:
+        return None, reason
     card = st.read_latest_card(seat)
-    if (int(card["generation"]) if card else 0) != int(req.get("card_generation", -1)):
-        return None, "card-changed"
+    if not card:
+        return None, "no-card"
+    if card.get("handed_off"):
+        return None, "handed-off"
+    return req, ""
+
+
+def claim_continue(path, nonce: Optional[str] = None):
+    """``pending`` -> ``sending``, once, right before the continue prompt is typed: ``(booking, "")``
+    or ``(None, reason)``.  Everything ``validate_continue`` checks is checked again under the seat lock."""
+    req, seat, reason = _booking_at(Path(path))
+    if req is None:
+        return None, reason
+    with st.seat_lock(seat.key):
+        req, reason = validate_continue(path, nonce)
+        if req is None:
+            return None, reason
+        req["continued"] = {**req["continued"], "state": "sending", "at": st.now_epoch()}
+        _write_reservation(req)
     return req, ""
 
 
@@ -325,21 +405,31 @@ def _herdr_wait_idle(pane: str, timeout_ms: int) -> str:
     return "herdr-protocol-error"
 
 
-def _run_steward(path: Path, nonce: str, pane: str) -> dict:
-    """``peer-steward.py clear`` -- its ``cleared=...`` line as a dict (``cleared`` is ``failed`` on a crash)."""
+def _ask_steward(command: str, word: str, path: Path, nonce: str, pane: str) -> dict:
+    """``peer-steward.py <command>`` -- its ``<word>=...`` line as a dict (``failed`` on a crash)."""
     injected = _injected("HEARTING_TIDY_PEER_STEWARD")
     base = [str(injected)] if injected else [sys.executable, str(HERE / "peer-steward.py")]
     try:
-        done = subprocess.run([*base, "clear", pane, "--request", str(path), "--nonce", nonce],
+        done = subprocess.run([*base, command, pane, "--request", str(path), "--nonce", nonce],
                               capture_output=True, text=True, timeout=STEWARD_TIMEOUT_SEC, env=_helper_env())
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"cleared": "failed", "reason": f"peer-steward-unavailable-{type(exc).__name__}"}
+        return {word: "failed", "reason": f"peer-steward-unavailable-{type(exc).__name__}"}
     for line in done.stdout.splitlines():
-        if line.startswith("cleared="):
+        if line.startswith(word + "="):
             fields = dict(part.partition("=")[::2] for part in line.split())
-            if fields.get("cleared") in ("true", "skipped", "failed", "unverified"):
+            if fields.get(word) in ("true", "skipped", "failed", "unverified"):
                 return fields
-    return {"cleared": "failed", "reason": f"peer-steward-exit-{done.returncode}"}
+    return {word: "failed", "reason": f"peer-steward-exit-{done.returncode}"}
+
+
+def _run_steward(path: Path, nonce: str, pane: str) -> dict:
+    """``peer-steward.py clear`` -- its ``cleared=...`` line as a dict."""
+    return _ask_steward("clear", "cleared", path, nonce, pane)
+
+
+def _run_continue(path: Path, nonce: str, pane: str) -> dict:
+    """``peer-steward.py continue`` -- its ``continued=...`` line as a dict."""
+    return _ask_steward("continue", "continued", path, nonce, pane)
 
 
 def _notice_text(outcome: str, reason: str, harness: str) -> str:
@@ -352,6 +442,23 @@ def _notice_text(outcome: str, reason: str, harness: str) -> str:
     return f"[정리] 창을 자동으로 비우지 않았습니다({why}). 필요하면 {hint} 하세요."
 
 
+def _continue_notice_text(outcome: str, reason: str) -> str:
+    said = f'"{CONTINUE_TEXT}"'
+    if outcome == "unverified":
+        return f"[정리] 새 세션에 {said}를 넣었지만 전달을 확인하지 못했습니다. 진행되지 않았다면 {said}라고 입력하세요."
+    why = REASON_TEXT.get(reason, reason or "알 수 없음")
+    if reason.startswith("not-idle-"):
+        why = "새 세션이 입력 대기 상태가 되지 않았습니다"
+    verb = "넣지 못했습니다" if outcome == "failed" else "넣지 않았습니다"
+    return f"[정리] 창은 비웠지만 {said}를 {verb}({why}). 이어서 하려면 {said}라고 입력하세요."
+
+
+def _booked_seat(req: dict, seat_key: str) -> "st.Seat":
+    fields = req.get("seat") or {}
+    return st.Seat(str(fields.get("kind") or ""), seat_key, str(fields.get("pane") or ""),
+                   str(fields.get("harness") or ""), str(fields.get("project_key") or ""))
+
+
 def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observed: str = "") -> bool:
     """Record how the booking ended -- only while it is still this helper's -- and leave the
     one result line for anything but a clear.  The notice is written after the seat lock is
@@ -360,25 +467,65 @@ def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observ
         req = read_reservation(seat_key)
         if not req or req.get("nonce") != nonce or req.get("status") not in ("reserved", "unverified"):
             return False
-        req.update(status=outcome, reason=reason, finished=st.now_epoch())
+        now = st.now_epoch()
+        req.update(status=outcome, reason=reason, finished=now)
         if observed:
             req["new_session"] = observed
+        if outcome == "cleared" and not req.get("continue_off"):
+            # Written before anything is typed: the new Codex thread's first hook finds its window by it.
+            req["continued"] = {"state": "pending", "deadline": now + _tunable("CONTINUE_WINDOW", CONTINUE_WINDOW_SEC)}
         _write_reservation(req)
     if outcome != "cleared":
         with contextlib.suppress(BaseException):
-            st.write_notice(st.Seat(str(req["seat"].get("kind") or ""), seat_key, str(req["seat"].get("pane") or ""),
-                                    str(req["seat"].get("harness") or ""), str(req["seat"].get("project_key") or "")),
-                            _notice_text(outcome, reason, str(req.get("harness") or "")),
+            st.write_notice(_booked_seat(req, seat_key), _notice_text(outcome, reason, str(req.get("harness") or "")),
                             author_harness=str(req.get("harness") or ""), author_sid=str(req.get("sid") or ""))
     return True
 
 
+def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "") -> bool:
+    """Record how the continue ended -- only while it is still this booking's and open -- and leave
+    one result line for a miss the person did not cause."""
+    with st.seat_lock(seat_key):
+        req = read_reservation(seat_key)
+        held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
+        if not req or req.get("nonce") != nonce or req.get("status") != "cleared" \
+                or held.get("state") not in ("pending", "sending"):
+            return False
+        req["continued"] = {**held, "state": "sent" if outcome == "true" else outcome, "reason": reason,
+                            "finished": st.now_epoch()}
+        _write_reservation(req)
+    if outcome != "true" and not (outcome == "skipped" and reason in CONTINUE_QUIET):
+        with contextlib.suppress(BaseException):
+            st.write_notice(_booked_seat(req, seat_key), _continue_notice_text(outcome, reason),
+                            author_harness=str(req.get("harness") or ""), author_sid=str(req.get("sid") or ""))
+    return True
+
+
+def _continue(seat_key: str, nonce: str, continuer: Callable[[Path, str, str], dict]) -> str:
+    """After a confirmed clear: ask ``peer-steward.py continue`` once and record its end.
+    ``continued`` when the prompt went in, else ``cleared`` (the clear itself stands)."""
+    path = reservation_path(seat_key)
+    req, reason = validate_continue(path, nonce)
+    if req is None and reason in ("superseded", "off"):
+        return "cleared"                # nothing pending: --no-continue, a newer tidy, --no-clear
+    if req is None:
+        verdict = {"continued": "skipped", "reason": reason}
+    else:
+        verdict = continuer(path, nonce, str((req.get("seat") or {}).get("pane") or ""))
+    outcome = verdict.get("continued", "failed")
+    _finish_continue(seat_key, nonce, outcome, verdict.get("reason", ""))
+    return "continued" if outcome == "true" else "cleared"
+
+
 def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int], str]] = None,
                steward: Optional[Callable[[Path, str, str], dict]] = None,
+               continuer: Optional[Callable[[Path, str, str], dict]] = None,
                sleep: Callable[[float], None] = time.sleep) -> str:
-    """Wait for idle, ask ``peer-steward.py clear`` once, record the end.  Returns the outcome word."""
+    """Wait for idle, ask ``peer-steward.py clear`` once, record the end; after a confirmed clear ask
+    ``peer-steward.py continue`` once.  Returns the outcome word (``continued`` when both happened)."""
     wait = wait or _herdr_wait_idle
     steward = steward or _run_steward
+    continuer = continuer or _run_continue
     path = reservation_path(seat_key)
     with st.seat_lock(seat_key):
         req = read_reservation(seat_key)
@@ -405,7 +552,7 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
     outcome, reason = verdict.get("cleared", "failed"), verdict.get("reason", "")
     if outcome == "true":
         _finish(seat_key, nonce, "cleared", observed=verdict.get("new_session", ""))
-        return "cleared"
+        return _continue(seat_key, nonce, continuer)
     if outcome == "unverified":
         # Typed once and never again; give the new conversation's start hook a short bounded
         # window to show up before calling it unconfirmed.
@@ -415,7 +562,7 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
             seen = (held or {}).get("observed") or {}
             if seen.get("sid"):
                 _finish(seat_key, nonce, "cleared", observed=str(seen["sid"]))
-                return "cleared"
+                return _continue(seat_key, nonce, continuer)
             sleep(1.0)
         return "unverified" if _finish(seat_key, nonce, "unverified", reason) else "superseded"
     final = "skipped" if outcome == "skipped" else "failed"

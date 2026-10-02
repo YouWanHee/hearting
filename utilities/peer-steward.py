@@ -1912,6 +1912,8 @@ _CLEAR_OBSERVE_SETTLE_MS = 1500
 _ANSI_TOKEN = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|(.)", re.S)
 _RULE_LINE = re.compile(r"^[\s\u2500-\u257f]*\u2500{8,}[\s\u2500-\u257f]*$")
 _OPENCODE_HOME_PLACEHOLDER = "askanything"
+# A whole thread id; a cut one (`…` in a narrow pane) or one inside a longer token is not.
+_THREAD_ID = re.compile(r"(?<![0-9A-Za-z-])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9A-Za-z-])")
 
 
 def _screen_lines(raw):
@@ -2015,6 +2017,42 @@ def _opencode_left_text(body):
     return re.split(r" {6,}", rest, maxsplit=1)[0].strip()
 
 
+def _screen_ready(harness, lines):
+    """None when the visible screen shows no selection/permission form and an empty input box,
+    else the reason (`form-open`, `draft`, `draft-unknown`)."""
+    flat = "".join("".join(_plain(c) for c in lines).split()).lower()
+    if any(token in flat for token in _FORM_TOKENS):
+        return "form-open"
+    draft = _draft_state(harness, lines)
+    if draft == "nonempty":
+        return "draft"
+    if draft != "empty":
+        return "draft-unknown"
+    return None
+
+
+def _codex_footer_threads(lines):
+    """The whole thread ids on Codex's status line (the lines below its input box).
+
+    hearting's Codex status line carries `thread-title`, which shows the thread id until the
+    thread has a title -- right after `/clear` the new thread's id (measured on codex 0.160.0:
+    the rollout written at the first message carries the same id; herdr kept the old one)."""
+    idx = next((i for i in range(len(lines) - 1, -1, -1)
+                if _marker_remainder(lines[i], "\u203a") is not None), None)
+    if idx is None:
+        return set()
+    return {m.group(0) for cells in lines[idx + 1:] for m in _THREAD_ID.finditer(_plain(cells))}
+
+
+def _codex_rollout_exists(thread_id):
+    """True when Codex has written a rollout for `thread_id` -- it does so with the thread's
+    first message, not at `/clear` (measured on codex 0.160.0)."""
+    import glob as _glob
+    pattern = os.path.join(_codex_home_dir(), "sessions", "*", "*", "*",
+                           f"rollout-*-{_glob.escape(thread_id)}.jsonl")
+    return bool(_glob.glob(pattern))
+
+
 def _read_screen(target):
     """The visible pane (ANSI) as screen lines, or None when it could not be read."""
     try:
@@ -2083,40 +2121,33 @@ def _herdr_lags(req, herdr_sid):
 
 
 def _clear_look(target, req):
-    """One judgement of the target: `(None, agent)` when it may be cleared, else `(reason, agent)`.
+    """One judgement of the target: `(None, agent, lines)` when it may be cleared, else
+    `(reason, agent, lines)`.
 
     Identity (pane, harness, session), idle state, then the screen: no form open and an empty
     input box. Every doubt is a reason, never a guess."""
     state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
     if unavailable or state in ("agent-not-found", "timeout"):
-        return (unavailable or "agent-not-found"), agent
+        return (unavailable or "agent-not-found"), agent, None
     seat_pane = (req.get("seat") or {}).get("pane")
     if seat_pane and agent.get("pane") != seat_pane:
-        return "target-changed", agent
+        return "target-changed", agent, None
     if agent.get("harness") != req.get("harness"):
-        return "target-changed", agent
+        return "target-changed", agent, None
     if req.get("harness") in ("claude", "codex") and agent.get("session_id") != req.get("sid"):
         # herdr's pane record can lag a /clear; the process itself is the proof, never a guess.
         # An unnamed session (`-`, empty) is not a confirmed match: only the process can vouch for it.
         if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid") \
                 and not _herdr_lags(req, agent.get("session_id")):
-            return "target-changed", agent
+            return "target-changed", agent, None
     if state == "blocked":
-        return "form-open", agent
+        return "form-open", agent, None
     if state not in ("idle", "done"):
-        return f"not-idle-{state}", agent
+        return f"not-idle-{state}", agent, None
     lines = _read_screen(target)
     if lines is None:
-        return "screen-unknown", agent
-    flat = "".join("".join(_plain(c) for c in lines).split()).lower()
-    if any(token in flat for token in _FORM_TOKENS):
-        return "form-open", agent
-    draft = _draft_state(req.get("harness"), lines)
-    if draft == "nonempty":
-        return "draft", agent
-    if draft != "empty":
-        return "draft-unknown", agent
-    return None, agent
+        return "screen-unknown", agent, None
+    return _screen_ready(req.get("harness"), lines), agent, lines
 
 
 def _wait_for_home(target, bound_ms):
@@ -2143,11 +2174,39 @@ def _opencode_home(lines):
     return 0 < len(shown) <= 2 and shown[-1][:1] in ("/", "~")
 
 
-def _clear_observe(target, req, request_path):
+def _seat_knows(req, sid):
+    """True when the booking seat's own ledger has seen session `sid` of the booked harness."""
+    try:
+        import session_tidy as st
+        seat_fields = req.get("seat") or {}
+        seat = st.Seat(str(seat_fields.get("kind") or ""), str(seat_fields.get("key") or ""),
+                       str(seat_fields.get("pane") or ""), str(seat_fields.get("harness") or ""),
+                       str(seat_fields.get("project_key") or ""))
+        return (str(req.get("harness")), sid) in st.session_summary(seat)
+    except Exception:
+        return True                     # unreadable: never call an unknown id new
+
+
+def _codex_new_thread(target, req, before):
+    """The thread Codex's status line shows now and did not show at the look before the send:
+    exactly one whole id, the cleared one gone, unknown to the seat. Else None."""
+    lines = _read_screen(target)
+    if lines is None:
+        return None
+    shown = _codex_footer_threads(lines)
+    fresh = shown - set(before or ())
+    if len(fresh) != 1 or req.get("sid") in shown:
+        return None
+    (thread,) = fresh
+    return None if _seat_knows(req, thread) else thread
+
+
+def _clear_observe(target, req, request_path, before_threads=()):
     """The new conversation, seen: its session id (`-` when the harness has none yet), or None.
 
     Hook-side proof first (the booking's `observed`, written by the new session's start hook),
-    then herdr's own session id for the pane (Claude/Codex), then OpenCode's home screen."""
+    then herdr's own session id for the pane (Claude/Codex), then the screen: Codex's status line
+    naming a new thread (its start hook only runs with the first message), OpenCode's home."""
     old = req.get("sid")
     for round_no in range(_CLEAR_OBSERVE_ROUNDS):
         held = _read_json(Path(request_path))
@@ -2167,6 +2226,10 @@ def _clear_observe(target, req, request_path):
                     return str(proven)
             elif sid not in (None, "-", old) and not _herdr_lags(req, sid):
                 return str(sid)
+        if not unavailable and req.get("harness") == "codex":
+            thread = _codex_new_thread(target, req, before_threads)
+            if thread:
+                return thread
         if not unavailable and req.get("harness") == "opencode" and state in ("idle", "done"):
             lines = _read_screen(target)
             if lines is not None and _opencode_home(lines):
@@ -2175,7 +2238,10 @@ def _clear_observe(target, req, request_path):
             if req.get("harness") == "opencode":
                 _wait_for_home(target, _CLEAR_OBSERVE_SETTLE_MS)
             else:
-                _settle(target, _CLEAR_OBSERVE_SETTLE_MS)
+                # The pane stays `done` through /clear, so an idle wait would return at once and every
+                # round would pass before the start hook ran or Codex repainted (measured 2026-10-02:
+                # 8 rounds in 187 ms). Waiting for a change gives each round its bound.
+                _run_herdr_wait(target, ["working", "blocked"], _CLEAR_OBSERVE_SETTLE_MS)
     return None
 
 
@@ -2198,8 +2264,9 @@ def cmd_clear(args):
     retry, and nothing is ever re-sent after a doubtful result.
 
     `cleared=true` only with evidence the conversation changed (start hook note, new herdr
-    session id, OpenCode home); otherwise `unverified`. Exit 0 true / 3 skipped / 1 failed /
-    5 unverified. One ledger row (`kind=notice`, `action=clear` in the receipt) per judgement.
+    session id, a new thread id on Codex's status line, OpenCode home); otherwise `unverified`.
+    Exit 0 true / 3 skipped / 1 failed / 5 unverified. One ledger row (`kind=notice`,
+    `action=clear` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
     if _herdr_missing():
@@ -2236,24 +2303,210 @@ def cmd_clear(args):
 
     if not command:
         return finish("skipped", "unsupported-harness")
-    reason, agent = _clear_look(target, req)
+    reason, agent, _lines = _clear_look(target, req)
     if reason:
-        return finish("skipped" if not reason.startswith(("herdr-", "agent-not-found")) else "failed", reason, agent)
+        return finish(_look_outcome(reason), reason, agent)
     req, why = clear.validate_request(args.request, args.nonce)
     if req is None:
         return finish("skipped", why, agent)
-    reason, agent = _clear_look(target, req)          # the look immediately before the one send
+    reason, agent, lines = _clear_look(target, req)   # the look immediately before the one send
     if reason:
-        return finish("skipped" if not reason.startswith(("herdr-", "agent-not-found")) else "failed", reason, agent)
+        return finish(_look_outcome(reason), reason, agent)
+    before = _codex_footer_threads(lines) if harness == "codex" else set()
     rc, payload = _herdr_prompt(target, command, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
     if rc is None:
         return finish("failed", "herdr-invocation-failed", agent)
     if rc != 0:
         return finish("failed", _herdr_error_reason(payload, rc), agent)
-    new_session = _clear_observe(target, req, args.request)
+    new_session = _clear_observe(target, req, args.request, before)
     if new_session is None:
         return finish("unverified", "new-session-not-observed", agent)
     return finish("true", None, agent)
+
+
+def _look_outcome(reason):
+    return "failed" if reason.startswith(("herdr-", "agent-not-found")) else "skipped"
+
+
+# --- continue: the one prompt that lets the cleared window's new session carry on (session-tidy) ---
+
+_CONTINUE_LOOK_ROUNDS = 12            # bounded re-looks while the new session settles (idle, card handed over)
+_CONTINUE_SETTLE_MS = 1500
+
+
+def _booked_seat(req):
+    import session_tidy as st
+    fields = req.get("seat") or {}
+    return st, st.Seat(str(fields.get("kind") or ""), str(fields.get("key") or ""), str(fields.get("pane") or ""),
+                       str(fields.get("harness") or ""), str(fields.get("project_key") or ""))
+
+
+def _continue_card_reason(req):
+    """Whether the booked card reaches the new session: Claude's start hook hands it over at once
+    (its receipt is there), Codex and OpenCode hand it over with the first message (nobody holds
+    it yet). `card-pending` is worth another look; `card-taken` is final."""
+    st, seat = _booked_seat(req)
+    card = st.read_latest_card(seat)
+    consumed = st.read_json(st._consumed_path(seat))
+    held = isinstance(consumed, dict) and bool(card) and consumed.get("generation") == card.get("generation")
+    receipts = (consumed.get("receipts") or []) if held else []
+    if req.get("harness") == "claude":
+        mine = f"claude:{req.get('new_session')}:"
+        return None if any(str(r).startswith(mine) for r in receipts) else "card-pending"
+    return "card-taken" if receipts else None
+
+
+def _continue_look(target, req):
+    """One judgement of the cleared window before the continue prompt: None when it may be typed,
+    else the reason.
+
+    The pane and harness are the booked ones and the session there is the one the clear started,
+    with no message yet: Claude -- the pane's process (or herdr) names `new_session`; Codex -- no
+    rollout exists for `new_session` yet and the status line shows it (or herdr/the process name
+    it); OpenCode -- its home screen, which also is its empty box. Then idle, the card on its way,
+    no form open, an empty input box."""
+    harness, new = req.get("harness"), str(req.get("new_session") or "")
+    state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
+    if unavailable or state in ("agent-not-found", "timeout"):
+        return unavailable or "agent-not-found"
+    seat_pane = (req.get("seat") or {}).get("pane")
+    if (seat_pane and agent.get("pane") != seat_pane) or agent.get("harness") != harness:
+        return "target-changed"
+    pane = agent.get("pane") or target
+    if harness in ("claude", "codex") and new in ("", "-"):
+        return "new-session-unknown"
+    if harness == "claude" and agent.get("session_id") != new and _process_session(pane, harness) != new:
+        return "target-changed"
+    if harness == "codex" and _codex_rollout_exists(new):
+        return "new-input"              # the new thread already had its first message
+    if state == "blocked":
+        return "form-open"
+    if state not in ("idle", "done"):
+        return f"not-idle-{state}"
+    card = _continue_card_reason(req)
+    if card:
+        return card
+    lines = _read_screen(target)
+    if lines is None:
+        return "screen-unknown"
+    if harness == "opencode":
+        flat = "".join("".join(_plain(c) for c in lines).split()).lower()
+        if any(token in flat for token in _FORM_TOKENS):
+            return "form-open"
+        return None if _opencode_home(lines) else "target-changed"
+    if harness == "codex" and new not in _codex_footer_threads(lines) \
+            and agent.get("session_id") != new and _process_session(pane, harness) != new:
+        return "target-changed"
+    return _screen_ready(harness, lines)
+
+
+def _continue_arrival(harness, sid, text, since_epoch):
+    """The continue prompt as a user row of the new Claude session's own transcript (only that one:
+    a short text could also be typed elsewhere)."""
+    if harness != "claude" or not sid:
+        return None
+    import glob as _glob
+    for path in _glob.glob(os.path.expanduser(f"~/.claude/projects/*/{_glob.escape(sid)}.jsonl")):
+        ts = _transcript_rows_with(path, text, since_epoch)
+        if ts:
+            return ts
+    return None
+
+
+def cmd_continue(args):
+    """session-tidy auto-continue: type the continue prompt once into a window whose clear was confirmed.
+
+    `--request` is the seat's booking after `peer-steward.py clear` reported the new session
+    (`session_tidy_clear.py`). The prompt (`session_tidy_clear.CONTINUE_TEXT`, no trailer) is typed
+    only when all of these hold now:
+
+    * the booking's continue is pending and in time, no prompt was submitted since the card, the
+      card is the booked generation and was not handed to a peer (`validate_continue`);
+    * the pane is the booked one, runs the booked harness, and holds the session the clear started,
+      which has had no message yet (`_continue_look`);
+    * it is idle or done, the card is on its way to it, no form is open and the input box is empty.
+
+    A new session that is still settling (not idle yet, Claude's start hook not through) gets a few
+    bounded looks. The last look is followed by the `pending -> sending` claim under the seat lock
+    (`claim_continue`) and the single `herdr agent prompt --wait --until working`; nothing is ever
+    re-sent and no Enter is retried. `continued=true` needs the state flip, the seat's prompt count
+    moving (the new session's prompt hook) or, for Claude, the text in the new transcript; anything
+    else is `unverified`. A keystroke landing between the last look and the send cannot be ruled out
+    (herdr has no conditional send), as for `clear`. Exit 0 true / 3 skipped / 1 failed /
+    5 unverified. One ledger row (`kind=notice`, `action=continue` in the receipt) per judgement.
+    """
+    import session_tidy_clear as clear
+    if _herdr_missing():
+        print("continued=failed reason=herdr-not-found")
+        return _CLEAR_EXIT["failed"]
+    req, why = clear.validate_continue(args.request, args.nonce)
+    if req is None:
+        print(f"continued=skipped reason={why}")
+        return _CLEAR_EXIT["skipped"]
+    harness, old_sid, new_sid, target = req.get("harness"), req.get("sid"), req.get("new_session"), args.target
+    text = clear.CONTINUE_TEXT
+    started = time.monotonic()
+    verify, pane = "none", (req.get("seat") or {}).get("pane")
+
+    def finish(outcome, reason=None):
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        receipt = (f"action=continue continued={outcome} harness={harness} old_session={old_sid} "
+                   f"new_session={new_sid or '-'} verify={verify} ms={elapsed_ms}"
+                   + (f" reason={reason}" if reason else ""))
+        try:
+            _record(to_harness=harness or "unknown", to_name=target, kind="notice",
+                    summary_text=f"[notice] action=continue {outcome} {text}",
+                    to_session_id=new_sid if new_sid not in (None, "", "-") else None, to_pane=pane, ref=[],
+                    status=_CLEAR_LEDGER_STATUS[outcome], receipt=receipt,
+                    from_identity=(old_sid, harness, _project_of(req.get("cwd"))),
+                    from_name=_from_name(harness, old_sid))
+        except Exception:
+            pass        # the verdict below is the result; a ledger hiccup must not change it
+        print(f"continued={outcome} target={target} harness={harness} new_session={new_sid or '-'} "
+              f"verify={verify}" + (f" reason={reason}" if reason else ""))
+        return _CLEAR_EXIT[outcome]
+
+    reason = None
+    for round_no in range(_CONTINUE_LOOK_ROUNDS):
+        reason = _continue_look(target, req)
+        if reason is None or not reason.startswith(("not-idle-", "card-pending")):
+            break
+        if round_no + 1 < _CONTINUE_LOOK_ROUNDS:
+            # Bounded and event-driven: until the state changes, else the bound passes (no sleep).
+            until = ["idle", "done"] if reason.startswith("not-idle-") else ["working", "blocked"]
+            _run_herdr_wait(target, until, _CONTINUE_SETTLE_MS)
+    if reason == "card-pending":
+        reason = "card-not-delivered"
+    if reason:
+        return finish(_look_outcome(reason), reason)
+    req, why = clear.validate_continue(args.request, args.nonce)
+    if req is None:
+        return finish("skipped", why)
+    reason = _continue_look(target, req)            # the look immediately before the one send
+    if reason:
+        return finish(_look_outcome(reason), reason)
+    req, why = clear.claim_continue(args.request, args.nonce)
+    if req is None:
+        return finish("skipped", why)
+    st, seat = _booked_seat(req)
+    seq_before = int(req.get("prompt_seq", 0) or 0)
+    sent_at = time.time()
+    rc, payload = _herdr_prompt(target, text, wait=True, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+    if rc is None:
+        return finish("failed", "herdr-invocation-failed")
+    if rc == 0:
+        verify = "state-flip"
+        return finish("true")
+    reason = _herdr_error_reason(payload, rc)
+    if reason != "timeout":
+        return finish("failed", reason)
+    if st.read_prompt_seq(seat) > seq_before:
+        verify = "prompt-hook"
+        return finish("true")
+    if _continue_arrival(harness, new_sid, text, sent_at):
+        verify = "transcript-arrival"
+        return finish("true")
+    return finish("unverified", "submission-not-observed")
 
 
 def _herdr_error_reason(payload, rc):
@@ -2370,6 +2623,13 @@ def build_parser():
                          help="the seat's auto-clear booking (session_tidy_clear.py)")
     p_clear.add_argument("--nonce", default=None, help="the booking's nonce, when the caller holds one")
     p_clear.set_defaults(func=cmd_clear)
+
+    p_continue = sub.add_parser("continue")
+    p_continue.add_argument("target")
+    p_continue.add_argument("--request", required=True,
+                            help="the seat's auto-clear booking after a confirmed clear (session_tidy_clear.py)")
+    p_continue.add_argument("--nonce", default=None, help="the booking's nonce, when the caller holds one")
+    p_continue.set_defaults(func=cmd_continue)
 
     p_mode = sub.add_parser("steward")
     p_mode.add_argument("state", choices=("on", "off"))

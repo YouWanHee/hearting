@@ -14,14 +14,16 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py status [--json] [--cwd D]
         Print where the state lives and what is waiting.
 
-    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D] [--no-clear]
+    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D] [--no-clear | --no-continue]
         Queue the memory tidy and return at once (one line); the detached runner
         ``session_tidy_runner.py`` does the work and leaves a result notice.  Inside
-        herdr it also books the window's auto-clear (``session_tidy_clear.py``);
-        ``--no-clear`` keeps the window and cancels a pending booking.
+        herdr it also books the window's auto-clear and the continue prompt after it
+        (``session_tidy_clear.py``); ``--no-clear`` keeps the window and cancels a pending
+        booking, ``--no-continue`` clears without typing anything after it.
     session_tidy.py handoff <target> [--harness H] [--session-id S] [--cwd D]
         Deliver this seat's card to a peer session through ``peer-steward.py prompt``
-        and report its typed verdict (``prompted=...``) and exit code on one line.
+        and report its typed verdict (``prompted=...``) and exit code on one line.  The
+        card is marked as handed off: this window is not continued from it.
 
 State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 (directories 0700, files 0600, temp file + rename, symlinks refused):
@@ -41,8 +43,9 @@ The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project
 A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
 pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
 caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
-a ``/clear``), else -- for the first hook after an auto-clear -- the one window waiting for its
-successor.  No match or several -> the project seat, quietly.
+a ``/clear``), else the one whose confirmed auto-clear named exactly this thread as its new session,
+else -- for the first hook after an auto-clear -- the one window waiting for its successor.  No
+match or several -> the project seat, quietly.
 A worker marker is checked before the pane: a worker that inherited its
 supervisor's pane id gets no card, ledger line or notice.
 """
@@ -371,22 +374,47 @@ def _successor_pane(sid: str, agents: list[dict], cwd: str) -> list[str]:
     return [pane] if ok else []
 
 
+def _cleared_into(sid: str) -> list[str]:
+    """The windows whose confirmed auto-clear read exactly ``sid`` off their own screen as the
+    thread it started (``peer-steward.py clear``).  Read from the bookings alone: a thread id is
+    unique, and herdr may be slow or gone just when that thread's first hook runs."""
+    try:
+        import session_tidy_clear
+        keys = [path.stem for path in session_tidy_clear.clear_dir().glob("*.json")]
+    except BaseException:  # noqa: BLE001
+        return []
+    panes = []
+    for key in keys:
+        try:
+            booking = session_tidy_clear.read_reservation(key)
+        except BaseException:  # noqa: BLE001
+            continue
+        pane = str(((booking or {}).get("seat") or {}).get("pane") or "")
+        if booking and booking.get("harness") == "codex" and booking.get("status") == "cleared" \
+                and booking.get("new_session") == sid and pane and _pane_seat_of(pane).key == key:
+            panes.append(pane)
+    return panes
+
+
 def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
     """The herdr pane of a Codex session that has no ``HERDR_PANE_ID`` -- exactly one, else "".
 
     In order: the pane whose herdr session is this thread; the pane whose seat ledger already
-    knows this thread (herdr's value can lag a ``/clear`` for good); for the first hook after a
-    clear (``source=clear``) the one window whose auto-clear is waiting for its successor."""
-    if not sid:
+    knows this thread (herdr's value can lag a ``/clear`` for good); the pane whose confirmed
+    auto-clear started exactly this thread (no herdr needed); for the first hook after a clear
+    (``source=clear``) the one window whose auto-clear is waiting for its successor."""
+    if not sid or sid == "-":
         return ""
     agents = _herdr_codex_agents()
-    if agents is None:
-        return ""
-    panes = [str(a["pane_id"]) for a in agents if _agent_session(a) == sid]
+    panes: list[str] = []
+    if agents:
+        panes = [str(a["pane_id"]) for a in agents if _agent_session(a) == sid]
+        if not panes:
+            panes = [str(a["pane_id"]) for a in agents
+                     if ("codex", sid) in session_summary(_pane_seat_of(str(a["pane_id"])))]
     if not panes:
-        panes = [str(a["pane_id"]) for a in agents
-                 if ("codex", sid) in session_summary(_pane_seat_of(str(a["pane_id"])))]
-    if not panes and source == "clear" and cwd:
+        panes = _cleared_into(sid)
+    if not panes and agents and source == "clear" and cwd:
         panes = _successor_pane(sid, agents, cwd)
     return panes[0] if len(set(panes)) == 1 else ""
 
@@ -575,6 +603,16 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
     atomic_write_json(card_json_path(seat), card)
     atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
     return card
+
+
+def mark_card_handed_off(seat: Seat) -> None:
+    """The latest card went to a peer session: this seat's window is not continued from it
+    (takes the seat lock; a newer card starts unmarked)."""
+    with seat_lock(seat.key):
+        card = read_latest_card(seat)
+        if card and not card.get("handed_off"):
+            card["handed_off"] = True
+            atomic_write_json(card_json_path(seat), card)
 
 
 def render_card_text(card: dict) -> str:
@@ -1001,7 +1039,8 @@ def cmd_enqueue(args) -> int:
             handover.write_snapshot_locked(seat, harness, sid)
     item = runner.enqueue_item(seat, harness, sid, cwd, transcript)
     try:
-        booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=bool(args.no_clear))
+        booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=bool(args.no_clear),
+                                            no_continue=bool(args.no_continue))
     except BaseException as exc:  # noqa: BLE001 - the tidy is queued; the window is left alone
         booked = f"clear=manual reason=internal-{type(exc).__name__} hint={clear.CLEAR_COMMAND.get(harness, '/clear')}"
     print(f"enqueue={item['id']} seat={seat.key} status=queued {booked}")
@@ -1097,6 +1136,8 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--cwd")
     enqueue.add_argument("--no-clear", action="store_true",
                          help="keep this window: no auto-clear (cancels a pending one)")
+    enqueue.add_argument("--no-continue", action="store_true",
+                         help="clear the window but type nothing after it (the user asked to stop after tidying)")
     enqueue.set_defaults(func=cmd_enqueue)
     handoff = sub.add_parser("handoff", help="deliver this seat's card to a peer session")
     handoff.add_argument("target")

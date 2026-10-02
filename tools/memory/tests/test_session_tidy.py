@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import stat
 import sys
@@ -399,6 +400,37 @@ class DaemonCodexSeatTest(TidyCase):
         self.assertEqual(self.seat(sid="t-B", source="clear").pane, "w:p1")
         self.book("w:p1", "t-A", cwd=self.iso.root / "elsewhere")    # the booking is for another directory
         self.assertEqual(self.seat(sid="t-B", source="clear").kind, "project")
+
+    def test_a_confirmed_clear_names_the_thread_whose_hooks_belong_to_the_window(self):
+        # Two Codex windows in one directory: the "one window waiting" rule gives up, the thread id
+        # the clear read off w:p1's own screen does not.
+        self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X")])
+        key = self.pane_key("w:p1")
+        with self.iso.patched_environ(self.env):
+            seat = st.Seat("pane", key, "w:p1", "codex", "")
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "codex", "t-A", "표식-정확일치")
+        for status, new, expect in (("cleared", "t-B", "w:p1"), ("cleared", "-", None), ("reserved", "t-B", None),
+                                    ("cleared", "t-other", None)):
+            with self.subTest(status=status, new=new):
+                self.book("w:p1", "t-A", status=status)
+                path = self.state / "clear" / f"{key}.json"
+                body = json.loads(path.read_text(encoding="utf-8"))
+                body["new_session"] = new
+                path.write_text(json.dumps(body), encoding="utf-8")
+                for source in ("clear", ""):           # the start hook and the prompt hook alike
+                    seat = self.seat(sid="t-B", source=source)
+                    self.assertEqual(seat.pane if expect else seat.kind, expect or "project")
+        self.book("w:p1", "t-A", status="cleared")
+        body = json.loads((self.state / "clear" / f"{key}.json").read_text(encoding="utf-8"))
+        body["new_session"] = "t-B"
+        (self.state / "clear" / f"{key}.json").write_text(json.dumps(body), encoding="utf-8")
+        self.agents_file.write_text("not json", encoding="utf-8")   # herdr fails just then: the id still decides
+        self.assertEqual(self.seat(sid="t-B").pane, "w:p1")
+        out = []
+        with self.iso.patched_environ(self.env):
+            st.run_hook("codex", "start", "t-B", source="clear", cwd=str(self.cwd), env={}, emit=out.append)
+        self.assertIn("표식-정확일치", "".join(out))
 
     def test_a_second_codex_window_in_the_directory_or_no_booking_is_no_decision(self):
         self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X")])
@@ -1211,6 +1243,17 @@ class ClearBookingTest(TidyCase):
         self.assertEqual(stat.S_IMODE((self.state / "clear" / f"{seat.key}.json").stat().st_mode), 0o600)
         self.assertEqual(len(self.started), 1)
 
+    def test_no_continue_books_the_clear_alone(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), no_continue=True),
+                             "clear=scheduled continue=off")
+            self.assertTrue(clear.read_reservation(seat.key)["continue_off"])
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd)), "clear=scheduled")
+            self.assertFalse(clear.read_reservation(seat.key)["continue_off"])
+
     def test_no_clear_keeps_the_window_and_cancels_a_pending_booking(self):
         line, seat = self.book()
         self.assertEqual(line, "clear=scheduled")
@@ -1476,6 +1519,168 @@ class ClearHelperTest(TidyCase):
         self.assertEqual(self.run_helper(seat, req), "skipped")
         self.assertEqual(self.calls, [])
         self.assertIn("예약 시간", self.notices(seat)[0])
+
+
+class ContinueHelperTest(TidyCase):
+    """After a confirmed clear the same helper asks ``peer-steward.py continue`` once (both replaced)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_herdr = self.iso.root / "fake-herdr"
+        self.fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.fake_herdr.chmod(0o755)
+        self.extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                      "HEARTING_TIDY_HERDR": str(self.fake_herdr), "HEARTING_TIDY_CLEAR_OBSERVE": "0.3"}
+        self.calls = []
+
+    def booked(self, harness="claude", sid="sid-A", no_continue=False, card=True):
+        shutil.rmtree(self.state, ignore_errors=True)               # every case starts from an empty seat
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
+            seat = st.resolve_seat(harness, str(self.cwd))
+            if card:
+                with st.seat_lock(seat.key):
+                    st.write_card(seat, harness, sid, "진행 중: 시험\n다음 할 일: 표식 쓰기",
+                                  prompt_seq=st.read_prompt_seq(seat))
+            clear.schedule_for_enqueue(seat, harness, sid, str(self.cwd), no_continue=no_continue)
+            return seat, clear.read_reservation(seat.key)
+
+    def run_helper(self, seat, req, verdict=None, cont=None, after_clear=None, extra=None):
+        def fake_steward(path, nonce, pane):
+            self.calls.append("clear")
+            if after_clear:
+                after_clear()
+            return dict(verdict or {"cleared": "true", "new_session": "sid-B"})
+
+        def fake_continue(path, nonce, pane):
+            self.calls.append(("continue", pane, nonce, Path(path).name))
+            return dict(cont or {"continued": "true"})
+        with self.iso.patched_environ({**self.extra, **(extra or {})}):
+            return clear.run_helper(seat.key, req["nonce"], wait=lambda *_a: "idle", steward=fake_steward,
+                                    continuer=fake_continue, sleep=lambda _s: None)
+
+    def booking(self, seat):
+        return st.read_json(self.state / "clear" / f"{seat.key}.json")
+
+    def notices(self, seat):
+        data = st.read_json(self.state / "notices" / f"{seat.key}.json")
+        return [i["text"] for i in (data or {}).get("items", [])]
+
+    def test_a_confirmed_clear_is_continued_once_and_silently(self):
+        seat, req = self.booked()
+        self.assertEqual(self.run_helper(seat, req), "continued")
+        self.assertEqual(self.calls, ["clear", ("continue", PANE, req["nonce"], f"{seat.key}.json")])
+        held = self.booking(seat)
+        self.assertEqual((held["status"], held["new_session"], held["continued"]["state"]), ("cleared", "sid-B", "sent"))
+        self.assertEqual(self.notices(seat), [])
+
+    def test_only_a_confirmed_clear_is_continued(self):
+        for verdict in ({"cleared": "skipped", "reason": "draft"}, {"cleared": "failed", "reason": "herdr-exit-1"},
+                        {"cleared": "unverified", "reason": "new-session-not-observed"}):
+            with self.subTest(verdict=verdict):
+                self.calls = []
+                seat, req = self.booked()
+                self.run_helper(seat, req, verdict=verdict)
+                self.assertEqual(self.calls, ["clear"])
+                self.assertNotIn("continued", self.booking(seat))
+
+    def test_a_clear_confirmed_by_the_late_start_hook_is_continued(self):
+        seat, req = self.booked()
+
+        def late_start(_sec):
+            with self.iso.patched_environ(self.extra):
+                st.run_hook("claude", "start", "sid-B", source="clear", cwd=str(self.cwd))
+        with self.iso.patched_environ(self.extra):
+            outcome = clear.run_helper(
+                seat.key, req["nonce"], wait=lambda *_a: "idle",
+                steward=lambda *_a: {"cleared": "unverified", "reason": "new-session-not-observed"},
+                continuer=lambda *a: self.calls.append("continue") or {"continued": "true"}, sleep=late_start)
+        self.assertEqual((outcome, self.calls), ("continued", ["continue"]))
+
+    def test_no_continue_and_no_card_clear_without_typing_after_it(self):
+        for kwargs in ({"no_continue": True}, {"card": False}):
+            with self.subTest(**kwargs):
+                self.calls = []
+                seat, req = self.booked(**kwargs)
+                self.assertEqual(self.run_helper(seat, req), "cleared")
+                self.assertEqual(self.calls, ["clear"])
+                self.assertEqual(self.notices(seat), [])
+
+    def test_a_prompt_a_new_card_or_a_handoff_after_the_clear_stops_it_quietly(self):
+        def prompt():
+            with self.iso.patched_environ(self.extra):
+                st.run_hook("claude", "prompt", "sid-B", cwd=str(self.cwd))     # the person typed first
+
+        def new_card():
+            with self.iso.patched_environ(self.extra):
+                seat = st.resolve_seat("claude", str(self.cwd))
+                with st.seat_lock(seat.key):
+                    st.write_card(seat, "claude", "sid-B", "새 카드")
+
+        def handed():
+            with self.iso.patched_environ(self.extra):
+                st.mark_card_handed_off(st.resolve_seat("claude", str(self.cwd)))
+        for name, during, reason in (("prompt", prompt, "new-input"), ("card", new_card, "card-changed"),
+                                     ("handoff", handed, "handed-off")):
+            with self.subTest(name):
+                self.calls = []
+                seat, req = self.booked()
+                self.assertEqual(self.run_helper(seat, req, after_clear=during), "cleared")
+                self.assertEqual(self.calls, ["clear"])                 # nothing typed after the clear
+                self.assertEqual((self.booking(seat)["continued"]["state"],
+                                  self.booking(seat)["continued"]["reason"]), ("skipped", reason))
+                self.assertEqual(self.notices(seat), [])
+
+    def test_each_continue_verdict_is_recorded_and_only_misses_the_person_did_not_cause_leave_a_line(self):
+        cases = (({"continued": "skipped", "reason": "draft"}, None),
+                 ({"continued": "skipped", "reason": "new-input"}, None),
+                 ({"continued": "skipped", "reason": "not-idle-working"}, "입력 대기"),
+                 ({"continued": "skipped", "reason": "card-not-delivered"}, "카드를 받지"),
+                 ({"continued": "skipped", "reason": "target-changed"}, "세션이 바뀌었습니다"),
+                 ({"continued": "failed", "reason": "herdr-exit-1"}, "넣지 못했습니다"),
+                 ({"continued": "unverified", "reason": "submission-not-observed"}, "확인하지 못했습니다"))
+        for cont, word in cases:
+            with self.subTest(cont=cont):
+                self.calls = []
+                seat, req = self.booked()
+                self.assertEqual(self.run_helper(seat, req, cont=cont), "cleared")
+                self.assertEqual(len([c for c in self.calls if c != "clear"]), 1)     # asked once, never again
+                state = {"failed": "failed", "unverified": "unverified"}.get(cont["continued"], "skipped")
+                self.assertEqual(self.booking(seat)["continued"]["state"], state)
+                if word is None:
+                    self.assertEqual(self.notices(seat), [])
+                else:
+                    self.assertEqual(len(self.notices(seat)), 1)
+                    self.assertIn(word, self.notices(seat)[0])
+                    self.assertIn("이어서해", self.notices(seat)[0])
+
+    def test_a_continue_window_that_passed_types_nothing_and_says_so(self):
+        seat, req = self.booked()
+        self.assertEqual(self.run_helper(seat, req, extra={"HEARTING_TIDY_CONTINUE_WINDOW": "-1"}), "cleared")
+        self.assertEqual(self.calls, ["clear"])
+        self.assertIn("예약 시간", self.notices(seat)[0])
+
+    def test_a_newer_tidy_during_the_clear_leaves_nothing_to_continue(self):
+        seat, req = self.booked()
+
+        def newer():
+            with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=2):
+                clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd))
+        self.assertEqual(self.run_helper(seat, req, after_clear=newer), "cleared")
+        self.assertEqual(self.calls, ["clear"])
+        self.assertEqual(self.notices(seat), [])
+
+    def test_the_claim_moves_pending_to_sending_exactly_once(self):
+        seat, req = self.booked()
+        with self.iso.patched_environ(self.extra):
+            path = clear.reservation_path(seat.key)
+            clear._finish(seat.key, req["nonce"], "cleared", observed="sid-B")
+            self.assertEqual(clear.validate_continue(path, req["nonce"])[1], "")
+            self.assertEqual(clear.validate_continue(path, "other"), (None, "superseded"))
+            claimed, why = clear.claim_continue(path, req["nonce"])
+            self.assertEqual((claimed["continued"]["state"], why), ("sending", ""))
+            self.assertEqual(clear.claim_continue(path, req["nonce"]), (None, "superseded"))
+            self.assertEqual(clear.validate_continue(path, req["nonce"]), (None, "superseded"))
+            self.assertEqual(clear.validate_request(path, req["nonce"]), (None, "superseded"))  # no second clear
 
 
 class SeatHandoverTest(TidyCase):
