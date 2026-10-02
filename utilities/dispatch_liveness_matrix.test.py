@@ -170,9 +170,14 @@ class HelperWiringTest(unittest.TestCase):
         src = Path(__file__).with_name("stage-dispatch-fallback.py").read_text(encoding="utf-8")
         self.assertNotIn("foreground_timeout + 10", src, "pre-fix inline deadline formula reintroduced")
         self.assertNotIn("foreground_timeout+10", src)
-        # one def + two wrapper-launch call sites
+        # Both wrapper-launch call sites go through `run_wrapper` (one def + two
+        # calls), which takes its deadline from the helper (one def + one call).
         self.assertGreaterEqual(
-            src.count("outer_subprocess_timeout("), 3,
+            src.count("run_wrapper("), 3,
+            "a wrapper launch stopped going through run_wrapper",
+        )
+        self.assertGreaterEqual(
+            src.count("outer_subprocess_timeout("), 2,
             "a wrapper-launch subprocess.run stopped routing its timeout through the helper",
         )
 

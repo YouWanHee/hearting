@@ -246,7 +246,7 @@ def main(argv: list[str]) -> int:
             label = slug or "?"
             exact = exact_attempt_state(pipe, now, agent_home)
             if exact and exact["state"] == "working":
-                detail = ("namespace-local exact heartbeat" if exact.get("pid_scope") == "namespace-local"
+                detail = ("namespace-local worker heartbeat" if exact.get("pid_scope") == "namespace-local"
                           else f"recorded pid {exact['pid']} running")
                 print(f"ALIVE    {label} ({detail}; classifier={ATTEMPT_CLASSIFIER_SOURCE})")
                 alive += 1

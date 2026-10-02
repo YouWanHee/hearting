@@ -18,7 +18,6 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from hearting_gates import gates_on, same_work_or_refuse
 from model_config import ModelConfigError, resolve_config  # noqa: E402
 from model_profile import sealed_pin_harness  # noqa: E402
 
@@ -41,9 +40,12 @@ def _unit_role(unit):
 
 from dispatch_lifecycle import (  # noqa: E402
     DETACHED,
+    FOREGROUND_INTERRUPTED,
+    FOREGROUND_NOTICE,
     FOREGROUND_SCOPED,
     FOREGROUND_TIMEOUT_DEFAULT,
     bounded_foreground_timeout,
+    run_forwarding_termination,
     select_launch_lifecycle,
 )
 # Spawn-confirm window: how long a `--start` call may synchronously watch a
@@ -128,6 +130,58 @@ def outer_subprocess_timeout(
     if lifecycle != FOREGROUND_SCOPED:
         return direct_timeout
     return bounded_foreground_timeout(foreground_timeout) + 10.0
+
+
+def run_wrapper(args: argparse.Namespace, command: list[str]):
+    """One adapter-wrapper launch for this chain.
+
+    A foreground-scoped ``--start`` hosts the worker inside this call, so a
+    stop request (SIGINT/SIGTERM/SIGHUP) is handed to the wrapper and the
+    chain waits for it to stop the worker and close the row
+    (``run_forwarding_termination``). Every other launch returns quickly and
+    keeps the plain ``subprocess.run``.
+    """
+    lifecycle = getattr(args, "launch_lifecycle", DETACHED)
+    timeout = outer_subprocess_timeout(
+        getattr(args, "foreground_timeout", FOREGROUND_TIMEOUT_DEFAULT),
+        lifecycle,
+        args.direct_timeout,
+    )
+    if getattr(args, "action", None) == "start" and lifecycle == FOREGROUND_SCOPED:
+        return run_forwarding_termination(
+            command, cwd=ROOT, env=direct_env(), capture=True, timeout=timeout,
+        )
+    return subprocess.run(
+        command, cwd=ROOT, text=True, capture_output=True, check=False,
+        timeout=timeout, env=direct_env(),
+    )
+
+
+def wrapper_interrupted(result, fields: dict[str, str]) -> bool:
+    """The caller stopped this call, or the wrapper reports it was stopped."""
+    return (
+        getattr(result, "received_signal", None) is not None
+        or fields.get("worker_failure") == FOREGROUND_INTERRUPTED
+    )
+
+
+def report_interrupted(result, output: str, attempt_id: str, attempts: list[str]) -> int:
+    """Stop the chain where the caller stopped it: no next hop is tried.
+
+    The interrupted attempt keeps its own row (``dead-interrupted``); a later
+    ``--start`` retries the same tuple through ``automatic_retry_of``.
+    """
+    signum = getattr(result, "received_signal", None)
+    extra = {"cleanup": "incomplete"} if getattr(result, "cleanup_incomplete", False) else {}
+    code = fail(
+        "interrupted", 128 + int(signum) if signum else 130,
+        interrupted="1", **extra, attempt_id=attempt_id,
+        detail="the call was stopped, so the worker was stopped with it",
+        attempt_trace="|".join(attempts),
+    )
+    if output:
+        print(output)
+    return code
 
 
 def fail(reason: str, code: int, **fields: str) -> int:
@@ -230,10 +284,63 @@ def _policy_by_profile(route, node):
     return by_profile
 
 
+HEADLESS_HOPS = frozenset({"same-harness-headless", "cross-harness-headless"})
+
+
+def _owner_harness(hops: list[dict], parent_identity: dict | None) -> str | None:
+    """The harness the native-subagent and inline hops would run on."""
+    if parent_identity and parent_identity.get("parent_harness"):
+        return parent_identity["parent_harness"]
+    sealed = {
+        row.get("parent_harness")
+        for hop in hops if hop.get("fallback_hop") in HEADLESS_HOPS
+        for row in hop.get("candidates", []) if row.get("parent_harness")
+    }
+    if len(sealed) == 1:
+        return next(iter(sealed))
+    native = {
+        row.get("harness")
+        for hop in hops if hop.get("fallback_hop") == "native-subagent"
+        for row in hop.get("candidates", []) if row.get("harness")
+    }
+    return next(iter(native)) if len(native) == 1 else None
+
+
+def apply_worker_pin(route: dict, hops: list[dict], parent_identity: dict | None) -> list[dict]:
+    """Keep a sealed `--pin worker=<harness>` step on that harness.
+
+    A headless candidate on another harness is marked ``_worker_pin_skip`` so
+    the loop records ``skipped-worker-pin`` instead of launching it; the
+    native-subagent and inline hops run on the owner's harness and stay only
+    when that is the pinned one. Without a pin the hops are returned as they
+    are.
+    """
+    pin = sealed_pin_harness(route, worker_type="stage")
+    if not pin:
+        return hops
+    owner = _owner_harness(hops, parent_identity)
+    pinned = []
+    for hop in hops:
+        if hop.get("fallback_hop") in HEADLESS_HOPS:
+            pinned.append({**hop, "candidates": [
+                row if row.get("child_harness") == pin else {**row, "_worker_pin_skip": pin}
+                for row in hop.get("candidates", [])
+            ]})
+        elif owner == pin:
+            pinned.append(hop)
+        else:
+            pinned.append({**hop, "_worker_pin_skip": pin})
+    return pinned
+
+
 def ordered_fallback_hops(
     route: dict, node: dict, jobs: Path, *, parent_identity: dict | None = None
 ) -> tuple[list[dict], dict | None]:
-    """Rank the checked direct-headless band from the sealed allocation policy."""
+    """Rank the checked direct-headless band from the sealed allocation policy.
+
+    Both paths end in ``apply_worker_pin``: a pinned step is never moved to
+    another tool.
+    """
 
     allocation = route.get("dispatch_allocation")
     if not isinstance(allocation, dict) or allocation.get("strategy") not in {
@@ -245,7 +352,7 @@ def ordered_fallback_hops(
         # Only the allocation path collapses the chain to one row per
         # harness (via headless.setdefault below) and therefore needs the
         # parent filter.
-        return list(node["fallback_hops"]), None
+        return apply_worker_pin(route, list(node["fallback_hops"]), parent_identity), None
     counts = attempt_counts(jobs, window=int(allocation["window"]))
     states = _usage_states(jobs, node.get("model_profile"))
     headless: dict[str, tuple[dict, dict]] = {}
@@ -387,7 +494,7 @@ def ordered_fallback_hops(
         ordered.append({**hop, "candidates": [candidate]})
     ordered.extend({**hop, "candidates": [dict(row)]} for hop, row in trailing_rows)
     ordered.extend(tail_hops)
-    return ordered, {
+    return apply_worker_pin(route, ordered, parent_identity), {
         "strategy": allocation["strategy"],
         "window": allocation["window"],
         "allocation": allocation,
@@ -882,6 +989,23 @@ def attempt_identity(args: argparse.Namespace, route: dict, node: dict, row: dic
     return "att-" + digest[:48]
 
 
+def retry_attempt_identity(failed_attempt_id: str) -> str:
+    """The one same-tuple successor of a failed attempt.
+
+    `attempt_identity` is deterministic, so a retry on the tuple that just
+    failed would name the failed row again, and the wrapper refuses a second
+    launch of an existing attempt. The successor is derived from the failed
+    attempt alone: dry-run, register and start (and concurrent conductors) all
+    name the same one, and the claim's `automatic_retry_of` admission keeps it
+    to one.
+    """
+    payload = {"automatic_retry_of": failed_attempt_id}
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return "att-" + digest[:48]
+
+
 def capacity_attempt_identity(args, route, node, row, ordinal, model):
     payload = {
         "route_id": route["route_id"], "route_node": node["id"], "slug": args.slug,
@@ -1225,6 +1349,60 @@ def live_attempt_row(jobs: Path, route_id: str, node_id: str, attempt_id: str):
     return row if attempt_process_quiescence(row).state == "live" else None
 
 
+def settle_dead_latest_attempt(jobs: Path, route_id: str, node_id: str) -> str:
+    """Close this node's newest launched row when its process is provably gone.
+
+    A foreground worker whose call was killed leaves its row open; the next
+    ``--start`` would otherwise hit that claimed row and start nothing. Only
+    the registry's exact-dead reconcile closes it (the row is reclassified
+    under the jobs lock, so a row that turned live is left alone), then the
+    post-exit cleanup is settled. Anything short of that changes nothing and
+    the start goes on as before. Returns the closed attempt id, else ''.
+    """
+    rows = registry_rows(jobs, route_id, node_id)
+    if not rows:
+        return ""
+    latest = rows[-1]
+    attempt_id = latest.get("attempt_id", "")
+    if (not attempt_id or latest.get("_status") not in {"open", "running"}
+            or latest.get("launch_claimed") != "1"):
+        return ""
+    try:
+        if attempt_process_quiescence(latest).state != "quiescent":
+            return ""
+        import dispatch_completion_join as JOIN
+
+        settled = JOIN.reconcile_exact_dead_attempt(jobs, JOIN.exact_attempt_row(jobs, attempt_id))
+        if not settled.get("closed"):
+            return ""
+        JOIN.resolve_attempt_cleanup(jobs, attempt_id, apply=True)
+    except (DispatchContractError, OSError, ValueError, TypeError, RuntimeError):
+        return ""
+    return attempt_id
+
+
+def pin_last_reason(jobs: Path, route_id: str, node_id: str, pin: str,
+                    attempts: list[str], direct_failures: list[dict[str, str]]) -> str:
+    """Why the pinned harness did not take this step, from this run's trace."""
+    failures = {item["attempt_id"]: item["reason"] for item in direct_failures}
+    for entry in reversed(attempts):
+        parts = entry.split(":", 2)
+        if len(parts) != 3 or parts[1].split("/")[3:4] != [pin]:
+            continue
+        rest = parts[2]
+        attempt_id = rest.rsplit("attempt-", 1)[1] if "attempt-" in rest else ""
+        if attempt_id in failures:
+            return failures[attempt_id]
+        if attempt_id:
+            note = next((row.get("note") for row in reversed(registry_rows(jobs, route_id, node_id))
+                         if row.get("attempt_id") == attempt_id and row.get("note")), "")
+            return note or rest.split(":", 1)[0]
+        if rest.startswith("watchdog-"):
+            continue
+        return rest[len("skipped-"):] if rest.startswith("skipped-") else rest
+    return f"no checked {pin} candidate"
+
+
 def progress_tool_failure_verdict(args, route, node, attempt_id, tool, fields):
     """SD-OPEN-38 (#9): a progress TOOL failure is evidence about the tool,
     not about the child.
@@ -1424,16 +1602,7 @@ def capacity_retry(
         (alt_model, alt_paired), failed,
     )
     try:
-        retry = subprocess.run(
-            retry_command, cwd=ROOT, text=True, capture_output=True,
-            check=False,
-            timeout=outer_subprocess_timeout(
-                getattr(args, "foreground_timeout", FOREGROUND_TIMEOUT_DEFAULT),
-                getattr(args, "launch_lifecycle", DETACHED),
-                args.direct_timeout,
-            ),
-            env=direct_env(),
-        )
+        retry = run_wrapper(args, retry_command)
     except subprocess.TimeoutExpired:
         if registry_has_attempt(args.jobs, retry_id):
             return "fail-closed", {"attempt_id": retry_id}, "capacity-launch-outcome-unknown"
@@ -1443,6 +1612,8 @@ def capacity_retry(
     attempts.append(
         f"{ordinal}:{tuple_key(row)}:capacity-retry:exit-{retry.returncode}:attempt-{retry_id}"
     )
+    if wrapper_interrupted(retry, retry_fields):
+        return "interrupted", {"attempt_id": retry_id, "_run": retry}, retry_output
     if retry_fields.get("duplicate_attempt") == "1":
         refreshed = capacity_context(args.jobs, route["route_id"], node["id"])["retries"]
         if refreshed:
@@ -1508,14 +1679,18 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     if args.prompt_file is not None:
         args.prompt_file = args.prompt_file.expanduser().resolve()
     args.launch_lifecycle = select_launch_lifecycle()
+    if args.action == "start" and args.launch_lifecycle == FOREGROUND_SCOPED:
+        print(FOREGROUND_NOTICE, file=sys.stderr, flush=True)
     self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG")
     if args.parent and self_slug and args.parent != self_slug:
-        if gates_on():
-            return fail(
-                "parent-identity-mismatch", 73, explicit=args.parent,
-                current=self_slug, child_spawned="0",
-            )
-        same_work_or_refuse("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
+        # The session's own name is the parent; a different --parent is a
+        # typo or a stale name, not a reason to stop. Fixed before any
+        # identity or registration is derived from it.
+        print(
+            f"notice: --parent {args.parent} is not this session's name; "
+            f"using {self_slug} (from AGENT_DISPATCH_SELF_SLUG).",
+            file=sys.stderr, flush=True,
+        )
         args.parent = self_slug
     args.parent = args.parent or self_slug
     if not args.parent:
@@ -1612,6 +1787,11 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
         reason = exc.reason
         return fail(reason, 73, child_spawned="0")
 
+    if args.action == "start":
+        # A provably dead claimed row is closed first, so neither the round
+        # admission nor the retry below reads it as a running attempt.
+        settle_dead_latest_attempt(args.jobs, route["route_id"], node["id"])
+
     # C-14: dispatch-node.py and dispatch-batch.py both cap review rounds, but
     # ordinary standard+ depth-2 work goes through this wrapper, which had no
     # such check -- so the cap was unreachable on the path most dispatches take.
@@ -1698,6 +1878,12 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
         prior_rows[-1].get("attempt_id", "") if prior_rows
         and committed_outcome(prior_rows[-1]["_status"], prior_rows[-1]) == "failed" else ""
     )
+    if (not args.automatic_retry_of and prior_rows
+            and prior_rows[-1]["_status"] == "open"
+            and prior_rows[-1].get("launch_claimed") == "0"):
+        # A retry `--register`ed but not yet started keeps its predecessor, so
+        # its `--start` names the same successor attempt.
+        args.automatic_retry_of = prior_rows[-1].get("automatic_retry_of", "")
     failed_tuples = set(args.failed_tuple) | set(prior_failures)
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
@@ -1736,16 +1922,28 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
             continue
         for ordered_row in ordered_hop.get("candidates", []):
             key = tuple_key(ordered_row)
+            if ordered_row.get("_worker_pin_skip"):
+                continue
             if key in failed_tuples and key not in recorded_prior_skips:
                 attempts.append(
                     f"{ordered_hop['ordinal']}:{key}:skipped-prior-unchanged-failure"
                 )
                 recorded_prior_skips.add(key)
+    pin_skipped = False
     for hop in fallback_hops:
         ordinal = int(hop["ordinal"])
+        if hop.get("_worker_pin_skip"):
+            # native-subagent/inline run on the owner's harness, not the pin's
+            attempts.append(f"{ordinal}:{hop['fallback_hop']}:skipped-worker-pin")
+            pin_skipped = True
+            continue
         if hop["fallback_hop"] in {"same-harness-headless", "cross-harness-headless"}:
             for row in hop.get("candidates", []):
                 key = tuple_key(row)
+                if row.get("_worker_pin_skip"):
+                    attempts.append(f"{ordinal}:{key}:skipped-worker-pin")
+                    pin_skipped = True
+                    continue
                 # Re-read after an early failure too: a whole-account quota
                 # cannot be cured by changing models later in this same chain.
                 from dispatch_capacity_evidence import active_limits
@@ -1850,6 +2048,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         if retry_output:
                             print(retry_output)
                         return 0
+                    if retry_state == "interrupted":
+                        return report_interrupted(
+                            retry_fields["_run"], retry_output, retry_fields["attempt_id"], attempts)
                     if retry_state == "fail-closed":
                         return fail(
                             retry_output or "capacity-retry-fail-closed", 76,
@@ -1860,6 +2061,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 attempt_id = attempt_identity(
                     args, route, node, row, ordinal,
                     node_round_admission.budget.next_round if node_round_admission is not None else 1)
+                if args.automatic_retry_of and attempt_id == args.automatic_retry_of:
+                    # This very tuple just failed: its successor is a new attempt.
+                    attempt_id = retry_attempt_identity(attempt_id)
                 legacy_reason = legacy_parent_generation_conflict(
                     args.jobs,
                     legacy_attempt_identity(args, route, node, row, ordinal),
@@ -1871,24 +2075,14 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     )
                 try:
                     command = wrapper_command(args, route, node, row, ordinal, attempt_id)
-                    result = subprocess.run(
-                        command,
-                        cwd=ROOT,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                        timeout=outer_subprocess_timeout(
-                            args.foreground_timeout,
-                            args.launch_lifecycle,
-                            args.direct_timeout,
-                        ),
-                        env=direct_env(),
-                    )
+                    result = run_wrapper(args, command)
                     output = (result.stdout + result.stderr).strip()
                     fields = output_fields(output)
                     early = fields.get("early_death", "-")
                     worker_failure = fields.get("worker_failure", "-")
                     attempts.append(f"{ordinal}:{key}:direct:exit-{result.returncode}:attempt-{attempt_id}")
+                    if wrapper_interrupted(result, fields):
+                        return report_interrupted(result, output, attempt_id, attempts)
                     verdict_row = (finished_verdict_row(args.jobs, route["route_id"], node["id"], attempt_id)
                                    if worker_failure != "-" else None)
                     if verdict_row is not None:
@@ -1993,6 +2187,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     retry_state, retry_fields, retry_output = capacity_retry(
                         args, route, node, row, ordinal, failed, attempts
                     )
+                    if retry_state == "interrupted":
+                        return report_interrupted(
+                            retry_fields["_run"], retry_output, retry_fields["attempt_id"], attempts)
                     if retry_state in {"success", "existing"}:
                         print("check=ok")
                         _emit_child_success(
@@ -2091,6 +2288,24 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
             )
             print("degradation_ledger=" + (str(ledger) if ledger else "-"))
             return 79
+    worker_pin = sealed_pin_harness(route, worker_type="stage") if pin_skipped else None
+    if worker_pin:
+        # The pinned harness cannot take this step now, and the step was not
+        # moved to another tool: say so in one line instead of "exhausted".
+        last = pin_last_reason(args.jobs, route["route_id"], node["id"], worker_pin,
+                               attempts, direct_failures)
+        detail = (f"the worker is pinned to {worker_pin}; {worker_pin} cannot take this step "
+                  f"now ({last}), and a pinned step is not moved to another tool")
+        ledger = record_degradation(
+            route_id=route.get("route_id"), route_node=node.get("id"),
+            route_hash=route.get("route_hash"), dispatch_depth=node.get("dispatch_depth", 2),
+            writer="stage-dispatch-fallback.py", kind="chain-exhausted",
+            reason="worker-pin-unavailable", detail=detail, attempt_trace="|".join(attempts),
+            route_file=str(args.route), completion_gate=node.get("completion_gate"), parent=args.parent,
+        )
+        return fail("worker-pin-unavailable", 79, detail=detail, worker_pin=worker_pin,
+                    attempt_trace="|".join(attempts),
+                    degradation_ledger=str(ledger) if ledger else "-")
     ledger = record_degradation(
         route_id=route.get("route_id"), route_node=node.get("id"),
         route_hash=route.get("route_hash"), dispatch_depth=node.get("dispatch_depth", 2),

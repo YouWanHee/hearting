@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -189,19 +190,44 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(outcome.failure, f"signal-{signal.SIGTERM}")
 
     def test_foreground_wait_forwards_wrapper_signal(self):
-        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
-        timer = threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM))
-        timer.start()
-        try:
+        # The wrapper itself was asked to stop: `interrupted`, not the
+        # `signal-N` a worker that died of a signal on its own reports above.
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signum=signum):
+                proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+                timer = threading.Timer(0.05, lambda: os.kill(os.getpid(), signum))
+                timer.start()
+                try:
+                    outcome = L.wait_foreground(proc, 2, poll_interval=0.01)
+                    self.assertEqual(outcome.failure, L.FOREGROUND_INTERRUPTED)
+                    self.assertEqual(outcome.failure, "interrupted")
+                    self.assertTrue(outcome.group_empty)
+                    self.assertIsNotNone(proc.poll())
+                finally:
+                    timer.cancel()
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+
+    def test_foreground_wait_reports_interrupted_when_the_child_exits_first(self):
+        # The forwarded signal ends the child before the loop's own check: the
+        # after-loop branch still reports the wrapper's stop request.
+        proc = subprocess.Popen(["sh", "-c", "exit 0"], start_new_session=True)
+        proc.wait()
+        received_late = {"done": False}
+        real_group_empty = L._group_empty
+
+        def group_empty_with_signal(pgid):
+            if not received_late["done"]:
+                received_late["done"] = True
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_group_empty(pgid)
+
+        with mock.patch.object(L, "process_start_ticks", return_value="1"), \
+             mock.patch.object(L, "_group_empty", side_effect=group_empty_with_signal), \
+             mock.patch.object(L, "_terminate_group", return_value="signalled"):
             outcome = L.wait_foreground(proc, 2, poll_interval=0.01)
-            self.assertEqual(outcome.failure, f"signal-{signal.SIGTERM}")
-            self.assertTrue(outcome.group_empty)
-            self.assertIsNotNone(proc.poll())
-        finally:
-            timer.cancel()
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+        self.assertEqual(outcome.failure, "interrupted")
 
     def test_foreground_timeout_terminates_group(self):
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
@@ -293,6 +319,166 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(outcome.exit_code, 0)
         sighup_calls = [call for call in install.call_args_list if call.args[0] == signal.SIGHUP]
         self.assertEqual(len(sighup_calls), 2)
+
+
+# A stand-in wrapper: on SIGINT/SIGTERM it "cleans up" for CLEANUP seconds,
+# writes how many stop requests it saw, and exits 0 -- what a foreground
+# wrapper does while it stops its worker and closes the row.
+FAKE_WRAPPER = r"""
+import os, signal, sys, time
+seen = []
+def stop(signum, _frame):
+    seen.append(signum)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+cleanup = float(sys.argv[1])
+marker = sys.argv[2]
+open(marker + ".ready", "w").close()
+while not seen:
+    time.sleep(0.01)
+deadline = time.monotonic() + cleanup
+while time.monotonic() < deadline:
+    time.sleep(0.01)
+with open(marker, "w") as out:
+    out.write(",".join(str(s) for s in seen))
+print("worker_failure=interrupted", flush=True)
+print("cleanup-said-to-stderr", file=sys.stderr, flush=True)
+"""
+
+
+class ForwardingTerminationTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.script = self.root / "fake_wrapper.py"
+        self.script.write_text(FAKE_WRAPPER, encoding="utf-8")
+        self.marker = self.root / "seen"
+
+    def command(self, cleanup):
+        return [sys.executable, str(self.script), str(cleanup), str(self.marker)]
+
+    def send_after_ready(self, signals, *, gap=0.0):
+        """Send stop requests to THIS process once the wrapper can take them."""
+        sent = []
+        ready = Path(str(self.marker) + ".ready")
+
+        def fire():
+            deadline = time.monotonic() + 20
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            for index, signum in enumerate(signals):
+                if index:
+                    time.sleep(gap)
+                sent.append(time.monotonic())
+                os.kill(os.getpid(), signum)
+        thread = threading.Thread(target=fire, daemon=True)
+        thread.start()
+        return thread, sent
+
+    def test_plain_run_captures_both_streams_without_signals(self):
+        run = L.run_forwarding_termination(
+            [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"],
+            capture=True, timeout=10,
+        )
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (3, "out\n", "err\n"))
+        self.assertIsNone(run.received_signal)
+        self.assertFalse(run.cleanup_incomplete)
+
+    def test_uncaptured_run_returns_no_text(self):
+        run = L.run_forwarding_termination([sys.executable, "-c", "pass"], capture=False, timeout=None)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, None, None))
+
+    def test_outer_timeout_keeps_subprocess_run_meaning(self):
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            L.run_forwarding_termination(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                capture=True, timeout=0.3,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_signal_is_forwarded_and_the_wrapper_cleanup_is_awaited(self):
+        before = signal.getsignal(signal.SIGINT)
+        thread, sent = self.send_after_ready([signal.SIGINT])
+        run = L.run_forwarding_termination(self.command(1.0), capture=True, timeout=30, grace=10)
+        ended = time.monotonic()
+        thread.join()
+        self.assertEqual(run.received_signal, signal.SIGINT)
+        self.assertFalse(run.cleanup_incomplete)
+        self.assertEqual(run.returncode, 0)
+        self.assertIn("worker_failure=interrupted", run.stdout)
+        self.assertIn("cleanup-said-to-stderr", run.stderr)
+        self.assertEqual(self.marker.read_text(), str(int(signal.SIGINT)))
+        # The launcher waited for the wrapper's whole 1s cleanup.
+        self.assertGreaterEqual(ended - sent[0], 1.0)
+        # The launcher's own handler is gone again.
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
+
+    def test_repeated_signals_are_forwarded_without_restarting_the_deadline(self):
+        # Wrapper cleanup takes 3s; the grace is 1.5s. Stop requests arrive at
+        # 0s, 0.6s and 1.2s: a deadline restarted by each would fire at 2.7s.
+        thread, sent = self.send_after_ready(
+            [signal.SIGINT, signal.SIGTERM, signal.SIGINT], gap=0.6)
+        run = L.run_forwarding_termination(self.command(3.0), capture=True, timeout=30, grace=1.5)
+        ended = time.monotonic()
+        thread.join()
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(run.received_signal, signal.SIGINT)
+        self.assertTrue(run.cleanup_incomplete)
+        self.assertEqual(run.returncode, -signal.SIGKILL)
+        self.assertFalse(self.marker.exists())
+        self.assertGreaterEqual(ended - sent[0], 1.45)
+        self.assertLess(ended - sent[0], 2.4)
+
+    def test_repeated_signals_reach_the_wrapper(self):
+        thread, _sent = self.send_after_ready([signal.SIGINT, signal.SIGTERM], gap=0.2)
+        run = L.run_forwarding_termination(self.command(1.0), capture=True, timeout=30, grace=10)
+        thread.join()
+        self.assertFalse(run.cleanup_incomplete)
+        self.assertEqual(
+            self.marker.read_text(), f"{int(signal.SIGINT)},{int(signal.SIGTERM)}")
+
+    def test_a_stop_before_launch_launches_nothing(self):
+        def stopped_popen(*_args, **_kwargs):
+            raise AssertionError("must not launch after a stop request")
+
+        real_signal = L.signal.signal
+        real_getsignal = L.signal.getsignal
+        before = real_getsignal(signal.SIGINT)
+        installed = {}
+
+        def capture(signum, handler):
+            installed[signum] = handler
+            return real_signal(signum, handler)
+
+        with mock.patch.object(L.signal, "signal", side_effect=capture), \
+             mock.patch.object(L.subprocess, "Popen", side_effect=stopped_popen) as popen:
+            # The stop request lands while the handlers are being installed.
+            def getsignal(signum):
+                handler = installed.get(signal.SIGINT)
+                if handler is not None and signum == signal.SIGHUP:
+                    handler(signal.SIGINT, None)
+                return real_getsignal(signum)
+
+            with mock.patch.object(L.signal, "getsignal", side_effect=getsignal):
+                run = L.run_forwarding_termination(["true"], capture=True, timeout=5)
+        popen.assert_not_called()
+        self.assertEqual(run.received_signal, signal.SIGINT)
+        self.assertEqual((run.stdout, run.stderr), ("", ""))
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
+
+    def test_handlers_are_left_alone_off_the_main_thread(self):
+        result = {}
+
+        def work():
+            result["run"] = L.run_forwarding_termination(
+                [sys.executable, "-c", "print('ok')"], capture=True, timeout=10)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join(10)
+        self.assertEqual(result["run"].stdout, "ok\n")
 
 
 if __name__ == "__main__":

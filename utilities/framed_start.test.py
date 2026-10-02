@@ -414,6 +414,24 @@ class ApprovalTest(StartBase):
         self.assertIn("- full-run for leg 0 (autopilot-lab:full-run): approved", task)
         self.assertEqual(len(self.leg_routes()), 1)
 
+    def test_a_korean_approval_question_id_is_normalized_and_the_start_goes_through(self):
+        approvals = [{"key": "full-run", "leg": 0, "question": "문서시작"}]
+        self.set_briefs(LAB_SETUP, LAB_SETUP, approvals=approvals)
+        normalized = [{"key": "full-run", "leg": 0, "question": "full-run-leg0"}]
+        self.set_interview({"legs": [LAB_SETUP], "entry_approvals": normalized},
+                           extra_questions=[question("full-run-leg0", labels=("예, 지금 시작", "아니요, 나중에"), approves=0)])
+        review = W._proposal_review(self.route, self.path, self.jobs)
+        for row in review["proposals"]:
+            self.assertEqual(row["reason"], "valid", row)
+            self.assertEqual(row["proposal"]["entry_approvals"], normalized)
+            self.assertEqual(row["question_renames"], [{**normalized[0], "original": "문서시작"}])
+        result = self.settle()
+        self.assertEqual(result["state"], "running", result)             # not none(schema-invalid)
+        decision = self.record()["decision"]
+        self.assertEqual(decision["approvals"]["given"][0]["question"], "full-run-leg0")
+        self.assertTrue(decision["approvals"]["given"][0]["accepted"])
+        self.assertTrue(all("문서시작" in row["source"] for row in decision["proposals"]), decision["proposals"])
+
     def test_a164_10_declining_the_approval_is_a_valid_answer_that_starts_nothing(self):
         self.lab(approval_choice=1)
         NoneEndingTest.assert_none(self, "approval-missing:full-run")

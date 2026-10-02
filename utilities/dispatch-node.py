@@ -13,6 +13,12 @@ from dispatch_contract import (
     resolve_global_registry,
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind
+from dispatch_lifecycle import (
+    FOREGROUND_NOTICE,
+    FOREGROUND_SCOPED,
+    run_forwarding_termination,
+    select_launch_lifecycle,
+)
 import model_profile as MODEL_PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 import dispatch_subsession_advance as SUBSESSION
@@ -507,6 +513,43 @@ def child_env(environ=None):
     }
 
 
+def requested_launch_lifecycle(adapter_args, environ=None):
+    """The lifecycle the wrapper this node starts will run under.
+
+    An explicit ``--launch-lifecycle`` among the adapter arguments wins;
+    otherwise the wrapper reselects in this same scope, so this call's own
+    selection is the one it lands on.
+    """
+    extra = strip_leading_separator(adapter_args)
+    for index, token in enumerate(extra):
+        if token == "--launch-lifecycle" and index + 1 < len(extra):
+            return extra[index + 1]
+        if token.startswith("--launch-lifecycle="):
+            return token.split("=", 1)[1]
+    return select_launch_lifecycle(environ)
+
+
+def run_launcher(argv, action, lifecycle):
+    """Run the wrapper (or owner selector) this node hands its launch to.
+
+    A foreground-scoped ``start`` hosts the worker inside this call: a stop
+    request is handed to the wrapper and this call waits for it to stop the
+    worker and close the row, instead of killing it mid-cleanup. The receipt
+    then says ``interrupted=1`` and the exit code is 128+signal.
+    """
+    if action != "start" or lifecycle != FOREGROUND_SCOPED:
+        return subprocess.run(argv, env=child_env()).returncode
+    run = run_forwarding_termination(argv, env=child_env(), capture=False, timeout=None)
+    if run.received_signal is None:
+        return run.returncode
+    sys.stdout.flush()
+    print("interrupted=1")
+    if run.cleanup_incomplete:
+        print("cleanup=incomplete")
+    sys.stdout.flush()
+    return 128 + int(run.received_signal)
+
+
 def collect_explicit_evidence(tokens, flags):
     """Scan trailing adapter args for `--flag value` and `--flag=value` forms.
 
@@ -631,7 +674,11 @@ def main():
  p=argparse.ArgumentParser(); p.add_argument("--route",required=True); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--slug",required=True); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
  from review_input import add_arguments, drop_inapplicable, resolve_input
  add_arguments(p)
- a=p.parse_args(); route=json.loads(Path(a.route).read_text())
+ a=p.parse_args()
+ lifecycle=requested_launch_lifecycle(a.adapter_args)
+ if a.action=="start" and lifecycle==FOREGROUND_SCOPED:
+  print(FOREGROUND_NOTICE,file=sys.stderr,flush=True)
+ route=json.loads(Path(a.route).read_text())
  verify=subprocess.run(
   [sys.executable,str(ROOT/"utilities/capability-route.py"),"verify","--route",a.route,
    "--cwd",route["cwd"],"--launch-phase",a.action],
@@ -693,7 +740,7 @@ def main():
   if requested_jobs: argv += ["--jobs",requested_jobs]
   if a.attempt_id: argv += ["--attempt-id",a.attempt_id]
   argv += strip_leading_separator(a.adapter_args)
-  raise SystemExit(subprocess.run(argv,env=child_env()).returncode)
+  raise SystemExit(run_launcher(argv,a.action,lifecycle))
  try:
   registry=resolve_global_registry(
       ROOT,requested_jobs,int(node.get("dispatch_depth",1)),a.action,child_env())
@@ -888,5 +935,5 @@ def main():
  if node.get("model_profile"):
   argv += ["--model-profile",node["model_profile"]]
  argv += strip_leading_separator(a.adapter_args)
- raise SystemExit(subprocess.run(argv, env=child_env()).returncode)
+ raise SystemExit(run_launcher(argv,a.action,lifecycle))
 if __name__=="__main__": main()

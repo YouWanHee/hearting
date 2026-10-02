@@ -994,7 +994,9 @@ class InstalledRuntimeRegistryTest(unittest.TestCase):
                                        "attempt_id": job.attempt_id,
                                        "route_id": job.route_id,
                                        "route_node": job.route_node,
-                                       "phase": "launch",
+                                       # A worker-written phase: the launcher's
+                                       # `launch` seed is not liveness evidence.
+                                       "phase": "tool",
                                        "sequence": 1,
                                    }), \
                  mock.patch.object(dispatch, "_job_transcript_signal", return_value="working"), \
@@ -1054,7 +1056,9 @@ class InstalledRuntimeRegistryTest(unittest.TestCase):
                                        "attempt_id": job.attempt_id,
                                        "route_id": job.route_id,
                                        "route_node": job.route_node,
-                                       "phase": "launch",
+                                       # A worker-written phase: the launcher's
+                                       # `launch` seed is not liveness evidence.
+                                       "phase": "tool",
                                        "sequence": 1,
                                    }), \
                  mock.patch.object(dispatch, "_job_transcript_signal", return_value="working"), \
@@ -2112,6 +2116,46 @@ class CodexAttemptIdentityTest(unittest.TestCase):
         self.assertEqual(state, "dead")
         self.assertEqual(job.state_evidence["attempt"]["source"], "terminal-observation")
         self.assertIn("process-exited", job.state_evidence["attempt"]["rule"])
+
+    def test_extinct_namespace_row_is_reconcile_needed_despite_a_launch_seed(self):
+        # 5th Codex run: the caller's sandbox namespace vanished with the worker.
+        # The shared observer, not the launcher's fresh `phase=launch` seed,
+        # decides; the row becomes a visible reconcile obligation.
+        import dispatch_contract as contract
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_log = os.path.join(tmp, "jobs.log")
+            attempt = "att-namespace-extinct-fleet"
+            with open(jobs_log, "w", encoding="utf-8") as out:
+                out.write(
+                    "2026-10-02T11:11:09Z\topen\t/repo\t/wt\tplan\t"
+                    "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                    "execution_surface=registered-headless,registered_worker=1,"
+                    "fallback_hop=same-harness-headless,worker_type=stage,harness=codex,"
+                    f"attempt_id={attempt},route_id=rt-ns,route_node=plan,"
+                    "launch_lifecycle=foreground-scoped,pgid=464,pid=464,"
+                    "pid_ns=pid:[4026534323],pid_observer_ns=pid:[4026534323],"
+                    "pid_scope=namespace-local,pid_start=537327887\n")
+            rows, malformed = dispatch._scan_jobs_log(jobs_log, set())
+            self.assertEqual(malformed, 0)
+
+            def probe(_metadata, *, host_complete=False):
+                if host_complete:
+                    return contract.ProcessGroupObservation("empty")
+                return contract.ProcessGroupObservation(
+                    "unverifiable", (), "observer-namespace-mismatch")
+
+            seed = {"attempt_id": attempt, "route_id": "rt-ns", "route_node": "plan",
+                    "phase": "launch", "kind": "registry", "sequence": 1, "updated_at": 990.0}
+            with mock.patch.object(contract, "namespace_gone", return_value="extinct"), \
+                 mock.patch.object(contract, "attempt_tagged_descendants", side_effect=probe), \
+                 mock.patch.object(dispatch, "_attempt_heartbeat", return_value=seed), \
+                 mock.patch.object(dispatch, "_job_transcript_signal", return_value="working"):
+                state = dispatch._dispatch_liveness(rows[0], now=1000.0, track=False)
+            self.assertEqual(state, "stale")
+            self.assertEqual(rows[0].stage, "reconcile-needed")
+            observed = rows[0].state_evidence["attempt"]["observed_liveness"]
+            self.assertEqual((observed["state"], observed["process_reason"]),
+                             ("reconcile-needed", contract.NAMESPACE_EXTINCT_REASON))
 
     def test_pid_gone_open_row_is_visible_reconcile_needed_without_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:

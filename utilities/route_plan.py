@@ -289,6 +289,54 @@ def _normal_leg(raw, index):
             "intensity": intensity, "why": _text(raw.get("why"), name=f"legs[{index}].why")}
 
 
+def _question_id(original, row, used) -> str:
+    """A `_SLUG` id for an approval question the brief wrote in some other shape: lower-cased, runs of
+    other characters become `-`, a leading digit gets `q-`, 32 characters at most, `<key>-leg<leg>` when
+    nothing is left (e.g. a Korean id), and `-2`, `-3`... when the proposal already used it
+    (an id that is already a slug is kept as written, even when two rows share it)."""
+    base = re.sub(r"[^a-z0-9]+", "-", original.lower()).strip("-")
+    if base and base[0].isdigit():
+        base = "q-" + base
+    base = base[:32].rstrip("-") or f"{row['key']}-leg{row['leg']}"
+    candidate, count = base, 1
+    while candidate in used:
+        count += 1
+        suffix = f"-{count}"
+        candidate = base[:32 - len(suffix)].rstrip("-") + suffix
+    return candidate
+
+
+def _approval_rows(approvals, leg_count) -> tuple:
+    """`(rows, renames)` of a proposal's `entry_approvals`. A string `question` that is not a slug is
+    normalized, never rejected; `renames` is `[{leg, key, question, original}]` for those rows."""
+    rows, renames = [], []
+    used = {raw["question"] for raw in approvals
+            if isinstance(raw, dict) and isinstance(raw.get("question"), str) and _SLUG.fullmatch(raw["question"])}
+    for raw in approvals:
+        if (not isinstance(raw, dict) or set(raw) != {"key", "leg", "question"}
+                or raw["key"] not in APPROVAL_KEYS or isinstance(raw["leg"], bool)
+                or not isinstance(raw["leg"], int) or not 0 <= raw["leg"] < leg_count
+                or not isinstance(raw["question"], str)):
+            raise ProposalError("schema-invalid:entry_approvals")
+        row = {"key": raw["key"], "leg": raw["leg"], "question": raw["question"]}
+        if not _SLUG.fullmatch(raw["question"]):
+            row["question"] = _question_id(raw["question"], row, used)
+            used.add(row["question"])
+            renames.append({**row, "original": raw["question"]})
+        rows.append(row)
+    return rows, renames
+
+
+def question_renames(source) -> list:
+    """The approval question ids `parse_proposal_with_source` normalized in a brief's proposal block
+    (`[{leg, key, question, original}]`, display only); `[]` when none or the block does not parse."""
+    try:
+        body = next(iter(_load_yaml(source).values()))
+        return _approval_rows(body.get("entry_approvals") or [], len(body["legs"]))[1]
+    except (ProposalError, AttributeError, KeyError, TypeError, StopIteration):
+        return []
+
+
 def parse_proposal(text: str) -> dict:
     """The one `route_proposal_v1` of a brief's section 8, normalized; ProposalError when none."""
     return parse_proposal_with_source(text)[0]
@@ -317,14 +365,7 @@ def parse_proposal_with_source(text: str) -> tuple:
     approvals = body.get("entry_approvals") or []
     if not isinstance(approvals, list) or len(approvals) > MAX_APPROVALS:
         raise ProposalError("schema-invalid:entry_approvals")
-    rows = []
-    for raw in approvals:
-        if (not isinstance(raw, dict) or set(raw) != {"key", "leg", "question"}
-                or raw["key"] not in APPROVAL_KEYS or isinstance(raw["leg"], bool)
-                or not isinstance(raw["leg"], int) or not 0 <= raw["leg"] < len(legs)
-                or not isinstance(raw["question"], str) or not _SLUG.fullmatch(raw["question"])):
-            raise ProposalError("schema-invalid:entry_approvals")
-        rows.append({"key": raw["key"], "leg": raw["leg"], "question": raw["question"]})
+    rows = _approval_rows(approvals, len(legs))[0]
     return ({"summary": _text(body.get("summary"), name="summary", required=True),
              "legs": [_normal_leg(raw, index) for index, raw in enumerate(legs)],
              "entry_approvals": rows, "execution_scope": scope}, source)

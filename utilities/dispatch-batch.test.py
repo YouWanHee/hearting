@@ -29,6 +29,7 @@ from dispatch_contract import (
     process_launch_identity,
     validate_dispatch_log_dir,
 )
+import dispatch_lifecycle as BATCH_LIFECYCLE  # noqa: E402
 
 
 class BatchLogDirAdmissionTest(unittest.TestCase):
@@ -4149,6 +4150,141 @@ class PlainSlotReservationTest(unittest.TestCase):
                 [sys.executable, str(self.GOVERNOR), "--root", td, "status"],
                 text=True, capture_output=True, check=True).stdout)
             self.assertEqual(status["reservations"], {})
+
+
+class SelfParentAndForegroundNoticeTest(unittest.TestCase):
+    """A mismatched --parent becomes the session's own name with one notice.
+
+    5th Codex run: `gate-off parent-identity-mismatch` read as an error, and
+    with gates on it refused. Both batch entry points now use
+    AGENT_DISPATCH_SELF_SLUG; a missing session name keeps its refusal.
+    """
+
+    # The group fixture only, not DispatchBatchTest's own tests.
+    setUp = DispatchBatchTest.setUp
+    argv = DispatchBatchTest.argv
+    common_patches = DispatchBatchTest.common_patches
+
+    NOTICE = ("notice: --parent wrong-owner is not this session's name; "
+              "using owner (from AGENT_DISPATCH_SELF_SLUG).")
+
+    def run_main(self, *, parent="wrong-owner", gates="on", lifecycle=None, self_slug="owner"):
+        stack, assignments = self.common_patches()
+        out, err = io.StringIO(), io.StringIO()
+        seen = {}
+
+        def parent_lookup(jobs, **kwargs):
+            seen.update(kwargs)
+            raise DispatchContractError("parent-attempt-not-found", "fixture stop")
+
+        argv = self.argv()
+        argv[argv.index("--parent") + 1] = parent
+        environment = {
+            "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture", "HEARTING_GATES": gates,
+            "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+            "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+        }
+        if self_slug:
+            environment["AGENT_DISPATCH_SELF_SLUG"] = self_slug
+        with stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
+            stack.enter_context(mock.patch.object(BATCH, "assign_harnesses", return_value=(
+                assignments, "cross-harness", {"families_considered": [], "usable_families": [],
+                                               "family_exclusions": {}, "capacity": {},
+                                               "degradation_cause": ""})))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(
+                BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt", side_effect=parent_lookup))
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            stack.enter_context(mock.patch.object(
+                BATCH, "select_launch_lifecycle", return_value=lifecycle or BATCH_LIFECYCLE.DETACHED))
+            popen = stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+            stack.enter_context(mock.patch.dict(os.environ, environment))
+            if not self_slug:
+                os.environ.pop("AGENT_DISPATCH_SELF_SLUG", None)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = BATCH.main(argv)
+        popen.assert_not_called()
+        return rc, json.loads(out.getvalue()), err.getvalue(), seen
+
+    def test_group_start_uses_the_session_name_whatever_the_gates(self):
+        for gates in ("on", "off"):
+            with self.subTest(gates=gates):
+                rc, receipt, err, seen = self.run_main(gates=gates)
+                # the fixture stops at the live-parent lookup, after the parent is fixed
+                self.assertEqual(receipt["reason"], "parent-attempt-not-found", receipt)
+                self.assertEqual(seen["parent_slug"], "owner")
+                self.assertEqual(err.splitlines().count(self.NOTICE), 1, err)
+                self.assertNotIn("gate-off", err)
+                self.assertNotIn("parent-identity-mismatch", json.dumps(receipt) + err)
+
+    def test_group_start_without_a_session_name_keeps_its_refusal(self):
+        rc, receipt, err, seen = self.run_main(self_slug=None)
+        self.assertEqual(receipt["reason"], "parent-identity-mismatch")
+        self.assertEqual(seen, {})
+        self.assertNotIn("notice: --parent", err)
+
+    def test_matching_parent_prints_no_notice(self):
+        _rc, _receipt, err, seen = self.run_main(parent="owner")
+        self.assertEqual(seen["parent_slug"], "owner")
+        self.assertNotIn("notice:", err)
+
+    def test_foreground_start_prints_its_notice_first_then_the_parent_notice(self):
+        _rc, _receipt, err, _seen = self.run_main(lifecycle=BATCH_LIFECYCLE.FOREGROUND_SCOPED)
+        self.assertEqual(err.splitlines()[:2], [BATCH_LIFECYCLE.FOREGROUND_NOTICE, self.NOTICE])
+
+    def test_dry_run_prints_no_foreground_notice(self):
+        argv = self.argv("dry-run")
+        err = io.StringIO()
+        with mock.patch.object(BATCH, "select_launch_lifecycle", return_value=BATCH_LIFECYCLE.FOREGROUND_SCOPED), \
+             mock.patch.object(BATCH, "load_route", side_effect=BATCH.BatchError("route-record-invalid", "fixture")), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            BATCH.main(argv)
+        self.assertNotIn(BATCH_LIFECYCLE.FOREGROUND_NOTICE, err.getvalue())
+
+    def run_subdivision(self, *, gates, self_slug="owner"):
+        admission = BATCH.SUBDIVISION_ADMISSION
+        args = SimpleNamespace(route=self.route_path, parallel_group="execute", jobs=self.jobs,
+                               action="start", parent="wrong-owner", slug_prefix="pe",
+                               subdivision_manifest=self.base / "manifest.json", slices=None)
+        named = []
+        out, err = io.StringIO(), io.StringIO()
+        environment = {"AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture", "HEARTING_GATES": gates}
+        if self_slug:
+            environment["AGENT_DISPATCH_SELF_SLUG"] = self_slug
+        with mock.patch.object(admission, "route_node", return_value={"id": "execute"}), \
+             mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base), \
+             mock.patch.object(BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)), \
+             mock.patch.object(admission, "raise_if_parallel_entry_fail_closed"), \
+             mock.patch.object(admission, "admit_batch",
+                               side_effect=admission.SubdivisionAdmissionError("fixture-stop")), \
+             mock.patch.object(admission, "single_session_next_action",
+                               side_effect=lambda route, node, slug, parent: named.append(parent) or "next"), \
+             mock.patch.dict(os.environ, environment), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            if not self_slug:
+                os.environ.pop("AGENT_DISPATCH_SELF_SLUG", None)
+            try:
+                rc = BATCH._run_subdivision_batch_admission(args, {"route_id": "rt-fixture"})
+            except BATCH.BatchError as exc:
+                return exc.reason, args, named, err.getvalue()
+        return rc, args, named, err.getvalue()
+
+    def test_subdivision_admission_uses_the_session_name_whatever_the_gates(self):
+        for gates in ("on", "off"):
+            with self.subTest(gates=gates):
+                rc, args, named, err = self.run_subdivision(gates=gates)
+                self.assertEqual(rc, 0)
+                self.assertEqual(args.parent, "owner")
+                self.assertEqual(named, ["owner"])
+                self.assertEqual(err.splitlines().count(self.NOTICE), 1, err)
+                self.assertNotIn("gate-off", err)
+
+    def test_subdivision_admission_without_a_session_name_keeps_its_refusal(self):
+        reason, args, named, err = self.run_subdivision(gates="on", self_slug=None)
+        self.assertEqual(reason, "parent-identity-mismatch")
+        self.assertEqual(named, [])
 
 
 if __name__ == "__main__":

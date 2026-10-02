@@ -726,7 +726,9 @@ def _proposal_review(route, path, jobs):
             **{key: row[key] for key in ("node", "proposal", "reason", "brief_path", "sha256")},
             "display": RP.none_text(row["reason"]) if row["proposal"] is None else "proposal",
             "legs": (row.get("facts") or {}).get("legs", []),
-            "start_approvals": _grouped_approvals(row)} for row in rows],
+            "start_approvals": _grouped_approvals(row),
+            **({"question_renames": renames} if (renames := RP.question_renames(row.get("source") or "")) else {})}
+           for row in rows],
         "equal": RP.proposals_equal(rows),
         "wording_differs": RP.wording_differs(rows),
         "frame_downgrade": _frame_downgrade_summary(route, jobs),
@@ -1362,7 +1364,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                 step = {**step, "route_proposal_review": _proposal_review(route, path, jobs),
                         "next_step": step.get("next_step", "") + " route_proposal_review holds each brief's validated route "
                             "proposal (or proposal:none(reason)), whether the two are equal, and the start-approval parts "
-                            "in scope. Write one route question and map its option labels to proposals in "
+                            "in scope (question_renames, when present, lists approval question ids converted to ASCII; use the "
+                            "id shown). Write one route question and map its option labels to proposals in "
                             "route_proposals {question, by_option}; put each start-approval question beside it "
                             "(mark its approving option \"approves\": true). Do not invent a route no brief proposed."}
             result.update(frame_interview=step, gate="frame-review", task=request["text"])

@@ -459,9 +459,15 @@ FOREGROUND_OUTCOME_KEYS = (
     "foreground_outcome_source",
 )
 FOREGROUND_OUTCOME_SOURCE = "wait-foreground-v1"
+# `interrupted`: the wrapper itself received SIGINT/SIGTERM/SIGHUP and tore the
+# worker down (its caller stopped). A worker that died of a signal on its own
+# stays `signal-N`.
 FOREGROUND_FAILURES = frozenset({
     "none", "timeout", "parent-terminated", "process-identity-unavailable",
+    "interrupted",
 })
+# The fixed failure words; `exit-N`/`signal-N` are validated separately.
+_FOREGROUND_FIXED_FAILURES = FOREGROUND_FAILURES - {"none"}
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
 _CAPACITY_TERMINAL_RE = re.compile(
     r"(?:error\s*[:\-]\s*)?(?:selected\s+)?model(?:\s+[A-Za-z0-9._:/-]+)?\s+"
@@ -2440,6 +2446,12 @@ def observer_namespace_extinct(metadata: dict[str, str]) -> str:
         or metadata.get("registered_worker") != "1"
     ):
         return "unverifiable"
+    return _recorded_pid_namespace_state(recorded_observer)
+
+
+def _recorded_pid_namespace_state(recorded: str) -> str:
+    """``observer_namespace_extinct``'s host walk for one recorded ``pid:[inode]`` value."""
+
     try:
         current = os.readlink("/proc/self/ns/pid")
     except OSError:
@@ -2448,7 +2460,7 @@ def observer_namespace_extinct(metadata: dict[str, str]) -> str:
         return "unverifiable"
     if not _current_observer_is_host_like():
         return "unverifiable"
-    if current == recorded_observer:
+    if current == recorded:
         return "present"
     try:
         proc_entries = os.listdir("/proc")
@@ -2470,8 +2482,51 @@ def observer_namespace_extinct(metadata: dict[str, str]) -> str:
                     and _procfs_root_namespace_member(Path(f"/proc/{entry}/status"), int(entry))):
                 continue
             return "unverifiable"
-        if candidate == recorded_observer:
+        if candidate == recorded:
             return "present"
+    return "extinct"
+
+
+NAMESPACE_EXTINCT_REASON = "namespace-extinct"
+_PID_NAMESPACE_LINK = re.compile(r"pid:\[[0-9]+\]\Z")
+
+
+def namespace_gone(metadata: dict[str, str]) -> str:
+    """Whether every PID namespace this row recorded has left the host.
+
+    Both the launch observer's namespace (``pid_observer_ns``, where the wrapper
+    ran) and the worker's (``pid_ns``) are checked with the
+    ``observer_namespace_extinct`` rule: a host-like observer, a complete walk,
+    and a value match that answers ``present`` even for a recycled inode. Any
+    ``present`` wins, then any ``unverifiable``; only all-``extinct`` is
+    ``extinct``. A process can never move to an ancestor PID namespace, so once
+    the namespace that launched the attempt is gone, nothing it started can be
+    running anywhere -- which is why a sandbox that died with its caller (the
+    5th Codex run) is an exact death and not a guess. A sandboxed observer
+    cannot see sibling namespaces and always answers ``unverifiable``; the host
+    runtime decides those rows. A recorded value that is not a kernel
+    ``pid:[<inode>]`` link was never observed and proves nothing.
+    """
+
+    recorded_observer = metadata.get("pid_observer_ns", "")
+    if (
+        not recorded_observer
+        or metadata.get("pid_scope") != "namespace-local"
+        or metadata.get("registered_worker") != "1"
+    ):
+        return "unverifiable"
+    recorded_values = tuple(
+        value
+        for value in dict.fromkeys((recorded_observer, metadata.get("pid_ns", "")))
+        if value
+    )
+    if any(_PID_NAMESPACE_LINK.fullmatch(value) is None for value in recorded_values):
+        return "unverifiable"
+    states = [_recorded_pid_namespace_state(recorded) for recorded in recorded_values]
+    if "present" in states:
+        return "present"
+    if "unverifiable" in states:
+        return "unverifiable"
     return "extinct"
 
 
@@ -2947,8 +3002,23 @@ def process_table_scan_scope():
         _PROCESS_TABLE_SCAN.reset(token)
 
 
+def _tag_scan_authority(metadata: dict[str, str], host_complete: bool) -> bool:
+    """Who may read an empty tag scan as absence.
+
+    ``host_complete`` is the extinct-namespace question only: a host-like
+    observer walks every PID namespace on the machine, so finding no tag there
+    is absence wherever the processes went. Every other caller keeps the
+    recording-namespace rule of ``attempt_scan_namespace_authority``.
+    """
+
+    if host_complete:
+        return _current_observer_is_host_like()
+    return attempt_scan_namespace_authority(metadata)
+
+
 def _tagged_descendants_from_scan(
-    scan: ProcessTableScan, metadata: dict[str, str], attempt_id: str
+    scan: ProcessTableScan, metadata: dict[str, str], attempt_id: str,
+    *, host_complete: bool = False,
 ) -> ProcessGroupObservation:
     if scan.error:
         return ProcessGroupObservation("unverifiable", reason=scan.error)
@@ -2961,7 +3031,7 @@ def _tagged_descendants_from_scan(
         return ProcessGroupObservation("populated", ordered, scan.incomplete_reason)
     if scan.incomplete_reason:
         return ProcessGroupObservation("unverifiable", (), scan.incomplete_reason)
-    if not attempt_scan_namespace_authority(metadata):
+    if not _tag_scan_authority(metadata, host_complete):
         return ProcessGroupObservation(
             "unverifiable", (), "observer-namespace-mismatch"
         )
@@ -2983,7 +3053,9 @@ def _process_group_from_scan(scan: ProcessTableScan, pgid: int) -> ProcessGroupO
     return ProcessGroupObservation("empty", ordered)
 
 
-def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservation:
+def attempt_tagged_descendants(
+    metadata: dict[str, str], *, host_complete: bool = False
+) -> ProcessGroupObservation:
     """Find live processes still tagged with this attempt, whatever group they left.
 
     The recorded leader and process group are the only things SD-79's quiescent
@@ -2996,7 +3068,10 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     from anywhere else the tagged processes may simply be invisible, so that
     case is ``unverifiable`` rather than a false death. Another uid's process is
     never one of this harness's workers, so an unreadable ``environ`` is skipped
-    instead of poisoning the scan.
+    instead of poisoning the scan. ``host_complete`` is used only once the
+    recorded namespaces are extinct (`attempt_process_quiescence`): then a
+    complete walk by a host-like observer, which sees every namespace, is the
+    one that may answer ``empty``.
     """
 
     attempt_id = metadata.get("attempt_id", "")
@@ -3006,7 +3081,9 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     if scan is not None:
         # Batch observer pass (`process_table_scan_scope`): same verdict, one
         # walk shared by every attempt of the pass instead of one per call.
-        return _tagged_descendants_from_scan(scan, metadata, attempt_id)
+        return _tagged_descendants_from_scan(
+            scan, metadata, attempt_id, host_complete=host_complete
+        )
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
     # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
     # recorded parent leader (the owner's governed process) is an ancestor,
@@ -3052,7 +3129,7 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
         return ProcessGroupObservation("populated", ordered, incomplete_reason)
     if incomplete_reason:
         return ProcessGroupObservation("unverifiable", (), incomplete_reason)
-    if not attempt_scan_namespace_authority(metadata):
+    if not _tag_scan_authority(metadata, host_complete):
         return ProcessGroupObservation(
             "unverifiable", (), "observer-namespace-mismatch"
         )
@@ -3418,12 +3495,18 @@ def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False
         return {**result, "reason": "cleanup-terminal-result-required"}
     validate_attempt_metadata(metadata)
     process = attempt_process_quiescence(metadata, terminal_receipt=True)
-    if process.state == "quiescent":
+    # A namespace-extinct verdict is quiescent only from a host-like observer.
+    # Still seal the existing cleanup receipt when its proof holds, so a later
+    # sandboxed reader of this row sees the same settled state.
+    extinct = process.state == "quiescent" and process.reason == NAMESPACE_EXTINCT_REASON
+    if process.state == "quiescent" and not extinct:
         return {**result, "settled": True, "reason": process.reason}
     if process.state == "live":
         return {**result, "reason": process.reason}
     proof = prove_attempt_quiescence(metadata, max_wait_seconds=0, allow_namespace_extinct=True)
     if not proof.proven:
+        if extinct:
+            return {**result, "settled": True, "reason": process.reason}
         return {**result, "reason": process.reason,
                 "group_state": proof.process_group_state, "descendant_state": proof.descendant_state,
                 "namespace_authority": proof.namespace_authority}
@@ -3523,7 +3606,8 @@ def attempt_process_quiescence(
     negative can turn into a duplicate launch, and it is also the rare one, so
     the ``/proc`` scan runs only at the moment quiescence is about to be
     declared and never on a hot path. ``live`` and ``unverifiable`` keep their
-    previous meaning to the letter.
+    previous meaning to the letter, with one exception: a receiptless row whose
+    recorded namespaces are extinct on the host (`_namespace_extinct_quiescence`).
     """
 
     # A terminal namespace-local row can become visible before its wrapper has
@@ -3559,6 +3643,11 @@ def attempt_process_quiescence(
         return ProcessQuiescence(
             "live", "attempt-descendant-live", probe.members[0][0]
         )
+    extinct = _namespace_extinct_quiescence(metadata, result)
+    if extinct is not None:
+        # Nobody is left to publish a namespace-local receipt: the wrapper
+        # died with the namespace. The receipt gate below never applies here.
+        return extinct
     if (
         terminal_receipt
         and metadata.get("registered_worker") == "1"
@@ -3586,6 +3675,36 @@ def attempt_process_quiescence(
             return result
         return ProcessQuiescence("unverifiable", "attempt-descendant-unverifiable")
     return result
+
+
+def _namespace_extinct_quiescence(
+    metadata: dict[str, str], governed: ProcessQuiescence
+) -> ProcessQuiescence | None:
+    """Exact death of a row whose recorded namespaces have left the host.
+
+    Only one branch is widened: a row with no authoritative PID and no receipt
+    (``process-namespace-unverifiable``). It becomes ``quiescent`` when both
+    recorded namespaces are extinct (`namespace_gone`) *and* a host-like
+    observer's complete walk finds no process carrying the attempt tag; a
+    tagged process found anywhere is ``live``. Any other answer -- a namespace
+    still present, a sandboxed observer, an incomplete walk -- returns ``None``
+    and the caller keeps its previous verdict to the letter.
+    """
+
+    if (
+        governed.state != "unverifiable"
+        or governed.reason != "process-namespace-unverifiable"
+        or namespace_gone(metadata) != "extinct"
+    ):
+        return None
+    probe = attempt_tagged_descendants(metadata, host_complete=True)
+    if probe.state == "populated":
+        return ProcessQuiescence(
+            "live", "attempt-descendant-live", probe.members[0][0]
+        )
+    if probe.state == "empty":
+        return ProcessQuiescence("quiescent", NAMESPACE_EXTINCT_REASON)
+    return None
 
 
 def attempt_governed_process_quiescence(
@@ -7980,7 +8099,7 @@ def _foreground_outcome_values_from_pipe(pipe: str) -> dict[str, str] | None:
     failure = found["foreground_process_failure"]
     if failure == "none":
         pass
-    elif failure in {"timeout", "parent-terminated", "process-identity-unavailable"}:
+    elif failure in _FOREGROUND_FIXED_FAILURES:
         pass
     else:
         match = _FOREGROUND_FAILURE_SUFFIX.fullmatch(failure)
@@ -8011,7 +8130,7 @@ def _foreground_outcome_values(
     storage_failure = "none" if failure == "" else failure
     if storage_failure == "none":
         pass
-    elif storage_failure in {"timeout", "parent-terminated", "process-identity-unavailable"}:
+    elif storage_failure in _FOREGROUND_FIXED_FAILURES:
         pass
     elif _FOREGROUND_FAILURE_SUFFIX.fullmatch(storage_failure) is None:
         raise DispatchContractError("foreground-outcome-malformed", "foreground_process_failure")
@@ -9752,22 +9871,48 @@ def attempt_launch_state(
         return "preview-only"
     if claimed:
         return "claimed"
+    return existing_attempt_launch_state(jobs, attempt_id)[0]
+
+
+def existing_attempt_launch_state(jobs: Path, attempt_id: str) -> tuple[str, str]:
+    """``(state, reason)`` for an attempt whose launch was claimed before this call.
+
+    An open row is not proof of a running worker: its launcher can be stopped
+    with the worker (5th Codex run), leaving the row open. The shared verdict
+    decides -- ``live`` is ``existing-active``, ``quiescent`` is
+    ``existing-dead``, anything this observer cannot see (or an observation
+    error) is ``existing-unverified``. A closed row is ``existing-completed``
+    and a missing one ``existing-unknown``. Read-only; never raises.
+    """
     try:
-        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return "existing-unknown"
-    states = []
+        return "existing-unknown", "registry-unreadable"
+    seen = False
+    open_metadata: dict[str, str] | None = None
     for line in lines:
         fields = line.split("\t")
         if len(fields) != 6:
             continue
-        if parse_registry_metadata(fields[5]).get("attempt_id") == attempt_id:
-            states.append(fields[1])
-    if any(state in {"open", "running"} for state in states):
-        return "existing-active"
-    if states:
-        return "existing-completed"
-    return "existing-unknown"
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") != attempt_id:
+            continue
+        seen = True
+        if fields[1] in {"open", "running"}:
+            open_metadata = metadata
+    if open_metadata is None:
+        if seen:
+            return "existing-completed", "attempt-closed"
+        return "existing-unknown", "attempt-row-missing"
+    try:
+        process = attempt_process_quiescence(open_metadata)
+    except Exception:  # noqa: BLE001 -- a launch receipt must not fail on observation
+        return "existing-unverified", "process-observation-failed"
+    if process.state == "live":
+        return "existing-active", process.reason or "process-live"
+    if process.state == "quiescent":
+        return "existing-dead", process.reason or "process-gone"
+    return "existing-unverified", process.reason or "process-unverifiable"
 
 
 def resolve_terminal_conflict(

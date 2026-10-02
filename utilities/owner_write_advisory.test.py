@@ -67,7 +67,10 @@ class OwnerWriteAdvisoryTest(unittest.TestCase):
 
     def test_primary_linked_readonly_and_direct(self):
         before = self.snapshot()
-        self.assertIn(".git는 보호", A.advisories(self.route)[0]["message"])
+        message = A.advisories(self.route)[0]["message"]
+        self.assertIn("커밋에 필요한 부분만 쓰기", message)
+        self.assertIn("config·hooks는 읽기 전용", message)
+        self.assertIn("지원하지 않으면 기존처럼 .git 전체가 보호", message)
         self.route["cwd"] = str(self.linked)
         row = A.advisories(self.route)[0]
         self.assertEqual(row["git_topology"], "linked")

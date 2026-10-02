@@ -56,7 +56,8 @@ def advisories(route, *, owner_harness=None, sandbox=None, git_writable_roots=()
         message = prefix + ("현재 workspace-write는" if applied else "workspace-write는")
         message += " source 편집을 허용해도 Git 메타데이터와 workspace 밖 경로는 별도 제약을 받습니다."
         if topology == "primary":
-            message += " primary checkout의 .git는 보호 대상입니다."
+            message += (" primary checkout의 .git는 커밋에 필요한 부분만 쓰기가 허용되고 config·hooks는 읽기 전용입니다."
+                        " 이 Codex가 named permission profile을 지원하지 않으면 기존처럼 .git 전체가 보호됩니다.")
         elif topology == "linked":
             message += " linked worktree owner에는 기존의 좁은 Git 메타데이터 grant가 있으며 common .git 전체 권한은 아닙니다."
         else:

@@ -92,5 +92,29 @@ class PolicyCompletionDeferredIsNotFallbackTest(unittest.TestCase):
         )
 
 
+
+class ExactDeathAndInterruptionTest(unittest.TestCase):
+    """5th Codex run outcomes, read by the one committed-outcome policy."""
+
+    def test_an_extinct_namespace_row_reconciles_open_and_falls_back_closed(self):
+        self.assertEqual(POLICY.decide_attempt(
+            "open", {}, process_state="quiescent", process_reason="namespace-extinct",
+        ).action, "reconcile")
+        closed = {"note": "dead-namespace-absent", "failure_class": "runtime"}
+        decision = POLICY.decide_attempt("done", closed, process_state="quiescent",
+                                         process_reason="namespace-extinct")
+        self.assertEqual((decision.outcome, decision.action, decision.retry_kind),
+                         ("failed", "inspect-failure", "fallback"))
+
+    def test_an_interrupted_foreground_worker_is_an_ordinary_failure(self):
+        # B2: the wrapper closes `dead-interrupted` with failure_class=runtime.
+        closed = {"note": "dead-interrupted", "failure_class": "runtime",
+                  "reconcile_reason": "interrupted"}
+        self.assertEqual(POLICY.committed_outcome("done", closed), "failed")
+        decision = POLICY.decide_attempt("done", closed, process_state="quiescent")
+        self.assertEqual((decision.action, decision.reason, decision.retry_kind),
+                         ("inspect-failure", "dead-interrupted", "fallback"))
+
+
 if __name__ == "__main__":
     unittest.main()

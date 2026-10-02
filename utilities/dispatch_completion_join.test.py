@@ -274,15 +274,20 @@ class DispatchCompletionJoinTest(unittest.TestCase):
             self.skipTest("host procfs cannot prove foreign namespace extinction: " + proof.reason)
         return metadata
 
-    def test_host_join_settles_extinct_foreign_namespace_without_silent_retry(self):
+    def test_host_join_closes_extinct_foreign_namespace_as_exact_death_without_retry(self):
+        # A namespace that left the host is an exact death (5th Codex run):
+        # the join's exact-dead reconcile closes it directly, with the cleanup
+        # proof sealed, instead of the receipt-unavailable cancellation. The
+        # join itself still launches nothing.
         metadata = self.extinct_foreign_namespace_metadata()
         self.jobs.write_text(row("open","att-extinct-stage","att-parent","foreign",process_metadata=metadata))
         receipt=JOIN.join_batch(jobs=self.jobs,parent_attempt_id="att-parent",
                                 timeout=10,interval=0.01,recover_receiptless=True)
         self.assertEqual(receipt["state"],"ready",receipt)
         saved=JOIN.current_attempt_row(self.jobs,"att-extinct-stage")
-        self.assertEqual(saved.metadata["note"],"cancelled-receipt-unavailable")
-        self.assertIn("cancellation_quiescence_receipt",saved.metadata)
+        self.assertEqual(saved.metadata["note"],"dead-namespace-absent")
+        self.assertIn("cleanup_receipt_digest",saved.metadata)
+        self.assertNotIn("cancellation_quiescence_receipt",saved.metadata)
         self.assertEqual(len(self.jobs.read_text().splitlines()),1)
 
     def test_closed_foreign_namespace_settles_across_operational_surfaces(self):
@@ -311,7 +316,14 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                 self.assertEqual(saved.status, "done")
                 self.assertEqual(saved.metadata["note"], "dead-worker-silent-exit")
                 self.assertEqual(saved.metadata["failure_class"], "contract")
-                self.assertIn("cleanup_receipt_digest", saved.metadata)
+                # A host observer now reads the extinct namespace itself as
+                # quiescent, so join and attempt-ready are settled without a
+                # recovery round; reconcile still seals the cleanup proof.
+                self.assertEqual(
+                    D.attempt_process_quiescence(saved.metadata, terminal_receipt=True).state,
+                    "quiescent")
+                if surface == "reconcile":
+                    self.assertIn("cleanup_receipt_digest", saved.metadata)
                 self.assertNotIn("cancellation_quiescence_receipt", saved.metadata)
                 result = subprocess.run(
                     [sys.executable, str(HERE / "dispatch-attempt-ready.py"),

@@ -1309,5 +1309,96 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self._value(calls[-1], "--worktree"), "/tmp/fixture-worktree")
 
+
+class ForegroundLaunchTest(unittest.TestCase):
+    """A foreground-scoped start hosts the worker inside this call.
+
+    The wrapper gets the caller's stop request and this call waits for it to
+    stop the worker and close the row (5th Codex run: the launcher killed the
+    wrapper mid-cleanup and the row stayed open).
+    """
+
+    def forwarded(self, **result):
+        L = sys.modules["dispatch_lifecycle"]
+        return L.ForwardedRun(**{"returncode": 0, "stdout": None, "stderr": None, **result})
+
+    def test_lifecycle_is_the_explicit_adapter_argument_or_this_scope(self):
+        with mock.patch.object(N, "select_launch_lifecycle", return_value="foreground-scoped") as select:
+            self.assertEqual(N.requested_launch_lifecycle(["--", "--launch-lifecycle", "detached"]), "detached")
+            self.assertEqual(N.requested_launch_lifecycle(["--launch-lifecycle=detached"]), "detached")
+            select.assert_not_called()
+            self.assertEqual(N.requested_launch_lifecycle(["--", "--log-dir", "/tmp/x"]), "foreground-scoped")
+
+    def test_foreground_start_forwards_and_reports_a_stop(self):
+        import contextlib, io, signal
+        calls = []
+
+        def forward(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return self.forwarded(received_signal=signal.SIGINT, cleanup_incomplete=True, returncode=-9)
+
+        out = io.StringIO()
+        with mock.patch.object(N, "run_forwarding_termination", side_effect=forward), \
+             mock.patch.object(N.subprocess, "run", side_effect=AssertionError("plain run")), \
+             mock.patch.dict(N.os.environ, {"AGENT_OWNER_ROUTE_FILE": "/tmp/owner.json"}), \
+             contextlib.redirect_stdout(out):
+            code = N.run_launcher(["wrapper", "--start"], "start", "foreground-scoped")
+        self.assertEqual(code, 128 + signal.SIGINT)
+        self.assertEqual(out.getvalue().splitlines(), ["interrupted=1", "cleanup=incomplete"])
+        argv, kwargs = calls[0]
+        self.assertEqual(argv, ["wrapper", "--start"])
+        self.assertEqual((kwargs["capture"], kwargs["timeout"]), (False, None))
+        self.assertNotIn("AGENT_OWNER_ROUTE_FILE", kwargs["env"])
+
+    def test_foreground_start_without_a_stop_returns_the_wrapper_exit(self):
+        import contextlib, io
+        out = io.StringIO()
+        with mock.patch.object(N, "run_forwarding_termination", return_value=self.forwarded(returncode=7)), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(N.run_launcher(["wrapper"], "start", "foreground-scoped"), 7)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_other_launches_keep_the_plain_run(self):
+        for action, lifecycle in (("start", "detached"), ("dry-run", "foreground-scoped"),
+                                  ("register", "foreground-scoped")):
+            with self.subTest(action=action, lifecycle=lifecycle), \
+                 mock.patch.object(N, "run_forwarding_termination", side_effect=AssertionError("forwarded")), \
+                 mock.patch.object(N.subprocess, "run", return_value=mock.Mock(returncode=3)) as run:
+                self.assertEqual(N.run_launcher(["wrapper"], action, lifecycle), 3)
+                run.assert_called_once()
+
+    def test_main_prints_the_foreground_notice_first_on_a_start_only(self):
+        import contextlib, io
+        node = make_node(depth=1, dispatch_fallback=[])
+        route = make_route(node, tuples=[])
+        L = sys.modules["dispatch_lifecycle"]
+        for action, expected in (("start", True), ("dry-run", False)):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as td:
+                route_path = Path(td) / "route.json"
+                route_path.write_text(json.dumps(route))
+                argv = ["dispatch-node.py", "--route", str(route_path), "--node", "execute",
+                        "--adapter", "claude", "--slug", "fg", "--action", action]
+                launched = []
+                err = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), \
+                     mock.patch.dict(N.os.environ, fixture_state_environ(td), clear=True), \
+                     mock.patch.object(N, "select_launch_lifecycle", return_value="foreground-scoped"), \
+                     mock.patch.object(N.subprocess, "run", side_effect=lambda cmd, **kw: (
+                         launched.append(("run", cmd)) or mock.Mock(returncode=0))), \
+                     mock.patch.object(N, "run_forwarding_termination", side_effect=lambda cmd, **kw: (
+                         launched.append(("forwarded", cmd)) or self.forwarded())), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit):
+                        N.main()
+                lines = err.getvalue().splitlines()
+                if expected:
+                    self.assertEqual(lines[0], L.FOREGROUND_NOTICE)
+                    self.assertEqual(launched[-1][0], "forwarded")
+                    self.assertTrue(str(launched[-1][1][1]).endswith("adapters/claude/bin/dispatch-headless.py"))
+                else:
+                    self.assertNotIn(L.FOREGROUND_NOTICE, lines)
+                    self.assertEqual(launched[-1][0], "run")
+
+
 if __name__ == "__main__":
     unittest.main()

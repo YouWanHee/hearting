@@ -125,9 +125,9 @@ created: {YYYY-MM-DD}
    dispatching depth-0 session turns this list into the frame interview (SD-129).
    When the route you propose in section 8 contains a part whose catalogue row
    carries `start_approval`, add one yes/no question asking whether those steps
-   may start now: give it a short slug id (the same id as `entry_approvals.question`
-   in section 8), say in plain words which steps it would start, and recommend
-   an answer.
+   may start now: give it a short ASCII slug id (a-z, 0-9, -; a non-ASCII id is converted
+   automatically; the same id as `entry_approvals.question` in section 8), say
+   in plain words which steps it would start, and recommend an answer.
 8. **Route proposal** ("경로 조립 제안"): exactly one fenced `yaml` block holding
    one `route_proposal_v1`, the smallest route that does the job. Pick only the
    parts and legs the work needs; do not choose a full preset out of habit. One

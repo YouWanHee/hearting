@@ -620,5 +620,49 @@ class NamespaceLocalDescendantEvidenceTest(unittest.TestCase):
         self.assertEqual((terminal["state"], terminal["source"]), ("dead", "namespace"))
 
 
+class NamespaceExtinctLadderTest(unittest.TestCase):
+    """5th Codex run: the launch seed is not life, and a gone namespace is death."""
+
+    evidence = NamespaceLocalDescendantEvidenceTest.evidence
+
+    def seed(self):
+        return {"attempt_id": "att-ghost", "route_id": "rt-ghost", "route_node": "execute",
+                "phase": "launch", "kind": "registry", "sequence": 1, "updated_at": 1000.0}
+
+    def test_launch_seed_alone_is_not_a_working_worker(self):
+        verdict = model.classify_attempt_evidence(
+            self.evidence(attempt_descendants="unverifiable", heartbeat=self.seed()), now=1060.0)
+        self.assertEqual((verdict["state"], verdict["source"]), ("unknown", "namespace"))
+
+    def test_worker_phase_heartbeat_still_works(self):
+        verdict = model.classify_attempt_evidence(
+            self.evidence(attempt_descendants="unverifiable"), now=1060.0)
+        self.assertEqual((verdict["state"], verdict["source"]), ("working", "heartbeat"))
+        self.assertEqual(verdict["rule"], "namespace-local attempt has a fresh worker heartbeat")
+
+    def test_extinct_namespace_is_dead_after_parent_and_before_heartbeat(self):
+        for heartbeat in (self.seed(), None, self.evidence()["heartbeat"]):
+            with self.subTest(phase=(heartbeat or {}).get("phase")):
+                verdict = model.classify_attempt_evidence(
+                    self.evidence(attempt_descendants="unverifiable", heartbeat=heartbeat,
+                                  namespace_extinct=True), now=1060.0)
+                self.assertEqual((verdict["state"], verdict["source"]), ("dead", "namespace"))
+                self.assertIn("namespaces no longer exist", verdict["rule"])
+        parent = model.classify_attempt_evidence(
+            self.evidence(attempt_descendants="unverifiable", namespace_extinct=True,
+                          parent_extinction={"state": "proven", "reason": "parent gone"}),
+            now=1060.0)
+        self.assertEqual((parent["state"], parent["source"]), ("dead", "parent"))
+
+    def test_extinct_flag_never_outranks_live_process_evidence(self):
+        for extra in ({"attempt_descendants": "populated"},
+                      {"pid": 437, "proc_start": "1", "pid_authoritative": True,
+                       "pid_alive": True, "proc_start_match": True}):
+            with self.subTest(extra=sorted(extra)):
+                verdict = model.classify_attempt_evidence(
+                    self.evidence(namespace_extinct=True, **extra), now=1060.0)
+                self.assertEqual(verdict["state"], "working")
+
+
 if __name__ == "__main__":
     unittest.main()
