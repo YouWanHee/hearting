@@ -24,7 +24,7 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not.
+Artifact root: `core/CONVENTIONS.md §5.1`.
 
 In a `standard+` `autopilot-code` stage cycle, `code-report` owns
 `final_report.md`, `analysis_project/code/`, and `pipeline_summary.md` (using the

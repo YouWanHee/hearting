@@ -34,7 +34,7 @@ Direct boundaries:
 
 Follow an explicit artifact or audience language when provided. Otherwise, write user-facing reports and cheatsheet prose in the conversation language according to `<agent-home>/roles/response-policy.md`. Preserve source quotations, code, paths, identifiers, and citation text when translation would reduce precision. Do not create a fixed language mirror unless the user or target workflow requests one.
 
-Resolve `<artifact-root>` by preferring `.agent_reports` and falling back to legacy `.claude_reports`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
+Resolve `<artifact-root>`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
 
 ## Arguments
 
