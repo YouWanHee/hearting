@@ -582,6 +582,38 @@ class GpuProgressLineRenderTest(unittest.TestCase):
         ])
         self.assertTrue(all(key in (None, "dim") for _text, key in rows[1]))
 
+    def test_epoch_leads_the_progress_line(self):
+        rows = render._gpu_process_rows(self.gpu(
+            {"line": self.TQDM, "age_s": 0, "epoch": {"n": "3", "of": 200}},
+            {"line": self.TQDM, "age_s": 0, "epoch": {"n": "2", "done": True}},
+            {"line": "Epoch(train) [3][100/1250] loss: 0.5", "age_s": 5,
+             "epoch": {"n": "1.25", "of": 3}}), "  ", 168)
+        text = [render._plain(row).strip() for row in rows]
+        self.assertEqual(text[1], "\u21b3 ep 3/200 \u00b7 TRAIN 76% 15135/20000 \u00b7 39:00 left "
+                                  "\u00b7 L_se=1.18e-02 L_loc=2.67e-03 \u00b7 0s ago")
+        self.assertTrue(text[3].startswith("\u21b3 ep 2 done \u00b7 TRAIN 76%"), text[3])
+        self.assertEqual(text[5], "\u21b3 ep 1.25/3 \u00b7 Epoch(train) [3][100/1250] loss: 0.5"
+                                  " \u00b7 5s ago")
+
+    def test_malformed_epoch_is_ignored(self):
+        for epoch in ({"n": 3}, {"n": "3; rm -rf"}, {"n": ""}, "ep 3", None, {"of": 5},
+                      {"n": "\x1b[31m3"}):
+            with self.subTest(epoch=epoch):
+                (_command, progress) = render._gpu_process_rows(
+                    self.gpu({"line": "step 9", "age_s": 1, "epoch": epoch}), "", 120)
+                self.assertEqual(render._plain(progress).strip(), "\u21b3 step 9 \u00b7 1s ago")
+        self.assertEqual(render._progress_epoch({"n": "4", "of": True}), "ep 4")
+        self.assertEqual(render._progress_epoch({"n": "4", "of": 0, "done": "yes"}), "ep 4")
+
+    def test_epoch_keeps_its_place_and_the_age_at_narrow_width(self):
+        for width in (60, 40):
+            (_command, progress) = render._gpu_process_rows(self.gpu(
+                {"line": self.TQDM, "age_s": 900, "epoch": {"n": "12", "of": 100}}), "    ", width)
+            text = render._plain(progress)
+            self.assertLessEqual(render._dw(text), width)
+            self.assertIn("ep 12/100 \u00b7 ", text)
+            self.assertTrue(text.endswith("stalled 15m"), text)
+
     def test_stock_tqdm_postfix_and_unknown_remaining_time(self):
         self.assertEqual(
             render._progress_body("eval: 100%|##########| 1.2k/1.2k "
