@@ -1,0 +1,1 @@
+../../../../tools/memory/mem_bootstrap_context.test.sh

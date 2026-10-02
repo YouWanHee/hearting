@@ -18,7 +18,7 @@ The single authority for resolving `$ARG` to a plan is [autopilot-code plan reso
 
 ## Model and QA policy
 
-Use one fast writer. The report synthesizes artifacts already checked by plan, code, and test review stages. Do not add another report-review loop or external adversary. `qa_level` is prompt context only and does not change the writer role.
+Use one deep editor. The report synthesizes artifacts already checked by plan, code, and test review stages. Do not add another report-review loop or external adversary. `qa_level` is prompt context only and does not change the writer role.
 
 ## Report Assembly — `editorial/report` unit
 

@@ -91,6 +91,60 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertEqual(module.ssh_prefix({"ssh_host": "example.invalid",
                                             "hostname": here}), [])
 
+    def test_self_discovery_accepts_short_name_and_name_lists(self):
+        # moving4's system hostname changed from `workstation` to
+        # `moving4.iip.lab`: an inventory that declares only the short name,
+        # or keeps several names, must still recognize the local machine.
+        module = load_module()
+        with mock.patch.object(module.socket, "gethostname",
+                               return_value="moving4.iip.lab"):
+            self.assertTrue(module.is_self({"ssh_host": "203.0.113.9",
+                                            "hostname": "moving4"}))
+            self.assertTrue(module.is_self({"ssh_host": "203.0.113.9",
+                                            "hostname": ["workstation",
+                                                         "moving4.iip.lab"]}))
+            self.assertTrue(module.is_self({"ssh_host": "203.0.113.9",
+                                            "hostname": ["workstation",
+                                                         "moving4"]}))
+            self.assertTrue(module.is_self({"ssh_host": "203.0.113.9",
+                                            "hostname": "MOVING4"}))
+            self.assertFalse(module.is_self({"ssh_host": "203.0.113.9",
+                                             "hostname": ["workstation",
+                                                          "cnn"]}))
+            self.assertFalse(module.is_self({"ssh_host": "203.0.113.9",
+                                             "hostname": "moving40"}))
+            self.assertFalse(module.is_self({"ssh_host": "203.0.113.9",
+                                             "hostname": [None, 7]}))
+        with mock.patch.object(module.socket, "gethostname",
+                               return_value="moving4"):
+            self.assertTrue(module.is_self({"ssh_host": "203.0.113.9",
+                                            "hostname": "moving4.iip.lab"}))
+
+    def test_static_listing_marks_short_and_listed_names_as_self(self):
+        import socket
+        short = socket.gethostname().split(".")[0]
+        self.config.write_text(
+            "schema_version: 1\n"
+            f"run_root: {self.run_root}\n"
+            "hosts:\n"
+            "  short:\n"
+            f"    hostname: {short}\n"
+            "    ssh_host: 203.0.113.9\n"
+            "  listed:\n"
+            f"    hostname: [stale-name, {short}]\n"
+            "    ssh_host: 203.0.113.10\n"
+            "  remote:\n"
+            "    hostname: somewhere-else.invalid\n"
+            "    ssh_host: 203.0.113.11\n",
+            encoding="utf-8")
+        result = self.run_tool("list", "--static", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        by_host = {row["host"]: row
+                   for row in json.loads(result.stdout)["hosts"]}
+        self.assertTrue(by_host["short"]["self"])
+        self.assertTrue(by_host["listed"]["self"])
+        self.assertFalse(by_host["remote"]["self"])
+
     def test_ssh_prefix_carries_port_and_user(self):
         module = load_module()
         argv = module.ssh_prefix({"ssh_host": "h", "ssh_port": 2222,

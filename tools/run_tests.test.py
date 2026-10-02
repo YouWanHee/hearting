@@ -670,6 +670,23 @@ class RetryFixture(RunTestsFixtureBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "attempts.txt").read_text(), "1")
 
+    def test_unlisted_failure_that_passes_alone_is_flaky_pass(self):
+        # A suite with no baseline row that fails in the main run gets one serial
+        # retry; passing alone means load/timing, reported but not fatal.
+        self.write_retry_suite("fail-pass")
+        result, rows = self.run_fixture([], extra_args=["--retries", "1"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows[0]["verdict"], "FLAKY-PASS")
+        self.assertIn("policy=unlisted-serial-retry", rows[0]["detail"])
+        self.assertEqual((self.root / "attempts.txt").read_text(), "2")
+
+    def test_unlisted_failure_that_fails_again_still_fails(self):
+        self.write_retry_suite("all-fail")
+        result, rows = self.run_fixture([], extra_args=["--retries", "1"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(rows[0]["verdict"], "FAIL")
+        self.assertEqual((self.root / "attempts.txt").read_text(), "2")
+
     def test_kind_mismatch_wins_over_flaky_aggregate(self):
         self.write_retry_suite("mismatch")
         result, rows = self.run_fixture(self.baseline(), extra_args=["--retries", "1"])

@@ -1985,6 +1985,40 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
     return 0 if all(row.get("started") for row in results) else 1
 
 
+
+def node_launch_command(*, route_path, leg, parent, prompt_text, reviewed_evidence, jobs,
+                        parent_attempt, log_dir, lifecycle, qa, automatic_retry_of=None):
+    """The dispatch-node.py argv for one admitted leg.
+
+    `--qa` is dispatch-node.py's own option and goes before the `--` separator: after it
+    the flag is a protected adapter argument and the node refuses the launch
+    (dispatch-generated-argument-override). Omitted when unset, so dispatch-node.py's
+    wrapper derives it from --intensity (dispatch_mode_contract.resolve_qa)."""
+    command = [
+        sys.executable,
+        str(ROOT / "utilities" / "dispatch-node.py"),
+        "--route", str(route_path),
+        "--node", str(leg["node"]),
+        "--adapter", str(leg["adapter"]),
+        "--action", "start",
+        "--slug", str(leg["slug"]),
+        "--parent", parent,
+        "--prompt-text", prompt_text,
+        *(["--reviewed-evidence", reviewed_evidence] if reviewed_evidence else []),
+        "--attempt-id", str(leg["attempt_id"]),
+        "--jobs", str(jobs),
+        *(["--qa", qa] if qa else []),
+        "--",
+        "--parent-attempt-id", parent_attempt,
+        *(["--log-dir", str(log_dir)] if log_dir is not None else []),
+        "--launch-lifecycle", lifecycle,
+        "--fallback-hop", str(leg["hop"]),
+        "--fallback-ordinal", str(leg["ordinal"]),
+    ]
+    if automatic_retry_of:
+        command += ["--automatic-retry-of", automatic_retry_of]
+    return command
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--route", type=Path, required=True)
@@ -2709,50 +2743,16 @@ def main(argv: list[str] | None = None) -> int:
                     "reason": "batch-interrupted-before-wrapper",
                 })
                 continue
-            command = [
-                sys.executable,
-                str(ROOT / "utilities" / "dispatch-node.py"),
-                "--route",
-                str(route_path),
-                "--node",
-                str(leg["node"]),
-                "--adapter",
-                str(leg["adapter"]),
-                "--action",
-                "start",
-                "--slug",
-                str(leg["slug"]),
-                "--parent",
-                args.parent,
-                "--prompt-text",
-                args.prompt_text,
-                *(["--reviewed-evidence", args.review_inputs[leg["node"]]["path"]]
-                  if leg["node"] in args.review_inputs else []),
-                "--attempt-id",
-                str(leg["attempt_id"]),
-                "--jobs",
-                str(jobs),
-                "--",
-                "--parent-attempt-id",
-                parent_attempt,
-                *(
-                    ["--log-dir", str(args.log_dir)]
-                    if args.log_dir is not None
-                    else []
-                ),
-                "--launch-lifecycle",
-                lifecycle,
-                "--fallback-hop",
-                str(leg["hop"]),
-                "--fallback-ordinal",
-                str(leg["ordinal"]),
-            ]
-            if args.qa:
-                # Omitted when unset: dispatch-node.py's wrapper derives it
-                # from --intensity (dispatch_mode_contract.resolve_qa).
-                command += ["--qa", args.qa]
-            if partial is not None and partial.get("automatic_replacement_evidence"):
-                command += ["--automatic-retry-of", str(partial["failed_source_attempt_id"])]
+            command = node_launch_command(
+                route_path=route_path, leg=leg, parent=args.parent, prompt_text=args.prompt_text,
+                reviewed_evidence=(args.review_inputs[leg["node"]]["path"]
+                                   if leg["node"] in args.review_inputs else None),
+                jobs=jobs, parent_attempt=parent_attempt, log_dir=args.log_dir,
+                lifecycle=lifecycle, qa=args.qa,
+                automatic_retry_of=(str(partial["failed_source_attempt_id"])
+                                    if partial is not None and partial.get("automatic_replacement_evidence")
+                                    else None),
+            )
             env = {
                 # This launches a depth-2 node (dispatch-node.py), which
                 # always supplies its own --route via `command` above. An

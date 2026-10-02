@@ -155,6 +155,13 @@ def _record_claim(run_root, claim):
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _normalize_hostname(value):
+    """One comparison form for a hostname value ("" when not usable)."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().rstrip(".").casefold()
+
+
 def is_self(host):
     """True when this entry describes the machine we are already running on.
 
@@ -163,12 +170,24 @@ def is_self(host):
     host `local` would make the file machine-specific and turn moving the
     session host into an edit on every server. A declared `hostname` is matched
     against this machine's own, since an inventory label (`moving4`) and the
-    system hostname (`workstation`) need not agree.
+    system hostname (`workstation`) need not agree. The declaration may also be
+    a short name (`moving4` for `moving4.iip.lab`) or a list of names, of which
+    any one matching is enough.
     """
     if host.get("ssh_host") == LOCAL:
         return True
     declared = host.get("hostname")
-    return bool(declared) and declared == socket.gethostname()
+    names = declared if isinstance(declared, (list, tuple)) else [declared]
+    local = _normalize_hostname(socket.gethostname())
+    local_first = local.split(".", 1)[0]
+    for name in names:
+        candidate = _normalize_hostname(name)
+        if not candidate:
+            continue
+        if (candidate == local or candidate == local_first
+                or candidate.split(".", 1)[0] == local):
+            return True
+    return False
 
 
 def ssh_prefix(host):

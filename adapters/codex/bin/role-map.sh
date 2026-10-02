@@ -56,7 +56,7 @@ case "$role" in
     ;;
   "report"|"reporting")
     pipeline_stage=report
-    portable_model_role="fast writer"
+    portable_model_role="deep editor"
     ;;
 esac
 if [ -n "$pipeline_stage" ]; then
