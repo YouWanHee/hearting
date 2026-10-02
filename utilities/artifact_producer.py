@@ -3248,6 +3248,23 @@ def _checkpoint_lock_path(root: Path, cycle_id: str) -> Path:
     return checkpoint_state_path(root, cycle_id).with_suffix(".lock")
 
 
+CLOSED_CYCLE_REFRESH_OFF_FILE = "cycle-refresh.off"
+
+
+def closed_cycle_refresh_off() -> bool:
+    """A machine-local switch that pauses the §45 closed-cycle refresh (and its sweep).
+
+    `${XDG_CONFIG_HOME:-~/.config}/hearting/cycle-refresh.off` present = paused.  It lets a
+    reader that does not yet follow updated closed-cycle manifests (Cairn sync) catch up
+    before closed cycles start changing; open-cycle checkpoints are unaffected.  Absent
+    file, the default, = on.  Read on every call so all three runtimes follow it at once."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        return os.path.exists(os.path.join(base, "hearting", CLOSED_CYCLE_REFRESH_OFF_FILE))
+    except (OSError, ValueError):
+        return False
+
+
 def checkpoint_interval_seconds() -> float:
     raw = os.environ.get(CHECKPOINT_INTERVAL_ENV, "")
     try:
@@ -6062,6 +6079,8 @@ def refresh_cycle(
     def skipped(reason: str, **extra: Any) -> Dict[str, Any]:
         return {"status": "skipped", "reason": reason, **base, **extra}
 
+    if closed_cycle_refresh_off():
+        return skipped("refresh-off")
     try:
         return _refresh_cycle_observed(root, cycle_id, trigger=trigger, clock=clock, budget=budget,
                                        allocator=allocator, observe=observe,
@@ -6230,6 +6249,9 @@ def refresh_sweep(
     budget = budget or (RefreshBudget.unlimited() if trigger == "explicit" else RefreshBudget())
     out: Dict[str, Any] = {"status": "swept", "trigger": trigger, "visited": 0, "refreshed": [], "skipped": [],
                            "cursor": None}
+    if closed_cycle_refresh_off():
+        out["status"] = "off"
+        return out
 
     def look(cycle_id: str, *, observe: bool) -> Dict[str, Any]:
         try:

@@ -69,7 +69,10 @@ class SealAbolitionBase(FX.ProducerTestBase):
         scrubbed = {key: os.environ.pop(key) for key in list(os.environ) if key.startswith("AGENT_")}
         self.addCleanup(os.environ.update, scrubbed)
         # Same switch tools/run-tests.py sets: route-hash and identity checks refuse, not warn.
-        patcher = mock.patch.dict(os.environ, {"HEARTING_GATES": "on"})
+        # A machine's own config (e.g. a closed-cycle refresh switch) must not steer the fixture either.
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        patcher = mock.patch.dict(os.environ, {"HEARTING_GATES": "on", "XDG_CONFIG_HOME": config.name})
         patcher.start()
         self.addCleanup(patcher.stop)
         super().setUp()
@@ -1256,6 +1259,23 @@ class B1RefreshTest(B1RefreshBase):
         new_a = next(r for r in again["artifact_revisions"] if r["locator"]["path"].endswith("/a.md"))
         self.assertEqual(json.dumps(old_a, sort_keys=True), json.dumps(new_a, sort_keys=True))
         self.assertEqual(len(self.snapshot_names(result)), 3)
+
+    def test_b1_off_switch_pauses_closed_cycle_refresh(self):
+        result = self.closed("b1-off", {"plans/cycle/a.md": b"a\n"})
+        self.edit(result, "plans/cycle/a.md", b"a, edited\n")
+        with tempfile.TemporaryDirectory() as config:
+            (Path(config) / "hearting").mkdir()
+            switch = Path(config) / "hearting" / P.CLOSED_CYCLE_REFRESH_OFF_FILE
+            switch.write_text("{}\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config}):
+                state = self.tree_state(result)
+                for trigger in ("turn-end", "explicit", "supervisor-poll"):
+                    got = self.refresh(result, trigger=trigger)
+                    self.assertEqual((got["status"], got["reason"]), ("skipped", "refresh-off"))
+                self.assertEqual(P.refresh_sweep(self.root, trigger="turn-end")["status"], "off")
+                self.assertEqual(state, self.tree_state(result))
+                switch.unlink()
+                self.assertEqual(self.refresh(result)["status"], "emitted")
 
     # -- correction B ----------------------------------------------------
     def test_b1_locked_index_read_once(self):
