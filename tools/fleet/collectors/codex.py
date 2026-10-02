@@ -277,6 +277,26 @@ def _question_replies(payload):
                 yield identity[1], identity[2]
 
 
+def _composer_prompt(item):
+    """True for a prompt the person submitted in the composer, judged by structure only.
+
+    A composer submit carries a UUID `client_id`; Hearting completion deliveries are
+    `delivery-<digest>`, and an exact native question reply keeps its per-index path.
+    The text is only tested for that envelope prefix and never retained.
+    """
+    if not isinstance(item, dict) or item.get("type") != "UserMessage":
+        return False
+    client_id = item.get("client_id")
+    if not isinstance(client_id, str) or not client_id or client_id.startswith("delivery-"):
+        return False
+    content = item.get("content")
+    for part in content if isinstance(content, list) else ():
+        text = part.get("text") if isinstance(part, dict) else None
+        if isinstance(text, str) and text.lstrip().startswith("<send_user_message_question_reply>"):
+            return False
+    return True
+
+
 def _advance_pending_input(open_calls, lifecycle, row):
     """Track only call/turn identity/time/indices; never retain question content."""
     if not isinstance(row, dict):
@@ -297,6 +317,12 @@ def _advance_pending_input(open_calls, lifecycle, row):
                 if kind == "task_complete" and request.questions is not None:
                     continue
                 if request.turn_id is None or request.turn_id == payload.get("turn_id"):
+                    open_calls.pop(call_id)
+        elif kind == "item_completed" and _composer_prompt(payload.get("item")):
+            # The TUI drops open async questions on any composer submit; the person's
+            # typed reply is the answer (roles/response-policy.md). Deliveries never clear.
+            for call_id, request in list(open_calls.items()):
+                if request.questions is not None:
                     open_calls.pop(call_id)
         return
     if row.get("type") != "response_item":
@@ -1607,7 +1633,8 @@ def _tail_pending_request_user_input(path, chunk=65536):
     """Full-history, append-cached pending input independent of the gateway.
 
     The lifecycle cursor pairs blocking calls/outputs and exact async question
-    replies. Async acceptance and normal turn completion keep the wait open.
+    replies. Async acceptance and normal turn completion keep the wait open; a later
+    composer prompt clears it.
     A question older than the last read chunk remains visible without rescanning
     history on each Fleet tick. Partial lines and changed file identities fail
     closed under the same cursor contract as task lifecycle observation.

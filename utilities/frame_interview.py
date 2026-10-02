@@ -37,6 +37,10 @@ ANSWERS_SCHEMA = "frame_interview_answers_v1"
 ANSWERS_SHAPE = ('answers file: {"understanding_confirmed": true, "answers": {"<question id>": {"choice": 0}}} '
                  '-- choice is an option index or label ("none" plus a "note" when no option fits); '
                  'add "correction" when understanding_confirmed is false')
+# A decision question stays open until the person answers (roles/response-policy.md).
+PENDING_ANSWER_RULE = ("Until the person answers, do not proceed and do not ask again; if the turn "
+                       "ends first, end it with the question and its options restated, and use the "
+                       "person's next reply, structured or typed, as the answer.")
 
 # Questions per raise, by intensity. `quick` now carries the `frame-review`
 # gate too (entry-bound at its `one-shot` node), so its cap is machine-checked

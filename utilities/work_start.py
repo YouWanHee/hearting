@@ -247,7 +247,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                 "answers_template": FI.answers_template(question),
                 "next_step": "Display the native question and preserve the actual response; then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "
-                    "For a revise/stop decision also pass --decision revise|stop."}
+                    "For a revise/stop decision also pass --decision revise|stop. " + FI.PENDING_ANSWER_RULE}
     if resolution["status"] in {"proceed", "revise", "stop"}:
         if resolution["status"] != decision or (decision != "stop" and resolution.get("answers") != response):
             raise ValueError("frame-answer-conflict: the recorded decision cannot be replaced")
@@ -1119,6 +1119,7 @@ def _owner_parked_response(result, jobs, aid):
     """The receipt for an owner that exited at a human gate, or None when it is not parked there
     (or the gate was answered `proceed`, which the continuation path handles)."""
     import dispatch_replacement
+    import frame_interview as FI
     parked = dispatch_replacement.owner_parked_gate(jobs, aid)
     if not parked:
         return None
@@ -1148,7 +1149,8 @@ def _owner_parked_response(result, jobs, aid):
                     + ((" owner_report is the owner's own account of what it already changed; show it "
                         "with the preview, because the edit was made before this answer."
                         if verdict_pass(owner_meta) else
-                        " owner_report is the owner's own account; show it with the preview.") if report else "")}
+                        " owner_report is the owner's own account; show it with the preview.") if report else "")
+                    + " " + FI.PENDING_ANSWER_RULE}
     if parked["status"] == "stop":
         return {**result, **extra, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
                 "next_step": f"The person stopped this work at gate {gate}. Report that; "

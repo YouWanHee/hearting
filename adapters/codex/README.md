@@ -89,9 +89,15 @@ project Claude Skill, Agent, command, hook, or statusline files into Codex.
 | autopilot routing | Codex exposes `autopilot-*` as native Skills/plugin entries and can select matching Skills from descriptions, but the adapter does not emulate Claude slash-command routing. `prompt-signal` emits the portable routing contract and Codex-native entrypoint surface; for spec-backed work, rely on spec-read/capability gates plus the relevant Skill or explicit dispatch wrapper |
 | subagent delegation | Codex supports native subagent workflows, but they are explicit or main-dispatched. Run `adapters/codex/bin/preflight.sh subagent-info --check` to verify the `multi_agent` runtime feature and projected custom agents before claiming delegation parity. Use prompt-directed subagents or `preflight.sh dispatch`; do not treat UI/status state as an automatic delegation trigger |
 
-Native Codex owns question timing. Default-mode unanswered questions may return
-empty answers after 120 seconds; plan mode waits. Empty answers never satisfy a
-human decision gate. Fleet question display uses rollout/panel evidence.
+Native Codex owns question timing. Codex 0.160 Default mode exposes only
+`request_user_input_async`: the box is answerable only while the asking turn
+runs (its 30 s countdown is cosmetic) and is dropped at turn end, so a late
+answer arrives as an ordinary typed message. The blocking tool (feature
+`default_mode_request_user_input`, under development) auto-resolves with empty
+answers outside Plan mode and is therefore not enabled. Empty answers never
+satisfy a human decision gate; the session restates an open decision question
+at turn end and uses the next reply as its answer. Fleet question display uses
+rollout/panel evidence.
 
 The dispatch wrapper still validates the capability catalog, validates an
 optional non-owner `worker_mode` through `mode-info`, and `_kernel/owner`
@@ -276,7 +282,11 @@ Fleet reads structured rollout question evidence. Blocking `request_user_input`
 calls remain pending until their matching output or turn boundary. Async
 `request_user_input_async` calls retain only call/turn identity, time and
 unanswered question indices: `accepted:true`, ordinary activity, and normal
-turn completion do not answer them. Exact native user reply envelopes with
+turn completion do not answer them. A later composer prompt (a UserMessage
+`item_completed` whose `client_id` is not a `delivery-` Hearting completion
+delivery and whose content is not an exact reply envelope) clears the open async
+questions, as the TUI does; a peer-steward prompt typed into the pane is
+indistinguishable and clears them too. Exact native user reply envelopes with
 `questionItemId=["request_user_input_async", call_id, index]` resolve each
 question; a failed request or originating-turn interruption also clears it.
 The async call/acceptance/reply shape was observed in local Codex traffic on
