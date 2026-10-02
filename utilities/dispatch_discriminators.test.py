@@ -74,22 +74,20 @@ class DiscriminatorLedgerTest(unittest.TestCase):
                 self.assertTrue(consumer_path.is_file(), consumer_path)
 
     def test_capacity_is_not_a_row_in_this_ledger(self):
-        # docs/capacity-failover-gap.md must not claim an SD-59 row here: this
-        # ledger is the SD-93 rejection_class enum, and `capacity` is a
-        # failure_class on a different axis.
+        # SD-59 capacity retry must not claim a row here: this ledger is the
+        # SD-93 rejection_class enum, and `capacity` is a failure_class on a
+        # different axis.
         sys.path.insert(0, str(ROOT / "utilities"))
         import dispatch_launch_tuple as LT
 
         _header, rows = _rows()
         self.assertNotIn("capacity", {row[0] for row in rows})
         self.assertNotIn("capacity", LT.REJECTION_CLASSES)
-        doc = (ROOT / "docs/capacity-failover-gap.md").read_text(encoding="utf-8")
-        self.assertIn("행이 없다", doc)
 
     def test_capacity_retry_has_no_supervised_join_caller(self):
-        # The documented gap itself: SD-59's retry is reachable only from the
+        # The known gap itself: SD-59's retry is reachable only from the
         # foreground `_dispatch` loop. A new caller elsewhere -- or a
-        # supervised-join wiring -- must break this and force a doc update.
+        # supervised-join wiring -- must break this and force this test to be revisited.
         source = (ROOT / "utilities/stage-dispatch-fallback.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         functions = [n for n in ast.walk(tree)
