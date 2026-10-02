@@ -768,5 +768,123 @@ class ComputeHostsTest(unittest.TestCase):
                              "ambiguous-session")
 
 
+    def test_stop_records_sigterm_exit_and_reason(self):
+        # `stop` kills the tmux session before the run shell can write its
+        # own exit code; the stop itself must leave 143 + a reason behind.
+        result = self.run_tool("run", "here", "--name", "stopme", "--",
+                               "bash", "-c", "sleep 30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        try:
+            for _ in range(50):
+                check = subprocess.run(
+                    ["tmux", "has-session", "-t", run_id],
+                    capture_output=True, timeout=5)
+                if check.returncode == 0:
+                    break
+                time.sleep(0.1)
+            stopped = self.run_tool("stop", run_id)
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertIn("stopped", stopped.stdout)
+            run_dir = self.run_root / run_id
+            for _ in range(50):
+                if (run_dir / "exit_code").is_file():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(
+                (run_dir / "exit_code").read_text(encoding="utf-8").strip(),
+                "143")
+            self.assertEqual(
+                (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
+                "stopped")
+            listed = self.run_tool("runs")
+            self.assertIn("exit 143 (stopped)", listed.stdout)
+            payload = json.loads(self.run_tool("runs", "--json").stdout)
+            row = next(item for item in payload if item["run_id"] == run_id)
+            self.assertEqual(row["exit_code"], 143)
+            self.assertEqual(row["stop_reason"], "stopped")
+            self.assertEqual(row["state"], "finished")
+            tail = self.run_tool("tail", run_id)
+            self.assertIn("exit 143 (stopped)", tail.stdout)
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", run_id],
+                           capture_output=True, timeout=5)
+
+    def test_stop_never_overwrites_a_natural_finish(self):
+        run_dir = self.run_root / "natural-20261002-000001-done"
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": run_dir.name, "host": "here",
+                        "command": ["true"]}), encoding="utf-8")
+        (run_dir / "exit_code").write_text("0\n", encoding="utf-8")
+        stopped = self.run_tool("stop", run_dir.name)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(
+            (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "0")
+        self.assertFalse((run_dir / "stop_reason").exists())
+
+    def test_runs_marks_a_gone_session_stopped_without_writing(self):
+        # Legacy runs stopped before this fix have no exit file and no
+        # tmux session left: `runs` must show them cleaned, read-only.
+        run_dir = self.run_root / "legacy-20261002-000001-stale"
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": run_dir.name, "host": "here",
+                        "command": ["bash", "-c", "sleep 30"]}),
+            encoding="utf-8")
+        listed = self.run_tool("runs")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("stopped (gone)", listed.stdout)
+        self.assertFalse((run_dir / "exit_code").exists())
+        payload = json.loads(self.run_tool("runs", "--json").stdout)
+        row = next(item for item in payload if item["run_id"] == run_dir.name)
+        self.assertIsNone(row["exit_code"])
+        self.assertEqual(row["state"], "stopped")
+        self.assertTrue(row["stale"])
+        # An explicit stop then seals the legacy run the same way as new ones.
+        stopped = self.run_tool("stop", run_dir.name)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(
+            (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "143")
+        self.assertEqual(
+            (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
+            "stopped")
+
+    def test_runs_stays_running_when_session_state_is_unknown(self):
+        module = load_module()
+        run_dir = self.run_root / "unknown-20261002-000001-live"
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": run_dir.name, "host": "here",
+                        "command": ["bash", "-c", "sleep 30"]}),
+            encoding="utf-8")
+        with mock.patch.object(module, "_tmux_session_alive", return_value=None):
+            config = module.load_config(str(self.config))
+            state = module._run_state(config, run_dir.name)
+            self.assertEqual(state["state"], "running")
+            self.assertIsNone(module._tmux_session_alive(object(), "x"))
+        listed = self.run_tool("runs", "--host", "here")
+        # With real tmux present and no such session this row shows stale;
+        # the unit point above is that unknown (None) never declares gone.
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+
+    def test_record_stop_writes_once_and_keeps_a_natural_exit(self):
+        module = load_module()
+        run_dir = self.root / "record-once"
+        self.assertTrue(module._record_stop(run_dir))
+        self.assertEqual((run_dir / "exit_code").read_text(
+            encoding="utf-8").strip(), "143")
+        self.assertEqual((run_dir / "stop_reason").read_text(
+            encoding="utf-8").strip(), "stopped")
+        self.assertFalse(module._record_stop(run_dir))
+        natural = self.root / "record-natural"
+        natural.mkdir(parents=True)
+        (natural / "exit_code").write_text("3\n", encoding="utf-8")
+        self.assertFalse(module._record_stop(natural))
+        self.assertEqual((natural / "exit_code").read_text(
+            encoding="utf-8").strip(), "3")
+        self.assertFalse((natural / "stop_reason").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
