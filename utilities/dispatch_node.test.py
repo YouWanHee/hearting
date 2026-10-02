@@ -541,6 +541,64 @@ class MainMaterializationTest(unittest.TestCase):
         idx = argv.index("--harness-affinity")
         self.assertEqual(argv[idx + 1], "codex")
 
+    # -- a sealed worker pin beats the requested adapter ---------------------------------
+    def _pinned(self, adapter, pin="claude", *, target="worker", claude_status="supported",
+                limits=None, extra=(), subject="execute"):
+        node = make_node(dispatch_fallback=make_fallback(claude=base_tuple("claude", status=claude_status)))
+        node["harness_affinity"] = pin
+        route = make_route(node, tuples=[base_tuple("claude", status=claude_status),
+                                         base_tuple("codex"), base_tuple("opencode")])
+        if pin:
+            route["selection_pins"] = {"contract_version": 1,
+                                       target: {"harness": pin, "model": None, "effort": None}}
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("dispatch_capacity_evidence.active_limits", return_value=limits or {}):
+            jobs = Path(td) / "jobs.log"
+            jobs.touch()
+            argv = self._run_main(["--node", subject, "--adapter", adapter, "--slug", "pin-probe",
+                                   "--parent", "owner", "--action", "start", *extra], route,
+                                  environ={"AGENT_DISPATCH_JOBS": str(jobs)})
+        self.assertIsNotNone(argv)
+        flag = argv[argv.index("--explicit-adapter") + 1] if "--explicit-adapter" in argv else None
+        return Path(argv[1]).parts[-3], flag, argv
+
+    def test_sealed_worker_pin_beats_an_explicit_adapter_and_records_the_request(self):
+        wrapper, flag, argv = self._pinned("codex")
+        self.assertEqual((wrapper, flag), ("claude", "codex"))
+        self.assertEqual(argv[argv.index("--harness-affinity") + 1], "claude")
+        # the checked evidence bound into the wrapper argv is the pinned harness's, not the request's
+        self.assertEqual(argv[argv.index("--nested-eligibility") + 1], "supported")
+
+    def test_requesting_the_pinned_harness_records_no_override(self):
+        wrapper, flag, _argv = self._pinned("claude")
+        self.assertEqual((wrapper, flag), ("claude", None))
+
+    def test_unavailable_worker_pin_keeps_the_request(self):
+        for label, kwargs in (
+                ("claude has no supported checked tuple", dict(claude_status="unsupported")),
+                ("claude is at an active limit", dict(limits={"claude": {"reset_epoch": 9999999999}}))):
+            with self.subTest(label):
+                wrapper, flag, _argv = self._pinned("codex", **kwargs)
+                self.assertEqual((wrapper, flag), ("codex", None))
+
+    def test_no_worker_pin_keeps_the_explicit_adapter(self):
+        for label, kwargs in (("no pin at all", dict(pin=None)),
+                              ("an owner pin only", dict(target="owner")),
+                              ("a frame pin only", dict(target="frame"))):
+            with self.subTest(label):
+                wrapper, flag, _argv = self._pinned("codex", **kwargs)
+                self.assertEqual((wrapper, flag), ("codex", None))
+
+    def test_a_replay_keeps_its_predecessor_harness(self):
+        # `replacement_task` ties a replay to the harness of the row it replays
+        wrapper, flag, argv = self._pinned("codex", extra=("--", "--automatic-retry-of", "att-prior"))
+        self.assertEqual((wrapper, flag), ("codex", None))
+        self.assertIn("att-prior", argv)
+
+    def test_the_override_record_cannot_be_forged_through_adapter_args(self):
+        with self.assertRaises(N.DispatchNodeError):
+            N.reject_generated_argument_overrides(["--explicit-adapter", "codex"])
+
     def test_harness_affinity_absent_field_omits_flag(self):
         node = make_node()
         self.assertNotIn("harness_affinity", node)

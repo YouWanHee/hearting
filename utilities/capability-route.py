@@ -3327,8 +3327,10 @@ def _apply_selection_pins(route, pins):
 
     A worker pin H becomes each depth-2 node's `harness_affinity` and moves H to
     the front of that node's sealed `primary` band (removing it from the other
-    bands), so the ordinary affinity consumers pick H first while eligibility
-    and capacity keep their precedence.  A route with no pin gets no key.
+    bands), so the ordinary affinity consumers pick H first.  The pin leads the
+    selection order (CONVENTIONS §2.1): it is ahead of the usage gate, and only
+    hard eligibility (policy, checked tuple) and an active usage limit keep H from
+    running.  A route with no pin gets no key.
     """
     if not pins:
         return

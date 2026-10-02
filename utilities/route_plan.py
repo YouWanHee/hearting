@@ -411,15 +411,23 @@ def wording_differs(rows) -> bool:
             or [leg["why"] for leg in first["legs"]] != [leg["why"] for leg in second["legs"]])
 
 
-def same_proposal(left, right) -> bool:
-    """Whether two proposals name the same legs (capability, mode, shape, graph, intensity). The runtime
-    matches an interview's copy to the proposal it validated itself this way; the copy's approval
-    questions are the interview's own and are not compared."""
+_LEG_KEYS = ("capability", "mode", "shape", "graph", "intensity")
+
+
+def same_proposal(left, right, resolved=None) -> bool:
+    """Whether `right` (an interview's copy) names the legs of `left` (a proposal the runtime validated):
+    each leg's (capability, mode, shape, graph, intensity) is, taken together, the proposal's own
+    leg or, given `resolved` (that proposal's compiled legs, `facts["legs"]`, shown as `legs` in
+    route_proposal_review), the leg its compile resolved it to -- never a per-key blend of the
+    two. The copy's approval questions are the interview's own and are not compared."""
     try:
-        return ([{key: leg.get(key) for key in ("capability", "mode", "shape", "graph", "intensity")} for leg in left["legs"]]
-                == [{key: leg.get(key) for key in ("capability", "mode", "shape", "graph", "intensity")}
-                    for leg in right["legs"]])
-    except (KeyError, TypeError):
+        own, copy = left["legs"], right["legs"]
+        shown = own if resolved is None else resolved
+        key_values = lambda leg: [leg.get(key) for key in _LEG_KEYS]
+        return (len(own) == len(copy) == len(shown)
+                and all(key_values(leg) in (key_values(mine), key_values(compiled))
+                        for leg, mine, compiled in zip(copy, own, shown)))
+    except (AttributeError, KeyError, TypeError):
         return False
 
 

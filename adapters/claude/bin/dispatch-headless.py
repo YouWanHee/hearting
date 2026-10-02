@@ -264,6 +264,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--write-scope")
     p.add_argument("--completion-gate")
     p.add_argument("--harness-affinity")
+    p.add_argument("--explicit-adapter")  # the request a sealed worker/owner pin replaced; recorded only
     p.add_argument(
         "--owner-harness",
         default=os.environ.get("AGENT_DISPATCH_OWNER_HARNESS")
@@ -1556,7 +1557,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",eligibility_failure_class={args.eligibility_failure_class or '-'}"
             f",eligibility_probe={getattr(args, 'eligibility_probe', None) or '-'}"
         )
-    for key in ("route_file", "route_id", "route_hash", "route_node", "registry_digest", "write_scope", "completion_gate", "harness_affinity"):
+    for key in ("route_file", "route_id", "route_hash", "route_node", "registry_digest", "write_scope", "completion_gate", "harness_affinity", "explicit_adapter"):
         value = getattr(args, key)
         if value:
             pipe += f",{key}={value}"
@@ -3013,6 +3014,8 @@ def main(argv: list[str]) -> int:
     settings = args.resolved_model_settings
     print(f"model_source={settings['source']}")
     print(f"model_pin_status={settings.get('pin_status', 'none')}")
+    if getattr(args, 'explicit_adapter', None):
+        print(f"explicit_adapter={args.explicit_adapter}")
     if settings.get("pin_model"):
         print(f"model_pin={settings['pin_model']}")
     print(f"model_role={settings['role']}")

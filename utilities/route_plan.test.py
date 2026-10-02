@@ -265,6 +265,38 @@ class ProposalValidationTest(ValidationBase):
         self.assertFalse(RP.wording_differs([first, none]))
         self.assertTrue(RP.same_proposal(first["proposal"], second["proposal"]))
         self.assertFalse(RP.same_proposal(first["proposal"], third["proposal"]))
+        # D11: an interview may copy either form the review shows -- the brief's own legs or their compiled legs
+        refine = self.evaluate([{"capability": "autopilot-refine", "shape": "staged", "graph": ["review", "transaction"]},
+                                {"capability": "autopilot-code", "shape": "staged", "graph": ["execute:dev/refactor", "test"]}])
+        shown = refine["facts"]["legs"]
+        self.assertEqual([(leg["mode"], leg["intensity"], leg["graph"]) for leg in shown],
+                         [("default", "standard", ["review", "transaction"]), ("dev", "standard", ["execute", "test"])])
+        self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown}))     # exact compare: the D11 ending
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": shown}, resolved=shown))
+        self.assertTrue(RP.same_proposal(refine["proposal"], refine["proposal"], resolved=shown))
+        for index, change in ((0, {"capability": "autopilot-draft"}), (0, {"mode": "dev"}), (1, {"mode": "debug"}),
+                              (0, {"shape": "solo"}), (0, {"graph": ["review"]}), (1, {"graph": ["execute:qa/ml-debug", "test"]}),
+                              (0, {"intensity": "strong"})):
+            with self.subTest(index=index, change=change):
+                legs = [dict(leg) for leg in shown]
+                legs[index].update(change)
+                self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": legs}, resolved=shown))
+        # a copy is one of the two complete legs, never a per-key blend of them
+        for index in (0, 1):
+            with self.subTest(index=index, blend="own+resolved"):
+                own = refine["proposal"]["legs"][index]
+                differing = [key for key in RP._LEG_KEYS if own.get(key) != shown[index].get(key)]
+                self.assertGreaterEqual(len(differing), 2, differing)
+                for key in differing:
+                    blend = [dict(leg) for leg in shown]
+                    blend[index][key] = own.get(key)
+                    self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": blend}, resolved=shown), key)
+        pure = [dict(own) for own in refine["proposal"]["legs"]]
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": pure}, resolved=shown))   # all own: still matches
+        pure[1] = dict(shown[1])
+        self.assertTrue(RP.same_proposal(refine["proposal"], {"legs": pure}, resolved=shown))   # one leg each: still matches
+        self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown[:1]}, resolved=shown))   # leg count
+        self.assertFalse(RP.same_proposal(refine["proposal"], {"legs": shown + shown[:1]}, resolved=shown))
         # an omitted mode/intensity equals its explicit default once compiled
         implicit = self.evaluate([{"capability": "autopilot-code", "shape": "staged", "graph": ["execute", "test"]}])
         explicit = self.evaluate([{"capability": "autopilot-code", "mode": "dev", "shape": "staged",

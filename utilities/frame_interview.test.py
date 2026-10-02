@@ -280,6 +280,24 @@ class AnswersTest(unittest.TestCase):
         answers = good_answers(interview, round=2)
         self.assertTrue(any("round" in e for e in FI.validate_answers(interview, answers)))
 
+    def test_the_envelope_is_this_interviews_when_absent_and_refused_when_wrong(self):
+        """REPORT3 §3-5: schema/route_id/round have one correct value each -- the
+        interview's own -- so a file without them answers this interview."""
+        interview = good_interview(round=2)
+        answers = good_answers(interview)
+        for key in ("schema", "route_id", "round"):
+            answers.pop(key)
+        answers["answers"]["q-cap"]["choice"] = 1
+        self.assertEqual(FI.validate_answers(interview, answers), [])
+        self.assertNotIn("schema", answers)                     # the user's file is not rewritten
+        self.assertIn("**No, fewer** (user's own choice)", FI.render_intent(interview, answers, now="2026-10-02"))
+        for key, wrong in (("schema", "x/v1"), ("route_id", "rt-other"), ("round", 1)):
+            with self.subTest(key=key):
+                errors = FI.validate_answers(interview, {**answers, key: wrong})
+                self.assertTrue(errors and errors[0].startswith(key + ":"), errors)
+        self.assertIn('"understanding_confirmed"', FI.validate_answers(interview, {**answers, "schema": "x/v1"})[0])
+        self.assertIn('"understanding_confirmed"', FI.validate_answers(interview, [])[0])
+
 
 class IntentTest(unittest.TestCase):
     def test_intent_carries_every_decision_and_the_brief(self):

@@ -916,6 +916,28 @@ class ReplacementTest(unittest.TestCase):
                      (['now','done'],{**self.meta,'worker_type':'frame','note':'dead-capacity'}),
                      (['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity'})):
             self.assertIsNone(R.death_kind(*case),case)
+        # a runtime death (the process exited, or the runtime returned an error envelope) is the owner's alone
+        for note in ('dead-runtime-exit','dead-runtime-error'):
+            self.assertEqual(R.death_kind(*row(note,failure_class='runtime')),'runtime',note)
+        self.assertIsNone(R.death_kind(*row('dead-runtime-error',status='cancelled')))
+        self.assertIsNone(R.death_kind(['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-runtime-error'}))
+
+    def test_runtime_death_is_settled_by_its_own_error_envelope(self):
+        self.absent.stop()
+        meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime'}
+        fields=['now','done','',str(self.root)]
+        def seen(state,failure_class):
+            return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
+                              return_value={'state':state,'failure_class':failure_class})
+        # a runtime death needs no handoff: an error envelope or no result is the death itself ...
+        for state,failure,ok in (('invalid','runtime',True),('absent','',True),
+                                 ('invalid','contract-violation',False),('valid','pass',False),
+                                 ('invalid','capacity',False)):
+            with self.subTest(state=state,failure=failure),seen(state,failure):
+                self.assertEqual(R._terminal_absent(fields,meta,runtime=True),ok)
+        # ... a silent death is still settled only by an absent result
+        with seen('invalid','runtime'):
+            self.assertFalse(R._terminal_absent(fields,meta))
 
     def test_capacity_death_with_invalid_capacity_terminal_is_settled_absent(self):
         self.absent.stop()

@@ -245,6 +245,23 @@ class SelectedLegTest(StartBase):
         self.assertEqual(len(self.registry_rows()), 1)
         self.assertEqual(self.cli_calls, ["complete", "close"])
 
+    def test_d11_a_copy_of_the_review_display_legs_selects_the_brief_proposal(self):
+        # The legs route_proposal_review shows resolve what the brief left out (mode, intensity).
+        legs = [dict(CODE_STAGED, graph=["plan", "execute", "test"]),
+                {"capability": "autopilot-refine", "shape": "staged", "graph": ["review", "transaction"], "why": "docs"}]
+        self.set_briefs(legs, legs)
+        row = W._proposal_review(self.route, self.path, self.jobs)["proposals"][0]
+        keys = ("capability", "mode", "shape", "graph", "intensity")
+        self.assertNotEqual(row["legs"], [{k: leg[k] for k in keys} for leg in row["proposal"]["legs"]])
+        self.assertEqual((row["legs"][1]["mode"], row["legs"][0]["intensity"]), ("default", "standard"))
+        self.set_interview({"legs": [{**shown, "why": own["why"]} for shown, own in zip(row["legs"], row["proposal"]["legs"])]})
+        result = self.settle()
+        decision = self.record()["decision"]
+        self.assertEqual((decision["selected"], decision["reason"]), (ROUTE_LABELS[0], ""))   # HEAD: ('none', 'proposal-not-verified')
+        self.assertEqual(result["route_decision"]["selected"], ROUTE_LABELS[0], result)
+        self.assertEqual(decision["proposal"], row["proposal"])          # the brief's own proposal is recorded, not the copy
+        self.assertEqual(len(self.leg_routes()), 1)
+
     def test_a164_3_two_different_proposals_each_select_their_own_route(self):
         for label_index, leg in ((0, DIRECT), (1, CODE_STAGED)):
             with self.subTest(route=leg["shape"]):
@@ -298,6 +315,22 @@ class NoneEndingTest(StartBase):
     def test_a164_4_a_proposal_no_brief_made_is_not_started(self):
         self.set_interview({"legs": [CODE_STAGED]})            # the briefs proposed a direct step
         self.assert_none("proposal-not-verified")
+
+    def test_d11_a_copy_that_differs_from_the_display_in_a_named_field_is_still_not_verified(self):
+        legs = [dict(CODE_STAGED, graph=["plan", "execute", "test"]),
+                {"capability": "autopilot-refine", "shape": "staged", "graph": ["review", "transaction"], "why": "docs"}]
+        changes = {"capability": (1, {"capability": "autopilot-draft"}), "mode": (0, {"mode": "debug"}),
+                   "refine-mode": (1, {"mode": "dev"}), "shape": (1, {"shape": "solo", "graph": None}),
+                   "graph": (0, {"graph": ["plan", "execute"]}), "intensity": (0, {"intensity": "strong"})}
+        for label, (index, change) in changes.items():
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                self.set_briefs(legs, legs)
+                shown = [dict(leg) for leg in W._proposal_review(self.route, self.path, self.jobs)["proposals"][0]["legs"]]
+                shown[index].update(change)
+                self.set_interview({"legs": shown})
+                self.assert_none("proposal-not-verified")
 
     def test_a164_4_briefs_with_no_valid_proposal_end_with_each_reason_recorded(self):
         self.set_briefs(brief([DIRECT], section=False), "## 8. 경로 조립 제안\n\nnothing fenced\n")

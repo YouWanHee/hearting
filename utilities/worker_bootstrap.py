@@ -305,11 +305,58 @@ def owner_gate_prompt(args) -> str:
         jobs = getattr(args, "jobs", None)
         command = (f"python3 {Path(__file__).resolve().with_name('workflow-supervisor.py')} gate --route {route_file} "
                    f"--gate {gate} --block --artifact <preview>" + (f" --jobs {jobs}" if jobs else ""))
+        before = _owner_stage_predecessors(route, node)
+        first = (f"first finish stage {', '.join(before)} (dispatch it, or run it yourself and publish its marker "
+                 "as below) -- the gate is raised on a reviewed preview -- then " if before else "")
         lines.append(
-            f"Human gate {gate} holds your own node {node.get('id')}: write the preview first, then run "
+            f"Human gate {gate} holds your own node {node.get('id')}: {first}write the preview, then run "
             f"`{command}` and end your turn; do not apply the edit before a person releases it. "
             "If the gate command is refused, do not apply either: finish with verdict BLOCKED and the reason.\n")
     return "".join(lines) + ("\n" if lines else "")
+
+
+def _owner_stage_predecessors(route, node):
+    """Declared stages before `node` that a worker, not the owner, executes (settlement needs their markers)."""
+    import dispatch_contract
+    nodes = {n.get("id"): n for n in route.get("nodes") or [] if isinstance(n, dict)}
+    seen, pending, found = set(), list(node.get("depends_on") or []), []
+    while pending:
+        nid = pending.pop()
+        if nid in seen or nid not in nodes:
+            continue
+        seen.add(nid)
+        pending.extend(nodes[nid].get("depends_on") or [])
+        if not dispatch_contract._owner_executed_node(nodes[nid]):
+            found.append(nid)
+    return sorted(found)
+
+
+def owner_inline_marker_prompt(args) -> str:
+    """Name the existing inline-stage completion command for a route owner. Text only; settlement still
+    refuses a declared stage with no marker whatever the owner does."""
+    if getattr(args, "worker_type", None) != "owner":
+        return ""
+    route_file = getattr(args, "route_file", None) or getattr(getattr(args, "owner_route_binding", None), "route_file", None)
+    if not route_file:
+        return ""
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        import dispatch_contract
+        stages = [n for n in route.get("nodes") or [] if isinstance(n, dict)
+                  and isinstance(n.get("dispatch_depth"), int) and n["dispatch_depth"] >= 2
+                  and not dispatch_contract._owner_executed_node(n)]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return ""
+    if not stages:
+        return ""
+    aid = getattr(args, "attempt_id", None) or "<owner attempt>"
+    depths = sorted({n["dispatch_depth"] for n in stages})
+    command = (f"python3 {Path(__file__).resolve().with_name('capability-route.py')} complete --route {route_file} "
+               f"--node <node> --evidence <stage terminal artifact> --attempt-id {aid}-<node>-inline "
+               f"--dispatch-depth {depths[0] if len(depths) == 1 else '<node dispatch_depth>'} --transport headless "
+               "--execution-surface inline --registered-worker 0 --fallback-hop inline")
+    return (f"A declared stage ({', '.join(str(n['id']) for n in stages)}) you run yourself instead of dispatching "
+            f"still publishes its completion marker: `{command}` (no --jobs). Without it the route never settles.\n\n")
 
 
 def assignment_prompt(args, task: str, environ) -> str:
@@ -322,13 +369,14 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
-            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}"
+            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}"
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         scope = resolve_node_scope(
             route, getattr(args, "route_node", None), environ,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
         )
-        return f"Assignment:\n{task.rstrip()}\n\n{node_scope_prompt(scope)}\n{owner_gate_prompt(args)}"
+        return (f"Assignment:\n{task.rstrip()}\n\n{node_scope_prompt(scope)}\n"
+                f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}")
     outputs = []
     route_file = getattr(args, "route_file", None)
     if route_file:

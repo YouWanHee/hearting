@@ -167,7 +167,8 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                 "next_step": "Compare these exact frame results; fill this semantic interview template and "
                     "rerun resume_command with --interview <file> before displaying the native question. "
                     "The runtime supplies route/cycle fields and registers the gate. If the user already "
-                    "answered, supply that interview and --answers <file> together; do not ask again."}
+                    "answered, supply that interview and --answers <file> together; do not ask again. "
+                    + FI.ANSWERS_SHAPE}
     if not isinstance(supplied, dict):
         raise ValueError("frame-interview-invalid: expected an object")
     if supplied.get("route_id", route["route_id"]) != route["route_id"]:
@@ -767,8 +768,10 @@ def _decide(route, jobs, root, record, output, briefs, intent):
         return ended(RP.NO_PROPOSAL_READ)
     if choice["state"] != "selected":
         return ended({"declined": "route-declined", "off-menu": "route-off-menu"}.get(choice["state"], "route-unanswered"), shown)
-    match = next((row for row in rows if row["proposal"] is not None
-                  and RP.same_proposal(row["proposal"], choice["proposal"])), None)
+    valid = [row for row in rows if row["proposal"] is not None]
+    match = (next((row for row in valid if RP.same_proposal(row["proposal"], choice["proposal"])), None)
+             or next((row for row in valid if RP.same_proposal(row["proposal"], choice["proposal"],
+                                                                resolved=row["facts"]["legs"])), None))
     if match is None:
         return ended("proposal-not-verified", shown)
     given = []
@@ -1371,6 +1374,11 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         jobs=jobs, expected_attempts={aid},
         timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
         recover=True)
+    if status != "done" and _rows(jobs).get(aid, (status,))[0] == "done":
+        # The owner exited while this call waited: its receipt asks the same question the next start would.
+        gate_response = _owner_gate_response(route, path, jobs, aid, _rows(jobs)[aid][1], result)
+        if gate_response is not None:
+            return gate_response
     from dispatch_replacement import advance, effective_attempts
     # Only an explicit start resumes an owner that stopped at a usage limit.
     replacement = advance(jobs, aid, run=run, resume_capacity=True)

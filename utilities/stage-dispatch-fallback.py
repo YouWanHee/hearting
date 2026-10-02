@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from hearting_gates import gates_on, same_work_or_refuse
 from model_config import ModelConfigError, resolve_config  # noqa: E402
+from model_profile import sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -318,7 +319,14 @@ def ordered_fallback_hops(
             declared_order=allocation.get("harness_order") or ALLOCATION_HARNESSES,
         )
     affinity = node.get("harness_affinity")
-    if affinity in ranked:
+    # A sealed `--pin worker=<harness>` leads the order (CONVENTIONS §2.1) while that harness is ranked,
+    # i.e. outside a usage limit and the node's policy. The soft usage gate does not move it; a limited
+    # pin is in `limited` and goes to the tail below, as before.
+    worker_pin = sealed_pin_harness(route, worker_type="stage")
+    pinned_head = worker_pin in ranked
+    if pinned_head:
+        ranked = [worker_pin] + [harness for harness in ranked if harness != worker_pin]
+    elif affinity in ranked:
         # B-1: mirrors the HARNESS_CAPACITY_BIAS gate-class constraint in
         # `rank_band` — a sealed affinity may reorder within its own gate
         # class but must never lift a gated harness above an ungated one.
@@ -360,7 +368,7 @@ def ordered_fallback_hops(
         if quality_peer is not None and owner_family:
             head = ranked[0] if ranked else None
             if head is not None and head not in quality_peer:
-                affinity_pinned_head = affinity in ranked and affinity == head
+                affinity_pinned_head = pinned_head or (affinity in ranked and affinity == head)
                 if affinity_pinned_head:
                     sole_gate = "degraded"
                 else:

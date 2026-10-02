@@ -15,6 +15,7 @@ from owner_route_binding import OwnerRouteBindingError, validate_owner_route_bin
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
                                parse_registry_metadata)
+from model_profile import pinned_launch_harness, sealed_pin_harness
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,7 @@ _FORBIDDEN = {
     "--worker-mode", "--model", "--reasoning", "--effort", "--variant",
     "--inherit-model-settings", "--completion-delivery",
     "--allow-unmanaged-parent-poll",
+    "--explicit-adapter",  # written only by this selector, to record a request a sealed pin replaced
 }
 _MODEL_ENV = re.compile(
     r"^[A-Za-z0-9]+_DISPATCH_(MODEL|MODEL_ROLE|MODEL_PROFILE|REASONING|EFFORT|VARIANT)$"
@@ -785,6 +787,16 @@ def main(argv):
                 raise OwnerError("explicit-adapter-disabled-by-user-policy")
             explicit_policy = "outside-profile-bands"
         sealed = sealed_context["harnesses"] if sealed_context else None
+        # A sealed owner pin (`compose --pin owner=<harness>`) beats the request while its harness is
+        # available (CONVENTIONS §2.1). The swap is made here, before the sealed-candidate check, so a
+        # request outside the route evidence is replaced rather than refused; the usage state is known
+        # only below, where a limited pin gives the request back to the checks it always had.
+        requested, pin_doc = explicit, None
+        if route_evidence and values["--worker-type"] == "owner":
+            pin_doc = json.loads(Path(route_evidence).read_text(encoding="utf-8"))
+            pinned = sealed_pin_harness(pin_doc, worker_type="owner")
+            if pinned and pinned != explicit and (sealed is None or pinned in sealed):
+                explicit = pinned
         policy_harnesses = list(configured)
         if sealed is not None:
             if explicit is not None and explicit not in sealed:
@@ -811,6 +823,17 @@ def main(argv):
         else:
             dropped = []
         states = _usage(jobs, profile)
+        overridden = None
+        pin_chosen = False
+        if pin_doc is not None:
+            choice, overridden = pinned_launch_harness(
+                pin_doc, worker_type="owner", requested=requested,
+                available=lambda h: (sealed is None or h in sealed) and _eligible(states.get(h, "unknown")))
+            pin_chosen = choice is not None and choice != requested
+            if choice != explicit:  # the pinned harness is limited: the request, with today's checks
+                explicit = choice
+                if explicit is not None and sealed is not None and explicit not in sealed:
+                    raise OwnerError("explicit-adapter-outside-route-evidence")
         allocation = (
             sealed_context.get("allocation")
             if sealed_context and isinstance(sealed_context.get("allocation"), dict)
@@ -848,7 +871,7 @@ def main(argv):
         quality_band = None
         relief_promoted = False
         if explicit and _eligible(states[explicit]):
-            selected, source, quality_band = explicit, "explicit", "explicit"
+            selected, source, quality_band = explicit, ("route-pin" if pin_chosen else "explicit"), "explicit"
         if selected is None and config_version in {3, 4}:
             selected, quality_band, _ranks, relief_promoted = _capacity.select(
                 policy, states, counts, allocation["harness_order"], capacity,
@@ -891,7 +914,7 @@ def main(argv):
                     break
         if selected is None:
             print("\n".join(_audit(
-                "unavailable", None, "none", configured, explicit, states,
+                "unavailable", None, "none", configured, requested, states,
                 allocation=allocation, counts=counts, rejected=rejected,
                 capacity=capacity, relief_promoted=relief_promoted, top_excluded=top_excluded,
             )))
@@ -937,7 +960,7 @@ def main(argv):
                 raise OwnerError(f"{exc.reason}:{exc.detail}") from exc
         wrapper = ROOT / "adapters" / selected / "bin" / "dispatch-headless.py"
         if not os.access(wrapper, os.X_OK):
-            print("\n".join(_audit("unavailable", selected, source, configured, explicit, states,
+            print("\n".join(_audit("unavailable", selected, source, configured, requested, states,
                                       allocation=allocation, counts=counts,
                                       rejected=rejected if source != "explicit" else (),
                                       fallback=selected if source == "eligibility-fallback" else None,
@@ -946,7 +969,7 @@ def main(argv):
                                       relief_promoted=relief_promoted, top_excluded=top_excluded)))
             print("check=failed\nreason=wrapper-unavailable\nchild_spawned=0")
             return 65
-        print("\n".join(_audit("eligible", selected, source, configured, explicit, states,
+        print("\n".join(_audit("eligible", selected, source, configured, requested, states,
                                   allocation=allocation, counts=counts,
                                   rejected=rejected if source != "explicit" else (),
                                   fallback=selected if source == "eligibility-fallback" else None,
@@ -1024,6 +1047,8 @@ def main(argv):
                         Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
                 except ProducerError as exc:
                     raise OwnerError(f"{exc.code}:{exc.detail}") from exc
+        if overridden:
+            forwarded += ["--explicit-adapter", overridden]
         child = subprocess.run([str(wrapper), *forwarded], env=child_env)
         return child.returncode
     except (OwnerError, OwnerRouteBindingError, OSError) as exc:

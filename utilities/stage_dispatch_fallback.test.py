@@ -1298,6 +1298,97 @@ class FallbackTest(unittest.TestCase):
        "claude":2,"opencode":9}):
    _hops,context=F.ordered_fallback_hops(route,node,self.jobs)
   self.assertEqual(context["rank"][:2],["opencode","claude"])
+ def _pinned_balanced_node(self):
+  return {
+   "kind":"pipeline-stage","harness_affinity":"claude",
+   "harness_policy":{"primary":["claude","codex"],"relief":["opencode"],
+                     "last_resort":[],"promote_relief_below":0},
+   "fallback_hops":[
+    {"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[
+     {"child_harness":"claude","status":"supported"}]},
+    {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[
+     {"child_harness":"codex","status":"supported"},
+     {"child_harness":"opencode","status":"supported"}]},
+    {"ordinal":3,"fallback_hop":"native-subagent","candidates":[]},
+    {"ordinal":4,"fallback_hop":"inline","candidates":[]},
+   ],
+  }
+ def _pinned_balanced_route(self,pin="claude",target="worker"):
+  route={"dispatch_allocation":{"strategy":"balanced","window":30,
+                                 "usage_gate_used_percent":90,
+                                 "harness_order":["claude","codex","opencode"]}}
+  if pin:
+   route["selection_pins"]={"contract_version":1,target:{"harness":pin,"model":None,"effort":None}}
+  return route
+ def test_a_sealed_worker_pin_stays_first_even_when_the_usage_gate_would_drop_it(self):
+  # The same node and scores as the affinity test above, but the route seals `--pin worker=claude`:
+  # claude is gated (5% headroom, not a limit) and still the first hop; the others keep their order.
+  node=self._pinned_balanced_node()
+  with mock.patch.object(F,"_usage_states",return_value={
+      "claude":"ok","codex":"ok","opencode":"ok"}), \
+      mock.patch.object(F.CAPACITY,"capacity_scores",return_value={
+       "claude":5,"codex":5,"opencode":80}):
+   hops,context=F.ordered_fallback_hops(self._pinned_balanced_route(),node,self.jobs)
+   self.assertEqual(context["rank"][0],"claude")
+   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"claude")
+   self.assertEqual(set(context["rank"]),{"claude","codex","opencode"})
+   # no pin, or a pin for another target: today's order (the gated affinity does not lead)
+   for route in (self._pinned_balanced_route(pin=None),
+                 self._pinned_balanced_route(pin="claude",target="owner"),
+                 self._pinned_balanced_route(pin="claude",target="frame")):
+    with self.subTest(route=sorted(route.get("selection_pins",{}))):
+     _hops,other=F.ordered_fallback_hops(route,node,self.jobs)
+     self.assertEqual(other["rank"][0],"opencode")
+ def test_a_sealed_worker_pin_that_is_at_its_limit_goes_to_the_tail_as_today(self):
+  node=self._pinned_balanced_node()
+  with mock.patch.object(F,"_usage_states",return_value={
+      "claude":"limited","codex":"ok","opencode":"ok"}), \
+      mock.patch.object(F.CAPACITY,"capacity_scores",return_value={
+       "claude":80,"codex":50,"opencode":50}):
+   hops,context=F.ordered_fallback_hops(self._pinned_balanced_route(),node,self.jobs)
+  self.assertNotIn("claude",context["rank"][:2])
+  self.assertEqual(context["limited"],["claude"])
+  skipped=[h["candidates"][0] for h in hops if h["candidates"] and h["candidates"][0].get("_allocation_skip")]
+  self.assertEqual([(c["child_harness"],c["_allocation_skip"]) for c in skipped],[("claude","usage-limited")])
+ def test_a_pinned_review_on_a_non_peer_harness_is_a_degraded_sole_gate_not_a_refusal(self):
+  parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"workspace-write"}
+  node={
+   "kind":"review-worker","harness_affinity":"opencode",
+   "harness_policy":{"primary":["claude","codex"],"relief":["opencode"],
+                     "last_resort":[],"promote_relief_below":35},
+   "fallback_hops":[
+    {"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[
+     {**parent,"child_harness":"claude","status":"supported"}]},
+    {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[
+     {**parent,"child_harness":"opencode","status":"supported"}]},
+    {"ordinal":3,"fallback_hop":"native-subagent","candidates":[]},
+    {"ordinal":4,"fallback_hop":"inline","candidates":[]},
+   ],
+  }
+  route={"dispatch_allocation":{"strategy":"balanced","window":30,"usage_gate_used_percent":90,
+                                 "harness_order":["claude","codex","opencode"]},
+   "owner_harness_policy":{"primary":["claude","codex"],"relief":["opencode"],
+                           "last_resort":[],"promote_relief_below":35},
+   "selection_pins":{"contract_version":1,"worker":{"harness":"opencode","model":None,"effort":None}},
+   "nodes":[
+    {"id":"plan","model_profile":"balanced-deep",
+     "harness_policy":{"primary":["claude","codex"],"relief":["opencode"],
+                       "last_resort":[],"promote_relief_below":35}},
+   ]}
+  scores={"claude":80,"codex":80,"opencode":5}   # the pinned opencode is gated, the peers are not
+  with mock.patch.object(F,"_usage_states",return_value=self._usage_states()), \
+       mock.patch.object(F.CAPACITY,"capacity_scores",return_value=scores):
+   hops,context=F.ordered_fallback_hops(route,node,self.jobs,parent_identity=parent)
+  self.assertEqual(hops[0]["candidates"][0]["child_harness"],"opencode")
+  self.assertEqual(context["sole_gate"],"degraded")
+  # the same route without the pin keeps the quality-peer harness first
+  del route["selection_pins"]
+  node["harness_affinity"]="diverse"
+  with mock.patch.object(F,"_usage_states",return_value=self._usage_states()), \
+       mock.patch.object(F.CAPACITY,"capacity_scores",return_value=scores):
+   hops,context=F.ordered_fallback_hops(route,node,self.jobs,parent_identity=parent)
+  self.assertEqual(hops[0]["candidates"][0]["child_harness"],"claude")
+  self.assertEqual(context["sole_gate"],"ok")
  def _shadowed_claude_node(self):
   # D7's live case reproduced on the third resolver: ordinal 1 seals a
   # foreign-parent (claude) same-harness claude row that would otherwise
