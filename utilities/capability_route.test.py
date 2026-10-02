@@ -3147,9 +3147,8 @@ class TestContinuation(unittest.TestCase):
   # there is no copy -- the guard calls this function.
   #
   # Scope of this claim (round 3, Q2): the route/guard pair, not the repo.
-  # `artifact-postscan.py` and `hooks/artifact-guard.sh` map the same scope
-  # words to artifact-root path patterns, which is an adjacent question ("what
-  # may this node write"), and both predate this branch verbatim.
+  # `hooks/artifact-guard.sh` maps the same scope words to artifact-root path
+  # patterns, which is an adjacent question ("what may this node write").
   # Within the guard process there is one object: the name it uses *is* the
   # route module's function. (This test file execs its own copy of the route
   # module, so `R`'s function is a different instance of the same definition --

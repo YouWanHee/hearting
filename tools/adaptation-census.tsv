@@ -10,7 +10,6 @@
 # script beside the checks that verify each projected link.
 list	name
 shared-utility-deferred	artifact-knowledge-feed.py
-shared-utility-deferred	artifact-pointer-bridge.py
 shared-utility-deferred	artifact-quiescence.py
 shared-utility-deferred	artifact-relocation-live.py
 shared-utility-deferred	artifact-relocation.py
@@ -55,7 +54,6 @@ shared-utility-deferred	spec_merge.py
 shared-utility-deferred	transcript_turn.py
 shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py
-utility-deferred	artifact-postscan.py
 utility-deferred	artifact-root.test.sh
 utility-deferred	artifact-sink.sh
 utility-deferred	artifact-sink.test.sh
@@ -193,7 +191,6 @@ utility-deferred	session_tidy.py
 utility-deferred	session_tidy_clear.py
 utility-deferred	session_tidy_runner.py
 utility-deferred	spec-transaction.py
-utility-deferred	spec_gate_evidence.py
 utility-deferred	spec_transaction.test.py
 utility-deferred	stage-dispatch-fallback.py
 utility-deferred	stage-session-chain.py
