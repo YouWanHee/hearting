@@ -923,7 +923,7 @@ def probe_namespace():
 
 class ProbeProgressTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.ns = probe_namespace()
@@ -965,11 +965,15 @@ class ProbeProgressTest(unittest.TestCase):
         size = log.stat().st_size
         with log.open("ab") as out:
             child = self.spawn(out, subprocess.DEVNULL)
+        fdinfo = Path("/proc/%d/fdinfo/1" % child.pid)
+        position = fdinfo.read_text().splitlines()[0]
         with mock.patch.object(os, "pread", wraps=os.pread) as pread:
             progress = self.progress(child)
         self.assertEqual(progress["line"], "step 9/10 loss=0.5")
         pread.assert_called_once()
         self.assertEqual(pread.call_args.args[1:], (4096, size - 4096))
+        # The trainer's own file offset is never moved by the probe.
+        self.assertEqual(fdinfo.read_text().splitlines()[0], position)
 
     def test_long_line_is_display_bounded(self):
         log = self.root / "long.log"
