@@ -9298,9 +9298,11 @@ def main():
             return 69
         if attempt!=a.attempt_id:
             result["redirected_from"]=a.attempt_id
-        if result.get("retained"):
-            # The owner had ended BLOCKED: its answer continues the route now, in the
-            # same call, through the one shared start (a replacement owner receives it).
+        from dispatch_owner_input import blocked_owner_answers
+        if a.message_file and (result.get("retained") or blocked_owner_answers(jobs,attempt)):
+            # The owner had ended BLOCKED (also when it ended just after this answer was
+            # queued): the answer continues the route now, in the same call, through the
+            # one shared start (a replacement owner receives it).
             result=_continue_after_answer(jobs,attempt,result)
         print(json.dumps(result,ensure_ascii=False))
         return 0

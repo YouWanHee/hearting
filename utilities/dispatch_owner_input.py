@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-from dispatch_completion_join import exact_attempt_row
+from dispatch_completion_join import JoinContractError, exact_attempt_row
 from dispatch_contract import supervisor_lease_is_held, supervisor_lease_path
 
 
@@ -173,6 +173,9 @@ def submit(jobs, attempt, text, request_id=None):
     with _locked(jobs, attempt) as (path, value):
         if value is None:
             raise InputError("owner-input-unsupported")
+        # Decide on the row as it is now, under the input lock: the owner may have
+        # ended (BLOCKED) since the first read, and an answer must then be kept.
+        row, target = _target(jobs, attempt)
         if value["target"] != target:
             raise InputError("owner-input-target-changed")
         for item in value["requests"]:
@@ -208,8 +211,16 @@ def _retained_fields(item):
                 "continues the work in a replacement owner that receives this answer first."}
 
 
+# Input no owner turn consumed: kept for an ended owner, or queued/undelivered when the owner
+# ended before its supervisor could hand it over. `delivery-unknown` may have been delivered.
+UNCONSUMED_STATES = frozenset({"retained", "queued", "undelivered"})
+
+
 def retained(jobs, attempt):
-    """Answers kept for an owner that ended BLOCKED, oldest first. Read-only."""
+    """Answers no owner turn consumed, oldest first. Read-only.
+
+    Once the owner ended BLOCKED these are the answers its continuation receives
+    (dispatch_replacement 'corrected'), including one queued just before it ended."""
     path = _path(jobs, attempt)
     if path.is_symlink():
         return []
@@ -221,7 +232,18 @@ def retained(jobs, attempt):
         return []
     return [{"id": item["id"], "digest": item["digest"], "text": item["text"]}
             for item in value.get("requests", [])
-            if isinstance(item, dict) and item.get("state") == "retained"]
+            if isinstance(item, dict) and item.get("state") in UNCONSUMED_STATES]
+
+
+def blocked_owner_answers(jobs, attempt):
+    """The unconsumed answers of an owner that has ended BLOCKED, read now; [] otherwise."""
+    try:
+        row, _ = _target(jobs, attempt)
+    except (InputError, JoinContractError, OSError, ValueError, KeyError):
+        return []
+    if not _answers_blocked_owner(row, supervisor_lease_is_held(jobs, row.metadata)):
+        return []
+    return retained(jobs, attempt)
 
 
 def initialize_owner_input(jobs, attempt, transport):

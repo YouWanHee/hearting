@@ -1493,7 +1493,7 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
         self.answer = Path(self.tmp.name) / "answer.md"; self.answer.write_text("approved: start the full run\n")
         self.route_path = Path(self.tmp.name) / "route.json"; self.route_path.write_text("{}")
 
-    def correct(self, *, submitted, receipt=None, current="att-owner"):
+    def correct(self, *, submitted, receipt=None, current="att-owner", blocked_answers=()):
         calls = []
         def start_work(route, path, jobs, **kwargs):
             calls.append((path, jobs))
@@ -1504,6 +1504,7 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
                 mock.patch.object(self.router, "_current_owner_attempt", return_value=current), \
                 mock.patch("dispatch_owner_input.submit", return_value=submitted) as submit, \
+                mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=list(blocked_answers)), \
                 mock.patch.object(W, "start_work", side_effect=start_work), \
                 mock.patch.object(W, "_rows", return_value={current: ("done", {"note": "dead-worker-blocked"})}), \
                 mock.patch("dispatch_replacement._route", return_value=(self.route_path, {})), \
@@ -1534,6 +1535,12 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
         code, result, calls, _ = self.correct(submitted={"request_id": "input-1", "duplicate": False})
         self.assertEqual((code, calls), (0, []))
         self.assertNotIn("correction", result)
+
+    def test_an_answer_queued_as_the_owner_ended_blocked_still_continues_the_route(self):
+        receipt = {"state": "running", "owner_attempt_id": "att-replacement", "parent_next": "end-turn"}
+        code, result, calls, _ = self.correct(submitted={"request_id": "input-1", "duplicate": False},
+                                              receipt=receipt, blocked_answers=[{"id": "input-1"}])
+        self.assertEqual((code, len(calls), result["state"]), (0, 1, "running"))
 
     def test_an_older_attempt_id_reaches_the_owner_doing_the_work_now(self):
         code, result, calls, submit = self.correct(submitted={"request_id": "input-1"}, current="att-replacement")

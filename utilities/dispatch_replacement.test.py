@@ -1167,6 +1167,20 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
+        import dispatch_owner_input as I
+        meta = {**self.meta, 'worker_type': 'owner'}
+        self.write(meta, 'open')
+        I.initialize_owner_input(self.jobs, 'att-source', 'claude-next-turn')
+        self.assertFalse(I.submit(self.jobs, 'att-source', 'approved: go', 'early').get('retained'))
+        self.write({**meta, 'note': 'dead-worker-blocked', 'failure_class': 'blocked'})
+        fields, row = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertEqual(R.death_kind(fields, row, jobs=self.jobs), R.CORRECTED)
+        record = self.claim()
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('approved: go', text)
+
     def test_a_changed_pinned_answer_is_refused_rather_than_sent(self):
         self._blocked_owner()
         self._answer()
