@@ -123,6 +123,21 @@ def read_proc_start(pid):
         return None
 
 
+def is_terminal_state(pid):
+    """True when /proc/<pid>/stat says the process is a zombie (`Z`) or dead (`X`).
+
+    An unreadable stat is no evidence either way: it returns False so a live process is never
+    hidden on missing evidence. The one small state test the session loop and `read_proc_start`
+    share the rule of.
+    """
+    try:
+        with open("/proc/%s/stat" % pid) as f:
+            data = f.read()
+        return data[data.rindex(")") + 1:].split()[0] in ("Z", "X")
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 _PROVENANCE_COMMS = (
     ("herdr", "herdr"),
     ("tmux", "terminal"), ("sshd", "terminal"), ("login", "terminal"),
@@ -608,6 +623,10 @@ def scan(harness_filter=None):
         try:
             pid = int(pid_s)
         except ValueError:
+            continue
+        # A defunct process (the shared Codex daemon never reaps the app-server children it
+        # replaced) has no cwd, environ or session: not a row.
+        if is_terminal_state(pid):
             continue
         cwd, orphan = _read_cwd(pid)
         # app-server companion marker: codex-only, literal "app-server" token in args.

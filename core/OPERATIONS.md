@@ -283,7 +283,16 @@ result. A registered parent advertises end-turn only with its exact live supervi
 lease. Claude and OpenCode use the same CLI session controller with native runtime
 drivers; the controller owns join, terminal commit, resume, and receipt acknowledgement. A selected child and Git checkout ancestry cannot substitute for parent
 identity. The parent runtime supplies its native session identity independently of the
-child adapter. Dispatch carries the issued producer cycle and a concrete output
+child adapter. A harness runtime clears the inherited `AGENT_DISPATCH_CALLER_HARNESS` and every other
+harness's native session ID from its own tool commands; its own native session ID, set by
+the runtime itself, then identifies it. It does this through its installed native config
+surface, so a name or ID inherited from whichever process started it (a pane, a launcher,
+or a shared service such as the Codex app-server daemon) does not survive into its tool
+commands, and no harness exports a name that could go stale in a process its shell starts.
+On a host where only some harnesses carry the config the result is an ambiguous caller,
+not a wrong one. The shared resolver follows an explicit name (a per-command override or
+a registered worker's marker) and refuses an unnamed mixed environment; launchers carry no
+identity logic. Dispatch carries the issued producer cycle and a concrete output
 directory in both environment and prompt. The producer record owns that path;
 write admission and completion publication use the same cycle binding. A missing
 cycle environment can be recovered from the route's producer record. Refusals
@@ -586,8 +595,11 @@ release. After `frame_interview.py validate-answers` and `render-intent`, run
 `workflow-supervisor.py release --route <route> --gate frame-review --decision
 proceed --answers <file>`, then launches the owner with `Intent: <absolute path>`.
 
-Quick refine's one conductor raises `preview-disposition` before apply.
-Target writes require user release of the current preview digest;
+New refine starts carry complete or report scope in the existing start choice.
+Report ends after review and the preview, before source snapshot or apply;
+complete proceeds through the existing review and verification without asking
+for a second entry approval. Older sealed quick routes retain their
+`preview-disposition` release and current-preview digest checks;
 `capabilities/autopilot-refine.md` owns the commands.
 
 ### §5.11. Commit and Push Policy for `<agent-home>`
@@ -919,6 +931,13 @@ and `correct` reports `owner-input-unsupported` before queueing; an owner
 already running under an older supervisor behaves the same way.
 Corrections preserve route, completion and cleanup evidence; completed-prefix
 reuse uses the existing `continuation` compiler rather than a fresh recipe.
+
+Newly compiled owner continuation budgets use one finite workload formula that
+accounts for declared nodes, unique retry boundaries, the review-round cap and
+terminal nodes. The separate workload floor applies only to newly derived
+budgets; valid older sealed budgets remain valid. The reserved continuation is
+for terminal handoff after ordinary work is exhausted and does not itself
+guarantee an unfinished report node.
 
 A steward is informally depth −1; not a dispatch depth. This role carries no launch,
 gate, write, or approval authority over the session it addresses — its peer messages are

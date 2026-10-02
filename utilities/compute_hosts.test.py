@@ -647,6 +647,33 @@ class ComputeHostsTest(unittest.TestCase):
             self.assertIsInstance(other["pgid"], int)
             self.assertIsInstance(other["proc_start"], int)
 
+    def test_gpu_probe_reports_progress_only_for_file_redirected_output(self):
+        log = self.root / "train.log"
+        with log.open("wb") as handle:
+            handle.write(b"TRAIN:  10%|#    | 10/100 [00:01<00:09]\r"
+                         b"TRAIN:  11%|#    | 11/100 [00:01<00:09]\n")
+        with log.open("ab") as out:
+            to_file = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                stdout=out, stderr=out)
+        to_pipe = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            payload = self._probe_with_fake_smi(
+                [["GPU-A", to_file.pid, "python", 512],
+                 ["GPU-A", to_pipe.pid, "python", 256]], "progress-bin")
+        finally:
+            for child in (to_file, to_pipe):
+                child.terminate()
+                child.wait(timeout=2)
+            to_pipe.stdout.close()
+        by_pid = {row["pid"]: row for row in payload["gpus"][0]["processes"]}
+        progress = by_pid[to_file.pid]["progress"]
+        self.assertEqual(progress["line"], "TRAIN: 11%|# | 11/100 [00:01<00:09]")
+        self.assertIsInstance(progress["age_s"], int)
+        self.assertNotIn("progress", by_pid[to_pipe.pid])
+
     def test_persistent_claim_reconnects_a_detached_root_to_its_session(self):
         module = load_module()
         fakebin = self.root / "claim-bin"
@@ -766,6 +793,231 @@ class ComputeHostsTest(unittest.TestCase):
             self.assertIsNone(conflict_process["owner"])
             self.assertEqual(conflict_process["attribution_reason"],
                              "ambiguous-session")
+
+    def test_stop_records_sigterm_exit_and_reason(self):
+        # `stop` kills the tmux session before the run shell can write its
+        # own exit code; the stop itself must leave 143 + a reason behind.
+        result = self.run_tool("run", "here", "--name", "stopme", "--",
+                               "bash", "-c", "sleep 30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        try:
+            for _ in range(50):
+                check = subprocess.run(
+                    ["tmux", "has-session", "-t", run_id],
+                    capture_output=True, timeout=5)
+                if check.returncode == 0:
+                    break
+                time.sleep(0.1)
+            stopped = self.run_tool("stop", run_id)
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertIn("stopped", stopped.stdout)
+            run_dir = self.run_root / run_id
+            for _ in range(50):
+                if (run_dir / "exit_code").is_file():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(
+                (run_dir / "exit_code").read_text(encoding="utf-8").strip(),
+                "143")
+            self.assertEqual(
+                (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
+                "stopped")
+            listed = self.run_tool("runs")
+            self.assertIn("exit 143 (stopped)", listed.stdout)
+            payload = json.loads(self.run_tool("runs", "--json").stdout)
+            row = next(item for item in payload if item["run_id"] == run_id)
+            self.assertEqual(row["exit_code"], 143)
+            self.assertEqual(row["stop_reason"], "stopped")
+            self.assertEqual(row["state"], "finished")
+            tail = self.run_tool("tail", run_id)
+            self.assertIn("exit 143 (stopped)", tail.stdout)
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", run_id],
+                           capture_output=True, timeout=5)
+
+    def test_stop_never_overwrites_a_natural_finish(self):
+        run_dir = self.run_root / "natural-20261002-000001-done"
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": run_dir.name, "host": "here",
+                        "command": ["true"]}), encoding="utf-8")
+        (run_dir / "exit_code").write_text("0\n", encoding="utf-8")
+        stopped = self.run_tool("stop", run_dir.name)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(
+            (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "0")
+        self.assertFalse((run_dir / "stop_reason").exists())
+
+    def test_runs_marks_a_gone_session_stopped_without_writing(self):
+        # Legacy runs stopped before this fix have no exit file and no
+        # tmux session left: `runs` must show them cleaned, read-only.
+        run_dir = self.run_root / "legacy-20261002-000001-stale"
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": run_dir.name, "host": "here",
+                        "command": ["bash", "-c", "sleep 30"]}),
+            encoding="utf-8")
+        listed = self.run_tool("runs")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("stopped (gone)", listed.stdout)
+        self.assertFalse((run_dir / "exit_code").exists())
+        payload = json.loads(self.run_tool("runs", "--json").stdout)
+        row = next(item for item in payload if item["run_id"] == run_dir.name)
+        self.assertIsNone(row["exit_code"])
+        self.assertEqual(row["state"], "stopped")
+        self.assertTrue(row["stale"])
+        # An explicit stop then seals the legacy run the same way as new ones.
+        stopped = self.run_tool("stop", run_dir.name)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(
+            (run_dir / "exit_code").read_text(encoding="utf-8").strip(), "143")
+        self.assertEqual(
+            (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
+            "stopped")
+
+    def test_runs_stays_running_when_session_state_is_unknown(self):
+        module = load_module()
+        run_dir = self.run_root / "unknown-20261002-000001-live"
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": run_dir.name, "host": "here",
+                        "command": ["bash", "-c", "sleep 30"]}),
+            encoding="utf-8")
+        with mock.patch.object(module, "_tmux_session_alive", return_value=None):
+            config = module.load_config(str(self.config))
+            state = module._run_state(config, run_dir.name)
+            self.assertEqual(state["state"], "running")
+            self.assertIsNone(module._tmux_session_alive(object(), "x"))
+        listed = self.run_tool("runs", "--host", "here")
+        # With real tmux present and no such session this row shows stale;
+        # the unit point above is that unknown (None) never declares gone.
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+
+    def test_record_stop_writes_once_and_keeps_a_natural_exit(self):
+        module = load_module()
+        run_dir = self.root / "record-once"
+        self.assertTrue(module._record_stop(run_dir))
+        self.assertEqual((run_dir / "exit_code").read_text(
+            encoding="utf-8").strip(), "143")
+        self.assertEqual((run_dir / "stop_reason").read_text(
+            encoding="utf-8").strip(), "stopped")
+        self.assertFalse(module._record_stop(run_dir))
+        natural = self.root / "record-natural"
+        natural.mkdir(parents=True)
+        (natural / "exit_code").write_text("3\n", encoding="utf-8")
+        self.assertFalse(module._record_stop(natural))
+        self.assertEqual((natural / "exit_code").read_text(
+            encoding="utf-8").strip(), "3")
+        self.assertFalse((natural / "stop_reason").exists())
+
+
+def probe_namespace():
+    """The probe script's helper functions, without running its collection body."""
+    source = load_module().PROBE_SCRIPT.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace = {}
+    exec(compile(source.split("\ncpu_count = os.cpu_count()", 1)[0],
+                 "<probe-helpers>", "exec"), namespace)
+    return namespace
+
+
+class ProbeProgressTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.ns = probe_namespace()
+
+    def spawn(self, stdout, stderr):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"],
+                                 stdout=stdout, stderr=stderr)
+        if child.stdout is not None:
+            self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait, 2)
+        self.addCleanup(child.terminate)
+        return child
+
+    def progress(self, child):
+        return self.ns["process_progress"](child.pid, self.ns["proc_stat"](child.pid)["start"])
+
+    def test_latest_regular_file_wins_and_tqdm_line_is_clean(self):
+        older = self.root / "out.log"
+        newer = self.root / "err.log"
+        older.write_bytes(b"epoch 1 done\n")
+        newer.write_bytes(
+            b"loading\n"
+            b"TRAIN:  51%|\x1b[33m\xe2\x96\x88\x1b[0m| 10458/20000 [46:49<47:30, 3.3batch/s]\r"
+            b"TRAIN:  52%|\x1b[33m\xe2\x96\x88\x1b[0m| 10459/20000 [46:50<47:21,  3.36batch/s]"
+            b" , L_se=6.77e-03\x1b]0;title\x07\r\r")
+        os.utime(older, (time.time() - 600, time.time() - 600))
+        with older.open("ab") as out, newer.open("ab") as err:
+            child = self.spawn(out, err)
+        progress = self.progress(child)
+        self.assertEqual(progress["line"],
+                         "TRAIN: 52%|\u2588| 10459/20000 [46:50<47:21, 3.36batch/s] , L_se=6.77e-03")
+        self.assertTrue(0 <= progress["age_s"] < 60, progress)
+
+    def test_only_the_tail_of_a_large_file_is_read(self):
+        log = self.root / "big.log"
+        with log.open("wb") as handle:
+            handle.write((b"x" * 1023 + b"\n") * 2048)
+            handle.write(b"step 9/10 loss=0.5\n")
+        size = log.stat().st_size
+        with log.open("ab") as out:
+            child = self.spawn(out, subprocess.DEVNULL)
+        fdinfo = Path("/proc/%d/fdinfo/1" % child.pid)
+        position = fdinfo.read_text().splitlines()[0]
+        with mock.patch.object(os, "pread", wraps=os.pread) as pread:
+            progress = self.progress(child)
+        self.assertEqual(progress["line"], "step 9/10 loss=0.5")
+        pread.assert_called_once()
+        self.assertEqual(pread.call_args.args[1:], (4096, size - 4096))
+        # The trainer's own file offset is never moved by the probe.
+        self.assertEqual(fdinfo.read_text().splitlines()[0], position)
+
+    def test_long_line_is_display_bounded(self):
+        log = self.root / "long.log"
+        log.write_bytes(b"a" * 3000 + b"\n")
+        with log.open("ab") as out:
+            child = self.spawn(out, out)
+        self.assertEqual(self.progress(child)["line"], "a" * 200)
+
+    def test_pipe_tty_and_device_outputs_have_no_progress(self):
+        piped = self.spawn(subprocess.PIPE, subprocess.DEVNULL)
+        self.assertIsNone(self.progress(piped))
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        try:
+            tty = self.spawn(slave, slave)
+        finally:
+            os.close(slave)
+        self.assertIsNone(self.progress(tty))
+
+    def test_stale_output_reports_its_age(self):
+        log = self.root / "stale.log"
+        log.write_bytes(b"TRAIN: 5%|#| 1/20 [00:01<00:19]\n")
+        os.utime(log, (time.time() - 900, time.time() - 900))
+        with log.open("ab") as out:
+            child = self.spawn(out, out)
+        self.assertGreaterEqual(self.progress(child)["age_s"], 899)
+
+    def test_read_failures_and_identity_changes_are_fail_soft(self):
+        log = self.root / "train.log"
+        log.write_bytes(b"step 1\n")
+        other = self.root / "other.log"
+        other.write_bytes(b"step 2\n")
+        with log.open("ab") as out:
+            child = self.spawn(out, out)
+        start = self.ns["proc_stat"](child.pid)["start"]
+        with mock.patch.object(os, "open", side_effect=PermissionError("denied")):
+            self.assertIsNone(self.ns["process_progress"](child.pid, start))
+        with mock.patch.object(os, "pread", side_effect=OSError("io")):
+            self.assertIsNone(self.ns["process_progress"](child.pid, start))
+        with mock.patch.object(os, "fstat", return_value=other.stat()):
+            self.assertIsNone(self.ns["process_progress"](child.pid, start))
+        self.assertIsNone(self.ns["process_progress"](child.pid, start + 1))
+        self.ns["same_euid"] = mock.Mock(return_value=False)
+        self.assertIsNone(self.ns["process_progress"](child.pid, start))
 
 
 if __name__ == "__main__":

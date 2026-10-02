@@ -145,6 +145,19 @@ class ValidationBase(F.FramedBase):
         return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*") if p.is_file())
 
 
+class EntryExecutionScopeTest(ValidationBase):
+    def test_proposal_scope_is_optional_and_validated(self):
+        proposal = {"legs": [LAB_SETUP], "entry_approvals": [], "execution_scope": "report"}
+        facts = RP.validate_proposal(proposal, compile_leg=self.compile,
+                                     start_approvals=R.route_start_approvals)
+        self.assertEqual(facts["execution_scope"], "report")
+        self.assertEqual(RP.validate_proposal({"legs": [LAB_SETUP], "entry_approvals": []}, compile_leg=self.compile,
+                                              start_approvals=R.route_start_approvals)["execution_scope"], "complete")
+        with self.assertRaises(RP.ProposalError):
+            RP.validate_proposal({"legs": [LAB_SETUP], "entry_approvals": [], "execution_scope": "deploy"},
+                                 compile_leg=self.compile, start_approvals=R.route_start_approvals)
+
+
 class ProposalValidationTest(ValidationBase):
     def write_brief(self, legs, **kw):
         path = self.output / "shards/frame/direction-brief.md"

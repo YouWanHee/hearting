@@ -90,6 +90,12 @@ Adapters must preserve the portable invariants relevant to this capability:
 
 ### Setup does not end at the training process
 
+The existing start choice may select `report`, which ends successfully after
+scaffold, smoke, and the existing hash-bound attestation; it omits full-run and
+all later work. `complete` retains the supervised resource run, verification,
+and recorded handoff. Smoke attestation, config provenance, and supervision
+remain required.
+
 The `setup` stage graph is `scaffold → smoke → full-run → run-verify → handoff`.
 `full-run` is a detached resource run, so it declares the `supervised`
 continuation and can never be the workflow terminal: the continuation supervisor

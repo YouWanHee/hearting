@@ -11,6 +11,13 @@ acknowledges notifications and reconciles exact worker outcomes; inspect the
 reported evidence and decide the authorized next work. Synthesize one owner artifact. Do not
 merge, push, clean worktrees, or create dispatch depth 3.
 
+When an entry part has `start_approval`, carry the user's complete or report
+choice from the existing start confirmation into the intent, decision record,
+and work request. Complete the selected scope without asking for another
+entry approval. Report ends at that capability's declared report point and
+does not start an excluded tail or next leg. Decline, off-menu, and unanswered
+remain no-start outcomes. Older sealed routes keep their recorded gates.
+
 New registered route owners carry `workflow_completion=runtime-v1`. Finish the
 declared work, write the report in the supplied cycle and return its final handoff.
 The completion controller owns workflow completion, route closure and report

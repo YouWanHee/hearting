@@ -41,10 +41,6 @@ if [ -n "$missing_tools" ]; then
 fi
 
 # Outputs belong to this run's mktemp directory, including across clones.
-# Keep the separate source lock: tools/adaptation-guard.test.sh temporarily
-# rewrites tracked adapter files that this suite reads.
-. "$ROOT/tools/worktree-lock.sh"
-worktree_lock_acquire "$ROOT" 900 || exit 70
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -3109,12 +3105,17 @@ await plugin["shell.env"]({ cwd: "$TMP/repo", sessionID: "opencode-shell-env-sid
 const withoutSid = {}
 await plugin["shell.env"]({ cwd: "$TMP/repo" }, withoutSid)
 if (withSid.env.OPENCODE_SESSION_ID !== "opencode-shell-env-sid") process.exit(1)
-if (withoutSid.env) process.exit(1)
+if (!withoutSid.env) process.exit(1)
+if ("OPENCODE_SESSION_ID" in withoutSid.env) process.exit(1)
+if ("AGENT_DISPATCH_CURRENT_HARNESS" in withSid.env || "AGENT_DISPATCH_CURRENT_HARNESS" in withoutSid.env) process.exit(1)
+for (const key of ["AGENT_DISPATCH_CALLER_HARNESS", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"]) {
+  if (withSid.env[key] !== "" || withoutSid.env[key] !== "") process.exit(1)
+}
 EOF
 then
-  ok "opencode plugin shell.env sets OPENCODE_SESSION_ID only for a nonempty sessionID"
+  ok "opencode plugin shell.env blanks the inherited caller name and foreign session IDs, and sets OPENCODE_SESSION_ID only for a nonempty sessionID"
 else
-  bad "opencode plugin shell.env should set OPENCODE_SESSION_ID only for a nonempty sessionID"
+  bad "opencode plugin shell.env should blank the inherited caller name and foreign session IDs, and set OPENCODE_SESSION_ID only for a nonempty sessionID"
 fi
 
 echo "== opencode capability mapping =="

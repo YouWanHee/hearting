@@ -105,6 +105,14 @@ posture only — no secrets and no machine-specific absolute project paths (the
 merge the relevant lines into `$CODEX_HOME/config.toml` on the target machine.
 (codex-adapter-parity audit P-15: gap closed.)
 
+Harness self-identity is the one fragment runtime activation does apply:
+`adapters/codex/config/harness-identity.toml` (`[shell_environment_policy.filters]`) makes Codex
+tool commands drop the inherited `AGENT_DISPATCH_CALLER_HARNESS` and Claude/OpenCode session
+IDs, so the thread's own `CODEX_THREAD_ID` identifies it even when a shared app-server
+daemon was started from another harness's shell. Nothing is exported that names a harness. Activation merges it into `$CODEX_HOME/config.toml` as one delimited managed block
+and reports a policy it cannot merge safely as `config-conflict:`; a new Codex thread picks
+it up, no daemon restart is needed.
+
 Interactive Codex uses its native launcher and user-owned permission settings.
 Hearting no longer inserts a managed gateway or changes interactive permission
 posture. Registered headless work keeps its separately checked permission and
@@ -354,6 +362,7 @@ notice as the conversational fallback; the client owns question styling.
 | Portable invariant | Codex adaptation requirement |
 |---|---|
 | design post-write verification | Run `adapters/codex/bin/preflight.sh design <file>` after design HTML writes |
+| route presence gate | `hooks.json` `PreToolUse` on `Write|Edit|MultiEdit|apply_patch|functions.apply_patch|Bash|Shell|functions.exec_command` runs `adapters/codex/hooks/route-presence-gate.py` (through `run-hook.sh`), which execs `utilities/route_presence_gate.py --codex`; a refusal is `{"decision":"block","reason":…}`. The payload `session_id` is the thread id the route-chain writer records from `CODEX_THREAD_ID`; `exec_command` is judged in its `workdir`. Like every `hooks.json` change, the new entry needs Codex's current-hash hook trust before it runs (`hook-trust-status.py`); until then the gate is simply absent, never blocking |
 | routing-contract signal | `adapters/codex/bin/preflight.sh prompt-signal [cwd] [session-id]` is the worker-startup/manual subcommand carrying the full routing contract; run it manually when no automatic hook is attached |
 | token/context pressure | `preflight.sh token-budget [cwd] [session-id] [kv|json|hook]` reads an exact Codex rollout session and keeps active context, exact directive bytes, and cumulative raw counters separate. `kv`/`json` are read-only L2 accounting diagnostics. Unknown/degraded signals fail open. `hook` remains transition-only and byte-identical; its parent lifecycle is the single exactly-once accounting authority for success/timeout/error and writes only a bounded content-free sha256-session aggregate under XDG state. `utilities/token-budget-experiment.py` is an explicit isolated `offline-forecast-v1` replay/evaluator: production hooks/preflight do not import or activate it, its maximum verdict is `eligible_for_user_review`, adoption stays `pending_user_decision`, and it never writes config. Native rollout-budget ownership requires `AGENT_TOKEN_BUDGET_NATIVE_VALIDATED=1` only after feature + no-side-effect config probes pass; local Codex 0.144.3 reports the feature under development and disabled, so exact-session rollout observation remains the fallback. The adapter never writes `$CODEX_HOME/config.toml` |
 | memory inject | Run `adapters/codex/bin/preflight.sh memory [cwd]` for plain-text memory injection; Codex SessionStart hook emission is opt-in via `CODEX_SESSION_MEMORY_INJECT=1` |
