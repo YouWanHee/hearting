@@ -3443,6 +3443,76 @@ def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False
             "proof_source": proof.source, "receipt_digest": digest if changed else ""}
 
 
+def resolve_residue_drain(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
+    """Repeat the reap watcher's drain observation for a residue-sealed open row."""
+    try:
+        return _resolve_residue_drain(Path(jobs), attempt_id, apply=apply)
+    except (OSError, ValueError, DispatchContractError) as error:
+        return {"attempt_id": attempt_id, "state": "unverifiable", "changed": False,
+                "live_pids": [], "reason": getattr(error, "reason", "residue-observation-unavailable")}
+
+
+def _resolve_residue_drain(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
+    """Observe a residue-sealed open row again; record the watcher's clean drain once it is empty.
+
+    The watcher seals ``attempt-tagged-residue-v1`` and exits, so nobody sees
+    the survivors leave. This makes the same group and tagged-descendant
+    observation from the recording namespace and, only when both are empty,
+    writes the two keys the watcher itself writes for a clean drain. It creates
+    no new evidence kind; residue history stays on the row. Observations run
+    outside the registry lock; the write is one compare-and-set.
+    """
+    matches = [line.split("\t") for line in jobs.read_text(encoding="utf-8").splitlines()
+               if len(line.split("\t")) == 6
+               and row_has_attempt(line.split("\t")[5], attempt_id)]
+    result: dict[str, object] = {"attempt_id": attempt_id, "state": "not-applicable",
+                                 "changed": False, "live_pids": []}
+    if len(matches) != 1:
+        return {**result, "reason": "residue-row-not-unique"}
+    fields = matches[0]
+    metadata = parse_registry_metadata(fields[5])
+    if fields[1] not in {"open", "running"}:
+        return {**result, "reason": "residue-open-row-required"}
+    validate_attempt_metadata(metadata)
+    if not _tagged_residue_receipt(metadata):
+        return {**result, "reason": "residue-receipt-absent"}
+    if (process_namespace_identity() != metadata["pid_observer_ns"]
+            or not attempt_scan_namespace_authority(metadata)):
+        return {**result, "state": "unverifiable", "reason": "residue-observer-namespace-mismatch"}
+    pid, pgid, start = metadata.get("pid", ""), metadata.get("pgid", ""), metadata.get("pid_start", "")
+    if not (pid.isdecimal() and pgid == pid and start):
+        return {**result, "state": "unverifiable", "reason": "residue-identity-invalid"}
+    if process_start_ticks(int(pid)) == start:
+        return {**result, "state": "live", "reason": "governed-leader-live"}
+    group = process_group_observation(int(pgid))
+    descendants = attempt_tagged_descendants(metadata)
+    if "unverifiable" in {group.state, descendants.state}:
+        return {**result, "state": "unverifiable",
+                "reason": "residue-scan-unverifiable:" + (group.reason or descendants.reason)}
+    if descendants.state == "populated":
+        # Display pids come from the tag scan only: a reused pgid must not
+        # present an unrelated process as something the worker left behind.
+        return {**result, "state": "residue-live", "reason": "attempt-descendant-live",
+                "live_pids": [member[0] for member in descendants.members][:16]}
+    if group.state == "populated":
+        return {**result, "state": "live", "reason": "governed-group-live"}
+    values = {"attempt_descendant_proof": ATTEMPT_DESCENDANT_PROOF,
+              "attempt_descendant_observer_ns": metadata["pid_observer_ns"]}
+    if not apply:
+        return {**result, "state": "drained", "reason": "residue-drain-proof-available"}
+    changed = annotate_attempt_row_if(jobs, attempt_id, values, lambda fresh: fresh == fields)
+    return {**result, "state": "drained", "changed": changed,
+            "reason": "residue-drain-refreshed" if changed else "residue-row-changed"}
+
+
+def residue_live_pids(metadata: dict[str, str]) -> tuple[int, ...]:
+    """Display-only: tagged survivors of a residue-sealed attempt that are still running."""
+    if not _tagged_residue_receipt(metadata):
+        return ()
+    probe = attempt_tagged_descendants(metadata)
+    return tuple(member[0] for member in probe.members) if probe.state == "populated" else ()
+
+
 def attempt_process_quiescence(
     metadata: dict[str, str], *, terminal_receipt: bool = False
 ) -> ProcessQuiescence:

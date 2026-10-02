@@ -243,6 +243,25 @@ def notice_is_current(record: dict) -> bool:
     return _pending(rows, receipt["monitored_attempt_ids"], Path(receipt["job_registry"]), receipt["reason"])
 
 
+def _residue_text(receipt: dict) -> str:
+    """Name survivors a finished worker left running; display only, empty when none."""
+    try:
+        from dispatch_contract import residue_live_pids
+        rows = _rows(Path(receipt["job_registry"]))
+    except (OSError, ValueError, SupervisionError):
+        return ""
+    parts = []
+    for aid in receipt["monitored_attempt_ids"]:
+        pids = residue_live_pids(rows[aid][1]) if aid in rows else ()
+        if pids:
+            parts.append(f"{aid} finished, but the worker left process pid "
+                         f"{', '.join(map(str, pids[:4]))} running")
+    if not parts:
+        return ""
+    return (" " + "; ".join(parts) + ". The row closes by itself once that process exits; "
+            "stop it if it is no longer needed. Nothing is signalled automatically.")
+
+
 def render_text(receipt: dict) -> str:
     receipt = validate(receipt)
     if receipt["reason"] == "owner-input-undelivered":
@@ -301,7 +320,8 @@ def render_text(receipt: dict) -> str:
             "The controller retains waiting/recovery responsibility. Explain the blockage to the user "
             "and inspect these exact attempts. Do not infer death, erase rows, or retry from this notice. "
             + disposition +
-            "an accepted notification does not close the work. Read-only diagnosis: " + " ; ".join(commands))
+            "an accepted notification does not close the work. Read-only diagnosis: " + " ; ".join(commands)
+            + _residue_text(receipt))
 
 
 def context(receipt: dict, delivery_id: str) -> dict:

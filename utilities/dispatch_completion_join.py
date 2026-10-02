@@ -58,8 +58,11 @@ from dispatch_contract import (  # noqa: E402
     parse_registry_metadata,
     process_identity_disposition,
     reconcile_attempt_terminal,
+    residue_live_pids,
     resolve_attempt_cleanup,
+    resolve_residue_drain,
     row_is_subsession,
+    tagged_residue_receipt,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 import dispatch_subsession_advance as subsession_advance  # noqa: E402
@@ -3006,7 +3009,8 @@ def read_join_observation(jobs: Path, identity: dict[str, str], *, now: float | 
 
 
 def write_join_observation(jobs: Path, identity: dict[str, str], children: list[dict],
-                           *, elapsed: float, recovery_results: dict) -> None:
+                           *, elapsed: float, recovery_results: dict,
+                           residue_pids: dict[str, list[int]] | None = None) -> None:
     """Publish bounded diagnostics separately from the completion receipt."""
     pending = [child for child in children if child["readiness"] == "pending"]
     attention = elapsed >= 30 and any(child["reason"] == "process-unverifiable" for child in pending)
@@ -3015,7 +3019,9 @@ def write_join_observation(jobs: Path, identity: dict[str, str], children: list[
              "elapsed_seconds": round(elapsed, 1),
              "pending_count": len(pending),
              "children": [{"attempt_id": child["attempt_id"], "reason": child["reason"],
-                           "recovery_reason": recovery_results.get(child["attempt_id"], {}).get("reason", "")}
+                           "recovery_reason": recovery_results.get(child["attempt_id"], {}).get("reason", ""),
+                           **({"residue_pids": residue_pids[child["attempt_id"]]}
+                              if (residue_pids or {}).get(child["attempt_id"]) else {})}
                           for child in pending[:16]]}
     path = join_observation_path(jobs, identity)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3068,6 +3074,13 @@ def recover_receiptless_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
     """
     if row.status not in OPEN_STATES:
         return resolve_attempt_cleanup(jobs, row.attempt_id, apply=True)
+    if tagged_residue_receipt(row.metadata):
+        drain = resolve_residue_drain(jobs, row.attempt_id, apply=True)
+        if drain.get("changed") is True:
+            # The watcher's own drain observation, repeated now that the residue
+            # it recorded is gone. The existing close path runs on the next tick.
+            return {"attempt_id": row.attempt_id, "closed": False, "changed": True,
+                    "reason": "residue-drain-refreshed"}
     exact = reconcile_exact_dead_attempt(jobs, row)
     if exact["closed"]:
         # A closed row can still lack its namespace cleanup proof. Settle the
@@ -3356,8 +3369,17 @@ def _join_snapshot(
         if observation_jobs is not None and (signature != last_signature
                 or time.monotonic() - last_observation >= 30):
             try:
+                # Display only: name the survivors a finished worker left running.
+                residue_pids = {
+                    row.attempt_id: list(residue_live_pids(row.metadata))[:16]
+                    for row in rows
+                    if tagged_residue_receipt(row.metadata)
+                    and any(child["attempt_id"] == row.attempt_id
+                            and child["reason"] == "process-alive" for child in children)
+                }
                 write_join_observation(observation_jobs, identity, children,
-                                       elapsed=elapsed, recovery_results=recovery_results)
+                                       elapsed=elapsed, recovery_results=recovery_results,
+                                       residue_pids=residue_pids)
                 observation_error = ""
             except OSError:
                 # A display record never owns the child's lifetime or verdict.

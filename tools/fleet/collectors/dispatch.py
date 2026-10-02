@@ -43,6 +43,8 @@ from dispatch_contract import (  # noqa: E402
     resolve_parent_extinction,
     resolve_agent_home,
     process_table_scan_scope,
+    residue_live_pids,
+    tagged_residue_receipt,
 )
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
@@ -973,6 +975,15 @@ def _dispatch_liveness(job, now, track=True, codex_index=None):
     state, evidence = model.classify_job(ev_in, now,
                                          key=("j", job.slug) if track else None)
     job.state_evidence = evidence
+    if (common_observation and common_observation.process_state == "live"
+            and isinstance(registry_metadata, dict)
+            and tagged_residue_receipt(registry_metadata)):
+        # The worker finished but left a tagged process running: say which one
+        # so a person knows what to stop. The state itself is not changed.
+        pids = residue_live_pids(registry_metadata)
+        if pids:
+            job.residue_pids = list(pids[:4])
+            job.state_evidence = {**evidence, "residue_pids": job.residue_pids}
     if common_observation and common_observation.state == "reconcile-needed":
         job.stage = "reconcile-needed"
         job.note = "reconcile-needed"

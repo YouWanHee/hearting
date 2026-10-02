@@ -2078,6 +2078,100 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertIn("receipt-recovery-mode-conflict",result.stdout)
 
 
+class DetachedResidueDrainReconcileTest(unittest.TestCase):
+ """stale-residue-1002: a residue seal whose survivors are gone must not stay `terminal-draining`."""
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+  self.base=Path(self.tmp.name);self.jobs=self.base/"jobs.log"
+  self.attempt="att-residue-reconcile"
+  self.repo=self.base/"repo";self.repo.mkdir()
+  root=self.repo/".agent_reports";root.mkdir()
+  artifact=root/"slice.md";artifact.write_text("finished slice\n")
+  self.log=self.base/f"slice.{self.attempt}.codex.jsonl"
+  self.log.write_text(
+   json.dumps({"type":"item.completed","item":{"type":"agent_message",
+    "text":f"artifact: {artifact}\nverdict: PASS\nblocker: none"}})+"\n"
+   +json.dumps({"type":"turn.completed"})+"\n")
+  ns=D.process_namespace_identity()
+  self.jobs.write_text(
+   f"2026-10-02T04:00:00Z\topen\t{self.repo}\t{self.repo}\tslice\t"
+   f"{CURRENT_ATTEMPT_CONTRACT},worker_type=stage,route_id=rt-residue,route_node=execute,"
+   f"route_file={self.base}/route.json,attempt_id={self.attempt},pid=99999996,pid_start=1,"
+   f"pgid=99999996,pid_scope=namespace-local,pid_ns={ns},pid_observer_ns={ns},"
+   f"launch_lifecycle=detached,log_file={self.log},artifact_root={root},"
+   f"launch_outcome=governed-process-group-drained,group_reap_proof={D.GROUP_REAP_PROOF},"
+   f"group_reap_pgid=99999996,attempt_descendant_proof={D.ATTEMPT_DESCENDANT_RESIDUE_PROOF},"
+   f"attempt_descendant_residue=99999997:2,attempt_descendant_residue_count=1,"
+   f"attempt_descendant_residue_basis=terminal-envelope,"
+   f"attempt_descendant_residue_at=2026-10-02T04:05:30Z,attempt_descendant_observer_ns={ns}\n")
+  spec=importlib.util.spec_from_file_location("dispatch_registry_residue",SCRIPT)
+  self.registry=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.registry)
+
+ def run_reconcile(self,*flags):
+  out=io.StringIO()
+  with contextlib.redirect_stdout(out):
+   code=self.registry.main(["dispatch-registry.py","reconcile","--jobs",str(self.jobs),
+                            "--attempt",self.attempt,"--agent-home",str(self.base),*flags])
+  return code,out.getvalue()
+
+ def decision(self,*flags):
+  code,text=self.run_reconcile(*flags)
+  self.assertEqual(code,0,text)
+  return json.loads(text)["decisions"][0]
+
+ def row_metadata(self):
+  return parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+
+ def test_the_stall_is_terminal_draining_before_any_upgrade(self):
+  rows=self.registry.read_rows(self.jobs)
+  newest={}
+  category,reason,_note=self.registry.classify(rows[0],types.SimpleNamespace(
+   attempt=self.attempt,agent_home=self.base,jobs=self.jobs,now=time.time(),apply=False),newest,rows)
+  self.assertEqual(category,"terminal-draining",reason)
+
+ def test_dry_run_reports_and_changes_nothing(self):
+  before=self.jobs.read_bytes()
+  decision=self.decision()
+  self.assertEqual(decision["category"],"residue-drain-ready")
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_apply_records_the_clean_drain_and_runs_the_existing_close_path(self):
+  def close(row,*,jobs):
+   self.jobs.write_text(self.jobs.read_text().replace("\topen\t","\tdone\t"))
+   return "completion-subsession"
+  with mock.patch.object(self.registry,"close_finished_child",side_effect=close) as closer:
+   decision=self.decision("--apply")
+  closer.assert_called_once()
+  self.assertEqual(decision["category"],"residue-drain-completed")
+  self.assertTrue(decision["closed"])
+  self.assertEqual(self.row_metadata()["attempt_descendant_proof"],D.ATTEMPT_DESCENDANT_PROOF)
+
+ def test_only_exact_dead_never_enters_the_residue_branch(self):
+  before=self.jobs.read_bytes()
+  code,text=self.run_reconcile("--only-exact-dead","--apply")
+  self.assertEqual(code,0,text)
+  self.assertFalse(json.loads(text)["decisions"][0]["category"].startswith("residue-drain"))
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_live_residue_keeps_waiting_and_names_the_pid(self):
+  populated=D.ProcessGroupObservation("populated",((4242,"900","S"),))
+  before=self.jobs.read_bytes()
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=populated):
+   decision=self.decision("--apply")
+  self.assertFalse(decision["category"].startswith("residue-drain"))
+  self.assertEqual(decision["residue"],{"state":"residue-live","live_pids":[4242]})
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_recovery_usage_error_names_the_route_file_requirement(self):
+  out=io.StringIO()
+  with contextlib.redirect_stdout(out):
+   code=self.registry.main(["dispatch-registry.py","reconcile","--jobs",str(self.jobs),
+                            "--attempt",self.attempt,"--recover-receiptless"])
+  self.assertEqual(code,64)
+  self.assertIn("reason=exact-attempt-recovery-required",out.getvalue())
+  self.assertIn("--route-file",out.getvalue())
+
+
 class MixedRegistryTest(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name);self.home=self.base/"home";self.jobs=self.base/"jobs.log"

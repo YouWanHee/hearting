@@ -167,6 +167,71 @@ class DispatchCompletionJoinTest(unittest.TestCase):
             "pid_scope": "namespace-local", "pid_observer_ns": "pid:[999999999]",
         })
 
+    def residue_row(self, attempt="att-residue", with_envelope=False):
+        """Open slice row sealed `attempt-tagged-residue-v1` whose residue has since exited."""
+        namespace = D.process_namespace_identity()
+        metadata = {
+            "harness": "claude", "fallback_hop": "same-harness-headless", "worker_type": "stage",
+            "pid": "99999996", "pid_start": "1", "pgid": "99999996",
+            "pid_scope": "namespace-local", "pid_observer_ns": namespace, "pid_ns": namespace,
+            "launch_lifecycle": "detached", "launch_outcome": "governed-process-group-drained",
+            "group_reap_proof": D.GROUP_REAP_PROOF, "group_reap_pgid": "99999996",
+            "attempt_descendant_proof": D.ATTEMPT_DESCENDANT_RESIDUE_PROOF,
+            "attempt_descendant_residue": "99999997:2", "attempt_descendant_residue_count": "1",
+            "attempt_descendant_residue_basis": "terminal-envelope",
+            "attempt_descendant_residue_at": "2026-10-02T04:05:30Z",
+            "attempt_descendant_observer_ns": namespace,
+        }
+        if with_envelope:
+            log = self.root / f"{attempt}.jsonl"
+            log.write_text('{"type":"result","subtype":"success"}\n', encoding="utf-8")
+            metadata["log_file"] = str(log)
+        return row("open", attempt, "att-parent", "a", process_metadata=metadata)
+
+    def test_recovery_upgrades_a_drained_residue_row_before_cancellation(self):
+        self.jobs.write_text(self.residue_row())
+        child = JOIN.current_children(self.jobs, "att-parent")[0]
+        with mock.patch.object(JOIN.subprocess, "run") as run:
+            outcome = JOIN.recover_receiptless_attempt(self.jobs, child)
+        run.assert_not_called()
+        self.assertEqual((outcome["changed"], outcome["closed"], outcome["reason"]),
+                         (True, False, "residue-drain-refreshed"))
+        saved = JOIN.current_attempt_row(self.jobs, "att-residue")
+        self.assertEqual(saved.status, "open")
+        self.assertEqual(saved.metadata["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_PROOF)
+
+    def test_join_proceeds_after_residue_drain_refresh(self):
+        self.jobs.write_text(self.residue_row(with_envelope=True))
+        before = JOIN.current_attempt_row(self.jobs, "att-residue")
+        stalled = D.attempt_process_quiescence(before.metadata, terminal_receipt=True)
+        self.assertEqual((stalled.state, stalled.reason), ("unverifiable", "post-exit-receipt-incomplete"))
+
+        def settle(child):
+            self.assertEqual(child.attempt_id, "att-residue")
+            self.assertEqual(child.metadata["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_PROOF)
+            self.jobs.write_text(self.jobs.read_text().replace("\topen\t", "\tdone\t")
+                                 .replace("note=,", "note=completed-subsession,"))
+            return {"attempt_id": child.attempt_id, "closed": True, "reason": "completed-subsession"}
+
+        with mock.patch.object(JOIN, "settle_finished_attempt", side_effect=lambda jobs, child: settle(child)):
+            receipt = JOIN.join_batch(jobs=self.jobs, parent_attempt_id="att-parent", timeout=5,
+                                      interval=0.05, recover_receiptless=True)
+        self.assertEqual(receipt["state"], "ready", receipt)
+        self.assertEqual(receipt["children"][0]["status"], "done")
+
+    def test_live_residue_pids_are_published_in_the_join_observation(self):
+        self.jobs.write_text(self.residue_row())
+        populated = D.ProcessGroupObservation("populated", ((4242, "900", "S"),))
+        with mock.patch.object(D, "attempt_tagged_descendants", return_value=populated), \
+             mock.patch.object(JOIN, "residue_live_pids", return_value=(4242,)):
+            receipt = JOIN.join_batch(jobs=self.jobs, parent_attempt_id="att-parent", timeout=0,
+                                      recover_receiptless=True)
+        self.assertEqual(receipt["state"], "timeout")
+        identity = {"parent_attempt_id": "att-parent"}
+        record = JOIN.read_join_observation(self.jobs, identity, now=time.time())
+        self.assertEqual(record["children"][0]["reason"], "process-alive")
+        self.assertEqual(record["children"][0]["residue_pids"], [4242])
+
     def test_join_settles_exact_dead_stage_and_cleanup_in_shared_dirty_worktree(self):
         shared=self.root / "shared"; shared.mkdir()
         def git(*args):

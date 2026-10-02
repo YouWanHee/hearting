@@ -4293,6 +4293,112 @@ class TerminalCleanupResponsibilityTest(unittest.TestCase):
   self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"quiescent")
 
 
+def residue_sealed_metadata(attempt="att-residue-drain"):
+ """Open row whose recorded residue is gone: a pid that cannot exist, current namespace."""
+ namespace=D.process_namespace_identity()
+ metadata=cancellation_metadata(attempt)
+ metadata.update({
+  "pid":"99999996","pgid":"99999996","pid_start":"1",
+  "pid_observer_ns":namespace,"pid_ns":namespace,
+  "launch_outcome":"governed-process-group-drained",
+  "group_reap_proof":D.GROUP_REAP_PROOF,"group_reap_pgid":"99999996",
+  "attempt_descendant_proof":D.ATTEMPT_DESCENDANT_RESIDUE_PROOF,
+  "attempt_descendant_residue":"99999997:2",
+  "attempt_descendant_residue_count":"1",
+  "attempt_descendant_residue_basis":"terminal-envelope",
+  "attempt_descendant_residue_at":"2026-10-02T04:05:30Z",
+  "attempt_descendant_observer_ns":namespace,
+ })
+ return metadata
+
+
+class ResidueDrainRefreshTest(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+  self.jobs=Path(self.tmp.name)/"jobs.log"
+  self.metadata=residue_sealed_metadata()
+  self.attempt=self.metadata["attempt_id"]
+
+ def write(self,status="open",metadata=None):
+  self.jobs.write_text(attempt_row(metadata or self.metadata,status)+"\n")
+  return self.jobs.read_bytes()
+
+ def row_metadata(self):
+  return D.parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+
+ def assert_refused(self,state,reason,**mocks):
+  original=self.jobs.read_bytes()
+  with contextlib.ExitStack() as stack:
+   for name,value in mocks.items():
+    stack.enter_context(mock.patch.object(D,name,**value))
+   result=D.resolve_residue_drain(self.jobs,self.attempt,apply=True)
+  self.assertEqual((result["state"],result["changed"]),(state,False),result)
+  self.assertTrue(result["reason"].startswith(reason),result)
+  self.assertEqual(self.jobs.read_bytes(),original)
+  return result
+
+ def test_gone_residue_upgrades_to_the_watchers_clean_drain_keys_only(self):
+  original=self.write()
+  before=self.row_metadata()
+  planned=D.resolve_residue_drain(self.jobs,self.attempt)
+  self.assertEqual((planned["state"],planned["changed"]),("drained",False))
+  self.assertEqual(self.jobs.read_bytes(),original)
+  done=D.resolve_residue_drain(self.jobs,self.attempt,apply=True)
+  self.assertEqual((done["state"],done["changed"],done["reason"]),("drained",True,"residue-drain-refreshed"))
+  sealed=self.row_metadata()
+  changed={key for key in sealed if sealed[key]!=before.get(key)}
+  self.assertEqual(changed,{"attempt_descendant_proof"})
+  self.assertEqual(sealed["attempt_descendant_proof"],D.ATTEMPT_DESCENDANT_PROOF)
+  self.assertEqual(sealed["attempt_descendant_observer_ns"],self.metadata["pid_observer_ns"])
+  self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"quiescent")
+
+ def test_observer_namespace_mismatch_changes_nothing(self):
+  self.write()
+  self.assert_refused("unverifiable","residue-observer-namespace-mismatch",
+                      process_namespace_identity=dict(return_value="pid:[other]"))
+
+ def test_untagged_group_member_keeps_waiting(self):
+  self.write()
+  populated=D.ProcessGroupObservation("populated",((4242,"900","S"),))
+  self.assert_refused("live","governed-group-live",
+                      process_group_observation=dict(return_value=populated),
+                      attempt_tagged_descendants=dict(return_value=D.ProcessGroupObservation("empty")))
+
+ def test_unverifiable_scan_changes_nothing(self):
+  self.write()
+  self.assert_refused("unverifiable","residue-scan-unverifiable:proc-permission-denied",
+                      process_group_observation=dict(return_value=D.ProcessGroupObservation("empty")),
+                      attempt_tagged_descendants=dict(return_value=D.ProcessGroupObservation(
+                       "unverifiable",reason="proc-permission-denied")))
+
+ def test_live_tagged_survivor_is_reported_with_its_pid(self):
+  self.write()
+  populated=D.ProcessGroupObservation("populated",((4242,"900","S"),))
+  result=self.assert_refused("residue-live","attempt-descendant-live",
+                             process_group_observation=dict(return_value=D.ProcessGroupObservation("empty")),
+                             attempt_tagged_descendants=dict(return_value=populated))
+  self.assertEqual(result["live_pids"],[4242])
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=populated):
+   self.assertEqual(D.residue_live_pids(self.metadata),(4242,))
+  self.assertEqual(D.residue_live_pids({}),())
+
+ def test_row_without_residue_receipt_is_not_applicable(self):
+  plain=dict(self.metadata,attempt_descendant_proof=D.ATTEMPT_DESCENDANT_PROOF)
+  self.write(metadata=plain)
+  self.assert_refused("not-applicable","residue-receipt-absent")
+
+ def test_terminal_row_is_left_to_attempt_cleanup(self):
+  self.write("done")
+  self.assert_refused("not-applicable","residue-open-row-required")
+
+ def test_row_changed_after_observation_is_not_overwritten(self):
+  self.write()
+  with mock.patch.object(D,"annotate_attempt_row_if",return_value=False):
+   result=D.resolve_residue_drain(self.jobs,self.attempt,apply=True)
+  self.assertEqual((result["state"],result["changed"],result["reason"]),
+                   ("drained",False,"residue-row-changed"))
+
+
 class CancellationReceiptWedgeTest(unittest.TestCase):
  def test_namespace_local_row_with_no_receipt_stays_incomplete(self):
   # C-9 (regression, unchanged)

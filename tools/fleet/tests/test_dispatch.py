@@ -2808,6 +2808,52 @@ class IntegratedAlertRemovalTest(unittest.TestCase):
         self.assertIn("lone-case-20260709-33333", text)
 
 
+class ResidueDisplayTest(unittest.TestCase):
+    """stale-residue-1002: name the process a finished worker left running."""
+
+    def _job(self):
+        job = DispatchJob(
+            key="code", slug="slice", cwd="/work/repo", harness="claude",
+            source="jobs", status="open", depth=2, dispatch_depth=2,
+            attempt_id="att-residue", attempt_contract_status="current",
+            registered_worker=True,
+        )
+        job._registry_metadata = {"attempt_id": "att-residue"}
+        return job
+
+    def _observed(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        return ObservedAttemptLiveness(
+            state="alive", reason="registry-terminal-process-live",
+            process_state="live", process_reason="attempt-descendant-live")
+
+    def test_residue_pid_is_collected_for_a_live_residue_row(self):
+        job = self._job()
+        with mock.patch.object(dispatch, "observed_attempt_liveness", return_value=self._observed()), \
+             mock.patch.object(dispatch, "tagged_residue_receipt", return_value=True), \
+             mock.patch.object(dispatch, "residue_live_pids", return_value=(753216,)):
+            dispatch._dispatch_liveness(job, now=1000.0, track=False)
+        self.assertEqual(job.residue_pids, [753216])
+        self.assertEqual(job.state_evidence["residue_pids"], [753216])
+
+    def test_residue_pid_is_absent_without_a_residue_receipt(self):
+        job = self._job()
+        with mock.patch.object(dispatch, "observed_attempt_liveness", return_value=self._observed()), \
+             mock.patch.object(dispatch, "residue_live_pids", return_value=(753216,)) as probe:
+            dispatch._dispatch_liveness(job, now=1000.0, track=False)
+        probe.assert_not_called()
+        self.assertIsNone(job.residue_pids)
+
+    def test_residue_pid_is_rendered_on_the_row(self):
+        job = DispatchJob(key="code", slug="slice", cwd="/work/repo", harness="claude",
+                          depth=1, dispatch_depth=1, liveness="working",
+                          residue_pids=[753216])
+        lines = render._build_lines([], [job], section="dispatch", narrow=False,
+                                    malformed=0, layout="wide")
+        text = "\n".join("".join(part for part, _key in line) for line in lines if line)
+        self.assertIn("left pid 753216", text)
+
+
 class TickReuseTest(unittest.TestCase):
     """Unchanged files reuse their parse across ticks; any stat change rereads."""
 
