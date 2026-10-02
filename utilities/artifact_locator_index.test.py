@@ -934,6 +934,7 @@ _EXPECTED_WRITER_CENSUS = {
     ("artifact_producer.py", "_adopt_location_locked"): "incremental",  # `cycle_move` and `reconcile_root` update them
     ("artifact_producer.py", "_tombstone_cycle_locked"): "incremental",  # `delete_cycle`, `delete_campaign`, `reconcile_root`
     ("artifact_producer.py", "_revive_cycle_locked"): "incremental",  # `reconcile_root` updates them
+    ("artifact_producer.py", "_reparent_children_locked"): "incremental",  # `delete_cycle`, `delete_campaign`, `reconcile_root` update them
     ("artifact_producer.py", "_finalize_deleted_locked"): "no-row-effect",  # a deleted cycle has no row
     ("artifact_producer.py", "delete_cycle"): "incremental",
     ("artifact_producer.py", "recover_cycle_times"): "full",

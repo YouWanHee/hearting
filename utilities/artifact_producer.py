@@ -8302,6 +8302,70 @@ def _remove_folder(root: Path, directory: Path) -> None:
     _fsync_dir(directory.parent)
 
 
+def _reparent_children_locked(root: Path, deleted_ids: Sequence[str], *, command: str, stamp: str,
+                              reason: Optional[str], now: Optional[float], by: str,
+                              folders: Optional[Mapping[str, Path]] = None
+                              ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """No surviving cycle names a cycle that is gone as its parent (the admission lock is held).
+
+    Whoever names a deleted cycle (the ones deleted now, an earlier delete, or an ID with no record)
+    takes the nearest ancestor that is still there, or none, as `cycle-move --parent` would: the
+    record, a closed cycle's manifest (a new document) and the index follow and one history line is
+    left.  A child whose folder cannot be found has its record mended and nothing else; it is reported
+    with `folder: "missing"`.  Returns the rows `{cycle_id, before, after}` and the campaign IDs whose
+    locator index is now stale.  `folders` are the paths a reconcile already found."""
+    records = {record["cycle_id"]: record for record in list_cycle_records(root) if record.get("cycle_id")}
+    gone = set(deleted_ids)
+
+    def departed(cycle_id: str) -> bool:
+        record = records.get(cycle_id)
+        return cycle_id in gone or record is None or bool(record.get("deleted_at"))
+
+    def surviving_ancestor(child_id: str, start: str) -> Optional[str]:
+        seen: Set[str] = set()
+        node: Optional[str] = start
+        while node and node not in seen and node != child_id:
+            if not departed(node):
+                return node
+            seen.add(node)
+            node = (records.get(node) or {}).get("parent_cycle_id")
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    stale: List[str] = []
+    for child_id, child in sorted(records.items()):
+        before = child.get("parent_cycle_id")
+        if child.get("deleted_at") or not before or not departed(before):
+            continue
+        after = surviving_ancestor(child_id, before)
+        folder = (folders or {}).get(child_id)
+        if folder is None:
+            try:
+                folder = cycle_dir(root, child["campaign_id"], child_id, child)
+            except (ProducerError, artifact_locator.LocatorError):
+                folder = None
+        row: Dict[str, Any] = {"cycle_id": child_id, "before": before, "after": after}
+        if folder is not None and folder.is_dir() and (folder.parent / "campaign.json").is_file():
+            _written, touched = _adopt_location_locked(
+                root, child, folder, command=command, stamp=stamp, reason=reason, now=now, by=by, parent=after)
+            stale += touched
+        else:
+            updated = dict(child, parent_cycle_id=after)
+            if after is None:
+                updated.pop("parent_cycle_state_at_begin", None)
+            else:
+                updated["parent_cycle_state_at_begin"] = (records.get(after) or {}).get("state", "open")
+            line = _command_line(
+                command=command, stamp=stamp, target_type="cycle", target_id=child_id,
+                target_path=_last_known_path(root, child), operation="update", field="parent",
+                before={"value": before}, after={"value": after}, reason=reason, now=now, by=by)
+            _write_cycle_record(root, _with_cycle_lines(updated, [line]), exclusive=False)
+            row["folder"] = "missing"
+        _flush_cycle_pending_locked(root, child_id)
+        rows.append(row)
+    return rows, stale
+
+
 def delete_cycle(root: Path, cycle_id: str, *, reason: Optional[str] = None, now: Optional[float] = None) -> Dict[str, Any]:
     """D-126: delete a cycle's folder and take it out of the index and the lists.
 
@@ -8341,12 +8405,15 @@ def delete_cycle(root: Path, cycle_id: str, *, reason: Optional[str] = None, now
         if campaign is not None and cycle_id in campaign.get("cycles", []):
             _write_campaign(root, dict(campaign, cycles=[c for c in campaign["cycles"] if c != cycle_id]), exclusive=False)
         _retire_rows(root, [cycle_id])
-        artifact_locator.update_indexes(root, [campaign_id])
+        reparented, touched = _reparent_children_locked(
+            root, [cycle_id], command="delete", stamp=stamp, reason=reason, now=now, by="human")
+        artifact_locator.update_indexes(root, list(dict.fromkeys([campaign_id] + touched)))
         _flush_cycle_pending_locked(root, cycle_id)
     finally:
         artifact_admission._release_lock(root, lock_fd)
     _drop_group_membership(root, campaign_id, [cycle_id])
-    return {"status": "deleted", "cycle_id": cycle_id, "campaign_id": campaign_id}
+    done = {"status": "deleted", "cycle_id": cycle_id, "campaign_id": campaign_id}
+    return dict(done, reparented=reparented) if reparented else done
 
 
 def delete_campaign(root: Path, campaign: str, *, reason: Optional[str] = None,
@@ -8398,13 +8465,16 @@ def delete_campaign(root: Path, campaign: str, *, reason: Optional[str] = None,
         _write_campaign_runtime_record(root, runtime)
         _remove_folder(root, folder)
         _retire_rows(root, gone)
-        artifact_locator.update_indexes(root, [campaign_id])
+        reparented, touched = _reparent_children_locked(
+            root, gone, command="delete", stamp=stamp, reason=reason, now=now, by=by)
+        artifact_locator.update_indexes(root, list(dict.fromkeys([campaign_id] + touched)))
         for cycle_id in gone:
             _flush_cycle_pending_locked(root, cycle_id)
         _flush_campaign_pending_locked(root, campaign_id)
     finally:
         artifact_admission._release_lock(root, lock_fd)
-    return {"status": "deleted", "campaign_id": campaign_id, "cycle_ids": gone}
+    done = {"status": "deleted", "campaign_id": campaign_id, "cycle_ids": gone}
+    return dict(done, reparented=reparented) if reparented else done
 
 
 # -- a move or a deletion made by hand ---------------------------------------------------
@@ -8801,6 +8871,12 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             _retire_rows(root, gone_cycles)
             for cycle_id in gone_cycles:
                 _flush_cycle_pending_locked(root, cycle_id)
+            reparented, touched = _reparent_children_locked(
+                root, gone_cycles, command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
+                folders=scan.cycles)
+            stale += touched
+            if reparented:
+                result["reparented"] = reparented
         if stale:
             artifact_locator.update_indexes(root, list(dict.fromkeys(stale)))
     finally:

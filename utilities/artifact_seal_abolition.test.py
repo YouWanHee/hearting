@@ -2764,6 +2764,171 @@ class C1DeleteTest(C1ChangesBase):
         self.assertNotIn("history_pending", self.record(solo))
 
 
+class C9ReparentOnDeleteTest(C1ChangesBase):
+    """Deleting a cycle (by command or by hand) leaves no survivor naming it as its parent.
+
+    The importer that reads the root fails all of it on one parent that is not a cycle of the root, so
+    the survivors take the nearest surviving ancestor (or none), one history line each."""
+
+    def child_of(self, slug, key, parent=None, *, activate=False):
+        if activate:
+            self.activate()
+        route, route_file = self.route(slug=slug, campaign_key=key)
+        extra = {"parent_cycle_id": parent} if parent else {}
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct", **extra)
+        self.write_output(result, "plans/cycle/plan.md", slug.encode() + b"\n")
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        self.history.made.clear()
+        self.history.published.clear()
+        return result
+
+    def survivors_name_survivors(self):
+        """What the importer needs: every surviving cycle's parent is a surviving cycle of the root, or none."""
+        records = {r["cycle_id"]: r for r in P.list_cycle_records(self.root)}
+        for cycle_id, record in records.items():
+            if record.get("deleted_at"):
+                continue
+            parent = record.get("parent_cycle_id")
+            if parent is not None:
+                self.assertIn(parent, records, f"{cycle_id} names a cycle with no record")
+                self.assertFalse(records[parent].get("deleted_at"), f"{cycle_id} names a deleted cycle")
+
+    def parent_lines(self, child):
+        return self.lines(kind="lifecycle", target_type="cycle", target_id=child["cycle_id"], field="parent")
+
+    def assert_one_parent_line(self, child, before, after):
+        (line,) = self.parent_lines(child)
+        self.assertEqual((line["operation"], line["before"], line["after"]),
+                         ("update", {"value": before}, {"value": after}))
+
+    def test_t9_1_deleting_a_cycle_gives_its_children_the_nearest_surviving_ancestor(self):
+        a = self.child_of("t91-a", "c9-chain", activate=True)
+        b = self.child_of("t91-b", "c9-chain", a["cycle_id"])
+        c = self.child_of("t91-c", "c9-chain", b["cycle_id"])
+        out = P.delete_cycle(self.root, b["cycle_id"])
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertEqual(out["reparented"], [{"cycle_id": c["cycle_id"], "before": b["cycle_id"], "after": a["cycle_id"]}])
+        self.assertEqual(self.record(c)["parent_cycle_id"], a["cycle_id"])
+        self.assertEqual(self.manifest(c)["cycle"]["parent_cycle_id"], a["cycle_id"])
+        self.assertEqual(self.record(c)["parent_cycle_state_at_begin"], self.record(a)["state"])
+        self.assert_one_parent_line(c, b["cycle_id"], a["cycle_id"])
+        self.survivors_name_survivors()
+        # The first of the chain goes too: nothing is left above the child.
+        self.history.made.clear()
+        out = P.delete_cycle(self.root, a["cycle_id"])
+        self.assertEqual(out["reparented"], [{"cycle_id": c["cycle_id"], "before": a["cycle_id"], "after": None}])
+        self.assertIsNone(self.record(c)["parent_cycle_id"])
+        self.assertNotIn("parent_cycle_state_at_begin", self.record(c))
+        self.assertIsNone(self.manifest(c)["cycle"]["parent_cycle_id"])
+        self.assert_one_parent_line(c, a["cycle_id"], None)
+        self.survivors_name_survivors()
+
+    def test_t9_2_deleting_a_campaign_leaves_its_outside_children_with_no_parent_in_it(self):
+        a = self.child_of("t92-a", "c9-x", activate=True)
+        b = self.child_of("t92-b", "c9-x", a["cycle_id"])
+        self.child_of("t92-y", "c9-y")  # the other campaign exists before a child of x's cycles joins it
+        c = self.child_of("t92-c", "c9-y", b["cycle_id"])
+        d = self.child_of("t92-d", "c9-y", a["cycle_id"])
+        out = P.delete_campaign(self.root, a["campaign_id"], reason="whole stream dropped")
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertEqual(sorted((row["cycle_id"], row["before"], row["after"]) for row in out["reparented"]),
+                         sorted([(c["cycle_id"], b["cycle_id"], None), (d["cycle_id"], a["cycle_id"], None)]))
+        for child, before in ((c, b), (d, a)):
+            self.assertIsNone(self.record(child)["parent_cycle_id"])
+            self.assertIsNone(self.manifest(child)["cycle"]["parent_cycle_id"])
+            self.assert_one_parent_line(child, before["cycle_id"], None)
+        self.survivors_name_survivors()
+
+    def test_t9_3_a_cycle_folder_removed_by_hand_is_handled_the_same_way(self):
+        a = self.child_of("t93-a", "c9-hand", activate=True)
+        b = self.child_of("t93-b", "c9-hand", a["cycle_id"])
+        c = self.child_of("t93-c", "c9-hand", b["cycle_id"])
+        shutil.rmtree(b["cycle_dir"])
+        out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "reconciled", out)
+        self.assertEqual(out["cycle_gone"], [b["cycle_id"]])
+        self.assertEqual(out["reparented"], [{"cycle_id": c["cycle_id"], "before": b["cycle_id"], "after": a["cycle_id"]}])
+        self.assertEqual(self.record(c)["parent_cycle_id"], a["cycle_id"])
+        self.assertEqual(self.manifest(c)["cycle"]["parent_cycle_id"], a["cycle_id"])
+        self.assert_one_parent_line(c, b["cycle_id"], a["cycle_id"])
+        self.survivors_name_survivors()
+
+    def test_t9_3_a_campaign_folder_removed_by_hand_is_handled_the_same_way(self):
+        a = self.child_of("t93-ca", "c9-hand-x", activate=True)
+        b = self.child_of("t93-cb", "c9-hand-x", a["cycle_id"])
+        self.child_of("t93-cy", "c9-hand-y")
+        c = self.child_of("t93-cc", "c9-hand-y", b["cycle_id"])
+        shutil.rmtree(str(P.campaign_dir(self.root, a["campaign_id"])))
+        out = P.reconcile_root(self.root)
+        self.assertEqual(out["status"], "reconciled", out)
+        self.assertEqual(out["reparented"], [{"cycle_id": c["cycle_id"], "before": b["cycle_id"], "after": None}])
+        self.assertIsNone(self.record(c)["parent_cycle_id"])
+        self.assert_one_parent_line(c, b["cycle_id"], None)
+        self.survivors_name_survivors()
+
+    def test_t9_4_what_the_deleted_cycle_did_not_parent_is_left_byte_for_byte(self):
+        a = self.child_of("t94-a", "c9-keep", activate=True)
+        b = self.child_of("t94-b", "c9-keep", a["cycle_id"])
+        other = self.child_of("t94-o", "c9-other")
+        other_child = self.child_of("t94-oc", "c9-other", other["cycle_id"])
+        watched = [a, other, other_child]
+
+        def snapshot():
+            return [(P.cycle_record_path(self.root, r["cycle_id"]).read_bytes(),
+                     (Path(r["cycle_dir"]) / "manifest.json").read_bytes()) for r in watched]
+
+        before = snapshot()
+        out = P.delete_cycle(self.root, b["cycle_id"])
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertNotIn("reparented", out)
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(self.parent_lines(other_child), [])
+        # A child whose folder is gone is no reason to refuse: the delete goes through.
+        gone_child = self.child_of("t94-g", "c9-keep", a["cycle_id"])
+        shutil.rmtree(gone_child["cycle_dir"])
+        self.assertEqual(P.delete_cycle(self.root, a["cycle_id"])["status"], "deleted")
+
+    def test_t9_5_a_parent_that_was_already_broken_is_mended_by_the_next_delete(self):
+        a = self.child_of("t95-a", "c9-old", activate=True)
+        old = self.child_of("t95-d", "c9-old", a["cycle_id"])
+        e = self.child_of("t95-e", "c9-old", old["cycle_id"])
+        g = self.child_of("t95-g", "c9-old", a["cycle_id"])
+        f = self.child_of("t95-f", "c9-old", a["cycle_id"])
+        # What an earlier release left behind: a record that says deleted, a record that names a cycle with no record.
+        P._write_cycle_record(self.root, dict(P.read_cycle_record(self.root, old["cycle_id"]),
+                                              deleted_at="2026-09-01T00:00:00Z", deleted_by="delete"), exclusive=False)
+        ghost = "cyc_" + "7" * 32
+        self.assertIsNone(P.read_cycle_record(self.root, ghost))
+        P._write_cycle_record(self.root, dict(P.read_cycle_record(self.root, g["cycle_id"]), parent_cycle_id=ghost),
+                              exclusive=False)
+        out = P.delete_cycle(self.root, f["cycle_id"])
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertEqual(sorted((row["cycle_id"], row["before"], row["after"]) for row in out["reparented"]),
+                         sorted([(e["cycle_id"], old["cycle_id"], a["cycle_id"]), (g["cycle_id"], ghost, None)]))
+        self.assertEqual(self.record(e)["parent_cycle_id"], a["cycle_id"])
+        self.assertIsNone(self.record(g)["parent_cycle_id"])
+        self.assert_one_parent_line(e, old["cycle_id"], a["cycle_id"])
+        self.assert_one_parent_line(g, ghost, None)
+        self.survivors_name_survivors()
+
+    def test_t9_6_a_surviving_child_with_no_folder_is_mended_in_its_record(self):
+        a = self.child_of("t96-a", "c9-missing", activate=True)
+        b = self.child_of("t96-b", "c9-missing", a["cycle_id"])
+        h = self.child_of("t96-h", "c9-missing", b["cycle_id"])
+        shutil.rmtree(h["cycle_dir"])
+        self.assertFalse(self.record(h).get("deleted_at"))
+        out = P.delete_cycle(self.root, b["cycle_id"])
+        self.assertEqual(out["status"], "deleted", out)
+        self.assertEqual(out["reparented"], [{"cycle_id": h["cycle_id"], "before": b["cycle_id"],
+                                              "after": a["cycle_id"], "folder": "missing"}])
+        self.assertEqual(self.record(h)["parent_cycle_id"], a["cycle_id"])
+        self.assertFalse(Path(h["cycle_dir"]).exists(), "nothing puts the folder back")
+        self.assert_one_parent_line(h, b["cycle_id"], a["cycle_id"])
+        self.survivors_name_survivors()
+
+
 class C1InlineFinishAfterMoveTest(unittest.TestCase):
     """The route's cycle is the same cycle after it moved; a finish is not refused for the campaign's key."""
 
