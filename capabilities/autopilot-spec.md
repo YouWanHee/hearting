@@ -82,6 +82,11 @@ Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude
 
 Spec work writes to `$AGENT_ARTIFACT_OUTPUT_DIR/spec/`. The canonical current blueprint is always `$AGENT_ARTIFACT_OUTPUT_DIR/spec/prd.md`.
 
+The `spec-review` node may receive an explicit `--reviewed-evidence` file as
+optional runtime-bound review input. The wrapper records and rechecks its
+digest against the exact route node and attempt. Omitting it remains supported;
+it is an input path, not a new artifact output or a required gate.
+
 `prd.md` opens with a bounded blueprint-summary block — exact `<!-- BLUEPRINT-SUMMARY:BEGIN -->` / `<!-- BLUEPRINT-SUMMARY:END -->` markers right after the H1 title, at most 40 lines, 160 characters per item, and 2,500 characters between markers — refreshed in the same transaction as every body update. The block is the concise user-facing blueprint (vision, current shape, active decisions, what is in progress and what comes next) in plain words, without `§N` references, internal abbreviations, or identifiers; downstream consumers such as note-app spec mirrors extract it by exact marker matching, so the markers are a stable contract. A legacy PRD without the block gains it on its next update.
 
 The body holds only the current contract: a revision rewrites the affected section in place and deletes superseded content, which survives in the version snapshot. Revision history (reasons, quoted user wording, triggers, supersede tables, per-version narrative) and internal tracking IDs (commit hashes, route, revision, cycle, and attempt IDs, session or pane names) go to `pipeline_summary.md`; the summary heading carries the only version tag. `utilities/spec-transaction.py` reports violations as warnings in its receipt and never fails the write. The one-time current-contract rewrite of a legacy PRD is defined in `skills/autopilot-spec/references/prd-authoring.md`.

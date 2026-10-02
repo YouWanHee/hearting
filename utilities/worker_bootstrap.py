@@ -249,6 +249,7 @@ class NodeScope(NamedTuple):
     needs no such lookup and stays immutable and attribute-accessed the same way.
     """
     output_dir: str | None
+    worktree_dir: str | None
     outputs: tuple[str, ...]
     write_scope: tuple[str, ...]
     source: str  # "env" | "producer-binding" | "unbound"
@@ -274,7 +275,8 @@ def resolve_node_scope(
     write_scope = tuple((node or {}).get("write_scope", []))
     env_output_dir = artifact_cycle_environment(environ)["AGENT_ARTIFACT_OUTPUT_DIR"]
     if env_output_dir:
-        return NodeScope(env_output_dir, outputs, write_scope, "env")
+        return NodeScope(env_output_dir, str(Path(route["cwd"]).resolve()) if route.get("cwd") else None,
+                         outputs, write_scope, "env")
     artifact_root = route.get("artifact_root")
     route_id = route.get("route_id")
     if parent_attempt_id and artifact_root and route_id:
@@ -289,27 +291,88 @@ def resolve_node_scope(
             campaign_id, cycle_id = record.get("campaign_id"), record.get("cycle_id")
             if campaign_id and cycle_id:
                 cdir = artifact_producer.cycle_dir(Path(artifact_root), campaign_id, cycle_id)
-                return NodeScope(str(cdir / "artifacts"), outputs, write_scope, "producer-binding")
+                return NodeScope(str(cdir / "artifacts"),
+                                 str(Path(route["cwd"]).resolve()) if route.get("cwd") else None,
+                                 outputs, write_scope, "producer-binding")
         except (dispatch_terminal_commit.TerminalCommitError, artifact_producer.ProducerError):
             pass
-    return NodeScope(None, outputs, write_scope, "unbound")
+    return NodeScope(None, str(Path(route["cwd"]).resolve()) if route.get("cwd") else None,
+                     outputs, write_scope, "unbound")
 
 
 def _resolved_paths(output_dir: str, paths) -> list[str]:
     return [str(Path(output_dir) / path) for path in paths]
 
 
+def route_node_commit_expected(route, node_id: str | None, worker_type: str,
+                              *, subsession_id: str | None = None,
+                              stage_authority: int = 1) -> bool:
+    """Read the sealed route's commit policy without inferring it from depth."""
+    if worker_type != "stage" or subsession_id or stage_authority == 0 or not node_id:
+        return False
+    node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
+    return bool(node and node.get("commit_expected") is True)
+
+
+def stage_commit_enabled(args) -> bool:
+    """Normalize the shared commit policy before adapters project permissions.
+
+    Route-bound launches use the sealed node, never a trailing legacy value.
+    Route-free fixtures retain their legacy input. Slices have no commit
+    authority on either path; adapters do not interpret sealed node fields.
+    """
+    worker_type = getattr(args, "worker_type", None)
+    subsession_id = getattr(args, "subsession_id", None)
+    authority = getattr(args, "stage_authority", 1)
+    if worker_type != "stage" or subsession_id or authority == 0:
+        return False
+    route_path = getattr(args, "route_file", None)
+    node_id = getattr(args, "route_node", None)
+    if route_path and node_id:
+        try:
+            route = json.loads(Path(route_path).read_text(encoding="utf-8"))
+            return route_node_commit_expected(route, node_id, worker_type,
+                subsession_id=subsession_id, stage_authority=authority)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+    return bool(getattr(args, "commit_expected", False))
+
+
+def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
+    """Resolve repository mutation vocabulary separately from artifact scopes."""
+    artifact, source = [], []
+    for value in scope.write_scope:
+        path = Path(value)
+        if path.is_absolute():
+            (source if scope.worktree_dir and path.is_relative_to(scope.worktree_dir) else artifact).append(str(path))
+        elif value in ("source/**", "source-alternative/**"):
+            source.append(str(Path(scope.worktree_dir) / "**") if scope.worktree_dir else value)
+        elif value.startswith("tests/"):
+            source.append(str(Path(scope.worktree_dir) / value) if scope.worktree_dir else value)
+        elif scope.output_dir:
+            artifact.append(str(Path(scope.output_dir) / value))
+        else:
+            artifact.append(value)
+    return artifact, source
+
+
 def node_scope_prompt(scope: "NodeScope") -> str:
+    artifact_scope, source_scope = _resolved_write_scopes(scope)
     if scope.output_dir:
-        return (
-            "This node's declared outputs / write scope (absolute): "
-            f"outputs={json.dumps(_resolved_paths(scope.output_dir, scope.outputs), ensure_ascii=False)} "
-            f"write_scope={json.dumps(_resolved_paths(scope.output_dir, scope.write_scope), ensure_ascii=False)}\n"
-        )
-    return (
-        "This node's declared scope is cycle-relative; no open cycle is bound — "
-        "do not write under the artifact root.\n"
-    )
+        outputs = _resolved_paths(scope.output_dir, scope.outputs)
+    else:
+        outputs = list(scope.outputs)
+    lines = ["This node's declared scope:",
+             f"outputs={json.dumps(outputs, ensure_ascii=False)}",
+             f"artifact_write_scope={json.dumps(artifact_scope, ensure_ascii=False)}"]
+    if source_scope:
+        lines.append(f"worktree_source_scope={json.dumps(source_scope, ensure_ascii=False)}")
+    if not scope.output_dir:
+        lines.append("Cycle is unbound (no open cycle is bound); do not write durable artifacts under the artifact root.")
+    if not scope.worktree_dir and ("source/**" in scope.write_scope or "source-alternative/**" in scope.write_scope
+                                   or any(path.startswith("tests/") for path in scope.write_scope)):
+        lines.append("The worktree source root is unresolved; do not guess its path.")
+    return " ".join(lines) + "\n"
 
 
 def released_task_prompt(args) -> str:

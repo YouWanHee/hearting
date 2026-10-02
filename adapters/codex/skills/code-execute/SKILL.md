@@ -50,11 +50,19 @@ cycle. It receives the owner's open cycle through
 `AGENT_ARTIFACT_CAMPAIGN_ID`/`AGENT_ARTIFACT_CYCLE_ID`/`AGENT_ARTIFACT_PRODUCER_ID`/
 `AGENT_ARTIFACT_CYCLE_DIR`/`AGENT_ARTIFACT_OUTPUT_DIR` (dispatch env
 pass-through), may call `utilities/artifact_producer.py begin --node <node id>`
-on the same route to resume that cycle, and writes only inside
-`<cycle_dir>/artifacts/<bucket>/...` within its node `write_scope`.
+on the same route to resume that cycle, and writes durable artifacts only inside
+`<cycle_dir>/artifacts/<bucket>/...` within its artifact output scope.
 `artifact_producer.py` owns the open cycle and its output paths; `finalize` and
 `admit-shared` belong to the owner, never to a stage worker. See
 `producer_lifecycle` in `capabilities/topologies.json`.
+
+The route's `source/**`, `source-alternative/**`, and `tests/**` write scopes
+refer to files in the assigned `route.cwd` worktree. They are not paths beneath
+the artifact directory. Declared durable outputs and artifact scopes resolve
+under the canonical cycle output directory. A normal single-session mutation
+node sealed with `commit_expected: true` commits its own validated changes;
+declared sub-session slices remain no-commit and leave the commit to their
+owner after the stage gate.
 
 For a `direct` inline route, the depth-0 interactive caller uses the single
 public finish command and its exact receipt under `core/WORKFLOW.md §0.5`.

@@ -409,8 +409,9 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
   route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id,
   record=record_auto_revisions,
  )
- from review_input import is_review_node, has_plan_producer, read_binding, resolve_input
- if reviewed_evidence and is_review_node(node) and not has_plan_producer(route,node):
+ from review_input import is_review_node, is_spec_review_node, has_plan_producer, read_binding, resolve_input
+ if (reviewed_evidence and is_review_node(node) and not has_plan_producer(route,node)
+     and not is_spec_review_node(node)):
   verdicts=[(cols,meta) for cols,meta in rows if REVIEW_ROUND_CAP.classify_round_row(
       cols[1],meta,worker_type=meta.get("worker_type") or "review")=="verdict"]
   if verdicts and verdicts[-1][1].get("note")=="completed-review-blocking":
