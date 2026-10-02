@@ -314,6 +314,30 @@ def route_node_commit_expected(route, node_id: str | None, worker_type: str,
     return bool(node and node.get("commit_expected") is True)
 
 
+def stage_commit_enabled(args) -> bool:
+    """Normalize the shared commit policy before adapters project permissions.
+
+    Route-bound launches use the sealed node, never a trailing legacy value.
+    Route-free fixtures retain their legacy input. Slices have no commit
+    authority on either path; adapters do not interpret sealed node fields.
+    """
+    worker_type = getattr(args, "worker_type", None)
+    subsession_id = getattr(args, "subsession_id", None)
+    authority = getattr(args, "stage_authority", 1)
+    if worker_type != "stage" or subsession_id or authority == 0:
+        return False
+    route_path = getattr(args, "route_file", None)
+    node_id = getattr(args, "route_node", None)
+    if route_path and node_id:
+        try:
+            route = json.loads(Path(route_path).read_text(encoding="utf-8"))
+            return route_node_commit_expected(route, node_id, worker_type,
+                subsession_id=subsession_id, stage_authority=authority)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+    return bool(getattr(args, "commit_expected", False))
+
+
 def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
     """Resolve repository mutation vocabulary separately from artifact scopes."""
     artifact, source = [], []

@@ -124,7 +124,7 @@ from worker_bootstrap import (
     render_worker_bootstrap,
     runtime_progress_prompt,
     resolve_worker_type,
-    route_node_commit_expected,
+    stage_commit_enabled,
 )
 from stage_session_runtime import (  # noqa: E402
     add_arguments as add_stage_session_arguments,
@@ -889,21 +889,7 @@ def _is_linked_worktree(worktree, agent_home) -> bool:
 def is_no_commit_stage(args: argparse.Namespace) -> bool:
     """Enforce no-commit only for route nodes or slices that are not commit-expected."""
     worker_type = getattr(args, "worker_type", None)
-    route_path = getattr(args, "route_file", None)
-    if route_path and getattr(args, "route_node", None):
-        try:
-            route = json.loads(Path(route_path).read_text(encoding="utf-8"))
-            expected = route_node_commit_expected(
-                route, args.route_node, worker_type,
-                subsession_id=getattr(args, "subsession_id", None),
-                stage_authority=getattr(args, "stage_authority", 1),
-            )
-        except (OSError, ValueError, TypeError):
-            expected = False
-    else:
-        expected = (worker_type == "stage" and bool(getattr(args, "commit_expected", False))
-                    and not getattr(args, "subsession_id", None)
-                    and getattr(args, "stage_authority", 1) != 0)
+    expected = stage_commit_enabled(args)
     return (
         worker_type == "stage" and not expected
         and _worktree_mutating_write_scope(getattr(args, "write_scope", None))
@@ -926,24 +912,7 @@ def linked_worktree_git_writable_dirs(args: argparse.Namespace) -> tuple[Path, .
     all other workers get no Git metadata grant.
     """
     worker_type = getattr(args, "worker_type", None)
-    commit_expected_stage = False
-    if worker_type == "stage":
-        route_path = getattr(args, "route_file", None)
-        if route_path and getattr(args, "route_node", None):
-            try:
-                route = json.loads(Path(route_path).read_text(encoding="utf-8"))
-                commit_expected_stage = route_node_commit_expected(
-                    route, args.route_node, worker_type,
-                    subsession_id=getattr(args, "subsession_id", None),
-                    stage_authority=getattr(args, "stage_authority", 1),
-                )
-            except (OSError, ValueError, TypeError):
-                commit_expected_stage = False
-        else:
-            commit_expected_stage = (bool(getattr(args, "commit_expected", False))
-                                     and not getattr(args, "subsession_id", None)
-                                     and getattr(args, "stage_authority", 1) != 0)
-    if worker_type != "owner" and not commit_expected_stage:
+    if worker_type != "owner" and not stage_commit_enabled(args):
         return ()
     dirs = _worktree_git_dirs(getattr(args, "worktree", ""))
     if dirs is None:
