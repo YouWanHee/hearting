@@ -8,6 +8,7 @@ markers unless a test sets one on purpose).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,9 @@ import re
 import sqlite3
 import stat
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -24,6 +27,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 
 from tidy_isolation import isolated_env  # noqa: E402
 import session_tidy as st  # noqa: E402
+import session_tidy_clear as clear  # noqa: E402
 import tidy_transcripts as tt  # noqa: E402
 from test_tidy_isolation import FIXTURES, FIXTURE_NOW, load_opencode_fixture  # noqa: E402
 
@@ -284,6 +288,180 @@ class SeatTest(TidyCase):
         self.card("sid-A", "표식-pane-a", pane="test:pane-a")
         self.assertEqual(self.hook("claude", "start", "sid-B", pane="test:pane-b"), "")
         self.assertIn("표식-pane-a", self.hook("claude", "start", "sid-B2", pane="test:pane-a"))
+
+
+class DaemonCodexSeatTest(TidyCase):
+    """Codex in the shared app-server daemon has no HERDR_PANE_ID: its pane comes from herdr."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_herdr = self.iso.root / "fake-herdr"
+        self.agents_file = self.iso.root / "agents.json"
+        self.calls = self.iso.root / "herdr-calls.txt"
+        self.fake_herdr.write_text(
+            f'#!/bin/sh\necho "$@" >> "{self.calls}"\ncat "{self.agents_file}"\n', encoding="utf-8")
+        self.fake_herdr.chmod(0o755)
+        self.agents([])
+        self.env = {"HEARTING_TIDY_TEST_ROOT": str(self.iso.root), "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+
+    def agents(self, rows):
+        self.agents_file.write_text(json.dumps({"id": "cli:agent:list", "result": {"agents": rows}}), encoding="utf-8")
+
+    def agent(self, pane, sid, harness="codex", cwd=None):
+        return {"agent": harness, "pane_id": pane, "agent_status": "idle", "cwd": str(cwd or self.cwd),
+                "foreground_cwd": str(cwd or self.cwd),
+                "agent_session": {"kind": "id", "source": f"herdr:{harness}", "value": sid}}
+
+    def seat(self, harness="codex", sid="t-A", source="", cwd=None):
+        with self.iso.patched_environ(self.env):
+            return st.resolve_seat(harness, str(cwd or self.cwd), {}, sid, source)
+
+    @staticmethod
+    def pane_key(pane):
+        return st._digest("pane", pane)
+
+    def know(self, pane, sid):
+        """The pane's seat ledger has seen ``sid`` (what a hook of that session leaves behind)."""
+        with self.iso.patched_environ(self.env):
+            seat = st.Seat("pane", self.pane_key(pane), pane, "codex", "")
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "codex", sid, "prompt", cwd=str(self.cwd))
+
+    def book(self, pane, sid, status="reserved", cwd=None):
+        key = self.pane_key(pane)
+        now = st.now_epoch()
+        body = {"schema": 1, "nonce": "n" + key[:6], "status": status, "created": now - 30, "deadline": now + 500,
+                "seat": {"kind": "pane", "key": key, "pane": pane, "harness": "codex", "project_key": ""},
+                "harness": "codex", "sid": sid, "cwd": str(cwd or self.cwd), "card_generation": 1, "prompt_seq": 1}
+        (self.state / "clear").mkdir(parents=True, exist_ok=True)
+        (self.state / "clear" / f"{key}.json").write_text(json.dumps(body), encoding="utf-8")
+
+    def test_the_one_codex_pane_with_the_thread_id_is_the_seat(self):
+        self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-other")])
+        seat = self.seat()
+        self.assertEqual((seat.kind, seat.pane, seat.key), ("pane", "w:p1", self.pane_key("w:p1")))
+
+    def test_no_match_two_matches_a_failing_herdr_and_other_harnesses_stay_on_the_project_seat(self):
+        for rows in ([], [self.agent("w:p1", "t-other")],
+                     [self.agent("w:p1", "t-A"), self.agent("w:p2", "t-A")],
+                     [self.agent("w:p1", "t-A", harness="claude")]):
+            self.agents(rows)
+            self.assertEqual(self.seat().kind, "project", rows)
+        self.agents_file.write_text("not json", encoding="utf-8")
+        self.assertEqual(self.seat().kind, "project")
+        self.agents_file.write_text(json.dumps({"error": {"code": "boom"}}), encoding="utf-8")
+        self.assertEqual(self.seat().kind, "project")
+        self.agents_file.unlink()                                    # the fake exits non-zero with no output
+        self.assertEqual(self.seat().kind, "project")
+        with self.iso.patched_environ({"HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                                       "HEARTING_TIDY_HERDR": str(self.iso.root / "missing-herdr")}):
+            self.assertEqual(st.resolve_seat("codex", str(self.cwd), {}, "t-A").kind, "project")
+
+    def test_other_harnesses_and_a_pane_variable_never_ask_herdr(self):
+        self.agents([self.agent("w:p1", "sid-A", harness="claude"), self.agent("w:p9", "t-A")])
+        self.assertEqual(self.seat("claude", "sid-A").kind, "project")
+        self.assertEqual(self.seat("opencode", "sid-A").kind, "project")
+        self.assertEqual(self.seat("codex", None).kind, "project")
+        with self.iso.patched_environ(self.env):
+            own = st.resolve_seat("codex", str(self.cwd), {"HERDR_PANE_ID": "w:p5"}, "t-A")
+            claude = st.resolve_seat("claude", str(self.cwd), {"HERDR_PANE_ID": "w:p5"}, "sid-A")
+        self.assertEqual((own.pane, claude.pane), ("w:p5", "w:p5"))
+        self.assertFalse(self.calls.exists(), self.calls.read_text() if self.calls.exists() else "")
+
+    def test_a_pane_whose_ledger_knows_the_thread_keeps_it_while_herdr_shows_the_old_session(self):
+        self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X")])
+        self.assertEqual(self.seat(sid="t-B").kind, "project")      # nobody knows t-B
+        self.know("w:p1", "t-B")
+        self.assertEqual(self.seat(sid="t-B").pane, "w:p1")
+        self.assertEqual(self.seat(sid="t-C").kind, "project")
+        self.know("w:p2", "t-B")                                     # two panes claim it: no decision
+        self.assertEqual(self.seat(sid="t-B").kind, "project")
+        self.agents([self.agent("w:p1", "t-B"), self.agent("w:p2", "t-X")])
+        self.assertEqual(self.seat(sid="t-B").pane, "w:p1")         # herdr's own value is decisive
+        self.agents([self.agent("w:p3", "t-Y")])                     # the pane is gone: its ledger is not consulted
+        self.assertEqual(self.seat(sid="t-B").kind, "project")
+
+    def test_the_first_hook_after_a_clear_belongs_to_the_one_window_waiting_for_its_successor(self):
+        self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X", cwd=self.iso.root / "else")])
+        self.book("w:p1", "t-A")
+        self.assertEqual(self.seat(sid="t-B", source="clear").pane, "w:p1")
+        self.book("w:p1", "t-A", status="unverified")
+        self.assertEqual(self.seat(sid="t-B", source="clear").pane, "w:p1")
+        self.assertEqual(self.seat(sid="t-B", source="startup").kind, "project")   # only a clear start
+        self.assertEqual(self.seat(sid="t-B", source="").kind, "project")
+        self.assertEqual(self.seat(sid="t-B", source="clear", cwd=self.iso.root / "else").kind, "project")
+        self.book("w:p1", "t-A", status="cleared")                   # nothing waits any more
+        self.assertEqual(self.seat(sid="t-B", source="clear").kind, "project")
+        self.book("w:p1", "t-old")                                   # herdr shows another session than the booked one
+        self.assertEqual(self.seat(sid="t-B", source="clear").kind, "project")
+        self.know("w:p1", "t-A")                                     # ... unless the seat's ledger puts it before
+        self.know("w:p1", "t-old")
+        self.assertEqual(self.seat(sid="t-B", source="clear").pane, "w:p1")
+        self.book("w:p1", "t-A", cwd=self.iso.root / "elsewhere")    # the booking is for another directory
+        self.assertEqual(self.seat(sid="t-B", source="clear").kind, "project")
+
+    def test_a_second_codex_window_in_the_directory_or_no_booking_is_no_decision(self):
+        self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X")])
+        self.book("w:p1", "t-A")
+        self.assertEqual(self.seat(sid="t-B", source="clear").kind, "project")
+        self.agents([self.agent("w:p1", "t-A")])
+        (self.state / "clear" / f"{self.pane_key('w:p1')}.json").unlink()
+        self.assertEqual(self.seat(sid="t-B", source="clear").kind, "project")
+
+    def test_the_hook_card_and_successor_work_through_the_pane_found_in_herdr(self):
+        self.agents([self.agent("w:p1", "t-A")])
+        with self.iso.patched_environ(self.env):
+            st.run_hook("codex", "start", "t-A", cwd=str(self.cwd), env={}, emit=lambda _t: None)
+            card = self.iso.run([sys.executable, TIDY, "card", "--harness", "codex", "--session-id", "t-A",
+                                 "--text", "표식-데몬"], extra=self.env, cwd=self.cwd)
+        self.assertEqual(card.returncode, 0, card.stderr)
+        self.assertIn(f"seat={self.pane_key('w:p1')}", card.stdout)
+        # /clear: herdr keeps showing t-A, the auto-clear booking waits; t-B's start hook is the first sign of it.
+        self.book("w:p1", "t-A")
+        out = []
+        with self.iso.patched_environ(self.env):
+            st.run_hook("codex", "start", "t-B", source="clear", cwd=str(self.cwd), env={}, emit=out.append)
+        self.assertIn("표식-데몬", "".join(out))
+        with clear_booking_seen(self, "w:p1") as booking:
+            self.assertEqual(booking["observed"]["sid"], "t-B")      # the clear helper sees its successor
+        # the booking is replaced (a second tidy by t-B) -- t-B keeps its pane through the ledger
+        self.book("w:p1", "t-B")
+        self.assertEqual(self.seat(sid="t-B").pane, "w:p1")
+        # a project-seat session of the same project does not get the pane's card
+        out = []
+        with self.iso.patched_environ(self.env):
+            st.run_hook("codex", "start", "t-Z", cwd=str(self.cwd), env={}, emit=out.append)
+        self.assertEqual("".join(out), "")
+
+    def test_enqueue_books_the_auto_clear_for_the_pane_found_in_herdr(self):
+        self.agents([self.agent("w:p1", "t-A")])
+        started = []
+        with self.iso.patched_environ(self.env), \
+                mock.patch.object(clear, "_start_helper", side_effect=lambda key, nonce: started.append(key) or 4242):
+            resolved = st.resolve_caller("codex", "t-A", str(self.cwd))
+            line = clear.schedule_for_enqueue(resolved[0], "codex", "t-A", str(self.cwd))
+        self.assertEqual(line, "clear=scheduled")
+        self.assertEqual(started, [self.pane_key("w:p1")])
+        self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-A")])
+        with self.iso.patched_environ(self.env):
+            resolved = st.resolve_caller("codex", "t-A", str(self.cwd))
+            self.assertEqual(clear.schedule_for_enqueue(resolved[0], "codex", "t-A", str(self.cwd)),
+                             "clear=manual hint=/clear")
+
+    def test_the_handover_storage_lookup_finds_the_pane_of_a_daemon_codex_session(self):
+        import dispatch_seat_handover as handover
+        self.agents([self.agent("w:p1", "t-A")])
+        with self.iso.patched_environ(self.env):
+            self.assertEqual(handover.pane_seat({}, "codex", "t-A").pane, "w:p1")
+            self.assertIsNone(handover.pane_seat({}, None, "t-A"))
+            self.assertIsNone(handover.pane_seat({}, "claude", "t-A"))
+            self.assertEqual(handover.storage_recipients("t-A", {}, "codex"), [("t-A", None)])
+
+
+@contextlib.contextmanager
+def clear_booking_seen(case, pane):
+    with case.iso.patched_environ():
+        yield clear.read_reservation(st._digest("pane", pane))
 
 
 class WorkerTest(TidyCase):
@@ -593,6 +771,269 @@ class ChunkReaderTest(TidyCase):
         self.assertEqual(order, [1, 2, 3, 4, 5, 6])
 
 
+def codex_row(kind: str, text: str) -> dict:
+    block = "input_text" if kind == "user" else "output_text"
+    return {"type": "response_item", "payload": {"type": "message", "role": kind,
+                                                 "content": [{"type": block, "text": text}]}}
+
+
+class TailFirstReadingTest(TidyCase):
+    """The newest unread range is read first; an old unread front is never overwritten by a newer end."""
+
+    SID = "sid-tail"
+    ROWS = 4000
+
+    def setUp(self):
+        super().setUp()
+        # ``tempfile`` remembers the first temp dir it saw; keep it from remembering a test's own
+        # (about to be deleted) one when the OpenCode snapshot copies the database.
+        self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+        tempfile.tempdir = str(self.iso.tmpdir)
+
+    def make(self, harness, n=None, tag="행", pad=600):
+        """A multi-MB record (about ``n`` * ``pad`` bytes) whose last row is the recent decision."""
+        n = n or self.ROWS
+        texts = [f"{tag} {i:05d} " + "가" * pad for i in range(n)] + ["최근 결정 마커"]
+        if harness == "opencode":
+            load_opencode_fixture(self.iso.opencode_db)
+            con = sqlite3.connect(self.iso.opencode_db)
+            con.execute("DELETE FROM part")
+            con.execute("INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) "
+                        "VALUES ('msg_big', ?, 1, 1, '{\"role\": \"user\"}')", (self.SID,))
+            con.executemany("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) "
+                            "VALUES (?, 'msg_big', ?, ?, ?, ?)",
+                            [(f"prt_{i:06d}", self.SID, 1, 1, json.dumps({"type": "text", "text": t}, ensure_ascii=False))
+                             for i, t in enumerate(texts)])
+            con.commit()
+            con.close()
+            return self.iso.opencode_db
+        path = self.iso.root / f"{harness}-big.jsonl"
+        build = claude_row if harness == "claude" else codex_row
+        jsonl(path, [build("user" if i % 2 == 0 else "assistant", t) for i, t in enumerate(texts)])
+        return path
+
+    def drain(self, harness, path, limit=192 * 1024, appended=None):
+        """Read and apply chunk after chunk; returns every chunk (the last one is the empty "nothing left")."""
+        chunks = []
+        with self.library():
+            for step in range(200):
+                chunk = tt.read_pending(harness, self.SID, path, limit)
+                self.assertEqual(chunk.error, "")
+                chunks.append(chunk)
+                if chunk.cursor_to == chunk.cursor_from and not chunk.pending_after:
+                    return chunks
+                tt.mark_applied(harness, self.SID, chunk)
+                if appended and step == 0:
+                    appended()
+        self.fail("the unread ranges never ran out")
+
+    def test_the_recent_decision_is_in_the_first_input_and_later_runs_reach_the_front(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                path = self.make(harness)
+                if harness != "opencode":
+                    self.assertGreater(path.stat().st_size, 2 * 1024 * 1024)
+                chunks = self.drain(harness, path)
+                first = chunks[0]
+                self.assertIn("최근 결정 마커", first.text)
+                self.assertNotIn("행 00000", first.text)                       # not the front of a 2.5MB record
+                self.assertTrue(first.pending_after)                            # and it says part is still unread
+                self.assertEqual(first.unit, "rowid" if harness == "opencode" else "byte")
+                self.assertRegex(tt.describe_coverage(first), r"^(byte|rowid) [\d,]+–[\d,]+ / 전체 [\d,]+$")
+                joined = "\n".join(c.text for c in reversed(chunks) if c.text)
+                numbers = re.findall(r"행 (\d{5})", joined)
+                self.assertEqual(numbers, [f"{i:05d}" for i in range(self.ROWS)])  # every row, once, in order
+                self.assertEqual(chunks[-1].pending_after, [])
+                with self.library():
+                    mark = tt.read_watermark(harness, self.SID)
+                self.assertEqual((mark["pending"], mark["cursor"]), ([], mark["end"]))      # nothing is left unread
+
+    def test_nothing_is_marked_read_until_it_is_applied(self):
+        path = self.make("claude", n=600)
+        with self.library():
+            a = tt.read_pending("claude", self.SID, path, 64 * 1024)
+            b = tt.read_pending("claude", self.SID, path, 64 * 1024)         # the apply failed: same range again
+            self.assertEqual((a.cursor_from, a.cursor_to, a.text), (b.cursor_from, b.cursor_to, b.text))
+            tt.mark_applied("claude", self.SID, a)
+            c = tt.read_pending("claude", self.SID, path, 64 * 1024)
+            self.assertEqual(c.cursor_to, a.cursor_from)                     # continues right before it
+            self.assertNotIn("최근 결정 마커", c.text)
+
+    def test_an_append_is_read_first_and_the_old_unread_front_stays_pending(self):
+        path = self.make("claude", n=1500)
+        added = [claude_row("user", f"새 {i}") for i in range(3)]
+
+        def append():
+            with open(path, "a", encoding="utf-8") as handle:
+                for row in added:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        chunks = self.drain("claude", path, limit=128 * 1024, appended=append)
+        self.assertEqual(chunks[1].text, "[user] 새 0\n[user] 새 1\n[user] 새 2")         # the delta, before any backlog
+        self.assertTrue(chunks[1].pending_after)                                          # the front is still unread
+        texts = "\n".join(c.text for c in chunks)
+        self.assertEqual(sorted(re.findall(r"행 (\d{5})", texts)), [f"{i:05d}" for i in range(1500)])
+        self.assertEqual(len(re.findall(r"최근 결정 마커", texts)), 1)
+
+    def test_a_schema_1_watermark_becomes_the_start_of_the_unread_range(self):
+        path = self.make("claude", n=300)
+        raw = path.read_bytes()
+        cut = raw.index(b"\n", len(raw) // 2) + 1
+        with self.library():
+            tt.write_watermark("claude", self.SID, cut, source=str(path))     # what the old runner wrote
+            chunks = self.drain("claude", path, limit=1 << 30)
+        self.assertEqual((chunks[0].cursor_from, chunks[0].cursor_to), (cut, len(raw)))
+        self.assertIn("최근 결정 마커", chunks[0].text)
+
+    def test_a_replaced_record_is_read_again_from_its_start_and_a_half_row_waits(self):
+        path = self.iso.root / "r.jsonl"
+        jsonl(path, [claude_row("user", "옛 " + "x" * 300) for _ in range(5)])
+        with self.library():
+            chunk = tt.read_pending("claude", self.SID, path, 1 << 20)
+            tt.mark_applied("claude", self.SID, chunk)
+            path.unlink()
+            good = json.dumps(claude_row("user", "새 파일"), ensure_ascii=False) + "\n"
+            partial = json.dumps(claude_row("user", "쓰는 중"), ensure_ascii=False)
+            path.write_text(good + partial[:15], encoding="utf-8")
+            chunk = tt.read_pending("claude", self.SID, path, 1 << 20)
+            self.assertEqual((chunk.text, chunk.cursor_from), ("[user] 새 파일", 0))
+            tt.mark_applied("claude", self.SID, chunk)
+            path.write_text(good + partial, encoding="utf-8")
+            self.assertEqual(tt.read_pending("claude", self.SID, path, 1 << 20).text, "[user] 쓰는 중")
+
+    def test_a_row_beyond_the_hard_cap_is_stepped_over_and_counted(self):
+        path = self.iso.root / "o.jsonl"
+        jsonl(path, [claude_row("user", "앞"), claude_row("user", "거대 " + "z" * 3000), claude_row("user", "뒤")])
+        original = tt.MAX_ROW_BYTES
+        tt.MAX_ROW_BYTES = 1000
+        self.addCleanup(setattr, tt, "MAX_ROW_BYTES", original)
+        chunks = self.drain("claude", path, limit=200)
+        self.assertEqual(sum(c.skipped_oversize for c in chunks), 1)
+        self.assertEqual([c.text for c in chunks if c.text], ["[user] 뒤", "[user] 앞"])
+
+    def test_a_question_and_its_answer_in_different_chunks_still_pair_when_the_answer_is_read_first(self):
+        path = FIXTURES / "codex-choice.jsonl"
+        with self.library():
+            choices = [c for chunk in self.drain("codex", path, limit=1) for c in chunk.choices]
+        self.assertEqual(sorted(tuple(c["answers"]) for c in choices),
+                         [("진행 (Recommended)",), ("한 파일만 하고 나머지는 나중에",)])
+
+    def test_opencode_holds_back_at_an_open_question_and_rereads_a_row_that_changed(self):
+        load_opencode_fixture(self.iso.opencode_db)
+        original = tt.now_epoch
+        tt.now_epoch = lambda: FIXTURE_NOW
+        self.addCleanup(setattr, tt, "now_epoch", original)
+        sid = "ses_fixture0000000000000001"
+        with self.library():
+            first = tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20)
+            self.assertEqual((first.blocked, first.cursor_to), ("open-question", 6))      # rowids 1..5 only
+            self.assertEqual(first.pending_after, [[6, 7]])                               # the question stays unread
+            tt.mark_applied("opencode", sid, first)
+            con = sqlite3.connect(self.iso.opencode_db)
+            part = json.loads(con.execute("SELECT data FROM part WHERE rowid = 6").fetchone()[0])
+            part["state"].update({"status": "completed", "metadata": {"answers": [["진행 (권장)"]]}})
+            con.execute("UPDATE part SET data = ?, time_updated = time_updated + 5000 WHERE rowid = 6",
+                        (json.dumps(part, ensure_ascii=False),))
+            con.commit()
+            con.close()
+            second = tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20)
+            self.assertEqual([c["answers"] for c in second.choices], [["진행 (권장)"]])
+            tt.mark_applied("opencode", sid, second)
+            self.assertEqual(tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20).pending_after, [])
+
+
+class MemoryLayerTest(TidyCase):
+    """Card layer B ("참고할 기억"): its own revision and receipt, beside the unchanged layer A."""
+
+    def refs(self, n=3, batch="b1", status="applied", **more):
+        rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
+        return dict(batch=batch, status=status, refs=rows, **more)
+
+    def update(self, **kw):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            return st.update_memory_refs(seat, **kw)
+
+    def read(self):
+        return json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
+
+    def test_only_memory_refs_changes_and_the_same_batch_result_is_a_no_op(self):
+        self.card("sid-A", "카드 본문")
+        before = self.read()
+        first = self.update(**self.refs(result_path="/r/result.json"))
+        after = self.read()
+        for key in ("body", "author", "authored_at", "authored_at_epoch", "generation", "prompt_seq"):
+            self.assertEqual(after.get(key), before.get(key), key)
+        self.assertEqual((first["revision"], first["source_generation"]), (1, 1))
+        again = self.update(**self.refs(result_path="/r/result.json"))
+        self.assertEqual(again["revision"], 1)                                  # the same batch: same revision
+        self.assertEqual(self.update(**self.refs(batch="b2"))["revision"], 2)
+        self.assertIsNone(st.update_memory_refs(st.Seat("pane", "nocard", "x", "claude", ""), batch="b", status="applied", refs=[]))
+
+    def test_a_new_card_keeps_the_finished_list_and_the_late_batch_names_the_card_it_was_queued_under(self):
+        self.card("sid-A", "첫 카드")
+        self.update(**self.refs())
+        self.card("sid-A", "둘째 카드")
+        card = self.read()
+        self.assertEqual((card["generation"], card["memory_refs"]["revision"]), (2, 1))
+        late = self.update(**self.refs(batch="old-runner"), source_generation=1)
+        self.assertEqual((late["source_generation"], self.read()["generation"], self.read()["body"]), (1, 2, "둘째 카드"))
+
+    def test_a_new_session_gets_the_card_and_the_list_in_one_injection_within_the_cap(self):
+        self.card("sid-A", "가나다라 " * 900)
+        self.update(**self.refs(n=8, more=4, coverage="일부만 읽음(byte 1–2 / 전체 3) — 앞부분은 다음 정리에서 계속",
+                                result_path=str(self.state / "runs" / "b1" / "result.json")))
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.write_notice(seat, "정리 결과: 새 기록 3건. 되돌리기: mem tidy-undo b1", author_harness="claude", author_sid="sid-A")
+        got = self.hook("claude", "start", "sid-B")
+        self.assertLessEqual(len(got.encode("utf-8")), st.INJECTION_MAX_BYTES)
+        for needle in ("[정리 결과]", "[세션 카드]", "[참고할 기억]", "mem-0", "일부만 읽음", "b1/result.json", "카드 전문:"):
+            self.assertIn(needle, got)
+        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+
+    def test_a_listed_record_is_never_a_body_and_the_list_alone_stays_within_its_bytes(self):
+        self.card("sid-A", "본문")
+        self.update(**self.refs(n=8, more=0))
+        text = st.build_memory_injection(self.read()["memory_refs"], st.MEMORY_REFS_BYTES + 600)
+        self.assertLessEqual(len(text.encode("utf-8")), st.MEMORY_REFS_BYTES + 600)
+        tiny = st.build_memory_injection(self.read()["memory_refs"], 160)
+        self.assertLessEqual(len(tiny.encode("utf-8")), 160)
+        self.assertTrue(tiny.startswith("[참고할 기억]"))
+
+    def test_a_session_that_took_layer_a_still_gets_a_newer_list_once_and_a_failed_emit_keeps_it(self):
+        self.card("sid-A", "카드")
+        self.assertIn("카드", self.hook("claude", "start", "sid-B"))            # A taken before any list exists
+        self.update(**self.refs())
+
+        def broken(_text):
+            raise BrokenPipeError()
+
+        with self.library():
+            with self.assertRaises(BrokenPipeError):
+                st.run_hook("claude", "prompt", "sid-B", cwd=str(self.cwd), emit=broken)
+        got = self.hook("claude", "prompt", "sid-B")                            # the failed emit used nothing up
+        self.assertIn("[참고할 기억]", got)
+        self.assertNotIn("[세션 카드]", got)
+        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+        consumed = json.loads(next((self.state / "consumed").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual((consumed["generation"], consumed["memory_revision"]), (1, 1))     # two receipts, kept apart
+        self.update(**self.refs(batch="b2"))
+        self.assertIn("[참고할 기억]", self.hook("claude", "prompt", "sid-B"))   # a newer revision is handed out again
+
+    def test_reread_keeps_what_the_session_already_got_and_adds_the_later_list(self):
+        self.card("sid-A", "OpenCode 카드")
+        with self.library({"HERDR_PANE_ID": PANE}):
+            st.run_hook("opencode", "start", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
+        self.update(**self.refs())
+        with self.library({"HERDR_PANE_ID": PANE}):
+            st.run_hook("opencode", "prompt", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
+            replay = []
+            st.run_hook("opencode", "prompt", "ses_B", cwd=str(self.cwd), reread=True, emit=replay.append)
+        self.assertIn("OpenCode 카드", replay[0])                                 # layer A is still in the replay
+        self.assertIn("[참고할 기억]", replay[0])
+
+
 class RecentSessionsTest(TidyCase):
 
     def make_claude_record(self, sid: str, cwd: Path, age_days: float, now: float) -> Path:
@@ -684,6 +1125,561 @@ class LocateTest(TidyCase):
             self.assertEqual(tt.locate_transcript("opencode", "ses_x"), self.iso.opencode_db)
             self.assertIsNone(tt.locate_transcript("claude", "nope"))
             self.assertEqual(tt.locate_transcript("codex", "zzz", hint=str(claude)), claude)
+
+
+class PromptSeqTest(TidyCase):
+    """Real prompts are counted per seat, in a file the ledger throttle and fold never touch."""
+
+    def seq(self, pane=PANE):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            return st.read_prompt_seq(st.resolve_seat("claude", str(self.cwd)))
+
+    def test_only_real_prompts_count(self):
+        self.hook("claude", "start", "sid-A")
+        self.hook("claude", "start", "sid-A", "--source", "compact")
+        self.hook("claude", "compact", "sid-A")
+        self.card("sid-A", "카드")
+        self.assertEqual(self.seq(), 0)
+        for _ in range(3):
+            self.hook("claude", "prompt", "sid-A")
+        self.assertEqual(self.seq(), 3)
+
+    def test_prompts_inside_the_ledger_throttle_window_still_count(self):
+        self.hook("claude", "start", "sid-A")
+        for _ in range(5):                                   # all within PROMPT_LEDGER_THROTTLE_SEC
+            self.hook("claude", "prompt", "sid-A")
+        lines = (next((self.state / "sessions").glob("*.jsonl"))).read_text(encoding="utf-8").splitlines()
+        self.assertLess(len(lines), 1 + 5)                   # the ledger did throttle ...
+        self.assertEqual(self.seq(), 5)                      # ... the count did not
+
+    def test_a_reread_is_not_a_prompt_and_a_second_pane_counts_alone(self):
+        self.hook("claude", "prompt", "sid-A")
+        self.hook("claude", "prompt", "sid-A", "--reread")
+        self.hook("claude", "prompt", "sid-Z", pane="test:pane-z")
+        self.assertEqual((self.seq(), self.seq("test:pane-z")), (1, 1))
+
+    def test_the_count_survives_a_ledger_fold(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            for n in range(st.LEDGER_FOLD_LINES + 20):
+                st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), now=1000.0 + n * 100)
+            self.assertEqual(st.read_prompt_seq(seat), st.LEDGER_FOLD_LINES + 20)
+            self.assertLess(len(st._read_ledger_lines(seat)), st.LEDGER_FOLD_LINES + 20)
+
+    def test_the_card_records_the_count_it_was_written_at(self):
+        self.hook("claude", "prompt", "sid-A")
+        self.hook("claude", "prompt", "sid-A")
+        self.card("sid-A", "카드")
+        data = json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(data["prompt_seq"], 2)
+
+
+class ClearBookingTest(TidyCase):
+    """``enqueue`` books at most one clear per seat; the helper is only started, never run here."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_herdr = self.iso.root / "fake-herdr"
+        self.fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.fake_herdr.chmod(0o755)
+        self.started = []
+
+    def book(self, harness="claude", sid="sid-A", pane=PANE, opt_out=False, herdr=True, seq_now=None):
+        extra = {"HERDR_PANE_ID": pane} if pane else {}
+        if herdr:
+            extra.update({"HEARTING_TIDY_TEST_ROOT": str(self.iso.root), "HEARTING_TIDY_HERDR": str(self.fake_herdr)})
+        with self.iso.patched_environ(extra), \
+                mock.patch.object(clear, "_start_helper", side_effect=lambda key, nonce: self.started.append(nonce) or 4242):
+            seat = st.resolve_seat(harness, str(self.cwd))
+            return clear.schedule_for_enqueue(seat, harness, sid, str(self.cwd), opt_out=opt_out), seat
+
+    def reservation(self, seat):
+        with self.iso.patched_environ():
+            return clear.read_reservation(seat.key)
+
+    def test_a_pane_inside_herdr_books_the_clear_with_the_exact_identity(self):
+        self.hook("claude", "prompt", "sid-A")
+        self.card("sid-A", "카드")
+        line, seat = self.book()
+        self.assertEqual(line, "clear=scheduled")
+        res = self.reservation(seat)
+        self.assertEqual((res["harness"], res["sid"], res["status"], res["card_generation"], res["prompt_seq"]),
+                         ("claude", "sid-A", "reserved", 1, 1))
+        self.assertEqual(res["seat"]["pane"], PANE)
+        self.assertEqual(res["deadline"] - res["created"], 600.0)
+        self.assertEqual(res["helper"]["pid"], 4242)
+        self.assertEqual(stat.S_IMODE((self.state / "clear" / f"{seat.key}.json").stat().st_mode), 0o600)
+        self.assertEqual(len(self.started), 1)
+
+    def test_no_clear_keeps_the_window_and_cancels_a_pending_booking(self):
+        line, seat = self.book()
+        self.assertEqual(line, "clear=scheduled")
+        line, _ = self.book(opt_out=True)
+        self.assertEqual(line, "clear=off")
+        self.assertIsNone(self.reservation(seat))
+        self.assertEqual(len(self.started), 1)                  # the opt-out started nothing
+
+    def test_a_newer_tidy_replaces_the_booking_and_the_old_nonce_is_dead(self):
+        self.book()
+        line, seat = self.book()
+        first, second = self.started
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.reservation(seat)["nonce"], second)
+        with self.iso.patched_environ():
+            self.assertEqual(clear.validate_request(clear.reservation_path(seat.key), first), (None, "superseded"))
+            self.assertEqual(clear.validate_request(clear.reservation_path(seat.key), second)[1], "")
+
+    def test_a_prompt_between_the_card_and_the_enqueue_books_nothing(self):
+        self.hook("claude", "prompt", "sid-A")
+        self.card("sid-A", "카드")
+        self.hook("claude", "prompt", "sid-A")                  # the user typed again after the card
+        line, seat = self.book()
+        self.assertEqual(line, "clear=skipped reason=new-input")
+        self.assertIsNone(self.reservation(seat))
+        self.assertEqual(self.started, [])
+
+    def test_outside_herdr_the_manual_command_of_each_harness_is_printed(self):
+        for harness, hint in (("claude", "/clear"), ("codex", "/clear"), ("opencode", "/new")):
+            line, seat = self.book(harness=harness, pane=None)       # no pane: a project seat
+            self.assertEqual(line, f"clear=manual hint={hint}")
+            self.assertIsNone(self.reservation(seat))
+        line, seat = self.book(herdr=False)                          # a pane id but no herdr to ask
+        self.assertEqual(line, "clear=manual hint=/clear")
+        self.assertEqual(self.started, [])
+
+    def test_a_manual_enqueue_cancels_the_older_booking(self):
+        _line, seat = self.book()
+        self.book(herdr=False)
+        self.assertIsNone(self.reservation(seat))
+
+    def test_the_enqueue_command_of_a_worker_in_the_inherited_pane_books_nothing(self):
+        result = self.cli("enqueue", "--harness", "claude", "--session-id", "sid-A",
+                          extra={"AGENT_SESSION_ROLE": "worker", "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)})
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "enqueue=none reason=worker"))
+        self.assertFalse((self.state / "clear").exists())
+
+    def test_a_start_at_the_booked_pane_is_noted_as_the_successor(self):
+        _line, seat = self.book()
+        self.hook("claude", "start", "sid-A")                        # the same session: not a successor
+        self.assertNotIn("observed", self.reservation(seat))
+        self.hook("claude", "start", "sid-B", "--source", "clear")
+        self.assertEqual(self.reservation(seat)["observed"]["sid"], "sid-B")
+        self.hook("codex", "start", "sid-C")                         # another harness at the pane: ignored
+        self.assertEqual(self.reservation(seat)["observed"]["sid"], "sid-B")
+
+    def test_request_checks_expiry_card_generation_new_input_and_location(self):
+        self.hook("claude", "prompt", "sid-A")
+        self.card("sid-A", "카드")
+        _line, seat = self.book()
+        path = self.state / "clear" / f"{seat.key}.json"
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            res = clear.read_reservation(seat.key)
+            self.assertEqual(clear.validate_request(path)[1], "")
+            self.assertEqual(clear.validate_request(path, now=res["deadline"] + 1), (None, "expired"))
+            elsewhere = self.iso.root / "copy.json"
+            elsewhere.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertEqual(clear.validate_request(elsewhere), (None, "request-unreadable"))
+            link = self.state / "clear" / "ffffffffffffffff.json"
+            os.symlink(path, link)
+            self.assertEqual(clear.validate_request(link), (None, "request-unreadable"))
+            link.unlink()
+        self.card("sid-A", "새 카드")
+        with self.iso.patched_environ():
+            self.assertEqual(clear.validate_request(path), (None, "card-changed"))
+        self.hook("claude", "prompt", "sid-A")
+        with self.iso.patched_environ():
+            self.assertEqual(clear.validate_request(path), (None, "new-input"))
+
+
+class OpenCodeReadRetryTest(unittest.TestCase):
+    """A snapshot of the shared OpenCode database is refused now and then; the read is tried again."""
+
+    def chunk(self, error=""):
+        return tt.Chunk("opencode", "db", 0, 0, error=error)
+
+    def test_a_refused_snapshot_is_tried_again_until_it_reads(self):
+        answers = [self.chunk("unreadable: OSError"), self.chunk("unreadable: OSError"), self.chunk()]
+        calls = []
+        result = tt._opencode_retry(lambda: calls.append(1) or answers[len(calls) - 1], pause=0)
+        self.assertEqual((result.error, len(calls)), ("", 3))
+
+    def test_a_read_that_keeps_failing_ends_with_the_last_error_after_a_bounded_number_of_tries(self):
+        calls = []
+        result = tt._opencode_retry(lambda: calls.append(1) or self.chunk("unreadable: OSError"), pause=0)
+        self.assertEqual((result.error, len(calls)), ("unreadable: OSError", tt.OPENCODE_READ_TRIES))
+
+    def test_a_clean_read_is_not_repeated(self):
+        calls = []
+        tt._opencode_retry(lambda: calls.append(1) or self.chunk(), pause=0)
+        self.assertEqual(len(calls), 1)
+
+
+class ClearHelperTest(TidyCase):
+    """The detached helper's decisions, with the herdr wait and ``peer-steward.py clear`` replaced."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_herdr = self.iso.root / "fake-herdr"
+        self.fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.fake_herdr.chmod(0o755)
+        self.extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                      "HEARTING_TIDY_HERDR": str(self.fake_herdr), "HEARTING_TIDY_CLEAR_OBSERVE": "0.3"}
+        self.calls = []
+
+    def test_helper_env_keeps_the_herdr_socket_but_not_the_callers_pane(self):
+        env = clear._helper_env({"HERDR_PANE_ID": PANE, "HERDR_TAB_ID": "t", "HERDR_ENV": "1",
+                                 "HERDR_SOCKET_PATH": "/run/herdr/custom.sock", "CLAUDE_CODE_SESSION_ID": "s",
+                                 "PATH": "/usr/bin"})
+        self.assertEqual(env.get("HERDR_SOCKET_PATH"), "/run/herdr/custom.sock")
+        self.assertEqual(env.get("PATH"), "/usr/bin")
+        for dropped in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_ENV", "CLAUDE_CODE_SESSION_ID"):
+            self.assertNotIn(dropped, env)
+        self.assertNotIn("HERDR_SOCKET_PATH", clear._helper_env({"HERDR_PANE_ID": PANE}))
+
+    def booked(self, harness="claude", sid="sid-A"):
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
+            seat = st.resolve_seat(harness, str(self.cwd))
+            clear.schedule_for_enqueue(seat, harness, sid, str(self.cwd))
+            return seat, clear.read_reservation(seat.key)
+
+    def run_helper(self, seat, req, wait="idle", verdict=None, during=None):
+        def fake_wait(pane, timeout_ms):
+            self.calls.append(("wait", pane))
+            if during:
+                during()
+            return wait
+
+        def fake_steward(path, nonce, pane):
+            self.calls.append(("clear", pane, nonce))
+            return dict(verdict or {"cleared": "true", "new_session": "sid-B"})
+
+        with self.iso.patched_environ(self.extra):
+            return clear.run_helper(seat.key, req["nonce"], wait=fake_wait, steward=fake_steward,
+                                    sleep=lambda _s: None)
+
+    def notices(self, seat):
+        data = st.read_json(self.state / "notices" / f"{seat.key}.json")
+        return [i["text"] for i in (data or {}).get("items", [])]
+
+    def status(self, seat):
+        return st.read_json(self.state / "clear" / f"{seat.key}.json")["status"]
+
+    def test_an_idle_window_is_cleared_once_and_silently(self):
+        seat, req = self.booked()
+        self.assertEqual(self.run_helper(seat, req), "cleared")
+        self.assertEqual([c[0] for c in self.calls], ["wait", "clear"])
+        self.assertEqual(self.calls[1][1:], (PANE, req["nonce"]))
+        self.assertEqual(self.notices(seat), [])
+        self.assertEqual(self.status(seat), "cleared")
+
+    def test_a_window_that_stays_busy_is_left_alone_with_one_line(self):
+        seat, req = self.booked()
+        self.assertEqual(self.run_helper(seat, req, wait="timeout"), "skipped")
+        self.assertEqual([c[0] for c in self.calls], ["wait"])           # nothing was typed
+        self.assertEqual(len(self.notices(seat)), 1)
+        self.assertIn("10분", self.notices(seat)[0])
+        self.assertIn("/clear", self.notices(seat)[0])
+
+    def test_a_prompt_that_arrives_before_idle_cancels_the_clear(self):
+        seat, req = self.booked()
+
+        def typed():
+            with self.iso.patched_environ(self.extra):
+                st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd))
+        self.assertEqual(self.run_helper(seat, req, during=typed), "skipped")
+        self.assertEqual([c[0] for c in self.calls], ["wait"])           # idle came, but the input is new
+        self.assertIn("새 입력", self.notices(seat)[0])
+
+    def test_the_steward_verdicts_skip_fail_unverified_each_leave_one_line(self):
+        for verdict, outcome, word in (({"cleared": "skipped", "reason": "draft"}, "skipped", "입력창에 쓰던 글"),
+                                       ({"cleared": "skipped", "reason": "form-open"}, "skipped", "선택"),
+                                       ({"cleared": "skipped", "reason": "draft-unknown"}, "skipped", "비어 있는지"),
+                                       ({"cleared": "failed", "reason": "herdr-exit-1"}, "failed", "실패"),
+                                       ({"cleared": "unverified", "reason": "new-session-not-observed"},
+                                        "unverified", "확인하지 못했습니다")):
+            with self.subTest(verdict=verdict):
+                self.calls = []
+                seat, req = self.booked()
+                self.assertEqual(self.run_helper(seat, req, verdict=verdict), outcome)
+                self.assertEqual([c[0] for c in self.calls], ["wait", "clear"])    # typed at most once, never again
+                last = self.notices(seat)[-1]
+                self.assertIn(word, last)
+
+    def test_an_unverified_send_is_not_resent_and_becomes_cleared_when_the_new_start_shows_up(self):
+        seat, req = self.booked()
+
+        def late_start():
+            with self.iso.patched_environ(self.extra):
+                st.run_hook("claude", "start", "sid-B", source="clear", cwd=str(self.cwd))
+        sleeps = []
+        verdict = {"cleared": "unverified", "reason": "new-session-not-observed"}
+
+        def fake_sleep(sec):
+            sleeps.append(sec)
+            late_start()
+        with self.iso.patched_environ(self.extra):
+            outcome = clear.run_helper(
+                seat.key, req["nonce"], wait=lambda *_a: "idle",
+                steward=lambda *_a: self.calls.append("clear") or verdict, sleep=fake_sleep)
+        self.assertEqual(outcome, "cleared")
+        self.assertEqual(self.calls, ["clear"])                           # one send, no second one
+        self.assertEqual(self.notices(seat), [])
+
+    def test_a_successor_that_starts_after_the_helper_gave_up_turns_the_doubt_into_a_clear(self):
+        seat, req = self.booked()
+        verdict = {"cleared": "unverified", "reason": "new-session-not-observed"}
+        self.assertEqual(self.run_helper(seat, req, verdict=verdict), "unverified")
+        self.assertIn("확인하지 못했습니다", self.notices(seat)[-1])
+        shown = []
+        with self.iso.patched_environ(self.extra):
+            st.write_notice(seat, "[정리] 다른 결과", author_harness="claude", author_sid="sid-A")
+            st.run_hook("claude", "start", "sid-B", source="clear", cwd=str(self.cwd), emit=shown.append)  # late hook
+        held = st.read_json(self.state / "clear" / f"{seat.key}.json")
+        self.assertEqual((held["status"], held["new_session"], held["observed"]["sid"]), ("cleared", "sid-B", "sid-B"))
+        self.assertIn("다른 결과", "".join(shown))                           # only the doubt was dropped
+        self.assertNotIn("확인하지 못했습니다", "".join(shown))
+
+    def test_a_replaced_or_cancelled_helper_writes_nothing(self):
+        seat, req = self.booked()
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=2):
+            clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd))       # a newer tidy
+        self.assertEqual(self.run_helper(seat, req, wait="timeout"), "superseded")
+        self.assertEqual(self.notices(seat), [])
+        with self.iso.patched_environ(self.extra):
+            clear.cancel(seat)                                                        # then --no-clear
+            self.assertEqual(clear.run_helper(seat.key, "whatever", wait=lambda *_a: "idle"), "superseded")
+        self.assertEqual(self.notices(seat), [])
+
+    def test_the_memory_notice_survives_and_the_clear_line_is_added_after_it(self):
+        seat, req = self.booked()
+        with self.iso.patched_environ(self.extra):
+            st.write_notice(seat, "[정리] 새 기록 1건", author_harness="claude", author_sid="sid-A")
+        self.run_helper(seat, req, verdict={"cleared": "skipped", "reason": "draft"})
+        texts = self.notices(seat)
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(texts[0].startswith("[정리] 새 기록"))
+        self.assertIn("입력창", texts[1])
+
+    def test_each_harness_names_its_own_manual_command_in_the_line(self):
+        for harness, hint in (("codex", "/clear"), ("opencode", "/new")):
+            seat, req = self.booked(harness=harness, sid=f"sid-{harness}")
+            self.run_helper(seat, req, wait="timeout")
+            self.assertIn(hint, self.notices(seat)[-1])
+
+    def test_an_expired_booking_is_never_typed(self):
+        seat, req = self.booked()
+        path = self.state / "clear" / f"{seat.key}.json"
+        data = st.read_json(path)
+        data["deadline"] = st.now_epoch() - 1
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.run_helper(seat, req), "skipped")
+        self.assertEqual(self.calls, [])
+        self.assertIn("예약 시간", self.notices(seat)[0])
+
+
+class SeatHandoverTest(TidyCase):
+    """A cleared window's successor at the same pane answers for the predecessor's depth-1 attempts."""
+
+    def setUp(self):
+        super().setUp()
+        self.jobs = self.iso.root / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir()
+        self.rows = []
+        import dispatch_seat_handover as handover
+        self.handover = handover
+
+    def row(self, aid, parent="sid-A", status="open", route="rt-1", node="one-shot", depth="1",
+            worker="owner", harness="claude", digest="sha256:aa", route_file="/tmp/rt-1.json"):
+        meta = {"attempt_id": aid, "parent_sid": parent, "parent_harness": harness, "dispatch_depth": depth,
+                "worker_type": worker, "route_id": route, "route_hash": digest, "route_node": node,
+                "route_file": route_file}
+        self.rows.append(f"2026-10-01T00:00:00Z\t{status}\t/w\t/w\tslug\t" + ",".join(f"{k}={v}" for k, v in meta.items()))
+        self.jobs.write_text("\n".join(self.rows) + "\n", encoding="utf-8")
+        return meta
+
+    def seat(self, pane=PANE):
+        return st.resolve_seat("claude", str(self.cwd), {"HERDR_PANE_ID": pane})
+
+    def snapshot(self, sid="sid-A", harness="claude", pane=PANE, now=None):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            seat = self.seat(pane)
+            with st.seat_lock(seat.key):
+                st.record_event(seat, harness, sid, "start", cwd=str(self.cwd), now=now)
+                return self.handover.write_snapshot_locked(seat, harness, sid, now=now, jobs=self.jobs)
+
+    def start(self, sid, harness="claude", event="start", source="clear", pane=PANE):
+        out = []
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            st.run_hook(harness, event, sid, source=source, cwd=str(self.cwd),
+                        env={"HERDR_PANE_ID": pane}, emit=out.append)
+            seat = self.seat(pane)
+            return out, self.handover.handover_rows(seat)
+
+    def effective(self, meta):
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            return self.handover.effective_parent(meta, self.jobs)
+
+    def test_the_snapshot_takes_only_live_route_bound_depth1_attempts_of_the_session(self):
+        keep = self.row("att-keep")
+        self.row("att-depth2", depth="2")
+        self.row("att-free", route="")
+        self.row("att-other", parent="sid-X")
+        self.row("att-done", status="done", route="rt-9")
+        self.assertEqual(self.snapshot(), 1)
+        with self.iso.patched_environ():
+            snap = self.handover.read_snapshot(self.seat().key)
+        self.assertEqual([b["attempt"] for b in snap["bindings"]], [keep["attempt_id"]])
+        self.assertEqual(snap["from"], {"harness": "claude", "sid": "sid-A"})
+
+    def test_no_live_attempt_leaves_no_snapshot(self):
+        self.row("att-1")
+        self.assertEqual(self.snapshot(), 1)
+        self.jobs.write_text("", encoding="utf-8")
+        self.assertEqual(self.snapshot(), 0)
+        with self.iso.patched_environ():
+            self.assertIsNone(self.handover.read_snapshot(self.seat().key))
+
+    def test_a_confirmed_clear_start_records_one_row_and_the_successor_answers(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(self.effective(meta), "sid-A")                 # nothing handed over yet
+        out, rows = self.start("sid-B")
+        self.assertEqual([(r["from"], r["sid"], r["source"]) for r in rows], [("sid-A", "sid-B", "clear")])
+        self.assertEqual(self.effective(meta), "sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
+            self.assertTrue(self.handover.owns(meta, "sid-A", self.jobs))     # the registered parent keeps its name
+            self.assertFalse(self.handover.owns(meta, "sid-Z", self.jobs))
+        self.assertEqual(meta["parent_sid"], "sid-A")                    # the registry row is untouched
+        again, rows2 = self.start("sid-B", event="prompt", source="")
+        self.assertEqual(len(rows2), 1)                                  # the same A -> B again is a no-op
+
+    def test_the_card_gets_the_verified_route_and_the_existing_resume_command(self):
+        self.row("att-1", route_file="/tmp/rt-1.json")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd), now=st.now_epoch() - 9)
+                st.write_card(seat, "claude", "sid-A", "카드 본문", cwd=str(self.cwd))
+                self.handover.write_snapshot_locked(seat, "claude", "sid-A", jobs=self.jobs)
+        out, _ = self.start("sid-B")
+        text = "\n".join(out)
+        self.assertIn("[이어받은 진행 작업] route=rt-1", text)
+        self.assertIn("capability-route.py start --route /tmp/rt-1.json --jobs " + str(self.jobs), text)
+        self.assertIn("카드 본문", text)
+
+    def test_only_a_confirmed_clear_hands_over(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(self.start("sid-B", source="startup")[1], [])          # a fresh start is not a clear
+        self.assertEqual(self.start("sid-B2", event="prompt", source="")[1], [])
+        self.assertEqual(self.effective(meta), "sid-A")
+
+    def test_the_clear_booking_confirms_a_start_that_carries_no_source(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                clear._write_reservation({"schema": 1, "nonce": "n", "status": "reserved", "created": st.now_epoch() - 4,
+                                          "deadline": st.now_epoch() + 500, "seat": seat.as_dict(), "harness": "claude",
+                                          "sid": "sid-A", "card_generation": 0, "prompt_seq": 0})
+        out, rows = self.start("sid-B", source="startup")
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("sid-A", "sid-B")])
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_a_session_older_than_the_snapshot_is_not_its_successor(self):
+        self.row("att-1")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-old", "start", cwd=str(self.cwd), now=st.now_epoch() - 600)
+        self.snapshot()
+        self.assertEqual(self.start("sid-old", source="clear")[1], [])
+
+    def test_another_pane_or_harness_never_receives_the_attempts(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(self.start("sid-B", pane="test:pane-b")[1], [])
+        self.assertEqual(self.start("sid-B", harness="codex")[1], [])
+        self.assertEqual(self.effective(meta), "sid-A")
+
+    def test_no_pane_means_no_handover(self):
+        meta = self.row("att-1")
+        with self.iso.patched_environ():
+            seat = st.resolve_seat("claude", str(self.cwd), {})
+            self.assertEqual(seat.kind, "project")
+            with st.seat_lock(seat.key):
+                self.assertEqual(self.handover.write_snapshot_locked(seat, "claude", "sid-A", jobs=self.jobs), 0)
+            self.assertEqual(self.handover.storage_recipients("sid-B", {}), [("sid-B", None)])
+        self.assertEqual(self.effective(meta), "sid-A")
+
+    def test_two_successors_of_one_session_are_refused_the_second(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.assertEqual(len(self.start("sid-B")[1]), 1)
+        self.assertEqual(len(self.start("sid-C")[1]), 1)                # A -> C is refused: still one row
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_the_next_clear_hands_over_only_through_the_successors_own_tidy(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 9)
+        self.start("sid-B")
+        self.assertEqual(self.start("sid-C", source="clear")[1][-1]["sid"], "sid-B")     # no B snapshot: no B -> C
+        self.snapshot(sid="sid-B", now=st.now_epoch() - 5)           # B tidies: its snapshot still binds the route
+        rows = self.start("sid-D")[1]
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("sid-A", "sid-B"), ("sid-B", "sid-D")])
+        self.assertEqual(self.effective(meta), "sid-D")
+
+    def test_a_replacement_attempt_of_the_same_route_node_follows_the_binding(self):
+        self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        replacement = self.row("att-2")                                   # same route, hash and node, still parent A
+        self.assertEqual(self.effective(replacement), "sid-B")
+        other_node = self.row("att-3", node="other")
+        self.assertEqual(self.effective(other_node), "sid-A")             # a different node was never bound
+        self.assertEqual(self.effective(self.row("att-4", digest="sha256:bb")), "sid-A")
+
+    def test_opencode_hands_over_at_the_first_message_of_the_new_session(self):
+        meta = self.row("att-1", parent="ses_A", harness="opencode")
+        self.snapshot(sid="ses_A", harness="opencode", now=st.now_epoch() - 5)
+        rows = self.start("ses_B", harness="opencode", event="prompt", source="")[1]
+        self.assertEqual([(r["from"], r["sid"]) for r in rows], [("ses_A", "ses_B")])
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            self.assertEqual(self.handover.effective_parent(meta, self.jobs), "ses_B")
+
+    def test_storage_stays_with_the_registered_parent_and_only_bound_attempts_reach_the_taker(self):
+        self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            recipients = self.handover.storage_recipients("sid-B")
+            self.assertEqual(recipients, [("sid-B", None), ("sid-A", frozenset({"att-1"}))])
+            allowed = recipients[1][1]
+            self.assertTrue(self.handover.record_for_session({"attempt_ids": ["att-1"]}, allowed))
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": ["att-1", "att-9"]}, allowed))
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": []}, allowed))
+            self.assertEqual(self.handover.storage_recipients("sid-A"), [("sid-A", None)])
+
+    def test_folding_the_ledger_keeps_the_handover_rows_and_leaves_sessions_alone(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                for index in range(st.LEDGER_FOLD_LINES + 5):
+                    st.record_event(seat, "claude", f"sid-n{index}", "start", cwd=str(self.cwd))
+            self.assertEqual([(r["from"], r["sid"]) for r in self.handover.handover_rows(seat)], [("sid-A", "sid-B")])
+            self.assertTrue(st.latest_session(seat)["sid"].startswith("sid-n"))     # the rows are not sessions
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_a_broken_state_answers_the_registered_parent(self):
+        meta = self.row("att-1")
+        with mock.patch.object(self.handover, "_all_snapshots", side_effect=OSError("boom")):
+            self.assertEqual(self.handover.effective_parent(meta, self.jobs), "sid-A")
 
 
 if __name__ == "__main__":

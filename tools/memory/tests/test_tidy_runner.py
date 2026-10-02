@@ -10,7 +10,8 @@ so the "nothing is left behind" check at the end of every test is a real PID che
 
 Worker scenarios (``scenario.json``, one entry per launcher call; ``gate`` is a file the
 test creates to let the worker finish, so no assertion depends on timing):
-``ok`` · ``governor`` · ``fail-start`` · ``bad-json`` · ``bad-shape`` · ``no-output`` · ``hang``.
+``ok`` · ``governor`` · ``fail-start`` · ``bad-json`` · ``bad-shape`` · ``no-output`` · ``hang`` ·
+``symlink`` (the output is a link to ``target``) · ``oversize`` · ``directory`` (the output is a folder).
 """
 
 from __future__ import annotations
@@ -118,7 +119,15 @@ FAKE_FINISHER = textwrap.dedent('''\
     if mode == "ok":
         doc = {"schema_version": 7, "batch_id": "the-worker-is-wrong", "input_digest": "wrong",
                "actions": spec.get("actions", [])}
+        if "related" in spec:
+            doc["related_existing_ids"] = spec["related"]
         open(output, "w").write(json.dumps(doc))
+    elif mode == "symlink":
+        os.symlink(spec["target"], output)
+    elif mode == "oversize":
+        open(output, "w").write('{"actions": [], "pad": "' + "x" * (1100 * 1024) + '"}')
+    elif mode == "directory":
+        os.mkdir(output)
     elif mode == "bad-json":
         open(output, "w").write("{not json at all")
     elif mode == "bad-shape":
@@ -154,6 +163,39 @@ FAKE_STEWARD = textwrap.dedent('''\
     verdict = os.environ.get("FAKE_PEER_VERDICT", "true")
     exits = {{"true": 0, "failed": 1, "queued": 3, "unverified": 5}}
     print("prompted=" + verdict + " target=" + args[1] + " state_before=idle verify=observed ms=12")
+    sys.exit(exits[verdict])
+    ''')
+
+
+FAKE_HERDR = textwrap.dedent('''\
+    #!{python}
+    import json, os, pathlib, sys, time
+    root = pathlib.Path(os.environ["FAKE_ROOT"])
+    args = sys.argv[1:]
+    with open(root / "herdr.jsonl", "a") as handle:
+        handle.write(json.dumps(args) + "\\n")
+    gate = root / "idle-gate"
+    deadline = time.time() + 60
+    while (root / "hold-idle").exists() and not gate.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    state = os.environ.get("FAKE_PANE_STATE", "idle")
+    if state == "timeout":
+        sys.stderr.write(json.dumps({{"error": {{"code": "timeout"}}}}))
+        sys.exit(1)
+    print(json.dumps({{"result": {{"agent": {{"agent": "claude", "agent_status": state, "pane_id": args[2]}}}}}}))
+    ''')
+
+FAKE_CLEAR_STEWARD = textwrap.dedent('''\
+    #!{python}
+    import json, os, pathlib, sys
+    root = pathlib.Path(os.environ["FAKE_ROOT"])
+    args = sys.argv[1:]
+    with open(root / "clear.jsonl", "a") as handle:
+        handle.write(json.dumps({{"argv": args}}) + "\\n")
+    verdict = os.environ.get("FAKE_CLEAR_VERDICT", "true")
+    exits = {{"true": 0, "skipped": 3, "failed": 1, "unverified": 5}}
+    extra = " new_session=sid-NEW" if verdict == "true" else " reason=draft"
+    print("cleared=" + verdict + " target=" + args[1] + extra)
     sys.exit(exits[verdict])
     ''')
 
@@ -255,7 +297,7 @@ class RunnerCase(unittest.TestCase):
         result = self.cli("enqueue", "--harness", "claude", "--session-id", sid, **more)
         self.assertEqual(result.returncode, 0, result.stderr)
         line = result.stdout.strip()
-        self.assertRegex(line, r"^enqueue=tidy-\d{14}-[0-9a-f]{6} seat=[0-9a-f]+ status=queued$")
+        self.assertRegex(line, r"^enqueue=tidy-\d{14}-[0-9a-f]{6} seat=[0-9a-f]+ status=queued clear=manual hint=/clear$")
         return line.split()[0].split("=", 1)[1]
 
     def item(self, qid):
@@ -397,8 +439,11 @@ class EnqueueTest(RunnerCase):
         self.assertEqual(words[-1], "attempt-state")
         # the prompt and the bundle are private files; the prompt names both paths
         self.assertEqual((call["prompt_mode"], call["input_mode"]), (0o600, 0o600))
-        self.assertIn(str(self.state / "runs" / qid / "actions.json"), call["prompt"])
-        self.assertIn(str(self.state / "runs" / qid / "input_v1.json"), call["prompt"])
+        # the worker's files live under the artifact root (what the wrapper launches it with), not the state folder
+        folder = self.cwd / ".agent_reports" / ".runtime" / "session-tidy" / qid
+        self.assertIn(str(folder / "actions.json"), call["prompt"])
+        self.assertIn(str(folder / "input_v1.json"), call["prompt"])
+        self.assertNotIn(str(self.state), call["prompt"])
         self.assertIn("`artifact: -`", call["prompt"])
 
     def test_the_worker_starts_without_the_callers_worker_marker_session_or_pane(self):
@@ -423,6 +468,121 @@ class EnqueueTest(RunnerCase):
         self.wait_status(qid, "notified")
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.notices(), ["[정리] 새로 정리할 대화가 없습니다."])
+
+
+class AutoClearTest(RunnerCase):
+    """``enqueue`` inside herdr: the memory runner and the clear helper are two detached
+    processes that never wait for each other (fake herdr and fake ``peer-steward.py clear``)."""
+
+    def setUp(self):
+        super().setUp()
+        self.herdr_cmd = self.fake / "bin" / "herdr.py"
+        self.herdr_cmd.write_text(FAKE_HERDR.format(python=sys.executable), encoding="utf-8")
+        self.clear_cmd = self.fake / "bin" / "clear.py"
+        self.clear_cmd.write_text(FAKE_CLEAR_STEWARD.format(python=sys.executable), encoding="utf-8")
+        for path in (self.herdr_cmd, self.clear_cmd):
+            path.chmod(0o755)
+
+    def env(self, **more):
+        env = super().env(HEARTING_TIDY_HERDR=str(self.herdr_cmd), HEARTING_TIDY_PEER_STEWARD=str(self.clear_cmd))
+        env.update(more)
+        return env
+
+    def enqueue_line(self, sid, *flags, **more):
+        result = self.cli("enqueue", "--harness", "claude", "--session-id", sid, *flags, **more)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def reservation(self):
+        files = list((self.state / "clear").glob("*.json")) if (self.state / "clear").is_dir() else []
+        return st.read_json(files[0]) if files else None
+
+    def steps(self, name):
+        path = self.fake / name
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+    def helper_gone(self):
+        res = self.reservation()
+        pid = (res or {}).get("helper", {}).get("pid")
+        return bool(pid) and not alive(pid)
+
+    def test_one_enqueue_starts_both_detached_processes_and_the_window_is_cleared_silently(self):
+        shutil.copy(FIXTURES / "claude-choice.jsonl", self.projects / f"{CHOICE_SID}.jsonl")
+        self.scenario([{"mode": "ok", "gate": self.gate(), "actions": []}])
+        (self.fake / "hold-idle").write_text("x", encoding="utf-8")        # the turn has not ended yet
+        line = self.enqueue_line(CHOICE_SID)
+        self.assertRegex(line, r"^enqueue=tidy-\d{14}-[0-9a-f]{6} seat=[0-9a-f]+ status=queued clear=scheduled$")
+        qid = line.split()[0].split("=", 1)[1]
+        self.wait_for(lambda: (self.reservation() or {}).get("helper", {}).get("pid"), "the helper to register")
+        self.wait_status(qid, "waiting-worker")                            # the tidy runs while the window waits
+        self.assertEqual(self.reservation()["status"], "reserved")
+        self.assertEqual(self.steps("clear.jsonl"), [])                    # nothing is typed before idle
+        (self.fake / "idle-gate").write_text("go", encoding="utf-8")       # the turn ended: idle
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "cleared", "the clear")
+        # the memory worker is still held: the clear did not wait for it
+        self.assertNotIn(self.item(qid)["status"], ("notified", "failed"))
+        calls = self.steps("clear.jsonl")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual((argv[0], argv[1]), ("clear", PANE))
+        self.assertEqual(argv[argv.index("--request") + 1], str(self.state / "clear" / f"{self.item(qid)['seat']['key']}.json"))
+        self.assertEqual(argv[argv.index("--nonce") + 1], self.reservation()["nonce"])
+        self.open_gate()
+        self.wait_status(qid, "notified")
+        self.assertEqual(len(self.notices()), 1, self.notices())           # only the memory line: the clear was silent
+        self.wait_for(self.helper_gone, "the helper to exit")
+
+    def test_no_clear_starts_no_helper_and_cancels_a_pending_booking(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        (self.fake / "hold-idle").write_text("x", encoding="utf-8")
+        self.assertTrue(self.enqueue_line("sid-A").endswith("clear=scheduled"))
+        self.wait_for(lambda: (self.reservation() or {}).get("helper", {}).get("pid"), "the helper to register")
+        pid = self.reservation()["helper"]["pid"]
+        line = self.enqueue_line("sid-A", "--no-clear")
+        self.assertTrue(line.endswith("status=queued clear=off"), line)
+        self.assertIsNone(self.reservation())
+        (self.fake / "idle-gate").write_text("go", encoding="utf-8")       # the first helper wakes and finds nothing
+        self.wait_for(lambda: not alive(pid), "the cancelled helper to exit")
+        self.assertEqual(self.steps("clear.jsonl"), [])
+        self.assertEqual([n for n in self.notices() if "비우" in n], [])
+
+    def test_a_newer_enqueue_replaces_the_booking_and_only_the_new_helper_types(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        (self.fake / "hold-idle").write_text("x", encoding="utf-8")
+        self.enqueue_line("sid-A")
+        self.wait_for(lambda: (self.reservation() or {}).get("helper", {}).get("pid"), "the first helper")
+        first = self.reservation()
+        self.enqueue_line("sid-A")
+        self.wait_for(lambda: (self.reservation() or {}).get("nonce") != first["nonce"]
+                      and (self.reservation() or {}).get("helper", {}).get("pid"), "the second helper")
+        (self.fake / "idle-gate").write_text("go", encoding="utf-8")
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "cleared", "the clear")
+        self.wait_for(lambda: not alive(first["helper"]["pid"]), "the replaced helper to exit")
+        self.assertEqual(len(self.steps("clear.jsonl")), 1)                 # one clear, not two
+
+    def test_a_window_that_cannot_be_cleared_gets_one_line_and_is_never_retried(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        line = self.enqueue_line("sid-A", FAKE_CLEAR_VERDICT="skipped")
+        self.assertTrue(line.endswith("clear=scheduled"), line)
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "skipped", "the skip")
+        self.wait_for(lambda: any("입력창" in n for n in self.notices()), "the one result line")
+        self.assertEqual(len(self.steps("clear.jsonl")), 1)
+        self.assertEqual(len([n for n in self.notices() if "자동으로 비우지 않았습니다" in n]), 1)
+
+    def test_a_window_that_never_goes_idle_times_out_with_one_line_and_no_input(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        self.enqueue_line("sid-A", FAKE_PANE_STATE="timeout")
+        self.wait_for(lambda: (self.reservation() or {}).get("status") == "skipped", "the timeout")
+        self.assertEqual(self.steps("clear.jsonl"), [])
+        self.wait_for(lambda: any("10분" in n for n in self.notices()), "the one result line")
+
+    def test_the_helper_is_not_started_for_a_worker_or_outside_herdr(self):
+        result = self.cli("enqueue", "--harness", "claude", "--session-id", "sid-A", AGENT_SESSION_ROLE="worker")
+        self.assertEqual(result.stdout.strip(), "enqueue=none reason=worker")
+        no_pane = self.iso.run([sys.executable, TIDY, "enqueue", "--harness", "codex", "--session-id", "sid-C"],
+                               extra={k: v for k, v in self.env().items() if k != "HERDR_PANE_ID"}, cwd=self.cwd)
+        self.assertTrue(no_pane.stdout.strip().endswith("clear=manual hint=/clear"), no_pane.stdout)
+        self.assertFalse((self.state / "clear").exists())
 
 
 class DetachTest(RunnerCase):
@@ -540,7 +700,10 @@ class FailureTest(RunnerCase):
     def assert_untouched_and_told(self, qid, reason_part):
         item = self.wait_status(qid, "failed")
         self.assertIn(reason_part, item["error"])
-        self.assertEqual(self.card_path.read_bytes(), self.card_before)
+        # The card's own text is untouched; only the "참고할 기억" section may follow it, and it says why.
+        after = self.card_path.read_bytes()
+        self.assertTrue(after.startswith(self.card_before), after)
+        self.assertIn("정돈을 끝내지 못함", after.decode("utf-8")[len(self.card_before):])
         self.assertEqual(self.records(), self.records_before)
         self.assertIsNone(self.watermark("sid-A"))
         notes = self.notices()
@@ -548,6 +711,17 @@ class FailureTest(RunnerCase):
         self.assertRegex(notes[0], r"^\[정리\] 기억 정리를 끝내지 못했습니다\. 카드와 기존 기억은 그대로이고 다음 정리 때 이어서 처리됩니다\. \(사유: ")
         self.assertNotIn("\n", notes[0])
         self.assertFalse((self.state / "runs" / qid / "input_v1.json").exists())
+
+    def test_a_record_that_cannot_be_read_is_a_failure_never_nothing_new(self):
+        path = self.projects / "sid-A.jsonl"
+        path.chmod(0)
+        try:
+            qid = self.enqueue("sid-A")
+            self.assert_untouched_and_told(qid, "대화 기록을 읽지 못했습니다")
+        finally:
+            path.chmod(0o600)
+        self.assertNotIn("새로 정리할 대화가 없습니다", " ".join(self.notices()))
+        self.assertEqual(self.calls(), [])
 
     def test_a_worker_that_wrote_something_that_is_not_json(self):
         self.scenario([{"mode": "bad-json"}])
@@ -582,6 +756,292 @@ class FailureTest(RunnerCase):
         self.assertIsNotNone(self.watermark("sid-A"))
 
 
+class WorkerFolderTest(RunnerCase):
+    """The worker's own files live under the artifact root the wrapper launches it with."""
+
+    def folder(self, qid):
+        return self.cwd / ".agent_reports" / ".runtime" / "session-tidy" / qid
+
+    def test_the_folder_is_made_private_holds_an_exact_input_copy_and_goes_after_a_clean_finish(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        self.scenario([{"mode": "ok", "gate": self.gate(), "actions": []}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "waiting-worker")
+        folder = self.folder(qid)
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+        for name in ("input_v1.json", "prompt.md"):
+            self.assertEqual(stat.S_IMODE((folder / name).stat().st_mode), 0o600, name)
+        # the same bytes as the state copy, so the digest the worker was given still holds
+        self.assertEqual((folder / "input_v1.json").read_bytes(), (self.state / "runs" / qid / "input_v1.json").read_bytes())
+        self.open_gate()
+        self.wait_status(qid, "notified")
+        self.assertFalse(folder.exists())                                  # nothing of the worker's is left behind
+        self.assertTrue((self.state / "runs" / qid / "actions.json").is_file())   # the checked copy tidy-apply read
+        checked = json.loads((self.state / "runs" / qid / "actions.json").read_text(encoding="utf-8"))
+        self.assertEqual((checked["batch_id"], checked["schema_version"]), (qid, 1))   # the runner's identity, not the worker's
+
+    def test_a_failed_batch_removes_the_conversation_copy_but_keeps_the_workers_answer_for_a_look(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        self.scenario([{"mode": "bad-json"}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "failed")
+        self.assertEqual(sorted(p.name for p in self.folder(qid).iterdir()), ["actions.json"])
+        self.assertEqual(self.item(qid)["exchange"], str(self.folder(qid)))
+
+    def test_a_link_a_folder_or_an_oversize_file_as_the_answer_is_refused(self):
+        outside = self.iso.root / "elsewhere.json"
+        outside.write_text('{"actions": []}', encoding="utf-8")
+        cases = (({"mode": "symlink", "target": str(outside)}, "cannot be read"),
+                 ({"mode": "oversize"}, "too large"),
+                 ({"mode": "directory"}, "cannot be read|not a regular file|without writing"))
+        self.scenario([spec for spec, _why in cases])                # one launcher call per case, in order
+        for spec, why in cases:
+            with self.subTest(mode=spec["mode"]):
+                self.transcript("sid-A", [claude_row("user", f"무언가 결정했다 {spec['mode']}")])
+                qid = self.enqueue("sid-A")
+                item = self.wait_status(qid, "failed")
+                self.assertRegex(item["error"], why)
+                self.assertFalse((self.state / "runs" / qid / "actions.json").exists())     # nothing was applied
+                self.assertEqual(self.records(), {})
+
+    def test_the_folder_is_made_when_the_project_has_no_artifact_root_yet(self):
+        self.assertFalse((self.cwd / ".agent_reports").exists())
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        self.assertTrue((self.cwd / ".agent_reports").is_dir())
+        (call,) = self.calls()
+        self.assertIn(str(self.cwd / ".agent_reports" / ".runtime" / "session-tidy" / qid), call["prompt"])
+
+    def test_the_root_is_the_one_the_wrapper_resolves_for_a_linked_worktree(self):
+        primary = self.iso.root / "primary"
+        linked = self.iso.root / "linked"
+        for command in (["git", "init", "-q", str(primary)],
+                        ["git", "-C", str(primary), "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q",
+                         "--allow-empty", "-m", "x"],
+                        ["git", "-C", str(primary), "worktree", "add", "-q", str(linked)]):
+            done = self.iso.run(command)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        (primary / ".agent_reports").mkdir()
+        with self.iso.patched_environ({"AGENT_ARTIFACT_ROOT": "/ignored"}):
+            self.assertEqual(runner.artifact_root_for(str(linked)), (primary / ".agent_reports").resolve())
+
+    def test_an_unresolvable_root_ends_the_tidy_with_the_usual_one_line(self):
+        with self.assertRaises(runner.RunnerFailure) as caught:
+            runner.artifact_root_for(str(self.iso.root / "no-such-folder"))
+        self.assertIn("no artifact root for the worker's files", str(caught.exception))
+
+    def test_a_symlinked_folder_is_refused(self):
+        self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
+        elsewhere = self.iso.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.cwd / ".agent_reports" / ".runtime").mkdir(parents=True)
+        os.symlink(elsewhere, self.cwd / ".agent_reports" / ".runtime" / "session-tidy")
+        qid = self.enqueue("sid-A")
+        item = self.wait_status(qid, "failed")
+        self.assertIn("symlink", item["error"])
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_pruning_a_finished_entry_removes_only_its_own_folder(self):
+        mine, other = self.folder("tidy-old"), self.folder("tidy-keep")
+        for path in (mine, other):
+            path.mkdir(parents=True)
+            (path / "actions.json").write_text("{}", encoding="utf-8")
+        runner.remove_exchange(str(self.cwd))                        # not a worker folder: left alone
+        runner.remove_exchange(str(mine))
+        self.assertFalse(mine.exists())
+        self.assertTrue(other.exists())
+
+
+class TailFirstRunTest(RunnerCase):
+    """A long record: the recent decision is in the first input, later tidies work backwards."""
+
+    def big(self, rows=1500):
+        texts = [f"기록 {i:05d} " + "나" * 700 for i in range(rows)] + ["최근 결정 마커"]
+        return self.transcript("sid-A", [claude_row("user" if i % 2 == 0 else "assistant", t)
+                                         for i, t in enumerate(texts)])
+
+    def test_the_first_input_holds_the_recent_decision_and_the_line_says_part_was_not_read(self):
+        path = self.big()
+        self.assertGreater(path.stat().st_size, 1024 * 1024)
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        first = self.saved_input(1)["sessions"][0]
+        self.assertIn("최근 결정 마커", first["text"])
+        self.assertNotIn("기록 00000", first["text"])
+        self.assertEqual((first["unit"], first["total"], first["cursor_to"]), ("byte", path.stat().st_size, path.stat().st_size))
+        (note,) = self.notices()
+        self.assertRegex(note, r"일부만 읽음\(byte [\d,]+–[\d,]+ / 전체 [\d,]+\) — 앞부분은 다음 정리에서 계속")
+        self.assertRegex(note, rf"— 되돌리기: mem tidy-undo {qid}$")          # the way back is still last
+        mark = self.watermark("sid-A")
+        self.assertEqual(mark["pending"], [[0, first["cursor_from"]]])         # the old front is still unread
+
+    def test_later_tidies_read_further_back_without_overlap_until_nothing_is_left(self):
+        path = self.big(rows=600)
+        ends = []
+        for round_ in range(1, 9):
+            qid = self.enqueue("sid-A")
+            self.wait_status(qid, "notified")
+            data = self.saved_input(round_)["sessions"][0]
+            ends.append((data["cursor_from"], data["cursor_to"]))
+            if not data["pending_after"]:
+                break
+        else:
+            self.fail("the record was never fully read")
+        self.assertGreater(len(ends), 2)
+        for (a_from, _a_to), (_b_from, b_to) in zip(ends, ends[1:]):
+            self.assertEqual(b_to, a_from)                                       # each run ends where the last began
+        self.assertEqual(ends[-1][0], 0)
+        self.assertEqual(self.watermark("sid-A")["pending"], [])
+        # and now there is truly nothing: no worker, and the old "nothing new" wording is honest
+        before = len(self.calls())
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        self.assertEqual(len(self.calls()), before)
+        self.assertEqual(self.notices()[-1], "[정리] 새로 정리할 대화가 없습니다.")
+        self.assertTrue(all("일부만 읽음" not in n for n in self.notices()[-1:]))
+
+    def test_an_append_is_read_first_and_the_older_front_is_not_overwritten(self):
+        path = self.big(rows=700)
+        first = self.enqueue("sid-A")
+        self.wait_status(first, "notified")
+        backlog = self.watermark("sid-A")["pending"]
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(claude_row("user", "그 뒤에 이어진 결정"), ensure_ascii=False) + "\n")
+        second = self.enqueue("sid-A")
+        self.wait_status(second, "notified")
+        data = self.saved_input(2)["sessions"][0]
+        self.assertEqual(data["text"], "[user] 그 뒤에 이어진 결정")
+        self.assertEqual(self.watermark("sid-A")["pending"], backlog)            # the front waits where it was
+
+    def test_a_part_with_nothing_to_tidy_never_reads_as_nothing_new(self):
+        rows = [claude_row("user", "처음 대화")] + [
+            {"type": "user", "cwd": "/w", "isMeta": True, "message": {"role": "user", "content": "x" * 800}}
+            for _ in range(900)]
+        self.transcript("sid-A", rows)
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        self.assertEqual(self.calls() and self.saved_input(1)["sessions"][0]["text"], "[user] 처음 대화")
+        self.assertNotIn("새로 정리할 대화가 없습니다", " ".join(self.notices()))
+
+    def test_proposals_beyond_the_batch_limit_keep_their_conversation_unread(self):
+        self.transcript("sid-A", [claude_row("user", "결정이 많은 대화")])
+        many = [{"kind": "add", "type": "decision", "tier": "working", "body": f"Distinct decision number {i} about topic {i}."}
+                for i in range(12)]
+        self.scenario([{"mode": "ok", "actions": many}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        self.assertEqual(self.watermark("sid-A"), None)                           # not marked read
+        (note,) = self.notices()
+        self.assertIn("상한을 넘은 제안은 다음 정리에서 다시 봅니다", note)
+        self.assertRegex(note, rf"— 되돌리기: mem tidy-undo {qid}$")
+
+
+class MemoryRefsRunTest(RunnerCase):
+    """Card layer B: what the batch really wrote plus the related records, handed over once."""
+
+    def setUp(self):
+        super().setUp()
+        self.transcript("sid-A", [claude_row("user", "참고 기억 시험 결정")])
+        self.mem("add", "durable", "lesson", "An existing lesson about the storage format.")
+        self.existing = next(iter(self.records()))
+        self.cli("card", "--harness", "claude", "--session-id", "sid-A", "--text", "진행 중: 시험")
+
+    def card(self):
+        return st.read_json(next((self.state / "cards").glob("*.json")))
+
+    def start(self, sid, event="start"):
+        return self.cli("hook", "--harness", "claude", "--event", event, "--session-id", sid).stdout
+
+    def test_the_actual_new_ids_and_the_related_existing_ones_become_the_list(self):
+        self.scenario([{"mode": "ok", "related": [self.existing, "not-a-record", self.existing], "actions": [
+            {"kind": "add", "type": "decision", "tier": "durable", "body": "Brand new decision about storage."}]}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        refs = self.card()["memory_refs"]
+        self.assertEqual((refs["revision"], refs["status"], refs["batch"], refs["source_generation"]),
+                         (1, "applied", qid, 1))
+        new_ids = [r["id"] for r in refs["refs"] if r["kind"] == "새"]
+        self.assertEqual(len(new_ids), 1)
+        self.assertEqual([r["id"] for r in refs["refs"]], new_ids + [self.existing])    # new first, related after
+        self.assertEqual(refs["refs"][-1]["kind"], "관련")
+        self.assertEqual(refs["result_path"], str(self.state / "runs" / qid / "result.json"))
+        # the card itself did not move, and its text file carries the section
+        card = self.card()
+        self.assertEqual((card["generation"], card["body"]), (1, "진행 중: 시험"))
+        self.assertIn("[참고할 기억]", (self.state / "cards" / (card["seat"]["key"] + ".md")).read_text(encoding="utf-8"))
+
+    def test_a_list_is_cut_to_eight_records_and_twelve_hundred_bytes(self):
+        actions = [{"kind": "add", "type": "decision", "tier": "working",
+                    "body": f"Decision {i}: " + "wordy detail " * 20 + f"unique-{i}", "headline": f"headline {i} " + "긴" * 60}
+                   for i in range(10)]
+        self.scenario([{"mode": "ok", "actions": actions}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        refs = self.card()["memory_refs"]
+        self.assertLessEqual(len(refs["refs"]), 8)
+        self.assertLessEqual(sum(len(f"- {r['id']} [{r['kind']}] {r['headline']}".encode("utf-8")) + 1 for r in refs["refs"]), 1200)
+        self.assertGreater(refs["more"], 0)
+        shown = self.start("sid-B")
+        self.assertRegex(shown, rf"외 {refs['more'] + 10 - len(refs['refs'])}건|외 \d+건")
+        self.assertIn(refs["result_path"], shown)
+
+    def test_a_tidy_that_ends_after_the_new_session_started_still_reaches_it_once(self):
+        self.scenario([{"mode": "ok", "gate": self.gate(), "actions": [
+            {"kind": "add", "type": "decision", "tier": "durable", "body": "A decision that lands late."}]}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "waiting-worker")
+        first = self.start("sid-B")                                                # cleared before the tidy ended
+        self.assertIn("진행 중: 시험", first)
+        self.assertNotIn("[참고할 기억]", first)
+        self.open_gate()
+        self.wait_status(qid, "notified")
+        second = self.start("sid-B", "prompt")                                     # layer A was taken; B is new
+        self.assertIn("[참고할 기억]", second)
+        self.assertNotIn("진행 중: 시험", second)                                    # the card is not handed out again
+        self.assertIn("[정리 결과]", second)
+        self.assertEqual(self.start("sid-B", "prompt"), "")                        # and neither is B
+        self.assertEqual(self.start("sid-C"), "")                                  # nor to a later session
+
+    def test_the_writing_session_does_not_use_layer_b_up_before_the_new_session_can_see_it(self):
+        self.scenario([{"mode": "ok", "actions": [
+            {"kind": "add", "type": "decision", "tier": "durable", "body": "Handed to the successor only."}]}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "notified")
+        shown = self.start("sid-A", "prompt")
+        self.assertIn("[정리 결과]", shown)
+        self.assertNotIn("[참고할 기억]", shown)
+        self.assertIn("[참고할 기억]", self.start("sid-B"))                        # the successor gets A and B together
+        self.assertEqual(self.start("sid-D"), "")                                  # B and A were handed over once
+
+    def test_a_failure_says_so_in_the_same_section_and_names_no_list(self):
+        self.scenario([{"mode": "bad-json"}])
+        qid = self.enqueue("sid-A")
+        self.wait_status(qid, "failed")
+        refs = self.card()["memory_refs"]
+        self.assertEqual((refs["status"], refs["refs"]), ("failed", []))
+        shown = self.start("sid-B")
+        self.assertIn("정돈을 끝내지 못함", shown)
+        self.assertIn("진행 중: 시험", shown)
+
+    def test_a_later_batch_replaces_the_list_and_a_late_old_batch_does_not_touch_the_card(self):
+        self.scenario([{"mode": "ok", "actions": [
+            {"kind": "add", "type": "decision", "tier": "durable", "body": "First batch decision."}]}])
+        first = self.enqueue("sid-A")
+        self.wait_status(first, "notified")
+        self.cli("card", "--harness", "claude", "--session-id", "sid-A", "--text", "진행 중: 둘째 카드")
+        card = self.card()
+        self.assertEqual((card["generation"], card["memory_refs"]["revision"]), (2, 1))   # B outlives the new card
+        self.transcript("sid-A", [claude_row("user", "참고 기억 시험 결정"), claude_row("user", "둘째 배치 결정")])
+        self.scenario([{"mode": "ok", "actions": [
+            {"kind": "add", "type": "decision", "tier": "durable", "body": "Second batch decision."}]}])
+        second = self.enqueue("sid-A")
+        self.wait_status(second, "notified")
+        refs = self.card()["memory_refs"]
+        self.assertEqual((refs["revision"], refs["batch"], refs["source_generation"]), (2, second, 2))
+        self.assertEqual(self.card()["body"], "진행 중: 둘째 카드")
+
+
 class PartialApplyTest(RunnerCase):
     """A batch that stopped after some writes must say so and keep its undo command."""
 
@@ -593,8 +1053,9 @@ class PartialApplyTest(RunnerCase):
                     "status": "queued", "updated": runner._now(), "seat": seat.as_dict(),
                     "harness": "claude", "sid": "sid-A", "cwd": str(self.cwd), "transcript": "", "attempts": 0}
             runner.write_item(item)
-            bundle = mock.Mock(empty=False, cursors=[])
+            bundle = mock.Mock(empty=False, cursors=[], unread=[], related=[], exchange=self.cwd / "worker-folder")
             with mock.patch.object(runner, "assemble", return_value=bundle), \
+                    mock.patch.object(runner, "prepare_exchange", return_value=bundle.exchange), \
                     mock.patch.object(runner, "dispatch_worker", return_value={"attempt_id": "att-x"}), \
                     mock.patch.object(runner, "wait_worker"), \
                     mock.patch.object(runner, "validate_actions"), \

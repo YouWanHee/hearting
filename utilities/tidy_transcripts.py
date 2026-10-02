@@ -12,20 +12,27 @@ What this adds over ``tools/fleet/refresh_title.read_delta`` /
   ``AskUserQuestion``, Codex ``request_user_input``, OpenCode ``question``), one
   record per question;
 * it finds the conversation records of the same seat over the last three days;
-* it keeps the per-session watermark (the cursor of the last *applied* chunk).
+* it keeps the per-session watermark: the **ranges still unread** (``pending``) inside
+  the snapshot it last saw.  ``read_pending`` hands out the *newest* unread range's
+  last whole rows first (so a long record's recent decisions are never starved by its
+  old front), and ``mark_applied`` removes only the range a successful apply covered.
+  A new append becomes its own range; an old unread front is never overwritten by a
+  newer end-of-file.
 
-Cursor meaning: a byte offset into the JSONL file (Claude, Codex) or the ``part``
-rowid (OpenCode).  A row that could not be read whole (a half-written last line,
-an unanswered question still open) does not move the cursor.
+Position meaning: a byte offset into the JSONL file (Claude, Codex) or the ``part``
+rowid (OpenCode); a range is half-open ``[from, to)``.  A row that could not be read
+whole (a half-written last line, an unanswered question still open) stays unread.
 
 Public functions (all return plain dicts / dataclasses, never raise for a missing
 or unreadable record):
 
     locate_transcript(harness, sid, hint=None) -> Path | None
     read_chunk(harness, source, cursor=0, sid=None, limit_bytes=DEFAULT_CHUNK_BYTES) -> Chunk
-    read_pending(harness, sid, source, limit_bytes=...) -> Chunk        # from the watermark
-    read_watermark(harness, sid) -> dict            {"cursor": int, ...}
-    write_watermark(harness, sid, cursor, **meta) -> dict
+    read_pending(harness, sid, source, limit_bytes=...) -> Chunk        # newest unread range, tail first
+    mark_applied(harness, sid, chunk) -> dict                           # drop that range from "unread"
+    read_watermark(harness, sid) -> dict            {"cursor": int, "pending": [[from, to], ...], ...}
+    write_watermark(harness, sid, cursor, **meta) -> dict               # legacy: "read up to cursor"
+    describe_coverage(chunk) -> str                                     # "byte 2,880,000–3,145,728 / 전체 3,145,728"
     select_recent_sessions(seat, cwd=None, now=None, days=3) -> list[dict]
 """
 
@@ -76,6 +83,10 @@ class Chunk:
     skipped_oversize: int = 0
     blocked: str = ""      # "open-question": stopped before an unanswered question
     error: str = ""
+    unit: str = "byte"     # "byte" (Claude, Codex) | "rowid" (OpenCode)
+    total: int = 0         # end of the snapshot this chunk was cut from
+    pending_after: list = dataclasses.field(default_factory=list)   # ranges still unread once this one is applied
+    plan: dict = dataclasses.field(default_factory=dict)            # what ``mark_applied`` needs
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -98,6 +109,22 @@ def codex_sessions_dir(env=None) -> Path:
 
 def opencode_db_path() -> Path:
     return _sst._opencode_db()
+
+
+OPENCODE_READ_TRIES = 4        # a snapshot of a database other windows keep writing fails now and then
+
+
+def _opencode_retry(read, pause: float = 0.5) -> "Chunk":
+    """``read()`` again while its snapshot was unreadable: every OpenCode window writes the same database,
+    so the private copy is refused whenever a write lands during the copy (about one read in two on a
+    busy 1 GB database, measured 2026-10-01).  A real failure still comes back as the last error."""
+    chunk = read()
+    for _ in range(OPENCODE_READ_TRIES - 1):
+        if not chunk.error:
+            break
+        time.sleep(pause)
+        chunk = read()
+    return chunk
 
 
 def locate_transcript(harness: str, sid: str, hint: Optional[str] = None) -> Optional[Path]:
@@ -401,13 +428,8 @@ def _complete_rows(path: Path, cursor: int, limit: int) -> tuple[list, int, bool
         return rows, new_cursor, new_cursor >= size, skipped
 
 
-def _read_jsonl(harness: str, path: Path, cursor: int, limit: int) -> Chunk:
-    chunk = Chunk(harness, str(path), cursor, cursor)
-    try:
-        lines, new_cursor, eof, skipped = _complete_rows(path, cursor, limit)
-    except OSError as exc:
-        chunk.error = f"unreadable: {exc.__class__.__name__}"
-        return chunk
+def _digest_rows(harness: str, path: Path, lines: list, before: int, chunk: Chunk) -> None:
+    """Fill ``chunk`` (rows, text, choices) from whole JSONL rows; ``before`` is where they start."""
     texts: list = []
     uses: dict = {}
     calls: dict = {}
@@ -423,9 +445,19 @@ def _read_jsonl(harness: str, path: Path, cursor: int, limit: int) -> Chunk:
         if harness == "claude":
             chunk.choices.extend(_claude_choices(data, uses))
         else:
-            chunk.choices.extend(_codex_records(data, calls, path, cursor))
-    chunk.cursor_to, chunk.eof, chunk.skipped_oversize = new_cursor, eof, skipped
+            chunk.choices.extend(_codex_records(data, calls, path, before))
     chunk.text = "\n".join(texts)
+
+
+def _read_jsonl(harness: str, path: Path, cursor: int, limit: int) -> Chunk:
+    chunk = Chunk(harness, str(path), cursor, cursor)
+    try:
+        lines, new_cursor, eof, skipped = _complete_rows(path, cursor, limit)
+    except OSError as exc:
+        chunk.error = f"unreadable: {exc.__class__.__name__}"
+        return chunk
+    _digest_rows(harness, path, lines, cursor, chunk)
+    chunk.cursor_to, chunk.eof, chunk.skipped_oversize = new_cursor, eof, skipped
     return chunk
 
 
@@ -482,7 +514,7 @@ def read_chunk(harness: str, source, cursor: int = 0, sid: Optional[str] = None,
     limit = max(1, int(limit_bytes))
     cursor = max(0, int(cursor or 0))
     if harness == "opencode":
-        return _read_opencode(Path(source), sid or "", cursor, limit)
+        return _opencode_retry(lambda: _read_opencode(Path(source), sid or "", cursor, limit))
     if harness in ("claude", "codex"):
         return _read_jsonl(harness, Path(source), cursor, limit)
     return Chunk(harness, str(source), cursor, cursor, error="unknown harness")
@@ -525,15 +557,284 @@ def _stat(path) -> Optional[os.stat_result]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Unread ranges: newest first
+# ---------------------------------------------------------------------------
+
+MAX_BACK_SCAN = 256 * 1024 * 1024
+
+
+def _merge_ranges(ranges) -> list:
+    """Sorted, non-empty, non-touching ``[from, to)`` ranges."""
+    out: list = []
+    for a, b in sorted((int(a), int(b)) for a, b in ranges if int(b) > int(a)):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _subtract(ranges, lo: int, hi: int) -> list:
+    out: list = []
+    for a, b in ranges:
+        if b <= lo or a >= hi:
+            out.append([a, b])
+            continue
+        if a < lo:
+            out.append([a, lo])
+        if b > hi:
+            out.append([hi, b])
+    return out
+
+
+def _row_end(path, size: int) -> int:
+    """End of the last whole row: a file ending in a newline, or whose last row parses, is whole."""
+    if size <= 0:
+        return 0
+    with open(path, "rb") as handle:
+        handle.seek(size - 1)
+        if handle.read(1) == b"\n":
+            return size
+        start, buf = size, b""
+        while start > 0 and b"\n" not in buf:
+            if len(buf) >= MAX_ROW_BYTES:
+                raise OSError("last row too long to judge")
+            step = min(64 * 1024, start)
+            start -= step
+            handle.seek(start)
+            buf = handle.read(step) + buf
+    tail = buf[buf.rfind(b"\n") + 1:]
+    try:
+        json.loads(tail)
+        return size
+    except ValueError:
+        return size - len(tail)               # half-written: stays unread until it is whole
+
+
+def _tail_rows(path: Path, lo: int, hi: int, limit: int) -> tuple[list, int, int]:
+    """The last whole rows of ``[lo, hi)`` within ``limit`` bytes: ``(rows, start, skipped_oversize)``.
+
+    ``lo`` and ``hi`` sit on row boundaries.  One row longer than ``limit`` is read whole
+    (up to ``MAX_ROW_BYTES``); a longer one is stepped over and counted, so a giant tool
+    output cannot stall the range.
+    """
+    with open(path, "rb") as handle:
+        want = max(lo, hi - max(1, limit))
+        handle.seek(want)
+        buf = handle.read(hi - want)
+        if want > lo:
+            handle.seek(want - 1)
+            if handle.read(1) != b"\n":
+                cut = buf.find(b"\n")
+                if 0 <= cut < len(buf) - 1:
+                    buf, want = buf[cut + 1:], want + cut + 1
+                else:
+                    # One row spans the whole window: find where it starts.
+                    start, scanned = want, 0
+                    while start > lo:
+                        step = min(1 << 20, start - lo)
+                        start -= step
+                        scanned += step
+                        handle.seek(start)
+                        block = handle.read(step)
+                        found = block.rfind(b"\n")
+                        if found >= 0:
+                            start += found + 1
+                            break
+                        if scanned > MAX_BACK_SCAN:
+                            raise OSError("row too long to step over")
+                    if hi - start > MAX_ROW_BYTES:
+                        return [], start, 1
+                    handle.seek(start)
+                    return [r for r in handle.read(hi - start).split(b"\n") if r.strip()], start, 0
+        return [r for r in buf.split(b"\n") if r.strip()], want, 0
+
+
+def _plan_jsonl(path, mark: dict) -> dict:
+    """The unread ranges of a Claude/Codex record (new appends join; a replaced file starts over)."""
+    info = os.stat(path)
+    end = _row_end(path, info.st_size)
+    inode = info.st_ino
+    pending = mark.get("pending")
+    if isinstance(pending, list) and mark.get("unit") == "byte" and isinstance(mark.get("end"), int):
+        if (mark.get("inode") in (None, 0, inode)) and mark["end"] <= end:
+            ranges = [list(r) for r in pending if isinstance(r, list) and len(r) == 2]
+            if end > mark["end"]:
+                ranges.append([mark["end"], end])
+            return {"unit": "byte", "end": end, "ranges": _merge_ranges(ranges), "inode": inode, "size": info.st_size}
+    elif isinstance(mark.get("cursor"), int) and not isinstance(pending, list):
+        cursor = mark["cursor"]                                   # schema 1: "read up to cursor"
+        if cursor <= end and (not mark.get("inode") or mark["inode"] == inode):
+            return {"unit": "byte", "end": end, "ranges": _merge_ranges([[cursor, end]]), "inode": inode,
+                    "size": info.st_size}
+    return {"unit": "byte", "end": end, "ranges": _merge_ranges([[0, end]]), "inode": inode, "size": info.st_size}
+
+
+def _plan_opencode(con, sid: str, mark: dict) -> dict:
+    """The unread rowid ranges of one OpenCode session, inside one read-only snapshot."""
+    top, stamp = con.execute("SELECT MAX(rowid), MAX(time_updated) FROM part WHERE session_id = ?", (sid,)).fetchone()
+    end = int(top) + 1 if top is not None else 0
+    snapshot_ms = int(stamp or 0)
+    pending = mark.get("pending")
+    if isinstance(pending, list) and mark.get("unit") == "rowid" and isinstance(mark.get("end"), int) \
+            and mark["end"] <= end:
+        ranges = [list(r) for r in pending if isinstance(r, list) and len(r) == 2]
+        if end > mark["end"]:
+            ranges.append([mark["end"], end])
+        if mark.get("snapshot_ms"):
+            # A row that changed after the last snapshot (a tool part that was still running) is read again.
+            for (rowid,) in con.execute("SELECT rowid FROM part WHERE session_id = ? AND rowid < ? "
+                                        "AND time_updated > ?", (sid, mark["end"], int(mark["snapshot_ms"]))):
+                ranges.append([int(rowid), int(rowid) + 1])
+    elif isinstance(mark.get("cursor"), int) and not isinstance(pending, list):
+        ranges = [[mark["cursor"] + 1, end]]                      # schema 1: last rowid consumed
+    else:
+        ranges = [[0, end]]
+    return {"unit": "rowid", "end": end, "ranges": _merge_ranges(ranges), "snapshot_ms": snapshot_ms}
+
+
+def _open_question_rowid(con, sid: str, lo: int, hi: int) -> Optional[int]:
+    """The first rowid in ``[lo, hi)`` of a question still waiting for its answer, if any."""
+    rows = con.execute("SELECT rowid, data, time_updated FROM part WHERE session_id = ? AND rowid >= ? "
+                       "AND rowid < ? AND data LIKE '%question%' ORDER BY rowid ASC", (sid, lo, hi))
+    for rowid, raw, updated_ms in rows:
+        raw = raw if isinstance(raw, str) else (raw or b"").decode("utf-8", "replace")
+        try:
+            part = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(part, dict) and part.get("tool") == "question" and \
+                (part.get("state") or {}).get("status") in ("pending", "running") and \
+                now_epoch() - float(updated_ms or 0) / 1000 < OPEN_QUESTION_STALE_SEC:
+            return int(rowid)
+    return None
+
+
+def _read_opencode_tail(db_path: Path, sid: str, mark: dict, limit: int) -> Chunk:
+    chunk = Chunk("opencode", str(db_path), 0, 0, unit="rowid")
+    if not sid:
+        chunk.error = "no session id"
+        return chunk
+    try:
+        with _rt._opencode_snapshot(str(db_path)) as con:
+            plan = _plan_opencode(con, sid, mark)
+            chunk.plan, chunk.total = plan, plan["end"]
+            ranges = plan["ranges"]
+            if not ranges:
+                chunk.cursor_from = chunk.cursor_to = plan["end"]
+                return chunk
+            lo, hi = ranges[-1]
+            blocked_at = _open_question_rowid(con, sid, lo, hi)
+            if blocked_at is not None:
+                chunk.blocked, hi = "open-question", blocked_at
+            low, rows, used = hi, [], 0
+            if hi > lo:
+                low = lo
+                for rowid, raw, message_raw in con.execute(
+                        "SELECT p.rowid, p.data, m.data FROM part p LEFT JOIN message m ON m.id = p.message_id "
+                        "WHERE p.session_id = ? AND p.rowid >= ? AND p.rowid < ? ORDER BY p.rowid DESC",
+                        (sid, lo, hi)):
+                    raw = raw if isinstance(raw, str) else (raw or b"").decode("utf-8", "replace")
+                    if used and used + len(raw) > limit:
+                        low = int(rowid) + 1
+                        break
+                    used += len(raw)
+                    rows.append((int(rowid), raw, message_raw))
+            texts = []
+            for _rowid, raw, message_raw in reversed(rows):
+                chunk.rows += 1
+                try:
+                    part = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(part, dict):
+                    continue
+                chunk.choices.extend(_opencode_choices(part))
+                if part.get("type") != "text" or part.get("synthetic") or part.get("ignored"):
+                    continue
+                text = _rt._opencode_text(part).strip()
+                if text:
+                    try:
+                        role = str((json.loads(message_raw) or {}).get("role") or "")
+                    except (ValueError, TypeError, AttributeError):
+                        role = ""
+                    texts.append(_dialogue_line(role, text))
+            chunk.cursor_from, chunk.cursor_to, chunk.text = low, hi, "\n".join(texts)
+            chunk.pending_after = _subtract(ranges, low, hi)
+            chunk.eof = not chunk.pending_after
+    except (OSError, sqlite3.Error) as exc:
+        chunk.error = f"unreadable: {exc.__class__.__name__}"
+    return chunk
+
+
+def _read_jsonl_tail(harness: str, path: Path, mark: dict, limit: int) -> Chunk:
+    chunk = Chunk(harness, str(path), 0, 0)
+    try:
+        plan = _plan_jsonl(path, mark)
+        chunk.plan, chunk.total = plan, plan["end"]
+        if not plan["ranges"]:
+            chunk.cursor_from = chunk.cursor_to = plan["end"]
+            return chunk
+        lo, hi = plan["ranges"][-1]
+        lines, start, skipped = _tail_rows(path, lo, hi, limit)
+    except OSError as exc:
+        chunk.error = f"unreadable: {exc.__class__.__name__}"
+        return chunk
+    _digest_rows(harness, path, lines, start, chunk)
+    chunk.cursor_from, chunk.cursor_to, chunk.skipped_oversize = start, hi, skipped
+    chunk.pending_after = _subtract(plan["ranges"], start, hi)
+    chunk.eof = not chunk.pending_after
+    return chunk
+
+
 def read_pending(harness: str, sid: str, source, limit_bytes: int = DEFAULT_CHUNK_BYTES) -> Chunk:
-    """The next chunk after this session's watermark (restarts at 0 when the file was replaced)."""
+    """The newest unread range's last whole rows (at most ``limit_bytes``), chronological inside.
+
+    ``cursor_from``/``cursor_to`` are the range this chunk covers; ``pending_after`` is what stays
+    unread once it is applied.  Nothing is written: ``mark_applied`` records it after a successful apply.
+    """
     mark = read_watermark(harness, sid)
-    cursor = int(mark["cursor"])
+    limit = max(1, int(limit_bytes))
+    if harness == "opencode":
+        return _opencode_retry(lambda: _read_opencode_tail(Path(source), sid or "", mark, limit))
+    if harness in ("claude", "codex"):
+        return _read_jsonl_tail(harness, Path(source), mark, limit)
+    return Chunk(harness, str(source), 0, 0, error="unknown harness")
+
+
+def mark_applied(harness: str, sid: str, chunk: Chunk, *, now: Optional[float] = None) -> dict:
+    """Record that ``chunk``'s range was applied: it leaves the unread ranges, nothing else does.
+
+    The ranges come from the snapshot the chunk was cut from, so a later append is not lost
+    and an old unread front is never overwritten.  A record replaced since the read writes nothing.
+    """
+    plan = chunk.plan or {}
+    if not plan or chunk.error:
+        return {}
     if harness != "opencode":
-        info = _stat(source)
-        if info and (cursor > info.st_size or (mark.get("inode") and mark["inode"] != info.st_ino)):
-            cursor = 0
-    return read_chunk(harness, source, cursor, sid, limit_bytes)
+        info = _stat(chunk.source)
+        if info is None or (plan.get("inode") and plan["inode"] != info.st_ino):
+            return {}
+    ranges = _subtract(plan["ranges"], chunk.cursor_from, chunk.cursor_to)
+    value = {"schema": 2, "harness": harness, "sid": sid, "unit": plan["unit"],
+             "cursor": ranges[0][0] if ranges else plan["end"], "end": plan["end"], "pending": ranges,
+             "updated": iso_utc(now_epoch() if now is None else now)}
+    for key in ("inode", "size", "snapshot_ms"):
+        if plan.get(key):
+            value[key] = plan[key]
+    ensure_dir(state_root() / "watermarks")
+    atomic_write_json(watermark_path(harness, sid), value)
+    return value
+
+
+def describe_coverage(chunk: Chunk) -> str:
+    """``byte 2,880,000–3,145,728 / 전체 3,145,728`` (rowid for OpenCode): what this chunk covered."""
+    return f"{chunk.unit} {chunk.cursor_from:,}–{chunk.cursor_to:,} / 전체 {chunk.total:,}"
+
+
+def unread_total(chunk: Chunk) -> int:
+    return sum(b - a for a, b in chunk.pending_after)
 
 
 # ---------------------------------------------------------------------------

@@ -21,11 +21,19 @@ watching and nobody will answer a question. Read one input file, write one outpu
 stop.
 
 **Input**: `input_v1.json` (path in the prompt, read only): the seat and project, the
-conversation after each session's watermark (`sessions[].text`), the user's own
+conversation still unread for each session (`sessions[].text`), the user's own
 question-tool answers (`user_choices`, already recorded by code — never re-add them),
 waiting answers (`pending_decisions`), related active records of this project
 (`existing_records`: id, tier, headline, excerpt), at most five duplicate-group signals
 (`duplicate_groups`), and the caller's card (`card`).
+
+`sessions[].text` is the **newest** unread part of a record, oldest line first. When
+`pending_after` is not empty, an older part of that record is still unread and a later tidy
+will read it; judge only what you were given and never say or imply the rest was reviewed.
+
+The input and the output file sit together in a folder under the project's artifact root
+(`.runtime/session-tidy/<batch>/`, the path is in the prompt). That folder is the one place
+you may write; the runner checks your file there, copies the checked result, and deletes the folder.
 
 **Output**: exactly one file, `actions.json` at the output path in the prompt, JSON
 only — no Markdown fence, no prose:
@@ -38,8 +46,15 @@ only — no Markdown fence, no prose:
   {"kind": "supersede", "old_id": "<existing id>", "body": "..."},
   {"kind": "supersede", "old_id": "<duplicate id>", "new_ref": "r1"},
   {"kind": "reinforce", "target_id": "<existing id>"}],
- "choice_duplicates": ["<user_choices question already covered by an existing record>"]}
+ "choice_duplicates": ["<user_choices question already covered by an existing record>"],
+ "related_existing_ids": ["<existing id the conversation relates to>"]}
 ```
+
+`related_existing_ids` is optional (an output without it is valid). List ids from
+`existing_records` whose record a later session should look at because of this conversation,
+whether or not you changed it, most relevant first (at most 20). Give ids only: no titles and no
+new ids; the runner takes the current titles from the memory itself, and drops any id that is not in
+`existing_records`. Use `[]` when none applies.
 
 ## What to write
 

@@ -1715,6 +1715,360 @@ def cmd_prompt(args):
     return _PROMPT_EXIT[outcome]
 
 
+# --- clear: the one typed command that starts a fresh conversation (session-tidy auto-clear) ---
+
+_CLEAR_COMMAND = {"claude": "/clear", "codex": "/clear", "opencode": "/new"}
+_CLEAR_EXIT = {"true": 0, "skipped": 3, "failed": 1, "unverified": 5}
+_CLEAR_LEDGER_STATUS = {"true": "sent", "failed": "failed", "skipped": "unknown", "unverified": "unknown"}
+_CLEAR_OBSERVE_ROUNDS = 8             # bounded waits between looks at the pane after the send (OpenCode repaints its home in ~5 s)
+_CLEAR_OBSERVE_SETTLE_MS = 1500
+_ANSI_TOKEN = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|(.)", re.S)
+_RULE_LINE = re.compile(r"^[\s\u2500-\u257f]*\u2500{8,}[\s\u2500-\u257f]*$")
+_OPENCODE_HOME_PLACEHOLDER = "askanything"
+
+
+def _screen_lines(raw):
+    """The visible screen as lines of `(char, faint)` cells: SGR faint (`2`) tracked,
+    every other escape sequence dropped. A dim line is a placeholder or a suggestion."""
+    lines, cells, faint = [], [], False
+    for match in _ANSI_TOKEN.finditer(raw or ""):
+        params, final, char = match.group(1), match.group(2), match.group(3)
+        if char is not None:
+            if char == "\n":
+                lines.append(cells)
+                cells = []
+            elif char != "\r":
+                cells.append((" " if char == "\u00a0" else char, faint))
+        elif final == "m":
+            for code in (params.split(";") if params else ["0"]):
+                if code in ("0", ""):
+                    faint = False
+                elif code == "2":
+                    faint = True
+                elif code == "22":
+                    faint = False
+    lines.append(cells)
+    return lines
+
+
+def _plain(cells):
+    return "".join(ch for ch, _ in cells)
+
+
+def _marker_remainder(cells, marker):
+    """`(text, any_bright)` after `marker` on a line that starts with it (leading blanks ok), else None."""
+    text = _plain(cells)
+    stripped = text.lstrip()
+    if not stripped.startswith(marker):
+        return None
+    offset = len(text) - len(stripped) + len(marker)
+    rest = cells[offset:]
+    body = _plain(rest).strip()
+    return body, any((not faint) and ch.strip() for ch, faint in rest)
+
+
+def _draft_state(harness, lines):
+    """`empty` | `nonempty` | `unknown` for the input box of one harness's visible screen.
+
+    Only a layout read for that harness decides `empty`; a box that cannot be located, or text
+    below the marker that could be a second draft line, a popup or a footer, is `unknown` --
+    never `empty` (clearing over a draft destroys it)."""
+    if harness == "claude":
+        idx = next((i for i in range(len(lines) - 1, -1, -1)
+                    if _marker_remainder(lines[i], "\u276f") is not None), None)
+        if idx is None:
+            return "unknown"
+        body, bright = _marker_remainder(lines[idx], "\u276f")
+        if bright:
+            return "nonempty"
+        for cells in lines[idx + 1:]:
+            if _RULE_LINE.match(_plain(cells)):
+                return "empty"          # the faint remainder, if any, is Claude's own suggestion
+            if _plain(cells).strip():
+                return "nonempty"       # a second draft line before the box closes
+        return "unknown"
+    if harness == "codex":
+        idx = next((i for i in range(len(lines) - 1, -1, -1)
+                    if _marker_remainder(lines[i], "\u203a") is not None), None)
+        if idx is None:
+            return "unknown"
+        body, bright = _marker_remainder(lines[idx], "\u203a")
+        if bright:
+            return "nonempty"
+        below = lines[idx + 1] if idx + 1 < len(lines) else []
+        return "empty" if not _plain(below).strip() else "unknown"
+    if harness == "opencode":
+        block, end = [], None
+        for i in range(len(lines) - 1, -1, -1):
+            text = _plain(lines[i]).lstrip()
+            if text.startswith("\u2503"):
+                if end is None:
+                    end = i
+                block.insert(0, text[1:])
+            elif end is not None:
+                break
+        if len(block) < 2:
+            return "unknown"
+        # The last bar line is the agent/model line. Typed text starts right after the bar's
+        # two-space margin; a hint right-aligned in a wide pane (the cwd and branch) sits far
+        # to the right behind a wide gap and is not the draft.
+        typed = " ".join(filter(None, (_opencode_left_text(body) for body in block[:-1])))
+        typed = "".join(typed.split())
+        if not typed or typed.lower().startswith(_OPENCODE_HOME_PLACEHOLDER):
+            return "empty"
+        return "nonempty"
+    return "unknown"
+
+
+def _opencode_left_text(body):
+    """The text at the left edge of one OpenCode input-box line (`body` is the line after its bar)."""
+    rest = body[2:] if not body[:2].strip() else body
+    if not rest[:1].strip():
+        return ""
+    return re.split(r" {6,}", rest, maxsplit=1)[0].strip()
+
+
+def _read_screen(target):
+    """The visible pane (ANSI) as screen lines, or None when it could not be read."""
+    try:
+        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible", "--format", "ansi"],
+                              capture_output=True, text=True, errors="replace", timeout=_herdr_get_timeout())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return None
+    return _screen_lines(proc.stdout)
+
+
+def _process_session(pane, harness):
+    """The session the pane's foreground Claude/Codex process is on now, or None.
+
+    Read from the process the way the Fleet board does (Claude's `sessions/<pid>.json`,
+    which is rewritten on `/clear`; Codex's open rollout). herdr's own `agent_session`
+    follows a `/clear` only when its integration reports it, and has been seen to keep
+    the previous session for good (live panes 2026-10-01), so a second tidy in the same
+    window would otherwise never clear it."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=_herdr_get_timeout())
+        payload = json.loads(proc.stdout or "")
+        processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+        tools_dir = Path(__file__).resolve().parent.parent / "tools"
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet.collectors import claude as claude_collector, codex as codex_collector
+    except Exception:
+        return None
+    for process in processes:
+        try:
+            pid = int(process.get("pid"))
+            if harness == "claude":
+                sid = claude_collector.session_id_of_process(pid)
+            else:
+                sid = codex_collector.session_id_of_process(pid)
+        except Exception:
+            continue
+        if sid:
+            return sid
+    return None
+
+
+def _herdr_lags(req, herdr_sid):
+    """True when herdr's session for the booked pane is an OLDER session of the booking seat's own
+    ledger than the booked one -- the booked thread is later, herdr just has not followed.
+
+    Codex tools and hooks run in the shared app-server daemon, so the pane's TUI holds no rollout
+    the process check could read and herdr's `agent_session` can stay on the cleared session for
+    good (measured 2026-10-01).  The seat ledger (written by the hooks of both sessions at this very
+    pane) is then the only record that orders the two.  A session the ledger has never seen is not
+    a predecessor."""
+    if req.get("harness") != "codex" or not herdr_sid or herdr_sid == "-" or herdr_sid == req.get("sid"):
+        return False
+    try:
+        import session_tidy as st
+        seat_fields = req.get("seat") or {}
+        seat = st.Seat(str(seat_fields.get("kind") or ""), str(seat_fields.get("key") or ""),
+                       str(seat_fields.get("pane") or ""), str(seat_fields.get("harness") or ""),
+                       str(seat_fields.get("project_key") or ""))
+        return st.ledger_precedes(seat, herdr_sid, str(req.get("sid")))
+    except Exception:
+        return False
+
+
+def _clear_look(target, req):
+    """One judgement of the target: `(None, agent)` when it may be cleared, else `(reason, agent)`.
+
+    Identity (pane, harness, session), idle state, then the screen: no form open and an empty
+    input box. Every doubt is a reason, never a guess."""
+    state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
+    if unavailable or state in ("agent-not-found", "timeout"):
+        return (unavailable or "agent-not-found"), agent
+    seat_pane = (req.get("seat") or {}).get("pane")
+    if seat_pane and agent.get("pane") != seat_pane:
+        return "target-changed", agent
+    if agent.get("harness") != req.get("harness"):
+        return "target-changed", agent
+    if req.get("harness") in ("claude", "codex") and agent.get("session_id") != req.get("sid"):
+        # herdr's pane record can lag a /clear; the process itself is the proof, never a guess.
+        # An unnamed session (`-`, empty) is not a confirmed match: only the process can vouch for it.
+        if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid") \
+                and not _herdr_lags(req, agent.get("session_id")):
+            return "target-changed", agent
+    if state == "blocked":
+        return "form-open", agent
+    if state not in ("idle", "done"):
+        return f"not-idle-{state}", agent
+    lines = _read_screen(target)
+    if lines is None:
+        return "screen-unknown", agent
+    flat = "".join("".join(_plain(c) for c in lines).split()).lower()
+    if any(token in flat for token in _FORM_TOKENS):
+        return "form-open", agent
+    draft = _draft_state(req.get("harness"), lines)
+    if draft == "nonempty":
+        return "draft", agent
+    if draft != "empty":
+        return "draft-unknown", agent
+    return None, agent
+
+
+def _wait_for_home(target, bound_ms):
+    """Event-driven pause for OpenCode: its pane is `done` before, during and after `/new`, so
+    `_settle` would return at once. Waits (bounded) for the home screen's placeholder to show;
+    the answer is not used -- the caller looks at the screen itself."""
+    try:
+        subprocess.run(["herdr", "pane", "wait-output", target, "--match", "Ask anything",
+                        "--source", "visible", "--timeout", str(int(bound_ms))],
+                       capture_output=True, text=True, timeout=bound_ms / 1000.0 + 5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _opencode_home(lines):
+    """OpenCode's home screen: the placeholder box (older builds) or, as measured on 1.18.34,
+    nothing at all but the working-directory line. A conversation view always carries the
+    `┃` input bars and a model line, so those never read as home."""
+    plain = [_plain(line).strip() for line in lines]
+    shown = [text for text in plain if text]
+    if any(text.startswith("\u2503") for text in shown):
+        return any(_OPENCODE_HOME_PLACEHOLDER in "".join(text.split()).lower() for text in shown) \
+            and _draft_state("opencode", lines) == "empty"
+    return 0 < len(shown) <= 2 and shown[-1][:1] in ("/", "~")
+
+
+def _clear_observe(target, req, request_path):
+    """The new conversation, seen: its session id (`-` when the harness has none yet), or None.
+
+    Hook-side proof first (the booking's `observed`, written by the new session's start hook),
+    then herdr's own session id for the pane (Claude/Codex), then OpenCode's home screen."""
+    old = req.get("sid")
+    for round_no in range(_CLEAR_OBSERVE_ROUNDS):
+        held = _read_json(Path(request_path))
+        seen = (held or {}).get("observed") or {}
+        if seen.get("sid") and seen.get("sid") != old:
+            return str(seen["sid"])
+        state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
+        sid = agent.get("session_id")
+        if not unavailable and req.get("harness") in ("claude", "codex"):
+            # The process's own session decides when it can be read; herdr's pane record can lag
+            # a /clear (or keep an older session) and is only the fallback.
+            proven = _process_session(agent.get("pane") or target, req.get("harness"))
+            if proven and _herdr_lags(req, proven):
+                proven = None           # the process check named an older session of this seat
+            if proven:
+                if proven != old:
+                    return str(proven)
+            elif sid not in (None, "-", old) and not _herdr_lags(req, sid):
+                return str(sid)
+        if not unavailable and req.get("harness") == "opencode" and state in ("idle", "done"):
+            lines = _read_screen(target)
+            if lines is not None and _opencode_home(lines):
+                return "-"
+        if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
+            if req.get("harness") == "opencode":
+                _wait_for_home(target, _CLEAR_OBSERVE_SETTLE_MS)
+            else:
+                _settle(target, _CLEAR_OBSERVE_SETTLE_MS)
+    return None
+
+
+def cmd_clear(args):
+    """session-tidy auto-clear: type the harness's own new-conversation command into `target`.
+
+    The last judgement and the only pane input of the clear flow. `--request` is the seat's
+    booking (`session_tidy_clear.py`); the command is typed only when all of these hold now:
+
+    * the booking is the current one (nonce), unexpired, no prompt was submitted since the card,
+      the card is the booked generation;
+    * the pane is the booked one, runs the booked harness (and session, where herdr names it),
+      and is idle or done (never working, never blocked);
+    * the visible screen shows no selection/permission form and the input box is read as empty
+      (a Claude suggestion or a Codex placeholder is empty; anything undecidable is not).
+
+    Both looks (`_clear_look`) are taken, the second immediately before the single
+    `herdr agent prompt`; herdr offers no send conditional on the pane's revision, so a keystroke
+    landing between that look and the send cannot be ruled out -- hence no trailer, no Enter
+    retry, and nothing is ever re-sent after a doubtful result.
+
+    `cleared=true` only with evidence the conversation changed (start hook note, new herdr
+    session id, OpenCode home); otherwise `unverified`. Exit 0 true / 3 skipped / 1 failed /
+    5 unverified. One ledger row (`kind=notice`, `action=clear` in the receipt) per judgement.
+    """
+    import session_tidy_clear as clear
+    if _herdr_missing():
+        print("cleared=failed reason=herdr-not-found")
+        return _CLEAR_EXIT["failed"]
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req is None:
+        print(f"cleared=skipped reason={why}")
+        return _CLEAR_EXIT["skipped"]
+    harness, old_sid, target = req.get("harness"), req.get("sid"), args.target
+    command = _CLEAR_COMMAND.get(harness)
+    started = time.monotonic()
+    new_session, pane = None, (req.get("seat") or {}).get("pane")
+
+    def finish(outcome, reason=None, agent=None):
+        nonlocal pane
+        if isinstance(agent, dict) and agent.get("pane") not in (None, "-"):
+            pane = agent.get("pane")
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        receipt = (f"action=clear cleared={outcome} harness={harness} old_session={old_sid} "
+                   f"new_session={new_session or '-'} ms={elapsed_ms}" + (f" reason={reason}" if reason else ""))
+        try:
+            _record(to_harness=harness or "unknown", to_name=target, kind="notice",
+                    summary_text=f"[notice] action=clear {outcome} {command or ''}".strip(),
+                    to_session_id=old_sid, to_pane=pane, ref=[], status=_CLEAR_LEDGER_STATUS[outcome],
+                    receipt=receipt, from_identity=(old_sid, harness, _project_of(req.get("cwd"))),
+                    from_name=_from_name(harness, old_sid))
+        except Exception:
+            pass        # the verdict below is the result; a ledger hiccup must not change it
+        line = (f"cleared={outcome} target={target} harness={harness} old_session={old_sid} "
+                f"new_session={new_session or '-'}" + (f" reason={reason}" if reason else ""))
+        print(line)
+        return _CLEAR_EXIT[outcome]
+
+    if not command:
+        return finish("skipped", "unsupported-harness")
+    reason, agent = _clear_look(target, req)
+    if reason:
+        return finish("skipped" if not reason.startswith(("herdr-", "agent-not-found")) else "failed", reason, agent)
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req is None:
+        return finish("skipped", why, agent)
+    reason, agent = _clear_look(target, req)          # the look immediately before the one send
+    if reason:
+        return finish("skipped" if not reason.startswith(("herdr-", "agent-not-found")) else "failed", reason, agent)
+    rc, payload = _herdr_prompt(target, command, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+    if rc is None:
+        return finish("failed", "herdr-invocation-failed", agent)
+    if rc != 0:
+        return finish("failed", _herdr_error_reason(payload, rc), agent)
+    new_session = _clear_observe(target, req, args.request)
+    if new_session is None:
+        return finish("unverified", "new-session-not-observed", agent)
+    return finish("true", None, agent)
+
+
 def _herdr_error_reason(payload, rc):
     error = payload.get("error") if isinstance(payload, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
@@ -1822,6 +2176,13 @@ def build_parser():
     p_prompt.add_argument("--wait-idle-ms", type=int, default=0,
                           help="defer the send until a working target settles (0 = send now; measured: mid-turn sends submit)")
     p_prompt.set_defaults(func=cmd_prompt)
+
+    p_clear = sub.add_parser("clear")
+    p_clear.add_argument("target")
+    p_clear.add_argument("--request", required=True,
+                         help="the seat's auto-clear booking (session_tidy_clear.py)")
+    p_clear.add_argument("--nonce", default=None, help="the booking's nonce, when the caller holds one")
+    p_clear.set_defaults(func=cmd_clear)
 
     p_mode = sub.add_parser("steward")
     p_mode.add_argument("state", choices=("on", "off"))
