@@ -4697,6 +4697,23 @@ def _progress_body(line):
     return " · ".join(parts)
 
 
+_PROGRESS_EPOCH_RE = re.compile(r"\d{1,7}(?:\.\d{1,4})?\Z")
+
+
+def _progress_epoch(epoch):
+    """`ep 3/200`, or `ep 2 done` once an epoch's finishing lines were seen; else None."""
+    if not isinstance(epoch, dict):
+        return None
+    number = epoch.get("n")
+    if not isinstance(number, str) or not _PROGRESS_EPOCH_RE.match(number):
+        return None
+    text = "ep " + number
+    total = epoch.get("of")
+    if isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7:
+        text += "/%d" % total
+    return text + " done" if epoch.get("done") is True else text
+
+
 def _progress_age(age_s):
     if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) or age_s < 0:
         return None, None
@@ -4722,6 +4739,9 @@ def _gpu_progress_row(process, indent, width):
         if len(_PROGRESS_BODY_CACHE) >= 256:
             _PROGRESS_BODY_CACHE.clear()
         body = _PROGRESS_BODY_CACHE[key] = _progress_body(line)
+    epoch = _progress_epoch(progress.get("epoch"))
+    if epoch:
+        body = epoch + " · " + body
     prefix = [(indent + "      ", None), ("↳ ", "dim")]
     age_text, age_key = _progress_age(progress.get("age_s"))
     suffix = [(" · ", "dim"), (age_text, age_key)] if age_text else []
