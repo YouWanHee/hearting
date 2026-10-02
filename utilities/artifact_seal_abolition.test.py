@@ -16,6 +16,7 @@ finished cycle as it is now, the batch and freeze digest guards stay).  Every
 fixture runs on an isolated temporary artifact root; the real canonical root,
 registry, and routes directory are never touched.
 """
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -265,6 +266,29 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
         # A link is only lstat-ed: neither the link nor its target was read.
         self.assertEqual([p for p in reads if "outside" in p or "linked-dir" in p], [])
         self.assertEqual(outside.read_text(encoding="utf-8"), "must never be read\n")
+
+    def test_pytest_basetemp_files_are_output_and_its_links_and_caches_are_not(self):
+        # §D-2 (b): no pytest name rule.  A basetemp a user named is ordinary output; what pytest
+        # leaves that the one rule already drops (its `*current` link, `.pytest_cache`, bytecode) stays dropped.
+        self.activate()
+        route, route_file, result = self.begin(campaign_key="pytest-basetemp")
+        self.write_output(result, "plans/report.md")
+        kept = ["plans/evidence/scratch/pytest-all/test_x0/out.json", "plans/evidence/pytest-report.html"]
+        for rel in kept:
+            self.write_output(result, rel, b"{}\n")
+        scratch = Path(result["cycle_dir"]) / "artifacts" / "plans/evidence/scratch/pytest-all"
+        os.symlink("test_x0", scratch / "test_xcurrent")
+        self.write_output(result, ".pytest_cache/v/x", b"x")
+        self.write_output(result, "plans/evidence/__pycache__/m.pyc", b"\x00pyc")
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        listed = {row["locator"]["path"] for row in self.manifest(result)["artifact_revisions"]}
+        self.assertEqual(listed, {"artifacts/plans/report.md"} | {"artifacts/" + rel for rel in kept})
+        self.assertEqual(sorted(sealed["excluded_symlinks"]),
+                         ["artifacts/plans/evidence/scratch/pytest-all/test_xcurrent"])
+        self.assertEqual(sorted(sealed["excluded_hidden"]),
+                         ["artifacts/.pytest_cache/v/x", "artifacts/plans/evidence/__pycache__/m.pyc"])
 
     def test_a1_enumerate_applies_one_rule_without_flags(self):
         self.activate()
@@ -3390,6 +3414,156 @@ class Gap2LocksTest(C1ChangesBase):
         self.assertEqual(order, [(True, "lock")])  # history first, with the section still open ...
         self.assertEqual(events, ["lock", "unlock"])  # ... and the manifest in that same section
         self.assertNotEqual((Path(result["cycle_dir"]) / "manifest.json").read_bytes(), raw)
+
+
+    # -- item 8 (a): an open cycle's first close reads its files before the admission lock ----------
+    PROBE_ACQUIRE = (
+        "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import artifact_admission as a\n"
+        "try:\n"
+        "    fd = a._acquire_lock(Path(sys.argv[2]), 1.0); a._release_lock(Path(sys.argv[2]), fd); print('acquired')\n"
+        "except Exception as e:\n"
+        "    print('timed-out:' + type(e).__name__)\n")
+
+    def first_close(self, slug, extra=5):
+        """An open cycle with `extra + 1` files whose route is closed: the next `finalize` is its first."""
+        self.activate()
+        route, route_file, result = self.open_with(slug, slug)
+        for i in range(extra):
+            self.write_output(result, f"plans/cycle/g{i}.md", f"g{i}\n".encode())
+        self.close(route, route_file)
+        return result
+
+    def payload_reads(self, result, on_read):
+        """Patches that call `on_read(kind, path)` wherever a payload byte of this cycle is read."""
+        payload = str(Path(result["cycle_dir"]) / "artifacts")
+        real_read_bytes, real_stream, real_sha = Path.read_bytes, P._stream_file_facts, P.artifact_lifecycle._sha256_path
+
+        def read_bytes(path):
+            if str(path).startswith(payload):
+                on_read("read_bytes", path)
+            return real_read_bytes(path)
+
+        def stream(path):
+            if str(path).startswith(payload):
+                on_read("stream", path)
+            return real_stream(path)
+
+        def sha(path, *args, **kwargs):
+            if str(path).startswith(payload):
+                on_read("sha", path)
+            return real_sha(path, *args, **kwargs)
+        return [mock.patch.object(Path, "read_bytes", read_bytes), mock.patch.object(P, "_stream_file_facts", stream),
+                mock.patch.object(P.artifact_lifecycle, "_sha256_path", sha)]
+
+    def test_gap2_first_finalize_scans_outside_admission(self):
+        result = self.first_close("gap2-first")
+        seen, reads, locked, holds, started = [], [], [], [], {}
+        real_acquire, real_release = adm._acquire_lock, adm._release_lock
+
+        def acquire(root, timeout, now=None):
+            fd = real_acquire(root, timeout, now)
+            started[fd] = time.monotonic()
+            return fd
+
+        def release(root, fd):
+            holds.append(time.monotonic() - started.pop(fd, time.monotonic()))
+            return real_release(root, fd)
+
+        def on_read(kind, path):
+            reads.append(str(path))
+            held = adm.holds_lock(self.root)
+            fd = adm.try_acquire_lock(self.root)
+            if fd is not None:
+                real_release(self.root, fd)
+            if kind == "read_bytes":
+                locked.extend([str(path)] if held else [])
+            else:
+                seen.append((held, fd is not None))
+            time.sleep(0.1)
+
+        patches = self.payload_reads(result, on_read) + [
+            mock.patch.object(P, "_walk_files", self.probe(seen, P._walk_files)),
+            mock.patch.object(P, "_scan_cycle_facts", self.probe(seen, P._scan_cycle_facts)),
+            mock.patch.object(adm, "_acquire_lock", acquire), mock.patch.object(adm, "_release_lock", release)]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(out["status"], "sealed", out)
+        self.assertGreaterEqual(len(reads), 6)  # every file is read at least once
+        self.assertEqual(set(seen), {(False, True)})  # every walk and chunked read ran with the lock free
+        # The one read left under the lock is the title's peek at the primary heading (a size-capped file).
+        self.assertLessEqual(len(locked), 1, locked)
+        self.assertLess(max(holds), 1.0, holds)  # the lock covered the short write section only
+
+    def test_gap2_first_finalize_lets_another_process_take_the_admission_lock_while_it_reads(self):
+        result = self.first_close("gap2-first-proc")
+        answers = []
+
+        def on_read(kind, path):
+            if answers:
+                return
+            utilities = str(Path(__file__).resolve().parent)
+            out = subprocess.run([sys.executable, "-c", self.PROBE_ACQUIRE, utilities, str(self.root)],
+                                 capture_output=True, text=True, timeout=60)
+            answers.append((out.returncode, out.stdout.strip(), out.stderr.strip()[-300:]))
+
+        with contextlib.ExitStack() as stack:
+            for patch in self.payload_reads(result, on_read):
+                stack.enter_context(patch)
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(out["status"], "sealed", out)
+        # The child's exit code and its output are both the answer: it got the flock, and ran clean.
+        self.assertEqual(answers, [(0, "acquired", "")])
+
+    def test_gap2_first_finalize_rescans_once_when_a_file_moves_under_the_scan(self):
+        result = self.first_close("gap2-first-move", extra=2)
+        real = P._prescan_cycle
+        calls = []
+
+        def prescan(*args, **kwargs):
+            out = real(*args, **kwargs)
+            calls.append(adm.holds_lock(self.root))
+            if len(calls) == 1:
+                self.edit(result, "plans/cycle/g0.md", b"g0, edited again, longer\n")
+            return out
+
+        with mock.patch.object(P, "_prescan_cycle", prescan):
+            out = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(calls, [False, False])  # read again with the lock released, not trusted
+        self.assertEqual(out["status"], "sealed", out)
+        (row,) = [r for r in self.manifest(result)["artifact_revisions"] if r["locator"]["path"].endswith("g0.md")]
+        self.assertEqual(row["content_digest"], "sha256:" + hashlib.sha256(b"g0, edited again, longer\n").hexdigest())
+
+    def test_gap2_first_finalize_keeps_its_refusals(self):
+        # A path the manifest cannot name still fails the close, as it did before the read moved out of the lock.
+        result = self.first_close("gap2-first-bad", extra=1)
+        stray = Path(result["cycle_dir"]) / "stray.md"
+        stray.write_text("x", encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(caught.exception.code, "output-invalid")
+        self.assertIn("file-outside-artifacts:stray.md", caught.exception.detail)
+        self.assertEqual(self.record(result)["state"], "open")
+        stray.unlink()
+        self.assertEqual(P.finalize(self.root, cycle_id=result["cycle_id"])["status"], "sealed")
+        # A live review lease still refuses the close.
+        held = self.first_close("gap2-first-lease", extra=1)
+        lease = P._review_lease_path(self.root, held["cycle_id"], "att-gap2-first")
+        lease.parent.mkdir(parents=True, exist_ok=True)
+        lease.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+        with mock.patch.object(P, "_live_review_lease", return_value=lease):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=held["cycle_id"])
+        self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(self.record(held)["state"], "open")
+        self.assertFalse((Path(held["cycle_dir"]) / "manifest.json").exists())
+        # A close that stopped after its manifest was written is finished by `recover`.
+        crashed = self.first_close("gap2-first-crash", extra=1)
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=crashed["cycle_id"], crash_after_manifest=True)
+        self.assertIn(crashed["cycle_id"], P.recover(self.root)["producer"]["rolled_forward"])
+        self.assertEqual(self.record(crashed)["state"], "sealed")
 
 
 class E1RecorderLinesTest(C1ChangesBase):
