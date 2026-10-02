@@ -578,7 +578,7 @@ class GpuProgressLineRenderTest(unittest.TestCase):
         self.assertEqual([render._plain(row).strip() for row in rows], [
             "\u21b3 python run.py --train",
             "\u21b3 TRAIN 76% 15135/20000 \u00b7 39:00 left \u00b7 "
-            "L_se=1.18e-02 L_loc=2.67e-03 \u00b7 8s ago",
+            "L_se=1.18e-02 L_loc=2.67e-03",
         ])
         self.assertTrue(all(key in (None, "dim") for _text, key in rows[1]))
 
@@ -590,10 +590,9 @@ class GpuProgressLineRenderTest(unittest.TestCase):
              "epoch": {"n": "1.25", "of": 3}}), "  ", 168)
         text = [render._plain(row).strip() for row in rows]
         self.assertEqual(text[1], "\u21b3 ep 3/200 \u00b7 TRAIN 76% 15135/20000 \u00b7 39:00 left "
-                                  "\u00b7 L_se=1.18e-02 L_loc=2.67e-03 \u00b7 0s ago")
+                                  "\u00b7 L_se=1.18e-02 L_loc=2.67e-03")
         self.assertTrue(text[3].startswith("\u21b3 ep 2 done \u00b7 TRAIN 76%"), text[3])
-        self.assertEqual(text[5], "\u21b3 ep 1.25/3 \u00b7 Epoch(train) [3][100/1250] loss: 0.5"
-                                  " \u00b7 5s ago")
+        self.assertEqual(text[5], "\u21b3 ep 1.25/3 \u00b7 Epoch(train) [3][100/1250] loss: 0.5")
 
     def test_malformed_epoch_is_ignored(self):
         for epoch in ({"n": 3}, {"n": "3; rm -rf"}, {"n": ""}, "ep 3", None, {"of": 5},
@@ -601,7 +600,7 @@ class GpuProgressLineRenderTest(unittest.TestCase):
             with self.subTest(epoch=epoch):
                 (_command, progress) = render._gpu_process_rows(
                     self.gpu({"line": "step 9", "age_s": 1, "epoch": epoch}), "", 120)
-                self.assertEqual(render._plain(progress).strip(), "\u21b3 step 9 \u00b7 1s ago")
+                self.assertEqual(render._plain(progress).strip(), "\u21b3 step 9")
         self.assertEqual(render._progress_epoch({"n": "4", "of": True}), "ep 4")
         self.assertEqual(render._progress_epoch({"n": "4", "of": 0, "done": "yes"}), "ep 4")
 
@@ -628,13 +627,14 @@ class GpuProgressLineRenderTest(unittest.TestCase):
             None, {"line": "   ", "age_s": 1}, {"age_s": 3}, "bad"), "", 120)
         text = [render._plain(row).strip() for row in rows]
         self.assertEqual(len(text), 6)
-        self.assertEqual(text[1], "\u21b3 Epoch 3 validation? done \u00b7 1m ago")
+        self.assertEqual(text[1], "\u21b3 Epoch 3 validation? done")
 
     def test_stalled_output_is_marked_in_warning_colour(self):
         (_command, progress) = render._gpu_process_rows(
             self.gpu({"line": self.TQDM, "age_s": 361}), "", 168)
         self.assertEqual(progress[-1], ("stalled 6m", "lvl_y"))
-        self.assertEqual(render._progress_age(300), ("5m ago", "dim"))
+        self.assertEqual(render._progress_age(300), (None, None))
+        self.assertEqual(render._progress_age(0), (None, None))
         self.assertEqual(render._progress_age(7300), ("stalled 2h", "lvl_y"))
         self.assertEqual(render._progress_age(None), (None, None))
 
