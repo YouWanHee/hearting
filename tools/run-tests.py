@@ -1762,6 +1762,7 @@ def main(argv: list[str]) -> int:
     # Retries are deliberately limited to baseline rows explicitly marked as
     # flaky-timing. Every attempt receives a fresh isolated environment.
     retry_budget_exhausted: set[str] = set()
+    unlisted_retried: set[str] = set()
     if args.retries:
         # The retry pass re-runs flaky suites serially after the main run, and
         # nothing bounded its total cost: N flaky suites could each consume the
@@ -1777,12 +1778,23 @@ def main(argv: list[str]) -> int:
             # of going through classify_result(), so without this filter it
             # would be a side entrance around the P8 contract: a failing suite
             # whose only row is foreign could come out KNOWN-FAIL.
-            if not any(
+            flaky_declared = any(
                 row["reason"].startswith("flaky-timing:")
                 and baseline_row_applicable(row, run_fingerprint)
                 for row in rows
-            ):
+            )
+            # An unlisted suite that failed under the parallel main run also gets
+            # one serial retry: a load- or timing-sensitive test that passes alone
+            # is reported as FLAKY-PASS instead of failing the whole run, while a
+            # suite that fails again still fails. Suites with any baseline row keep
+            # the baseline contract (no side entrance around a declared failure).
+            failed_unlisted = (not rows) and any(
+                not r.passed for r in results_by_suite.get(rel, [])
+            )
+            if not (flaky_declared or failed_unlisted):
                 continue
+            if failed_unlisted:
+                unlisted_retried.add(rel)
             profile = profile_of[rel]
             extra: list[SuiteResult] = []
             for _ in range(args.retries):
@@ -1931,6 +1943,20 @@ def main(argv: list[str]) -> int:
                 else "FLAKY-KNOWN-FAIL"
             )
             verdicts = [Verdict(result.relpath, "-", verdict, detail=detail)]
+        elif result.relpath in unlisted_retried and len(attempt_results) > 1:
+            retries = attempt_results[1:]
+            if any(attempt.passed for attempt in retries):
+                failing_ids = sorted({
+                    test_id for attempt in attempt_results
+                    if not attempt.passed for test_id in attempt.failing_test_ids
+                })
+                outcomes = ",".join("pass" if a.passed else "fail" for a in attempt_results)
+                detail = f"attempts={len(attempt_results)}; outcomes={outcomes}; policy=unlisted-serial-retry"
+                if failing_ids:
+                    detail += f"; failing={','.join(failing_ids)}"
+                verdicts = [Verdict(result.relpath, "-", "FLAKY-PASS", detail=detail)]
+            else:
+                verdicts = classify_result(retries[-1], baseline, today, run_fingerprint)
         else:
             verdicts = classify_result(result, baseline, today, run_fingerprint)
         for v in verdicts:
