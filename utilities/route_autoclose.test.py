@@ -1084,6 +1084,50 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
             self.assertEqual(len(reads) - before, 1)         # only the new route file was parsed
             self.assertEqual(self.P._finalize_route(self.root, self._record(cycle))["route_id"], d["route_id"])
 
+    def test_an_edge_file_rewritten_in_place_is_read_again(self):
+        a = self._root_route("leftover-rewrite")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycle = self._begin(a)
+        directory = self.P._routes_dir(self.root)
+        stale = time.time() - 3600
+        os.utime(directory, (stale, stale))
+        self.assertEqual(self.P._finalize_route(self.root, self._record(cycle))["route_id"], c["route_id"])
+        # Rewritten in place (same inode, the directory's signature unchanged): its sealed hash no
+        # longer recomputes, so it is no longer a continuation of b.
+        path = directory / f"{c['route_id']}.json"
+        tampered = json.loads(path.read_text())
+        tampered["slug"] = "rewritten-in-place"
+        path.write_text(json.dumps(tampered))
+        os.utime(path, ns=(time.time_ns(), time.time_ns() + 1_000_000_000))
+        os.utime(directory, (stale, stale))
+        self.assertEqual(self.P._lineage_children(self.root, b["route_id"], b["route_hash"]), [])
+        self.assertEqual(self.P._finalize_route(self.root, self._record(cycle))["route_id"], b["route_id"])
+
+    def test_finalize_keeps_the_sweep_deadline_for_its_own_lineage_walk(self):
+        a = self._root_route("leftover-inner-walk")
+        self._publish_root(a)
+        b = self._continuation(a)
+        c = self._continuation(b)
+        cycle = self._begin(a)
+        self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        for route in (a, b, c):
+            self._close_unproven(route)
+        record = self._record(cycle)
+        spent = self.P.RefreshBudget(float("inf"), float("inf"), 0.0)
+        result = self.P.finalize(self.root, cycle_id=cycle["cycle_id"], state="abandoned",
+                                 abandon_reason="route-unrecoverable", lock_timeout=0,
+                                 exclude_symlinks=True, _scan_budget=spent)
+        self.assertEqual((result["status"], result.get("reason")), ("deferred", "scan-budget"))
+        self.assertEqual(self._record(cycle)["state"], "open")
+        self.assertFalse((self.P.cycle_dir(self.root, record["campaign_id"], cycle["cycle_id"], record)
+                          / "manifest.json").exists())
+        # Without a time share the same close finishes.
+        self.assertEqual(self.P.finalize(self.root, cycle_id=cycle["cycle_id"], state="abandoned",
+                                         abandon_reason="route-unrecoverable", lock_timeout=0,
+                                         exclude_symlinks=True)["status"], "sealed")
+
     def test_index_duplicate_shape_seals_on_begin_route(self):
         a = self._root_route("leftover-index")
         self._publish_root(a)

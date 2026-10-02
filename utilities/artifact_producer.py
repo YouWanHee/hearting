@@ -781,6 +781,23 @@ def _routes_dir_signature(directory: Path) -> Optional[Tuple[int, int, int]]:
     return (info.st_ino, info.st_mtime_ns, info.st_size)
 
 
+def _edge_stamps_hold(directory: Path, held: _RouteEdges) -> bool:
+    """The files that held an edge still have the size and mtime they were parsed at.
+
+    A file rewritten in place leaves the directory's signature as it was; route files are written
+    once (`write_once`), so this only looks at the few that held an edge."""
+    for name, (size, mtime_ns, edge) in held.files.items():
+        if edge is None:
+            continue
+        try:
+            info = os.stat(str(directory / name))
+        except OSError:
+            return False
+        if (info.st_size, info.st_mtime_ns) != (size, mtime_ns):
+            return False
+    return True
+
+
 def _route_edges(root: Path) -> Mapping[Tuple[str, Any], List[Dict[str, Any]]]:
     """The routes directory's continuation edges, read at most once per process while it is unchanged.
 
@@ -795,7 +812,7 @@ def _route_edges(root: Path) -> Mapping[Tuple[str, Any], List[Dict[str, Any]]]:
         _ROUTE_EDGES.pop(key, None)
         return {}
     held = _ROUTE_EDGES.get(key)
-    if held is not None and held.trusted and held.signature == before:
+    if held is not None and held.trusted and held.signature == before and _edge_stamps_hold(directory, held):
         return held.children
     known = held.files if held is not None else {}
     files: Dict[str, Tuple[int, int, Optional[Dict[str, Any]]]] = {}
@@ -4818,7 +4835,15 @@ def finalize(
         # D-120: the route that seals this cycle is the unique T(C) leaf, not
         # necessarily the begin route -- an inherited (rebound) cycle's begin
         # route may long since have a continuation writing it.
-        route = _finalize_route(root, record)
+        try:
+            route = _finalize_route(root, record,
+                                    deadline=_scan_budget.deadline() if _scan_budget is not None else None)
+        except ProducerError as exc:
+            if exc.code != "scan-in-progress":
+                raise
+            if prescan is not None and prescan.open_cycle:
+                _keep_prescan_digests(root, cycle_id, prescan)   # the next try reads only what is left
+            return _finish({"status": "deferred", "reason": "scan-budget", "cycle_id": cycle_id})
         admission = cycle_route_admission(root, record, route, finalize=True)
         if not admission.allow:
             raise ProducerError(admission.reason, admission.detail)
@@ -5810,6 +5835,10 @@ class RefreshBudget:
 
     def exhausted(self) -> bool:
         return self.walk_exhausted() or self.hash_exhausted()
+
+    def deadline(self) -> Optional[float]:
+        """The `time.monotonic()` value its time share ends at, `None` when it has none."""
+        return None if self.max_seconds == _UNLIMITED else self._started + self.max_seconds
 
 
 def _fingerprint(st: os.stat_result) -> List[int]:
@@ -9602,7 +9631,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--cycle", required=True)
     p.add_argument("--state", default="completed", choices=["completed", "abandoned"])
     p.add_argument("--primary", help="primary artifact as a cycle-relative locator "
-                   "(artifacts/<bucket>/<file>); an absolute path inside this cycle's artifacts/ is accepted")
+                   "(artifacts/<file> or artifacts/<folder>/<file>); an absolute path inside this cycle's artifacts/ is accepted")
     p.add_argument("--publication", default="not-offered")
     p.add_argument("--allow-open-route", action="store_true")
     p.add_argument("--adopt-root-output", action="append", default=[])
