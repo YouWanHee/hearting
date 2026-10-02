@@ -365,7 +365,11 @@ def _seal_owner_envelope(*, request: TerminalCommitRequest, route: Mapping[str, 
                          slot: Path, terminal_nodes: tuple[str, ...]) -> Optional[str]:
     selected_binding = dict(binding or {})
     owner_hint = (request.owner_handoff or {}).get("primary")
-    if "primary" not in selected_binding and isinstance(owner_hint, str):
+    # Producer cycles select the hint once, before the immutable terminal
+    # claim, and persist only a payload-validated primary in the binding.  Do
+    # not let envelope sealing re-introduce an ignored private or late hint.
+    if (not producer_lifecycle_applies(route) and "primary" not in selected_binding
+            and isinstance(owner_hint, str)):
         selected_binding["primary"] = owner_hint
     primary = select_primary_artifact(route, gates, selected_binding, artifact_root=request.artifact_root)
     if primary is None:
@@ -615,7 +619,8 @@ def _valid_cycle_primary(candidate: Any, *, root: Path, binding: Mapping[str, An
         record = artifact_producer.read_cycle_record(Path(root), binding["cycle_id"])
         directory = artifact_producer.cycle_dir(Path(root), record["campaign_id"],
                                                  binding["cycle_id"], record).resolve()
-        path.resolve(strict=True).relative_to(directory)
+        payload = (directory / "artifacts").resolve()
+        path.resolve(strict=True).relative_to(payload)
     except Exception:
         return None
     return path.resolve()
@@ -1066,24 +1071,61 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             if terminal_marker_digest(list(fresh_gates.values())) != marker_digest:
                 raise TerminalCommitError("transaction-conflict", "claim-markers-changed")
             if pending_primary is not None:
-                if dispatch_contract.terminal_claim_observation(
-                        request.jobs, route["route_id"], request.owner_attempt_id) is not None:
-                    raise TerminalCommitError("transaction-conflict", "terminal-claim-already-exists")
-                binding_value = {**binding_value, "primary": str(pending_primary)}
-                binding_path = producer_binding_path(
-                    request.artifact_root, route["route_id"], request.owner_attempt_id)
-                _atomic_json(binding_path, binding_value)
-                producer_digest = _digest(binding_path.read_bytes())
-                commit_id = terminal_commit_id(
-                    route_id=route["route_id"], route_hash=route["route_hash"],
-                    owner_attempt_id=request.owner_attempt_id,
-                    marker_digest=marker_digest, producer_digest=producer_digest)
-                path = _commit_state_path(request)
-                initial = {"schema_version": 1, "terminal_commit_id": commit_id,
-                           "route_id": route["route_id"], "route_hash": route["route_hash"],
-                           "owner_attempt_id": request.owner_attempt_id,
-                           "terminal_marker_digest": marker_digest,
-                           "producer_binding_digest": producer_digest, "state": "claimed"}
+                existing_claim = dispatch_contract.terminal_claim_observation(
+                    request.jobs, route["route_id"], request.owner_attempt_id)
+                if existing_claim is None:
+                    binding_value = {**binding_value, "primary": str(pending_primary)}
+                    binding_path = producer_binding_path(
+                        request.artifact_root, route["route_id"], request.owner_attempt_id)
+                    _atomic_json(binding_path, binding_value)
+                    producer_digest = _digest(binding_path.read_bytes())
+                    commit_id = terminal_commit_id(
+                        route_id=route["route_id"], route_hash=route["route_hash"],
+                        owner_attempt_id=request.owner_attempt_id,
+                        marker_digest=marker_digest, producer_digest=producer_digest)
+                    path = _commit_state_path(request)
+                    initial = {"schema_version": 1, "terminal_commit_id": commit_id,
+                               "route_id": route["route_id"], "route_hash": route["route_hash"],
+                               "owner_attempt_id": request.owner_attempt_id,
+                               "terminal_marker_digest": marker_digest,
+                               "producer_binding_digest": producer_digest, "state": "claimed"}
+                else:
+                    # A claimant may have published the immutable registry fence
+                    # and crashed before its local state file.  Under this same
+                    # jobs lock, re-read the exact producer binding and only
+                    # replay the claim when all route, owner, marker and digest
+                    # identities still agree.  The claim's selected primary is
+                    # authoritative over any later valid owner hint.
+                    claim_proof = existing_claim.get("proof") if isinstance(existing_claim, dict) else None
+                    if (existing_claim.get("schema_version") != 1
+                            or existing_claim.get("contract") != dispatch_contract.TERMINAL_CLAIM_CONTRACT
+                            or existing_claim.get("route_id") != route["route_id"]
+                            or existing_claim.get("owner_attempt_id") != request.owner_attempt_id
+                            or not isinstance(claim_proof, dict)
+                            or claim_proof.get("terminal_marker_digest") != marker_digest):
+                        raise TerminalCommitError("transaction-conflict", "terminal-claim-identity")
+                    current_binding = load_producer_binding(
+                        artifact_root=request.artifact_root, route_id=route["route_id"],
+                        owner_attempt_id=request.owner_attempt_id)
+                    current_digest = _digest(current_binding.path.read_bytes())
+                    if current_binding.digest != current_digest:
+                        raise TerminalCommitError("transaction-conflict", "terminal-claim-binding-changed")
+                    expected_id = terminal_commit_id(
+                        route_id=route["route_id"], route_hash=route["route_hash"],
+                        owner_attempt_id=request.owner_attempt_id, marker_digest=marker_digest,
+                        producer_digest=current_digest)
+                    if (claim_proof.get("producer_binding_digest") != current_digest
+                            or claim_proof.get("terminal_commit_id") != expected_id):
+                        raise TerminalCommitError("transaction-conflict", "terminal-claim-binding")
+                    binding_value = current_binding.binding
+                    producer_digest = current_digest
+                    commit_id = expected_id
+                    path = _commit_state_path(request)
+                    initial = {"schema_version": 1, "terminal_commit_id": commit_id,
+                               "route_id": route["route_id"], "route_hash": route["route_hash"],
+                               "owner_attempt_id": request.owner_attempt_id,
+                               "terminal_marker_digest": marker_digest,
+                               "producer_binding_digest": producer_digest, "state": "claimed"}
             dispatch_contract.claim_terminal_route_locked(
                 request.jobs, route["route_id"], request.owner_attempt_id,
                 lock_fd=jobs_lock.fileno(),

@@ -119,9 +119,12 @@ def _public(value, *, live=False, reachable=None, owner_phase=None):
     reachable = live if reachable is None else reachable
     phase = owner_phase or _owner_phase(value["attempt_id"])
     timing = ("active-turn" if value["transport"] == "codex-active-turn" and phase == "running-turn"
+              else "phase-unavailable" if value["transport"] == "codex-active-turn" and phase == "unknown"
               else "next-owner-turn")
     notice = ("Queued corrections may wait for the next owner turn; a parked owner may be delayed "
               "until joined children finish or require attention. This command does not wake or cancel the owner.")
+    if timing == "phase-unavailable":
+        notice = ("Delivery timing is unknown because the exact owner phase is unavailable. " + notice)
     return {"attempt_id": value["attempt_id"], "thread_id": value["thread_id"],
             "transport": value["transport"], "accepting": value["accepting"] and reachable,
             "supervisor_live": live, "owner_phase": phase,
