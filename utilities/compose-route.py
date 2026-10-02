@@ -404,13 +404,12 @@ def run_compile(args, recipe, evidence) -> str:
             "--artifact-root", args.artifact_root,
             "--composed-recipe", str(recipe_path),
             "--dispatch-evidence", str(evidence_path),
-            "--tracking", args.tracking,
-            "--spec-read", args.spec_read,
-            "--drift-verdict", args.drift_verdict,
-            "--workflow-mode", args.workflow_mode,
-            "--artifact-guard", args.artifact_guard,
             "--transport-evidence", args.transport_evidence,
         ]
+        for field in ("tracking", "spec_read", "drift_verdict", "workflow_mode", "artifact_guard"):
+            value = getattr(args, field)
+            if value is not None:
+                command += ["--" + field.replace("_", "-"), value]
         for field in ("profile_demands", "explicit_profiles"):
             value = getattr(args, field, None)
             if value:
@@ -471,12 +470,13 @@ def main() -> int:
     parser.add_argument("--predicate", action="append", default=[])
     parser.add_argument("--transport-evidence", default="caller-selected")
     parser.add_argument("--output", help="sealed route path (compiler write-once); must resolve inside <artifact-root>/.runtime/routes, defaults there when omitted")
-    # Tracked gate evidence -- the caller states these; this tool never fabricates them.
-    parser.add_argument("--tracking", required=True, choices=("tracked", "untracked"))
-    parser.add_argument("--spec-read", required=True)
-    parser.add_argument("--drift-verdict", required=True)
-    parser.add_argument("--workflow-mode", required=True, choices=("tracked", "untracked"))
-    parser.add_argument("--artifact-guard", required=True)
+    # Tracked gate evidence -- passed through as stated; an omitted field takes
+    # `capability-route.py compile`'s default (the same one compose records).
+    parser.add_argument("--tracking", choices=("tracked", "untracked"))
+    parser.add_argument("--spec-read")
+    parser.add_argument("--drift-verdict")
+    parser.add_argument("--workflow-mode", choices=("tracked", "untracked"))
+    parser.add_argument("--artifact-guard")
     # Dispatch evidence: caller-supplied file, or live probe of each child harness.
     parser.add_argument("--dispatch-evidence", help="checked dispatch evidence JSON (skips the live probe)")
     parser.add_argument("--native-evidence", help="native_subagent evidence JSON list (probe path only)")

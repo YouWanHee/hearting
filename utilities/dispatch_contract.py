@@ -6047,6 +6047,23 @@ def resolve_dispatch_state_root(
     return _fallback_registry(agent_home, env).parent
 
 
+def default_jobs_path(
+    environ: dict[str, str] | os._Environ[str] | None = None,
+    agent_home: str | Path | None = None,
+) -> Path:
+    """What an omitted `--jobs` means: the inherited `AGENT_DISPATCH_JOBS`,
+    else the same checked fallback `resolve_dispatch_state_root` uses (for
+    `agent_home` when the tool was given one). The value a caller would have
+    typed as `--jobs "$AGENT_DISPATCH_JOBS"`."""
+
+    env = os.environ if environ is None else environ
+    inherited = env.get("AGENT_DISPATCH_JOBS")
+    if inherited:
+        return Path(inherited).expanduser()
+    home = Path(agent_home) if agent_home is not None else resolve_agent_home()
+    return _fallback_registry(home, env).resolve(strict=False)
+
+
 def dispatch_state_roots(
     agent_home: Path,
     jobs: str | Path | None = None,

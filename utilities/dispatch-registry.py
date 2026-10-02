@@ -50,6 +50,7 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                claim_recovery_retry,
                                reconcile_local_registry, resolve_agent_home,
                                resolve_dispatch_state_root,
+                               default_jobs_path,
                                resolve_parent_extinction,
                                resolve_terminal_conflict,
                                resolve_attempt_cleanup,
@@ -2755,7 +2756,7 @@ def main(argv):
         print(f"check=ok\nglobal_registry={args.global_jobs.resolve()}\nlocal_registry={args.local_jobs.resolve()}\nreconciled={count}\nmalformed={malformed}")
         return 0
     if not args.jobs:
-        print("check=failed\nreason=jobs-required"); return 64
+        args.jobs = default_jobs_path(agent_home=args.agent_home)
     args.jobs = args.jobs.resolve()
     if args.operation == "resolve-terminal-conflict":
         if not args.attempt or any((args.session, args.route, args.node, args.job, args.all)):

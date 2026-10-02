@@ -1728,9 +1728,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Recover one runtime-owned workflow completion; never launch a model.")
     parser.add_argument("operation", choices=["inspect", "finish"])
-    parser.add_argument("--jobs", required=True, type=Path)
+    parser.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     parser.add_argument("--attempt", required=True)
     args = parser.parse_args()
+    if args.jobs is None:
+        args.jobs = dispatch_contract.default_jobs_path()
     from dispatch_completion_join import exact_attempt_row, materialize_after_terminal_close
     row = exact_attempt_row(args.jobs, args.attempt)
     if args.operation == "inspect":

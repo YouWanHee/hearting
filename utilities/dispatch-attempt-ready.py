@@ -100,13 +100,16 @@ def classify_selection(jobs: Path, rows, *, settle: bool = False) -> dict[str, o
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--jobs", required=True)
+    parser.add_argument("--jobs", help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     parser.add_argument("--parent", default="")
     parser.add_argument("--slug", default="")
     parser.add_argument("--attempt-id", default="")
     parser.add_argument("--settle", action="store_true",
                         help="operational wait: commit exact outcomes through the shared runtime join")
     args = parser.parse_args()
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = str(default_jobs_path())
     try:
         rows = selected_rows(
                 Path(args.jobs),

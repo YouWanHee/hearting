@@ -351,6 +351,16 @@ class DispatchContractTest(unittest.TestCase):
     D.resolve_dispatch_state_root(checkout,environ={})
    self.assertEqual(caught.exception.reason,"dispatch-state-root-unresolved")
 
+ def test_default_jobs_path_is_the_inherited_or_canonical_registry(self):
+  # An omitted `--jobs` means what callers typed by hand: the inherited
+  # AGENT_DISPATCH_JOBS, else the registry the state-root chain resolves.
+  with tempfile.TemporaryDirectory() as tmp:
+   inherited=Path(tmp)/"elsewhere"/"jobs.log"
+   self.assertEqual(D.default_jobs_path({"AGENT_DISPATCH_JOBS":str(inherited)}),inherited)
+   env={"HOME":str(Path(tmp)/"userhome")}
+   self.assertEqual(D.default_jobs_path(env),
+    D.resolve_dispatch_state_root(D.resolve_agent_home(),environ=env)/"jobs.log")
+
  def test_codex_standard_owner_network_profile_is_exactly_scoped(self):
   self.assertTrue(D.codex_standard_owner_network_enabled(
    dispatch_depth=1, worker_type="owner", intensity="standard",

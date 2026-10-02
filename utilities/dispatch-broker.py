@@ -745,7 +745,7 @@ def print_meta(meta: dict) -> None:
 def parse_common(sub: argparse.ArgumentParser, *, jobs: bool = True) -> None:
     sub.add_argument("--root", type=Path, default=default_root())
     if jobs:
-        sub.add_argument("--jobs", type=Path, required=True)
+        sub.add_argument("--jobs", type=Path, help="default: AGENT_DISPATCH_JOBS, else the canonical registry")
     sub.add_argument("--stale-seconds", type=float, default=DEFAULT_STALE_SECONDS)
 
 
@@ -768,6 +768,9 @@ def main() -> int:
     parse_common(stop_p)
     stop_p.add_argument("--timeout", type=float, default=5.0)
     args = parser.parse_args()
+    if args.jobs is None:
+        from dispatch_contract import default_jobs_path
+        args.jobs = default_jobs_path()
     if args.command in {"ensure", "request", "serve"}:
         print("check=failed")
         print("reason=launch-broker-retired")
