@@ -466,6 +466,63 @@ class RegisteredOwnerInputTest(unittest.TestCase):
                 self.assertIn('unsupported', str(exc))
         self.assertEqual(sorted(p.name for p in self.root.rglob('*.input.json*')), [])
 
+    def end_row(self, note):
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t')
+                             .replace('\n', f',note={note}\n', 1))
+
+    def test_an_answer_to_an_owner_that_ended_blocked_is_kept_for_its_continuation(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'claude-next-turn')
+        self.end_row('dead-worker-blocked')
+        result = I.submit(self.jobs, self.attempt, 'approved: start the full run', 'approval')
+        self.assertTrue(result['retained'])
+        self.assertFalse(result['duplicate'])
+        self.assertIn('replacement owner', result['next_step'])
+        self.assertEqual([item['state'] for item in result['requests']], ['retained'])
+        self.assertEqual(I.retained(self.jobs, self.attempt),
+                         [{'id': 'approval', 'digest': I._digest('approved: start the full run'),
+                           'text': 'approved: start the full run'}])
+        again = I.submit(self.jobs, self.attempt, 'approved: start the full run', 'approval')
+        self.assertTrue(again['duplicate'] and again['retained'])
+        self.assertEqual(len(I.retained(self.jobs, self.attempt)), 1)
+        # A kept answer is not undelivered input: no supervision notice is raised for it.
+        self.assertFalse(I.unresolved(self.jobs, self.attempt))
+        self.assertEqual(I.inspect(self.jobs, self.attempt)['requests'][0]['delivery_observation'], 'retained')
+
+    def test_an_owner_that_ends_blocked_while_the_answer_is_sent_still_gets_it(self):
+        """The row read before the input lock said open; it ended BLOCKED before the decision."""
+        import dataclasses
+        from unittest import mock
+        I.initialize_owner_input(self.jobs, self.attempt, 'claude-next-turn')
+        self.end_row('dead-worker-blocked')
+        real = I._target
+        reads = []
+        def stale_then_real(jobs, attempt):
+            row, target = real(jobs, attempt)
+            reads.append(row.status)
+            return (dataclasses.replace(row, status='open'), target) if len(reads) == 1 else (row, target)
+        with mock.patch.object(I, '_target', side_effect=stale_then_real):
+            result = I.submit(self.jobs, self.attempt, 'approved', 'raced')
+        self.assertEqual(len(reads), 2)
+        self.assertTrue(result['retained'])
+        self.assertEqual([item['id'] for item in I.retained(self.jobs, self.attempt)], ['raced'])
+
+    def test_input_queued_before_the_owner_ended_blocked_is_still_its_answer(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'claude-next-turn')
+        I.submit(self.jobs, self.attempt, 'approved, sent while it was finishing', 'early')
+        self.assertEqual(I.blocked_owner_answers(self.jobs, self.attempt), [])   # still open: not an answer yet
+        self.end_row('dead-worker-blocked')
+        self.assertEqual([item['id'] for item in I.blocked_owner_answers(self.jobs, self.attempt)], ['early'])
+
+    def test_an_answer_to_any_other_ended_owner_is_still_not_admitted(self):
+        for note in ('dead-worker-fail', 'completed-supervisor', 'dead-exact-pid'):
+            with self.subTest(note=note):
+                self.setUp()
+                I.initialize_owner_input(self.jobs, self.attempt, 'claude-next-turn')
+                self.end_row(note)
+                with self.assertRaisesRegex(I.InputError, 'unavailable-retain-correction'):
+                    I.submit(self.jobs, self.attempt, 'too late')
+                self.assertEqual(I.retained(self.jobs, self.attempt), [])
+
     def test_submissions_racing_the_first_consumer_are_all_kept(self):
         I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
         errors = []

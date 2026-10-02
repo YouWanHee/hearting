@@ -37,10 +37,11 @@ SCHEMA = 'automatic-dead-replacement-v1'
 # D2: a frame leg whose `top` the frame rule assigned is replaced once, one profile lower, when it
 # stops at a usage limit. The claim carries exactly this value; nothing else may.
 FRAME_CAPACITY = 'frame-capacity'
-# Stops that are pauses, not the one silent replacement: a usage limit, or an owner its launcher
-# closed before spawning. Each pause opens its own family (`after_capacity` keeps the digests of
-# existing capacity families unchanged).
-PAUSE_KINDS = frozenset({'capacity', 'unlaunched'})
+# Stops that are pauses, not the one silent replacement: a usage limit, an owner its launcher
+# closed before spawning, or an owner that ended BLOCKED and has since been answered. Each pause
+# opens its own family (`after_capacity` keeps the digests of existing capacity families unchanged).
+CORRECTED = 'corrected'
+PAUSE_KINDS = frozenset({'capacity', 'unlaunched', CORRECTED})
 FRAME_TRANSITION = {'from': 'top', 'to': 'deep', 'reason': 'capacity', 'ordinal': 1, 'origin': 'frame-rule'}
 CONTINUATION_WAIT_NOTE = (
     'This route has already used its one automatic continuation. If you raise a human gate later, '
@@ -272,7 +273,8 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     """The one place that says why a terminal row may be replaced.
 
     'parked' is a released human gate, 'capacity' an owner stopped at a usage limit,
-    'unlaunched' an owner its launcher closed before spawning,
+    'unlaunched' an owner its launcher closed before spawning, 'corrected' an owner that ended
+    BLOCKED and has since received a person's answer through `correct`,
     'silent' a proven silent death, 'frame-capacity' a frame leg at its frame-rule `top` stopped at
     a usage limit (replaced once at `deep`). Anything else, including a user cancel, is None.
     Only a route owner pauses on capacity: a stage worker's limit stays with its owner's
@@ -282,6 +284,11 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
         found = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':
             return 'parked'
+        # A BLOCKED owner was waiting for an answer no declared gate carries; once a person
+        # sent one (`correct`), the same work continues with it. A gate park keeps its own answer.
+        if (found is None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
+                and _retained_corrections(jobs, meta.get('attempt_id'))):
+            return CORRECTED
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
@@ -315,7 +322,7 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
     proof = DC.attempt_process_quiescence(meta, terminal_receipt=True)
     if proof.state != 'quiescent':
         raise _process_error(proof, meta)
-    if kind not in {'parked', 'unlaunched'} and not _terminal_absent(
+    if kind not in {'parked', 'unlaunched', CORRECTED} and not _terminal_absent(
             fields, meta, capacity=kind in {'capacity', FRAME_CAPACITY}, runtime=kind == 'runtime'):
         raise DC.DispatchContractError('replacement-result-settlement-required')
     result = {'state': proof.state, 'reason': proof.reason, 'death_kind': kind,
@@ -326,7 +333,35 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
         if not parked:
             raise DC.DispatchContractError('replacement-not-silent-death')
         result.update({'parked_gate': parked['gate'], 'gate_epoch': parked['epoch']})
+    if kind == CORRECTED:
+        # The answers the continuation receives are pinned here, by id and digest.
+        result['corrections'] = [{'id': item['id'], 'digest': item['digest']}
+                                 for item in _retained_corrections(jobs, meta.get('attempt_id'))]
+        handoff = _blocked_handoff(fields, meta)
+        if handoff:
+            result['handoff'] = handoff
     return result
+
+
+def _retained_corrections(jobs, aid):
+    from dispatch_owner_input import retained
+    return retained(Path(jobs), aid) if jobs is not None and aid else []
+
+
+def _blocked_handoff(fields, meta):
+    """The report a BLOCKED owner named in its own terminal result, or None."""
+    try:
+        import base64
+        from codex_dispatch_terminal import inspect_terminal_attempt
+        result = inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
+                                          artifact_root_metadata=meta.get('artifact_root'),
+                                          worker_type='owner')
+        encoded = result.get('artifact_path_b64') if result.get('artifact_state') == 'readable' else None
+        if not encoded:
+            return None
+        return base64.urlsafe_b64decode(str(encoded) + '=' * (-len(str(encoded)) % 4)).decode()
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
 
 
 def _process_error(proof, meta, attempt_id=None):
@@ -885,6 +920,8 @@ def _reuse_snapshot(jobs, route, lines):
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
             raise DC.DispatchContractError('replacement-completion-unsettled', str(node['id']))
+        # The replacement owner reuses this completion: a gates-off evidence edit is kept as history.
+        DC.note_evidence_change(route, node, path, marker)
         completed.append({'node': node['id'], 'marker_digest': _digest(marker),
                           'attempt_id': marker.get('attempt_id', '')})
     root = Path(route['artifact_root'])
@@ -1268,7 +1305,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         return {'state': 'not-applicable', 'parked_gate': parked} if parked else {'state':'not-applicable'}
     if kind == 'capacity' and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
         return _capacity_wait(jobs, aid, source)
-    if kind in {'runtime', 'unlaunched'} and not resume_capacity and not _replacement_in_flight(jobs, rows, source):
+    if (kind in {'runtime', 'unlaunched', CORRECTED} and not resume_capacity
+            and not _replacement_in_flight(jobs, rows, source)):
         return {'state': 'not-applicable'}  # never a supervisor tick: no loop of relaunches
     try:
         if authority_check is None:
@@ -1413,7 +1451,7 @@ def advance_batch(jobs, attempts, *, authority_check=None, run=subprocess.run):
         meta=pair[1]
         if meta.get('replacement_original_attempt_id'):
             if not DC.verdict_pass(meta):
-                if death_kind(pair[0], meta) == 'capacity':
+                if death_kind(pair[0], meta, jobs=jobs) in {'capacity', CORRECTED}:
                     step=advance(jobs,aid,authority_check=authority_check,run=run)
                     if step.get('state')=='needs-attention': attention.append(step)
                 else:
@@ -1514,7 +1552,10 @@ def recovery_instructions(args):
         raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
     completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
     kind = (record.get('proof') or {}).get('death_kind')
-    if kind == 'capacity':
+    if kind == CORRECTED:
+        opening = (f'The previous owner {prior} ended BLOCKED and a person has answered it; this continues '
+                   f'the same work on the existing route {record["route_id"]}.\n')
+    elif kind == 'capacity':
         opening = f'The previous attempt {prior} stopped at a usage limit; this resumes it on the existing route {record["route_id"]}.\n'
     elif kind == 'unlaunched':
         opening = f'The previous attempt {prior} never started (its launcher stopped before spawning); this starts the same work on the existing route {record["route_id"]}.\n'
@@ -1535,4 +1576,24 @@ def recovery_instructions(args):
                  'a person released it with proceed. '
                  f'Read the recorded answers with: {read} '
                  f'Do not raise {gate} again. Continue from the node it gated through the remaining declared stages.\n')
+    if kind == CORRECTED:
+        text += _correction_context(jobs, prior, record['proof'])
     return text + CONTINUATION_WAIT_NOTE
+
+
+def _correction_context(jobs, prior, proof):
+    """The pinned answers, exactly as sent, and what they answer."""
+    from dispatch_owner_input import OwnerInput
+    kept = {item['id']: item for item in _retained_corrections(jobs, prior)}
+    items = []
+    for pinned in proof.get('corrections') or []:
+        item = kept.get(pinned.get('id'))
+        if item is None or item['digest'] != pinned.get('digest'):
+            raise DC.DispatchContractError('replacement-correction-drift', str(pinned.get('id')))
+        items.append(item)
+    handoff = proof.get('handoff')
+    return ((f'The previous owner reported why it stopped in {handoff}. ' if handoff else '')
+            + 'The answer below is the reply to what it was waiting for (for example an approval it asked '
+              'for). Treat it as given: do not ask for it again, and continue from where the previous '
+              'owner stopped through the remaining declared stages.'
+            + OwnerInput.text(items) + '\n')

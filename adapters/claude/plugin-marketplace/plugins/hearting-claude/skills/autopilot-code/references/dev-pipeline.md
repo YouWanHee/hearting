@@ -133,7 +133,8 @@ fallback stops with `child_spawned=0` and reports the reason's own `next_action`
 instead of degrading to an inline run of a node whose own recorded state, not runtime availability, is
 what is blocking it — most often `capability-route.py revise --route <route> --node <node> --evidence
 <evidence-path> --basis review-findings|user-direction|owner-correction` when the gate's evidence
-changed after its marker published. For case 3, record reasoning in
+changed after its marker published (opt-in gates only; with gates off, the default, the edit is
+kept as history and the node proceeds). For case 3, record reasoning in
 `plans/<slug>/_internal/metrics.md`; an unrecorded inline standard+ run violates the contract.
 Still parallelize separable census or disjoint file groups. Dispatch-infrastructure
 self-modification requires the explicit `STAGE_DISPATCH_INLINE_OK` opt-out.

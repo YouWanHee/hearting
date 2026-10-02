@@ -573,7 +573,10 @@ def cmd_gate(args):
     ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
-        raise SupervisorError(f"route declares no human gate {args.gate!r}")
+        hint = ("; to ask a person here, end BLOCKED and name the question in your handoff: their "
+                "answer (capability-route.py correct) continues this route in a replacement owner"
+                if args.block else "")
+        raise SupervisorError(f"route declares no human gate {args.gate!r}{hint}")
     payload = {"gate": args.gate,
                **ledger_metadata(getattr(args, "jobs", None), ledger)}
     with ledger.lock():
