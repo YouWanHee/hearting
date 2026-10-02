@@ -2929,6 +2929,9 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
         def _stage_part(budget):
             if _route_rides_the_rail(j, route_seq, in_card):
                 return []
+            residue = getattr(j, "residue_pids", None)
+            if residue:
+                return _stage_zone_segs([("⚠ worker left pid %s running" % ",".join(map(str, residue)), "gate_u")])
             bc = _dispatch_stage_segs(j, key, stage, slug_name,
                                       working=(unit_working if unit_working is not None
                                                else j.liveness == "working"),

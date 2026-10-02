@@ -743,9 +743,17 @@ preserves the result, marker, and delivery receipt and grants no retry credit.
 Missing observation keeps the cleanup obligation and its durable supervision
 notice open. A later proof settles it without a new model turn or cancellation.
 Historical artifact and residue seals remain audit evidence: a valid artifact
-never proves that a live descendant stopped. The launcher/watchdog owns signals;
-join/reconcile own proof recovery, bounded typed observer-error diagnostics and
-notification, not guessed process death. The shared controller retains the same
+never proves that a live descendant stopped.
+A residue seal is not a permanent veto: once every recorded residue process is
+gone, the join recovery tick and `dispatch-registry.py reconcile` repeat the
+watcher's own group and tagged-descendant observation and record the same clean
+drain proof, after which the existing close path runs. An owner supervisor
+started from an older release keeps its old join, so release such a row once with
+`python3 "$AGENT_HOME/utilities/dispatch-registry.py" reconcile --jobs <jobs.log> --attempt <attempt-id> --apply`
+from the current release (it changes nothing while a residue process still
+runs). The launcher/watchdog owns signals; join/reconcile own proof recovery,
+bounded typed observer-error diagnostics and notification, not guessed process
+death. The shared controller retains the same
 batch across observation failures.
 
 A terminal `capability-owner` node is executed by the bound depth-1 owner.

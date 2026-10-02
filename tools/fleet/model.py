@@ -421,6 +421,7 @@ class DispatchJob:
     """One headless dispatch job (autopilot-*/loops process, or jobs.log row)."""
     key: str                            # pipe key: autopilot-code / oncall / ...
     stage: Optional[str] = None         # plan | exec | test | done (live_stage)
+    residue_pids: Optional[list] = None  # tagged pids a finished worker left running (display only)
     mode: Optional[str] = None          # legacy overloaded --mode value (read-only)
     capability_mode: Optional[str] = None  # entry capability behavior (dev/debug/...)
     worker_mode: Optional[str] = None   # non-owner family/mode compatibility projection

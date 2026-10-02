@@ -53,8 +53,10 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                resolve_parent_extinction,
                                resolve_terminal_conflict,
                                resolve_attempt_cleanup,
+                               resolve_residue_drain,
                                seal_cancellation_quiescence_receipt,
                                signal_exact_process_group,
+                               tagged_residue_receipt,
                                ROUTE_IDENTITY_METADATA_KEYS,
                                validate_attempt_metadata)  # noqa: E402
 from dispatch_continuation_budget import resolve_continuation_budget  # noqa: E402
@@ -1264,6 +1266,45 @@ def reconcile(rows, args):
                 "summary_owner": {"state": "not-applied", "reason": "exact-attempt-only"},
             })
             continue
+        # The reap watcher seals `attempt-tagged-residue-v1` and exits, so
+        # nobody sees the survivors leave. Repeat its drain observation: when
+        # group and tagged descendants are both empty it records the same clean
+        # drain proof, and the existing completion writer runs unchanged. While
+        # a survivor still runs the row classifies `active`; the same call then
+        # only reports its pids.
+        residue = (
+            resolve_residue_drain(args.jobs, row["meta"]["attempt_id"], apply=args.apply)
+            if (category in {"terminal-draining", "active"} and not only_exact_dead
+                and row.get("attempt_contract_status") == "current"
+                and tagged_residue_receipt(row["meta"]))
+            else None
+        )
+        if residue is not None and residue["state"] == "drained":
+            exact_repair_only = True
+            completion = "not-attempted"
+            completed = False
+            if args.apply and residue["changed"]:
+                try:
+                    fresh = exact_attempt_row(args.jobs, row["meta"]["attempt_id"])
+                    completion = close_finished_child(fresh, jobs=args.jobs) or "writer-returned-success"
+                    latest = next((item for item in read_rows(args.jobs)
+                                   if item["meta"].get("attempt_id") == row["meta"]["attempt_id"]), None)
+                    completed = bool(latest and latest["status"] not in OPEN)
+                except (DispatchContractError, JoinContractError, OSError, ValueError) as exc:
+                    completion = getattr(exc, "reason", type(exc).__name__)
+            decisions.append({
+                "attempt_id": row["meta"]["attempt_id"], "slug": row["slug"],
+                "category": "residue-drain-completed" if completed else
+                            "residue-drain-refreshed" if args.apply and residue["changed"] else
+                            "residue-drain-ready" if not args.apply else
+                            "residue-drain-revalidation-veto",
+                "reason": residue["reason"], "proposed_note": None,
+                "revalidated": residue["changed"] if args.apply else None,
+                "closed": completed, "completion": completion, "cascade": [],
+                "summary_owner": {"state": "not-applied", "reason": "receipt-only"},
+                "cleanup": None,
+            })
+            continue
         # A same-host foreground stage can outlive the wrapper that normally
         # publishes its post-exit receipt. Reconstruct only that receipt from
         # the exact terminal envelope and complete local teardown proof, then
@@ -1393,7 +1434,9 @@ def reconcile(rows, args):
                           "category": category, "reason": reason, "proposed_note": note,
                           "revalidated": revalidated, "closed": closed,
                           "cascade": cascade, "summary_owner": summary_owner,
-                          "cleanup": terminal_cleanup})
+                          "cleanup": terminal_cleanup,
+                          **({"residue": {"state": residue["state"], "live_pids": residue["live_pids"]}}
+                             if residue is not None else {})})
     record = {"at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
               "apply": args.apply, "classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
               "attempted": len(selected), "closed": sum(item["closed"] for item in decisions),
@@ -2656,7 +2699,8 @@ def main(argv):
     p.add_argument("--automatic-cancel-receiptless", action="store_true")
     p.add_argument("--only-exact-dead", action="store_true",
                    help="settle only the selected attempt's exact death; never apply cleanup eligibility")
-    p.add_argument("--recover-receiptless", action="store_true")
+    p.add_argument("--recover-receiptless", action="store_true",
+                   help="exact retry recovery; requires --attempt and --route-file")
     p.add_argument("--seal-artifact-proof-receipt", action="store_true")
     p.add_argument("--route-file", type=Path)
     p.add_argument("--agent-home", type=Path); p.add_argument("--now", type=float, default=time.time(), help=argparse.SUPPRESS)
@@ -2777,7 +2821,9 @@ def main(argv):
         or not args.route_file
         or any((args.session, args.route, args.node, args.job, args.all))
     ):
-        print("check=failed\nreason=exact-attempt-recovery-required"); return 64
+        print("check=failed\nreason=exact-attempt-recovery-required\n"
+              "required=reconcile --recover-receiptless --attempt <attempt-id> --route-file <route.json>"
+              " (no --session/--route/--node/--job/--all)"); return 64
     rows = read_rows(args.jobs)
     if args.operation == "current":
         return emit_current(rows, args)

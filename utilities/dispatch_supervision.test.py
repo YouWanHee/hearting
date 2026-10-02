@@ -238,6 +238,18 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
             expected_epoch=1, expected_attempts={"att-owner"}, expected_sealed_batch_id="batch-test")
         self.assertIn("not workflow completion", supervision.render_text(first["receipt"]))
 
+    def test_residue_pid_is_named_in_the_notice_only_while_it_runs(self):
+        self._notice_rows()
+        receipt = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")[0]["receipt"]
+        with mock.patch.object(contract, "residue_live_pids", return_value=()):
+            plain = supervision.render_text(receipt)
+        self.assertNotIn("left process", plain)
+        with mock.patch.object(contract, "residue_live_pids", return_value=(753216,)):
+            named = supervision.render_text(receipt)
+        self.assertTrue(named.startswith(plain))
+        self.assertIn("att-child finished, but the worker left process pid 753216 running", named)
+        self.assertIn("closes by itself once that process exits", named)
+
     def test_claim_binds_live_generation_without_changing_the_obligation(self):
         self._notice_rows()
         record = supervision.materialize(self.jobs, {"att-child"}, reason="join-deadline")[0]

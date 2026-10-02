@@ -290,6 +290,127 @@ class DispatchReapWatchTest(unittest.TestCase):
             self.assertFalse(D.resolve_attempt_cleanup(jobs,attempt,apply=True)["settled"])
             self.assertEqual(jobs.read_bytes(),before)
 
+    def _open_residue_row(self, base, attempt, residue_seconds):
+        """Open row whose worker finished (terminal envelope) leaving a tagged
+        survivor; run the reap watcher until it seals the residue proof."""
+
+        jobs = base / "jobs.log"
+        log = base / f"{attempt}.claude.jsonl"
+        log.write_text('{"type":"result","subtype":"success"}\n', encoding="utf-8")
+        identity = self._tagged_residue_worker(attempt, residue_seconds)
+        metadata = ",".join(
+            f"{key}={value}"
+            for key, value in {
+                **identity,
+                "attempt_id": attempt,
+                "launch_lifecycle": "detached",
+                "pid_scope": "namespace-local",
+                "log_file": str(log),
+            }.items()
+        )
+        jobs.write_text(
+            "2026-08-09T00:00:00Z\topen\t/repo\t/wt\tworker\t"
+            f"{CURRENT},{metadata}\n",
+            encoding="utf-8",
+        )
+        watcher = subprocess.Popen(
+            [
+                sys.executable, str(WATCH),
+                "--jobs", str(jobs),
+                "--attempt-id", attempt,
+                "--pid", identity["pid"],
+                "--pid-start", identity["pid_start"],
+                "--pgid", identity["pgid"],
+                "--interval", "0.02",
+                "--residue-grace", "0.3",
+            ]
+        )
+        self.assertEqual(watcher.wait(timeout=10), 0)
+        return jobs
+
+    @staticmethod
+    def _row_metadata(jobs):
+        return D.parse_registry_metadata(
+            jobs.read_text(encoding="utf-8").strip().split("\t")[5]
+        )
+
+    def test_residue_that_later_exits_is_released_by_the_runtime_not_left_draining(self):
+        """stale-residue-1002 (BC [32], att-execute-e2584831102a-c3): the
+        watcher sealed `attempt-tagged-residue-v1`, the survivor later exited,
+        and nothing re-observed: the row stayed `post-exit-receipt-incomplete`
+        for 2.5 h until the watcher was rerun by hand."""
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            attempt = "att-residue-later-exits"
+            jobs = self._open_residue_row(base, attempt, "1.5")
+            meta = self._row_metadata(jobs)
+            self.assertEqual(
+                meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF
+            )
+            self.assertEqual(meta["attempt_descendant_residue_basis"], "terminal-envelope")
+            deadline = time.monotonic() + 5
+            while D.attempt_tagged_descendants(meta).state != "empty":
+                self.assertLess(time.monotonic(), deadline, "residue never exited")
+                time.sleep(0.05)
+
+            # Today's stall: the residue is gone, yet the receipt gate still
+            # answers incomplete because only the empty proof releases it.
+            verdict = D.attempt_process_quiescence(meta, terminal_receipt=True)
+            self.assertEqual(
+                (verdict.state, verdict.reason),
+                ("unverifiable", "post-exit-receipt-incomplete"),
+            )
+            self.assertEqual(
+                D.observed_attempt_liveness("open", meta, terminal_envelope=True).state,
+                "unverifiable",
+            )
+
+            # The fix: the runtime repeats the watcher's own observation.
+            before = jobs.read_bytes()
+            dry = D.resolve_residue_drain(jobs, attempt)
+            self.assertEqual((dry["state"], dry["changed"]), ("drained", False))
+            self.assertEqual(jobs.read_bytes(), before)
+            applied = D.resolve_residue_drain(jobs, attempt, apply=True)
+            self.assertEqual((applied["state"], applied["changed"]), ("drained", True))
+            fresh = self._row_metadata(jobs)
+            self.assertEqual(fresh["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_PROOF)
+            self.assertEqual(
+                fresh["attempt_descendant_observer_ns"], meta["pid_observer_ns"]
+            )
+            for key in (
+                "attempt_descendant_residue",
+                "attempt_descendant_residue_count",
+                "attempt_descendant_residue_basis",
+                "attempt_descendant_residue_at",
+            ):
+                self.assertEqual(fresh[key], meta[key], key)
+            verdict = D.attempt_process_quiescence(fresh, terminal_receipt=True)
+            self.assertEqual(verdict.state, "quiescent", verdict.reason)
+            self.assertEqual(
+                D.observed_attempt_liveness("open", fresh, terminal_envelope=True).state,
+                "reconcile-needed",
+            )
+            again = D.resolve_residue_drain(jobs, attempt, apply=True)
+            self.assertEqual((again["changed"], again["reason"]),
+                             (False, "residue-receipt-absent"))
+
+    def test_live_residue_is_reported_not_upgraded(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            attempt = "att-residue-still-live"
+            jobs = self._open_residue_row(base, attempt, "30")
+            meta = self._row_metadata(jobs)
+            live = D.attempt_tagged_descendants(meta)
+            self.assertEqual(live.state, "populated")
+            expected = [pid for pid, _s, _st in live.members]
+            before = jobs.read_bytes()
+            outcome = D.resolve_residue_drain(jobs, attempt, apply=True)
+            self.assertEqual((outcome["state"], outcome["changed"]), ("residue-live", False))
+            self.assertEqual(outcome["live_pids"], expected)
+            self.assertEqual(jobs.read_bytes(), before)
+            self.assertEqual(list(D.residue_live_pids(meta)), expected)
+
     def test_sd_open_47_residue_inside_the_governed_group_is_sealed_too(self):
         """review finding 11: `nohup cmd &` without setsid keeps the governed
         pgid; when every live group member carries the tag it is residue."""
