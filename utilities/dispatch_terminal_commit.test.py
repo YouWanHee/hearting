@@ -1545,7 +1545,7 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     state_path = terminal._commit_state_path(request)
                     stored = json.loads(state_path.read_text())
                     envelope = json.loads((state_path.parent / "owner-envelope.json").read_text())
-                    self.assertEqual(envelope["primary_path"], str(moved[0].resolve()))
+                    self.assertEqual(envelope["primary_path"], str(report.resolve()))
                     producer_binding = terminal.load_producer_binding(
                         artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
                     cycle_record = artifact_producer.read_cycle_record(fixture.root, producer_binding["cycle_id"])
@@ -1558,13 +1558,13 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     primary_revision = next(row for row in manifest["artifact_revisions"]
                                             if row["artifact_id"] == primary_id)
                     self.assertEqual(primary_revision["locator"]["path"],
-                                     "artifacts/" + moved[0].relative_to(cycle_dir / "artifacts").as_posix())
+                                     "artifacts/" + report.relative_to(cycle_dir / "artifacts").as_posix())
                     handoff = terminal.completed_owner_handoff(jobs, "done", meta)
-                    self.assertIn(f"artifact: {moved[0].resolve()}", handoff)
+                    self.assertIn(f"artifact: {report.resolve()}", handoff)
                     import work_start
                     consumed = work_start._outcome(jobs, owner)
                     self.assertIn("handoff", consumed)
-                    self.assertIn(f"artifact: {moved[0].resolve()}", consumed["handoff"])
+                    self.assertIn(f"artifact: {report.resolve()}", consumed["handoff"])
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                     second = terminal.settle_owner_completion(jobs, "done", meta)
                     self.assertEqual(second.result, "completed", second)
