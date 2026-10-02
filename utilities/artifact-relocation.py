@@ -2420,7 +2420,8 @@ def main() -> int:
 
     b = sub.add_parser("bind-e1")
     b.add_argument("--owner-prompt", required=True); b.add_argument("--route", required=True)
-    b.add_argument("--manifest", required=True); b.add_argument("--jobs", help="default: AGENT_DISPATCH_JOBS, else the canonical registry"); b.add_argument("--routes-dir", required=True)
+    from dispatch_contract import inherited_jobs_argument
+    b.add_argument("--manifest", required=True); b.add_argument("--jobs", **inherited_jobs_argument()); b.add_argument("--routes-dir", required=True)
     b.add_argument("--w7-route-outcome", dest="w7_route_outcome", required=True); b.add_argument("--w7-final-report", dest="w7_final_report", required=True)
     b.add_argument("--w7-r6b-verdict", dest="w7_r6b_verdict", required=True); b.add_argument("--w7-blocked-apply", dest="w7_blocked_apply", required=True)
     b.add_argument("--authority-output", required=True); b.add_argument("--w7-binding-output", required=True)
@@ -2506,9 +2507,6 @@ def main() -> int:
     w.set_defaults(fn=handoff)
 
     args = parser.parse_args()
-    if getattr(args, "jobs", "") is None:
-        from dispatch_contract import default_jobs_path
-        args.jobs = str(default_jobs_path())
     try:
         return args.fn(args)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:

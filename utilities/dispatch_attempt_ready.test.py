@@ -344,6 +344,15 @@ class OmittedJobsTest(unittest.TestCase):
         self.assertNotEqual(receipt["state"], "contract-error", receipt)
         self.assertEqual(receipt["children"], [])
 
+    def test_cli_without_jobs_or_an_inherited_registry_still_requires_it(self):
+        import subprocess
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_")}
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "utilities" / "dispatch-attempt-ready.py"), "--attempt-id", "att-none"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--jobs", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
