@@ -4119,5 +4119,37 @@ class SlicesOneCommandTest(unittest.TestCase):
         self.assertIn(f"--subsession-manifest {manifest_path}", receipt["next_command"])
         self.assertIn("--node execute", receipt["next_command"])
 
+class PlainSlotReservationTest(unittest.TestCase):
+    """F12: a subdivision reserves N plain slots from the real governor, all or none."""
+
+    GOVERNOR = ROOT / "utilities" / "model-worker-governor.py"
+
+    def _reserve(self, root: Path, count: int) -> list[str]:
+        return BATCH.reserve_plain_slots(
+            self.GOVERNOR, root, [{"attempt_id": f"att-{i}"} for i in range(count)],
+            manifest={}, manifest_digest="sha256:" + "0" * 64,
+        )
+
+    def test_reserves_n_distinct_plain_tokens(self):
+        with tempfile.TemporaryDirectory() as td:
+            tokens = self._reserve(Path(td), 3)
+            self.assertEqual(len(set(tokens)), 3)
+            status = json.loads(subprocess.run(
+                [sys.executable, str(self.GOVERNOR), "--root", td, "status"],
+                text=True, capture_output=True, check=True).stdout)
+            self.assertEqual(len(status["reservations"]), 3)
+
+    def test_shortfall_refuses_all_and_carries_the_governor_detail(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_CLASS_LIMIT_DISPATCH": "2"}):
+                with self.assertRaises(BATCH.BatchError) as caught:
+                    self._reserve(Path(td), 3)
+            self.assertIn("cap reached", str(caught.exception))
+            status = json.loads(subprocess.run(
+                [sys.executable, str(self.GOVERNOR), "--root", td, "status"],
+                text=True, capture_output=True, check=True).stdout)
+            self.assertEqual(status["reservations"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

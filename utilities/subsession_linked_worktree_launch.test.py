@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 _R_SPEC = importlib.util.spec_from_file_location("route", ROOT / "utilities/capability-route.py")
 ROUTE = importlib.util.module_from_spec(_R_SPEC)
 _R_SPEC.loader.exec_module(ROUTE)
+sys.path.insert(0, str(ROOT / "utilities"))
+import dispatch_contract as D  # noqa: E402
 
 
 def load_wrapper(name):
@@ -169,6 +171,42 @@ class LinkedWorktreeSliceLaunchTest(unittest.TestCase):
         self.assertEqual(meta["parent_attempt_id"], "att-owner-bravo")
         self.assertEqual(meta["launch_head"], git("rev-parse", "HEAD", cwd=self.linked))
         self.assertEqual(meta["source_commit_branch"], "fixture-slice")
+
+    def claim(self, attempt):
+        """Claim a registered row exactly as a start does, against the exact owner it inherited."""
+        binding = D.resolve_live_parent_attempt(
+            self.jobs, parent_slug="owner", repo=str(self.primary), worktree=str(self.primary),
+            expected_attempt_id="att-owner-bravo")
+        procs = []
+
+        def spawn(_gate):
+            procs.append(subprocess.Popen(["sleep", "60"], start_new_session=True, pass_fds=(_gate,)))
+            return procs[-1]
+
+        self.addCleanup(lambda: [(p.kill(), p.wait()) for p in procs])
+        return D.spawn_claimed_attempt(self.jobs, attempt, parent_binding=binding, spawn=spawn)
+
+    def test_claim_time_parent_identity_accepts_a_slice_in_the_linked_worktree(self):
+        registered = self.register_slice(inherited="att-owner-bravo")
+        self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+        self.assertNotEqual(self.slice_row()[3], str(self.primary))
+        self.claim("att-slice-beta")
+        self.assertEqual(self.metadata(self.slice_row())["launch_claimed"], "1")
+
+    def test_claim_time_parent_identity_still_refuses_a_plain_child_in_another_worktree(self):
+        registered = self.wrapper_register(self.primary)
+        self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+        lines = []
+        for line in self.jobs.read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if "attempt_id=att-plain-gamma" in fields[5]:
+                fields[3] = str(self.linked)
+            lines.append("\t".join(fields))
+        self.jobs.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with self.assertRaises(D.DispatchContractError) as caught:
+            self.claim("att-plain-gamma")
+        self.assertEqual(caught.exception.reason, "parent-attempt-identity-changed")
+        self.assertEqual(self.metadata(self.slice_row("att-plain-gamma"))["launch_claimed"], "0")
 
     def test_explicit_parent_selection_picks_the_other_same_slug_owner(self):
         result = self.register_slice(inherited="att-owner-alpha")

@@ -225,12 +225,12 @@ def _run_parallel_subdivision(
         admission = SUBDIVISION_ADMISSION.admit_batch(
             route=route_record, node=node, manifest_path=args.manifest,
             governor=governor, governor_root=governor_root,
-            reserve=DISPATCH_BATCH.reserve_batch, jobs=jobs,
+            reserve=DISPATCH_BATCH.reserve_plain_slots, jobs=jobs,
         )
     except SUBDIVISION_ADMISSION.SubdivisionAdmissionError as exc:
         print(json.dumps({
             "schema_version": 1, "state": "subdivision-batch-refused",
-            "chain_id": None, "reason": exc.reason,
+            "chain_id": None, "reason": exc.reason, "detail": exc.detail,
             "admitted_rows": 0, "admitted_models": 0,
         }, sort_keys=True))
         return 65

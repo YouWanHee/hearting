@@ -226,6 +226,7 @@ def prompt_fragment(args: argparse.Namespace) -> str:
         f"- phase brief: {args.phase_brief}\n"
         f"- persistent compact anchor: {args.state_ledger}\n"
         f"- narrow verify: {args.narrow_verify}\n"
+        f"- final handoff: `artifact: {args.state_ledger}` (this ledger, never a source file you edited)\n"
         "- fixed files (exhaustive; out-of-list work stops with a handoff):\n"
         f"{files}\n"
         f"- after at most three edits or one verify round trip, update: python3 {Path(__file__).resolve().parent / 'worker-state-ledger.py'} update --path {args.state_ledger} --attempt-id {args.attempt_id} ...\n"

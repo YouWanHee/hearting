@@ -41,6 +41,8 @@ from dispatch_subsession_advance import chain_manifest_pointer_path  # noqa: E40
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
     close_attempt_row,
+    close_attempt_row_if,
+    parse_registry_metadata,
     resolve_global_registry,
     terminal_claim_observation,
 )
@@ -341,6 +343,23 @@ def _cancel_registered_row(jobs: Path, attempt_id: str) -> int:
         return 0
 
 
+BATCH_START_FAILED = "subsession-batch-start-failed"
+
+
+def _close_unclaimed_row(jobs: Path, attempt_id: str) -> int:
+    """Close one slice row whose start failed before its launcher claimed it, so
+    the owner's join never waits on a row that will never run. A claimed (launched)
+    row is left to its own lifecycle; returns 1 only when this call closed it."""
+
+    def never_claimed(fields: list[str]) -> bool:
+        return fields[1] == "open" and parse_registry_metadata(fields[5]).get("launch_claimed") == "0"
+
+    try:
+        return 1 if close_attempt_row_if(jobs, attempt_id, BATCH_START_FAILED, never_claimed) else 0
+    except (DispatchContractError, OSError):
+        return 0
+
+
 def start_admitted_batch(
     admission: AdmissionResult,
     *,
@@ -349,6 +368,7 @@ def start_admitted_batch(
     governor_reservation_env: str,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     cancel_row: Callable[[Path, str], int] | None = None,
+    close_unclaimed: Callable[[Path, str], int] | None = None,
 ) -> list[dict[str, Any]]:
     """Register every admitted slice first; only start ANY slice once EVERY
     registration has succeeded (F-4, impl-review round 1). Registration and
@@ -436,11 +456,13 @@ def start_admitted_batch(
         # Slices share one worktree: `git status` must not take index.lock.
         env["GIT_OPTIONAL_LOCKS"] = "0"
         start = runner(dispatch_command(admission.manifest, session, "start", parent, jobs), env)
+        closed = (close_unclaimed or _close_unclaimed_row)(jobs, session["attempt_id"]) if start.returncode else 0
         results.append({
             "subsession_id": session["subsession_id"],
             "registered": 1,
             "started": 0 if start.returncode else 1,
             "cancelled": 0,
+            "closed_unclaimed": closed,
             "refusal_reason": "",
             "stdout": start.stdout, "stderr": start.stderr, "exit_code": start.returncode,
         })
@@ -460,7 +482,7 @@ SLICE_RULES = (
     "Edit only the fixed_files above. Never run git add, commit, checkout, restore, stash, "
     "reset or rollback; read git state with `GIT_OPTIONAL_LOCKS=0 git ...`. checklist.md and "
     "the dev log belong to the owner. If a file outside the list is needed, stop and hand "
-    "off. Finish by reporting the changed files and the verify result."
+    "off. Finish by reporting the changed files and the verify result; your final `artifact:` line is your state ledger's absolute path, never a source file."
 )
 
 

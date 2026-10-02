@@ -62,6 +62,7 @@ class StageSessionStateDirTests(unittest.TestCase):
         self.assertIn("dispatch_subsession_handoff.py",fragment)
         self.assertIn("Before compaction",fragment)
         self.assertIn("Native helper support",fragment)
+        self.assertIn(f"final handoff: `artifact: {args.state_ledger}`",fragment)
         self.assertEqual(runtime.prompt_fragment(argparse.Namespace(subsession_id=None)),"")
 
     def test_dry_run_creates_nothing(self):

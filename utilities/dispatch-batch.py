@@ -1240,6 +1240,39 @@ def parallel_slug(prefix: str, node_id: str) -> str:
 replica_slug = parallel_slug
 
 
+def reserve_plain_slots(
+    governor: Path,
+    governor_root: Path,
+    pending_legs: list[dict[str, object]],
+    **_unused: object,
+) -> list[str]:
+    """All-or-nothing reservation of one plain dispatch slot per pending leg.
+
+    A sub-session slice is not a route-leg replica batch, so it carries no
+    `--batch-manifest` (that binds the caller to this process and to a leg
+    manifest). The governor still grants every slot or none."""
+    count = len(pending_legs)
+    result = subprocess.run(
+        [sys.executable, str(governor), "--root", str(governor_root), "reserve",
+         "--class", "dispatch", "--count", str(count), "--pid", str(os.getpid())],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        payload = {}
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if (
+        result.returncode
+        or not isinstance(tokens, list)
+        or len(tokens) != count
+        or not all(isinstance(token, str) and RESERVATION_TOKEN.fullmatch(token) for token in tokens)
+    ):
+        detail = (result.stderr or result.stdout).strip()[:512]
+        raise BatchError("governor-reservation-refused", detail or "governor-reserve-failed")
+    return tokens
+
+
 def reserve_batch(
     governor: Path,
     governor_root: Path,
@@ -1943,7 +1976,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         SUBDIVISION_ADMISSION.raise_if_parallel_entry_fail_closed(args.subdivision_manifest)
         admission = SUBDIVISION_ADMISSION.admit_batch(
             route=route, node=node, manifest_path=args.subdivision_manifest,
-            governor=governor, governor_root=governor_root, reserve=reserve_batch,
+            governor=governor, governor_root=governor_root, reserve=reserve_plain_slots,
             jobs=args.jobs,
         )
     except SUBDIVISION_ADMISSION.SubdivisionAdmissionError as exc:
@@ -1953,6 +1986,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
             "action": args.action,
             "parallel_group": args.parallel_group,
             "reason": exc.reason,
+            "detail": exc.detail,
             "admitted_rows": 0,
             "admitted_models": 0,
             "next_action": _single_session_next_action(args, route),

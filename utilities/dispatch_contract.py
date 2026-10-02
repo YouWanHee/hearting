@@ -39,6 +39,13 @@ from dispatch_receipt_identity import receipt_digest as shared_receipt_digest, u
 _GOVERNOR_WITNESS_HANDLES: dict[tuple[str, str], object] = {}
 
 
+def is_linked_worktree_slice(metadata: Mapping[str, object]) -> bool:
+    """A sub-session slice (`stage_authority=0`) runs in a linked worktree while its
+    owner row keeps the route cwd, so only a slice may differ from its parent's
+    worktree; every other identity comparison stays exact."""
+    return bool(metadata.get("subsession_id")) and str(metadata.get("stage_authority", "")) == "0"
+
+
 def _governor_witness_key(root: Path, token: str) -> tuple[str, str]:
     return str(root.resolve()), token
 
@@ -1144,6 +1151,7 @@ def resolve_parent_extinction(
         return ParentExtinctionEvidence("unproven", "parent-identity-foreign", parent_id)
     if (Path(child_worktree).expanduser().resolve(strict=False)
         != Path(parent_worktree).expanduser().resolve(strict=False)
+        and not is_linked_worktree_slice(child)
     ):
         return ParentExtinctionEvidence("unproven", "parent-worktree-foreign", parent_id)
     child_route_id = str(child.get("route_id") or "")
@@ -1194,8 +1202,9 @@ def resolve_parent_extinction(
             sibling_parent != parent_slug
             or canonical_repository_identity(sibling_repo)
             != canonical_repository_identity(parent_repo)
-            or Path(sibling_worktree).expanduser().resolve(strict=False)
-            != Path(parent_worktree).expanduser().resolve(strict=False)
+            or (Path(sibling_worktree).expanduser().resolve(strict=False)
+                != Path(parent_worktree).expanduser().resolve(strict=False)
+                and not is_linked_worktree_slice(sibling))
         ):
             return ParentExtinctionEvidence(
                 "unproven", "parent-route-context-conflict", parent_id
@@ -4122,6 +4131,10 @@ def reserve_governor_token(
                 "model-worker-reservation-unavailable", str(payload.get("state", "invalid"))
             )
         _validate_replica_reservation(payload, expected_reservation)
+        if expected_reservation is None:
+            # A plain slot token (batch kinds were refused above) carries no batch
+            # binding for the wrappers to read.
+            return provided_token, {}
         return provided_token, payload
     if expected_reservation is not None:
         raise DispatchContractError(
@@ -4599,7 +4612,7 @@ def parent_completion_window(
     same_identity = (
         parent_metadata.get("dispatch_depth") == "1"
         and parent_metadata.get("worker_type") == "owner"
-        and parent_fields[3] == child_fields[3]
+        and (parent_fields[3] == child_fields[3] or is_linked_worktree_slice(child_metadata))
         and canonical_repository_identity(parent_fields[2])
         == canonical_repository_identity(child_fields[2])
         and parent_fields[4] == child_metadata.get("parent")
@@ -4756,7 +4769,7 @@ def spawn_claimed_attempt(
                 == parent_binding.repository_identity
                 and canonical_repository_identity(child_fields[2])
                 == parent_binding.repository_identity
-                and parent_fields[3] == child_fields[3]
+                and (parent_fields[3] == child_fields[3] or is_linked_worktree_slice(child_meta))
                 and parent_fields[4] == child_meta.get("parent")
                 and child_meta.get("parent_attempt_id") == parent_binding.attempt_id
                 and parent_fields[3] == parent_binding.worktree
@@ -7133,6 +7146,16 @@ def _sibling_attempt_gate(
     else:
         lines = registry_lines
     sibling: tuple[str, dict[str, str]] | None = None
+    # Parallel slices of one chain run side by side; only another chain's
+    # (or a non-slice) attempt of this node can be a leaked prior execution.
+    own_chain = ""
+    if attempt_id:
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) == 6:
+                own = parse_registry_metadata(fields[5])
+                if own.get("attempt_id") == attempt_id and own.get("subsession_mode") == "parallel":
+                    own_chain = own.get("session_chain_id", "")
     for line in lines:
         fields = line.split("\t")
         if len(fields) != 6:
@@ -7145,6 +7168,8 @@ def _sibling_attempt_gate(
             continue
         candidate = metadata.get("attempt_id", "")
         if not candidate or candidate == (attempt_id or ""):
+            continue
+        if own_chain and metadata.get("session_chain_id") == own_chain:
             continue
         # A row that never recorded a governed process cannot have leaked one,
         # and judging it `unverifiable` would wedge the node permanently.

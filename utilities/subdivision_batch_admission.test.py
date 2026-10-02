@@ -506,6 +506,59 @@ def _plan_text(*blocks: str, prefix: str = "") -> str:
     return "# plan\n" + prefix + "".join(f"\n{FENCE}slices\n{b}\n{FENCE}\n" for b in blocks)
 
 
+class FailedStartClosesUnclaimedRowTest(AdmissionFixture):
+    """F14: a slice whose start failed must not leave its never-claimed row open."""
+
+    SLICE = (
+        "subsession_mode=parallel,subsession_index=1,subsession_count=2,subsession_purpose=planned,"
+        "expected_round_trips=2,parallel_group=execute,phase_brief=/b.md,state_ledger=/l.yaml,"
+        f"phase_brief_sha256={'a' * 64},fixed_files_sha256={'b' * 64},narrow_verify_sha256={'c' * 64}"
+    )
+
+    def _row(self, attempt: str, claimed: str) -> str:
+        return (
+            "2026-10-02T00:00:01Z\topen\t/repo\t/repo\towner\t"
+            "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            "fallback_hop=same-harness-headless,worker_type=stage,"
+            f"attempt_id={attempt},parent=owner,parent_attempt_id=att-owner,route_id=rt-1,route_node=execute,"
+            f"subsession_id=ss-{attempt},stage_authority=0,session_chain_id=ssc-aaaa,{self.SLICE},"
+            f"launch_claimed={claimed}"
+        )
+
+    def _status(self, jobs: Path, attempt: str) -> str:
+        return next(line.split("\t")[1] for line in jobs.read_text().splitlines() if f"attempt_id={attempt}," in line + ",")
+
+    def test_closes_only_a_never_claimed_row(self):
+        jobs = self.base / "jobs.log"
+        jobs.write_text(self._row("att-open", "0") + "\n" + self._row("att-claimed", "1") + "\n")
+        self.assertEqual(SUBDIV._close_unclaimed_row(jobs, "att-open"), 1)
+        self.assertEqual(SUBDIV._close_unclaimed_row(jobs, "att-claimed"), 0)
+        self.assertEqual(self._status(jobs, "att-open"), "done")
+        self.assertEqual(self._status(jobs, "att-claimed"), "open")
+        self.assertIn(f"note={SUBDIV.BATCH_START_FAILED}", jobs.read_text())
+
+    def test_failed_start_closes_that_slice_and_reports_it(self):
+        admission = StartAdmittedBatchPartialFailureTest._admission(self, 2)
+        closed: list[str] = []
+
+        def fake_run(cmd, env):
+            action = cmd[cmd.index("--action") + 1]
+            slug = cmd[cmd.index("--slug") + 1]
+            if action == "start" and slug == "slice-1":
+                return subprocess.CompletedProcess(cmd, 65, "", "start-failed")
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        results = SUBDIV.start_admitted_batch(
+            admission, parent="owner", jobs=self.base / "jobs.log",
+            governor_reservation_env="AGENT_DISPATCH_GOVERNOR_RESERVATION",
+            run=fake_run, close_unclaimed=lambda jobs, attempt: closed.append(attempt) or 1,
+        )
+        self.assertEqual([row["started"] for row in results], [0, 1])
+        self.assertEqual([row["closed_unclaimed"] for row in results], [1, 0])
+        self.assertEqual(closed, [admission.sessions[0]["attempt_id"]])
+
+
 class ReadSlicesTest(unittest.TestCase):
     def _read(self, text: str, name: str = "plan.md"):
         with tempfile.TemporaryDirectory() as td:
