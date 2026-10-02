@@ -928,6 +928,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--approval", choices=("untrusted", "on-request", "never", "inherit"), default="never")
     value.add_argument("--network-access", action="store_true")
     value.add_argument("--writable-root", action="append", default=[])
+    value.add_argument("--primary-git-commit", action="store_true",
+                       help="This run may commit: a primary checkout gets the commit-only .git profile")
     value.add_argument("--model")
     value.add_argument("--reasoning")
     value.add_argument("--join-interval", type=float, default=2.0)
@@ -998,6 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
     ]
     args.native_permission_profile = commit_profile_config(
         args.worktree, args.writable_root, args.sandbox, args.network_access,
+        primary_commit=args.primary_git_commit,
     )
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)

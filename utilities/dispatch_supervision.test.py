@@ -447,5 +447,39 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         self.assertEqual(stop_check.call_count, 0)
 
 
+
+class NamespaceExtinctObligationTest(unittest.TestCase):
+    """5th Codex run: an extinct namespace is a terminal-writer job, not an unverifiable process."""
+
+    def test_open_row_is_a_reconcile_obligation_and_the_closed_row_ends_it(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        jobs = Path(temp.name) / "jobs.log"
+        namespace = {"pid": "464", "pid_start": "537327887", "pgid": "464",
+                     "pid_scope": "namespace-local", "pid_observer_ns": "pid:[4026534323]",
+                     "pid_ns": "pid:[4026534323]", "launch_lifecycle": "foreground-scoped"}
+
+        def probe(_metadata, *, host_complete=False):
+            if host_complete:
+                return contract.ProcessGroupObservation("empty")
+            return contract.ProcessGroupObservation("unverifiable", (), "observer-namespace-mismatch")
+
+        with mock.patch.object(contract, "namespace_gone", return_value="extinct"), \
+                mock.patch.object(contract, "attempt_tagged_descendants", side_effect=probe):
+            jobs.write_text(row("att-extinct", **namespace))
+            rows = supervision._rows(jobs)
+            meta = rows["att-extinct"][1]
+            proof = contract.observed_attempt_liveness("open", meta, terminal_receipt_gate=True)
+            self.assertEqual((proof.state, proof.process_reason),
+                             ("reconcile-needed", contract.NAMESPACE_EXTINCT_REASON))
+            self.assertEqual(policy.decide_attempt("open", meta, process_state=proof.process_state,
+                                                   process_reason=proof.process_reason).action,
+                             "reconcile")
+            self.assertTrue(supervision._pending(rows, ["att-extinct"], jobs))
+            jobs.write_text(row("att-extinct", status="done", note="dead-namespace-absent",
+                                failure_class="runtime", **namespace))
+            self.assertFalse(supervision._pending(supervision._rows(jobs), ["att-extinct"], jobs))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -35,6 +36,32 @@ FOREGROUND_TIMEOUT_DEFAULT = 3600.0  # 1h: what a non-positive/non-finite reques
 FOREGROUND_TIMEOUT_MAX = 86400.0  # 24h hard ceiling: no finite request may be effectively infinite
 _REVIEW_WITNESS_UNLOCK_TIMEOUT = 1.0
 _REVIEW_WITNESS_POLL_INTERVAL = 0.02
+
+# The wrapper itself was asked to stop (SIGINT/SIGTERM/SIGHUP) and stopped its
+# worker. A worker that died of a signal on its own stays `signal-N`.
+FOREGROUND_INTERRUPTED = "interrupted"
+# One stderr line every launcher prints first on a foreground-scoped `--start`:
+# the call it is in hosts the worker, so a caller that stops it stops the work.
+FOREGROUND_NOTICE = (
+    "notice: the worker runs inside this call — wait until this call returns "
+    "(it can take a while); stopping the call stops the worker."
+)
+# One plain line for a caller whose `--start` found its attempt already
+# claimed; an attempt that is still running needs no extra line.
+EXISTING_ATTEMPT_NOTES = {
+    "existing-dead": (
+        "the earlier attempt is no longer running; run the same --start again "
+        "and a replacement starts"
+    ),
+    "existing-unverified": (
+        "this place cannot see whether the earlier attempt is still running; the "
+        "runtime checks it and replaces it if it died — end the turn and wait"
+    ),
+}
+# Time a launcher gives its wrapper to stop the worker and close the row after
+# the first stop request: the wrapper's TERM (5s) and KILL (5s) windows plus
+# room for the registry close.
+FORWARDED_TERMINATION_GRACE = 30.0
 
 
 @dataclass(frozen=True)
@@ -856,7 +883,7 @@ def wait_foreground(
                     proc, leader_start, poll_interval=poll_interval
                 )
                 return ForegroundResult(
-                    exit_code, f"signal-{received[-1]}", group_empty
+                    exit_code, FOREGROUND_INTERRUPTED, group_empty
                 )
             parent_lost = False
             if parent_is_live is not None:
@@ -892,9 +919,187 @@ def wait_foreground(
             signal.signal(signum, handler)
 
     if received:
-        return ForegroundResult(exit_code, f"signal-{received[-1]}")
+        return ForegroundResult(exit_code, FOREGROUND_INTERRUPTED)
     if exit_code < 0:
         return ForegroundResult(exit_code, f"signal-{-exit_code}")
     if exit_code:
         return ForegroundResult(exit_code, f"exit-{exit_code}")
     return ForegroundResult(exit_code, "")
+
+
+@dataclass(frozen=True)
+class ForwardedRun:
+    """What a launcher learns from one wrapper run it hosted.
+
+    ``received_signal`` is the first stop request this launcher received while
+    the wrapper ran; ``cleanup_incomplete`` means the wrapper had not finished
+    within the grace window and was killed (or its output stayed open).
+    """
+
+    returncode: int
+    stdout: str | None
+    stderr: str | None
+    received_signal: int | None = None
+    cleanup_incomplete: bool = False
+
+
+def _forwarded_signals() -> list[int]:
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        signals.append(signal.SIGHUP)
+    return signals
+
+
+def _drain_pipe(stream: Any, sink: list[bytes]) -> None:
+    """Read one wrapper pipe to EOF; the reader alone closes it."""
+
+    try:
+        fd = stream.fileno()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            sink.append(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def run_forwarding_termination(
+    command: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    capture: bool,
+    timeout: float | None,
+    grace: float = FORWARDED_TERMINATION_GRACE,
+    poll_interval: float = 0.05,
+) -> ForwardedRun:
+    """Run a wrapper inside this call and hand any stop request to it.
+
+    ``subprocess.run`` answers SIGINT by killing its child 0.25s later, so a
+    foreground wrapper never got to stop its worker and close the row. Here the
+    first SIGINT/SIGTERM/SIGHUP fixes one cleanup deadline (``now + grace``)
+    and is passed to the wrapper; later signals are passed too but never move
+    that deadline. A wrapper still running at the deadline is killed (only the
+    wrapper: its worker group belongs to the wrapper's own cleanup) and the
+    result says ``cleanup_incomplete``. Without a signal, ``timeout`` keeps the
+    ``subprocess.run`` meaning and raises ``subprocess.TimeoutExpired``.
+    Handlers are installed only on the main thread and are always restored.
+    """
+
+    received: list[int] = []
+    cleanup_deadline: list[float] = []
+    child: list[subprocess.Popen] = []
+    pending: list[int] = []
+
+    def deliver(proc: subprocess.Popen, signum: int) -> None:
+        try:
+            proc.send_signal(signum)
+        except OSError:
+            pass
+
+    def forward(signum: int, _frame: object) -> None:
+        received.append(signum)
+        if not cleanup_deadline:
+            cleanup_deadline.append(time.monotonic() + grace)
+        if child:
+            deliver(child[0], signum)
+        else:
+            pending.append(signum)
+
+    previous: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in _forwarded_signals():
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward)
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    def text(chunks: list[bytes]) -> str | None:
+        if not capture:
+            return None
+        return b"".join(list(chunks)).decode("utf-8", errors="replace")
+
+    try:
+        if received:
+            # Stopped before anything was launched: launch nothing.
+            return ForwardedRun(-received[0], text([]), text([]), received[0])
+        pipe = subprocess.PIPE if capture else None
+        proc = subprocess.Popen(
+            list(command), cwd=cwd, env=None if env is None else dict(env),
+            stdout=pipe, stderr=pipe,
+        )
+        child.append(proc)
+        for signum in pending:
+            deliver(proc, signum)
+        readers = []
+        if capture:
+            for stream, sink in ((proc.stdout, stdout_chunks), (proc.stderr, stderr_chunks)):
+                reader = threading.Thread(target=_drain_pipe, args=(stream, sink), daemon=True)
+                reader.start()
+                readers.append(reader)
+        outer_deadline = None if timeout is None else time.monotonic() + timeout
+        cleanup_incomplete = False
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=poll_interval)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                now = time.monotonic()
+                if cleanup_deadline:
+                    if now >= cleanup_deadline[0]:
+                        proc.kill()
+                        proc.wait()
+                        cleanup_incomplete = True
+                        break
+                elif outer_deadline is not None and now >= outer_deadline:
+                    proc.kill()
+                    proc.wait()
+                    for reader in readers:
+                        reader.join(timeout=1.0)
+                    raise subprocess.TimeoutExpired(
+                        list(command), timeout,
+                        output=text(stdout_chunks), stderr=text(stderr_chunks),
+                    )
+            for reader in readers:
+                while reader.is_alive():
+                    # The wrapper has exited; something it started may still
+                    # hold its output open. Bound that wait by the same clock.
+                    limit = cleanup_deadline[0] if cleanup_deadline else outer_deadline
+                    if limit is None:
+                        reader.join(poll_interval)
+                        continue
+                    remaining = limit - time.monotonic()
+                    if remaining <= 0:
+                        if cleanup_deadline:
+                            cleanup_incomplete = True
+                            break
+                        raise subprocess.TimeoutExpired(
+                            list(command), timeout,
+                            output=text(stdout_chunks), stderr=text(stderr_chunks),
+                        )
+                    reader.join(min(poll_interval, remaining))
+        except subprocess.TimeoutExpired:
+            raise
+        except BaseException:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            raise
+        return ForwardedRun(
+            proc.returncode,
+            text(stdout_chunks),
+            text(stderr_chunks),
+            received[0] if received else None,
+            cleanup_incomplete,
+        )
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)

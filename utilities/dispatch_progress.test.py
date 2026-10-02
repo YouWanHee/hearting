@@ -333,7 +333,8 @@ class ProgressTest(unittest.TestCase):
                 "pid_scope=namespace-local,pid_observer_ns=pid:[inner],"
             ),
         ))
-        P.heartbeat(self.args(), 1)
+        # A worker's own heartbeat; the launcher's `launch` seed is not life.
+        P.heartbeat(self.args(phase="tool", kind="tool", evidence="editing"), 1)
         first = P.watchdog(self.args(), 11)
         self.assertEqual(first["verdict"], "working")
         with mock.patch.object(P.os, "killpg") as killpg:

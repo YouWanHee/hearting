@@ -1206,6 +1206,20 @@ def _matching_attempt_heartbeat(ev_in):
     return heartbeat
 
 
+def _worker_liveness_heartbeat(ev_in):
+    """A matching heartbeat the worker itself wrote, for the liveness ladder only.
+
+    The launcher seeds ``phase=launch`` right after spawn (wrapper
+    ``seed_launch_heartbeat``, chain ``watch_launched_attempt``). It says the
+    launch happened, not that the worker is still running, so it never keeps a
+    row "working". Every other heartbeat consumer keeps the seed.
+    """
+    heartbeat = _matching_attempt_heartbeat(ev_in)
+    if heartbeat is None or heartbeat.get("phase") == "launch":
+        return None
+    return heartbeat
+
+
 def _matching_attempt_terminal(ev_in):
     """Return exact attempt-scoped terminal infrastructure evidence."""
 
@@ -1260,7 +1274,7 @@ def classify_attempt_evidence(ev_in, now=None):
     if not has_attempt_identity(ev_in):
         return None
     has_process_identity = ev_in.get("pid") is not None and bool(ev_in.get("proc_start"))
-    heartbeat = _matching_attempt_heartbeat(ev_in)
+    heartbeat = _worker_liveness_heartbeat(ev_in)
     terminal = _matching_attempt_terminal(ev_in)
     pid_scope = ev_in.get("pid_scope")
     observed = ev_in.get("observed_liveness")
@@ -1335,6 +1349,12 @@ def classify_attempt_evidence(ev_in, now=None):
               and ev_in["parent_extinction"].get("state") == "proven"):
             state, source = "dead", "parent"
             rule = ev_in["parent_extinction"].get("reason", "proven parent extinction")
+        elif ev_in.get("namespace_extinct") is True:
+            # Both recorded PID namespaces have left the host and a host-wide
+            # walk finds no tagged process: nothing of this attempt can run.
+            # Computed by the caller from the shared quiescence verdict.
+            state, source = "dead", "namespace"
+            rule = "namespace-local attempt's recorded PID namespaces no longer exist"
         elif ev_in.get("attempt_descendants") == "empty":
             # SD-58: a heartbeat is the attempt talking about itself, and a row
             # that stopped mid-sentence keeps a fresh one forever. A proven-empty
@@ -1345,7 +1365,7 @@ def classify_attempt_evidence(ev_in, now=None):
             rule = "namespace-local attempt has no surviving attempt-tagged process"
         elif heartbeat and now is not None and now - float(heartbeat["updated_at"]) <= ATTEMPT_HEARTBEAT_LIVE_SEC:
             state, source = "working", "heartbeat"
-            rule = "namespace-local attempt has a fresh exact UI heartbeat"
+            rule = "namespace-local attempt has a fresh worker heartbeat"
         else:
             # Reached when the scan itself was impossible (`unverifiable`), or on
             # an older caller that supplies no probe at all. Both stay fail-closed.

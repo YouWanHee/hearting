@@ -162,10 +162,10 @@ if [ -d /proc ]; then
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "2026-07-16T00:00:00" "open" "agent_setting" "$tmp/wt/namespace" "namespacepid" \
     "capability=x,harness=codex,pid=437,pid_start=1,pid_scope=namespace-local,attempt_id=$attemptG3,route_id=$routeG3,route_node=$nodeG3" > "$jobsG3"
   outG3=$(AGENT_HOME="$agent_home" DISPATCH_RUNTIME_ROOT="$runtime_root" bash "$LIVENESS" "$jobsG3" 2>&1); rcG3=$?
-  if [ "$rcG3" -eq 0 ] && printf '%s' "$outG3" | grep -q 'ALIVE.*namespace-local exact heartbeat'; then
+  if [ "$rcG3" -eq 0 ] && printf '%s' "$outG3" | grep -q 'ALIVE.*namespace-local worker heartbeat'; then
     ok "namespace-local depth-2 pid uses exact fresh heartbeat instead of root /proc"
   else
-    bad "expected namespace-local exact heartbeat ALIVE; got rc=$rcG3 out=[$outG3]"
+    bad "expected namespace-local worker heartbeat ALIVE; got rc=$rcG3 out=[$outG3]"
   fi
 
   # --- Case H (본 수정의 회귀 핵심): pid 종료 + *신선* transcript → EXITED, exit 3.

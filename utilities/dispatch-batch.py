@@ -21,7 +21,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from hearting_gates import gates_on, same_work_or_refuse
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
     GOVERNOR_RESERVATION_ENV,
@@ -43,7 +42,11 @@ from dispatch_contract import (  # noqa: E402
     validate_attempt_metadata,
     validate_dispatch_log_dir,
 )
-from dispatch_lifecycle import select_launch_lifecycle  # noqa: E402
+from dispatch_lifecycle import (  # noqa: E402
+    FOREGROUND_NOTICE,
+    FOREGROUND_SCOPED,
+    select_launch_lifecycle,
+)
 from replica_batch_contract import (  # noqa: E402
     DIGEST,
     ReplicaBatchContractError,
@@ -1940,6 +1943,22 @@ def _record_failed_legs(route, results, agent_home):
     return paths[-1] if paths else None
 
 
+def adopt_self_parent(args: argparse.Namespace, self_slug: str) -> None:
+    """Use this session's own name as the parent.
+
+    A ``--parent`` that differs from ``AGENT_DISPATCH_SELF_SLUG`` is a typo or
+    a stale name; the session's own name is the one every leg is bound to, so
+    it is used with one plain notice instead of a refusal.
+    """
+    if args.parent != self_slug:
+        print(
+            f"notice: --parent {args.parent} is not this session's name; "
+            f"using {self_slug} (from AGENT_DISPATCH_SELF_SLUG).",
+            file=sys.stderr, flush=True,
+        )
+        args.parent = self_slug
+
+
 def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, object]) -> int:
     """SD-119 R4: dedicated admission surface for a node with no `parallel_group`
     membership (`SUBDIVISION_ADMISSION.has_route_leg_group` is false). Deliberately
@@ -1959,11 +1978,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
     parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
     if not self_slug or not parent_attempt:
         raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug or '-'}")
-    if args.parent != self_slug:
-        if gates_on():
-            raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
-        same_work_or_refuse("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
-        args.parent = self_slug
+    adopt_self_parent(args, self_slug)
     artifact_root = Path(
         os.environ.get("AGENT_ARTIFACT_ROOT", str(agent_home / ".agent_reports"))
     )
@@ -2185,6 +2200,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.parallel_group:
         parser.error("one of --parallel-group or --replica-group is required")
     args.replica_group = args.parallel_group
+    if args.action == "start" and select_launch_lifecycle() == FOREGROUND_SCOPED:
+        # First line of a foreground start: the legs run inside this call.
+        print(FOREGROUND_NOTICE, file=sys.stderr, flush=True)
 
     agent_home = None
     route: dict[str, object] = {}
@@ -2379,11 +2397,7 @@ def main(argv: list[str] | None = None) -> int:
         parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
         if not self_slug or not parent_attempt:
             raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug or '-'}")
-        if args.parent != self_slug:
-            if gates_on():
-                raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
-            same_work_or_refuse("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
-            args.parent = self_slug
+        adopt_self_parent(args, self_slug)
         repo = subprocess.check_output(
             ["git", "-C", str(route["cwd"]), "rev-parse", "--show-toplevel"],
             text=True,

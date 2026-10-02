@@ -45,6 +45,7 @@ from dispatch_contract import (
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    existing_attempt_launch_state,
     owner_frame_launch_gate,
     recover_preview_gate_after_refusal,
     dispatch_state_root,
@@ -93,6 +94,7 @@ from dispatch_lifecycle import (  # noqa: E402
     acquire_review_admission,
     begin_finite_watchdog,
     DETACHED,
+    EXISTING_ATTEMPT_NOTES,
     FOREGROUND_SCOPED,
     LIFECYCLES,
     deterministic_post_exit_outcome,
@@ -1231,6 +1233,20 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     )
 
 
+def _foreground_failure_evidence(outcome) -> dict[str, str]:
+    """Evidence sealed when a foreground worker's process ends in failure.
+
+    The same fields the Claude/Codex foreground close writes, so the row reads
+    the same whichever tool ran it.
+    """
+    return {
+        "detected_by": "foreground-process-exit",
+        "failure_class": "runtime",
+        "reconcile_reason": outcome.failure,
+        "process_exit": str(outcome.exit_code),
+    }
+
+
 def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str, attempt_id: str | None = None) -> bool:
     """SD-15: flip this dispatch's own open row to done with a dead-<reason> note.
 
@@ -2207,11 +2223,18 @@ def main(argv: list[str]) -> int:
                 print("status=start")
                 print(f"attempt_id={args.attempt_id}")
                 print("duplicate_attempt=1")
-                print("launch_state=existing-active")
+                # The claimed row says nothing about whether its process still
+                # runs; the shared core reads that from the process itself.
+                existing_state, existing_reason = existing_attempt_launch_state(
+                    jobs, args.attempt_id
+                )
+                print(f"launch_state={existing_state}")
                 print("registered=0")
                 print("started=0")
                 print("child_spawned=0")
-                print("reason=attempt-launch-already-claimed")
+                print(f"reason={existing_reason}")
+                if existing_state in EXISTING_ATTEMPT_NOTES:
+                    print(f"note={EXISTING_ATTEMPT_NOTES[existing_state]}")
                 return 0
             outcome = adapter_launch_failure_outcome(jobs, args.attempt_id, exc.reason)
             annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": outcome})
@@ -2433,9 +2456,19 @@ def main(argv: list[str]) -> int:
             args.worker_exit = outcome.exit_code
             args.worker_failure = outcome.failure
             if outcome.failure:
-                close_job_row(
-                    jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
+                # Same close as the Claude/Codex wrappers: dead-<failure> with
+                # the process exit as runtime evidence (dead-interrupted when
+                # this call was stopped).
+                closed = bool(args.attempt_id) and close_attempt_row(
+                    jobs, args.attempt_id, f"dead-{outcome.failure}",
+                    evidence=_foreground_failure_evidence(outcome),
                 )
+                if closed:
+                    materialize_after_terminal_close(jobs, args.attempt_id)
+                else:
+                    close_job_row(
+                        jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
+                    )
         else:
             # SD-15: detached launches retain the short early-death watch.
             death = watch_early_death(proc, log_path, args.early_exit_watch)

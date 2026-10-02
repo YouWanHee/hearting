@@ -47,6 +47,7 @@ from dispatch_contract import (
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    existing_attempt_launch_state,
     owner_frame_launch_gate,
     recover_preview_gate_after_refusal,
     ensure_terminal_claim_absent,
@@ -95,6 +96,7 @@ from dispatch_lifecycle import (  # noqa: E402
     acquire_review_admission,
     begin_finite_watchdog,
     DETACHED,
+    EXISTING_ATTEMPT_NOTES,
     FOREGROUND_SCOPED,
     LIFECYCLES,
     deterministic_post_exit_outcome,
@@ -898,6 +900,14 @@ def is_no_commit_stage(args: argparse.Namespace) -> bool:
     )
 
 
+def commit_grant_target(args: argparse.Namespace) -> bool:
+    """Who may commit: an owner, or a stage whose sealed node is commit-expected.
+
+    One rule for the linked-worktree grant and the primary-checkout profile.
+    """
+    return getattr(args, "worker_type", None) == "owner" or stage_commit_enabled(args)
+
+
 def linked_worktree_git_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     """Primary Git metadata dirs a commit-expected linked-worktree run needs.
 
@@ -912,8 +922,7 @@ def linked_worktree_git_writable_dirs(args: argparse.Namespace) -> tuple[Path, .
     narrow grant only when its sealed route node is commit-expected; slices and
     all other workers get no Git metadata grant.
     """
-    worker_type = getattr(args, "worker_type", None)
-    if worker_type != "owner" and not stage_commit_enabled(args):
+    if not commit_grant_target(args):
         return ()
     dirs = _worktree_git_dirs(getattr(args, "worktree", ""))
     if dirs is None:
@@ -1396,6 +1405,11 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
         if getattr(args, "max_continuations", None) is not None:
             command += ["--max-continuations", str(args.max_continuations)]
+        if commit_grant_target(args):
+            # The supervisor builds the native profile; it only needs to know
+            # whether this launch may commit (a primary checkout then gets the
+            # commit-only `.git` grant).
+            command += ["--primary-git-commit"]
         if registry_writable_launch(args):
             command += [
                 "--writable-root",
@@ -1481,6 +1495,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     profile = commit_profile_config(
         args.worktree, [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"],
         effective_runtime_sandbox(args), args.nested_headless_network,
+        primary_commit=commit_grant_target(args),
     )
     if profile is not None:
         cmd += config_arguments(profile)
@@ -3035,11 +3050,16 @@ def main(argv: list[str]) -> int:
                 print("status=start")
                 print(f"attempt_id={args.attempt_id}")
                 print("duplicate_attempt=1")
-                print("launch_state=existing-active")
+                existing_state, existing_reason = existing_attempt_launch_state(
+                    jobs, args.attempt_id
+                )
+                print(f"launch_state={existing_state}")
                 print("registered=0")
                 print("started=0")
                 print("child_spawned=0")
-                print("reason=attempt-launch-already-claimed")
+                print(f"reason={existing_reason}")
+                if existing_state in EXISTING_ATTEMPT_NOTES:
+                    print(f"note={EXISTING_ATTEMPT_NOTES[existing_state]}")
                 return 0
             reason = (
                 "parent-exited"

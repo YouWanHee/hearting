@@ -715,14 +715,37 @@ class FallbackTest(unittest.TestCase):
   command=F.wrapper_command(args,route,node,self.tuple("codex","supported"),1,"att-test")
   self.assertNotIn("--qa",command)
   self.assertEqual(command[command.index("--intensity")+1],route["effective_intensity"])
- def test_explicit_parent_mismatch_fails_before_registration(self):
+ def test_explicit_parent_mismatch_uses_the_session_name_with_one_notice(self):
+  # 5th Codex run: a mismatched --parent printed `gate-off parent-identity-mismatch`
+  # (gates off) or refused with exit 73 (gates on). Either way the session's own
+  # name is the parent: it is used, with one plain notice, before any identity
+  # is derived -- the attempt id is the one the session's own name produces.
+  notice=("notice: --parent wrong-owner is not this session's name; "
+          "using owner (from AGENT_DISPATCH_SELF_SLUG).")
+  path=self.route(same_status="supported"); route=json.loads(path.read_text())
+  node=next(n for n in route["nodes"] if n["id"]=="plan")
+  for gates in ("on","off"):
+   with self.subTest(gates=gates):
+    result=self.run_chain(path,"--parent","wrong-owner",HEARTING_GATES=gates)
+    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+    self.assertEqual(result.stderr.splitlines().count(notice),1,result.stderr)
+    self.assertNotIn("gate-off",result.stderr)
+    self.assertNotIn("parent-identity-mismatch",result.stdout+result.stderr)
+    verdict=self.cli_verdict(result.stdout)
+    expected=F.attempt_identity(
+     SimpleNamespace(slug="fallback-plan",parent="owner",parent_attempt_id="att-fallback-parent"),
+     route,node,{"child_harness":verdict["child_harness"]},int(verdict["fallback_ordinal"]))
+    self.assertEqual(verdict["attempt_id"],expected)
+ def test_parent_without_a_session_name_keeps_the_missing_identity_refusal(self):
   path=self.route(same_status="supported")
-  cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--parent","wrong-owner","--capability-mode","dev","--worker-mode","plan/plan-author","--jobs",str(self.jobs),"--register"]
-  env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"real-owner"}
+  self.seed_predecessor_markers(path,"plan"); self.seed_parent()
+  cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--capability-mode","dev","--worker-mode","plan/plan-author","--jobs",str(self.jobs),"--dry-run"]
+  env={k:v for k,v in os.environ.items() if k!="AGENT_DISPATCH_SELF_SLUG"}
+  env.update({"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_DISPATCH_JOBS":str(self.jobs)})
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,73,result.stdout+result.stderr)
-  self.assertIn("reason=parent-identity-mismatch",result.stdout)
-  self.assertFalse(self.jobs.exists())
+  self.assertIn("reason=parent-identity-missing",result.stdout)
+  self.assertNotIn("notice: --parent",result.stderr)
  def test_failed_same_and_cross_degrade_in_order(self):
   path=self.route(native="supported"); same="codex/headless/workspace-write/codex/conductor"; cross="codex/headless/workspace-write/claude/conductor"
   result=self.run_chain(path,"--failed-tuple",same,"--failed-tuple",cross); self.assertEqual(result.returncode,79,result.stdout+result.stderr); self.assertIn("skipped-child-proof-missing",result.stdout); self.assertIn("selected_hop=inline",result.stdout)
@@ -2088,6 +2111,322 @@ class FallbackTest(unittest.TestCase):
  # so they share its read-only currency/readiness gate. This class's test
  # above proves the OTHER half of the same regression: a fallback chain that
  # receives that exact reason from a wrapper never descends to inline.
+
+ # --- 5th Codex run fixes (items 3/1/7), on the `plan` stage of a standard route.
+ # The wrapper launch is replaced at its one seam: `subprocess.run` for a
+ # detached start, `run_forwarding_termination` for a foreground-scoped one.
+ PARENT=SimpleNamespace(slug="fallback-plan",parent="owner",parent_attempt_id="att-fallback-parent")
+ def standard_route(self):
+  path=self.route(same_status="supported",intensity="standard")
+  route=json.loads(path.read_text())
+  return path,route,next(n for n in route["nodes"] if n["id"]=="plan")
+ def compiled_order(self):
+  # The stage's compiled hop order, without the usage/capacity ranking.
+  return mock.patch.object(F,"ordered_fallback_hops",side_effect=lambda route,node,jobs,parent_identity=None:(
+   F.apply_worker_pin(route,list(node["fallback_hops"]),parent_identity),None))
+ def start(self,path,*extra,lifecycle=None,patches=()):
+  self.seed_predecessor_markers(path,"plan"); self.seed_parent()
+  argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan","--slug","fallback-plan",
+        "--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author",
+        "--model-role","deep maker","--jobs",str(self.jobs),"--start",*extra]
+  out=io.StringIO(); err=io.StringIO()
+  with contextlib.ExitStack() as stack:
+   stack.enter_context(mock.patch.object(sys,"argv",argv))
+   stack.enter_context(mock.patch.object(F,"select_launch_lifecycle",return_value=lifecycle or F.DETACHED))
+   stack.enter_context(mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})))
+   for patch in patches: stack.enter_context(patch)
+   stack.enter_context(contextlib.redirect_stdout(out)); stack.enter_context(contextlib.redirect_stderr(err))
+   code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+  return code,out.getvalue(),err.getvalue()
+ def wrapper_run(self,calls,receipt,code=0):
+  real_run=subprocess.run
+  def run(cmd,**kwargs):
+   if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
+    calls.append(cmd)
+    return SimpleNamespace(returncode=code,stdout=receipt(cmd) if callable(receipt) else receipt,stderr="")
+   return real_run(cmd,**kwargs)
+  return mock.patch.object(F.subprocess,"run",side_effect=run)
+ @staticmethod
+ def arg(cmd,flag):
+  return cmd[cmd.index(flag)+1] if flag in cmd else None
+ def forwarded(self,calls,**result):
+  ForwardedRun=sys.modules["dispatch_lifecycle"].ForwardedRun
+  def run(cmd,**kwargs):
+   calls.append((cmd,kwargs))
+   return ForwardedRun(**{"returncode":0,"stdout":"","stderr":"",**result})
+  return mock.patch.object(F,"run_forwarding_termination",side_effect=run)
+
+ # --- item 3: a stopped foreground call stops the chain -------------------
+ def test_a_stopped_foreground_start_reports_interrupted_and_tries_no_next_hop(self):
+  import signal
+  receipt=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
+           "worker_exit=-2\nworker_failure=interrupted\n")
+  cases=(
+   (dict(stdout=receipt,received_signal=signal.SIGINT),130,False),
+   (dict(stdout=receipt,received_signal=signal.SIGTERM,cleanup_incomplete=True,returncode=-9),143,True),
+   # the wrapper alone was stopped (this call saw no signal)
+   (dict(stdout=receipt),130,False),
+  )
+  for result,expected_code,incomplete in cases:
+   with self.subTest(result=result), self.dispatch_env():
+    path,_route,_node=self.standard_route()
+    calls=[]
+    code,out,err=self.start(path,lifecycle=F.FOREGROUND_SCOPED,
+                            patches=(self.compiled_order(),self.forwarded(calls,**result)))
+    self.assertEqual(code,expected_code,out+err)
+    self.assertEqual(len(calls),1,"a stopped call must not try the next hop")
+    cmd,kwargs=calls[0]
+    self.assertTrue(kwargs["capture"])
+    self.assertEqual(self.arg(cmd,"--launch-lifecycle"),"foreground-scoped")
+    own=self.cli_verdict(out)
+    self.assertEqual((own["check"],own["reason"],own["interrupted"]),("failed","interrupted","1"))
+    self.assertEqual(own.get("cleanup"),"incomplete" if incomplete else None)
+    self.assertIn("worker_failure=interrupted",out.splitlines())
+    self.assertNotIn("selected_hop",out)
+    self.assertEqual(err.splitlines()[0],F.FOREGROUND_NOTICE)
+ def test_a_foreground_start_prints_the_notice_first_and_the_parent_notice_second(self):
+  ok=("check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"
+      "worker_exit=0\nworker_failure=-\n")
+  with self.dispatch_env():
+   path,_route,_node=self.standard_route()
+   calls=[]
+   code,out,err=self.start(path,"--parent","wrong-owner",lifecycle=F.FOREGROUND_SCOPED,
+                           patches=(self.compiled_order(),self.forwarded(calls,stdout=ok)))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(err.splitlines()[:2],[
+   F.FOREGROUND_NOTICE,
+   "notice: --parent wrong-owner is not this session's name; using owner (from AGENT_DISPATCH_SELF_SLUG).",
+  ])
+  self.assertEqual(self.arg(calls[0][0],"--parent"),"owner")
+ def test_a_detached_start_keeps_the_plain_launch_and_no_notice(self):
+  with self.dispatch_env():
+   path,_route,_node=self.standard_route()
+   calls=[]
+   forwarded=mock.patch.object(F,"run_forwarding_termination",side_effect=AssertionError("detached"))
+   code,out,err=self.start(path,patches=(self.compiled_order(),forwarded,self.wrapper_run(
+    calls,"check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n")))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(len(calls),1)
+  self.assertNotIn(F.FOREGROUND_NOTICE,err)
+ def test_dry_run_never_prints_the_foreground_notice(self):
+  with self.dispatch_env():
+   path,_route,_node=self.standard_route()
+   self.seed_predecessor_markers(path,"plan"); self.seed_parent()
+   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan","--slug","fallback-plan",
+         "--parent","owner","--jobs",str(self.jobs),"--dry-run"]
+   err=io.StringIO()
+   with mock.patch.object(sys,"argv",argv), mock.patch.object(F,"select_launch_lifecycle",return_value=F.FOREGROUND_SCOPED), \
+        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+    F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+  self.assertNotIn(F.FOREGROUND_NOTICE,err.getvalue())
+
+ # --- item 1: a provably dead claimed row is settled before the start -------
+ def open_claimed_row(self,route,node,harness="codex"):
+  old=F.attempt_identity(self.PARENT,route,node,{"child_harness":harness},1)
+  self.seed_parent()
+  with self.jobs.open("a",encoding="utf-8") as fh:
+   fh.write(f"2026-10-02T00:00:00Z\topen\t{self.repo}\t{self.repo}\tfallback-plan\t"
+            "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+            f"route_id={route['route_id']},route_node=plan,parent_attempt_id=att-fallback-parent,"
+            f"pid_scope=namespace-local,launch_claimed=1,attempt_id={old}\n")
+  return old
+ def test_a_dead_claimed_row_is_closed_and_the_same_tuple_starts_a_new_attempt(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   old=self.open_claimed_row(route,node)
+   settled=[]
+   def reconcile(jobs,row):
+    settled.append(row.attempt_id)
+    text=jobs.read_text(encoding="utf-8").replace(
+     f"launch_claimed=1,attempt_id={old}",f"launch_claimed=1,attempt_id={old},note=dead-namespace-absent")
+    jobs.write_text(text.replace(f"\topen\t{self.repo}\t{self.repo}\tfallback-plan",
+                                 f"\tdone\t{self.repo}\t{self.repo}\tfallback-plan"),encoding="utf-8")
+    return {"attempt_id":row.attempt_id,"closed":True,"reason":"dead-namespace-absent"}
+   cleanup=[]; calls=[]
+   code,out,err=self.start(path,patches=(
+    self.compiled_order(),
+    mock.patch.object(F,"attempt_process_quiescence",return_value=SimpleNamespace(state="quiescent",reason="namespace-extinct")),
+    mock.patch("dispatch_completion_join.exact_attempt_row",side_effect=lambda jobs,attempt:SimpleNamespace(attempt_id=attempt)),
+    mock.patch("dispatch_completion_join.reconcile_exact_dead_attempt",side_effect=reconcile),
+    mock.patch("dispatch_completion_join.resolve_attempt_cleanup",side_effect=lambda jobs,attempt,apply=False:cleanup.append((attempt,apply))),
+    self.wrapper_run(calls,"check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"),
+   ))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(settled,[old]); self.assertEqual(cleanup,[(old,True)])
+  self.assertEqual(len(calls),1)
+  self.assertEqual(self.arg(calls[0],"--automatic-retry-of"),old)
+  self.assertEqual(self.arg(calls[0],"--attempt-id"),F.retry_attempt_identity(old))
+  self.assertNotEqual(F.retry_attempt_identity(old),old)
+  self.assertEqual(self.arg(calls[0],"--child-harness") or self.arg(calls[0],"--parent-harness"),"codex")
+ def test_a_live_claimed_row_is_left_alone_and_reused(self):
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   old=self.open_claimed_row(route,node)
+   calls=[]
+   code,out,err=self.start(path,patches=(
+    self.compiled_order(),
+    mock.patch.object(F,"attempt_process_quiescence",return_value=SimpleNamespace(state="live",reason="process-live")),
+    mock.patch("dispatch_completion_join.reconcile_exact_dead_attempt",side_effect=AssertionError("live row closed")),
+    self.wrapper_run(calls,"check=ok\nstatus=start\nduplicate_attempt=1\nlaunch_state=existing-active\n"
+                           "registered=0\nstarted=0\nchild_spawned=0\n"),
+   ))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(self.arg(calls[0],"--attempt-id"),old)
+  self.assertIsNone(self.arg(calls[0],"--automatic-retry-of"))
+  self.assertIn("open",self.jobs.read_text())
+ def test_an_unsettled_dead_row_starts_nothing_new(self):
+  # The exact reconcile could not close it (it turned live, or proof failed):
+  # the start goes on exactly as before and names the same claimed attempt.
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   old=self.open_claimed_row(route,node)
+   calls=[]
+   code,out,err=self.start(path,patches=(
+    self.compiled_order(),
+    mock.patch.object(F,"attempt_process_quiescence",return_value=SimpleNamespace(state="quiescent",reason="namespace-extinct")),
+    mock.patch("dispatch_completion_join.exact_attempt_row",side_effect=lambda jobs,attempt:SimpleNamespace(attempt_id=attempt)),
+    mock.patch("dispatch_completion_join.reconcile_exact_dead_attempt",return_value={"closed":False,"reason":"still-live"}),
+    mock.patch("dispatch_completion_join.resolve_attempt_cleanup",side_effect=AssertionError("not closed")),
+    self.wrapper_run(calls,"check=ok\nstatus=start\nduplicate_attempt=1\nlaunch_state=existing-dead\n"
+                           "registered=0\nstarted=0\nchild_spawned=0\n"),
+   ))
+  self.assertEqual(self.arg(calls[0],"--attempt-id"),old)
+  self.assertIsNone(self.arg(calls[0],"--automatic-retry-of"))
+ def test_a_closed_interrupted_attempt_is_retried_once_on_the_same_tuple(self):
+  # `dead-interrupted` is a runtime failure, not a spent launch tuple: the next
+  # start retries the same tuple as a new attempt bound to the stopped one.
+  with self.dispatch_env():
+   path,route,node=self.standard_route()
+   old=F.attempt_identity(self.PARENT,route,node,{"child_harness":"codex"},1)
+   self.seed_parent()
+   with self.jobs.open("a",encoding="utf-8") as fh:
+    fh.write(f"2026-10-02T00:00:00Z\tdone\t{self.repo}\t{self.repo}\tfallback-plan\t"
+             "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+             f"route_id={route['route_id']},route_node=plan,parent_attempt_id=att-fallback-parent,"
+             "parent_harness=codex,parent_transport=headless,parent_sandbox=workspace-write,"
+             "child_harness=codex,launch_authority=conductor,"
+             f"launch_claimed=1,attempt_id={old},note=dead-interrupted,failure_class=runtime,"
+             "reconcile_reason=interrupted\n")
+   self.assertEqual(F.registry_failures(self.jobs,route["route_id"],"plan"),{})
+   calls=[]
+   code,out,err=self.start(path,patches=(
+    self.compiled_order(),
+    self.wrapper_run(calls,"check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"),
+   ))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(self.arg(calls[0],"--attempt-id"),F.retry_attempt_identity(old))
+  self.assertEqual(self.arg(calls[0],"--automatic-retry-of"),old)
+  # A retry that was `--register`ed first keeps the same successor at `--start`.
+  successor=F.retry_attempt_identity(old)
+  with self.dispatch_env():
+   with self.jobs.open("a",encoding="utf-8") as fh:
+    fh.write(f"2026-10-02T00:00:01Z\topen\t{self.repo}\t{self.repo}\tfallback-plan\t"
+             "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+             f"route_id={route['route_id']},route_node=plan,parent_attempt_id=att-fallback-parent,"
+             f"automatic_retry_of={old},launch_claimed=0,attempt_id={successor}\n")
+   calls=[]
+   code,out,err=self.start(path,patches=(
+    self.compiled_order(),
+    self.wrapper_run(calls,"check=ok\nstatus=start\nregistered=1\nstarted=1\nchild_spawned=1\n"),
+   ))
+  self.assertEqual(code,0,out+err)
+  self.assertEqual(self.arg(calls[0],"--attempt-id"),successor)
+  self.assertEqual(self.arg(calls[0],"--automatic-retry-of"),old)
+
+ # --- item 7: a pinned step is never moved to another tool -----------------
+ def pin_node(self,parent="codex"):
+  row=lambda child:{"parent_harness":parent,"parent_transport":"headless","parent_sandbox":"workspace-write",
+                    "child_harness":child,"launch_authority":"conductor","status":"supported"}
+  return {"kind":"pipeline-stage","harness_affinity":"unspecified",
+   "harness_policy":{"primary":["claude","codex"],"relief":["opencode"],"last_resort":[],"promote_relief_below":0},
+   "fallback_hops":[
+    {"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[row(parent)]},
+    {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[row(h) for h in ("claude","codex","opencode") if h!=parent]},
+    {"ordinal":3,"fallback_hop":"native-subagent","candidates":[{"harness":parent,"status":"supported"}]},
+    {"ordinal":4,"fallback_hop":"inline","candidates":[]},
+   ]}
+ def pin_route(self,pin,allocation):
+  route={}
+  if allocation:
+   route["dispatch_allocation"]={"strategy":"balanced","window":30,"usage_gate_used_percent":90,
+                                 "harness_order":["claude","codex","opencode"]}
+  if pin:
+   route["selection_pins"]={"contract_version":1,"worker":{"harness":pin,"model":None,"effort":None}}
+  return route
+ def ordered(self,route,node,parent_identity=None):
+  with mock.patch.object(F,"_usage_states",return_value={"claude":"ok","codex":"ok","opencode":"ok"}), \
+       mock.patch.object(F.CAPACITY,"capacity_scores",return_value={"claude":50,"codex":50,"opencode":50}):
+   return F.ordered_fallback_hops(route,node,self.jobs,parent_identity=parent_identity)
+ @staticmethod
+ def launchable(hops):
+  return [row["child_harness"] for hop in hops if hop["fallback_hop"] in F.HEADLESS_HOPS
+          for row in hop["candidates"] if not row.get("_worker_pin_skip")]
+ @staticmethod
+ def skipped(hops):
+  return ([row["child_harness"] for hop in hops if hop["fallback_hop"] in F.HEADLESS_HOPS
+           for row in hop["candidates"] if row.get("_worker_pin_skip")],
+          [hop["fallback_hop"] for hop in hops if hop.get("_worker_pin_skip")])
+ def test_a_worker_pin_keeps_only_its_harness_on_both_ordering_paths(self):
+  for allocation in (False,True):
+   with self.subTest(allocation=allocation):
+    hops,context=self.ordered(self.pin_route("opencode",allocation),self.pin_node("codex"))
+    self.assertEqual(self.launchable(hops),["opencode"])
+    self.assertEqual(sorted(self.skipped(hops)[0]),["claude","codex"])
+    # the owner (codex) is not the pinned tool: its native/inline hops go too
+    self.assertEqual(self.skipped(hops)[1],["native-subagent","inline"])
+    self.assertEqual(context is None,not allocation)
+    # an owner on the pinned harness keeps its native-subagent and inline hops
+    hops,_context=self.ordered(self.pin_route("codex",allocation),self.pin_node("codex"),
+                               parent_identity={"parent_harness":"codex"})
+    self.assertEqual(self.launchable(hops),["codex"])
+    self.assertEqual(self.skipped(hops)[1],[])
+ def test_no_worker_pin_keeps_the_existing_order_on_both_paths(self):
+  for allocation in (False,True):
+   with self.subTest(allocation=allocation):
+    route=self.pin_route(None,allocation); node=self.pin_node("codex")
+    hops,_context=self.ordered(route,node)
+    self.assertEqual(self.skipped(hops),([],[]))
+    if not allocation:
+     self.assertEqual(hops,node["fallback_hops"])
+    self.assertEqual(sorted(self.launchable(hops)),["claude","codex","opencode"])
+    # a pin for another target is not a worker pin
+    route["selection_pins"]={"contract_version":1,"owner":{"harness":"claude","model":None,"effort":None}}
+    self.assertEqual(self.skipped(self.ordered(route,node)[0]),([],[]))
+ def test_a_failed_pinned_harness_stops_with_worker_pin_unavailable(self):
+  with self.dispatch_env():
+   path,route,_node=self.standard_route()
+   calls=[]
+   code,out,err=self.start(path,patches=(
+    mock.patch.object(F,"sealed_pin_harness",side_effect=lambda route,worker_type=None:"claude"),
+    mock.patch.object(F,"_usage_states",return_value={"claude":"ok","codex":"ok","opencode":"ok"}),
+    mock.patch.object(F.CAPACITY,"capacity_scores",return_value={"claude":50,"codex":50,"opencode":50}),
+    self.wrapper_run(calls,"check=failed\nreason=launch-error\nchild_spawned=0\n",code=73),
+   ))
+  self.assertEqual(code,79,out+err)
+  self.assertEqual([self.arg(cmd,"--fallback-ordinal") and cmd[1].split("/")[-3] for cmd in calls],["claude"])
+  own=self.cli_verdict(out)
+  self.assertEqual(own["reason"],"worker-pin-unavailable")
+  self.assertEqual(own["detail"],"the worker is pinned to claude; claude cannot take this step now "
+                                 "(launch-error), and a pinned step is not moved to another tool")
+  trace=own["attempt_trace"]
+  self.assertIn("/codex/conductor:skipped-worker-pin",trace)
+  self.assertIn(":native-subagent:skipped-worker-pin",trace)
+  self.assertIn(":inline:skipped-worker-pin",trace)
+  self.assertNotIn("selected_hop",out)
+ def test_a_pinned_owner_harness_still_reaches_its_inline_hop(self):
+  with self.dispatch_env():
+   path,route,_node=self.standard_route()
+   calls=[]
+   code,out,err=self.start(path,patches=(
+    mock.patch.object(F,"sealed_pin_harness",side_effect=lambda route,worker_type=None:"codex"),
+    mock.patch.object(F,"_usage_states",return_value={"claude":"ok","codex":"ok","opencode":"ok"}),
+    mock.patch.object(F.CAPACITY,"capacity_scores",return_value={"claude":50,"codex":50,"opencode":50}),
+    self.wrapper_run(calls,"check=failed\nreason=launch-error\nchild_spawned=0\n",code=73),
+   ))
+  self.assertEqual(code,79,out+err)
+  self.assertEqual([cmd[1].split("/")[-3] for cmd in calls],["codex"])
+  self.assertIn("selected_hop=inline",out)
+  self.assertIn("/claude/conductor:skipped-worker-pin",out)
 
 
 class LaunchTupleReportOnlyTest(unittest.TestCase):

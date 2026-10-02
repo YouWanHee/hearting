@@ -4414,11 +4414,14 @@ class ResidueDrainRefreshTest(unittest.TestCase):
 
 class CancellationReceiptWedgeTest(unittest.TestCase):
  def test_namespace_local_row_with_no_receipt_stays_incomplete(self):
-  # C-9 (regression, unchanged)
+  # C-9 (regression). An observer that cannot prove the recorded namespace
+  # gone (a sandbox, or any non-host procfs) still wedges on the receipt. A
+  # host-like observer that does prove it is NamespaceExtinctQuiescenceTest.
   metadata=direct_extinct_metadata()
-  self.assertEqual(
-   D.attempt_process_quiescence(metadata,terminal_receipt=True),
-   D.ProcessQuiescence("unverifiable","post-exit-receipt-incomplete"))
+  with mock.patch.object(D,"namespace_gone",return_value="unverifiable"):
+   self.assertEqual(
+    D.attempt_process_quiescence(metadata,terminal_receipt=True),
+    D.ProcessQuiescence("unverifiable","post-exit-receipt-incomplete"))
 
  def _sealed_cancellation_metadata(self):
   metadata=extinct_metadata()
@@ -4448,9 +4451,11 @@ class CancellationReceiptWedgeTest(unittest.TestCase):
   # C-11
   sealed,_=self._sealed_cancellation_metadata()
   partial={**sealed,"quiescence_pgid_proof":"garbage"}
-  self.assertEqual(
-   D.attempt_process_quiescence(partial,terminal_receipt=True).reason,
-   "post-exit-receipt-incomplete")
+  # As C-9: the wedge belongs to an observer that cannot see the namespace.
+  with mock.patch.object(D,"namespace_gone",return_value="unverifiable"):
+   self.assertEqual(
+    D.attempt_process_quiescence(partial,terminal_receipt=True).reason,
+    "post-exit-receipt-incomplete")
 
  def test_cancellation_receipt_is_not_a_post_exit_receipt(self):
   # C-12 (SD-79 negative)
@@ -6049,6 +6054,275 @@ class DiffAttributionTest(unittest.TestCase):
                 "nodes": [{"id": "plan", "depends_on": []}, {"id": "execute", "depends_on": ["plan"]}],
             }
             self.assertEqual(D.diff_attribution_lines(route, route["nodes"][0], jobs), [])
+
+
+
+def namespace_row_metadata(attempt="att-namespace-extinct"):
+ # The 5th Codex run's plan row: a receiptless namespace-local worker whose
+ # recorded (kernel-shaped) PID namespace is not this observer's.
+ return {"attempt_id":attempt,"route_id":"rt-namespace","route_hash":"sha256:"+"5"*64,
+         "route_node":"plan","pid":"464","pid_start":"537327887","pgid":"464",
+         "pid_scope":"namespace-local","pid_observer_ns":"pid:[4026534323]",
+         "pid_ns":"pid:[4026534323]","registered_worker":"1",
+         "launch_lifecycle":"foreground-scoped"}
+
+def namespace_row(attempt,status="open",**extra):
+ # attempt_row() already carries registered_worker=1 (CURRENT).
+ metadata={key:value for key,value in namespace_row_metadata(attempt).items()
+           if key!="registered_worker"}
+ return attempt_row({**metadata,**extra},status=status)
+
+
+class NamespaceGoneTest(unittest.TestCase):
+ """B1: both recorded namespaces must be extinct; present wins, then unverifiable."""
+
+ def walk(self,entries,*,host_like=True,self_ns="pid:[4026531836]"):
+  def readlink(path):
+   if path=="/proc/self/ns/pid":return self_ns
+   return entries[path.split("/")[2]]
+  stack=contextlib.ExitStack()
+  stack.enter_context(mock.patch.object(D.os,"readlink",side_effect=readlink))
+  stack.enter_context(mock.patch.object(D.os,"listdir",return_value=list(entries)))
+  stack.enter_context(mock.patch.object(D,"_current_observer_is_host_like",return_value=host_like))
+  return stack
+
+ def test_extinct_only_when_every_recorded_namespace_is_gone(self):
+  metadata=namespace_row_metadata()
+  with self.walk({"7":"pid:[4026531836]"}):
+   self.assertEqual(D.namespace_gone(metadata),"extinct")
+  split={**metadata,"pid_ns":"pid:[4026534999]"}
+  with self.walk({"7":"pid:[4026531836]"}):
+   self.assertEqual(D.namespace_gone(split),"extinct")
+  # One of the two still has a process: not a death.
+  with self.walk({"7":"pid:[4026534999]"}):
+   self.assertEqual(D.namespace_gone(split),"present")
+  with self.walk({"7":"pid:[4026534323]"}):
+   self.assertEqual(D.namespace_gone(split),"present")
+
+ def test_inode_reuse_reads_present(self):
+  # A recycled inode on an unrelated live namespace is a value match.
+  with self.walk({"9":"pid:[4026534323]"}):
+   self.assertEqual(D.namespace_gone(namespace_row_metadata()),"present")
+
+ def test_any_unverifiable_namespace_is_unverifiable_unless_one_is_present(self):
+  split={**namespace_row_metadata(),"pid_ns":"pid:[4026534999]"}
+  for states,expected in (
+   ({"pid:[4026534323]":"extinct","pid:[4026534999]":"unverifiable"},"unverifiable"),
+   ({"pid:[4026534323]":"unverifiable","pid:[4026534999]":"extinct"},"unverifiable"),
+   ({"pid:[4026534323]":"unverifiable","pid:[4026534999]":"present"},"present"),
+  ):
+   with self.subTest(states=states), mock.patch.object(
+     D,"_recorded_pid_namespace_state",side_effect=lambda value,states=states:states[value]):
+    self.assertEqual(D.namespace_gone(split),expected)
+
+ def test_sandboxed_observer_and_incomplete_walk_are_unverifiable(self):
+  with self.walk({"7":"pid:[4026531836]"},host_like=False):
+   self.assertEqual(D.namespace_gone(namespace_row_metadata()),"unverifiable")
+  import errno
+  def readlink(path):
+   if path=="/proc/self/ns/pid":return "pid:[4026531836]"
+   raise OSError(errno.EIO,"io")
+  with mock.patch.object(D.os,"readlink",side_effect=readlink), \
+       mock.patch.object(D.os,"listdir",return_value=["7"]), \
+       mock.patch.object(D,"_current_observer_is_host_like",return_value=True):
+   self.assertEqual(D.namespace_gone(namespace_row_metadata()),"unverifiable")
+
+ def test_rows_without_a_recorded_kernel_namespace_prove_nothing(self):
+  base=namespace_row_metadata()
+  for mutation in ({"pid_observer_ns":""},{"pid_scope":"host-visible"},
+                   {"registered_worker":"0"},{"pid_observer_ns":"pid:[source]"},
+                   {"pid_ns":"pid:[inner]"}):
+   with self.subTest(mutation=mutation), mock.patch.object(
+     D,"_recorded_pid_namespace_state",return_value="extinct") as walk:
+    self.assertEqual(D.namespace_gone({**base,**mutation}),"unverifiable")
+    walk.assert_not_called()
+
+
+class NamespaceExtinctQuiescenceTest(unittest.TestCase):
+ """B1: extinct namespaces + a complete host walk with no tag = quiescent."""
+
+ def verdict(self,metadata=None,*,gone="extinct",host=None,ordinary=None,terminal_receipt=False):
+  metadata=metadata or namespace_row_metadata()
+  host=host or D.ProcessGroupObservation("empty")
+  ordinary=ordinary or D.ProcessGroupObservation(
+   "unverifiable",(),"observer-namespace-mismatch")
+  def probe(_metadata,*,host_complete=False):
+   return host if host_complete else ordinary
+  with mock.patch.object(D,"namespace_gone",return_value=gone), \
+       mock.patch.object(D,"attempt_tagged_descendants",side_effect=probe):
+   return D.attempt_process_quiescence(metadata,terminal_receipt=terminal_receipt)
+
+ def test_extinct_namespaces_and_empty_host_walk_are_quiescent_past_the_receipt_gate(self):
+  for terminal_receipt in (False,True):
+   with self.subTest(terminal_receipt=terminal_receipt):
+    self.assertEqual(self.verdict(terminal_receipt=terminal_receipt),
+                     D.ProcessQuiescence("quiescent",D.NAMESPACE_EXTINCT_REASON))
+
+ def test_a_namespace_that_is_not_proven_gone_keeps_the_previous_verdict(self):
+  # One namespace still present, an observer that cannot see (sandbox), or
+  # a recycled inode (present) -- exactly the old answers.
+  for gone in ("present","unverifiable"):
+   with self.subTest(gone=gone):
+    self.assertEqual(self.verdict(gone=gone),
+                     D.ProcessQuiescence("unverifiable","process-namespace-unverifiable"))
+    self.assertEqual(self.verdict(gone=gone,terminal_receipt=True),
+                     D.ProcessQuiescence("unverifiable","post-exit-receipt-incomplete"))
+
+ def test_a_tagged_process_in_another_namespace_is_live(self):
+  live=D.ProcessGroupObservation("populated",((4242,"1","S"),))
+  self.assertEqual(self.verdict(host=live),
+                   D.ProcessQuiescence("live","attempt-descendant-live",4242))
+
+ def test_incomplete_walk_or_sandboxed_observer_is_never_absence(self):
+  for host in (D.ProcessGroupObservation("unverifiable",(),"procfs-environ:7:5"),
+               D.ProcessGroupObservation("unverifiable",(),"observer-namespace-mismatch")):
+   with self.subTest(reason=host.reason):
+    self.assertEqual(self.verdict(host=host),
+                     D.ProcessQuiescence("unverifiable","process-namespace-unverifiable"))
+    self.assertEqual(self.verdict(host=host,terminal_receipt=True),
+                     D.ProcessQuiescence("unverifiable","post-exit-receipt-incomplete"))
+
+ def test_only_the_receiptless_no_identity_branch_is_widened(self):
+  metadata=namespace_row_metadata()
+  for governed in (D.ProcessQuiescence("unverifiable","local-process-identity-inaccessible"),
+                   D.ProcessQuiescence("unverifiable","process-identity-missing")):
+   with self.subTest(reason=governed.reason), \
+        mock.patch.object(D,"_attempt_process_quiescence_impl",return_value=governed), \
+        mock.patch.object(D,"attempt_tagged_descendants",
+                          return_value=D.ProcessGroupObservation("empty")), \
+        mock.patch.object(D,"namespace_gone",return_value="extinct") as gone:
+    self.assertEqual(D.attempt_process_quiescence(metadata).state,"unverifiable")
+    gone.assert_not_called()
+  legacy={key:value for key,value in metadata.items() if key!="attempt_id"}
+  with mock.patch.object(D,"namespace_gone",return_value="extinct") as gone:
+   self.assertEqual(D.attempt_process_quiescence(legacy).reason,"process-namespace-unverifiable")
+   gone.assert_not_called()
+  # The governed-process-only surface is not widened at all.
+  with mock.patch.object(D,"namespace_gone",return_value="extinct"):
+   self.assertEqual(D.attempt_governed_process_quiescence(metadata),
+                    D.ProcessQuiescence("unverifiable","process-namespace-unverifiable"))
+
+ def test_host_complete_walk_needs_a_host_like_observer_and_still_sees_tags(self):
+  metadata=namespace_row_metadata(f"att-host-walk-{os.getpid()}")
+  for host_like,expected in ((True,"empty"),(False,"unverifiable")):
+   with self.subTest(host_like=host_like), \
+        mock.patch.object(D,"_current_observer_is_host_like",return_value=host_like):
+    self.assertEqual(D.attempt_tagged_descendants(metadata,host_complete=True).state,expected)
+    with D.process_table_scan_scope():
+     self.assertEqual(D.attempt_tagged_descendants(metadata,host_complete=True).state,expected)
+    # The ordinary authority is unchanged: this observer did not record the row.
+    self.assertEqual(D.attempt_tagged_descendants(metadata).reason,"observer-namespace-mismatch")
+  child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
+                         env={**os.environ,D.ATTEMPT_DESCENDANT_ENV:metadata["attempt_id"]})
+  try:
+   deadline=time.monotonic()+5
+   while time.monotonic()<deadline:
+    with mock.patch.object(D,"_current_observer_is_host_like",return_value=True):
+     found=D.attempt_tagged_descendants(metadata,host_complete=True)
+    if found.state=="populated":break
+    time.sleep(0.05)
+   self.assertEqual(found.state,"populated")
+   self.assertIn(child.pid,[member[0] for member in found.members])
+  finally:
+   child.kill();child.wait(timeout=5)
+
+ def test_open_row_needs_reconcile_and_closed_rows_follow_their_outcome(self):
+  metadata=namespace_row_metadata()
+  with mock.patch.object(D,"namespace_gone",return_value="extinct"), \
+       mock.patch.object(D,"attempt_tagged_descendants",
+                         side_effect=lambda _m,*,host_complete=False:D.ProcessGroupObservation(
+                          "empty" if host_complete else "unverifiable",(),
+                          "" if host_complete else "observer-namespace-mismatch")):
+   observed=D.observed_attempt_liveness("open",metadata,terminal_receipt_gate=True)
+   self.assertEqual((observed.state,observed.process_state,observed.process_reason),
+                    ("reconcile-needed","quiescent",D.NAMESPACE_EXTINCT_REASON))
+   self.assertEqual(D.decide_attempt("open",metadata,process_state=observed.process_state,
+                                     process_reason=observed.process_reason).action,"reconcile")
+   for note,action,retry in (("dead-namespace-absent","inspect-failure","fallback"),
+                             ("completed-marker","advance","")):
+    with self.subTest(note=note):
+     closed={**metadata,"note":note}
+     observed=D.observed_attempt_liveness("done",closed)
+     self.assertEqual((observed.state,observed.process_reason),
+                      ("terminal",D.NAMESPACE_EXTINCT_REASON))
+     decision=D.decide_attempt("done",closed,process_state=observed.process_state,
+                               process_reason=observed.process_reason)
+     self.assertEqual((decision.action,decision.retry_kind),(action,retry))
+
+ def test_cleanup_settles_and_keeps_sealing_the_existing_receipt_when_provable(self):
+  metadata={**namespace_row_metadata(),"note":"dead-namespace-absent"}
+  for provable in (False,True):
+   with self.subTest(provable=provable), tempfile.TemporaryDirectory() as td:
+    jobs=Path(td)/"jobs.log"
+    jobs.write_text(namespace_row(metadata["attempt_id"],"done",note="dead-namespace-absent")+"\n",
+                    encoding="utf-8")
+    proof=D.QuiescenceProof(
+     provable,"cancellation-quiescence-proven" if provable else "cancellation-quiescence-unproven",
+     metadata["attempt_id"],"namespace-extinct",464,"empty","empty",True,
+     D._cancellation_quiescence_binding_digest(metadata))
+    with mock.patch.object(D,"attempt_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent",D.NAMESPACE_EXTINCT_REASON)), \
+         mock.patch.object(D,"prove_attempt_quiescence",return_value=proof):
+     result=D.resolve_attempt_cleanup(jobs,metadata["attempt_id"],apply=True)
+    self.assertTrue(result["settled"],result)
+    saved=D.parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
+    self.assertEqual("cleanup_receipt_digest" in saved,provable)
+    self.assertEqual(result["reason"],
+                     "attempt-cleanup-proven" if provable else D.NAMESPACE_EXTINCT_REASON)
+
+
+class ExistingAttemptLaunchStateTest(unittest.TestCase):
+ def test_open_row_state_comes_from_the_shared_verdict(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text(namespace_row("att-existing")+"\n",encoding="utf-8")
+   for verdict,expected in (
+    (D.ProcessQuiescence("live","attempt-descendant-live",7),("existing-active","attempt-descendant-live")),
+    (D.ProcessQuiescence("quiescent",D.NAMESPACE_EXTINCT_REASON),("existing-dead","namespace-extinct")),
+    (D.ProcessQuiescence("unverifiable","process-namespace-unverifiable"),
+     ("existing-unverified","process-namespace-unverifiable")),
+   ):
+    with self.subTest(state=verdict.state), \
+         mock.patch.object(D,"attempt_process_quiescence",return_value=verdict):
+     self.assertEqual(D.existing_attempt_launch_state(jobs,"att-existing"),expected)
+     self.assertEqual(D.attempt_launch_state(jobs,"att-existing",claimed=False,action="start"),
+                      expected[0])
+   with mock.patch.object(D,"attempt_process_quiescence",side_effect=OSError("boom")):
+    self.assertEqual(D.existing_attempt_launch_state(jobs,"att-existing"),
+                     ("existing-unverified","process-observation-failed"))
+   self.assertEqual(D.attempt_launch_state(jobs,"att-existing",claimed=True,action="start"),"claimed")
+   self.assertEqual(D.attempt_launch_state(jobs,"att-existing",claimed=False,action="dry-run"),
+                    "preview-only")
+
+ def test_closed_missing_and_unreadable_rows(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text(namespace_row("att-closed","done")+"\n",encoding="utf-8")
+   with mock.patch.object(D,"attempt_process_quiescence") as probe:
+    self.assertEqual(D.existing_attempt_launch_state(jobs,"att-closed"),
+                     ("existing-completed","attempt-closed"))
+    self.assertEqual(D.existing_attempt_launch_state(jobs,"att-missing"),
+                     ("existing-unknown","attempt-row-missing"))
+    probe.assert_not_called()
+   self.assertEqual(D.existing_attempt_launch_state(Path(td)/"absent.log","att-closed"),
+                    ("existing-unknown","registry-unreadable"))
+
+
+class ForegroundInterruptedOutcomeTest(unittest.TestCase):
+ def test_interrupted_round_trips_through_storage(self):
+  self.assertIn("interrupted",D.FOREGROUND_FAILURES)
+  values=D._foreground_outcome_values(exit_code=-15,failure="interrupted",group_empty=True)
+  self.assertEqual(values["foreground_process_failure"],"interrupted")
+  pipe=",".join(f"{key}={value}" for key,value in
+                {**values,"foreground_outcome_source":D.FOREGROUND_OUTCOME_SOURCE}.items())
+  self.assertEqual(D._foreground_outcome_values_from_pipe(pipe)["foreground_process_failure"],
+                   "interrupted")
+
+ def test_unknown_words_and_the_none_exit_relation_still_fail(self):
+  for failure,exit_code in (("interrupted-1",-15),("interrupt",-15),("interrupted",0)):
+   with self.subTest(failure=failure,exit_code=exit_code), \
+        self.assertRaises(D.DispatchContractError):
+    D._foreground_outcome_values(exit_code=exit_code,failure=failure,group_empty=True)
 
 
 if __name__=="__main__": unittest.main()

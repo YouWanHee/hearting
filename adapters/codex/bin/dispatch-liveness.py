@@ -449,7 +449,7 @@ def main(argv: list[str]) -> int:
                 continue
             if exact and exact["state"] == "working":
                 detail = (
-                    "namespace-local exact heartbeat"
+                    "namespace-local worker heartbeat"
                     if exact.get("source") == "heartbeat"
                     else f"recorded pid {exact['pid']} running"
                 )

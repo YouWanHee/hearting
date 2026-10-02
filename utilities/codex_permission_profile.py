@@ -1,6 +1,8 @@
-"""Project existing linked-worktree Git grants into native Codex permissions.
+"""Project existing Git commit grants into native Codex permissions.
 
-No user config is written. Runtimes without named profiles keep their existing
+Linked worktrees project their existing narrow grant; a primary checkout gets
+a commit-only `.git` grant for the same callers (`primary_commit`). No user
+config is written. Runtimes without named profiles keep their existing
 legacy sandbox projection; discovery never becomes a new launch gate.
 """
 from functools import lru_cache
@@ -21,8 +23,18 @@ def named_profiles_available() -> bool:
         return False
 
 
+# Entries inside a primary `.git` that stay read-only so a commit-capable
+# worker cannot plant config or hooks a later unsandboxed session would run.
+# `config`/`hooks` are always protected; the optional ones only when present,
+# because Codex materializes an empty placeholder for a missing protected path
+# and a placeholder `config.worktree` or `info` breaks git.
+_PRIMARY_GIT_PROTECTED = ("config", "hooks")
+_PRIMARY_GIT_PROTECTED_IF_PRESENT = ("config.worktree", "info")
+
+
 def commit_profile_config(worktree: str, writable_roots: list[str],
-                          sandbox: str, network: bool) -> dict | None:
+                          sandbox: str, network: bool, *,
+                          primary_commit: bool = False) -> dict | None:
     if sandbox != "workspace-write":
         return None
     try:
@@ -35,19 +47,34 @@ def commit_profile_config(worktree: str, writable_roots: list[str],
         git_dir, common = result.stdout.strip().splitlines()
         git_dir = Path(git_dir).resolve()
         common = (wt / common).resolve()
-        if git_dir == common:
-            return None
         roots = {str(Path(root).resolve()) for root in writable_roots}
+        if git_dir == common:
+            # Primary checkout: only a commit-grant caller on a runtime with
+            # named profiles gets a grant, and never as a plain writable root
+            # (`--add-dir .git` would also open config and hooks).
+            if not primary_commit or not named_profiles_available():
+                return None
+            return _profile({
+                **{root: "write" for root in sorted(roots)},
+                str(git_dir): "write",
+                **{str(git_dir / name): "read" for name in _PRIMARY_GIT_PROTECTED},
+                **{str(git_dir / name): "read" for name in _PRIMARY_GIT_PROTECTED_IF_PRESENT
+                   if (git_dir / name).exists()},
+            }, network)
         required = {str(git_dir), *(str(common / name) for name in ("objects", "refs", "logs"))}
         if not required.issubset(roots) or not named_profiles_available():
             return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+    return _profile({str(common): "read", **{root: "write" for root in sorted(roots)}}, network)
+
+
+def _profile(filesystem: dict, network: bool) -> dict:
     return {
         "default_permissions": PROFILE_NAME,
         "permissions": {PROFILE_NAME: {
             "extends": ":workspace",
-            "filesystem": {str(common): "read", **{root: "write" for root in sorted(roots)}},
+            "filesystem": filesystem,
             "network": {"enabled": bool(network)},
         }},
     }

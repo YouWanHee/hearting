@@ -16,6 +16,12 @@ from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
                                parse_registry_metadata)
 from model_profile import pinned_launch_harness, sealed_pin_harness
+from dispatch_lifecycle import (
+    FOREGROUND_NOTICE,
+    FOREGROUND_SCOPED,
+    run_forwarding_termination,
+    select_launch_lifecycle,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -743,6 +749,28 @@ def _error(reason, configured=(), explicit=None, states=None):
     return 65
 
 
+
+def run_owner_wrapper(argv: list[str], env: dict[str, str]) -> int:
+    """Run the selected adapter wrapper for this owner launch.
+
+    A foreground-scoped ``--start`` hosts the owner inside this call (a
+    sandboxed depth-0 caller). A stop request is handed to the wrapper and this
+    call waits for it to stop the owner and close its row, instead of
+    ``subprocess.run`` killing it 0.25s later mid-cleanup.
+    """
+    if "--start" not in argv or select_launch_lifecycle() != FOREGROUND_SCOPED:
+        return subprocess.run(argv, env=env).returncode
+    print(FOREGROUND_NOTICE, file=sys.stderr, flush=True)
+    run = run_forwarding_termination(argv, env=env, capture=False, timeout=None)
+    if run.received_signal is None:
+        return run.returncode
+    sys.stdout.flush()
+    print("interrupted=1")
+    if run.cleanup_incomplete:
+        print("cleanup=incomplete")
+    sys.stdout.flush()
+    return 128 + int(run.received_signal)
+
 def main(argv):
     try:
         explicit, values, forwarded, route_evidence, derived = _parse(argv)
@@ -1049,8 +1077,7 @@ def main(argv):
                     raise OwnerError(f"{exc.code}:{exc.detail}") from exc
         if overridden:
             forwarded += ["--explicit-adapter", overridden]
-        child = subprocess.run([str(wrapper), *forwarded], env=child_env)
-        return child.returncode
+        return run_owner_wrapper([str(wrapper), *forwarded], child_env)
     except (OwnerError, OwnerRouteBindingError, OSError) as exc:
         return _error(str(exc))
 

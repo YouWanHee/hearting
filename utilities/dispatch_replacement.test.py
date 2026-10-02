@@ -1634,4 +1634,53 @@ class FrameCapacityFlow:
         case.assertNotIn(record['replacement_attempt_id'], fx.rows())
 
 
+
+class NamespaceExtinctDeathProofTest(unittest.TestCase):
+    """5th Codex run: a closed row whose recorded namespaces left the host."""
+
+    def row(self, note):
+        meta = {'attempt_schema_version': '2', 'dispatch_depth': '2', 'transport': 'headless',
+                'execution_surface': 'registered-headless', 'registered_worker': '1',
+                'fallback_hop': 'same-harness-headless', 'worker_type': 'stage',
+                'attempt_id': 'att-namespace-dead', 'route_id': 'rt-test', 'route_node': 'plan',
+                'pid': '464', 'pid_start': '537327887', 'pgid': '464',
+                'pid_scope': 'namespace-local', 'pid_observer_ns': 'pid:[4026534323]',
+                'pid_ns': 'pid:[4026534323]', 'launch_lifecycle': 'foreground-scoped',
+                'note': note, 'failure_class': 'runtime'}
+        return ['now', 'done', '/repo', '/repo', 'plan'], meta
+
+    def namespace(self, gone):
+        def probe(_metadata, *, host_complete=False):
+            if host_complete:
+                return D.ProcessGroupObservation('empty')
+            return D.ProcessGroupObservation('unverifiable', (), 'observer-namespace-mismatch')
+        stack = __import__('contextlib').ExitStack()
+        stack.enter_context(mock.patch.object(D, 'namespace_gone', return_value=gone))
+        stack.enter_context(mock.patch.object(D, 'attempt_tagged_descendants', side_effect=probe))
+        return stack
+
+    def test_dead_namespace_absent_is_a_silent_death_with_an_exact_proof(self):
+        fields, meta = self.row('dead-namespace-absent')
+        self.assertEqual(R.death_kind(fields, meta), 'silent')
+        with self.namespace('extinct'):
+            proof = R.death_proof(fields, meta)
+        self.assertEqual((proof['state'], proof['reason'], proof['death_kind']),
+                         ('quiescent', D.NAMESPACE_EXTINCT_REASON, 'silent'))
+
+    def test_without_proven_extinction_the_receipt_gate_still_holds(self):
+        fields, meta = self.row('dead-namespace-absent')
+        for gone in ('present', 'unverifiable'):
+            with self.subTest(gone=gone), self.namespace(gone), \
+                    self.assertRaises(D.DispatchContractError):
+                R.death_proof(fields, meta)
+
+    def test_an_interrupted_foreground_worker_is_not_replaced_by_the_runtime(self):
+        # The caller stopped it; its next explicit start retries (B2).
+        fields, meta = self.row('dead-interrupted')
+        self.assertIsNone(R.death_kind(fields, meta))
+        with self.namespace('extinct'), self.assertRaises(D.DispatchContractError) as refused:
+            R.death_proof(fields, meta)
+        self.assertEqual(refused.exception.reason, 'replacement-not-silent-death')
+
+
 if __name__=='__main__':unittest.main()

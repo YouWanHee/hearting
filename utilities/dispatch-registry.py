@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -35,12 +37,14 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                close_attempt_row,
                                close_attempt_row_if,
                                exact_process_group_signal_authority,
-                               observer_namespace_extinct,
+                               NAMESPACE_EXTINCT_REASON,
+                               namespace_gone,
                                parse_registry_metadata,
                                process_group_observation,
                                process_observation,
                                process_state,
                                process_start_ticks,
+                               process_table_scan_scope,
                                prove_attempt_quiescence,
                                observed_attempt_liveness,
                                post_exit_receipt_reason,
@@ -231,11 +235,22 @@ def proc_inputs(row, home=None, jobs=None, rows=None, args=None):
             "pid_host": int(meta["pid_host"]) if meta.get("pid_host", "").isdigit() else None,
             "pid_host_start": meta.get("pid_host_start", ""),
             "pid_scope": meta.get("pid_scope"),
-            "attempt_descendants": attempt_tagged_descendants(meta).state,
             "attempt_id": meta.get("attempt_id"), "route_id": meta.get("route_id"),
             "route_node": meta.get("route_node"),
             "heartbeat": attempt_heartbeat(home, meta, jobs),
             "terminal_observation": attempt_terminal_observation(home, meta, jobs)}
+    # One /proc walk answers both questions below.
+    with process_table_scan_scope():
+        inputs["attempt_descendants"] = attempt_tagged_descendants(meta).state
+        # A namespace-local row with no authoritative PID: the same shared
+        # verdict every join, gate and Fleet surface reads -- both recorded
+        # namespaces gone and no tagged process anywhere on the host.
+        inputs["namespace_extinct"] = bool(
+            identity is None
+            and meta.get("pid_scope") == "namespace-local"
+            and inputs["attempt_descendants"] != "populated"
+            and attempt_process_quiescence(meta).reason == NAMESPACE_EXTINCT_REASON
+        )
     proof = parent_extinction_proof(row, rows, args)
     if proof.state == "proven":
         inputs["parent_extinction"] = {
@@ -1490,7 +1505,7 @@ def _receiptless_namespace_cancel_reason(row, args):
         return "observer-namespace-unavailable"
     if meta.get("pid_observer_ns") in {None, "", observer_namespace}:
         return "namespace-not-foreign"
-    namespace_state = observer_namespace_extinct(meta)
+    namespace_state = namespace_gone(meta)
     if namespace_state == "present":
         return "namespace-not-extinct"
     if namespace_state != "extinct":
@@ -1901,6 +1916,33 @@ def automatic_cancel_receiptless(rows, args):
     return 0
 
 
+def _close_exact_dead(rows, args):
+    """Run the join's own ``reconcile --only-exact-dead --apply`` for one attempt.
+
+    Same classification, lock-held revalidation and close as the runtime join,
+    so a row whose death is exact (for example ``dead-namespace-absent``) closes
+    the same way here. Returns whether the row closed; any failure is "not
+    closed" and leaves the receiptless path to run as before.
+    """
+
+    exact_args = argparse.Namespace(**{
+        **vars(args), "only_exact_dead": True, "apply": True, "audit": None,
+        "integration_ref": getattr(args, "integration_ref", None),
+    })
+    stream = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stream):
+            reconcile(rows, exact_args)
+        record = json.loads(stream.getvalue())
+    except (DispatchContractError, JoinContractError, OSError, ValueError):
+        return False
+    closed = bool(isinstance(record, dict) and record.get("closed"))
+    if closed:
+        # As the join does after its exact close: settle the post-exit proof now.
+        resolve_attempt_cleanup(args.jobs, args.attempt, apply=True)
+    return closed
+
+
 def recover_receiptless(rows, args):
     """Seal and claim one recovery retry; registration and spawn stay external."""
 
@@ -1962,6 +2004,22 @@ def recover_receiptless(rows, args):
         )
     )
     cancellation = None
+    if (not already_cancelled and args.apply and row["status"] in OPEN
+            and row.get("attempt_contract_status") == "current"
+            and _close_exact_dead(rows, args)):
+        # An exact death closes first, exactly as the runtime join closes it.
+        # Its retry is the runtime's own replacement (SD-157, death_kind=silent);
+        # the receipt-unavailable claim below needs a cancellation receipt this
+        # row never gets, and claiming would spend the one replacement on a
+        # retry nothing launches.
+        print(json.dumps({
+            "apply": True,
+            "attempted": 1,
+            "claimed": 0,
+            "spawned": 0,
+            "reason": "exact-death-closed",
+        }, sort_keys=True))
+        return 0
     if not already_cancelled:
         cancellation = _automatic_receiptless_result(rows, args)
         if not cancellation["closed"]:

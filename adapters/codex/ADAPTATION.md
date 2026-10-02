@@ -702,4 +702,19 @@ enforce fail before registration/model spawn.
 Owner-to-worker propagation and continuation hash binding remain a separate
 unimplemented slice.
 
+## Git commit grant
+
+A commit-capable Codex run (an owner, or a single-session stage whose sealed node
+is commit-expected) keeps the commit working under `workspace-write`, which
+otherwise reads `.git` only. A linked worktree gets exact per-worktree and
+common-dir `objects`/`refs`/`logs` roots. A primary checkout gets a named
+permission profile (`utilities/codex_permission_profile.py`, applied by the
+one-shot builder and, through `--primary-git-commit`, the App Server supervisor)
+that makes `.git` writable while `.git/config`, `.git/hooks`, and, when present,
+`.git/config.worktree` and `.git/info` stay read-only. A Codex without named
+profiles gets no primary `.git` grant at all (`--add-dir .git` would open config
+and hooks). Claude and OpenCode run with `runtime_sandbox=adapter-default`, no OS
+filesystem sandbox, so they commit on a primary checkout unless launched inside a
+Codex owner sandbox, whose grant they inherit.
+
 Session and prompt bridges retain `hookSpecificOutput.additionalContext` for optional memory and lifecycle context.

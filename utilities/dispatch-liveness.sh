@@ -214,7 +214,7 @@ while IFS=$'\t' read -r ts status repo wt slug pipe || [ -n "${ts:-}" ]; do
     classifier=$(printf '%s\n' "$exact" | sed -n 's/^classifier_source=//p' | head -1)
     if [ "$exact_state" = "working" ]; then
       if [ "$pid_scope" = "namespace-local" ]; then
-        echo "ALIVE      ${slug:-?}  (namespace-local exact heartbeat; harness=$harness; classifier=$classifier)"
+        echo "ALIVE      ${slug:-?}  (namespace-local worker heartbeat; harness=$harness; classifier=$classifier)"
       else
         echo "ALIVE      ${slug:-?}  (pid $pid running; harness=$harness; classifier=$classifier)"
       fi

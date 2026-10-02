@@ -46,6 +46,7 @@ from dispatch_contract import (
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    existing_attempt_launch_state,
     owner_frame_launch_gate,
     recover_preview_gate_after_refusal,
     ensure_terminal_claim_absent,
@@ -95,6 +96,7 @@ from dispatch_lifecycle import (  # noqa: E402
     acquire_review_admission,
     begin_finite_watchdog,
     DETACHED,
+    EXISTING_ATTEMPT_NOTES,
     FOREGROUND_SCOPED,
     LIFECYCLES,
     deterministic_post_exit_outcome,
@@ -2713,11 +2715,18 @@ def main(argv: list[str]) -> int:
                 print("status=start")
                 print(f"attempt_id={args.attempt_id}")
                 print("duplicate_attempt=1")
-                print("launch_state=existing-active")
+                # The claimed row says nothing about whether its process still
+                # runs; the shared core reads that from the process itself.
+                existing_state, existing_reason = existing_attempt_launch_state(
+                    jobs, args.attempt_id
+                )
+                print(f"launch_state={existing_state}")
                 print("registered=0")
                 print("started=0")
                 print("child_spawned=0")
-                print("reason=attempt-launch-already-claimed")
+                print(f"reason={existing_reason}")
+                if existing_state in EXISTING_ATTEMPT_NOTES:
+                    print(f"note={EXISTING_ATTEMPT_NOTES[existing_state]}")
                 return 0
             reason = (
                 "parent-exited"

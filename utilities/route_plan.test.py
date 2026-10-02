@@ -59,6 +59,60 @@ class ExtractionTest(unittest.TestCase):
         self.assertEqual(proposal["legs"][1]["graph"], ["plan", "execute", "test", "report"])
         self.assertEqual(proposal["entry_approvals"], [{"key": "full-run", "leg": 1, "question": "run-ok"}])
 
+    def approvals_of(self, *questions, key="full-run"):
+        rows = "".join(f"    - {{key: {key}, leg: 0, question: {q}}}\n" for q in questions)
+        text = ("route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
+                "  entry_approvals:\n" + rows)
+        return fenced(text)
+
+    def test_a_question_id_that_is_not_a_slug_is_normalized_not_refused(self):
+        cases = {
+            "문서시작": "full-run-leg0",                       # nothing ASCII left: <key>-leg<leg>
+            "Docs Start": "docs-start",                      # lower-cased, runs of other characters -> -
+            "  Docs__Start!! ": "docs-start",
+            "2nd-run": "q-2nd-run",                          # a leading digit gets a q- prefix
+            "run-ok": "run-ok",                              # a slug is kept
+            "a" * 40: "a" * 32,                              # 32 characters at most
+            "a" * 31 + "-" + "b" * 5: "a" * 31,              # the cut never leaves a trailing -
+        }
+        for original, expected in cases.items():
+            with self.subTest(original):
+                proposal = self.parse(self.approvals_of(f"'{original}'"))
+                self.assertEqual(proposal["entry_approvals"], [{"key": "full-run", "leg": 0, "question": expected}])
+                self.assertTrue(RP._SLUG.fullmatch(expected), expected)
+
+    def test_normalized_ids_that_collide_get_a_numeric_suffix_inside_32_characters(self):
+        long_a, long_b = "x" * 40, "x" * 36 + "-zzzz"      # both cut to the same 32 characters
+        proposal = self.parse(self.approvals_of(f"'{long_a}'", f"'{long_b}'", "'xx'", "'xx'"))
+        ids = [row["question"] for row in proposal["entry_approvals"]]
+        self.assertEqual(ids, ["x" * 32, "x" * 30 + "-2", "xx", "xx"])   # a slug the brief repeats is left as written
+        self.assertTrue(all(RP._SLUG.fullmatch(i) for i in ids), ids)
+        korean = self.parse(self.approvals_of("'문서'", "'시작'", "'full-run-leg0'"))
+        self.assertEqual([r["question"] for r in korean["entry_approvals"]],
+                         ["full-run-leg0-2", "full-run-leg0-3", "full-run-leg0"])
+
+    def test_the_original_question_id_stays_in_the_source_and_is_listed_for_display(self):
+        text = self.approvals_of("'문서시작'", "run-ok", "'Docs Start'")
+        proposal, source = RP.parse_proposal_with_source(text)
+        self.assertIn("문서시작", source)
+        self.assertEqual(proposal["entry_approvals"][0], {"key": "full-run", "leg": 0, "question": "full-run-leg0"})
+        self.assertEqual(RP.question_renames(source), [
+            {"key": "full-run", "leg": 0, "question": "full-run-leg0", "original": "문서시작"},
+            {"key": "full-run", "leg": 0, "question": "docs-start", "original": "Docs Start"}])
+        self.assertEqual(RP.question_renames(self.approvals_of("run-ok").split("```")[1].replace("yaml\n", "", 1)), [])
+        self.assertEqual(RP.question_renames("not: [yaml"), [])
+
+    def test_a_non_string_question_or_a_bad_row_is_still_refused(self):
+        for bad in ("123", "[a]", "{a: b}", "null", "true"):
+            with self.subTest(bad):
+                self.assertEqual(self.reason(self.approvals_of(bad)), "schema-invalid:entry_approvals")
+        for row in ("{key: full-run, leg: 5, question: a}", "{key: full-run, leg: true, question: a}",
+                    "{key: full-run, leg: 0}", "{key: full-run, leg: 0, question: a, extra: 1}"):
+            with self.subTest(row):
+                text = ("route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
+                        f"  entry_approvals:\n    - {row}\n")
+                self.assertEqual(self.reason(fenced(text)), "schema-invalid:entry_approvals")
+
     def test_every_none_reason(self):
         ok = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
         cases = {
