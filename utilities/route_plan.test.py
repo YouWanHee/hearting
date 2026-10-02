@@ -578,7 +578,12 @@ class SecondLegCommandTest(PlanFixture):
         self.assertEqual(second["route_plan"], {**route["route_plan"], "index": 1})
         self.assertEqual((second["parent_cycle_id"], second["campaign_key"]), (parent, "framed-key"))
         self.assertEqual(second["selection"]["shape"], "direct")
-        self.assertEqual(second["work_request"]["text"], route["work_request"]["text"])
+        # Carry the frozen task, while the entry scope applies only to leg 0.
+        task = Path(self.record()["decision"]["first_leg_compose"]["context"]["prompt_file"])
+        self.assertEqual(second["work_request"]["text"], task.read_text(encoding="utf-8"))
+        self.assertEqual(route["entry_execution_scope"], "complete")
+        self.assertNotIn("entry_execution_scope", second)
+        self.assertNotIn("entry_scope_contract_version", second)
         self.assertNotIn("next_leg", json.dumps(receipt))
 
 
