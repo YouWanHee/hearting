@@ -7,7 +7,11 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
+
+from hearting_gates import gates_on
+from owner_write_advisory import worktree_mutating_scope
 
 SCHEMA_VERSION = 1
 MODES = {"serial", "parallel"}
@@ -18,6 +22,34 @@ _ATTEMPT = re.compile(r"^att-[A-Za-z0-9._-]{8,240}$")
 
 class StageSessionError(ValueError):
     """Raised when a stage-session manifest is unsafe or incomplete."""
+
+
+def _git_path(path: Path, flag: str) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", flag],
+            text=True, capture_output=True, check=True, timeout=10,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    if not value:
+        return None
+    found = Path(value)
+    return (found if found.is_absolute() else Path(path) / found).resolve()
+
+
+def same_repository_worktree(candidate: Path | str, sealed_cwd: Path | str) -> bool:
+    """True when `candidate` is a worktree root of the repository `sealed_cwd` belongs to."""
+    try:
+        candidate = Path(candidate).resolve()
+        sealed_cwd = Path(sealed_cwd).resolve()
+    except (OSError, ValueError):
+        return False
+    if _git_path(candidate, "--show-toplevel") != candidate:
+        return False
+    common = _git_path(candidate, "--git-common-dir")
+    return common is not None and common == _git_path(sealed_cwd, "--git-common-dir")
 
 
 def validate_subdivision_or_fallback(
@@ -224,7 +256,13 @@ def load_manifest(
         # sealed cwd; every identity field can match while the tree is foreign
         # (routing-flex canary review round 2, M1).
         sealed_cwd = route.get("cwd")
-        if isinstance(sealed_cwd, str) and sealed_cwd and worktree != Path(sealed_cwd).resolve():
+        # A linked worktree of the same repository is accepted while the
+        # same-work gates are off; with the gates on it stays refused.
+        if (
+            isinstance(sealed_cwd, str) and sealed_cwd
+            and worktree != Path(sealed_cwd).resolve()
+            and (gates_on() or not same_repository_worktree(worktree, sealed_cwd))
+        ):
             raise StageSessionError(f"manifest-worktree-mismatch:{worktree}:{Path(sealed_cwd).resolve()}")
     if node is not None:
         if raw.get("route_node") != node.get("id"):
@@ -259,7 +297,16 @@ def load_manifest(
                 session_id=item.get("subsession_id") or f"index-{sessions.index(item) + 1}",
             )
             union |= set(fixed)
-        if route is not None and node is not None:
+        # A worktree-mutating scope (`source/**`) means the whole worktree, the
+        # same reading the route and guards use; `_fixed_files` already keeps
+        # every file inside the worktree.
+        if (
+            route is not None and node is not None
+            and not any(
+                isinstance(scope, str) and scope and worktree_mutating_scope(scope)
+                for scope in (node.get("write_scope") or [])
+            )
+        ):
             sealed_scopes = []
             for scope in (node.get("write_scope") or []):
                 if not isinstance(scope, str) or not scope:

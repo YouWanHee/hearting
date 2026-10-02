@@ -5138,6 +5138,38 @@ def spawn_claimed_attempt(
         return proc, identity
 
 
+def parent_lookup_worktree(
+    worktree: str,
+    route_file: str | Path | None,
+    *,
+    subsession: bool,
+    parent_attempt_id: str | None,
+) -> str:
+    """The worktree column a slice's live-parent lookup compares against.
+
+    An owner's registry row carries the route cwd, while a slice may launch in a
+    linked worktree of the same repository. Only a slice that names its owner by
+    the exact inherited attempt id is looked up at the route cwd (the id keeps a
+    same-slug owner from being picked by accident); every other launch compares
+    the worktree it was given.
+    """
+
+    if not subsession or not parent_attempt_id or not route_file:
+        return worktree
+    try:
+        route_cwd = json.loads(Path(route_file).read_text(encoding="utf-8")).get("cwd")
+    except (OSError, ValueError, AttributeError):
+        return worktree
+    if (
+        not isinstance(route_cwd, str)
+        or not route_cwd
+        or route_cwd == worktree
+        or canonical_repository_identity(route_cwd) != canonical_repository_identity(worktree)
+    ):
+        return worktree
+    return route_cwd
+
+
 def resolve_live_parent_attempt(
     jobs: Path,
     *,
