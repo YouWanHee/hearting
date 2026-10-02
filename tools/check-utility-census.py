@@ -27,8 +27,9 @@ TEST_PATTERNS = (".test.py", ".test.sh")
 
 def census_list(census: str, name: str) -> set[str]:
     members = set()
-    for line in census.splitlines():
-        fields = line.split("\t")
+    # Same row rule as the guard's awk reader: split on LF, drop a trailing CR.
+    for line in census.split("\n"):
+        fields = line.rstrip("\r").split("\t")
         if len(fields) == 2 and fields[0] == name:
             members.add(fields[1])
     return members

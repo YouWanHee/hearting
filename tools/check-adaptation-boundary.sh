@@ -29,7 +29,7 @@ fail=0
 # tools/adaptation-census.tsv (also read by tools/check-utility-census.py).
 CENSUS_FILE=tools/adaptation-census.tsv
 census() {
-  awk -F '\t' -v list="$1" '$1 == list {printf "%s ", $2}' "$CENSUS_FILE"
+  awk -F '\t' -v list="$1" '{sub(/\r$/, "")} $1 == list {printf "%s ", $2}' "$CENSUS_FILE"
 }
 # Shared pre-owner evidence generator is invoked through adapter preflight
 # wrappers and remains at the portable root; no adapter-local utility symlink.
