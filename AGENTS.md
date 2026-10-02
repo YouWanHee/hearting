@@ -1,26 +1,30 @@
-# Hearting 프로젝트 유지보수 원칙
+# Hearting Maintenance Principles
 
-이 문서는 **하팅 자체를 개발·수정하는 모든 에이전트**에게 적용한다.
-Claude·Codex·OpenCode에 동일하며, 하팅을 사용하는 다른 프로젝트의 작업 절차를
-바꾸는 사용자 전역 지침이 아니다.
+These principles apply to every agent that develops or changes Hearting itself,
+equally under Claude, Codex, and OpenCode. They do not change how agents work in
+other projects that use Hearting.
 
-## 세부 절차보다 먼저 적용할 기준
+## The standard before detailed procedure
 
-**하네스가 사용자와 에이전트의 부담이 되면 안 된다.**
-완료 기준은 검사나 PASS 표식의 수가 아니라, 사용자가 요청한 일이 정상·실패·중단
-상황에서도 불필요한 개입 없이 끝나는가이다.
+**The harness must not become a burden on users or agents.** Work is done when
+the requested task finishes without needless intervention in normal, failure,
+and interruption cases — not when more checks or PASS markers exist.
 
-- 기존 workflow·recipe·adapter 절차가 승인된 작업을 반복해서 막으면 그 절차도
-  수정·통합·제거할 대상이다. 기존 구조를 불변의 전제로 삼지 않는다.
-- 실패마다 새 게이트·proof·seal·승인·필수 입력·복구 명령·오너 체인을 덧붙이지 않는다.
-  “내부 검증”이나 “새 플래그가 없음”도 부담 증가의 면책이 아니다.
-- 같은 부류의 막힘이 반복되면 개별 예외를 계속 쌓지 말고 중복 판단과 경로 자체를
-  줄인다. 제거하려는 장치를 다시 경유하느라 그 장치부터 고치는 일을 반복하지 않는다.
-- 사용자 승인, 데이터, 실행 중인 작업은 보호한다. 그 책임은 기존 정상 동작 안에서
-  처리하며, 에이전트의 추가 증명·수동 복구 의무로 전가하지 않는다.
-- 이 원칙을 확인하기 위한 새 체크리스트·hook·승인 단계도 만들지 않는다.
+- If an existing workflow, recipe, or adapter procedure repeatedly blocks
+  approved work, fix, merge, or remove that procedure too. Existing structure
+  is not a fixed premise.
+- Do not answer each failure with another gate, proof, seal, approval, required
+  input, recovery command, or owner chain. "Internal validation" or "no new
+  flag" does not excuse added burden.
+- When the same kind of blockage recurs, stop stacking exceptions; remove the
+  duplicated decisions and shorten the path itself. Do not route back through a
+  mechanism you are removing just to repair it first.
+- Protect user approvals, data, and running work within existing normal
+  behavior, without shifting extra proof or manual recovery onto agents.
+- Do not add a checklist, hook, or approval step to enforce these principles.
 
-이 기준은 하팅 유지보수에서 세부 절차 기본값보다 우선한다. 이미 사용자가 끈 게이트를
-임의로 다시 켜지 않는다. 코드 변경은 공통 의미를 소유한 `core/`, `capabilities/`,
-`roles/`에서 시작하고 세 어댑터를 동등하게 다룬다.
-기존 개발 철학의 정본은 [core/LOOP_ENGINEERING.md](core/LOOP_ENGINEERING.md)이다.
+This standard overrides detailed procedural defaults when maintaining Hearting.
+Do not re-enable a gate the user has turned off. Start code changes in `core/`,
+`capabilities/`, and `roles/`, which own the shared meaning, and treat the
+three adapters equally. The development philosophy is
+[core/LOOP_ENGINEERING.md](core/LOOP_ENGINEERING.md).
