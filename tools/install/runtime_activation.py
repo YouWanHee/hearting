@@ -45,7 +45,15 @@ import user_model_config
 RUNTIMES = ("claude", "codex", "opencode")
 MODES = ("linked", "packaged")
 SCHEMA = 2
-CLAUDE_MANAGED_ENV_KEYS: tuple = ()
+# A harness clears inherited caller names and other harnesses' session ids from its own tool commands
+# (core/OPERATIONS.md). Claude's half is these `env` keys (blank values); the Codex half is the
+# managed block.
+CLAUDE_MANAGED_ENV_KEYS: tuple = (
+    "AGENT_DISPATCH_CALLER_HARNESS",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "OPENCODE_SESSION_ID",
+)
 CLAUDE_STATUSLINE_COMMAND = "bash $HOME/.claude/statusline.sh"
 
 SESSION_ACTIONS = {
@@ -1576,6 +1584,274 @@ def _claude_settings_health(
     return missing, conflicts
 
 
+CODEX_IDENTITY_FRAGMENT = ("adapters", "codex", "config", "harness-identity.toml")
+CODEX_IDENTITY_BEGIN = (
+    "# >>> hearting harness identity (managed by runtime activation; edit outside this block) >>>"
+)
+CODEX_IDENTITY_END = "# <<< hearting harness identity <<<"
+CODEX_IDENTITY_BACKUP = "config.toml.pre-harness-identity"
+
+
+def _codex_identity_fragment(active_root: Path):
+    """``(block_body, set_values, excluded_keys)`` of the shipped fragment, or ``None``.
+
+    A release that ships no fragment (an older source) simply manages nothing.
+    """
+    path = Path(active_root).joinpath(*CODEX_IDENTITY_FRAGMENT)
+    if not path.is_file():
+        return None
+    import tomllib
+
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ActivationError(f"invalid Codex identity fragment: {path}: {exc}") from exc
+    policy = data.get("shell_environment_policy")
+    policy = policy if isinstance(policy, dict) else {}
+    set_values = policy.get("set") if isinstance(policy.get("set"), dict) else {}
+    filters = policy.get("filters") if isinstance(policy.get("filters"), dict) else {}
+    if not set_values and not filters:
+        raise ActivationError(f"Codex identity fragment has no shell_environment_policy: {path}")
+    body = "".join(
+        line + "\n" for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    return body, dict(set_values), sorted(key for key, action in filters.items() if action == "exclude")
+
+
+def _codex_identity_block(body: str) -> str:
+    return f"{CODEX_IDENTITY_BEGIN}\n{body}{CODEX_IDENTITY_END}\n"
+
+
+def _codex_identity_split(text: str):
+    """``(before, block, after)`` around the delimited block, ``(text, None, "")`` when absent.
+
+    ``block`` includes both marker lines and the final newline. Unbalanced or repeated markers
+    raise ``ValueError``: the block cannot be located, so it is not touched.
+    """
+    begins = text.count(CODEX_IDENTITY_BEGIN)
+    ends = text.count(CODEX_IDENTITY_END)
+    if begins == 0 and ends == 0:
+        return text, None, ""
+    if begins != 1 or ends != 1:
+        raise ValueError("unbalanced harness identity markers")
+    start = text.index(CODEX_IDENTITY_BEGIN)
+    stop = text.index(CODEX_IDENTITY_END)
+    if stop < start or (start and text[start - 1] != "\n"):
+        raise ValueError("misplaced harness identity markers")
+    end = text.find("\n", stop)
+    end = len(text) if end == -1 else end + 1
+    return text[:start], text[start:end], text[end:]
+
+
+def _codex_identity_assess(text: str, set_values: dict, excluded: List[str]):
+    """``(status, conflicts)`` of an already parsed config text without the managed block.
+
+    ``satisfied``: the effective policy already carries the fragment's values; ``clear``: no
+    policy key is in the way (the block can be added); ``conflict``: it cannot be merged safely.
+    """
+    import tomllib
+
+    data = tomllib.loads(text) if text.strip() else {}
+    policy = data.get("shell_environment_policy")
+    if policy is None:
+        return "clear", []
+    if not isinstance(policy, dict):
+        return "conflict", ["shell_environment_policy"]
+    conflicts = [f"shell_environment_policy.{key}" for key in ("exclude", "include_only") if key in policy]
+    user_set = policy.get("set")
+    user_filters = policy.get("filters")
+    if user_set is not None and not isinstance(user_set, dict):
+        conflicts.append("shell_environment_policy.set")
+    if user_filters is not None and not isinstance(user_filters, dict):
+        conflicts.append("shell_environment_policy.filters")
+    if conflicts:
+        return "conflict", conflicts
+    set_ok = all((user_set or {}).get(key) == value for key, value in set_values.items())
+    filters_ok = all((user_filters or {}).get(key) == "exclude" for key in excluded)
+    if set_ok and filters_ok:
+        return "satisfied", []
+    # A second `[shell_environment_policy.set|filters]` header beside the user's own table
+    # would be a duplicate table, so a partial user table cannot take the block. Only the tables
+    # the fragment itself defines can clash.
+    owned = (("set", user_set, set_values), ("filters", user_filters, excluded))
+    clashing = [f"shell_environment_policy.{key}" for key, table, wanted in owned
+                if wanted and table is not None]
+    return ("conflict", clashing) if clashing else ("clear", [])
+
+
+def _codex_identity_candidate_ok(text: str, set_values: dict, excluded: List[str]) -> bool:
+    import tomllib
+
+    try:
+        policy = (tomllib.loads(text).get("shell_environment_policy") or {})
+    except ValueError:
+        return False
+    if not isinstance(policy, dict) or "exclude" in policy or "include_only" in policy:
+        return False
+    user_set = policy.get("set") if isinstance(policy.get("set"), dict) else {}
+    filters = policy.get("filters") if isinstance(policy.get("filters"), dict) else {}
+    return (
+        all(user_set.get(key) == value for key, value in set_values.items())
+        and all(filters.get(key) == "exclude" for key in excluded)
+    )
+
+
+# destructive-ok: reason=atomically publish one managed config file or discard its own temporary; boundary=the target file and one mkstemp sibling in its directory
+def _atomic_text(path: Path, text: str, mode: Optional[int] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = None
+    try:
+        existing_mode = path.stat().st_mode & 0o777
+    except OSError:
+        pass
+    descriptor, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, existing_mode if existing_mode is not None else (mode or 0o600))
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _merge_codex_identity_config(
+    active_root: Path, previous: Optional[dict], scope: str = "global"
+) -> dict:
+    """Merge the fragment into ``$CODEX_HOME/config.toml`` as one delimited block.
+
+    Never refuses and never rewrites what the user owns: a policy that cannot be merged safely
+    is reported in ``conflicts`` and the file stays byte-identical. Invalid TOML takes the same
+    ``ActivationError`` path as the plugin conflict check that already ran.
+    """
+    result = {"kind": "codex-config-merged", "managed_config": None, "conflicts": []}
+    fragment = _codex_identity_fragment(active_root)
+    if fragment is None:
+        return result
+    body, set_values, excluded = fragment
+    config = _config_path("codex", scope, "config.toml")
+    result["path"] = str(config)
+    if config.exists() and not config.is_file():
+        raise ActivationError(f"invalid Codex config: {config} is not a regular file")
+    original = ""
+    if config.exists():
+        try:
+            original = config.read_text(encoding="utf-8")
+            import tomllib
+
+            tomllib.loads(original)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ActivationError(f"invalid Codex config: {config}: {exc}") from exc
+    previous_record = {}
+    if previous:
+        candidate = previous.get("managed_config", {}).get("codex_identity")
+        if isinstance(candidate, dict):
+            previous_record = candidate
+    block = _codex_identity_block(body)
+    try:
+        before, existing, after = _codex_identity_split(original)
+    except ValueError:
+        result["conflicts"].append("shell_environment_policy.managed-block")
+        return result
+    without_block = before + after if existing is not None else original
+    status, conflicts = _codex_identity_assess(without_block, set_values, excluded)
+    if status == "conflict":
+        result["conflicts"] = conflicts
+        return result
+    if status == "satisfied":
+        return result
+    if existing == block:
+        recorded = previous_record.get("inserted")
+        result["managed_config"] = {
+            "inserted": recorded if isinstance(recorded, str) and block in recorded else block,
+        }
+        return result
+    if existing is not None:
+        recorded = previous_record.get("inserted")
+        if isinstance(recorded, str) and recorded in original:
+            without_block = original.replace(recorded, "", 1)
+        status, conflicts = _codex_identity_assess(without_block, set_values, excluded)
+        if status == "conflict":
+            result["conflicts"] = conflicts
+            return result
+    separator = ""
+    if without_block:
+        separator = ("" if without_block.endswith("\n") else "\n") + "\n"
+    candidate_text = without_block + separator + block
+    if not _codex_identity_candidate_ok(candidate_text, set_values, excluded):
+        result["conflicts"] = ["shell_environment_policy"]
+        return result
+    if config.exists():
+        backup = config.with_name(CODEX_IDENTITY_BACKUP)
+        if not backup.exists():
+            _atomic_text(backup, original)
+    _atomic_text(config, candidate_text)
+    result["managed_config"] = {"inserted": separator + block}
+    return result
+
+
+def _unmerge_codex_identity_config(
+    state: dict, scope: str, dry_run: bool = False
+) -> List[str]:
+    """Remove the block activation inserted, only while its text is still exactly what it wrote."""
+    managed = (state.get("managed_config") or {}) if isinstance(state, dict) else {}
+    record = managed.get("codex_identity") if isinstance(managed, dict) else None
+    inserted = record.get("inserted") if isinstance(record, dict) else None
+    if not isinstance(inserted, str) or not inserted:
+        return []
+    config = _config_path("codex", scope, "config.toml")
+    if not config.is_file():
+        return []
+    try:
+        text = config.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    if text.count(inserted) != 1:
+        return []
+    if not dry_run:
+        _atomic_text(config, text.replace(inserted, "", 1))
+    return [str(config)]
+
+
+def _codex_identity_health(active_root: Path, scope: str = "global") -> tuple[bool, List[str]]:
+    """``(missing, conflicts)`` for the Codex identity policy; a release without it is healthy."""
+    try:
+        fragment = _codex_identity_fragment(active_root)
+    except ActivationError:
+        return True, []
+    if fragment is None:
+        return False, []
+    body, set_values, excluded = fragment
+    try:
+        config = _config_path("codex", scope, "config.toml")
+        text = config.read_text(encoding="utf-8") if config.is_file() else ""
+        before, existing, after = _codex_identity_split(text)
+    except (ActivationError, OSError, UnicodeDecodeError):
+        return True, []
+    except ValueError:
+        return False, ["shell_environment_policy.managed-block"]
+    if existing is not None and existing != _codex_identity_block(body):
+        return True, []
+    try:
+        import tomllib
+
+        tomllib.loads(text)
+        status, conflicts = _codex_identity_assess(before + after, set_values, excluded)
+    except ValueError:
+        return True, []
+    if status == "conflict":
+        return False, conflicts
+    if status == "satisfied":
+        return False, []
+    return existing is None, []
+
+
 _HOOK_COMMAND_PATH_RE = re.compile(r"\$HOME/[^\s\"']+")
 
 
@@ -1607,15 +1883,20 @@ def _activation_protected_paths(runtime: str, scope: str = "global") -> List[Pat
     paths_owned = [_state_path(runtime, scope)]
     if runtime == "claude":
         paths_owned.append(_config_path(runtime, scope, "settings.json"))
+    elif runtime == "codex":
+        paths_owned.append(_config_path(runtime, scope, "config.toml"))
+        paths_owned.append(_config_path(runtime, scope, CODEX_IDENTITY_BACKUP))
     return paths_owned
 
 
 def _prepare_runtime_config(
     runtime: str, active_root: Path, previous: Optional[dict], scope: str = "global"
 ) -> List[dict]:
-    if runtime != "claude":
-        return []
-    return [_merge_claude_settings(active_root, previous, scope)]
+    if runtime == "claude":
+        return [_merge_claude_settings(active_root, previous, scope)]
+    if runtime == "codex":
+        return [_merge_codex_identity_config(active_root, previous, scope)]
+    return []
 
 
 def duplicate_sources(runtime: str, scope: str = "global") -> List[str]:
@@ -2594,6 +2875,23 @@ def activate(
                     ),
                     [],
                 ),
+                "codex_identity": next(
+                    (
+                        change["managed_config"]
+                        for change in config_changes
+                        if change.get("kind") == "codex-config-merged"
+                        and change.get("managed_config")
+                    ),
+                    None,
+                ),
+                "codex_conflicts": next(
+                    (
+                        change["conflicts"]
+                        for change in config_changes
+                        if change.get("kind") == "codex-config-merged"
+                    ),
+                    [],
+                ),
                 "model_config": model_config_action,
             },
             "replaced_installer_symlink_targets": replaced_installer_symlink_targets,
@@ -2680,6 +2978,10 @@ def status(runtime: str, scope: str = "global") -> dict:
         config_missing, config_conflicts = _claude_settings_health(active_root, scope)
         if config_missing:
             missing = True
+    elif runtime == "codex":
+        config_missing, config_conflicts = _codex_identity_health(active_root, scope)
+        if config_missing:
+            missing = True
     model_config_path = paths.runtime_home(runtime, scope) / "agent-config" / "models.conf"
     model_config_present = model_config_path.is_file() and not model_config_path.is_symlink()
     try:
@@ -2711,9 +3013,10 @@ def status(runtime: str, scope: str = "global") -> dict:
     if duplicates:
         freshness = "duplicate"
         if config_conflicts:
+            label = "Claude settings" if runtime == "claude" else f"{runtime.capitalize()} config"
             next_action = (
-                f"resolve Claude settings conflicts ({','.join(config_conflicts)}), "
-                "then harness runtime refresh --runtime claude"
+                f"resolve {label} conflicts ({','.join(config_conflicts)}), "
+                f"then harness runtime refresh --runtime {runtime}"
             )
         else:
             next_action = (
@@ -2902,11 +3205,11 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
             restored_installer_links.append(value)
         else:
             removed.append(value)
-    restored = (
-        _unmerge_claude_settings(state, scope, dry_run=dry_run)
-        if runtime == "claude"
-        else []
-    )
+    restored = []
+    if runtime == "claude":
+        restored = _unmerge_claude_settings(state, scope, dry_run=dry_run)
+    elif runtime == "codex":
+        restored = _unmerge_codex_identity_config(state, scope, dry_run=dry_run)
     if not dry_run:
         bundles = paths.harness_state_dir(runtime, scope) / "bundles"
         if bundles.is_dir() and not bundles.is_symlink():

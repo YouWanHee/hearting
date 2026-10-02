@@ -105,6 +105,14 @@ posture only — no secrets and no machine-specific absolute project paths (the
 merge the relevant lines into `$CODEX_HOME/config.toml` on the target machine.
 (codex-adapter-parity audit P-15: gap closed.)
 
+Harness self-identity is the one fragment runtime activation does apply:
+`adapters/codex/config/harness-identity.toml` (`[shell_environment_policy.filters]`) makes Codex
+tool commands drop the inherited `AGENT_DISPATCH_CALLER_HARNESS` and Claude/OpenCode session
+IDs, so the thread's own `CODEX_THREAD_ID` identifies it even when a shared app-server
+daemon was started from another harness's shell. Nothing is exported that names a harness. Activation merges it into `$CODEX_HOME/config.toml` as one delimited managed block
+and reports a policy it cannot merge safely as `config-conflict:`; a new Codex thread picks
+it up, no daemon restart is needed.
+
 Interactive Codex uses its native launcher and user-owned permission settings.
 Hearting no longer inserts a managed gateway or changes interactive permission
 posture. Registered headless work keeps its separately checked permission and

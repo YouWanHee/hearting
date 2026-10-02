@@ -432,11 +432,14 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         import contextlib
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))):
+                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))), \
+             mock.patch.object(peer_steward, "_BIND_PROCESS_SECONDS", 0.1), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.02):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
         self.assertIn("session_id=-", out.getvalue())
+        self.assertIn("session_bind=no-process", out.getvalue())
 
     def test_the_receipt_names_the_identity_when_there_is_one(self):
         import io
@@ -638,6 +641,243 @@ if verb == "wait":
 print(json.dumps(info)); sys.exit(0)
 '''
 
+
+class StartSessionBindTest(_TmpRootMixin, unittest.TestCase):
+    """`start --kind codex` binds the launched thread when the launcher can prove it.
+
+    A TUI attached to the shared Codex daemon holds no rollout file and the daemon creates
+    the thread's rollout about a second after the TUI starts, so Fleet sees an anonymous
+    row (several same-cwd starts overlap its start-time window). The launcher is the one
+    party that saw the launch: it notes the rollouts that exist before `herdr agent start`
+    and, afterwards, takes exactly one new root rollout for the target cwd as the session.
+    Zero or several new rollouts is no proof: no guess, `session_id=-`, and the start is
+    never failed or blocked beyond the bound.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp_root / "codex-home"
+        (self.home / "sessions" / "2026" / "10" / "02").mkdir(parents=True)
+        self.project = self.tmp_root / "project"
+        self.project.mkdir()
+        self.registry = self.tmp_root / "registry"
+        os.environ["CODEX_HOME"] = str(self.home)
+        os.environ["FLEET_SESSION_REGISTRY_DIR"] = str(self.registry)
+        # the "TUI": a real process, so /proc has a start time and a cwd for it
+        self.tui = subprocess.Popen(["sleep", "60"], cwd=str(self.project))
+        self.addCleanup(self.tui.wait)
+        self.addCleanup(self.tui.kill)
+        self.late = []        # rollouts the "daemon" writes after the TUI is up
+        self.calls = []
+
+    def _rollout(self, sid, cwd=None, created=None, originator="codex-tui", source="vscode"):
+        created = created if created is not None else time.time()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(created)) + ".%03dZ" % (int(created * 1000) % 1000)
+        meta = {"id": sid, "timestamp": stamp, "cwd": str(cwd or self.project),
+                "originator": originator, "source": source}
+        path = self.home / "sessions" / "2026" / "10" / "02" / (
+            "rollout-%s-%s.jsonl" % (stamp[:19].replace(":", "-"), sid))
+        path.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
+        return path
+
+    def _fake_herdr(self, argv, **_kwargs):
+        self.calls.append(list(argv))
+        if argv[:3] == ["herdr", "agent", "start"]:
+            return _herdr_json({"result": {"agent": {"name": argv[3], "agent": "codex",
+                                                     "pane_id": "w1:pM"}}})
+        if argv[:3] == ["herdr", "pane", "process-info"]:
+            for write in self.late:
+                write()
+            self.late = []
+            return _herdr_json({"result": {"process_info": {"foreground_processes": [
+                {"pid": self.tui.pid, "argv": ["codex", "--cd", str(self.project)]}]}}})
+        return _herdr_json({"result": {"pane": {}}})
+
+    def _start(self, *extra, kind="codex", name="bl-c1"):
+        import io
+        import contextlib
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", name, "--kind", kind, "--pane", "w1:pM",
+                                    *(["--cwd", str(self.project)] if kind == "codex" else []), *extra])
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    def _registry_record(self):
+        path = self.registry / "codex" / ("%d.json" % self.tui.pid)
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def _proc_start(self):
+        raw = Path("/proc/%d/stat" % self.tui.pid).read_text()
+        return raw[raw.rindex(")") + 1:].split()[19]
+
+    def test_one_new_root_rollout_is_the_launched_session(self):
+        sid = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
+        self.late.append(lambda: self._rollout(sid))
+        out = self._start()
+        self.assertIn("session_id=" + sid, out)
+        self.assertIn("session_bind=bound", out)
+        record = self._registry_record()
+        self.assertEqual(record["sessionId"], sid)
+        self.assertEqual(record["procStart"], self._proc_start())
+        self.assertEqual(record["cwd"], os.path.realpath(str(self.project)))
+        self.assertEqual(record["name"], "bl-c1")
+        self.assertNotEqual(record.get("nameSource"), "derived")
+        self.assertEqual(record["harness"], "codex")
+        self.assertEqual(record["pid"], self.tui.pid)
+        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
+        self.assertEqual(sent[0]["to"]["session_id"], sid)
+
+    def test_two_new_root_rollouts_are_never_guessed(self):
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000001"))
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000002"))
+        out = self._start()
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=ambiguous", out)
+        self.assertIsNone(self._registry_record())
+
+    def test_no_new_rollout_within_the_bound_times_out_without_failing(self):
+        started = time.time()
+        out = self._start()
+        self.assertLess(time.time() - started, 5)
+        self.assertIn("started=true", out)
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=timeout", out)
+        self.assertIsNone(self._registry_record())
+
+    def test_a_rollout_that_existed_before_the_start_is_never_taken(self):
+        self._rollout("01a0fa57-0000-7000-8000-0000000000aa")
+        out = self._start()
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=timeout", out)
+        sid = "01a0fa57-0000-7000-8000-0000000000bb"
+        self.late.append(lambda: self._rollout(sid))
+        self.assertIn("session_id=" + sid, self._start(name="bl-c2"))
+
+    def test_other_cwd_subagent_and_stale_rollouts_are_ignored(self):
+        other = self.tmp_root / "elsewhere"
+        other.mkdir()
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c1", cwd=other))
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c2",
+                                               source={"subagent": {"parent": "x"}}))
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c3",
+                                               created=time.time() - 3600))
+        out = self._start()
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=timeout", out)
+        self.assertIsNone(self._registry_record())
+
+    def test_a_session_id_herdr_already_gave_is_kept_and_not_searched_for(self):
+        def with_session(argv, **kwargs):
+            if argv[:3] == ["herdr", "agent", "start"]:
+                self.calls.append(list(argv))
+                return _herdr_json({"result": {"agent": {
+                    "name": argv[3], "agent": "codex",
+                    "agent_session": {"value": "herdr-given-sid"}}}})
+            return self._fake_herdr(argv, **kwargs)
+        import io
+        import contextlib
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=with_session), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             contextlib.redirect_stdout(out):
+            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=herdr-given-sid", out.getvalue())
+        self.assertNotIn("session_bind=", out.getvalue())
+        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
+
+    def test_other_harnesses_are_not_searched_for_a_rollout(self):
+        out = self._start(kind="claude")
+        self.assertNotIn("session_bind=", out)
+        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
+
+    def test_the_cwd_defaults_to_the_launched_process_cwd(self):
+        sid = "01a0fa57-0000-7000-8000-0000000000d1"
+        self.late.append(lambda: self._rollout(sid))
+        import io
+        import contextlib
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
+             contextlib.redirect_stdout(out):
+            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=" + sid, out.getvalue())
+
+    def test_a_missing_proc_start_keeps_the_thread_id_but_writes_no_registry_record(self):
+        # Fleet rejects a record without a matching procStart, so none is written and the
+        # receipt says the binding is unregistered; the start itself is neither failed nor blocked.
+        sid = "01a0fa57-0000-7000-8000-0000000000e1"
+        self.late.append(lambda: self._rollout(sid))
+        with mock.patch.object(peer_steward, "_proc_start_ticks", return_value=None):
+            out = self._start()
+        self.assertIn("started=true", out)
+        self.assertIn("session_id=" + sid, out)
+        self.assertIn("session_bind=bound-unregistered", out)
+        self.assertNotIn("session_bind=bound ", out + " ")
+        self.assertIsNone(self._registry_record())
+        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
+        self.assertEqual(sent[0]["to"]["session_id"], sid)
+
+    def test_a_registry_write_that_fails_is_reported_unregistered_not_bound(self):
+        sid = "01a0fa57-0000-7000-8000-0000000000e2"
+        self.late.append(lambda: self._rollout(sid))
+        registry = peer_steward._session_registry()
+        with mock.patch.object(registry, "write", side_effect=OSError("read-only registry")):
+            out = self._start()
+        self.assertIn("session_id=" + sid, out)
+        self.assertIn("session_bind=bound-unregistered", out)
+
+
+class BindDeadlineConfirmationTest(unittest.TestCase):
+    """A single candidate counts only after a second observation, also at the deadline.
+
+    A rollout first seen on the final poll cannot be told apart from a concurrent same-cwd
+    start, so the bind ends as `timeout` instead of taking it.
+    """
+
+    def _bind(self, sightings):
+        """Run `_bind_codex_session` on a fake clock; `sightings[i]` is the poll-i rollout list."""
+        clock = {"now": 0.0}
+        polls = iter(sightings)
+        fake_time = mock.Mock()
+        fake_time.monotonic = lambda: clock["now"]
+        fake_time.sleep = lambda seconds: clock.__setitem__("now", clock["now"] + seconds)
+        fake_time.time = time.time
+        with mock.patch.object(peer_steward, "time", fake_time), \
+             mock.patch.object(peer_steward, "_fleet_codex_collector", return_value=object()), \
+             mock.patch.object(peer_steward, "_pane_codex_pid", return_value=4242), \
+             mock.patch.object(peer_steward, "_new_root_rollouts",
+                               side_effect=lambda *a, **k: next(polls, sightings[-1])), \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.25):
+            return peer_steward._bind_codex_session("w1:pM", "/work", "/home", set(), 0.0)
+
+    def test_a_candidate_first_seen_on_the_final_poll_is_not_bound(self):
+        # polls at t=0, .25, .5, .75 -- the candidate appears only on the last one
+        state, sid, pid, cwd = self._bind([[], [], [], ["sid-late"]])
+        self.assertEqual((state, sid), ("timeout", None))
+        self.assertEqual((pid, cwd), (4242, "/work"))
+
+    def test_a_candidate_seen_on_the_last_two_polls_is_bound(self):
+        state, sid, _pid, _cwd = self._bind([[], [], ["sid-ok"], ["sid-ok"]])
+        self.assertEqual((state, sid), ("bound", "sid-ok"))
+
+    def test_a_candidate_that_changes_on_the_final_poll_is_not_bound(self):
+        state, sid, _pid, _cwd = self._bind([[], [], ["sid-a"], ["sid-b"]])
+        self.assertEqual((state, sid), ("timeout", None))
+
+    def test_a_candidate_that_vanishes_before_confirmation_is_not_bound(self):
+        state, sid, _pid, _cwd = self._bind([["sid-a"], [], [], []])
+        self.assertEqual((state, sid), ("timeout", None))
 
 
 class _WatchMixin(_TmpRootMixin):
@@ -889,12 +1129,22 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             path = (_HERE / name).resolve()
             self.assertTrue(path.exists(), f"{name} missing")
             tree = ast.parse(path.read_text())
+            # The one bounded wait: `start` looks for the launched Codex thread's rollout for
+            # at most `_BIND_SECONDS`. It is launch bookkeeping, not a watch.
+            bounded_launch_bind = {
+                inner
+                for fn in ast.walk(tree)
+                if isinstance(fn, ast.FunctionDef) and fn.name == "_bind_codex_session"
+                for inner in ast.walk(fn)
+            }
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call):
                     func = node.func
                     dotted = (
                         isinstance(func, ast.Attribute) and func.attr == "sleep"
                     ) or (isinstance(func, ast.Name) and func.id == "sleep")
+                    if dotted and node in bounded_launch_bind:
+                        continue
                     self.assertFalse(dotted, f"{path.name} must not sleep")
                 if isinstance(node, ast.While):
                     test = node.test
@@ -1693,7 +1943,7 @@ class FromNameBareSubprocessTest(unittest.TestCase):
 class CurrentSessionIdentityDelegationTest(unittest.TestCase):
     """F-<next> fleet-route-chain-r2 plan §3 B-3: `_current_session_identity` delegates to
     `dispatch_parent_completion.interactive_parent_identity` first, keeping the prior
-    claude > codex > opencode > AGENT_SESSION_ID fallback for the ambiguous/unset case."""
+    AGENT_SESSION_ID fallback for the ambiguous/unset case; a native id is never guessed."""
 
     _ENV_KEYS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
                  "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "AGENT_SESSION_ID",
@@ -1715,11 +1965,25 @@ class CurrentSessionIdentityDelegationTest(unittest.TestCase):
                              AGENT_DISPATCH_CALLER_HARNESS="codex"):
             self.assertEqual(peer_steward._current_session_identity(), ("sid-x", "codex"))
 
-    def test_ambiguous_multiple_sessions_falls_back_to_legacy_priority(self):
+    def test_ambiguous_multiple_sessions_records_unknown_sender(self):
         # No explicit caller harness + two sessions set -> interactive_parent_identity()
-        # raises caller-harness-ambiguous; the prior claude-first order still applies.
+        # raises caller-harness-ambiguous. The sender is unknown, never the first of the
+        # claude > codex > opencode guesses (that named a Codex thread `claude [bc]`).
         with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x"):
-            self.assertEqual(peer_steward._current_session_identity(), ("sid-c", "claude"))
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
+
+    def test_ambiguous_env_keeps_the_agent_session_id_fallback(self):
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x",
+                             AGENT_SESSION_ID="sid-legacy"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-legacy", "unknown"))
+
+    def test_explicit_name_without_its_sid_never_takes_foreign_sid(self):
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", AGENT_DISPATCH_CALLER_HARNESS="codex"):
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
+
+    def test_invalid_explicit_name_never_takes_a_native_sid(self):
+        with self._clean_env(CODEX_THREAD_ID="sid-x", AGENT_DISPATCH_CALLER_HARNESS="gemini"):
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
 
     def test_single_session_delegates_cleanly(self):
         with self._clean_env(CODEX_THREAD_ID="sid-solo"):
