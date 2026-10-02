@@ -59,8 +59,9 @@ def main() -> int:
     except Exception:
         pass
     try:
-        # Refresh this session's (or dispatched worker's) open-cycle interim
-        # manifest: detached, rate-limited, silent.
+        # Observe this session's (or dispatched worker's) cycle: the open cycle's
+        # interim manifest, or a closed cycle's changed files. Detached,
+        # rate-limited, silent -- the launcher Claude Stop and OpenCode share.
         import artifact_checkpoint_trigger
 
         artifact_checkpoint_trigger.launch_for_session("codex", _sid(payload))

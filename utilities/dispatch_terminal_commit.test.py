@@ -182,7 +182,6 @@ class ProducerBindingTests(unittest.TestCase):
             "child-not-terminal": "child-not-quiescent",
             "active-retry": "child-not-quiescent",
             "active-review-lease": "producer-finalize-failed",
-            "binding-cycle-not-open": "producer-binding-mismatch",
         }
         for detail, reason in expected.items():
             proof = T._proof_failure(detail)
@@ -252,6 +251,41 @@ class ProducerBindingTests(unittest.TestCase):
         after = sorted((str(path.relative_to(self.root)), path.read_bytes())
                        for path in self.root.rglob("*") if path.is_file())
         self.assertEqual(before, after)
+
+
+    def test_closed_or_moved_cycle_still_proves_the_binding(self):
+        # §45 D-123: the cycle's state and campaign are not part of its identity.
+        route = {"route_id": "rt-abcdef12", "route_hash": "sha256:" + "a" * 64,
+                 "capability": "autopilot-code", "capability_mode": "dev", "nodes": []}
+        seal_fixture_route(route, self.route_file, self.root, self.jobs, "att-owner")
+        owner = owner_route_binding.OwnerRouteBinding(str(self.route_file), route["route_id"], route["route_hash"])
+        cycle_id = "cyc_" + "d" * 32
+        bound = {"state": "open", "campaign_id": "camp_" + "1" * 32, "cycle_id": cycle_id,
+                 "producer_id": "prod_" + "2" * 32, "route_id": route["route_id"],
+                 "route_hash": route["route_hash"], "route_file": str(self.route_file)}
+        cycle_path = self.root / ".runtime/artifact-producer/v1/cycles" / f"{cycle_id}.json"
+        cycle_path.parent.mkdir(parents=True, exist_ok=True)
+        binding = SimpleNamespace(binding={
+            "route_hash": route["route_hash"], "cycle_id": cycle_id, "campaign_id": bound["campaign_id"],
+            "cycle_record_digest": T.cycle_identity_digest(bound)})
+
+        def prove(record):
+            cycle_path.write_text(json.dumps(record), encoding="utf-8")
+            with mock.patch.object(T, "validate_owner_route", return_value=owner), \
+                 mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
+                 mock.patch.object(T, "_route_module") as route_module, \
+                 mock.patch.object(T, "load_producer_binding", return_value=binding), \
+                 mock.patch.object(artifact_producer, "cycle_route_admission", return_value=SimpleNamespace(allow=True)), \
+                 mock.patch("artifact_producer._live_review_lease", return_value=None):
+                route_module.return_value.terminal_gate_observation.return_value = {"route": {"passed": True}}
+                return T.prove_terminal_authority(T.TerminalCommitRequest(
+                    self.route_file, "att-owner", self.jobs, self.root))
+
+        closed_and_moved = {**bound, "state": "sealed", "campaign_id": "camp_" + "9" * 32}
+        self.assertEqual(prove(closed_and_moved).status, "proved")
+        drifted = prove({**closed_and_moved, "producer_id": "prod_" + "8" * 32})
+        self.assertEqual((drifted.status, drifted.reason, drifted.detail),
+                         ("rejected", "producer-binding-mismatch", "cycle-identity-drift"))
 
 
 class ContinuationTerminalSettlementTests(unittest.TestCase):
@@ -676,6 +710,9 @@ class _TerminalCommitFixture(unittest.TestCase):
     def request(self):
         return T.TerminalCommitRequest(self.route_file, "att-a3fixture", self.jobs, self.root)
 
+    def _slot(self):
+        return T._commit_state_path(self.request()).parent
+
     def patch_settle(self, *, producer=False):
         proof = T.TerminalProof("proved")
         topology = mock.patch.object(T, "producer_lifecycle_applies", return_value=producer)
@@ -961,19 +998,36 @@ class EnvelopeReplayReverificationTest(_TerminalCommitFixture):
             second = T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
         self.assertEqual(second.result, "completed")
 
-    def test_primary_content_drift_after_seal_is_transaction_conflict_not_replay(self):
-        owner = self._seal_once()
-        # Mutate the sealed primary artifact's bytes after sealing.
-        self.artifact.write_text("tampered after seal\n", encoding="utf-8")
+    def _replay(self, owner):
         with mock.patch.object(T, "prove_terminal_authority", return_value=T.TerminalProof("proved")), \
              mock.patch.object(T, "validate_owner_route", return_value=owner), \
              mock.patch.object(T, "producer_lifecycle_applies", return_value=False), \
              mock.patch.object(T, "_route_module") as route_module:
             route_module.return_value.terminal_gate_observation.return_value = self.gates
-            second = T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
-        self.assertEqual(second.result, "recoverable")
-        self.assertEqual(second.reason, "transaction-conflict")
-        self.assertEqual(second.detail, "primary-content-drifted-after-seal")
+            return T.settle_terminal_commit(self.request(), T.TerminalCommitServices())
+
+    def test_primary_content_change_after_seal_is_news_beside_the_stored_envelope(self):
+        """§45 D-127: the sealed envelope is delivered as stored; an edited report is information."""
+        owner = self._seal_once()
+        stored = (self._slot() / "owner-envelope.txt").read_text()
+        # Mutate the sealed primary artifact's bytes after sealing.
+        self.artifact.write_text("tampered after seal\n", encoding="utf-8")
+        second = self._replay(owner)
+        self.assertEqual((second.result, second.reason), ("completed", None))
+        self.assertEqual(second.detail, "primary-changed-after-seal")
+        self.assertEqual(second.envelope_text, stored)
+        # A report that went away is the other piece of news.
+        self.artifact.unlink()
+        third = self._replay(owner)
+        self.assertEqual((third.result, third.detail), ("completed", "primary-missing-after-seal"))
+        self.assertEqual(third.envelope_text, stored)
+
+    def test_a_tampered_stored_envelope_is_still_a_conflict(self):
+        owner = self._seal_once()
+        (self._slot() / "owner-envelope.txt").write_text("artifact: elsewhere\nverdict: PASS\nblocker: none\n")
+        second = self._replay(owner)
+        self.assertEqual((second.result, second.reason, second.detail),
+                         ("recoverable", "transaction-conflict", "envelope-content-mismatch"))
 
 
 class CleanupScopeDurabilityTest(_TerminalCommitFixture):
@@ -1037,7 +1091,6 @@ class ProducerBindingMatrixTest(_TerminalCommitFixture):
         with mock.patch.object(T, "validate_owner_route", side_effect=T.TerminalCommitError("producer-binding-required")):
             self.assertEqual(T.prove_terminal_authority(request).reason, "producer-binding-required")
         self.assertEqual(T._proof_failure("owner-route-mismatch").reason, "route-identity-unverified")
-        self.assertEqual(T._proof_failure("binding-cycle-not-open").reason, "producer-binding-mismatch")
         self.assertEqual(T._proof_failure("producer-binding-mismatch").reason, "producer-binding-mismatch")
 
 

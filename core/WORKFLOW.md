@@ -628,7 +628,7 @@ returns to such a route is not refused: `finish` reports it closed, and
 
 A session finishes its own `direct` inline route to record real evidence.
 Supply a readable, nonempty artifact from the route's exact open cycle and the
-final summary; the command records terminal proof, closes the route, seals
+final summary; the command records terminal proof, closes the route, finalizes
 that cycle and returns a receipt only after rechecking all three. A partial
 transaction remains `finish-pending` and is resumed with the same intent.
 
@@ -645,11 +645,13 @@ python3 utilities/capability-route.py status --artifact-root <dir> --open-only
 ```
 
 For producer-backed work, the controller's transaction is **terminal proof →
-route close → exact cycle seal → workflow COMPLETE**. Eligible direct inline
+route close → cycle finalize (the completion record) → workflow COMPLETE**. Eligible direct inline
 work uses `finish`; legacy recovery uses complete, close and finalize in that
 order. Shared admission applies only to
-shared kinds after sealing; it is never a prerequisite for the terminal marker.
-A cycle sealed while its route is open (`finalize --allow-open-route`) stays
+shared kinds after finalize; it is never a prerequisite for the terminal marker.
+Finalize records the cycle's completion as of that moment and does not lock the
+cycle: its files stay editable, movable and deletable afterwards (artifact-path-contract §45).
+A cycle finalized while its route is open (`finalize --allow-open-route`) stays
 `active` in its manifest; a later close, proven or not, leaves it there, and
 campaign closure lists it as `sealed-unproven` with the route's recorded proof
 state.

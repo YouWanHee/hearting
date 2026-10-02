@@ -310,8 +310,11 @@ class InterimManifestTest(CheckpointTestBase):
         self.assertEqual((result["status"], result["reason"]), ("skipped", "route-closed"))
         self.assertFalse(P.open_manifest_path(self.root, self.cycle_id).exists())
         P.finalize(self.root, cycle_id=self.cycle_id)
+        # §45 D-124: a closed cycle is not skipped; the checkpoint looks for changed files
+        # (none here), never publishes an interim document for it.
         result = P.checkpoint(self.root, cycle_id=self.cycle_id)
-        self.assertEqual((result["status"], result["reason"]), ("skipped", "cycle-not-open"))
+        self.assertEqual(result["status"], "unchanged")
+        self.assertFalse(P.open_manifest_path(self.root, self.cycle_id).exists())
 
     def test_empty_cycle_publishes_nothing(self):
         result = P.checkpoint(self.root, cycle_id=self.cycle_id)

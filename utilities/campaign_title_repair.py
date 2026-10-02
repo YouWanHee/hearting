@@ -832,7 +832,8 @@ def _latest_sealed(root: Path, campaign_ids: Sequence[str]) -> list[str]:
     latest: Dict[str, tuple] = {}
     for record in artifact_producer.list_cycle_records(Path(root)):
         campaign_id = record.get("campaign_id")
-        if campaign_id in wanted and record.get("state") == "sealed" and isinstance(record.get("sealed_on"), str):
+        if (campaign_id in wanted and artifact_producer.cycle_record_closed(record)
+                and isinstance(record.get("sealed_on"), str)):
             stamp = (record["sealed_on"], str(record.get("cycle_id")))
             if campaign_id not in latest or stamp > latest[campaign_id]:
                 latest[campaign_id] = stamp

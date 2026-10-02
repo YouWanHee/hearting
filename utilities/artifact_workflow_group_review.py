@@ -372,7 +372,7 @@ def ensure_enrolled(root: Path, trigger_ids: Sequence[str], now: Optional[float]
     stamps = [_now_iso(now)]
     for cycle_id in trigger_ids:
         record = producer.read_cycle_record(root, cycle_id)
-        if record and record.get("state") == "sealed" and isinstance(record.get("sealed_on"), str):
+        if producer.cycle_record_closed(record) and isinstance(record.get("sealed_on"), str):
             stamps.append(record["sealed_on"])
     value = min(stamps)
 
@@ -522,7 +522,7 @@ def select_targets(root: Path, doc: Optional[Mapping[str, Any]], *, cycles: Sequ
     result = Selection()
     members = _Members(root)
     wanted = set(campaign_ids)
-    records = {row.get("cycle_id"): row for row in producer.list_cycle_records(root)}
+    records = {row.get("cycle_id"): row for row in producer.list_cycle_records(root) if not row.get("deleted_at")}
     skip = set(exclude)
     enrolled_at = (doc or {}).get("enrolled_at")
     enrolled_at = enrolled_at if isinstance(enrolled_at, str) else None
@@ -535,7 +535,7 @@ def select_targets(root: Path, doc: Optional[Mapping[str, Any]], *, cycles: Sequ
             result.skipped.append({"cycle_id": cycle_id, "reason": "cycle-unknown"})
             result.considered.append(cycle_id)
             return
-        sealed = row.get("state") == "sealed" and isinstance(row.get("sealed_on"), str)
+        sealed = producer.cycle_record_closed(row) and isinstance(row.get("sealed_on"), str)
         if not sealed and not (explicit and include_open and row.get("state") == "open"):
             result.skipped.append({"cycle_id": cycle_id, "reason": "not-sealed"})
             result.considered.append(cycle_id)
@@ -577,7 +577,7 @@ def select_targets(root: Path, doc: Optional[Mapping[str, Any]], *, cycles: Sequ
         if wanted and since is None:
             for cycle_id, row in records.items():
                 if (row.get("campaign_id") in wanted and cycle_id not in chosen and cycle_id not in skip
-                        and cycle_id not in cycles and row.get("state") == "sealed"):
+                        and cycle_id not in cycles and producer.cycle_record_closed(row)):
                     consider(cycle_id, explicit=True)
         if since is not None:
             for cycle_id, row in records.items():
@@ -585,12 +585,12 @@ def select_targets(root: Path, doc: Optional[Mapping[str, Any]], *, cycles: Sequ
                 if cycle_id in chosen or cycle_id in skip or cycle_id in cycles or (opened and not include_open):
                     continue
                 stamp = str(row.get("started_on") if opened else row.get("sealed_on") or "")
-                if stamp and stamp >= since and row.get("state") in ("sealed", "open"):
+                if stamp and stamp >= since and (opened or producer.cycle_record_closed(row)):
                     consider(cycle_id, explicit=True)
     else:
         for cycle_id, row in records.items():
             if (cycle_id in chosen or cycle_id in skip or cycle_id in result.considered
-                    or row.get("state") != "sealed" or not isinstance(row.get("sealed_on"), str)):
+                    or not producer.cycle_record_closed(row) or not isinstance(row.get("sealed_on"), str)):
                 continue
             if _auto_eligible(_entry(doc, cycle_id), row["sealed_on"], enrolled_at, trigger=False):
                 consider(cycle_id, explicit=False, report=False)
@@ -670,7 +670,7 @@ def _view(root: Path, campaign_id: str, record: Mapping[str, Any], titles_by_id:
     cycle_id = record["cycle_id"]
     title = titles_by_id.get(cycle_id) or str(record.get("title") or "")
     request = _clip(cycle_titles._route_text(root, record) or "", REQUEST_MAX)
-    view = _View(cycle_id, title, "sealed" if record.get("state") == "sealed" else "open",
+    view = _View(cycle_id, title, "sealed" if producer.cycle_record_closed(record) else "open",
                  record, request, [], [])
     try:
         directory = producer.cycle_dir(root, campaign_id, cycle_id, record)
@@ -772,7 +772,7 @@ def build_input(root: Path, campaign_id: str, target_ids: Sequence[str],
                if records.get(cid)]
     context_rows = sorted(
         (row for cid, row in records.items()
-         if row and row.get("state") == "sealed" and cid not in members_of and cid not in target_ids),
+         if producer.cycle_record_closed(row) and cid not in members_of and cid not in target_ids),
         key=lambda row: (str(row.get("sealed_on")), row["cycle_id"]), reverse=True)[:CONTEXT_MAX]
     context = [_view(root, campaign_id, row, titles_by_id) for row in context_rows]
     member_views = {}
@@ -810,7 +810,7 @@ def build_input(root: Path, campaign_id: str, target_ids: Sequence[str],
         groups={group["group_id"]: group for group in (doc or {}).get("groups", [])},
         context_ids=shown_context, cycle_ids=frozenset(campaign.get("cycles", [])),
         titles={**{cid: (row or {}).get("title", "") for cid, row in records.items()}, **titles_by_id},
-        states={cid: ("sealed" if (row or {}).get("state") == "sealed" else "open")
+        states={cid: ("sealed" if producer.cycle_record_closed(row) else "open")
                 for cid, row in records.items()})
 
 
@@ -1410,7 +1410,7 @@ def _ensure_title_renewal(root: Path, selection: Selection, campaign_ids: Sequen
         if read.status == "invalid" or not M.legacy_title_replaceable(entry, legacy):
             continue
         sealed = [row for row in records if row.get("campaign_id") == campaign_id
-                  and row.get("state") == "sealed" and isinstance(row.get("sealed_on"), str)]
+                  and producer.cycle_record_closed(row) and isinstance(row.get("sealed_on"), str)]
         if not sealed:
             continue
         newest = max(sealed, key=lambda row: (row["sealed_on"], row["cycle_id"]))["cycle_id"]
@@ -1443,7 +1443,7 @@ def _pass(root: Path, *, cycles: Sequence[str], since: Optional[str], include_op
                                missing_only=missing_only,
                                limit=AUTO_LIMIT if limit is None and auto else limit)
     records = producer.list_cycle_records(root)
-    states = {row["cycle_id"]: ("sealed" if row.get("state") == "sealed" else "open") for row in records}
+    states = {row["cycle_id"]: ("sealed" if producer.cycle_record_closed(row) else "open") for row in records}
     if replace_legacy_titles and not auto:
         _ensure_title_renewal(root, selection, campaign_ids, records)
     protect_title = auto and M.title_auto_disabled()

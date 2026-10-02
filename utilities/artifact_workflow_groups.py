@@ -253,7 +253,7 @@ def _member_dir(root: Path, campaign: Mapping[str, Any], cycle_id: str) -> Path:
 
 def _manifest(root: Path, campaign: Mapping[str, Any], cycle_id: str, directory: Path) -> dict[str, Any]:
     record = producer.read_cycle_record(root, cycle_id)
-    path = directory / "manifest.json" if record and record.get("state") == "sealed" else (
+    path = directory / "manifest.json" if producer.cycle_record_closed(record) else (
         producer.producer_dir(root) / "open-manifests" / f"{cycle_id}.json")
     value = _json(_regular(path, cap=32 * 1024 * 1024) or b"")
     root_identity = lifecycle.read_root_identity(root)

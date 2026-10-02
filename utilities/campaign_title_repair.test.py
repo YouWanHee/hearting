@@ -826,7 +826,8 @@ class HumanRaceAndContractTest(AutoBase):
         self.assertEqual((result["targets"][0]["status"], result["targets"][0]["failure_class"], result["targets"][0]["code"]),
                          ("failed", "apply-failed", "cycle-not-member"))
         self.assertIsNone(self.meta(first))
-        self.assertEqual([e for e in M.H.iter_events(self.root) if e["target"]["id"] in (first["campaign_id"], first["cycle_id"])], [])
+        self.assertEqual([e for e in M.H.iter_events(self.root) if e["kind"] in ("meta", "group")  # the fixture's own close line is not the repair's
+                      and e["target"]["id"] in (first["campaign_id"], first["cycle_id"])], [])
 
 
 if __name__ == "__main__":

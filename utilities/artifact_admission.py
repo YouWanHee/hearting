@@ -27,8 +27,9 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import artifact_identity
 import artifact_index
 import artifact_locator
 import artifact_manifest
@@ -757,6 +758,78 @@ def _known_idempotency_keys(root: Path) -> Tuple[Dict[str, str], Dict[str, str]]
     return by_cycle, by_path
 
 
+_CYCLE_RECORD_REL = Path(".runtime/artifact-producer/v1/cycles")
+# The location `artifact_lifecycle.MANIFEST_SNAPSHOT_REL` names; that module
+# imports this one, so the path is repeated here rather than imported back.
+_MANIFEST_SNAPSHOT_REL = Path(".runtime/artifact-producer/v1/manifests")
+_CYCLE_ID_FILE_RE = re.compile(r"^cyc_[0-9a-f]{32}$")
+
+
+def _producer_cycle_ids(root: Path) -> frozenset:
+    """Cycle IDs the root's producer has a record for (open, closed, or since deleted).
+
+    A cycle's parent is a reference to one of these, not an ordering rule
+    (§45 D-123), so a parent that is still open or already deleted is a known
+    parent even when the index has no row for it."""
+    try:
+        names = os.listdir(str(Path(root) / _CYCLE_RECORD_REL))
+    except OSError:
+        return frozenset()
+    return frozenset(name[:-5] for name in names
+                     if name.endswith(".json") and _CYCLE_ID_FILE_RE.match(name[:-5]))
+
+
+def _preserved_documents(root: Path, cycle_id: Any) -> List[Mapping[str, Any]]:
+    """The cycle's earlier published documents (§45 D-124), read-only."""
+    if not isinstance(cycle_id, str) or not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        return []
+    try:
+        directory = Path(root) / _MANIFEST_SNAPSHOT_REL / cycle_id
+        names = sorted(os.listdir(str(directory)))
+    except OSError:
+        return []
+    documents = []
+    for name in names:
+        path = directory / name
+        if not name.endswith(".json") or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            document = json.loads(path.read_bytes().decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(document, dict) and document.get("manifest_revision_id") == name[:-5]:
+            documents.append(document)
+    return documents
+
+
+def _retired_documents(root: Path) -> Dict[str, List[Mapping[str, Any]]]:
+    """The preserved documents of every cycle the root deleted (§45 D-126), by cycle ID.
+
+    A deleted cycle has no current row, but its IDs stay owned: a rebuilt index folds these
+    documents in and then drops the cycle's own rows, so no ID a deleted cycle used is issued again."""
+    directory = Path(root) / _CYCLE_RECORD_REL
+    try:
+        names = sorted(os.listdir(str(directory)))
+    except OSError:
+        return {}
+    found: Dict[str, List[Mapping[str, Any]]] = {}
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            raw = (directory / name).read_bytes()
+            if b'"deleted_at"' not in raw:
+                continue
+            record = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(record, dict) and record.get("deleted_at") and _CYCLE_ID_FILE_RE.match(str(record.get("cycle_id"))):
+            documents = _preserved_documents(root, record["cycle_id"])
+            if documents:
+                found[record["cycle_id"]] = documents
+    return found
+
+
 def _compute_rebuilt_index(
     root: Path,
 ) -> Tuple[artifact_index.IndexDocument, List[str]]:
@@ -766,6 +839,7 @@ def _compute_rebuilt_index(
     known_by_cycle, known_by_path = _known_idempotency_keys(root)
     fallback_keys: List[str] = []
     items = []
+    preserved: Dict[str, List[Mapping[str, Any]]] = {}
     if campaigns_dir.exists():
         for campaign_dir in sorted(campaigns_dir.iterdir(), key=lambda path: path.name):
             if campaign_dir.name.startswith(".") or campaign_dir.is_symlink() or not campaign_dir.is_dir():
@@ -775,7 +849,15 @@ def _compute_rebuilt_index(
                 if not manifest_path.is_file():
                     continue
                 document = json.loads(manifest_path.read_bytes().decode("utf-8"))
+                earlier = [old for old in _preserved_documents(
+                               root, (document.get("cycle") or {}).get("cycle_id")
+                               if isinstance(document.get("cycle"), dict) else None)
+                           if old.get("manifest_revision_id") != document.get("manifest_revision_id")]
                 report = artifact_manifest.validate(document)
+                if not report.ok and earlier:
+                    # A document the runtime refreshed after the close names
+                    # things only its earlier documents still declare.
+                    report = artifact_manifest.validate_update(document, preserved=earlier, published=True)
                 if not report.ok:
                     raise AdmissionRecoveryRequired(
                         "published manifest at {0} fails validation during rebuild".format(
@@ -807,13 +889,26 @@ def _compute_rebuilt_index(
                     idempotency_key = document.get("manifest_id")
                     fallback_keys.append(idempotency_key)
                 items.append((document, cycle_path, digest, idempotency_key))
-    if not items:
+                if earlier:
+                    preserved[cycle_id] = earlier
+    present = {(doc.get("cycle") or {}).get("cycle_id") for doc, _p, _d, _k in items}
+    retired = {cycle_id: docs for cycle_id, docs in _retired_documents(root).items() if cycle_id not in present}
+    if not items and not retired:
         return artifact_index.empty(identity.artifact_root_id), fallback_keys
-    return artifact_index.build(items), fallback_keys
+    return artifact_index.build(
+        items, known_parent_cycle_ids=_producer_cycle_ids(root), preserved=preserved,
+        retired=retired, artifact_root_id=identity.artifact_root_id), fallback_keys
 
 
 def rebuild_index(root: Path) -> artifact_index.IndexDocument:
     root = Path(root)
+    try:
+        # §45 D-126: a cycle or campaign folder moved, renamed or removed by hand is found first, so the
+        # index is rebuilt from records that say where things are.  Never an error for the rebuild.
+        import artifact_producer
+        artifact_producer.reconcile_root(root)
+    except Exception:  # noqa: BLE001
+        pass
     index, fallback_keys = _compute_rebuilt_index(root)
     # A manifest-id fallback means the caller-supplied idempotency key was not
     # recoverable (index absent), so an exact retry with the original custom
@@ -1100,6 +1195,7 @@ def admit(
             idempotency_key=request.idempotency_key,
             manifest_digest=digest,
             repository_id=identity.repository_id,
+            known_parent_cycle_ids=_producer_cycle_ids(root),
         )
         if not index_report.ok:
             return AdmissionOutcome(

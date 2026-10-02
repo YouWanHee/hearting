@@ -71,11 +71,11 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    on the same route, which resumes the owner's open cycle.
 4. **runtime-owned closure.** A new registered owner returns its final report;
    the shared completion controller owns workflow/route closure and exact-cycle
-   sealing after PASS and process cleanup. Interrupted closure retains the
+   finalization after PASS and process cleanup. Interrupted closure retains the
    result and transaction, retries without a model turn, and carries a recovery
    notice. `roles/worker-types/owner.md` defines this shared contract. Explicit
    close/finalize commands remain for inline work and legacy recovery.
-5. **shared admission.** `analysis_project` output is admitted to `shared/analysis/` by `admit-shared --kind analysis` after the cycle is sealed (canonical shared kind).
+5. **shared admission.** `analysis_project` output is admitted to `shared/analysis/` by `admit-shared --kind analysis` after the cycle is finalized (canonical shared kind).
 
 ## Role Requirements
 

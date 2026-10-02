@@ -433,6 +433,57 @@ def _ledger_error(schema_version: Optional[int] = None) -> Verdict:
     )
 
 
+def _resolve_in_preserved_revision(root: Path, receipt: Mapping[str, Any]) -> Verdict:
+    """S8 fallback: the receipt's own revision, read from the cycle's preserved copy.
+
+    The cycle is registered and its identity matched above; only the revision is
+    older than the current one.  The copy is judged by the same lineage rules as
+    a current document (S11, S13-S15) and the verdict says the cycle was updated
+    since, instead of rejecting a receipt that was true when it was written."""
+    cycle_id = receipt["cycle_id"]
+    try:
+        copies = artifact_lifecycle.read_manifest_snapshots(root, cycle_id)
+    except artifact_lifecycle.LifecycleError:
+        return _rejected("local-manifest-unregistered", 3)
+    document = next((doc for _raw, doc in copies
+                     if doc.get("manifest_revision_id") == receipt["manifest_revision_id"]), None)
+    if document is None:
+        return _rejected("local-manifest-unregistered", 3)
+    earlier = [doc for _raw, doc in copies if doc.get("manifest_revision_id") != document["manifest_revision_id"]]
+    report = artifact_manifest.validate(document)
+    if not report.ok:
+        report = artifact_manifest.validate_update(document, preserved=earlier, published=True)
+    if not report.ok:
+        return _rejected("local-lineage-mismatch", 3)
+    campaign = document.get("campaign") if isinstance(document.get("campaign"), dict) else {}
+    cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
+    if (
+        document.get("repository_id") != receipt["repository_id"]
+        or document.get("manifest_id") != receipt["manifest_id"]
+        or campaign.get("campaign_id") != receipt["campaign_id"]
+        or cycle.get("cycle_id") != receipt["cycle_id"]
+        or cycle.get("campaign_id") != receipt["campaign_id"]
+    ):
+        return _rejected("local-lineage-mismatch", 3)
+    artifact_row = next((row for row in (document.get("artifacts") or [])
+                         if isinstance(row, dict) and row.get("artifact_id") == receipt["artifact_id"]
+                         and row.get("cycle_id") == receipt["cycle_id"]), None)
+    revision_row = next((row for row in (document.get("artifact_revisions") or [])
+                         if isinstance(row, dict)
+                         and row.get("artifact_revision_id") == receipt["artifact_revision_id"]
+                         and row.get("artifact_id") == receipt["artifact_id"]), None)
+    if artifact_row is None or revision_row is None:
+        return _rejected("local-lineage-mismatch", 3)
+    return Verdict(
+        state="accepted",
+        detail="updated-since",
+        schema_version=3,
+        receipt=receipt,
+        digest=receipt_digest(receipt),
+        identity=identity_tuple(receipt),
+    )
+
+
 def resolve(artifact_root: Any, receipt: Mapping[str, Any]) -> Verdict:
     schema_version = receipt.get("schema_version")
     if schema_version != 3:
@@ -507,7 +558,10 @@ def resolve(artifact_root: Any, receipt: Mapping[str, Any]) -> Verdict:
         and row.get("cycle_id") == receipt["cycle_id"]
     ]
     if not matches:
-        return _rejected("local-manifest-unregistered", 3)
+        # §45 D-127: a receipt names the revision it was written for.  When the
+        # cycle has published a later document since, the preserved copy of
+        # that revision is what the receipt is resolved against.
+        return _resolve_in_preserved_revision(root, receipt)
     if len(matches) > 1:
         return _rejected("local-lineage-mismatch", 3)
     manifest_row = matches[0]

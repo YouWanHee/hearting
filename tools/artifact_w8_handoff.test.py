@@ -412,15 +412,22 @@ class BundleBoundaryCLITest(producer_fixture.ProducerTestBase):
                         fixture.tearDown()
                         fixture.doCleanups()
 
-    def test_sealed_bundle_cannot_be_reissued_with_w16(self):
+    def test_closed_cycle_bundle_can_be_reissued_with_w16(self):
+        # Seal abolition §45 D-123: a closed cycle no longer refuses writes, so
+        # the same bundle dir can be issued again with the W16 boundary.
         bundle, _ = self.issue()
         before = {p.name: p.read_bytes() for p in bundle.iterdir()}
+        old_boundary = w8.read_json(bundle / "approval-boundary.json")
+        old_digest = w8.read_json(bundle / "handoff.json")["bundle_digest"]
         self.close(self.output_route, self.output_route_file)
         w8.P.finalize(self.root, cycle_id=self.output["cycle_id"])
-        _, result = self.issue("default", "--include-w16-namespace-delete", success=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("bundle dir not writable under the producer contract", result.stderr)
-        self.assertEqual(before, {p.name: p.read_bytes() for p in bundle.iterdir()})
+        _, result = self.issue("default", "--include-w16-namespace-delete")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        new_boundary = w8.read_json(bundle / "approval-boundary.json")
+        self.assertEqual(new_boundary["stages"][-1]["stage"], "W16-namespace-delete")
+        self.assertEqual(len(new_boundary["stages"]), len(old_boundary["stages"]) + 1)
+        self.assertNotEqual(old_digest, w8.read_json(bundle / "handoff.json")["bundle_digest"])
+        self.assertNotEqual(before, {p.name: p.read_bytes() for p in bundle.iterdir()})
 
     @unittest.skipUnless(os.environ.get("CAIRN_CHECKOUT"), "CAIRN_CHECKOUT으로 실제 reader 검증 선택")
     def test_real_cairn_reader_accepts_bindings_and_rejects_invalid_boundaries(self):

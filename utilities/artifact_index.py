@@ -10,7 +10,7 @@ durable source of truth (that is the published manifest + its events). See
 
 import os.path
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Collection, Dict, Iterable, Mapping, Optional, Tuple
 
 from artifact_manifest import (
     ValidationReport,
@@ -206,7 +206,22 @@ def check(
     idempotency_key: str,
     manifest_digest: str,
     repository_id: Optional[str] = None,
+    known_parent_cycle_ids: Optional[Collection[str]] = None,
+    replaces_manifest_digest: Optional[str] = None,
 ) -> ValidationReport:
+    """Judge ``document`` against the index.
+
+    ``known_parent_cycle_ids`` names cycles that exist as producer records of
+    the same root but are not (yet) in the index -- a parent still open, or
+    one deleted since.  A parent is a reference, not an ordering or campaign
+    constraint (§45 D-123): it only has to be a cycle of this root.
+
+    ``replaces_manifest_digest`` makes ``document`` the same cycle's next
+    manifest (§45 D-124): the cycle's current index row must still carry that
+    digest (the compare-and-swap), IDs, routes and events the cycle already owns
+    are references to what it has, and only its new events advance a stream
+    cursor.  Every ID another cycle owns is still refused.
+    """
     violations = []
 
     if document.get("artifact_root_id") != index.artifact_root_id:
@@ -233,7 +248,12 @@ def check(
         index, document, idempotency_key=idempotency_key, manifest_digest=manifest_digest
     )
 
-    if not is_idempotent_retry and cycle_id in index.cycles:
+    replacing = replaces_manifest_digest is not None and not is_idempotent_retry
+
+    def owned_by_this_cycle(row: Any) -> bool:
+        return replacing and isinstance(row, dict) and row.get("cycle_id") == cycle_id
+
+    if not is_idempotent_retry and cycle_id in index.cycles and not replacing:
         violations.append(
             Violation(
                 "index-cycle-id-duplicate",
@@ -243,7 +263,7 @@ def check(
         )
 
     parent_cycle_id = cycle.get("parent_cycle_id")
-    if parent_cycle_id is not None and not is_idempotent_retry:
+    if parent_cycle_id is not None and not is_idempotent_retry and not replacing:
         if parent_cycle_id == cycle_id:
             violations.append(
                 Violation(
@@ -252,24 +272,14 @@ def check(
                     "cycle cannot be its own parent",
                 )
             )
-        elif parent_cycle_id not in index.cycles:
+        elif parent_cycle_id not in index.cycles and parent_cycle_id not in (known_parent_cycle_ids or ()):
             violations.append(
                 Violation(
                     "index-orphan-parent-cycle",
                     "$.cycle.parent_cycle_id",
-                    "parent cycle is not an admitted cycle in this root",
+                    "parent cycle is not a cycle of this root",
                 )
             )
-        else:
-            parent_campaign = index.cycles[parent_cycle_id].get("campaign_id")
-            if parent_campaign != cycle.get("campaign_id"):
-                violations.append(
-                    Violation(
-                        "index-parent-cycle-campaign-mismatch",
-                        "$.cycle.parent_cycle_id",
-                        "parent cycle belongs to a different campaign",
-                    )
-                )
 
     incoming_ids = declared_ids(document)
     for stable_id, kind in incoming_ids.items():
@@ -285,7 +295,7 @@ def check(
                     "stable id already present with kind {0!r}".format(existing_kind),
                 )
             )
-        elif kind not in _REUSABLE_SAME_KIND:
+        elif kind not in _REUSABLE_SAME_KIND and not owned_by_this_cycle(existing):
             violations.append(
                 Violation(
                     "index-stable-id-duplicate",
@@ -296,7 +306,7 @@ def check(
 
     for root_id, route_id in declared_routes(document):
         existing = index.routes.get(root_id, {}).get(route_id)
-        if existing is not None and not is_idempotent_retry:
+        if existing is not None and not is_idempotent_retry and not owned_by_this_cycle(existing):
             violations.append(
                 Violation(
                     "index-route-composite-duplicate",
@@ -311,7 +321,7 @@ def check(
         if isinstance(row, dict)
     ]:
         existing = index.event_ids.get(event_id)
-        if existing is not None and not is_idempotent_retry:
+        if existing is not None and not is_idempotent_retry and not owned_by_this_cycle(existing):
             violations.append(
                 Violation(
                     "index-event-id-reused",
@@ -321,7 +331,12 @@ def check(
             )
 
     if not is_idempotent_retry:
-        for stream_id, (min_seq, max_seq) in declared_streams(document).items():
+        incoming = document
+        if replacing:
+            # A re-referenced event is the cycle's own; only a new one moves a cursor.
+            incoming = {"events": [row for row in document.get("events", []) or []
+                                   if isinstance(row, dict) and row.get("event_id") not in index.event_ids]}
+        for stream_id, (min_seq, max_seq) in declared_streams(incoming).items():
             existing_stream = index.streams.get(stream_id)
             if existing_stream is None:
                 if min_seq != 1:
@@ -344,8 +359,20 @@ def check(
                     )
 
     existing_manifest = index.manifests.get(idempotency_key)
+    if replacing and existing_manifest is None:
+        violations.append(
+            Violation(
+                "manifest-revision-append-out-of-scope",
+                "$.manifest_id",
+                "no current index row to replace for this idempotency key",
+            )
+        )
     if existing_manifest is not None and not is_idempotent_retry:
-        if existing_manifest.get("manifest_digest") != manifest_digest:
+        if replacing:
+            expected_digest = replaces_manifest_digest
+        else:
+            expected_digest = manifest_digest
+        if existing_manifest.get("manifest_digest") != expected_digest:
             violations.append(
                 Violation(
                     "manifest-revision-append-out-of-scope",
@@ -457,10 +484,39 @@ def apply(
     )
 
 
+def retire(index: IndexDocument, cycle_id: str) -> IndexDocument:
+    """§45 D-126: a deleted cycle has no current row; every ID its documents declared stays owned.
+
+    The cycle's `manifests` and `cycles` rows go; `stable_ids`, `routes`, `event_ids` and `streams`
+    keep naming it, so an ID it used is never issued again and an earlier reference still resolves."""
+    if cycle_id not in index.manifests and cycle_id not in index.cycles:
+        return index
+    manifests = {k: v for k, v in index.manifests.items() if v.get("cycle_id") != cycle_id and k != cycle_id}
+    cycles = {k: v for k, v in index.cycles.items() if k != cycle_id}
+    return IndexDocument(
+        schema_version=index.schema_version, artifact_root_id=index.artifact_root_id,
+        stable_ids=index.stable_ids, routes=index.routes, event_ids=index.event_ids,
+        streams=index.streams, manifests=manifests, cycles=cycles)
+
+
 def build(
-    admitted: Iterable[Tuple[Mapping[str, Any], str, str, str]]
+    admitted: Iterable[Tuple[Mapping[str, Any], str, str, str]],
+    *,
+    known_parent_cycle_ids: Optional[Collection[str]] = None,
+    preserved: Optional[Mapping[str, Iterable[Mapping[str, Any]]]] = None,
+    retired: Optional[Mapping[str, Iterable[Mapping[str, Any]]]] = None,
+    artifact_root_id: Optional[str] = None,
 ) -> IndexDocument:
     """Rebuild from published documents, refusing cross-manifest conflicts.
+
+    ``preserved`` maps a cycle ID to that cycle's earlier documents (§45 D-124).
+    They never replace the current row: the current document is folded last and
+    carries every earlier event, while an ID only an earlier document declared
+    (a removed artifact or revision) stays owned by its cycle, so a rebuilt
+    index refuses to reuse it just as the incrementally updated one does.
+
+    ``retired`` maps a deleted cycle's ID to its preserved documents (§45 D-126): they own their IDs
+    again after the rebuild, but the cycle has no current row.
 
     Rebuild input order is directory order, not admission order, so per-item
     stream-continuity cursors cannot be enforced here; instead the union of
@@ -469,9 +525,9 @@ def build(
     a conflict is a refusal, never a silent overwrite (D-7).
     """
     items = list(admitted)
-    if not items:
+    if not items and not artifact_root_id:
         raise ValueError("build() requires at least one admitted document to seed artifact_root_id")
-    root_id = items[0][0].get("artifact_root_id")
+    root_id = items[0][0].get("artifact_root_id") if items else artifact_root_id
     index = empty(root_id)
     stream_sequences: Dict[str, Dict[int, int]] = {}
     for document, cycle_path, manifest_digest, idempotency_key in items:
@@ -480,6 +536,7 @@ def build(
             document,
             idempotency_key=idempotency_key,
             manifest_digest=manifest_digest,
+            known_parent_cycle_ids=known_parent_cycle_ids,
         )
         conflict_codes = sorted(
             {
@@ -495,6 +552,11 @@ def build(
                     idempotency_key, ", ".join(conflict_codes)
                 )
             )
+        earlier_documents = [
+            old for old in (preserved or {}).get(
+                (document.get("cycle") or {}).get("cycle_id") if isinstance(document.get("cycle"), dict) else None, ())
+            if old.get("manifest_revision_id") != document.get("manifest_revision_id")
+        ]
         for stream_id, (min_seq, max_seq) in declared_streams(document).items():
             bucket = stream_sequences.setdefault(stream_id, {})
             for row in document.get("events", []) or []:
@@ -503,6 +565,14 @@ def build(
                 seq = row.get("stream_sequence")
                 if isinstance(seq, int) and not isinstance(seq, bool):
                     bucket[seq] = bucket.get(seq, 0) + 1
+        for old in earlier_documents:
+            index = apply(
+                index,
+                old,
+                cycle_path=cycle_path,
+                manifest_digest=manifest_digest,
+                idempotency_key=idempotency_key,
+            )
         index = apply(
             index,
             document,
@@ -510,6 +580,10 @@ def build(
             manifest_digest=manifest_digest,
             idempotency_key=idempotency_key,
         )
+    for retired_id, old_documents in sorted((retired or {}).items()):
+        for old in old_documents:
+            index = apply(index, old, cycle_path="", manifest_digest="", idempotency_key=retired_id)
+        index = retire(index, retired_id)
     for stream_id, bucket in sorted(stream_sequences.items()):
         duplicates = sorted(seq for seq, count in bucket.items() if count > 1)
         if duplicates:
@@ -528,25 +602,17 @@ def build(
             )
     # Parent linkage is order-independent: verify against the fully folded set.
     parent_of: Dict[str, str] = {}
-    campaign_of: Dict[str, Any] = {}
     for document, _cycle_path, _digest, idempotency_key in items:
         cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
         cid = cycle.get("cycle_id")
-        campaign_of[cid] = cycle.get("campaign_id")
         parent_cycle_id = cycle.get("parent_cycle_id")
         if parent_cycle_id is None:
             continue
-        if parent_cycle_id not in index.cycles:
+        if parent_cycle_id not in index.cycles and parent_cycle_id not in (known_parent_cycle_ids or ()):
             raise ValueError(
                 "build-conflict for idempotency key {0!r}: orphan parent cycle {1!r}".format(
                     idempotency_key, parent_cycle_id
                 )
-            )
-        parent_row = index.cycles[parent_cycle_id]
-        if parent_row.get("campaign_id") != cycle.get("campaign_id"):
-            raise ValueError(
-                "build-conflict for idempotency key {0!r}: parent cycle {1!r} "
-                "belongs to a different campaign".format(idempotency_key, parent_cycle_id)
             )
         parent_of[cid] = parent_cycle_id
     # A parent chain from tampered on-disk input could be circular; incremental

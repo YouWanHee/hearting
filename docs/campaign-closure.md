@@ -4,7 +4,7 @@
 
 ## 운영 순서
 
-`campaign-status`로 목표, criterion, 사이클 disposition, 닫기 가능 여부와 실행 명령을 확인한다. 기본 criterion인 `every cycle sealed with a manifest`를 쓰는 캠페인은 충족된 종결 조건을 한 문장으로 `--reason`에 적는다.
+`campaign-status`로 목표, criterion, 사이클 disposition, 닫기 가능 여부와 실행 명령을 확인한다. 닫을 때 `--reason`은 선택이다. 없으면 criterion 문장 또는 `campaign-close`가 이유로 기록된다. 마감되지 않은 사이클, 마감 뒤 파일 변경, 손 편집으로 생긴 차이는 닫기를 막지 않는다. 닫기를 거부하는 것은 열린 route 하나뿐이다.
 
 ```sh
 python3 "$AGENT_HOME/utilities/artifact_producer.py" campaign-status \
@@ -28,6 +28,14 @@ python3 "$AGENT_HOME/utilities/artifact_producer.py" campaign-reopen \
 
 닫힌 캠페인의 key, ID 또는 parent cycle을 선택해 `begin`하면 자동으로 재개하고 새 사이클을 같은 campaign에 붙인다. `compose`는 닫힌 key에 `(닫힌 캠페인 재개)`를 표시한다. 같은 key로 닫힌 캠페인이 여럿이면 `campaign-key-reopen-ambiguous`로 거부되며, `abandoned`와 `superseded`는 재개하지 않는다.
 
+## 사이클 이동·표시·삭제
+
+승인이나 확인 플래그 없이 쓰며 `--reason`은 선택이다.
+
+- `cycle-move --cycle <id> [--campaign <id|key>] [--parent <id>|--no-parent]`: 사이클을 다른 캠페인으로 옮기거나 parent를 바꾼다(ID 유지).
+- `cycle-mark --cycle <id> --discard|--superseded-by <ids>|--clear|--primary <path>`: 버림·대체 표시, 표시 해제, 대표 문서 지정.
+- `delete --cycle <id>|--campaign <id|key>`: 사이클이나 캠페인을 삭제한다(기록과 보존 사본은 남는다).
+
 ## Event와 복구
 
 새 기록은 `campaigns/<locator>/campaign.events/<NNNNNN>.json`에 순번대로 추가한다. 기존 `campaign.satisfied.json`은 sequence 1의 읽기 전용 기록으로 취급한다. 닫기와 재개는 D-11 event envelope를 사용하고, 재개 event는 직전 종결 event ID를 가리킨다. 기록 파일 발행이 commit point이며, 이전 event를 수정하거나 지우지 않는다.
@@ -38,7 +46,6 @@ python3 "$AGENT_HOME/utilities/artifact_producer.py" campaign-reopen \
 
 일반적인 오류와 다음 행동:
 
-- `campaign-close-reason-required`: 기본 criterion의 실제 종결 조건을 `--reason`으로 기록한다.
 - `campaign-cycle-provisional-active` / `campaign-cycle-not-sealed`: 해당 route와 cycle의 봉인 상태를 확인한다.
 - `campaign-membership-drift` / `campaign-index-mismatch` / `campaign-artifact-mismatch`: 현재 기록과 immutable evidence의 차이를 조사한다.
 - `campaign-event-sequence-invalid` / `campaign-event-invalid` / `campaign-event-transition-invalid`: stream을 직접 고치지 말고 원본과 복구 결과를 보존한다.

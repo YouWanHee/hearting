@@ -36,7 +36,6 @@ import artifact_manifest
 PUBLICATION_RESULTS = frozenset(
     {"not-offered", "skipped", "succeeded", "failed"}
 )
-UNRESOLVED_CYCLE_STATES = frozenset({"active", "pending", "in-progress"})
 _ROUTE_ID_RE = re.compile(r"^rt-[A-Za-z0-9][A-Za-z0-9._-]{0,126}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CAPABILITY_ROUTE_MODULE = None
@@ -390,52 +389,6 @@ def read_admitted_cycle(
     return cycle
 
 
-def decide_cycle_start_or_resume(
-    existing_cycle: Optional[Mapping[str, Any]], candidate_cycle: Mapping[str, Any]
-) -> Decision:
-    required = {"cycle_id", "campaign_id", "parent_cycle_id", "input_digest", "outcome_criterion", "state"}
-    if not isinstance(candidate_cycle, Mapping) or not required.issubset(candidate_cycle):
-        return Decision("reject", (_violation("candidate-cycle-incomplete"),))
-    if existing_cycle is None:
-        if candidate_cycle.get("parent_cycle_id") is not None:
-            return Decision("reject", (_violation("new-root-cycle-has-parent"),))
-        return Decision("new-cycle", detail={"cycle_id": candidate_cycle["cycle_id"]})
-    if not isinstance(existing_cycle, Mapping) or not required.issubset(existing_cycle):
-        return Decision("reject", (_violation("cycle-prior-descriptor-unverified"),))
-    if existing_cycle.get("campaign_id") != candidate_cycle.get("campaign_id"):
-        return Decision("reject", (_violation("cycle-campaign-mismatch"),))
-    if existing_cycle.get("state") not in UNRESOLVED_CYCLE_STATES:
-        return Decision("reject", (_violation("cycle-prior-terminal"),))
-    compatible = (
-        existing_cycle.get("input_digest") == candidate_cycle.get("input_digest")
-        and existing_cycle.get("outcome_criterion") == candidate_cycle.get("outcome_criterion")
-    )
-    if compatible:
-        reasons = []
-        if candidate_cycle.get("cycle_id") != existing_cycle.get("cycle_id"):
-            reasons.append(_violation("compatible-resume-must-preserve-cycle-id"))
-        if candidate_cycle.get("parent_cycle_id") != existing_cycle.get("parent_cycle_id"):
-            reasons.append(_violation("compatible-resume-parent-mismatch"))
-        if reasons:
-            return Decision("reject", tuple(reasons))
-        return Decision(
-            "resume-same-cycle", detail={"cycle_id": existing_cycle["cycle_id"]}
-        )
-    reasons = []
-    if candidate_cycle.get("cycle_id") == existing_cycle.get("cycle_id"):
-        reasons.append(_violation("material-input-change-reused-cycle-id"))
-    if candidate_cycle.get("parent_cycle_id") != existing_cycle.get("cycle_id"):
-        reasons.append(_violation("cycle-child-parent-link-missing"))
-    return Decision(
-        "new-child-cycle-required",
-        tuple(reasons),
-        {
-            "cycle_id": candidate_cycle.get("cycle_id"),
-            "parent_cycle_id": existing_cycle.get("cycle_id"),
-        },
-    )
-
-
 def _sha256_path(path: Path) -> str:
     return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -500,6 +453,127 @@ def verify_artifact_revisions(
     return tuple(sorted(failures))
 
 
+def manifest_route_row(
+    document: Mapping[str, Any], *, route_id: Optional[str] = None, route_hash: Optional[str] = None
+) -> Optional[Mapping[str, Any]]:
+    """The manifest's `routes[]` row for a route named by ID (or, failing that, by hash).
+
+    A closed cycle that a later route closed again carries one row per closing route
+    (§45 D-127); this is the one place that asks whether a route has its row."""
+    rows = [row for row in (document.get("routes") or []) if isinstance(row, Mapping)] \
+        if isinstance(document, Mapping) else []
+    for key, wanted in (("route_id", route_id), ("route_hash", route_hash)):
+        if wanted:
+            return next((row for row in rows if row.get(key) == wanted), None)
+    return None
+
+
+MANIFEST_SNAPSHOT_REL = Path(".runtime/artifact-producer/v1/manifests")
+
+
+def manifest_snapshot_dir(artifact_root: Path, cycle_id: str) -> Path:
+    if not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise LifecycleError("cycle-id-invalid", str(cycle_id))
+    return Path(artifact_root) / MANIFEST_SNAPSHOT_REL / cycle_id
+
+
+def manifest_snapshot_path(artifact_root: Path, cycle_id: str, manifest_revision_id: str) -> Path:
+    if not artifact_identity.is_well_formed(manifest_revision_id, "manifest_revision"):
+        raise LifecycleError("manifest-revision-id-invalid", str(manifest_revision_id))
+    return manifest_snapshot_dir(artifact_root, cycle_id) / f"{manifest_revision_id}.json"
+
+
+def _fsync_path(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def preserve_manifest_snapshot(artifact_root: Path, cycle_id: str, raw: bytes) -> Path:
+    """§45 D-124: keep one published manifest document's exact bytes (no replace).
+
+    The file name is the document's own `manifest_revision_id`.  A copy that is
+    already there must hold the same bytes; nothing is ever overwritten, and the
+    caller's own raw bytes are stored, never a re-encoding of the parsed document.
+    """
+    try:
+        document = json.loads(raw.decode("utf-8"))
+        revision_id = document["manifest_revision_id"]
+        document_cycle = document["cycle"]["cycle_id"]
+    except (ValueError, UnicodeError, KeyError, TypeError) as exc:
+        raise LifecycleError("manifest-snapshot-invalid", "unreadable manifest document") from exc
+    if document_cycle != cycle_id:
+        raise LifecycleError("manifest-snapshot-invalid", "cycle identity")
+    path = manifest_snapshot_path(artifact_root, cycle_id, revision_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags, 0o644)
+    except FileExistsError:
+        if path.is_symlink() or path.read_bytes() != raw:
+            raise LifecycleError("manifest-snapshot-conflict", str(path))
+        return path
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    _fsync_path(path.parent)
+    return path
+
+
+def read_manifest_snapshots(artifact_root: Path, cycle_id: str) -> Tuple[Tuple[bytes, Mapping[str, Any]], ...]:
+    """Every preserved document of a cycle, as `(raw bytes, parsed document)`.
+
+    An unreadable or foreign file is skipped: a snapshot is evidence that is
+    read, never one that a reader repairs."""
+    directory = manifest_snapshot_dir(artifact_root, cycle_id)
+    try:
+        names = sorted(directory.iterdir())
+    except OSError:
+        return ()
+    found = []
+    for entry in names:
+        if entry.suffix != ".json" or entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            raw = entry.read_bytes()
+            document = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if (isinstance(document, dict) and document.get("manifest_revision_id") == entry.stem
+                and isinstance(document.get("cycle"), dict) and document["cycle"].get("cycle_id") == cycle_id):
+            found.append((raw, document))
+    return tuple(found)
+
+
+def find_manifest_snapshot(
+    artifact_root: Path, cycle_id: str, *, manifest_revision_id: Optional[str] = None,
+    manifest_digest: Optional[str] = None,
+) -> Optional[Mapping[str, Any]]:
+    """The preserved document with this revision ID or `manifest_digest`, if any."""
+    if manifest_revision_id is not None:
+        for _raw, document in read_manifest_snapshots(artifact_root, cycle_id):
+            if document.get("manifest_revision_id") == manifest_revision_id:
+                return document
+        return None
+    for _raw, document in read_manifest_snapshots(artifact_root, cycle_id):
+        if artifact_manifest.manifest_digest(document) == manifest_digest:
+            return document
+    return None
+
+
 def verify_published_payload(cycle_dir: Path, document: Mapping[str, Any]) -> Decision:
     failures = verify_artifact_revisions(document, cycle_dir)
     if failures:
@@ -518,20 +592,42 @@ def validate_publication(value: str) -> Decision:
     return Decision("accept", detail={"publication": value})
 
 
-def _marker_digest(route_module: Any, route: Mapping[str, Any]) -> str:
+def _marker_digest(route_module: Any, route: Mapping[str, Any], *, recorded: bool = False) -> str:
+    """Digest of the terminal completion markers.
+
+    Live, it reads the route's gate observation, so a marker whose evidence file has
+    changed is not "passed".  `recorded=True` is the proof of a cycle that is already
+    closed (§45 D-127): the markers' own bytes are what was bound at the close, and the
+    evidence file they pointed at is free to be edited, moved or removed afterwards."""
     terminal = sorted(
         node["id"] for node in route.get("nodes", []) if node.get("terminal") is True
     )
     if not terminal:
         raise LifecycleError("completion-terminal-node-missing")
     rows = []
-    gates = route_module.terminal_gate_observation(route)
-    for node_id in terminal:
-        proof = gates.get(node_id, {})
-        digest = proof.get("marker_digest")
-        if not proof.get("passed") or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise LifecycleError("completion-terminal-marker-unverified", node_id)
-        rows.append({"node_id": node_id, "sha256": "sha256:" + digest})
+    if recorded:
+        live = None
+        for node_id in terminal:
+            path = route_module.completion_dir(route["route_id"]) / f"{node_id}.json"
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                # An owner-executed terminal node publishes no marker file; its proof is the
+                # owner's own observation, which is all there is to read for it.
+                live = live if live is not None else route_module.terminal_gate_observation(route)
+                proof = live.get(node_id, {})
+                digest = proof.get("marker_digest")
+                if not proof.get("passed") or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise LifecycleError("completion-terminal-marker-unverified", node_id) from exc
+            rows.append({"node_id": node_id, "sha256": "sha256:" + digest})
+    else:
+        gates = route_module.terminal_gate_observation(route)
+        for node_id in terminal:
+            proof = gates.get(node_id, {})
+            digest = proof.get("marker_digest")
+            if not proof.get("passed") or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise LifecycleError("completion-terminal-marker-unverified", node_id)
+            rows.append({"node_id": node_id, "sha256": "sha256:" + digest})
     encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -544,7 +640,12 @@ def evaluate_cycle_completion(
     publication: str = "not-offered",
     expected_root_id: Optional[str] = None,
     inline_finish_id: Optional[str] = None,
+    preserved: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Decision:
+    """`preserved` marks a document the runtime has already refreshed after the
+    close (§45 D-124): earlier documents of the cycle resolve its references,
+    the first-close rules (required roles, payload bytes) are not asked again,
+    and what is proved is the terminal record the close left."""
     publication_check = validate_publication(publication)
     if not publication_check.ok:
         return publication_check
@@ -567,7 +668,7 @@ def evaluate_cycle_completion(
         role for role in criterion.get("required_artifact_roles", [])
         if role not in revised_roles
     )
-    if missing_roles:
+    if missing_roles and preserved is None:
         return Decision(
             "reject",
             (_violation("completion-required-artifact-missing", detail=",".join(missing_roles)),),
@@ -584,18 +685,22 @@ def evaluate_cycle_completion(
         event.get("event_type") == "route.terminal.recorded" for event in cycle_events
     ):
         return Decision("reject", (_violation("completion-terminal-evidence-unbound"),))
-    report = artifact_manifest.validate(document)
+    report = (artifact_manifest.validate(document) if preserved is None
+              else artifact_manifest.validate_update(document, preserved=preserved, published=True))
     if not report.ok:
         details = " ".join(v.detail for v in report.violations)
         return Decision("reject", (_violation("completion-manifest-invalid", detail=details),))
     if document.get("cycle", {}).get("state") != "completed":
         return Decision("incomplete", (_violation("completion-cycle-not-completed"),))
-    payload_check = verify_published_payload(content_root, document)
-    if not payload_check.ok:
-        return payload_check
+    if preserved is None:
+        payload_check = verify_published_payload(content_root, document)
+        if not payload_check.ok:
+            return payload_check
     root = Path(route_file).resolve().parents[2]
     rows = document.get("routes", []) if isinstance(document, Mapping) else []
-    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+    if (not isinstance(rows, list) or not rows or not all(isinstance(row, Mapping) for row in rows)
+            or (len(rows) != 1 and preserved is None)):
+        # One row at the first close; a closed cycle another route closed again has one per route.
         return Decision("reject", (_violation("completion-route-composite-mismatch"),))
     selected_route_file = Path(route_file)
     cycle_id = cycle.get("cycle_id") if isinstance(cycle, Mapping) else None
@@ -672,13 +777,14 @@ def evaluate_cycle_completion(
         isinstance(row, dict) and row.get("passed") is True for row in gates.values()
     ):
         return Decision("reject", (_violation("completion-terminal-gate-unproven"),))
-    live_gates = route_module.terminal_gate_observation(route)
-    if not live_gates or not all(row.get("passed") is True for row in live_gates.values()):
-        return Decision(
-            "reject", (_violation("completion-terminal-marker-unverified"),)
-        )
+    if preserved is None:
+        live_gates = route_module.terminal_gate_observation(route)
+        if not live_gates or not all(row.get("passed") is True for row in live_gates.values()):
+            return Decision(
+                "reject", (_violation("completion-terminal-marker-unverified"),)
+            )
     try:
-        marker_digest = _marker_digest(route_module, route)
+        marker_digest = _marker_digest(route_module, route, recorded=preserved is not None)
     except LifecycleError as exc:
         return Decision("reject", (_violation(exc.code, detail=exc.detail),))
     outcome_digest = _sha256_path(outcome_path)

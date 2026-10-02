@@ -219,9 +219,10 @@ def _primary_heading_candidate(ctx: CycleContext) -> Tuple[Optional[str], Option
     revisions_field = ctx.manifest.get("artifact_revisions")
     revisions = [row for row in revisions_field if isinstance(row, Mapping) and row.get("artifact_id") == artifact_id] \
         if isinstance(revisions_field, list) else []
-    if len(revisions) != 1:
+    if not revisions:
         return None, "primary-ambiguous"
-    revision = revisions[0]
+    # A finished cycle's primary may have been edited since: the newest revision names the file.
+    revision = max(revisions, key=lambda row: row.get("revision_sequence") if isinstance(row.get("revision_sequence"), int) else 0)
     locator = revision.get("locator") if isinstance(revision.get("locator"), Mapping) else {}
     rel = locator.get("path")
     if locator.get("kind") != "cycle-relative" or not isinstance(rel, str):
@@ -248,8 +249,6 @@ def _primary_heading_candidate(ctx: CycleContext) -> Tuple[Optional[str], Option
         return None, "primary-missing"
     if len(raw) > PRIMARY_MAX_BYTES:
         return None, "primary-too-large"
-    if artifact_manifest.digest_bytes(raw) != revision.get("content_digest"):
-        return None, "primary-digest-mismatch"
     heading = _first_heading(raw)
     if heading is None:
         return None, "no-heading"
@@ -430,11 +429,6 @@ def _eligibility_check(record: Optional[Mapping[str, Any]], raw: bytes, parsed: 
                        identity: artifact_identity.RootIdentity) -> Optional[str]:
     if record is None:
         return "record-missing"
-    state = record.get("state")
-    if state == "superseded":
-        return "record-superseded"
-    if state != "sealed":
-        return "record-not-sealed"
     if record_digest(raw) != record.get("manifest_digest"):
         return "record-digest-mismatch"
     campaign = parsed.get("campaign") if isinstance(parsed.get("campaign"), Mapping) else {}

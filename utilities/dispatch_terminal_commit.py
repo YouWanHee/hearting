@@ -47,7 +47,6 @@ _DETAIL_REASON_MAP = {
     "child-not-terminal": "child-not-quiescent",
     "active-retry": "child-not-quiescent",
     "active-review-lease": "producer-finalize-failed",
-    "binding-cycle-not-open": "producer-binding-mismatch",
 }
 
 
@@ -539,7 +538,7 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         record = json.loads(record_raw.decode())
     except (OSError, UnicodeError, ValueError) as exc:
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}") from exc
-    if not isinstance(record, dict) or record.get("cycle_id") != cycle_id or record.get("state") != "open":
+    if not isinstance(record, dict) or record.get("cycle_id") != cycle_id:
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}")
     producer = __import__("artifact_producer")
     admission = producer.cycle_route_admission(root, record, route)
@@ -555,14 +554,14 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         "root_identity": {"repository_id": identity.repository_id, "artifact_root_id": identity.artifact_root_id},
         "campaign_id": record.get("campaign_id"), "cycle_id": cycle_id,
         "producer_id": record.get("producer_id"),
-        "cycle_record_digest": cycle_identity_digest(record), "observed_state": "open",
+        "cycle_record_digest": cycle_identity_digest(record), "observed_state": record.get("state"),
     }
     path = producer_binding_path(root, owner.route_id, owner_attempt_id)
     data = _canonical(binding) + b"\n"
     if not owner_begin:
         existing = load_producer_binding(artifact_root=root, route_id=owner.route_id,
                                          owner_attempt_id=owner_attempt_id)
-        if existing.path.read_bytes() != data:
+        if not _binding_replays(existing, data, binding, record):
             raise TerminalCommitError("transaction-conflict", str(path))
         return ProducerBindingResult("replayed", path, existing.binding, existing.digest, True)
     try:
@@ -570,9 +569,27 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         return ProducerBindingResult("published", path, binding, _digest(data), False)
     except FileExistsError:
         existing = load_producer_binding(artifact_root=root, route_id=owner.route_id, owner_attempt_id=owner_attempt_id)
-        if existing.binding is not None and existing.path.read_bytes() == data:
+        if existing.binding is not None and _binding_replays(existing, data, binding, record):
             return ProducerBindingResult("replayed", path, existing.binding, existing.digest, True)
         raise TerminalCommitError("transaction-conflict", str(path))
+
+
+def _binding_replays(existing, data, fresh, record) -> bool:
+    """Whether a binding published earlier is this same binding read again.
+
+    The stored bytes are never rewritten.  A cycle that has since been closed
+    or moved to another campaign is still the same cycle: the state it was
+    observed in and its campaign are a snapshot of that moment, so only the
+    cycle/producer/route identity and the owner/route fields must agree.
+    """
+    if existing.path.read_bytes() == data:
+        return True
+    stored = existing.binding or {}
+    projection = ("campaign_id", "cycle_record_digest", "observed_state")
+    if ({k: v for k, v in stored.items() if k not in projection}
+            != {k: v for k, v in fresh.items() if k not in projection}):
+        return False
+    return cycle_identity_matches(record, stored.get("cycle_record_digest"), campaign_id=stored.get("campaign_id"))
 
 
 def producer_binding_digest(binding_path: Path) -> str:
@@ -586,6 +603,22 @@ def cycle_identity_digest(record):
     """Only immutable cycle identity; state/mtime/projection updates are not identity."""
     return _digest(_canonical({key: record.get(key) for key in (
         "campaign_id", "cycle_id", "producer_id", "route_id", "route_hash", "route_file")}))
+
+
+def cycle_identity_matches(record, expected_digest, *, campaign_id=None) -> bool:
+    """Whether ``record`` is the cycle whose identity digest was stored as ``expected_digest``.
+
+    A cycle moved to another campaign is the same cycle (§45 D-123): the stored
+    campaign (``campaign_id``) stands in for the record's current one, while the
+    cycle, producer and begin-route identity stay exact.
+    """
+    if not expected_digest:
+        return False
+    if cycle_identity_digest(record) == expected_digest:
+        return True
+    if campaign_id and record.get("campaign_id") != campaign_id:
+        return cycle_identity_digest({**record, "campaign_id": campaign_id}) == expected_digest
+    return False
 
 
 def _route_module():
@@ -756,7 +789,8 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
         if children.status != "proved":
             return children
         if producer_lifecycle_applies(route):
-            # Binding is immutable and must still point at an open, matching cycle.
+            # Binding is immutable and must still point at the same cycle; the
+            # cycle's state and campaign are not part of that identity.
             binding = load_producer_binding(artifact_root=request.artifact_root,
                                             route_id=route["route_id"],
                                             owner_attempt_id=request.owner_attempt_id)
@@ -764,9 +798,8 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
                 return _proof_failure("producer-binding-mismatch")
             cycle_path = Path(request.artifact_root).resolve() / ".runtime/artifact-producer/v1/cycles" / f"{binding.binding['cycle_id']}.json"
             cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
-            if cycle.get("state") != "open":
-                return _proof_failure("binding-cycle-not-open")
-            if cycle_identity_digest(cycle) != binding.binding.get("cycle_record_digest"):
+            if not cycle_identity_matches(cycle, binding.binding.get("cycle_record_digest"),
+                                          campaign_id=binding.binding.get("campaign_id")):
                 return _proof_failure("producer-binding-mismatch", "cycle-identity-drift")
             producer = __import__("artifact_producer")
             admission = producer.cycle_route_admission(Path(request.artifact_root).resolve(), cycle, route)
@@ -783,6 +816,40 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
     except (OSError, UnicodeError, ValueError, KeyError, TypeError):
         return _proof_failure("route-identity-unverified")
     return TerminalProof("proved", None)
+
+
+# A settled transaction (the envelope is sealed) is replayed from what it recorded
+# (§45 D-127).  The route's live gate observation judges a completion marker's evidence
+# file by today's bytes, so a report edited, moved or deleted after the settlement reads as
+# "evidence moved on".  For these two reasons only, the row is rebuilt from the marker
+# itself: its own bytes and the evidence digest it recorded, which is what the claim bound.
+_EVIDENCE_MOVED_ON = frozenset({"completion-evidence-revised-unrecorded", "completion-evidence-unreadable"})
+
+
+def _settled_gate_rows(route_module, route, request, gates):
+    nodes = {node.get("id"): node for node in route.get("nodes", []) if isinstance(node, dict)}
+    rows = {}
+    for node_id, row in gates.items():
+        rebuilt = None
+        if (isinstance(row, Mapping) and row.get("passed") is False
+                and row.get("reason") in _EVIDENCE_MOVED_ON and node_id in nodes):
+            try:
+                path = route_module.completion_dir(route["route_id"], jobs=request.jobs) / f"{node_id}.json"
+                raw = path.read_bytes()
+                marker = json.loads(raw)
+                evidence = marker.get("evidence") or {}
+                if (marker.get("route_id") == route["route_id"] and marker.get("route_hash") == route["route_hash"]
+                        and marker.get("node_id") == node_id
+                        and marker.get("completion_gate") == nodes[node_id].get("terminal_gate")
+                        and isinstance(marker.get("attempt_id"), str) and isinstance(evidence.get("sha256"), str)):
+                    rebuilt = {"passed": True, "node_id": node_id, "attempt_id": marker["attempt_id"],
+                               "completion_gate": marker["completion_gate"],
+                               "marker_digest": hashlib.sha256(raw).hexdigest(),
+                               "evidence_digest": evidence["sha256"], "evidence": evidence.get("path")}
+            except (OSError, ValueError, TypeError, AttributeError):
+                rebuilt = None
+        rows[node_id] = rebuilt or row
+    return rows
 
 
 def _reverify_forward_recovery(
@@ -814,6 +881,8 @@ def _reverify_forward_recovery(
         )
         route_module = _route_module()
         gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+        if existing_state_value.get("state") == "owner-envelope-sealed":
+            gates = _settled_gate_rows(route_module, route, request, gates)
         marker_digest = terminal_marker_digest(list(gates.values()))
         if producer_lifecycle_applies(route):
             binding = load_producer_binding(
@@ -887,6 +956,9 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         route = json.loads(Path(request.route_file).read_text(encoding="utf-8"))
         route_module = _route_module()
         gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+        settled = existing_state_value is not None and existing_state_value.get("state") == "owner-envelope-sealed"
+        if settled:
+            gates = _settled_gate_rows(route_module, route, request, gates)
         markers = list(gates.values())
         terminal_nodes = tuple((route.get("workflow_contract") or {}).get("terminal_nodes") or ())
         marker_digest = terminal_marker_digest(markers)
@@ -920,6 +992,8 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             if fresh.status != "proved":
                 raise TerminalCommitError(fresh.reason or "transaction-conflict", fresh.detail or "claim-proof-changed")
             fresh_gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+            if settled:
+                fresh_gates = _settled_gate_rows(route_module, route, request, fresh_gates)
             if terminal_marker_digest(list(fresh_gates.values())) != marker_digest:
                 raise TerminalCommitError("transaction-conflict", "claim-markers-changed")
             dispatch_contract.claim_terminal_route_locked(
@@ -977,11 +1051,13 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             if production_services:
                 _verify_settled_outputs(request, route, commit_id, binding_value)
             try:
-                envelope_text = _read_sealed_owner_envelope(request, commit_id)
+                envelope_text, after_seal = _sealed_owner_envelope(request, commit_id)
             except TerminalCommitError as exc:
                 _record_attempt(request, exc.code, exc.detail)
                 return TerminalCommitResult("recoverable", exc.code, exc.detail, terminal_nodes)
-            return TerminalCommitResult("completed", None, None, terminal_nodes, envelope_text)
+            # §45 D-127: the stored envelope is delivered as it was; a report that
+            # changed or went away afterwards is information beside it, not a failure.
+            return TerminalCommitResult("completed", None, after_seal, terminal_nodes, envelope_text)
         return TerminalCommitResult("recoverable", "recovery-unavailable", "partial-state", terminal_nodes)
     except TerminalCommitError as exc:
         _record_attempt(request, exc.code, exc.detail)
@@ -994,8 +1070,38 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         return TerminalCommitResult("recoverable", "recovery-unavailable", str(exc))
 
 
-def _read_sealed_owner_envelope(request, commit_id):
-    """One read-only envelope proof for settlement replay and delivery."""
+def _missing_after_seal(artifact_root: Path, primary: Path) -> str:
+    """Why the sealed report is not there: its cycle was deleted since (§45 D-126), or it moved on.
+
+    Information beside the stored envelope, never a failure."""
+    directory = Path(artifact_root) / ".runtime/artifact-producer/v1/cycles"
+    try:
+        names = os.listdir(str(directory))
+    except OSError:
+        return "primary-missing-after-seal"
+    text = primary.as_posix()
+    for name in names:
+        try:
+            raw = (directory / name).read_bytes()
+            if b'"deleted_at"' not in raw:
+                continue
+            record = json.loads(raw)
+        except (OSError, ValueError):
+            continue
+        locator = record.get("locator") if isinstance(record, dict) else None
+        if isinstance(locator, str) and locator and record.get("deleted_at") and f"/{locator}/" in text:
+            return "cycle-deleted-after-seal"
+    return "primary-missing-after-seal"
+
+
+def _sealed_owner_envelope(request, commit_id):
+    """The stored envelope text and what became of its primary report afterwards.
+
+    The envelope and its content digest, and the commit identity they were sealed
+    under, are proved.  The report the envelope names is judged only as news
+    (§45 D-127): `None` when it still holds the sealed bytes, else
+    `primary-changed-after-seal`, `primary-missing-after-seal` (moved or removed) or
+    `cycle-deleted-after-seal` (its cycle was deleted, §45 D-126).  Nothing here fails because the report moved on."""
     slot = _commit_state_path(request).parent
     try:
         meta = json.loads((slot / "owner-envelope.json").read_text())
@@ -1007,11 +1113,22 @@ def _read_sealed_owner_envelope(request, commit_id):
     if _digest(text.encode()) != meta.get("content_digest"):
         raise TerminalCommitError("transaction-conflict", "envelope-content-mismatch")
     primary = Path(meta.get("primary_path") or "")
-    if not primary.is_absolute() or not _in_root_regular(primary, request.artifact_root.resolve()):
+    if not primary.is_absolute():
         raise TerminalCommitError("recovery-unavailable", "primary-no-longer-in-root")
-    if _digest(primary.read_bytes()) != meta.get("primary_digest"):
-        raise TerminalCommitError("transaction-conflict", "primary-content-drifted-after-seal")
-    return text
+    if not _in_root_regular(primary, request.artifact_root.resolve()):
+        return text, _missing_after_seal(request.artifact_root, primary)
+    try:
+        sealed_bytes = primary.read_bytes()
+    except OSError:
+        return text, _missing_after_seal(request.artifact_root, primary)
+    if _digest(sealed_bytes) != meta.get("primary_digest"):
+        return text, "primary-changed-after-seal"
+    return text, None
+
+
+def _read_sealed_owner_envelope(request, commit_id):
+    """One read-only envelope proof for settlement replay and delivery."""
+    return _sealed_owner_envelope(request, commit_id)[0]
 
 
 def _verify_settled_outputs(request, route, commit_id, binding):
