@@ -28,7 +28,7 @@ rebuttals, reviews, blogs, and memos). The mode is form-first; the natural
 language task describes purpose/genre without a subtype enum. Discover inputs
 from `<artifact-root>/{analysis_project,research}/*`; preprocess external
 materials with `/analyze-project --mode {paper|doc}`. Load matching format specs
-from `analysis_project/doc/{matching}/formats/` without a `--format-ref` flag.
+from `analysis_project/doc/{matching}/formats/` automatically.
 Mode conventions live under `## Mode-Specific Conventions` (common plus paper,
 presentation, or doc). Presentation mode produces Markdown only; PPTX export is
 unsupported, so use PowerPoint directly.
@@ -83,7 +83,7 @@ notice after; `core/WORKFLOW.md` §0.4 owns the user-facing card.
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.
+Artifact root: `core/CONVENTIONS.md §5.1`; output placement: `§5`.
 
 ## Artifact Producer Lifecycle
 

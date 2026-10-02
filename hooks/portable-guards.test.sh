@@ -19,7 +19,6 @@ MARK="$ROOT/hooks/spec-read-marker.sh"
 RECALL="$ROOT/hooks/mem-recall-inject.sh"
 BRIEF="$ROOT/hooks/mem-briefing-inject.sh"
 SDR="$ROOT/hooks/stage-dispatch-reminder.sh"
-CSG="$ROOT/hooks/conductor-stop-gate.sh"
 
 PASS=0
 FAIL=0
@@ -3532,35 +3531,6 @@ err=$(env -u CLAUDE_CODE_CHILD_SESSION AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --ski
 [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'stage-dispatch denied' \
   && ok "SDR denies on harness depth marker alone (no runtime marker)" \
   || bad "SDR should deny on depth alone (rc=$rc) [$err]"
-
-echo "== SD-14b conductor Stop gate (UNREGISTERED / CLI unit) =="
-sdtmp="$(mktemp -d)"
-sdjobs="$sdtmp/jobs.log"
-: > "$sdjobs"
-# no open children → exit 0, no block
-out=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_DEPTH=1 "$CSG" --self-slug cyc --jobs "$sdjobs" 2>/dev/null)
-[ -z "$out" ] && ok "CSG no block when no open children" || bad "CSG should not block with no children [$out]"
-# open child, dead (no transcript) → block with diagnose
-printf '%s\t%s\t%s\t%s\t%s\t%s\n' "2026-07-10T00:00:00" "open" "repo" "$sdtmp/wt/d" "dc" "capability=code-plan,parent=cyc" >> "$sdjobs"
-out=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_DEPTH=1 DISPATCH_RUNTIME_ROOT="$sdtmp/rt" "$CSG" --self-slug cyc --jobs "$sdjobs" 2>/dev/null)
-if printf '%s' "$out" | grep -q '"decision":[[:space:]]*"block"' && printf '%s' "$out" | grep -q 'SUSPECT/DEAD'; then
-  ok "CSG blocks with diagnose for dead open child"
-else bad "CSG should block-diagnose for dead child [$out]"; fi
-# stop_hook_active → no block (loop guard)
-out=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_DEPTH=1 "$CSG" --self-slug cyc --jobs "$sdjobs" --stop-active true 2>/dev/null)
-[ -z "$out" ] && ok "CSG no block when stop_hook_active" || bad "CSG should no-op when stop_hook_active [$out]"
-# non-conductor env (no dispatch depth) → no block
-out=$("$CSG" --self-slug cyc --jobs "$sdjobs" 2>/dev/null)
-[ -z "$out" ] && ok "CSG no block for non-conductor env" || bad "CSG should no-op for non-conductor [$out]"
-# §5.10: a runtime child-session marker alone is a teammate session → no block
-out=$(CLAUDE_CODE_CHILD_SESSION=1 "$CSG" --self-slug cyc --jobs "$sdjobs" 2>/dev/null)
-[ -z "$out" ] && ok "CSG no block for teammate session (runtime marker, no depth)" || bad "CSG should no-op for teammate session [$out]"
-# depth marker alone is sufficient conductor evidence → still blocks
-out=$(env -u CLAUDE_CODE_CHILD_SESSION AGENT_DISPATCH_DEPTH=1 DISPATCH_RUNTIME_ROOT="$sdtmp/rt" "$CSG" --self-slug cyc --jobs "$sdjobs" 2>/dev/null)
-printf '%s' "$out" | grep -q '"decision":[[:space:]]*"block"' \
-  && ok "CSG blocks on harness depth marker alone (no runtime marker)" \
-  || bad "CSG should block on depth alone [$out]"
-rm -rf "$sdtmp"
 
 echo "== §5.10 main-session lifecycle predicates: harness markers only =="
 # A runtime injects CLAUDE_CODE_CHILD_SESSION into every child process an ordinary

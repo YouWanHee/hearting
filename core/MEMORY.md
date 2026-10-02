@@ -1,6 +1,6 @@
 # Memory — Unified Store (canonical)
 
-> Split from `CONVENTIONS.md` on 2026-06-23. Memory is an independent subsystem. Preserve the §7 numbering. This is the single source; the spec is `<artifact-root>/spec/prd.md` (`.agent_reports` first, with legacy `.claude_reports` compatibility), and the implementation is `tools/memory/mem.py` plus the dependency-free `protocol_v2.py`, `sync_v2.py`, `git_exchange_v2.py`, and `migration_v2.py` modules.
+> Split from `CONVENTIONS.md` on 2026-06-23. Memory is an independent subsystem. Preserve the §7 numbering. This is the single source; the spec is `<artifact-root>/spec/prd.md` (artifact root: `CONVENTIONS.md §5.1`), and the implementation is `tools/memory/mem.py` plus the dependency-free `protocol_v2.py`, `sync_v2.py`, `git_exchange_v2.py`, and `migration_v2.py` modules.
 
 ## §7. Unified Memory System
 

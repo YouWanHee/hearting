@@ -29,10 +29,9 @@ orientation and is not an `analyze-project` trigger by itself. When analysis
 already exists, read it before deciding that reanalysis is needed.
 
 That orientation starts with one targeted, agent-chosen memory recall; reads a
-shortened relevant hit in full by record ID; prefers `.agent_reports/` and uses
-`.claude_reports/` only when the canonical root is absent; then reads the
-newest report/experiment artifact with its current PRD/spec before primary
-code or data. Resolve drift as latest spec or user confirmation, durable
+shortened relevant hit in full by record ID; resolves the artifact root
+(`CONVENTIONS §5.1`); then reads the newest report/experiment artifact with its
+current PRD/spec before primary code or data. Resolve drift as latest spec or user confirmation, durable
 project fact, latest experiment contract, then legacy document, and report the
 conflict instead of silently selecting the older value.
 
@@ -46,7 +45,7 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.
+Artifact root: `core/CONVENTIONS.md §5.1`; output placement: `§5`.
 
 ## Artifact Producer Lifecycle
 
@@ -92,10 +91,9 @@ Adapters must preserve the portable invariants relevant to this capability:
 
 Before invocation, follow `core/WORKFLOW.md §0.1`: run one targeted,
 agent-chosen memory recall and read any shortened relevant hit in full by
-record ID; prefer `.agent_reports/`, falling back to `.claude_reports/` only
-when the canonical root is absent; then inspect the newest report and
-experiment artifacts plus current PRD/spec before checking primary code or
-data. This order is context recovery, not persistent reanalysis.
+record ID; resolve the artifact root (`CONVENTIONS §5.1`); then inspect the
+newest report and experiment artifacts plus current PRD/spec before checking
+primary code or data. This order is context recovery, not persistent reanalysis.
 
 For read-only orientation, do not invoke this capability and do not create or
 update `analysis_project/`. Follow relevant memory paths and resolve drift with

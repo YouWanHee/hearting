@@ -11,6 +11,7 @@ from tools.fleet.collectors import dispatch
 
 _ROW = ("2026-07-19T00:00:00Z\tdone\t/r\t/w\t{slug}\t"
         "route_id={rid},route_file={rf},owner_route_id={rid},owner_route_file={rf},"
+        "owner_route_hash=sha256:f83,"
         "worker_type=owner,attempt_id={att},pid=999999990,pid_start=1,"
         "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
         "execution_surface=registered-headless,registered_worker=1,"

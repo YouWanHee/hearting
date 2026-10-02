@@ -1,6 +1,6 @@
 > **Artifact layout:** follow [CONVENTIONS §5](../../../core/CONVENTIONS.md#5-skill-output-convention--t1t2t3). Code artifacts normally live under `<artifact-root>/plans/<date>_<slug>/`, independent of spec presence. `direct` has no plan artifact. `quick` uses an inline micro-plan and writes a durable plan only when adapter or repository policy requires it. In standard+, `plan/` and checklist are T1, `dev_logs/` and `test_logs/` are T2, and reviewer logs live under `_internal/`. Monorepos may use component subdirectories.
 >
-> **Artifact root:** prefer `.agent_reports`; use legacy `.claude_reports` only when it exists and `.agent_reports` does not. In shell, resolve with `REPORTS_DIR=.agent_reports; [ -d .claude_reports ] && [ ! -d .agent_reports ] && REPORTS_DIR=.claude_reports`.
+> **Artifact root:** resolve with `utilities/artifact-root.sh` (CONVENTIONS §5.1).
 
 ## Context Auto-Detection
 

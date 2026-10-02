@@ -1,1 +1,0 @@
-../../../hooks/conductor-stop-gate.sh

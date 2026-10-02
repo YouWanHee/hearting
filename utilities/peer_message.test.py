@@ -106,7 +106,7 @@ class PeerMessageTest(_TmpRootMixin, unittest.TestCase):
 
     def test_same_second_repeated_records_get_distinct_message_ids(self):
         # Same sender/target/second-resolution ts/summary — the classic
-        # steward-wait collision reproduced in evidence/peer-steward-wait.txt.
+        # steward-wait collision (its reproduction log left the repo with evidence/).
         to = {"session_id": "sid-b"}
         ts = "2026-09-02T00:00:00Z"
         id_a = peer_message._message_id("sid-a", to, ts, "same summary")

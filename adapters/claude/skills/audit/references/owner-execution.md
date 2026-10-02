@@ -3,7 +3,7 @@
 Read-oriented post-run inspection entrypoint for artifacts and pipelines. Diagnose drift, inconsistency, and omissions through Stages A-E: detect type, select scope, ingest the P1 baseline, lint selected aspects, report findings, and optionally dispatch an auto-fix chain. This file defines routing and stage contracts; load the relevant reference only when its detailed procedure or template is needed.
 
 > **Output folder convention**: CONVENTIONS.md §5 (`<agent-home>/core/CONVENTIONS.md#5-skill-output-convention--t1t2t3`) (3-tier). Do not modify the audited artifact during inspection; write only an audit report at `{artifact_dir}/_internal/audit/audit_{YYYY-MM-DDTHHMM}.md`.
-> Resolve `<artifact-root>` by preferring `.agent_reports` and falling back to legacy `.claude_reports`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
+> Resolve `<artifact-root>`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
 
 ## Position in autopilot family
 

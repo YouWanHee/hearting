@@ -4150,44 +4150,6 @@ def prepare_review_output_binding(
     return binding
 
 
-def review_output_write_authorized_from_cycle(
-    root: Path, *, jobs: str | Path, attempt_id: str, cycle_id: str,
-    review_output: str | Path,
-) -> bool:
-    """Authorize one report using cycle/route/registry facts, never env axes."""
-
-    root_input = Path(root)
-    canonical_root = root_input.resolve(strict=False)
-    if not root_input.is_absolute() or str(root_input) != str(canonical_root):
-        return False
-    try:
-        record = read_cycle_record(canonical_root, cycle_id)
-        if record is None:
-            return False
-        route = load_route(
-            canonical_root, Path(str(record.get("route_file", "")))
-        )
-        producer_id = str(record.get("producer_id", ""))
-        capability = str(record.get("capability", ""))
-        worktree = str(Path(str(route.get("cwd", ""))).resolve(strict=False))
-        binding = prepare_review_output_binding(
-            canonical_root, cycle_id=cycle_id, producer_id=producer_id,
-            attempt_id=attempt_id, review_output=review_output,
-            capability=capability, unit="qa/code-review", worktree=worktree,
-        )
-        lease_record = _read_json(
-            _review_lease_path(canonical_root, cycle_id, attempt_id)
-        )
-        return review_output_write_authorized(
-            jobs, output_path=binding["output_path"], attempt_id=attempt_id,
-            cycle_id=cycle_id, producer_id=producer_id,
-            capability=capability, unit="qa/code-review", worktree=worktree,
-            artifact_root=canonical_root, lease_record=lease_record,
-        )
-    except (ProducerError, OSError, TypeError, ValueError):
-        return False
-
-
 def review_lease_acquire(
     root: Path, *, cycle_id: str, attempt_id: str, deadline_seconds: float = 900.0,
     now: Optional[float] = None, review_output: Optional[str | Path] = None,

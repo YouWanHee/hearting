@@ -14,10 +14,9 @@ understand the project, recover prior context, resume work, or report current
 status remains read-only orientation, not an `analyze-project` trigger.
 
 Before invocation, run one targeted, agent-chosen memory recall and read a
-shortened relevant hit in full by record ID. Then resolve `.agent_reports/`,
-falling back to legacy `.claude_reports/` only when the canonical root is
-absent; read the newest report/experiment artifact and current PRD/spec before
-primary code or data, as defined by `core/WORKFLOW.md §0.1`. For orientation,
+shortened relevant hit in full by record ID. Then resolve the artifact root
+(CONVENTIONS §5.1); read the newest report/experiment artifact and current
+PRD/spec before primary code or data, as defined by `core/WORKFLOW.md §0.1`. For orientation,
 invoke no capability and write no artifact. Resolve drift as latest spec or
 user confirmation, durable project fact, latest experiment contract, then
 legacy document, and report the conflict instead of silently selecting an
@@ -30,7 +29,7 @@ older value.
 > **Output folder convention**: CONVENTIONS.md §5 (`<agent-home>/core/CONVENTIONS.md#5-skill-output-convention--t1t2t3`) (3-tier T1/T2/T3). Write this skill's outputs under `<artifact-root>/analysis_project/{code,paper,doc}/`. Keep each mode's main outputs at its root and raw scan logs or QA reviews under `_internal/`.
 
 > **Workspace assumption**: Run from the project root. Create `<artifact-root>/` in the current directory and resolve input code, PDFs, or document materials from that directory or its descendants.
-> Resolve `<artifact-root>` by preferring `.agent_reports` and falling back to legacy `.claude_reports`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md`).
+> Resolve `<artifact-root>`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md`).
 
 ## Language Rule
 
