@@ -574,8 +574,8 @@ reference를 받는다. 실제 두 adapter의 5 level×2 track, 20 CLI 호출과
 
 원 증거는 `/tmp/responsibility-proof-20260912/r5-owner-proof.json`, native 부모
 export와 `r5-all-opencode-native-models.json`에 있고 핵심 식별자·해시·시각·한계는
-버전 관리되는 [입증 기록](evidence/dispatch-responsibility-proof-20260913.json)에
-보존한다. 이전 r4 실패와 operator 복구를 삭제하거나 새 성공으로 바꿔 쓰지 않았다.
+입증 기록 `docs/evidence/dispatch-responsibility-proof-20260913.json`에 보존했다
+(2026-10-02 정리로 저장소에서 내렸고 git 이력 `26003e09`에 남아 있다). 이전 r4 실패와 operator 복구를 삭제하거나 새 성공으로 바꿔 쓰지 않았다.
 
 입증 범위는 다음과 같다. 실행·완료·재시도·정리·통보 계약의 공통화는 위 코드와
 회귀 검사로 확인했고, 실제 Codex/OpenCode 오너의 선택된 단계 실행과 런타임
@@ -621,7 +621,7 @@ entry 26 / terminal transaction 22 검사도 PASS였다. 설정·인증 파일 1
 원문을 보존하고 기존 사용자 지시대로 별도 CI 추격은 하지 않았다. 정식 Release와
 설치 검증의 통과를 전체 CI가 모두 녹색이라는 주장으로 확대하지 않는다.
 
-[설치 입증 기록](evidence/dispatch-responsibility-install-20260913.json)에
+설치 입증 기록 `docs/evidence/dispatch-responsibility-install-20260913.json`(git 이력 `26003e09`)에
 정확한 릴리즈·설치 source, 세 runtime 검사, 해시와 원본 로그 위치를 저장했다.
 이 절과 설치 기록은 문서만 추가하는 후속 커밋이며 새 릴리즈를 요구하지 않는다.
 
