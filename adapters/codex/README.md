@@ -382,7 +382,7 @@ Claude Code-specific files remain valid as implementation references, not as Cod
 When porting a behavior, copy the underlying invariant from `CORE.md`, `WORKFLOW.md`, `CONVENTIONS.md`, or `OPERATIONS.md`; then map it to Codex's tool, approval, and session model.
 # Material-route boundary
 
-Hook write gates are retired. Spec-read observations, design checks, memory and session signals remain available.
+Hook write gates are retired except the two kept core write gates and the route presence gate (`core/HOOKS.md`). Spec-read observations, design checks, memory and session signals remain available.
 
 Resource-runner startup requires a sealed route, exact detached resource node,
 and smoke attestation before launch state or a child process exists. Installing

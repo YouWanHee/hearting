@@ -17,6 +17,8 @@ const checkpointTrigger = path.join(root, "utilities", "artifact_checkpoint_trig
 const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
+const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
+const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_patch", "bash"])
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 const promptBySession = new Map()
 const turnBySession = new Map()
@@ -496,6 +498,16 @@ export const AgentHarnessGuards = async (ctx) => {
   "tool.execute.before": async (input, output) => {
     for (const file of targetFiles(ctx, input.tool || {}, output.args || {})) {
       const result = spawnSync("python3", [coreWriteGuard, "--check", file, "--cwd", baseDir(ctx)], {
+        encoding: "utf8",
+      })
+      if (result.status === 1) throw new Error((result.stdout || "").trim())
+    }
+    // The route presence gate (utilities/route_presence_gate.py): a session's first source
+    // edit, commit or long run in a folder needs a route there. Anything else passes.
+    const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
+    if (routeGateTools.has(toolName)) {
+      const result = spawnSync("python3", [routePresenceGate, "--opencode"], {
+        input: JSON.stringify({ tool: toolName, args: output.args || {}, sessionID: input.sessionID || "", cwd: baseDir(ctx) }),
         encoding: "utf8",
       })
       if (result.status === 1) throw new Error((result.stdout || "").trim())
