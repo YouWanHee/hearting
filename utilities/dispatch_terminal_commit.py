@@ -820,6 +820,11 @@ def _prove_route_children(request, route, gates):
     for status, meta in related:
         if status == "done" and dispatch_contract.completed_marker_verdict_contradicts(meta):
             return _proof_failure("terminal-attempt-not-pass")
+        if (status == "done" and meta.get("launch_claimed") == "0" and meta.get("launch_started") != "1"
+                and not meta.get("pid")):
+            # Registered, never claimed for launch, then closed: no process ever existed to wait for.
+            # (`claim_attempt_row` sets launch_claimed=1 under the jobs lock before any spawn.)
+            continue
         process = dispatch_contract.attempt_process_quiescence(meta, terminal_receipt=True)
         decision = decide_attempt(status, meta, process_state=process.state, process_reason=process.reason)
         if decision.action == "inspect-conflict":
@@ -1630,6 +1635,20 @@ def inspect_owner_completion(jobs, status, metadata):
     return result
 
 
+def _parent_has_notice_carrier(metadata) -> bool:
+    """Whether a completion notice has a carrier to reach the parent.
+
+    A poll-fallback parent has none: it reads the same state from its own `start --wait`
+    receipt, so building the notice could only fail again on every poll. A child row's
+    lineage root is resolved by `materialize` itself.
+    """
+    if metadata.get("parent_attempt_id") not in (None, "", "-"):
+        return True
+    import dispatch_pending_delivery as pending_delivery
+    return (bool(metadata.get("parent_sid"))
+            and metadata.get("parent_completion_delivery") in pending_delivery.RECIPIENT_KINDS)
+
+
 def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | None:
     """Runtime-owned, retryable workflow/route/cycle closure after exact PASS.
 
@@ -1671,7 +1690,7 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         # terminal failure. Preserve their typed reason without model content.
         result = TerminalCommitResult("recoverable", "recovery-unavailable",
                                       str(getattr(exc, "code", type(exc).__name__)))
-    if result.result != "completed":
+    if result.result != "completed" and _parent_has_notice_carrier(metadata):
         from dispatch_supervision import materialize
         try:
             materialize(Path(jobs), {metadata["attempt_id"]}, reason="workflow-completion-pending")

@@ -76,12 +76,21 @@ def _file(path):
     return {"path": str(resolved), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def drop_inapplicable(node, reviewed_evidence):
+    """`--reviewed-evidence` binds what a plan or spec review examines; on any other node it binds
+    nothing, so the optional value is dropped with a printed note instead of refusing the launch."""
+    if reviewed_evidence and not is_review_node(node):
+        print(f"reviewed_evidence_ignored={node.get('id')}")
+        return None
+    return reviewed_evidence
+
+
 def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None,
                   producer_preview=None):
-    """Resolve explicit authority or the current primary plan gate, read-only."""
+    """Resolve explicit authority or the current primary plan gate, read-only.
+
+    A node that is not a plan/spec review has no reviewed input; a value given for it is ignored."""
     if not is_review_node(node):
-        if reviewed_evidence:
-            raise DC.DispatchContractError("reviewed-evidence-node-invalid", str(node.get("id")))
         return None
     explicit = _file(reviewed_evidence) if reviewed_evidence else None
     if retry_of:

@@ -959,6 +959,31 @@ class FallbackTest(unittest.TestCase):
    F.capacity_attempt_identity(one,route,node,row,1,"model-a"),
    F.capacity_attempt_identity(two,route,node,row,1,"model-a"),
   )
+ def test_a_later_round_keeps_the_same_harness_under_its_own_identity(self):
+  # OpenCode r4: round 2 of `test` on the pinned harness got round 1's (finished) identity,
+  # was refused as an identity conflict and fell through to another harness.
+  route={"route_id":"rt-rounds"};node={"id":"test"};row={"child_harness":"opencode"}
+  args=SimpleNamespace(slug="stage",parent="owner",parent_attempt_id="att-owner")
+  first=F.attempt_identity(args,route,node,row,1)
+  self.assertEqual(F.attempt_identity(args,route,node,row,1,1),first)
+  self.assertNotEqual(F.attempt_identity(args,route,node,row,1,2),first)
+  self.assertEqual(F.attempt_identity(args,route,node,row,1,2),F.attempt_identity(args,route,node,row,1,2))
+ def test_start_does_not_count_the_row_it_registered_itself_as_a_live_round(self):
+  def row(aid,status="open",**extra):
+   meta={"route_id":"rt-own","route_node":"test","attempt_id":aid,"parent_attempt_id":"att-owner",
+         "launch_claimed":"0",**extra}
+   return "2026-10-02T00:00:00Z\t"+status+"\t/repo\t/repo\tstage\t"+",".join(f"{k}={v}" for k,v in meta.items())
+  route={"route_id":"rt-own"};node={"id":"test"}
+  args=lambda action,slug="stage",parent="att-owner":SimpleNamespace(action=action,jobs=self.jobs,slug=slug,parent_attempt_id=parent)
+  self.jobs.write_text(row("att-registered")+"\n")
+  self.assertEqual(F.own_registered_attempt(args("start"),route,node),"att-registered")
+  for other in (args("register"),args("dry-run"),args("start",slug="other"),args("start",parent="att-other")):
+   self.assertIsNone(F.own_registered_attempt(other,route,node))
+  for line in (row("att-registered",launch_claimed="1"),row("att-registered",pid="12"),row("att-registered","done")):
+   self.jobs.write_text(line+"\n")
+   self.assertIsNone(F.own_registered_attempt(args("start"),route,node))
+  self.jobs.write_text(row("att-a")+"\n"+row("att-b")+"\n")
+  self.assertIsNone(F.own_registered_attempt(args("start"),route,node))
  def test_legacy_parent_generation_conflict_is_typed_without_reusing_identity(self):
   route={"route_id":"rt-parent-generation"};node={"id":"plan"};row={"child_harness":"codex"}
   old=SimpleNamespace(slug="stage",parent="owner",parent_attempt_id="att-parent-old")

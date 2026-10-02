@@ -199,6 +199,31 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["capacity_waited_seconds"], 7)
         self.assertEqual(W.join_selected_attempts.call_args.kwargs["timeout"], 600 - 7)
 
+    def test_a_replacement_inside_one_wait_uses_only_what_is_left_of_the_start_window(self):
+        # OpenCode r4: the frame/owner died after ~590 s of the wait, was replaced at once, and the same
+        # call then waited another full window -- past its caller's timeout, so nothing came back.
+        now = [1_800_000_000.0]
+        timeouts = []
+
+        def join(**kwargs):
+            timeouts.append(kwargs["timeout"])
+            now[0] += 590
+            return {"state": "timeout", "children": []}
+        replaced = [True]
+
+        def batch(jobs, attempts, run=None):
+            if replaced:
+                replaced.pop()
+                return set(attempts) | {"att-replacement"}, [{"replacement_attempt_id": "att-replacement"}], []
+            return set(attempts), [], []
+        with mock.patch.object(W, "join_selected_attempts", side_effect=join), \
+                mock.patch("dispatch_replacement.advance_batch", side_effect=batch):
+            result = self.start(wait=True, sleep=lambda seconds: None, clock=lambda: now[0])
+        self.assertEqual(timeouts, [600, 10])
+        self.assertEqual(result["join_waited_seconds"], 1180)
+        self.assertEqual(W._wait_budget(result), 0)
+        self.assertEqual(W._wait_budget({"capacity_waited_seconds": 7, "join_waited_seconds": 3}), 590)
+
     def test_resume_wait_refused_again_hands_back_without_another_wait(self):
         run = self.make_run(refuse_node="frame-alternative", refuse_times=99,
                              receipt=self.refusal_receipt(retry_after_seconds=3))
@@ -773,6 +798,25 @@ class WorkStartTest(unittest.TestCase):
             "workflow_completion": "runtime-v1", "owner_route_id": self.route["route_id"]})}), \
                 mock.patch.object(terminal, "owner_completion_state", return_value=terminal.CompletionState("pending")):
             self.assertEqual(self.start()["reason"], "workflow-completion-pending")
+        self.assertEqual(self.calls, [])
+
+    def test_a_replaced_owner_with_nothing_to_settle_does_not_hold_a_closed_route(self):
+        # The first owner stopped at a gate and was replaced; its BLOCKED row is `not-applicable`,
+        # and the replacement settled the route (Claude r4 leg1, defect 2).
+        import dispatch_terminal_commit as terminal
+        self.path.with_suffix(".outcome.json").write_text(json.dumps({
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"], "terminal_gate_proven": True,
+            "terminal_owner_attempt_id": "att-replacement"}))
+        rows = {aid: ("done", {"workflow_completion": "runtime-v1", "owner_route_id": self.route["route_id"]})
+                for aid in ("att-first", "att-replacement")}
+        states = {"att-first": "not-applicable", "att-replacement": "complete"}
+        with mock.patch.object(W, "_rows", return_value=rows), \
+                mock.patch.object(terminal, "owner_completion_state",
+                                  side_effect=lambda jobs, status, meta: terminal.CompletionState(states[meta["aid"]])):
+            for aid, (_status, meta) in rows.items():
+                meta["aid"] = aid
+            result = self.start()
+        self.assertEqual((result["state"], result["required_action"]), ("completed", "advance-completed"), result)
         self.assertEqual(self.calls, [])
 
     def test_successor_session_harvests_a_finished_route_but_not_a_live_one(self):

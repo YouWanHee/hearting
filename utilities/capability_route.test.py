@@ -8181,11 +8181,25 @@ class EntryExecutionScopeTest(unittest.TestCase):
     self.assertEqual(projected["graph"], expected)
     self.assertEqual(leg["graph"], original)
 
- def test_route_plan_scope_applies_to_first_leg_only(self):
-  record={"decision":{"approvals":{"execution_scope":"report"}}}
-  self.assertEqual(R.route_plan_execution_scope({"index":0,"record":record}),"report")
-  self.assertIsNone(R.route_plan_execution_scope({"index":1,"record":record}))
-  self.assertIsNone(R.route_plan_execution_scope({"index":True,"record":record}))
+ def test_route_plan_scope_carries_to_every_leg_of_the_same_decision(self):
+  code={"capability":"autopilot-code","mode":"dev","shape":"staged","graph":["plan","execute","test","report"]}
+  refine={"capability":"autopilot-refine","mode":None,"shape":"staged","graph":["review","transaction"]}
+  legs=[code,refine]
+  def binding(index, scope, given):
+   record={"decision":{"approvals":{"execution_scope":scope,"given":given}}}
+   return {"index":index,"record":record,"legs":legs}
+  approved=[{"key":"preview","leg":1,"accepted":True}]
+  self.assertEqual(R.route_plan_execution_scope(binding(0,"report",[])),"report")
+  self.assertEqual(R.route_plan_execution_scope(binding(1,"report",[])),"report")
+  self.assertEqual(R.route_plan_execution_scope(binding(1,"complete",approved)),"complete")
+  # A part the person did not approve for that leg keeps its gate.
+  self.assertIsNone(R.route_plan_execution_scope(binding(1,"complete",[])))
+  self.assertIsNone(R.route_plan_execution_scope(binding(1,"complete",[{**approved[0],"accepted":False}])))
+  self.assertIsNone(R.route_plan_execution_scope(binding(1,"complete",[{**approved[0],"leg":0}])))
+  # Report stops before the first approval; a later leg with no step before it keeps its gate.
+  only_transaction=[code,{**refine,"graph":["transaction"]}]
+  self.assertIsNone(R.route_plan_execution_scope({**binding(1,"report",[]),"legs":only_transaction}))
+  self.assertIsNone(R.route_plan_execution_scope({**binding(0,"report",[]),"index":True}))
 
  def test_scope_marker_rejects_boolean_and_unversioned_markers(self):
   for version, scope in ((True, "report"), (1, "x"), (None, "report")):

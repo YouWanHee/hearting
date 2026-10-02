@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -75,6 +76,33 @@ def target_parts(artifact_root: Path, target: Path) -> tuple[Path,Path]:
     if "_internal" in parts or parts[-1] in EXCLUDED_NAMES:
         raise SnapshotError("target-machine-managed")
     return artifact_root.joinpath(*prefix,parts[0],parts[1]),Path(*parts[2:])
+
+
+def worktree_target(artifact_root: Path, route: dict, target: Path) -> tuple[Path,Path] | None:
+    """A document in the route's own working-tree repository (README and the like).
+
+    Its pre-change copy is kept in the route's cycle, under the cycle's `artifacts/` as
+    `_internal/versions/vN/<repository path>`; nothing is written into the repository. None when
+    the target lies outside that repository (or in its `.git`) or the route has no cycle yet.
+    """
+    cwd=route.get("cwd")
+    if not isinstance(cwd,str) or not cwd:
+        return None
+    try:
+        top=subprocess.run(["git","-C",cwd,"rev-parse","--show-toplevel"],capture_output=True,text=True,timeout=10)
+        repository=Path(top.stdout.strip() if top.returncode==0 and top.stdout.strip() else cwd).resolve()
+        relative=target.resolve(strict=False).relative_to(repository)
+    except (OSError,ValueError,subprocess.SubprocessError):
+        return None
+    if not relative.parts or relative.parts[0]==".git":
+        return None
+    try:
+        import artifact_producer
+        record=artifact_producer.route_cycle_for(artifact_root,route)
+        artifacts=artifact_producer._cycle_artifacts_dir(artifact_root,record["cycle_id"]) if record else None
+    except Exception:
+        return None
+    return (artifacts,relative) if artifacts else None
 
 
 def bucket_relative_parts(artifact_root: Path, target: Path) -> tuple[str,...]:
@@ -229,13 +257,17 @@ def prepare(args) -> int:
             raise SnapshotError(exc.code + ": " + exc.detail) from exc
         # The preview is output of this same conductor, before approval. It is
         # not a target document and must not enter the target snapshot path.
-        rel_parts = target.resolve().relative_to(artifact_root).parts
+        try:
+            rel_parts = target.resolve().relative_to(artifact_root).parts
+        except ValueError:
+            rel_parts = ()     # a repository document, handled below
         if rel_parts[:1] == ("campaigns",):
             index = 4 if len(rel_parts) > 2 and rel_parts[2] == "cycles" else 3
             rel_parts = rel_parts[index + 1:]
         if rel_parts[:2] == ("reviews", "refine") and "reviews/refine/**" in node.get("write_scope", []):
             emit({"status": "skipped", "reason": "quick-preview-artifact", "target": str(target)})
             return 0
+    in_repository=False
     try:
         artifact_dir,relative=target_parts(artifact_root,target)
     except SnapshotError as exc:
@@ -252,7 +284,10 @@ def prepare(args) -> int:
         ):
             emit({"status":"skipped","reason":"support-artifact","target":str(target)})
             return 0
-        raise
+        found=worktree_target(artifact_root,route,target) if reason=="target-outside-artifact-root" else None
+        if found is None:
+            raise
+        (artifact_dir,relative),in_repository=found,True
     if capability == "autopilot-refine" and intensity != "quick":
         # The owner's own `transaction` changes the target after the person released the preview it
         # raised: the fence the entry gate holds for a child launch, asked only once the path is known
@@ -270,7 +305,7 @@ def prepare(args) -> int:
         raise SnapshotError("target-not-regular")
     preimage=target.read_bytes()
     internal=artifact_dir/"_internal"
-    if not internal.exists():
+    if not internal.exists() and not in_repository:
         legacy_result=prepare_legacy(target,preimage,args.route_id)
         if legacy_result is not None:
             return legacy_result

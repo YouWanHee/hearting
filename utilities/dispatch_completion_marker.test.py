@@ -2418,6 +2418,26 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout)["read_only"])
         self.assertEqual(snapshot(), before)
 
+    def test_closure_check_on_a_node_that_is_not_a_review_answers_not_applicable(self):
+        # Codex r4: a refine owner's read-only `--check` on its `transaction` node was refused with
+        # `owner-closure-source-attempt-not-exact`; owner closure exists only for a blocking review.
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        other = next(n for n in route["nodes"] if n.get("kind") != "review-worker")
+        def snapshot():
+            return {str(p.relative_to(self.base)): (p.read_bytes(), p.stat().st_mtime_ns)
+                    for root in (self.artifact, self.stable_dispatch) for p in root.rglob("*") if p.is_file()}
+        before = snapshot()
+        result = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"),
+                                 "complete", "--check", "--route", str(path), "--node", other["id"],
+                                 "--evidence", str(memo), "--jobs", str(self.jobs),
+                                 "--attempt-id", "att-source-review-r2"],
+                                env=self.base_env(), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual((payload["result"], payload["read_only"], payload["node_id"]),
+                         ("not-applicable", True, other["id"]))
+        self.assertEqual(snapshot(), before)
+
     def test_continuation_closure_unknown_conflict_and_changed_review_hold_consumption(self):
         source, route, path, node, memo, reviews = self.continuation_closure_fixture()
         with mock.patch.dict(os.environ, self.base_env(), clear=True):

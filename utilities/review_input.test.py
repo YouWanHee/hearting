@@ -69,6 +69,18 @@ class ReviewInputTest(unittest.TestCase):
         self.assert_reason('reviewed-evidence-required', R.resolve_input, self.route, node, self.jobs)
         self.assertIsNone(R.resolve_input(self.route, {'id': 'execute'}, self.jobs))
 
+    def test_evidence_given_for_a_node_that_is_not_a_plan_review_is_ignored_not_refused(self):
+        # Codex r4: impl-review (qa/code-review) was refused `reviewed-evidence-node-invalid`.
+        code_review = {'id': 'impl-review', 'kind': 'review-worker', 'unit': 'qa/code-review'}
+        self.assertIsNone(R.resolve_input(self.route, code_review, self.jobs, self.evidence))
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(R.drop_inapplicable(code_review, str(self.evidence)))
+            self.assertEqual(R.drop_inapplicable(self.node, str(self.evidence)), str(self.evidence))
+            self.assertIsNone(R.drop_inapplicable(code_review, None))
+        self.assertEqual(out.getvalue(), 'reviewed_evidence_ignored=impl-review\n')
+
     def test_spec_review_accepts_explicit_evidence_and_keeps_no_input_legacy_path(self):
         node = {'id': 'review', 'kind': 'review-worker', 'unit': 'research/plan-review',
                 'completion_gate': 'spec-review', 'depends_on': ['research']}

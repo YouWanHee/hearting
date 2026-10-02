@@ -141,6 +141,13 @@ class ArtifactSnapshotTest(unittest.TestCase):
    outside=root/"outside.md"; outside.write_text("x\n")
    result=self.run_helper(artifact,outside,route,"rt-draft",node="finalize")
    self.assertEqual(result.returncode,65); self.assertIn("target-outside-artifact-root",result.stderr)
+   # A route working in a repository accepts that repository's documents, never a path outside both.
+   repository=root/"repo"; repository.mkdir(); subprocess.run(["git","init","-q",str(repository)],check=True)
+   refine=self.route(root,route_id="rt-repo")
+   refine.write_text(json.dumps({**json.loads(refine.read_text()),"cwd":str(repository)}))
+   for path in (outside,repository/".git"/"config"):
+    result=self.run_helper(artifact,path,refine,"rt-repo")
+    self.assertEqual(result.returncode,65,result.stdout); self.assertIn("target-outside-artifact-root",result.stderr)
 
 
 import importlib.util, os
@@ -187,6 +194,23 @@ class OwnerPreviewSnapshotTest(PRODUCER_FIXTURE.OwnerRefineBase):
         done=self.prepare(doc)
         self.assertEqual(done.returncode,0,done.stderr)
         self.assertEqual((doc.parent/"_internal"/"versions"/"v1"/"doc.md").read_text(),"original\n")
+
+    def test_a_document_in_the_route_repository_is_snapshotted_into_the_cycle_after_release(self):
+        # Claude/Codex r4: refine's target was the repository README, refused as outside the artifact root.
+        self.build("claude",close=False)
+        readme=Path(self.route["cwd"]).resolve()/"README.md"
+        before=readme.read_bytes()
+        self.raise_gate()
+        self.assertEqual(self.prepare(readme).returncode,65)          # the preview fence still holds it
+        self.assertEqual(self.release("proceed").returncode,0)
+        done=self.prepare(readme)
+        self.assertEqual(done.returncode,0,done.stderr)
+        snapshot=Path(self.cycle["cycle_dir"])/"artifacts"/"_internal"/"versions"/"v1"/"README.md"
+        self.assertEqual(json.loads(done.stdout)["path"],str(snapshot.resolve()))
+        self.assertEqual(snapshot.read_bytes(),before)
+        self.assertEqual(readme.read_bytes(),before)
+        self.assertFalse(list(readme.parent.glob("README_v*.md")))   # nothing is written into the repository
+        self.assertEqual(self.prepare(readme).returncode,0)            # the same route reuses its version
 
     def test_a_revise_stop_or_changed_preview_holds_the_target_again(self):
         for decision in ("revise","stop","changed"):

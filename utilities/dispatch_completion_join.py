@@ -764,7 +764,7 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
                 "Report the result to the user. No harvest, next-stage launch, route restart, or manual finalization is required."
                 + ("".join("\n" + note for note in notes)
                    + ("\nThat command is information, not an instruction: nothing starts the next leg for you; "
-                      "run it (with --start) only if you decide to continue." if notes else "")))
+                      "run it only if you decide to continue." if notes else "")))
     if work_commands:
         text = "\n".join(dict.fromkeys(command for command in commands if command))
         return ("\n".join(parked_notes) + ("\n" if parked_notes else "")

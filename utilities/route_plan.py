@@ -543,8 +543,8 @@ def frame_selection_pins(decision, artifact_root) -> dict:
 
 
 def compose_argv(leg, *, context, route_plan_arg, parent_cycle, slug, pins=None) -> list:
-    """The `capability-route.py compose` argv for one leg; `--start` is left to the main session."""
-    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose", "--slug", slug,
+    """The `capability-route.py compose --start` argv for one leg: run as printed, it seals and starts."""
+    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose", "--start", "--slug", slug,
             "--shape", leg["shape"], "--capability", leg["capability"]]
     if leg.get("mode"):
         argv += ["--capability-mode", leg["mode"]]
@@ -618,6 +618,42 @@ def completed_cycle(route):
         if record.get("route_id") in ids and record.get("state") == "sealed":
             return record
     return None
+
+
+def latest_leg_route(route):
+    """The furthest leg already started from the same decision record as `route`, or `route` itself.
+
+    A started leg begins its cycle under the previous leg's cycle (`--parent-cycle`), so the walk
+    follows cycle parents and accepts only a route that seals the same record and digest with the
+    next index. Reads only; a leg that was composed but never started is not found.
+    """
+    try:
+        import artifact_producer as producer
+        sealed = validate_sealed(route.get("route_plan"))
+        root = Path(route["artifact_root"]).resolve()
+        records = producer.list_cycle_records(root)
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        return route
+    current = route
+    for _ in range(MAX_LEGS):
+        cycles = {rec.get("cycle_id") for rec in records if rec.get("route_id") == current.get("route_id")}
+        index = current["route_plan"]["index"] + 1
+        found = []
+        for rec in records:
+            if rec.get("parent_cycle_id") not in cycles or not rec.get("cycle_id"):
+                continue
+            try:
+                candidate = json.loads((root / ".runtime" / "routes" / f"{rec.get('route_id')}.json")
+                                       .read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if (isinstance(candidate, dict) and candidate.get("route_plan") == {**sealed, "index": index}
+                    and candidate.get("route_id") == rec.get("route_id")):
+                found.append((str(rec.get("started_on") or ""), candidate))
+        if not found:
+            return current
+        current = max(found, key=lambda row: row[0])[1]
+    return current
 
 
 def next_leg_for_route(route):
