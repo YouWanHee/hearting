@@ -97,7 +97,7 @@ make_fixture() {
   printf '%s\n' '# fixture loop' > "$root/adapters/claude/loops/demo.md"
   printf '%s\n' 'fixture' > "$root/adapters/claude/scaffolds/README.md"
   printf '%s\n' \
-    '{"autoMemoryEnabled":false,"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh $HOME/.claude/utilities/fixture.sh"}]}]},"statusLine":{"type":"command","command":"bash $HOME/.claude/statusline.sh","refreshInterval":60}}' \
+    '{"autoMemoryEnabled":false,"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh $HOME/.claude/utilities/fixture.sh"}]}]},"statusLine":{"type":"command","command":"bash $HOME/.claude/statusline.sh","refreshInterval":60},"env":{"AGENT_DISPATCH_CALLER_HARNESS":"","CODEX_THREAD_ID":"","CODEX_SESSION_ID":"","OPENCODE_SESSION_ID":""}}' \
     > "$root/adapters/claude/settings.json"
   printf '%s\n' '{"name":"hearting-claude","version":"1.0.0"}' \
     > "$root/adapters/claude/plugin-marketplace/plugins/hearting-claude/.claude-plugin/plugin.json"

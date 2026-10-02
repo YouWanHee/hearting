@@ -283,7 +283,16 @@ result. A registered parent advertises end-turn only with its exact live supervi
 lease. Claude and OpenCode use the same CLI session controller with native runtime
 drivers; the controller owns join, terminal commit, resume, and receipt acknowledgement. A selected child and Git checkout ancestry cannot substitute for parent
 identity. The parent runtime supplies its native session identity independently of the
-child adapter. Dispatch carries the issued producer cycle and a concrete output
+child adapter. A harness runtime clears the inherited `AGENT_DISPATCH_CALLER_HARNESS` and every other
+harness's native session ID from its own tool commands; its own native session ID, set by
+the runtime itself, then identifies it. It does this through its installed native config
+surface, so a name or ID inherited from whichever process started it (a pane, a launcher,
+or a shared service such as the Codex app-server daemon) does not survive into its tool
+commands, and no harness exports a name that could go stale in a process its shell starts.
+On a host where only some harnesses carry the config the result is an ambiguous caller,
+not a wrong one. The shared resolver follows an explicit name (a per-command override or
+a registered worker's marker) and refuses an unnamed mixed environment; launchers carry no
+identity logic. Dispatch carries the issued producer cycle and a concrete output
 directory in both environment and prompt. The producer record owns that path;
 write admission and completion publication use the same cycle binding. A missing
 cycle environment can be recovered from the route's producer record. Refusals

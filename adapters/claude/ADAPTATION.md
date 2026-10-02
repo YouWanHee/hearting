@@ -32,6 +32,7 @@ physical instruction masking.
 |---|---|---|
 | Session bootstrap | `adapters/claude/CLAUDE.md` | `claude_setting/CLAUDE.md` |
 | Hook and permission config | `adapters/claude/settings.json` | `claude_setting/settings.json` |
+| Harness self-identity | `adapters/claude/settings.json` `env` (blank `AGENT_DISPATCH_CALLER_HARNESS` and other harnesses' session IDs, so inherited values are cleared and Claude's own session ID identifies it), installed through `CLAUDE_MANAGED_ENV_KEYS` | the same `settings.json` |
 | Keybindings | `adapters/claude/keybindings.json` | `claude_setting/keybindings.json` |
 | Slash commands | `adapters/claude/commands/` | `claude_setting/commands` |
 | Runtime worker wrappers | `adapters/claude/bin/` | `claude_setting/bin` |

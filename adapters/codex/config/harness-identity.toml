@@ -1,0 +1,27 @@
+# Codex harness self-identity — adapter-owned, version-controlled.
+#
+# A harness runtime clears the caller names and the other harnesses' session ids it inherited from
+# its own tool commands; its native session id then identifies it (core/OPERATIONS.md). Codex tool
+# commands run inside the shared app-server daemon, which keeps the environment of whichever shell
+# started it — often a Claude Code tool shell. Without this table a Codex thread's commands carried
+# that Claude session id beside the thread's own, and every identity resolver saw an ambiguous
+# caller. Nothing is exported here that names a harness: a name would be inherited by whatever a
+# tool shell starts and go stale. A per-command `AGENT_DISPATCH_CALLER_HARNESS=<harness> <command>`
+# is set inside the shell and still works.
+#
+# Runtime activation merges this table into `$CODEX_HOME/config.toml` as one delimited block
+# (`harness runtime activate --runtime codex`); the rest of config.toml stays runtime-owned.
+# A config that already defines a conflicting `[shell_environment_policy]` (legacy `exclude`
+# / `include_only`, or other values for these keys) is left untouched and reported as
+# `config-conflict:` instead. Codex applies the table per new thread, so a running daemon needs
+# no restart; existing threads keep the environment they started with.
+#
+# `filters` is the current form; Codex rejects it mixed with the legacy arrays in one layer.
+
+[shell_environment_policy.filters]
+"AGENT_DISPATCH_CALLER_HARNESS" = "exclude"
+"CLAUDE_CODE_SESSION_ID" = "exclude"
+"CLAUDE_SESSION_ID" = "exclude"
+"OPENCODE_SESSION_ID" = "exclude"
+"CLAUDECODE" = "exclude"
+"CLAUDE_CODE_CHILD_SESSION" = "exclude"

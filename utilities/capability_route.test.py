@@ -7659,6 +7659,57 @@ class RouteChainWriterTest(ComposeRouteTest):
    route=self.compose(artifact_root=tmp)
    err=self._emit(route,tmp)
    self.assertIn("route_chain_written=1 harness=codex",err)
+ def _tool_shell_env(self,parent,child,sid):
+  """The child harness's tool-command env, built from the shipped adapter configs."""
+  fixtures=str(P.parent/"fixtures")
+  if fixtures not in sys.path: sys.path.insert(0,fixtures)
+  import harness_tool_env as E
+  try:
+   inherited=E.daemon_started_from(E.tool_shell_env(parent,{},"parent-sid-"+parent))
+   return E.tool_shell_env(child,inherited,sid)
+  except E.ToolMissing as exc:
+   self.skipTest(str(exc))
+ def test_compose_records_codex_ledger_in_claude_started_daemon_env(self):
+  # A Codex thread served by the shared daemon that a Claude tool shell started: its tool
+  # commands carry the thread id AND the starter's Claude session id (the SR_CorrNet incident).
+  env=self._tool_shell_env("claude","codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1")
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{**env,"AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=1 harness=codex",err)
+   self.assertNotIn("reason=no-identity",err)
+   self.assertEqual([line["route_id"] for line in self.RC.read_tail("codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1")],
+                    [route["route_id"]])
+   self.assertEqual(self.RC.read_tail("claude","parent-sid-claude"),[])
+ def test_compose_never_records_claude_when_the_codex_block_is_not_installed(self):
+  # Partial rollout: Claude's env is installed, Codex's block is not. The Claude-started daemon's
+  # Codex thread carries its own id next to the stale Claude one and NO exported harness name, so
+  # the writer finds it ambiguous and records nothing -- never a Claude ledger line.
+  fixtures=str(P.parent/"fixtures")
+  if fixtures not in sys.path: sys.path.insert(0,fixtures)
+  import harness_tool_env as E
+  try:
+   inherited=E.daemon_started_from(E.tool_shell_env("claude",{},"parent-sid-claude"))
+   env=E.tool_shell_env("codex",inherited,"01a0f6a2-785d-7503-bb78-368d1a1eaab1",installed=False)
+  except E.ToolMissing as exc:
+   self.skipTest(str(exc))
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{**env,"AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=0",err)
+   self.assertNotIn("harness=claude",err)
+   self.assertEqual(self.RC.read_tail("claude","parent-sid-claude"),[])
+   self.assertEqual(self.RC.read_tail("codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1"),[])
+ def test_compose_caller_follows_tool_shell_harness(self):
+  from dispatch_parent_completion import default_parent_harness
+  for parent,child in (("claude","codex"),("codex","claude"),("claude","opencode"),("opencode","codex")):
+   with self.subTest(parent=parent,child=child):
+    env=self._tool_shell_env(parent,child,"child-sid-"+child)
+    with mock.patch.dict(os.environ,env):
+     # the expression compose evaluates for `--parent-harness` (capability-route.py)
+     self.assertEqual(default_parent_harness("claude"),child)
  def test_plan_invalid_refuses_before_route_write(self):
   import types
   with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-plan-invalid"}):
