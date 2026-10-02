@@ -660,11 +660,11 @@ def inspect_terminal_attempt(
                 reason="artifact-outside-root",
             )
         if not os.path.lexists(candidate):
-            # A checkpoint may place a cycle's loose output into its declared
-            # bucket after the worker wrote its final handoff. Follow only the
-            # producer's recorded same-cycle move, then recheck the root. This
-            # keeps the exact handoff useful without accepting an arbitrary
-            # replacement file at the old or new path.
+            # An earlier release's checkpoint may have moved a cycle's loose output
+            # into its declared bucket after the worker wrote its final handoff.
+            # Follow only the producer's recorded same-cycle move, then recheck the
+            # root. This keeps the exact handoff useful without accepting an
+            # arbitrary replacement file at the old or new path.
             from artifact_producer import resolve_placed_output
             try:
                 artifact_path = resolve_placed_output(candidate).resolve(strict=False)

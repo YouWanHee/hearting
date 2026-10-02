@@ -64,7 +64,7 @@ class OwnerRefineBase(PF.ProducerTestBase):
                 + ",".join(f"{k}={v}" for k, v in meta.items()) + "\n")
 
     def build(self, harness="claude", *, review=True, close=True, parent="claude-parent-runtime",
-              report_rel="owner-report.md", verdict="PASS"):
+              report_rel="owner-report.md", verdict="PASS", route_plan=None):
         os.environ["AGENT_HOME"] = str(R.ROOT)
         self.activate()
         self.harness = harness
@@ -72,7 +72,7 @@ class OwnerRefineBase(PF.ProducerTestBase):
             capability="autopilot-refine", capability_mode=None, shape="staged", graph="review,transaction",
             slug="owner-preview", cwd=R.ROOT, artifact_root=self.root, intensity="standard",
             dispatch_evidence={"tuples": [nested(harness, "codex")]}, unassigned=True,
-            work_request={"text": "Refine the README", "owner_harness": harness})
+            work_request={"text": "Refine the README", "owner_harness": harness}, route_plan=route_plan)
         self.path = Path(L.admit_runtime_route(self.root, self.route).route_file)
         # Per-process ids: `worker_bootstrap.test.py` and `artifact_snapshot.test.py` load this fixture and may run in
         # a sibling process at the same time; the process-wide tagged-descendant scan keys on the attempt id, so a
@@ -107,6 +107,29 @@ class OwnerRefineBase(PF.ProducerTestBase):
         if close:
             self.close_owner()
         return self
+
+    def three_leg_plan(self):
+        """The refine `review,transaction` route as leg #1 of a code -> refine -> code report route plan."""
+        import route_plan as RP
+        task = Path(self._tmp.name) / "leg-task.md"
+        task.write_text("the reusable work request\n")
+        code = {"capability": "autopilot-code", "mode": "dev", "shape": "staged", "graph": ["execute", "test"],
+                "intensity": None, "why": "x"}
+        refine = {"capability": "autopilot-refine", "mode": None, "shape": "staged",
+                  "graph": ["review", "transaction"], "intensity": None, "why": "x"}
+        report = {**code, "graph": ["report"]}
+        frame = {"route_id": "rt-" + "1" * 16, "route_hash": "sha256:" + "2" * 64, "cycle_id": "cyc_" + "3" * 32}
+        decision = RP.build_decision(
+            frame_route=frame, selected="Go", reason="", briefs=[], intent={"path": "x", "sha256": "0" * 64},
+            proposal={"summary": "three", "legs": [code, refine, report], "entry_approvals": []},
+            first_leg_compose={"leg": 0, "context": {
+                "cwd": str(R.ROOT), "artifact_root": str(self.root), "slug": "owner-preview",
+                "campaign_key": "owner-preview", "parent_cycle": frame["cycle_id"],
+                "prompt_file": str(task), "prompt_sha256": "0" * 64, "spec_read": "fixture", "owner": None}})
+        path = self.root / "decisions" / "route-decision.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(RP.render(RP.build_record(decision)))
+        return RP.read_route_plan(f"{path}#1", self.root)
 
     def close_owner(self):
         lines = self.jobs.read_text().splitlines()
@@ -327,6 +350,47 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
 
 PARENTS = (("claude-parent-runtime", "claude"), ("codex-native-queue", "codex"),
            ("codex-managed-gateway", "codex"), ("opencode-turn", "opencode"), ("poll-fallback", "opencode"))
+
+
+class LooseOutputLegClosureTest(OwnerRefineBase):
+    """Files left where they were written never hold a document leg open, so `start` names the next leg."""
+
+    def test_a_document_leg_with_loose_outputs_closes_and_names_the_next_leg_for_every_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture = LooseOutputLegClosureTest(
+                    "test_a_document_leg_with_loose_outputs_closes_and_names_the_next_leg_for_every_harness")
+                fixture.setUp()
+                try:
+                    fixture.build(harness, close=False, route_plan=fixture.three_leg_plan())
+                    self.assertEqual(fixture.route["route_plan"]["index"], 1)
+                    preview = fixture.write_output(fixture.cycle, rel="diff-preview.md", data=b"--- a/README\n+++ b/README\n")
+                    fixture.raise_gate(preview)
+                    self.assertEqual(fixture.release("proceed").returncode, 0)
+                    with fixture.env():
+                        checkpoint = P.checkpoint(fixture.root, cycle_id=fixture.cycle["cycle_id"])
+                    self.assertEqual(checkpoint["status"], "emitted", checkpoint)
+                    fixture.close_owner()
+                    settled = fixture.settle()
+                    self.assertEqual(settled.result, "completed", settled)
+                    receipt = fixture.start()
+                    self.assertEqual(receipt["state"], "completed", receipt)
+                    self.assertEqual(receipt["next_leg"]["index"], 2, receipt)
+                    self.assertIn("--route-plan", receipt["next_leg"]["compose_command"])
+                    self.assertIn("#2", receipt["next_leg"]["compose_command"])
+                    self.assertEqual(P.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])["state"], "sealed")
+                    self.assertTrue(preview.is_file())
+                    self.assertEqual(hashlib.sha256(preview.read_bytes()).hexdigest(),
+                                     fixture.resolution()["artifact_sha256"])
+                    with fixture.env():
+                        gates = R.terminal_gate_observation(fixture.route, jobs=fixture.jobs, exact_terminal=True)
+                    self.assertTrue(gates["transaction"]["passed"], gates)
+                    self.assertEqual(Path(gates["transaction"]["evidence"]), fixture.report)
+                    self.assertTrue(fixture.report.is_file())
+                    self.assertFalse((P.producer_dir(fixture.root) / "bucket-placements"
+                                      / f"{fixture.cycle['cycle_id']}.json").exists())
+                finally:
+                    fixture.doCleanups()
 
 
 class OwnerGateReachesEveryParentTest(OwnerRefineBase):

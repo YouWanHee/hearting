@@ -144,11 +144,8 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         raise InlineFinishError("finish-active-review-lease")
     output = artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
     evidence = Path(args.evidence).absolute()
-    # Place payloads before terminal evidence is bound to an exact path. Replays
-    # translate the original caller path through the runtime's move record.
-    if record.get("state") == "open" and prior_state is None:
-        with artifact_producer._checkpoint_lock(root, record["cycle_id"], timeout=artifact_producer.CHECKPOINT_FINALIZE_LOCK_SECONDS):
-            artifact_producer._place_loose_outputs(root, record, output.parent)
+    # Nothing moves payloads now; a path an earlier release moved is translated
+    # through the move record it left.
     try:
         evidence_rel = evidence.relative_to(output).as_posix()
         placed = artifact_producer._placed_locator(evidence_rel, artifact_producer._output_placements(root, record))

@@ -941,7 +941,7 @@ class A2SharedPublicationTest(SealAbolitionBase):
     def test_a2_shared_retry_survives_source_changes(self):
         cycle = self._cycle([["a"], ["a"]])
         first = self.admit(cycle, 0, base_revision="none")
-        source = Path(cycle["cycle_dir"]) / "artifacts/spec/gen0"
+        source = Path(cycle["cycle_dir"]) / "artifacts/gen0"
         digest = P.read_cycle_record(self.root, cycle["cycle_id"])["manifest_digest"]
         latest = self._reference(first["shared_reference_id"])["latest_revision_id"]
         # The published PRD is edited, moved, then removed: the same call is the same publication.
@@ -965,7 +965,7 @@ class A2SharedPublicationTest(SealAbolitionBase):
         self.assertEqual((again["status"], again["shared_reference_revision_id"]),
                          ("reused", first["shared_reference_revision_id"]))
         # A new publication takes the source as it is now, and records the manifest it was taken from.
-        (Path(cycle["cycle_dir"]) / "artifacts/spec/gen1/a/prd.md").write_text("gen1, edited before publishing")
+        (Path(cycle["cycle_dir"]) / "artifacts/gen1/a/prd.md").write_text("gen1, edited before publishing")
         second = self.admit(cycle, 1, base_revision=first["shared_reference_revision_id"])
         self.assertEqual(second["status"], "admitted")
         self.assertEqual((Path(second["revision_dir"]) / "a/prd.md").read_text(), "gen1, edited before publishing")
@@ -988,7 +988,7 @@ class A2SharedPublicationTest(SealAbolitionBase):
                 self.admit(cycle, 1, base_revision=first["shared_reference_revision_id"])
         self.assertEqual(len(self._journals()), 1)
         latest = self._reference(first["shared_reference_id"])["latest_revision_id"]
-        source_file = Path(cycle["cycle_dir"]) / "artifacts/spec/gen1/a/prd.md"
+        source_file = Path(cycle["cycle_dir"]) / "artifacts/gen1/a/prd.md"
         original = source_file.read_bytes()
         # The input the publication took no longer matches: it is not committed over a changed source.
         source_file.write_bytes(b"changed while the publication waited to commit")

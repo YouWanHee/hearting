@@ -2630,64 +2630,6 @@ def _is_support_locator(rel: str) -> bool:
     return any(part in SUPPORT_SEGMENTS for part in rel.split("/")[1:])
 
 
-def _place_loose_outputs(root: Path, record: Mapping[str, Any], directory: Path) -> List[Dict[str, str]]:
-    """Normalize visible payloads under the cycle lock without replacing files."""
-    output = directory / "artifacts"
-    if output.is_symlink() or not output.is_dir():
-        return []
-    sources = [p for p in sorted(output.iterdir())
-               if p.name not in BUCKET_TYPES and p.name not in SUPPORT_SEGMENTS
-               # Cutover snapshots are harness-owned staging, not user output.
-               and not (p.name == "shared-input" and
-                        (p / "_internal/migration-shared-bases.json").is_file())
-               and not p.name.startswith(".") and not p.is_symlink()
-               and (p.is_file() or p.is_dir())]
-    if not sources:
-        return []
-    target = output / default_bucket(str(record.get("capability", "")))
-    # A foreign file/link at the bucket name is preserved by the existing scanner.
-    if target.is_symlink() or (target.exists() and not target.is_dir()):
-        return []
-    target.mkdir(exist_ok=True)
-    if any(os.path.lexists(target / p.name) for p in sources):
-        ordinal = 1
-        while os.path.lexists(target / f"relocated-{ordinal}"):
-            ordinal += 1
-        target = target / f"relocated-{ordinal}"
-    moved = []
-    placement_path = producer_dir(root) / "bucket-placements" / f"{record['cycle_id']}.json"
-    placements = {row["from"]: row for row in _output_placements(root, record)}
-    for source in sources:
-        source_rel = source.relative_to(directory).as_posix()
-        prior = placements.get(source_rel)
-        destination = directory / prior["to"] if prior else target / source.name
-        if os.path.lexists(destination):
-            destination = target / source.name
-        if os.path.lexists(destination):
-            continue
-        if any(parent.is_symlink() for parent in destination.parents if parent != directory):
-            continue
-        row = {"from": source_rel, "to": destination.relative_to(directory).as_posix()}
-        placements[source_rel] = row
-        # Record the intended path before moving, so a retry can find the same
-        # destination after a crash between rename and checkpoint publication.
-        _ensure_dir(placement_path.parent)
-        _write_atomic(placement_path, _json_bytes({"moves": list(placements.values())}), 0o644)
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            source.rename(destination)
-        except OSError as exc:
-            placements.pop(source_rel, None)
-            _write_atomic(placement_path, _json_bytes({"moves": list(placements.values()),
-                          "pending": [{**row, "error": str(exc)}]}), 0o644)
-            continue
-        moved.append(row)
-    if moved:
-        print(f"artifact-buckets moved={len(moved)} paths=" + "; ".join(
-            f"{row['from']} -> {row['to']}" for row in moved), file=sys.stderr)
-    return moved
-
-
 def _output_placements(root: Path, record: Mapping[str, Any]) -> List[Dict[str, str]]:
     path = producer_dir(root) / "bucket-placements" / f"{record['cycle_id']}.json"
     rows = (_read_json(path) or {}).get("moves", [])
@@ -3794,10 +3736,6 @@ def _checkpoint_commit(
             result["reason"] = reason
         return result
 
-    moved = _place_loose_outputs(root, fresh, directory)
-    if moved:
-        scan = _checkpoint_scan(directory, previous_stats, limits)
-        base = {**base, "moved_outputs": moved}
     if scan.get("skip"):
         detail = {key: value for key, value in scan.items() if key != "skip"}
         return settle("skipped", scan["skip"], limit_detail=detail)
@@ -4809,7 +4747,6 @@ def finalize(
         for name, source, target in adoption_moves:
             os.replace(source, target)
             adopted_root_outputs.append(name)
-        moved_outputs = _place_loose_outputs(root, record, directory)
         placements = _output_placements(root, record)
         primary = _placed_locator(_cycle_relative_primary(primary, directory), placements)
         support_locators = tuple(_placed_locator(value, placements) for value in support_locators)
@@ -4916,7 +4853,6 @@ def finalize(
             ) from exc
         sealed_result = {"excluded_hidden": excluded_hidden, "excluded_symlinks": excluded_symlinks,
             "adopted_root_outputs": adopted_root_outputs,
-            "moved_outputs": moved_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],

@@ -4932,7 +4932,7 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         def decoded(value):
             return Path(base64.urlsafe_b64decode(value+"="*(-len(value)%4)).decode())
         # Bytes are read where the report lives now; the identity is the locator the owner named.
-        # A bucket organizer that moves a loose report is recorded by the producer and
+        # A move an earlier release made to a loose report is recorded by the producer and
         # surfaced as `artifact_origin_path_b64`, so placement never changes who the owner was.
         evidence=decoded(str(terminal["artifact_path_b64"]))
         origin=decoded(str(terminal["artifact_origin_path_b64"])) if terminal.get("artifact_origin_path_b64") else evidence

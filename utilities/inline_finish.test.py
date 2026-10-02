@@ -155,14 +155,14 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertNotEqual(receipt.returncode, 0)
         self.assertIn("finish-registered-route-ineligible", receipt.stderr)
 
-    def test_loose_evidence_is_placed_before_terminal_binding_and_replays(self):
+    def test_loose_evidence_stays_in_place_and_replays(self):
         loose = self.cycle_dir / "artifacts/code_change.md"
         self.evidence.rename(loose)
         self.command[self.command.index("--evidence") + 1] = str(loose)
         receipt = self.finish()
         self.assertEqual(receipt.returncode, 0, receipt.stderr + receipt.stdout)
-        self.assertFalse(loose.exists())
-        self.assertTrue((self.cycle_dir / "artifacts/plans/code_change.md").is_file())
+        self.assertTrue(loose.is_file())
+        self.assertFalse((self.cycle_dir / "artifacts/plans/code_change.md").exists())
         replay = self.finish()
         self.assertEqual(replay.returncode, 0, replay.stderr + replay.stdout)
 

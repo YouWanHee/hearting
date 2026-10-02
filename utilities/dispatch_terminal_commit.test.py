@@ -1495,7 +1495,7 @@ class ProveRouteChildrenDeferredTest(unittest.TestCase):
 
 
 class OwnerTerminalPlacementReplayTest(unittest.TestCase):
-    """A loose owner report that the bucket organizer moves keeps one terminal identity."""
+    """A loose owner report stays where it was written and keeps one terminal identity."""
 
     NATIVE = {
         "claude": lambda text: [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
@@ -1523,17 +1523,14 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
         meta = exact_attempt_row(jobs, owner).metadata
         return fixture, terminal, route, path, jobs, owner, report, meta
 
-    def test_a_replayed_settlement_after_placement_completes_for_every_harness(self):
+    def test_a_replayed_settlement_after_a_checkpoint_completes_for_every_harness(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
                 fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
                 with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
                     first = terminal.settle_owner_completion(jobs, "done", meta)
                     self.assertEqual(first.result, "completed", first)
-                    placed = Path(fixture.root).rglob("owner-report.md")
-                    moved = [p for p in placed if p != report]
-                    self.assertEqual(len(moved), 1, "the organizer must have placed the loose report")
-                    self.assertFalse(report.exists())
+                    self.assertTrue(report.exists(), "nothing moves the loose report")
                     request = terminal.TerminalCommitRequest(path, owner, jobs, fixture.root)
                     state_path = terminal._commit_state_path(request)
                     stored = json.loads(state_path.read_text())
@@ -1544,7 +1541,7 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     row = ROUTE.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)["prd-transaction"]
                     self.assertTrue(row["passed"], row)
                     self.assertEqual(row["evidence"], str(report))  # identity stays the worker's own locator
-                    self.assertEqual(row["evidence_digest"], ROUTE.evidence_digest(moved[0]))
+                    self.assertEqual(row["evidence_digest"], ROUTE.evidence_digest(report))
                     self.assertFalse((ROUTE.completion_dir(route["route_id"], jobs=jobs) / "prd-transaction.json").exists())
 
     def test_a_report_already_in_its_bucket_is_unchanged(self):
@@ -1554,18 +1551,17 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
             self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
 
-    def test_a_changed_or_missing_placed_report_still_fails_the_replay(self):
-        for harness in ("claude",):   # the damage is to the placed file, whatever shape the native result had
+    def test_a_changed_or_missing_report_still_fails_the_replay(self):
+        for harness in ("claude",):   # the damage is to the report file, whatever shape the native result had
             for damage in ("bytes", "missing"):
                 with self.subTest(harness=harness, damage=damage):
                     fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
                     with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
                         self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
-                        moved = next(p for p in Path(fixture.root).rglob("owner-report.md"))
                         if damage == "bytes":
-                            moved.write_text("tampered after settlement")
+                            report.write_text("tampered after settlement")
                         else:
-                            moved.unlink()
+                            report.unlink()
                         self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                         self.assertNotEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
 

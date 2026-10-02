@@ -64,22 +64,37 @@ class CheckpointTestBase(F.ProducerTestBase):
 
 
 class InterimManifestTest(CheckpointTestBase):
-    def test_loose_report_tree_is_placed_and_html_is_primary(self):
-        self.write_output(self.result, "report/report.html", b'<img src="../field/img1.png"><audio src="audio/a.wav">')
-        self.write_output(self.result, "report/audio/a.wav", b"audio")
-        self.write_output(self.result, "field/img1.png", b"image")
-        self.write_output(self.result, "request.md", b"request")
-        self.write_output(self.result, "make_report.log", b"log")
+    def legacy_move(self, rel, to):
+        """What a release before the move's removal left: the file at `to` and its ledger row."""
+        cycle = Path(self.result["cycle_dir"])
+        source, target = cycle / "artifacts" / rel, cycle / "artifacts" / to
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(target)
+        ledger = P.producer_dir(self.root) / "bucket-placements" / f"{self.cycle_id}.json"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps({"moves": [{"from": f"artifacts/{rel}", "to": f"artifacts/{to}"}]}))
+        return target
+
+    def test_loose_report_tree_stays_where_it_was_written_and_html_is_primary(self):
+        files = {
+            "report/report.html": b'<img src="../field/img1.png"><audio src="audio/a.wav">',
+            "report/audio/a.wav": b"audio",
+            "field/img1.png": b"image",
+            "request.md": b"request",
+            "make_report.log": b"log",
+        }
+        for path, data in files.items():
+            self.write_output(self.result, path, data)
         result = P.checkpoint(self.root, cycle_id=self.cycle_id)
         self.assertEqual(result["status"], "emitted", result)
-        self.assertEqual(len(result["moved_outputs"]), 4)
+        self.assertNotIn("moved_outputs", result)
         output = Path(self.result["cycle_dir"]) / "artifacts"
-        report = output / "plans/report/report.html"
-        self.assertTrue(report.is_file())
-        self.assertEqual((report.parent / "../field/img1.png").read_bytes(), b"image")
-        self.assertEqual((report.parent / "audio/a.wav").read_bytes(), b"audio")
+        for path, data in files.items():
+            self.assertEqual((output / path).read_bytes(), data)
+        self.assertFalse((output / "plans").exists())
+        self.assertFalse((P.producer_dir(self.root) / "bucket-placements" / f"{self.cycle_id}.json").exists())
         primary = [path for path, fields in _ids_by_path(self.interim()).items() if fields[-1] == "primary"]
-        self.assertEqual(primary, ["artifacts/plans/report/report.html"])
+        self.assertEqual(primary, ["artifacts/report/report.html"])
         again = P.checkpoint(self.root, cycle_id=self.cycle_id)
         self.assertEqual(again["status"], "unchanged")
         self.assertNotIn("moved_outputs", again)
@@ -119,22 +134,12 @@ class InterimManifestTest(CheckpointTestBase):
                          {"locator-control-char": 1})
         self.assertEqual(self.state()["excluded"], result["excluded"])
 
-    def test_finalize_places_loose_output_without_checkpoint(self):
-        self.write_output(self.result, "code_change.md", b"changes")
+    def test_finalize_keeps_loose_output_in_place(self):
+        written = self.write_output(self.result, "code_change.md", b"changes")
         result, document = self.seal(primary="code_change.md")
-        self.assertEqual(result["moved_outputs"], [{"from": "artifacts/code_change.md", "to": "artifacts/plans/code_change.md"}])
-        self.assertIn("artifacts/plans/code_change.md", _ids_by_path(document))
-
-    def test_collision_keeps_existing_bytes_and_relative_links(self):
-        self.write_output(self.result, "plans/report/report.html", b"existing")
-        self.write_output(self.result, "report/report.html", b'<img src="../field/a.png">')
-        self.write_output(self.result, "field/a.png", b"new image")
-        result = P.checkpoint(self.root, cycle_id=self.cycle_id)
-        output = Path(self.result["cycle_dir"]) / "artifacts/plans"
-        self.assertEqual((output / "report/report.html").read_bytes(), b"existing")
-        self.assertEqual((output / "relocated-1/report/../field/a.png").read_bytes(), b"new image")
-        self.assertEqual(result["artifact_count"], 3)
-        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "unchanged")
+        self.assertNotIn("moved_outputs", result)
+        self.assertIn("artifacts/code_change.md", _ids_by_path(document))
+        self.assertTrue(written.is_file())
 
     def test_default_bucket_mapping_and_compose_notice(self):
         self.assertEqual(P.default_bucket("autopilot-lab"), "experiments")
@@ -144,11 +149,11 @@ class InterimManifestTest(CheckpointTestBase):
         folder = Path(self.result["cycle_dir"]) / "artifacts/plans"
         self.assertIn("산출물 " + str(folder), card)
 
-    def test_completion_evidence_remains_readable_after_checkpoint_move(self):
+    def test_completion_evidence_remains_readable_after_recorded_move(self):
         evidence = self.write_output(self.result, "report/report.html", b"completed report")
         node = next(node for node in self.route_obj["nodes"] if node.get("terminal"))
         F.R.write_completion_marker(self.route_obj, node, node["id"], evidence)
-        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.legacy_move("report/report.html", "plans/report/report.html")
         self.assertFalse(evidence.exists())
         self.assertTrue(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
         mapped = P.resolve_placed_output(evidence)
@@ -157,26 +162,26 @@ class InterimManifestTest(CheckpointTestBase):
         with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
             self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
 
-    def test_reviewed_plan_evidence_follows_checkpoint_move(self):
+    def test_reviewed_plan_evidence_follows_recorded_move(self):
         # plan-check launch read the plan marker's original path and was refused with
-        # reviewed-evidence-producer-unproven once a checkpoint had placed the plan.
+        # reviewed-evidence-producer-unproven once an earlier release had placed the plan.
         import review_input as RI
         evidence = self.write_output(self.result, "plan.md", b"exact plan\n")
-        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.legacy_move("plan.md", "plans/plan.md")
         self.assertFalse(evidence.exists())
         found = RI._file(str(evidence))
         self.assertEqual(Path(found["path"]), P.resolve_placed_output(evidence).resolve())
         self.assertEqual(found["sha256"], hashlib.sha256(b"exact plan\n").hexdigest())
 
-    def test_owner_envelope_primary_follows_checkpoint_move(self):
+    def test_owner_envelope_primary_follows_recorded_move(self):
         # The owner envelope used to look only at the marker's original evidence path,
-        # so every closure whose report finalize had placed stayed closure-pending with
-        # recovery-unavailable/material-primary-required.
+        # so every closure whose report an earlier release had placed stayed closure-pending
+        # with recovery-unavailable/material-primary-required.
         import dispatch_terminal_commit as TC
         evidence = self.write_output(self.result, "final_report.md", b"final report\n")
         node = next(node for node in self.route_obj["nodes"] if node.get("terminal"))
         F.R.write_completion_marker(self.route_obj, node, node["id"], evidence)
-        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.legacy_move("final_report.md", "plans/final_report.md")
         self.assertFalse(evidence.exists())
         gates = {node["id"]: {"evidence": str(evidence)}}
         route = dict(self.route_obj, workflow_contract={"terminal_nodes": [node["id"]]})
@@ -187,6 +192,7 @@ class InterimManifestTest(CheckpointTestBase):
 
     def test_placed_output_proof_binds_ledger_manifest_and_current_bytes(self):
         original = self.write_output(self.result, "plan.md", b"exact plan\n")
+        self.legacy_move("plan.md", "plans/plan.md")
         P.checkpoint(self.root, cycle_id=self.cycle_id)
         expected = dict(route_id=self.route_obj["route_id"], route_hash=self.route_obj["route_hash"])
         proof = P.placed_output_proof(original, **expected)
@@ -224,8 +230,10 @@ class InterimManifestTest(CheckpointTestBase):
         self.write_output(self.result, "shared-input/spec/prd.md", b"source snapshot")
         self.write_output(self.result, "report/report.html", b"report")
         result = P.checkpoint(self.root, cycle_id=self.cycle_id)
-        self.assertEqual([row["from"] for row in result["moved_outputs"]], ["artifacts/report"])
-        self.assertIn("artifacts/shared-input/spec/prd.md", _ids_by_path(self.interim()))
+        self.assertNotIn("moved_outputs", result)
+        interim = _ids_by_path(self.interim())
+        self.assertIn("artifacts/shared-input/spec/prd.md", interim)
+        self.assertIn("artifacts/report/report.html", interim)
 
     def test_document_fallback_precedes_media(self):
         self.write_output(self.result, "plans/a.png", b"image")
