@@ -32,6 +32,7 @@ import datetime
 import hashlib
 import json
 import os
+import py_compile
 import re
 import shutil
 import signal
@@ -138,6 +139,135 @@ _EXPLICIT_UNSET_KEYS = (
 )
 
 
+# Diagnostics only. A suite that captures a child's stderr and asserts only on
+# its stdout drops the child's explanation: on 2026-10-01/02 CI kept
+# `reason=worker-route-validation-failed` but never the route guard's own
+# reason. This hook, installed as `usercustomize` in each suite's private HOME,
+# keeps the tail of every captured stderr of a child that exited non-zero, and
+# the runner writes it beside a failing suite's own output. It patches
+# `subprocess` only when that module is first imported and never changes what
+# the caller receives. A process started with `python -I` or `-s`, or under
+# another HOME, skips it; nothing else depends on it.
+CHILD_STDERR_ENV = "HEARTING_TEST_CHILD_STDERR_DIR"
+_CHILD_STDERR_LIMIT = 256 * 1024
+_CHILD_STDERR_HOOK = """\
+# Installed by tools/run-tests.py; see CHILD_STDERR_ENV there.
+import os
+import sys
+
+_DIR = os.environ.get("HEARTING_TEST_CHILD_STDERR_DIR")
+
+
+def _keep(proc, err):
+    if proc.returncode in (0, None) or not err:
+        return
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    path = os.path.join(_DIR, "%d.log" % os.getpid())
+    try:
+        if os.path.getsize(path) > 1048576:
+            return
+    except OSError:
+        pass
+    args = proc.args
+    if not isinstance(args, (str, bytes)):
+        args = " ".join(str(item) for item in args)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("--- rc=%s pid=%d: %s\\n%s\\n" % (
+            proc.returncode, os.getpid(), str(args)[:400], err[-4000:].rstrip()))
+
+
+def _patch(module):
+    communicate = module.Popen.communicate
+
+    def keeping_communicate(self, *args, **kwargs):
+        out, err = communicate(self, *args, **kwargs)
+        try:
+            _keep(self, err)
+        except Exception:
+            pass
+        return out, err
+
+    module.Popen.communicate = keeping_communicate
+
+
+class _OnSubprocessImport:
+    def find_spec(self, name, path=None, target=None):
+        if name != "subprocess":
+            return None
+        sys.meta_path.remove(self)
+        from importlib.machinery import PathFinder
+        spec = PathFinder.find_spec(name, path)
+        loader = getattr(spec, "loader", None)
+        if loader is None or not hasattr(loader, "exec_module"):
+            return spec
+        exec_module = loader.exec_module
+
+        def exec_and_patch(module):
+            exec_module(module)
+            try:
+                _patch(module)
+            except Exception:
+                pass
+
+        loader.exec_module = exec_and_patch
+        return spec
+
+
+if _DIR and os.path.isdir(_DIR):
+    try:
+        if "subprocess" in sys.modules:
+            _patch(sys.modules["subprocess"])
+        else:
+            sys.meta_path.insert(0, _OnSubprocessImport())
+    except Exception:
+        pass
+"""
+
+
+def _install_child_stderr_hook(home: Path, directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    site_packages = (
+        home / ".local" / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
+    site_packages.mkdir(parents=True, exist_ok=True)
+    hook = site_packages / "usercustomize.py"
+    hook.write_text(_CHILD_STDERR_HOOK, encoding="utf-8")
+    # Suites run with PYTHONDONTWRITEBYTECODE, so compile once here rather
+    # than in every Python process the suite starts. The cache path is the
+    # suite's own, not this runner's PYTHONPYCACHEPREFIX.
+    py_compile.compile(
+        str(hook),
+        cfile=str(site_packages / "__pycache__" / f"usercustomize.{sys.implementation.cache_tag}.pyc"),
+        doraise=False,
+    )
+
+
+def collect_child_stderr(env: dict[str, str]) -> str:
+    """Drain the hook's per-process logs for one suite attempt, newest last."""
+    directory = env.get(CHILD_STDERR_ENV)
+    if not directory or not os.path.isdir(directory):
+        return ""
+    logs = []
+    for path in Path(directory).glob("*.log"):
+        try:
+            logs.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    parts = []
+    for _mtime, path in sorted(logs):
+        try:
+            parts.append(path.read_text(encoding="utf-8", errors="replace"))
+            path.unlink()
+        except OSError:
+            continue
+    text = "".join(parts)
+    if len(text) > _CHILD_STDERR_LIMIT:
+        text = "[earlier child stderr truncated]\n" + text[-_CHILD_STDERR_LIMIT:]
+    return text
+
+
 def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     """The single owner of the isolation definition (Q4). No caller-ambient
     execution path exists anywhere in this runner; every subprocess gets an
@@ -183,6 +313,9 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     gitconfig = tmpdir / "gitconfig"
     gitconfig.write_text(f"[safe]\n\tdirectory = {repo_root}\n", encoding="utf-8")
     env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
+    child_stderr = tmpdir / "child-stderr"
+    _install_child_stderr_hook(home, child_stderr)
+    env[CHILD_STDERR_ENV] = str(child_stderr)
     # _EXPLICIT_UNSET_KEYS are simply omitted from `env` (env -i semantics: a
     # subprocess launched with this dict as its full environment never sees
     # them, regardless of what the caller's ambient shell has set).
@@ -418,6 +551,7 @@ class SuiteResult:
         "duration_s",
         "profile",
         "failing_test_ids",
+        "child_stderr",
     )
 
     def __init__(self, relpath, returncode, timed_out, stdout, stderr, duration_s, profile):
@@ -429,6 +563,7 @@ class SuiteResult:
         self.duration_s = duration_s
         self.profile = profile
         self.failing_test_ids = extract_failing_test_ids(stdout, stderr)
+        self.child_stderr = ""
 
     @property
     def passed(self) -> bool:
@@ -686,7 +821,11 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
             with _OWNED_LIVE_PATHS_LOCK:
                 _OWNED_LIVE_PATHS_BY_SUITE.setdefault(relpath, set()).update(snapshot)
     duration = (datetime.datetime.now() - started).total_seconds()
-    return SuiteResult(relpath, rc, timed_out, out, err, duration, profile)
+    result = SuiteResult(relpath, rc, timed_out, out, err, duration, profile)
+    child_stderr = collect_child_stderr(env)
+    if not result.passed:
+        result.child_stderr = child_stderr
+    return result
 
 
 def reap_process_group(proc: subprocess.Popen) -> tuple[str, str]:
@@ -1104,6 +1243,11 @@ def write_failure_diagnostics(
                     stderr_name = f"{prefix}.stderr.txt"
                     _write_diagnostic_text(suite_fd, stdout_name, result.stdout or "")
                     _write_diagnostic_text(suite_fd, stderr_name, result.stderr or "")
+                    child_stderr = getattr(result, "child_stderr", "")
+                    if child_stderr:
+                        _write_diagnostic_text(
+                            suite_fd, f"{prefix}.child-stderr.txt", child_stderr
+                        )
                     rows.append(
                         {
                             "suite_path": suite_path,
