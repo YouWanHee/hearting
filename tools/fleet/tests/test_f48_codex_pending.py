@@ -61,6 +61,17 @@ class CodexPendingTest(unittest.TestCase):
     def event(self, kind, turn="turn"):
         return {"type": "event_msg", "payload": {"type": kind, "turn_id": turn}}
 
+    def user_prompt(self, client_id, text="PRIVATE TYPED REPLY"):
+        """The composer-submit event the TUI writes beside the response_item message."""
+        item = {"type": "UserMessage", "id": "u", "content": [
+            {"type": "text", "text": text, "text_elements": []}]}
+        if client_id is not None:
+            item["client_id"] = client_id
+        return {"type": "event_msg", "payload": {"type": "item_completed", "item": item}}
+
+    def reply_text(self, index=0, call_id="async"):
+        return self.reply(call_id, index)["payload"]["content"][0]["text"]
+
     def append(self, *rows):
         with open(self.path, "a", encoding="utf-8") as handle:
             for row in rows:
@@ -163,6 +174,49 @@ class CodexPendingTest(unittest.TestCase):
         pending = codex._LIFECYCLE_CACHE[os.path.realpath(self.path)].pending_calls
         self.assertNotIn("PRIVATE", repr(pending))
         self.assertEqual(pending["async"].questions, frozenset({1}))
+
+    def test_typed_reply_after_turn_end_clears_async_question(self):
+        # Observed 2026-10-02: the box is dropped at turn end and the answer is an ordinary message.
+        self.write(self.event("task_started"), self.async_call(), self.accepted(),
+                   self.event("task_complete"))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+        self.append(self.user_prompt("3b21a49f-2a77-4c1d-9a0e-5d3f6a7b8c90"))
+        self.assertIsNone(codex._tail_pending_request_user_input(self.path))
+
+    def test_completion_delivery_prompt_keeps_async_question(self):
+        self.write(self.event("task_started"), self.async_call(), self.accepted(),
+                   self.event("task_complete"), self.user_prompt("delivery-" + "ab" * 32),
+                   self.event("task_started", "t2"), self.event("task_complete", "t2"))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+
+    def test_prompt_before_question_in_same_turn_does_not_clear_it(self):
+        self.write(self.user_prompt("3b21a49f-2a77-4c1d-9a0e-5d3f6a7b8c90"),
+                   self.event("task_started"), self.async_call(), self.accepted())
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+
+    def test_structured_reply_prompt_clears_only_the_answered_index(self):
+        self.write(self.async_call(count=2), self.accepted(),
+                   self.user_prompt("3b21a49f-2a77-4c1d-9a0e-5d3f6a7b8c90", self.reply_text(0)),
+                   self.reply(index=0))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+        pending = codex._LIFECYCLE_CACHE[os.path.realpath(self.path)].pending_calls
+        self.assertEqual(pending["async"].questions, frozenset({1}))
+
+    def test_prompt_without_client_id_is_unchanged(self):
+        self.write(self.event("task_started"), self.async_call(), self.accepted(),
+                   self.event("task_complete"), self.user_prompt(None))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "async")
+
+    def test_prompt_leaves_a_blocking_call_to_its_own_rules(self):
+        self.write(self.event("task_started"), self.call("blocking"),
+                   self.user_prompt("3b21a49f-2a77-4c1d-9a0e-5d3f6a7b8c90"))
+        self.assertEqual(codex._tail_pending_request_user_input(self.path)["call_id"], "blocking")
+
+    def test_prompt_clear_keeps_no_typed_content(self):
+        self.write(self.async_call(), self.accepted(),
+                   self.user_prompt("3b21a49f-2a77-4c1d-9a0e-5d3f6a7b8c90"))
+        codex._tail_pending_request_user_input(self.path)
+        self.assertNotIn("PRIVATE", repr(codex._LIFECYCLE_CACHE[os.path.realpath(self.path)].pending_calls))
 
     def test_namespaced_calls_and_malformed_async_requests(self):
         self.write(self.async_call(name="functions.request_user_input_async"), self.accepted())

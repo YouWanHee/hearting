@@ -65,7 +65,7 @@ Interactive completion uses Codex's native queue, addressed to the caller's
 The exact-batch sidecar checks consumed and pending messages before sending;
 ambiguous sends may repeat. Only an exact Hearting item may restart an interrupted
 parent. The TUI owns questions and approvals; headless owners keep their separate
-supervisor. Empty native question answers are not user decisions.
+supervisor. Default mode asks through `request_user_input_async`; its question box vanishes when the turn ends, so an open decision question is restated in the final message and the next reply is its answer (response-policy). Empty answers are not decisions.
 Arbitrary detached shell output still does not auto-resume. For non-dispatch
 long-running work, obey `preflight.sh
 loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback

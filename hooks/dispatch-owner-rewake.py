@@ -36,6 +36,7 @@ from dispatch_completion_join import (  # noqa: E402
     delivery_required_action,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
 from dispatch_session_sweep import (  # noqa: E402
     HUMAN_GATE_PREFIX,
@@ -974,7 +975,7 @@ def classified_receipt(
                 f"The owner paused at human gate {gate} and exited; this is not a failure. "
                 f"Read {parked.get('artifact') or 'the gate artifact'}, ask the person, then record "
                 f"the answer with:\n{release}\n(replace proceed with revise or stop when chosen). "
-                "A proceed starts the continuation owner."
+                "A proceed starts the continuation owner. " + PENDING_ANSWER_RULE
             )
         elif parked and parked["status"] == "proceed":
             reason = "owner-parked-gate-released"

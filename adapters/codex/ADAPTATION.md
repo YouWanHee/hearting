@@ -354,8 +354,10 @@ context, limits, and footer monitoring. Fleet does not own summary generation or
 interaction lifecycle; it only renders stored evidence. The async question
 call/acceptance/exact-reply rollout shape was observed locally on 2026-10-01.
 That does not establish question observability for every client or Code Mode
-wrapper. Unobserved shapes remain unverified, with an explicit native question
-notice as the conversational fallback; the client owns question styling.
+wrapper. A later composer prompt clears the Fleet async wait and `delivery-`
+completion deliveries do not (observed 2026-10-02). Unobserved shapes remain
+unverified, with an explicit native question notice as the conversational
+fallback; the client owns question styling.
 
 ## Required Codex Mappings
 

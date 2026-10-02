@@ -407,6 +407,8 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertIn(f"--jobs {self.jobs}", message)
         self.assertNotIn("inspect-done-failure", message)
         self.assertIn("state=attention", message)
+        from frame_interview import PENDING_ANSWER_RULE
+        self.assertIn(PENDING_ANSWER_RULE, message)
 
     def test_released_parked_owner_wake_gives_the_start_handle(self) -> None:
         message = self.parked_owner_receipt("proceed")

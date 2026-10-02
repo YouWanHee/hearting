@@ -107,15 +107,20 @@ Each clause is one contract line plus the signal that it was violated.
   "camera-ready" request does not by itself add a pause). The one-time entry
   confirmation above is a separate pre-execution contract. *Violation signal:*
   a pause flag added because the task merely feels important.
-- **An empty answer is not a decision** — an empty answer or no response from a
-  structured question (`request_user_input`, `AskUserQuestion`, or equivalent)
-  never counts as the user's decision. For a simple, reversible confirmation,
-  proceed with the recommended option and report it briefly. If the work needs
-  a user decision about goals, architecture, destructive actions, external
-  effects, or a large scope, do not proceed with that work: state in one line
-  what decision is pending and end the turn. Previously authorized work remains
-  authorized. *Violation signal:* silence or an empty answer is treated as
-  approval for a consequential choice.
+- **No answer is not a decision** — an empty answer, no response, or elapsed
+  time from a structured question (`AskUserQuestion`, Codex
+  `request_user_input[_async]`, OpenCode `question`, or equivalent) never counts
+  as the user's decision. For a simple, reversible confirmation of your own,
+  proceed with the recommended option and report it briefly. A question that
+  needs a user decision — goals, architecture, destructive actions, external
+  effects, a large scope, or any question a Hearting receipt asks — stays open:
+  do not proceed with work that depends on it. If the turn ends first, end it
+  with the question and its options restated in one plain block, since some
+  runtimes drop an unanswered question box at turn end. The user's next reply,
+  structured or typed, is the answer; do not ask the same question again each
+  turn. Previously authorized work remains authorized. *Violation signal:*
+  silence, elapsed time, or an empty answer is treated as approval for a
+  consequential choice, or an open question is re-asked instead of awaited.
 - **Do not ask what is certain** — reserve questions for genuinely non-obvious
   design, format, destructive, or large-scope decisions, and prefer pre-commit
   exposure over asking. *Violation signal:* over-confirmation on self-evident or

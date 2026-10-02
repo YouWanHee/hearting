@@ -664,6 +664,8 @@ class WorkStartTest(unittest.TestCase):
             self.assertIn(token,result['release_command'])
         self.assertNotIn('parent_next',result)
         self.assertIn('resume_command',result)
+        import frame_interview as FI
+        self.assertIn(FI.PENDING_ANSWER_RULE,result['next_step'])
         self.assertEqual(len(self.calls),3)
 
     def test_a_parked_receipt_points_at_the_owners_own_report_when_it_has_one(self):
@@ -1029,7 +1031,10 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
 
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
-        self.assertEqual(self.step(interview=self.question_file)["state"], "needs-question")
+        asked = self.step(interview=self.question_file)
+        self.assertEqual(asked["state"], "needs-question")
+        import frame_interview as FI
+        self.assertIn(FI.PENDING_ANSWER_RULE, asked["next_step"])
         self.assertEqual(self.resolution()["status"], "blocked")
         self.assertEqual(self.step()["state"], "needs-question")
         self.assertEqual(self.resolution()["epoch"], 1)
