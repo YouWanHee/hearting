@@ -223,7 +223,7 @@ blueprint `spec/artifact-path-contract/prd.md` D-23; it is not restated here.
 
 **Cycle payload paths.** Producer collection and manifest validation share one
 locator check, and finalization and every later refresh share one inclusion rule
-(§45 D-123). Inside cycle-relative `artifacts/`, hidden components
+(§45 D-123). The closed-cycle refresh pauses on one machine while `${XDG_CONFIG_HOME:-~/.config}/hearting/cycle-refresh.off` exists, so a reader that does not yet follow updated closed-cycle manifests can catch up; open-cycle checkpoints are unaffected. Inside cycle-relative `artifacts/`, hidden components
 (dot-prefixed names such as `.git/` or `.pytest_cache/`), `__pycache__/`,
 `*.pyc`, editor temporaries (`*.swp`, `*~`, `.#*`), `*.tmp`/`*.part` and symbolic
 links are not output: a link is only `lstat`-ed and its target is not followed or read, and each
