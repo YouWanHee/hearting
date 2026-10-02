@@ -184,19 +184,27 @@ class RefreshPumpTest(unittest.TestCase):
         def run_loop():
             result.append(render._loop(Screen(), collector, None, "both", 2.0))
 
+        # After `release`, the snapshot worker still runs the side collectors.
+        # Unpatched, `_malformed()` first-imports collectors.dispatch (~80
+        # modules, compiled from source under PYTHONDONTWRITEBYTECODE) and
+        # `_collect_governor()` runs artifact-root.sh: >1s on a loaded runner,
+        # so `_loop`'s own `pump.stop(join_timeout=1.0)` raced the join below.
         with mock.patch.object(render, "_init_colors"), \
              mock.patch.object(render, "_draw"), \
              mock.patch.object(render.curses, "curs_set"), \
+             mock.patch.object(render, "_malformed", return_value=0), \
+             mock.patch.object(render, "_collect_memory", return_value=None), \
+             mock.patch.object(render, "_collect_governor", return_value=None), \
              mock.patch.dict(render.os.environ, {"HERDR_ENV": "1"}):
             thread = threading.Thread(target=run_loop)
             thread.start()
-            self.assertTrue(collector_entered.wait(1.0))
-            # The point is that key input runs while the first snapshot is still
-            # blocked (release is set only after this), not how fast: 0.2 s raced a
-            # loaded CI runner.
-            self.assertTrue(getch_called.wait(2.0))
+            # The collector stays blocked until `release`, so these waits are
+            # hang guards: getch is reached while it is blocked or never.
+            self.assertTrue(collector_entered.wait(5.0))
+            self.assertTrue(getch_called.wait(5.0))
             release.set()
-            thread.join(1.0)
+            # Hang guard only; `_loop` itself bounds its exit by its 1.0s stop join.
+            thread.join(5.0)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [0])

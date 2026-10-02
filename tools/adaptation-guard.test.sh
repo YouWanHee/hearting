@@ -7,17 +7,20 @@
 #     4) 파생 codex-hook 집합 대비 ADAPTATION_INVENTORY ledger drift(HLS-7) 시 가드 red.
 #     5) parity-loss(HLS-8) 명시 unsupported 토큰이 사라지면 가드 red (silent skip 금지).
 #     6) build-manifest REPO_ROOT realpath — 어댑터 심링크 경로 직접 실행 시 이중경로 없이 정상.
-#   전략: 실트리를 임시 변형 → 가드 실행 → 메시지 assert → 무조건 원복(trap). 종료 시 트리 clean 확인.
+#   전략: 체크아웃 사본을 임시 변형 → 가드 실행 → 메시지 assert → 무조건 원복(trap). 종료 시 트리 clean 확인.
 set -uo pipefail
 
 if ! ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
   ROOT=$(cd "$(dirname -- "$0")/.." && pwd)
 fi
+# The negative cases rewrite tracked files; do it in a private copy so peer
+# suites never read the live checkout mid-edit (tools/checkout-copy.sh).
+. "$ROOT/tools/checkout-copy.sh"
+COPY_PARENT=$(mktemp -d)
+trap 'rm -rf "$COPY_PARENT"' EXIT
+checkout_copy "$ROOT" "$COPY_PARENT/repo" || { echo "FAIL - checkout copy"; exit 1; }
+ROOT="$COPY_PARENT/repo"
 cd "$ROOT"
-# Shared with every other suite that reads or writes this checkout; see
-# tools/worktree-lock.sh for why it is anchored at the git dir.
-. "$ROOT/tools/worktree-lock.sh"
-worktree_lock_acquire "$ROOT" 900 || exit 70
 
 GUARD="tools/check-adaptation-boundary.sh"
 BM="tools/build-manifest.py"
@@ -65,7 +68,7 @@ restore_all() {
   done
   # 임시 생성 파일 제거
   for f in $CREATED; do rm -f "$f"; done
-  rm -rf "$TMP"
+  rm -rf "$TMP" "$COPY_PARENT"
 }
 trap restore_all EXIT
 
