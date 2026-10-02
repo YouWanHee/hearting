@@ -90,7 +90,9 @@ def worktree_target(artifact_root: Path, route: dict, target: Path) -> tuple[Pat
         return None
     try:
         top=subprocess.run(["git","-C",cwd,"rev-parse","--show-toplevel"],capture_output=True,text=True,timeout=10)
-        repository=Path(top.stdout.strip() if top.returncode==0 and top.stdout.strip() else cwd).resolve()
+        if top.returncode!=0 or not top.stdout.strip():
+            return None     # not a repository: the ordinary outside-root refusal stands
+        repository=Path(top.stdout.strip()).resolve()
         relative=target.resolve(strict=False).relative_to(repository)
     except (OSError,ValueError,subprocess.SubprocessError):
         return None

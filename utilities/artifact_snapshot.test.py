@@ -149,6 +149,26 @@ class ArtifactSnapshotTest(unittest.TestCase):
     result=self.run_helper(artifact,path,refine,"rt-repo")
     self.assertEqual(result.returncode,65,result.stdout); self.assertIn("target-outside-artifact-root",result.stderr)
 
+ def test_only_a_verified_git_repository_counts_as_the_route_repository(self):
+  # A cwd whose `git rev-parse` fails must not be taken as the repository root.
+  import importlib.util
+  if str(ROOT/"utilities") not in sys.path:
+   sys.path.insert(0,str(ROOT/"utilities"))
+  import artifact_producer
+  spec=importlib.util.spec_from_file_location("artifact_snapshot_helper",HELPER)
+  helper=importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); plain=root/"plain"; plain.mkdir(); (plain/"notes.md").write_text("x\n")
+   repository=root/"repo"; repository.mkdir(); subprocess.run(["git","init","-q",str(repository)],check=True)
+   (repository/"README.md").write_text("r\n")
+   cycle=root/".agent_reports"/"cycle"/"artifacts"; cycle.mkdir(parents=True)
+   with mock.patch.object(artifact_producer,"route_cycle_for",return_value={"cycle_id":"cyc"}), \
+        mock.patch.object(artifact_producer,"_cycle_artifacts_dir",return_value=cycle):
+    self.assertIsNone(helper.worktree_target(root/".agent_reports",{"cwd":str(plain)},plain/"notes.md"))
+    self.assertIsNone(helper.worktree_target(root/".agent_reports",{"cwd":str(repository)},repository/".git"/"HEAD"))
+    self.assertEqual(helper.worktree_target(root/".agent_reports",{"cwd":str(repository)},repository/"README.md"),
+                     (cycle,Path("README.md")))
+
 
 import importlib.util, os
 _SPEC=importlib.util.spec_from_file_location("owner_preview_fixture_for_snapshot",Path(__file__).with_name("owner_preview_approval.test.py"))
