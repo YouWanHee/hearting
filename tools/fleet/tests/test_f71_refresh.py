@@ -191,7 +191,10 @@ class RefreshPumpTest(unittest.TestCase):
             thread = threading.Thread(target=run_loop)
             thread.start()
             self.assertTrue(collector_entered.wait(1.0))
-            self.assertTrue(getch_called.wait(0.2))
+            # The point is that key input runs while the first snapshot is still
+            # blocked (release is set only after this), not how fast: 0.2 s raced a
+            # loaded CI runner.
+            self.assertTrue(getch_called.wait(2.0))
             release.set()
             thread.join(1.0)
 
