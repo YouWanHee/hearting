@@ -4663,7 +4663,75 @@ def _gpu_process_rows(gpu, indent, width):
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
         row = [(indent + "    ", None), ("↳ ", "dim"), (command, "dim")]
         rows.append(_clip_segs(row, width)[0])
+        progress = _gpu_progress_row(process, indent, width)
+        if progress:
+            rows.append(progress)
     return rows
+
+
+# A tqdm-shaped line (`desc: NN%|bar| n/total [elapsed<left, rate, k=v]`, metrics may also
+# follow the bracket) is compacted by shape alone; any other line is shown clipped as is.
+_PROGRESS_TQDM_RE = re.compile(
+    r"^(?P<desc>.*?)\s*(?P<pct>\d{1,3}(?:\.\d+)?)%\s*\|[^|]*\|\s*"
+    r"(?P<count>[\d.]+[kMGTPE]?/[\d.]+[kMGTPE]?)(?P<rest>.*)$")
+_PROGRESS_LEFT_RE = re.compile(r"\s*\[[^<\]]*<\s*(?P<left>\d[\d:]*)")
+_PROGRESS_METRIC_RE = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*=[^\s,;\[\]]+")
+_PROGRESS_STALLED_S = 300
+_PROGRESS_BODY_CACHE = {}   # {(pid, line): compact text}; the line changes per probe, not per frame
+
+
+def _progress_body(line):
+    match = _PROGRESS_TQDM_RE.match(line)
+    if not match:
+        return line
+    desc = match.group("desc").strip().rstrip(":").strip()[:24]
+    parts = [" ".join(part for part in (desc, match.group("pct") + "%",
+                                        match.group("count")) if part)]
+    rest = match.group("rest")
+    left = _PROGRESS_LEFT_RE.match(rest)
+    if left:
+        parts.append(left.group("left") + " left")
+    metrics = _PROGRESS_METRIC_RE.findall(rest)[:2]
+    if metrics:
+        parts.append(" ".join(metrics))
+    return " · ".join(parts)
+
+
+def _progress_age(age_s):
+    if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) or age_s < 0:
+        return None, None
+    age_s = int(age_s)
+    if age_s > _PROGRESS_STALLED_S:
+        minutes = age_s // 60
+        return ("stalled %dm" % minutes if minutes < 120
+                else "stalled %dh" % (minutes // 60)), "lvl_y"
+    return ("%ds ago" % age_s if age_s < 60 else "%dm ago" % (age_s // 60)), "dim"
+
+
+def _gpu_progress_row(process, indent, width):
+    """One dim line of the process's latest file-redirected output, or None."""
+    progress = process.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    line = _gpu_safe_text(progress.get("line")).strip()
+    if not line:
+        return None
+    key = (process.get("pid"), line)
+    body = _PROGRESS_BODY_CACHE.get(key)
+    if body is None:
+        if len(_PROGRESS_BODY_CACHE) >= 256:
+            _PROGRESS_BODY_CACHE.clear()
+        body = _PROGRESS_BODY_CACHE[key] = _progress_body(line)
+    prefix = [(indent + "      ", None), ("↳ ", "dim")]
+    age_text, age_key = _progress_age(progress.get("age_s"))
+    suffix = [(" · ", "dim"), (age_text, age_key)] if age_text else []
+    # The age is the stall signal, so the body yields width before it does.
+    room = width - sum(_dw(text) for text, _key in prefix + suffix)
+    if room >= 2:
+        segs = prefix + [(_clip_w(body, room), "dim")] + suffix
+    else:
+        segs = prefix + ([(age_text, age_key)] if age_text else [(body, "dim")])
+    return _clip_segs(segs, width)[0]
 
 
 def _fresh_compute_hosts():

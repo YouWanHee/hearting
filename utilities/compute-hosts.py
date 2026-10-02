@@ -529,11 +529,13 @@ import ipaddress
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from stat import S_ISREG
 
 try:
     OWNER_CLAIMS = json.loads(os.environ.get("HEARTING_OWNER_CLAIMS_JSON", "[]"))
@@ -777,7 +779,7 @@ COMMAND_ARGV_MAX = 32
 COMMAND_CELLS_MAX = 160
 
 
-def command_text(values):
+def command_text(values, cells_max=COMMAND_CELLS_MAX):
     # One control-free, display-bounded line from already bounded argv bytes.
     words = []
     for raw in list(values)[:COMMAND_ARGV_MAX]:
@@ -796,7 +798,7 @@ def command_text(values):
     for char in joined:
         width = (0 if unicodedata.combining(char) else
                  2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1)
-        if cells + width > COMMAND_CELLS_MAX:
+        if cells + width > cells_max:
             break
         out.append(char)
         cells += width
@@ -841,6 +843,57 @@ def process_cwd(pid, expected_start):
             or any(ord(char) < 32 or ord(char) == 127 for char in target)):
         return None
     return target
+
+
+PROGRESS_TAIL_BYTES = 4096
+PROGRESS_CELLS_MAX = 200
+ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_])")
+
+
+def process_progress(pid, expected_start):
+    # Last line of a file-redirected stdout/stderr; pipes, ttys and failures stay absent.
+    before = proc_stat(pid)
+    if (before is None or before["start"] != expected_start or not same_euid(pid)):
+        return None
+    chosen = None
+    for fd in (1, 2):
+        path = "/proc/%d/fd/%d" % (pid, fd)
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        if S_ISREG(info.st_mode) and (chosen is None or info.st_mtime > chosen[1].st_mtime):
+            chosen = (path, info)
+    if chosen is None:
+        return None
+    path, info = chosen
+    try:
+        # A fresh read-only description: the process's own offset is untouched,
+        # and a pipe swapped in after the stat is never read.
+        handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(handle)
+        if (not S_ISREG(opened.st_mode) or opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino):
+            return None
+        raw = os.pread(handle, PROGRESS_TAIL_BYTES,
+                       max(0, opened.st_size - PROGRESS_TAIL_BYTES))
+    except OSError:
+        return None
+    finally:
+        os.close(handle)
+    after = proc_stat(pid)
+    if (after is None or after["start"] != expected_start or not same_euid(pid)):
+        return None
+    text = ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
+    for piece in reversed(re.split(r"[\r\n]", text)):
+        line = command_text([piece], PROGRESS_CELLS_MAX)
+        if line:
+            return {"line": line, "age_s": max(0, int(time.time() - opened.st_mtime))}
+    return None
 
 
 def process_elapsed_s(start_ticks, uptime):
@@ -1121,6 +1174,9 @@ else:
         }
         if session_owner is not None:
             process["session_owner"] = session_owner
+        progress = process_progress(pid, stat["start"]) if stat is not None else None
+        if progress is not None:
+            process["progress"] = progress
         gpu = by_uuid.get(uuid)
         if gpu is None:
             payload["unmatched_processes"].append(process)
