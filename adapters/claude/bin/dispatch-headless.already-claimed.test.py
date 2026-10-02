@@ -28,6 +28,12 @@ class AlreadyClaimedTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # The harness CLI only has to exist on PATH: the launch itself is mocked,
+        # and CI runners have no claude binary installed.
+        self.fakebin = self.root / "bin"
+        self.fakebin.mkdir()
+        (self.fakebin / "claude").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (self.fakebin / "claude").chmod(0o755)
         self.repo = self.root / "repo"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
@@ -58,7 +64,7 @@ class AlreadyClaimedTest(unittest.TestCase):
                 "--launch-authority", "conductor", "--nested-eligibility", "supported",
                 "--eligibility-source", "claude-fixture", "--fallback-ordinal", "1",
                 "--model", "claude-test", "--effort", "low"]
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.root), "AGENT_HOME": str(ROOT),
+        env = {"PATH": str(self.fakebin) + os.pathsep + os.environ.get("PATH", ""), "HOME": str(self.root), "AGENT_HOME": str(ROOT),
                "AGENT_ARTIFACT_ROOT": str(self.art), "AGENT_DISPATCH_JOBS": str(self.jobs),
                "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture", "XDG_STATE_HOME": str(self.root / "state")}
         lost_claim = self.wrapper.DispatchContractError(
