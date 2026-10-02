@@ -554,5 +554,81 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         self.assertNotIn(render._SUBAGENT_IND + "● GPU", text)
 
 
+class GpuProgressLineRenderTest(unittest.TestCase):
+    TQDM = ("TRAIN: 76%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258c | 15135/20000 "
+            "[1:52:10<39:00, 2.08batch/s] , L_se=1.18e-02, L_loc=2.67e-03, L_vad=3.20e-01")
+
+    def setUp(self):
+        render._PROGRESS_BODY_CACHE.clear()
+        self.addCleanup(render._PROGRESS_BODY_CACHE.clear)
+
+    def gpu(self, *progress):
+        processes = []
+        for offset, value in enumerate(progress):
+            row = {"pid": 400 + offset, "used_memory_mib": 100 - offset,
+                   "command": "python run.py --train"}
+            if value is not None:
+                row["progress"] = value
+            processes.append(row)
+        return {"index": 0, "processes": processes}
+
+    def test_tqdm_line_is_compacted_under_its_process(self):
+        rows = render._gpu_process_rows(
+            self.gpu({"line": self.TQDM, "age_s": 8}), "  ", 168)
+        self.assertEqual([render._plain(row).strip() for row in rows], [
+            "\u21b3 python run.py --train",
+            "\u21b3 TRAIN 76% 15135/20000 \u00b7 39:00 left \u00b7 "
+            "L_se=1.18e-02 L_loc=2.67e-03 \u00b7 8s ago",
+        ])
+        self.assertTrue(all(key in (None, "dim") for _text, key in rows[1]))
+
+    def test_stock_tqdm_postfix_and_unknown_remaining_time(self):
+        self.assertEqual(
+            render._progress_body("eval: 100%|##########| 1.2k/1.2k "
+                                  "[00:10<00:00, 120it/s, loss=0.12, acc=0.9, f1=0.8]"),
+            "eval 100% 1.2k/1.2k \u00b7 00:00 left \u00b7 loss=0.12 acc=0.9")
+        self.assertEqual(render._progress_body(" 3%|#| 3/100 [00:01<?, ?it/s]"),
+                         "3% 3/100")
+
+    def test_other_lines_are_shown_raw_and_absent_progress_adds_no_row(self):
+        rows = render._gpu_process_rows(self.gpu(
+            {"line": "Epoch 3 validation\x1b done", "age_s": 75},
+            None, {"line": "   ", "age_s": 1}, {"age_s": 3}, "bad"), "", 120)
+        text = [render._plain(row).strip() for row in rows]
+        self.assertEqual(len(text), 6)
+        self.assertEqual(text[1], "\u21b3 Epoch 3 validation? done \u00b7 1m ago")
+
+    def test_stalled_output_is_marked_in_warning_colour(self):
+        (_command, progress) = render._gpu_process_rows(
+            self.gpu({"line": self.TQDM, "age_s": 361}), "", 168)
+        self.assertEqual(progress[-1], ("stalled 6m", "lvl_y"))
+        self.assertEqual(render._progress_age(300), ("5m ago", "dim"))
+        self.assertEqual(render._progress_age(7300), ("stalled 2h", "lvl_y"))
+        self.assertEqual(render._progress_age(None), (None, None))
+
+    def test_narrow_width_clips_the_body_before_the_age(self):
+        for width in (60, 40, 23):
+            (_command, progress) = render._gpu_process_rows(
+                self.gpu({"line": self.TQDM, "age_s": 900}), "    ", width)
+            text = render._plain(progress)
+            self.assertLessEqual(render._dw(text), width)
+            self.assertTrue(text.endswith("stalled 15m"), text)
+
+    def test_compaction_is_cached_per_pid_and_line(self):
+        gpu = self.gpu({"line": self.TQDM, "age_s": 8})
+        with mock.patch.object(render, "_progress_body",
+                               wraps=render._progress_body) as body:
+            for _frame in range(3):
+                render._gpu_process_rows(gpu, "", 120)
+            gpu["processes"][0]["progress"] = {"line": self.TQDM + " ", "age_s": 9}
+            render._gpu_process_rows(gpu, "", 120)
+        self.assertEqual(body.call_count, 1)
+        gpu["processes"][0]["progress"] = {"line": "TRAIN: 77%|#| 15136/20000", "age_s": 0}
+        with mock.patch.object(render, "_progress_body",
+                               wraps=render._progress_body) as body:
+            render._gpu_process_rows(gpu, "", 120)
+        self.assertEqual(body.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

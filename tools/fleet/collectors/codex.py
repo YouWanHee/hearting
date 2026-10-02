@@ -1038,6 +1038,30 @@ def _proc_rollout(pid, cwd, home):
     return None
 
 
+def _registered_thread(pid):
+    """The thread a launcher bound to this exact process, or None.
+
+    `peer-steward start --kind codex` proves the thread of a daemon-attached TUI (which holds
+    no rollout) from the one new root rollout and writes the tier-1 record for the TUI pid. The
+    record counts only while its `procStart` still equals the live process's start time, so a
+    recycled pid, or a record with no start time, is not proof.
+    """
+    try:
+        record = session_registry.read("codex", pid)
+    except Exception:
+        return None
+    if not record:
+        return None
+    from . import procscan
+    claimed = record.get("procStart")
+    thread = record.get("sessionId")
+    if claimed is None or str(claimed) != str(procscan.read_proc_start(pid) or ""):
+        return None
+    if not isinstance(thread, str) or _sid("rollout-x-%s.jsonl" % thread) != thread:
+        return None
+    return thread
+
+
 def session_id_of_process(pid, live_codex=None):
     """The thread a live Codex process is running, or None — proven the way the board proves it.
 
@@ -1067,6 +1091,9 @@ def session_id_of_process(pid, live_codex=None):
     path = _proc_rollout(pid, cwd, _home())
     if path:
         return _sid(path)
+    registered = _registered_thread(pid)
+    if registered:
+        return registered
     if procscan._comm_of(pid) != "codex":
         return None                     # procscan lists only `codex` itself as a runtime
     env = procscan.read_environ(pid)

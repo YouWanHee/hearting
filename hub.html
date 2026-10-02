@@ -449,7 +449,7 @@
   "manifest_version": "2.0.0",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:aab4c06ec844c16e3885c44ff33bbb9f147d0d876bea0f3d3cbb6f9e290786f7",
+    "digest": "sha256:f50e45034b95a948bba152a0939df241cb0484036a405277784c40720dd4bb87",
     "capabilities": 13,
     "recipes": 29
   },
@@ -823,11 +823,11 @@
       "group": "ops",
       "fam": "ops",
       "modes": [],
-      "blurb": "Write a handoff card; tidy memory.",
+      "blurb": "Write a handoff card; tidy memory; clear the window.",
       "invocation_class": "model-support",
       "use_when": "Use when context fills, before compact, on handoff to another session, after a large task, or on request.",
       "not_for": "Not for primary routing or memory writes.",
-      "argument_hint": "[정리] | 인계 <받을 세션>"
+      "argument_hint": "[정리] | 정리만 | 인계 <받을 세션>"
     }
   ],
   "agents": [
@@ -949,6 +949,13 @@
       "slug": "hook__herdr-agent-state__PreToolUse",
       "name": "herdr-agent-state working",
       "mono": "herdr-agent-state",
+      "event": "PreToolUse",
+      "hard_block": false
+    },
+    {
+      "slug": "hook__route-presence-gate.py__PreToolUse",
+      "name": "route-presence-gate.py",
+      "mono": "route-presence-gate.py",
       "event": "PreToolUse",
       "hard_block": false
     },

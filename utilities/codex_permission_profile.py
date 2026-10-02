@@ -15,7 +15,7 @@ PROFILE_NAME = "hearting_linked_commit"
 def named_profiles_available() -> bool:
     try:
         result = subprocess.run(["codex", "sandbox", "--help"], capture_output=True,
-                                text=True, timeout=10)
+                                text=True, stdin=subprocess.DEVNULL, timeout=10)
         return result.returncode == 0 and "--permission-profile" in result.stdout
     except (OSError, subprocess.SubprocessError):
         return False

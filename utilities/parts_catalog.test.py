@@ -490,7 +490,8 @@ class StagesTest(unittest.TestCase):
         parts = {node["part"]: node for block in blocks for node in block["nodes"]}
         self.assertEqual({part: node["start_approval"] for part, node in parts.items() if node["start_approval"]}, {
             "autopilot-lab:full-run": "full-run", "autopilot-ship:deploy": "deploy",
-            "autopilot-apply:handback": "handback"})
+            "autopilot-apply:handback": "handback",
+            "autopilot-refine:transaction": "preview"})
         self.assertEqual(sorted(part for part, node in parts.items() if node["shareable"]), [
             "autopilot-lab:diagnose", "autopilot-lab:full-run", "autopilot-lab:smoke",
             "autopilot-research:retrieval", "autopilot-research:synthesis"])
@@ -528,7 +529,8 @@ class StartApprovalTest(CatalogBase):
     def test_own_parts_are_reported_without_changing_the_route(self):
         expected = {("autopilot-lab", "setup"): ("full-run", "autopilot-lab:full-run", "full-run"),
                     ("autopilot-ship", "default"): ("deploy", "autopilot-ship:deploy", "deploy"),
-                    ("autopilot-apply", "default"): ("handback", "autopilot-apply:handback", "handback")}
+                    ("autopilot-apply", "default"): ("handback", "autopilot-apply:handback", "handback"),
+                    ("autopilot-refine", "default"): ("transaction", "autopilot-refine:transaction", "preview")}
         for (capability, mode), (node, part, approval) in expected.items():
             with self.subTest(capability=capability):
                 route = R.compile_route(

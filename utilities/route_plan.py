@@ -46,7 +46,7 @@ MAX_APPROVALS = 4
 MAX_TEXT = 300
 MAX_YAML_EVENTS = 600
 SHAPES = ("direct", "solo", "staged")
-APPROVAL_KEYS = ("full-run", "deploy", "handback")
+APPROVAL_KEYS = ("full-run", "deploy", "handback", "preview")
 VALID = "valid"
 _SLUG = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _CAPABILITY = re.compile(r"[a-z][a-z0-9-]{0,63}")
@@ -306,7 +306,10 @@ def parse_proposal_with_source(text: str) -> tuple:
     source = textwrap.dedent(blocks[0])
     document = _load_yaml(source)
     body = document.get(PROPOSAL_SCHEMA) if isinstance(document, dict) and len(document) == 1 else None
-    if not isinstance(body, dict) or set(body) - {"summary", "legs", "entry_approvals"}:
+    if not isinstance(body, dict) or set(body) - {"summary", "legs", "entry_approvals", "execution_scope"}:
+        raise ProposalError("schema-invalid:document")
+    scope = body.get("execution_scope", "complete")
+    if scope not in ("complete", "report"):
         raise ProposalError("schema-invalid:document")
     legs = body.get("legs")
     if not isinstance(legs, list) or not 1 <= len(legs) <= MAX_LEGS:
@@ -324,7 +327,7 @@ def parse_proposal_with_source(text: str) -> tuple:
         rows.append({"key": raw["key"], "leg": raw["leg"], "question": raw["question"]})
     return ({"summary": _text(body.get("summary"), name="summary", required=True),
              "legs": [_normal_leg(raw, index) for index, raw in enumerate(legs)],
-             "entry_approvals": rows}, source)
+             "entry_approvals": rows, "execution_scope": scope}, source)
 
 
 def leg_arguments(leg) -> dict:
@@ -340,6 +343,9 @@ def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
     Returns `{"legs": [facts], "start_approvals": [{leg, key, part, node}]}`; raises ProposalError
     for the first invalid leg, so one bad leg makes the whole proposal none.
     """
+    scope = proposal.get("execution_scope", "complete")
+    if scope not in ("complete", "report"):
+        raise ProposalError("schema-invalid:document")
     facts, approvals = [], []
     for index, leg in enumerate(proposal["legs"]):
         try:
@@ -352,10 +358,10 @@ def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
                       "graph": list(composed.get("graph") or []) or None,
                       "intensity": route["effective_intensity"]})
         approvals.extend({"leg": index, **row} for row in start_approvals(route))
-    for row in proposal["entry_approvals"]:
+    for row in proposal.get("entry_approvals", []):
         if not any(item["leg"] == row["leg"] and item["start_approval"] == row["key"] for item in approvals):
             raise ProposalError(f"entry-approval-mismatch:{row['key']}@{row['leg']}")
-    return {"legs": facts, "start_approvals": approvals}
+    return {"legs": facts, "start_approvals": approvals, "execution_scope": scope}
 
 
 def evaluate_brief(path, *, root, node, compile_leg, start_approvals) -> dict:

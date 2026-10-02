@@ -1,5 +1,11 @@
 {
   "autoMemoryEnabled": false,
+  "env": {
+    "AGENT_DISPATCH_CALLER_HARNESS": "",
+    "CODEX_THREAD_ID": "",
+    "CODEX_SESSION_ID": "",
+    "OPENCODE_SESSION_ID": ""
+  },
   "permissions": {
     "allow": [
       "Bash",
@@ -77,6 +83,16 @@
             "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/core-write-guard.py\"",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/route-presence-gate.py\"",
+            "timeout": 30
           }
         ]
       },

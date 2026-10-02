@@ -439,12 +439,15 @@ def main() -> int:
         )
     sd111_first_prompt_sweep(sid)
 
+    # The card hook runs first: it is where a cleared window's successor is recorded, and the
+    # receipts a predecessor left for it are swept only once that is known.
+    card = card_context(payload, current_cwd)
     batches = []
     try:
         batches, parts = native_queue_prompt_receipts(sid)
     except Exception:
         parts = []
-    parts.append(card_context(payload, current_cwd))
+    parts.append(card)
     parts.append(candidate_context(payload, current_cwd, sid))
     parts.append(run_preflight("briefing", current_cwd))
     # Phase 1 token self-regulation is transition-only. Normal, unknown,

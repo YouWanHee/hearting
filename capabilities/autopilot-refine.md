@@ -17,17 +17,27 @@ This is the portable capability contract for `autopilot-refine`. It defines runt
 
 ## Invocation Semantics
 
-Autopilot family — post-creation iteration pipeline for research and doc artifacts (NOT code). Prompt-driven: target artifact identified via prompt fuzzy match against `<artifact-root>/{research,documents}/*`, then auto-discovers the artifact's file structure, plans edits, shows a diff preview in chat, and on user confirm applies edits with versioning + integrated history logging in `pipeline_summary.md` (single source of truth — no separate CHANGELOG). Default intensity is `quick` (one registered conductor). Its sealed `inline_human_gates` declares `preview-disposition`, bound at the one-shot terminal boundary and enforced before any target-artifact write. The conductor writes `reviews/refine/preview.md`, raises and awaits the gate, then applies within the same attempt only after the person releases it; escalate intensity to `standard|strong|thorough|adversarial` for multi-round review, fact-check, or external adversary work. Optional `--memo <file>` falls back to file-memo style for deferred reviews.
+Autopilot family — post-creation iteration pipeline for research and doc artifacts (NOT code). Prompt-driven: target artifact identified via prompt fuzzy match against `<artifact-root>/{research,documents}/*`, then auto-discovers the artifact's file structure, plans edits, shows a diff preview in chat, and on user confirm applies edits with versioning + integrated history logging in `pipeline_summary.md` (single source of truth — no separate CHANGELOG). Default intensity is `quick` (one registered conductor). New starts carry complete or report scope in the existing start choice; report ends after the preview without target-artifact writes. Older sealed quick routes retain their `preview-disposition` inline gate and current-preview protection. Escalate intensity to `standard|strong|thorough|adversarial` for multi-round review, fact-check, or external adversary work. Optional `--memo <file>` falls back to file-memo style for deferred reviews.
 
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
+## Entry Scope and Existing Routes
+
+The existing start choice carries `complete` or `report` for the exact shown
+scope. Report completes review and writes `reviews/refine/preview.md`, then
+stops before snapshot, source mutation, and apply. Complete proceeds through
+review, preview, snapshot/history, and apply without a second approval wait.
+`--review-only` follows report; `--confirm` keeps its explicit meaning and does
+not imply an approval that was not given at start. Old sealed routes keep their
+preview gate, digest binding, and user-only release.
+
 ## Post-Frame Direction Gate
 
-**One gate, raised from the frame legs (SD-123/SD-129).** A `quick+` route seals `human_gates: ["frame-review", "preview-disposition"]` and both
+**Existing route gates (SD-123/SD-129).** Older sealed `quick+` routes carry `human_gates: ["frame-review", "preview-disposition"]` and both
 `frame` and `frame-alternative` continuations as that human gate, bound at
 `one-shot`'s entry for `quick` and `review`'s entry for `standard+`. `frame-review` is the recipe's one **direction** gate.
 
-**Preview approval stays (user decision, 2026-09-10).** `preview-disposition`
+**Older preview approval stays (user decision, 2026-09-10).** `preview-disposition`
 is not a direction: it is the approval refine was built around — plan edits,
 show the diff preview, apply only on the user's confirm. `review` keeps its
 `human-gate` continuation naming `preview-disposition`, bound at

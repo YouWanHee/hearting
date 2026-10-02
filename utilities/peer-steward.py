@@ -16,6 +16,7 @@ it; and `ack` makes an at-least-once wake idempotent to display. `wait` keeps
 its bounded-foreground semantics unchanged.
 """
 import argparse
+import calendar
 import fcntl
 import hashlib
 import importlib.util
@@ -59,24 +60,20 @@ _PERMISSION_FLAGS = {
 
 def _current_session_identity():
     """`(session_id, harness)` — delegates to `dispatch_parent_completion
-    .interactive_parent_identity` (the portable first-source-of-truth, F-<next> plan §3 B-3)
-    when it can resolve one unambiguous caller harness; falls back to the prior
-    claude > codex > opencode > AGENT_SESSION_ID priority otherwise (an explicit caller
-    harness env still wins there too, so a genuinely ambiguous or unset environment keeps
-    its exact prior behavior)."""
+    .interactive_parent_identity`, the one resolver every identity consumer shares, so the
+    sender of a peer message is the harness the route-chain writer and compose name.
+
+    Never guesses a native id: when the resolver finds the caller ambiguous or invalid, or
+    an explicit harness name has no session id of its own, the sender stays unknown
+    (`AGENT_SESSION_ID` if set, else `("", "unknown")`) and the message is still recorded.
+    The old claude > codex > opencode fallback named a Codex thread `claude [bc]`."""
     try:
         from dispatch_parent_completion import interactive_parent_identity
         harness, sid = interactive_parent_identity()
         if sid:
             return sid, harness
-    except Exception:   # caller-harness-ambiguous/invalid -> fall through to legacy order
+    except Exception:   # caller-harness-ambiguous/invalid -> sender unknown, never guessed
         pass
-    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        return os.environ["CLAUDE_CODE_SESSION_ID"], "claude"
-    if os.environ.get("CODEX_THREAD_ID"):
-        return os.environ["CODEX_THREAD_ID"], "codex"
-    if os.environ.get("OPENCODE_SESSION_ID"):
-        return os.environ["OPENCODE_SESSION_ID"], "opencode"
     if os.environ.get("AGENT_SESSION_ID"):
         return os.environ["AGENT_SESSION_ID"], "unknown"
     return "", "unknown"
@@ -470,6 +467,178 @@ def _pane_is_managed(pane):
     return False if processes else None
 
 
+# A Codex TUI attached to the shared app-server daemon holds no rollout file of its own, and
+# the daemon creates the thread's rollout about a second after the TUI starts. Fleet can then
+# only match a TUI to its thread by start time, which several same-cwd starts a few seconds
+# apart defeat on purpose (no guessing), so the row stays anonymous and herdr learns nothing.
+# `start` is the one party that saw the launch: it notes which rollouts exist before the
+# launch and afterwards takes exactly ONE new root rollout for the target cwd as the session.
+# Zero or several is no proof, so nothing is bound and the receipt says why. Bookkeeping, not
+# a gate: it adds no flag or required input and never fails the start; the bound is the wait.
+_BIND_SECONDS = 15.0
+_BIND_POLL_SECONDS = 0.5
+_BIND_PROCESS_SECONDS = 3.0      # how long to wait for the pane's `codex` process to appear
+_BIND_START_SLACK_SECONDS = 2.0
+
+
+def _codex_home_dir():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def _rollout_paths(home):
+    """Every rollout file name under the Codex sessions tree (names only, nothing is read)."""
+    found = set()
+    for root, _dirs, names in os.walk(os.path.join(home, "sessions")):
+        for name in names:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                found.add(os.path.join(root, name))
+    return found
+
+
+def _fleet_codex_collector():
+    """`fleet.collectors.codex`, whose rollout helpers (`_rollout_meta`, `_is_subagent`,
+    `_sid`) are reused instead of re-parsing rollouts here. ``None`` on any failure."""
+    if _session_registry() is None:
+        return None
+    try:
+        from fleet.collectors import codex as collector
+        return collector
+    except Exception:
+        return None
+
+
+def _pane_codex_pid(pane):
+    """Pid of the pane's foreground `codex` process, from `herdr pane process-info`."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+        info = (payload.get("result") or {}).get("process_info") or {}
+        processes = info.get("foreground_processes") or []
+    except Exception:
+        return None
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        argv = [str(part) for part in (process.get("argv") or [])]
+        if argv and os.path.basename(argv[0]) == "codex" and process.get("pid"):
+            try:
+                return int(process["pid"])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _proc_cwd(pid):
+    try:
+        return os.path.realpath(os.readlink("/proc/%d/cwd" % int(pid)))
+    except (OSError, ValueError):
+        return None
+
+
+def _rollout_created_at(meta, path):
+    stamp = meta.get("timestamp")
+    if isinstance(stamp, str):
+        try:
+            return calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _new_root_rollouts(collector, home, before, cwd, launched_at):
+    """Thread ids of root rollouts for ``cwd`` created at/after the launch and not in ``before``."""
+    found = []
+    for path in sorted(_rollout_paths(home) - before):
+        meta = collector._rollout_meta(path)
+        if not meta or collector._is_subagent(meta):
+            continue
+        if os.path.realpath(str(meta.get("cwd") or "")) != cwd:
+            continue
+        if _rollout_created_at(meta, path) < launched_at - _BIND_START_SLACK_SECONDS:
+            continue
+        sid = collector._sid(path)
+        if sid:
+            found.append(sid)
+    return found
+
+
+def _bind_codex_session(pane, pane_cwd, home, before, launched_at):
+    """`(state, session_id, pid, cwd)`; state is bound|ambiguous|timeout|no-process|unavailable.
+
+    A single candidate is confirmed once more one poll later, so a second same-cwd launch that
+    lands a moment after the first is seen as ambiguous rather than silently taken. A candidate
+    first seen on the final poll never got that second look, so the bind ends as `timeout`."""
+    collector = _fleet_codex_collector()
+    if collector is None:
+        return "unavailable", None, None, None
+    began = time.monotonic()
+    deadline = began + _BIND_SECONDS
+    pid = cwd = None
+    candidate = None
+    while time.monotonic() < deadline:
+        if pid is None:
+            pid = _pane_codex_pid(pane)
+        if pid is not None and cwd is None:
+            cwd = pane_cwd or _proc_cwd(pid)
+        if cwd:
+            found = _new_root_rollouts(collector, home, before, cwd, launched_at)
+            if len(found) > 1:
+                return "ambiguous", None, pid, cwd
+            if len(found) == 1:
+                if candidate == found[0]:
+                    return "bound", found[0], pid, cwd
+                candidate = found[0]
+            else:
+                candidate = None
+        if pid is None and time.monotonic() - began >= _BIND_PROCESS_SECONDS:
+            break
+        time.sleep(_BIND_POLL_SECONDS)
+    return ("timeout" if pid is not None and cwd else "no-process"), None, pid, cwd
+
+
+def _proc_start_ticks(pid):
+    """/proc/<pid>/stat field 22 as a str (the registry's PID-reuse guard), else None."""
+    try:
+        raw = Path("/proc/%d/stat" % int(pid)).read_text()
+        rest = raw[raw.rindex(")") + 1:].split()
+        return None if rest[0] in ("Z", "X") else rest[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_bound_registry(pid, session_id, cwd, name):
+    """Fleet's tier-1 record for the launched TUI, so Fleet (and through it herdr) names it.
+
+    Written only with a nonempty procStart: Fleet rejects a record without a matching process
+    start time, so one written without it would claim a binding nobody can use. Returns whether
+    a usable record was written."""
+    proc_start = _proc_start_ticks(pid)
+    if not proc_start:
+        return False
+    registry = _session_registry()
+    if registry is None:
+        return False
+    try:
+        registry.write("codex", pid, {
+            "sessionId": session_id,
+            "cwd": cwd,
+            "startedAt": int(time.time() * 1000),
+            "procStart": proc_start,
+            "name": name,
+            "nameSource": "user",
+            "kind": "codex-tui",
+            "entrypoint": "peer-steward-start",
+            "harness": "codex",
+        })
+        return True
+    except Exception:
+        return False
+
+
 # The harness flag that puts a launched session in a chosen directory. `herdr agent
 # start` has none of its own — the agent it starts inherits the PANE's shell cwd — so
 # `--cwd` used to move nothing but this CLI process: a session started with
@@ -504,6 +673,12 @@ def cmd_start(args):
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
     ingress_note = _ensure_pane_ingress(args.pane, args.kind)
+
+    bind_home = bind_before = None
+    launched_at = time.time()
+    if args.kind == "codex":
+        bind_home = _codex_home_dir()
+        bind_before = _rollout_paths(bind_home)
 
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
@@ -551,6 +726,18 @@ def cmd_start(args):
         failure_reason = (code if isinstance(code, str)
                           and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", code)
                           else "herdr-start-error" if payload_error else "herdr-start-failed")
+    # herdr names no Codex thread for a daemon-attached TUI; the launcher proves it from the
+    # one new root rollout (see the block comment above `_BIND_SECONDS`).
+    session_bind = None
+    if started and isinstance(agent_block, dict) and args.kind == "codex" and not started_sid:
+        session_bind, bound_sid, tui_pid, tui_cwd = _bind_codex_session(
+            args.pane, pane_cwd, bind_home, bind_before, launched_at)
+        if session_bind == "bound":
+            started_sid = bound_sid
+            # The thread id stays in the ledger and receipt either way; only the Fleet registry
+            # projection needs the process start time.
+            if not _write_bound_registry(tui_pid, bound_sid, tui_cwd, args.name):
+                session_bind = "bound-unregistered"
     _record(
         to_harness=args.kind, to_name=args.name, kind="steer",
         summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
@@ -567,19 +754,18 @@ def cmd_start(args):
             {"harness": args.kind, "session_id": started_sid, "name": args.name},
             "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
         )
-    # `session_id=-` is the launch-time signal that this session will have no identity
-    # anywhere downstream: no ledger endpoint, no board badge, nothing to steer by name.
-    # It used to be visible only hours later as a nameless row (measured 2026-09-10: a
-    # codex session started here came up unmanaged because the pane's PATH had no
-    # hearting wrapper on it, so no tier-1 record was ever written). Saying it at the
-    # launch is the difference between a known gap and a mystery.
+    # `session_id=-` is the launch-time signal that nothing proved which session this is
+    # (no ledger endpoint, no board badge, nothing to steer by name); `session_bind=` says
+    # why for a Codex start (timeout | ambiguous | no-process | unavailable), `bound` when
+    # the launcher itself proved the thread id, and `bound-unregistered` when it did but Fleet's
+    # registry record could not be written (no process start time to guard PID reuse).
     #
     # `cwd=` only when one was asked for: it is the receipt that the flag was honored,
     # and an unasked-for value would cost an extra herdr call on every start.
     # `managed=` is read off the started process, not inferred from how it was launched.
-    # An unmanaged Codex writes no session record, so it has no id, no badge and no way to
-    # be addressed later — that has to be visible at the launch, not discovered hours
-    # later as a nameless row on the board.
+    # Interactive managed ingress is retired, so `managed=false` is no longer a defect
+    # signal; the field stays for receipt compatibility and `session_id=` is what says
+    # whether the session got an identity.
     managed = "-"
     if started and _MANAGED_INGRESS.get(args.kind):
         verdict = _pane_is_managed(args.pane)
@@ -588,6 +774,7 @@ def cmd_start(args):
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
         f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'} "
         f"managed={managed}"
+        + (f" session_bind={session_bind}" if session_bind else "")
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
@@ -1715,6 +1902,360 @@ def cmd_prompt(args):
     return _PROMPT_EXIT[outcome]
 
 
+# --- clear: the one typed command that starts a fresh conversation (session-tidy auto-clear) ---
+
+_CLEAR_COMMAND = {"claude": "/clear", "codex": "/clear", "opencode": "/new"}
+_CLEAR_EXIT = {"true": 0, "skipped": 3, "failed": 1, "unverified": 5}
+_CLEAR_LEDGER_STATUS = {"true": "sent", "failed": "failed", "skipped": "unknown", "unverified": "unknown"}
+_CLEAR_OBSERVE_ROUNDS = 8             # bounded waits between looks at the pane after the send (OpenCode repaints its home in ~5 s)
+_CLEAR_OBSERVE_SETTLE_MS = 1500
+_ANSI_TOKEN = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|(.)", re.S)
+_RULE_LINE = re.compile(r"^[\s\u2500-\u257f]*\u2500{8,}[\s\u2500-\u257f]*$")
+_OPENCODE_HOME_PLACEHOLDER = "askanything"
+
+
+def _screen_lines(raw):
+    """The visible screen as lines of `(char, faint)` cells: SGR faint (`2`) tracked,
+    every other escape sequence dropped. A dim line is a placeholder or a suggestion."""
+    lines, cells, faint = [], [], False
+    for match in _ANSI_TOKEN.finditer(raw or ""):
+        params, final, char = match.group(1), match.group(2), match.group(3)
+        if char is not None:
+            if char == "\n":
+                lines.append(cells)
+                cells = []
+            elif char != "\r":
+                cells.append((" " if char == "\u00a0" else char, faint))
+        elif final == "m":
+            for code in (params.split(";") if params else ["0"]):
+                if code in ("0", ""):
+                    faint = False
+                elif code == "2":
+                    faint = True
+                elif code == "22":
+                    faint = False
+    lines.append(cells)
+    return lines
+
+
+def _plain(cells):
+    return "".join(ch for ch, _ in cells)
+
+
+def _marker_remainder(cells, marker):
+    """`(text, any_bright)` after `marker` on a line that starts with it (leading blanks ok), else None."""
+    text = _plain(cells)
+    stripped = text.lstrip()
+    if not stripped.startswith(marker):
+        return None
+    offset = len(text) - len(stripped) + len(marker)
+    rest = cells[offset:]
+    body = _plain(rest).strip()
+    return body, any((not faint) and ch.strip() for ch, faint in rest)
+
+
+def _draft_state(harness, lines):
+    """`empty` | `nonempty` | `unknown` for the input box of one harness's visible screen.
+
+    Only a layout read for that harness decides `empty`; a box that cannot be located, or text
+    below the marker that could be a second draft line, a popup or a footer, is `unknown` --
+    never `empty` (clearing over a draft destroys it)."""
+    if harness == "claude":
+        idx = next((i for i in range(len(lines) - 1, -1, -1)
+                    if _marker_remainder(lines[i], "\u276f") is not None), None)
+        if idx is None:
+            return "unknown"
+        body, bright = _marker_remainder(lines[idx], "\u276f")
+        if bright:
+            return "nonempty"
+        for cells in lines[idx + 1:]:
+            if _RULE_LINE.match(_plain(cells)):
+                return "empty"          # the faint remainder, if any, is Claude's own suggestion
+            if _plain(cells).strip():
+                return "nonempty"       # a second draft line before the box closes
+        return "unknown"
+    if harness == "codex":
+        idx = next((i for i in range(len(lines) - 1, -1, -1)
+                    if _marker_remainder(lines[i], "\u203a") is not None), None)
+        if idx is None:
+            return "unknown"
+        body, bright = _marker_remainder(lines[idx], "\u203a")
+        if bright:
+            return "nonempty"
+        below = lines[idx + 1] if idx + 1 < len(lines) else []
+        return "empty" if not _plain(below).strip() else "unknown"
+    if harness == "opencode":
+        block, end = [], None
+        for i in range(len(lines) - 1, -1, -1):
+            text = _plain(lines[i]).lstrip()
+            if text.startswith("\u2503"):
+                if end is None:
+                    end = i
+                block.insert(0, text[1:])
+            elif end is not None:
+                break
+        if len(block) < 2:
+            return "unknown"
+        # The last bar line is the agent/model line. Typed text starts right after the bar's
+        # two-space margin; a hint right-aligned in a wide pane (the cwd and branch) sits far
+        # to the right behind a wide gap and is not the draft.
+        typed = " ".join(filter(None, (_opencode_left_text(body) for body in block[:-1])))
+        typed = "".join(typed.split())
+        if not typed or typed.lower().startswith(_OPENCODE_HOME_PLACEHOLDER):
+            return "empty"
+        return "nonempty"
+    return "unknown"
+
+
+def _opencode_left_text(body):
+    """The text at the left edge of one OpenCode input-box line (`body` is the line after its bar)."""
+    rest = body[2:] if not body[:2].strip() else body
+    if not rest[:1].strip():
+        return ""
+    return re.split(r" {6,}", rest, maxsplit=1)[0].strip()
+
+
+def _read_screen(target):
+    """The visible pane (ANSI) as screen lines, or None when it could not be read."""
+    try:
+        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible", "--format", "ansi"],
+                              capture_output=True, text=True, errors="replace", timeout=_herdr_get_timeout())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return None
+    return _screen_lines(proc.stdout)
+
+
+def _process_session(pane, harness):
+    """The session the pane's foreground Claude/Codex process is on now, or None.
+
+    Read from the process the way the Fleet board does (Claude's `sessions/<pid>.json`,
+    which is rewritten on `/clear`; Codex's open rollout). herdr's own `agent_session`
+    follows a `/clear` only when its integration reports it, and has been seen to keep
+    the previous session for good (live panes 2026-10-01), so a second tidy in the same
+    window would otherwise never clear it."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=_herdr_get_timeout())
+        payload = json.loads(proc.stdout or "")
+        processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+        tools_dir = Path(__file__).resolve().parent.parent / "tools"
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet.collectors import claude as claude_collector, codex as codex_collector
+    except Exception:
+        return None
+    for process in processes:
+        try:
+            pid = int(process.get("pid"))
+            if harness == "claude":
+                sid = claude_collector.session_id_of_process(pid)
+            else:
+                sid = codex_collector.session_id_of_process(pid)
+        except Exception:
+            continue
+        if sid:
+            return sid
+    return None
+
+
+def _herdr_lags(req, herdr_sid):
+    """True when herdr's session for the booked pane is an OLDER session of the booking seat's own
+    ledger than the booked one -- the booked thread is later, herdr just has not followed.
+
+    Codex tools and hooks run in the shared app-server daemon, so the pane's TUI holds no rollout
+    the process check could read and herdr's `agent_session` can stay on the cleared session for
+    good (measured 2026-10-01).  The seat ledger (written by the hooks of both sessions at this very
+    pane) is then the only record that orders the two.  A session the ledger has never seen is not
+    a predecessor."""
+    if req.get("harness") != "codex" or not herdr_sid or herdr_sid == "-" or herdr_sid == req.get("sid"):
+        return False
+    try:
+        import session_tidy as st
+        seat_fields = req.get("seat") or {}
+        seat = st.Seat(str(seat_fields.get("kind") or ""), str(seat_fields.get("key") or ""),
+                       str(seat_fields.get("pane") or ""), str(seat_fields.get("harness") or ""),
+                       str(seat_fields.get("project_key") or ""))
+        return st.ledger_precedes(seat, herdr_sid, str(req.get("sid")))
+    except Exception:
+        return False
+
+
+def _clear_look(target, req):
+    """One judgement of the target: `(None, agent)` when it may be cleared, else `(reason, agent)`.
+
+    Identity (pane, harness, session), idle state, then the screen: no form open and an empty
+    input box. Every doubt is a reason, never a guess."""
+    state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
+    if unavailable or state in ("agent-not-found", "timeout"):
+        return (unavailable or "agent-not-found"), agent
+    seat_pane = (req.get("seat") or {}).get("pane")
+    if seat_pane and agent.get("pane") != seat_pane:
+        return "target-changed", agent
+    if agent.get("harness") != req.get("harness"):
+        return "target-changed", agent
+    if req.get("harness") in ("claude", "codex") and agent.get("session_id") != req.get("sid"):
+        # herdr's pane record can lag a /clear; the process itself is the proof, never a guess.
+        # An unnamed session (`-`, empty) is not a confirmed match: only the process can vouch for it.
+        if _process_session(agent.get("pane") or target, req.get("harness")) != req.get("sid") \
+                and not _herdr_lags(req, agent.get("session_id")):
+            return "target-changed", agent
+    if state == "blocked":
+        return "form-open", agent
+    if state not in ("idle", "done"):
+        return f"not-idle-{state}", agent
+    lines = _read_screen(target)
+    if lines is None:
+        return "screen-unknown", agent
+    flat = "".join("".join(_plain(c) for c in lines).split()).lower()
+    if any(token in flat for token in _FORM_TOKENS):
+        return "form-open", agent
+    draft = _draft_state(req.get("harness"), lines)
+    if draft == "nonempty":
+        return "draft", agent
+    if draft != "empty":
+        return "draft-unknown", agent
+    return None, agent
+
+
+def _wait_for_home(target, bound_ms):
+    """Event-driven pause for OpenCode: its pane is `done` before, during and after `/new`, so
+    `_settle` would return at once. Waits (bounded) for the home screen's placeholder to show;
+    the answer is not used -- the caller looks at the screen itself."""
+    try:
+        subprocess.run(["herdr", "pane", "wait-output", target, "--match", "Ask anything",
+                        "--source", "visible", "--timeout", str(int(bound_ms))],
+                       capture_output=True, text=True, timeout=bound_ms / 1000.0 + 5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _opencode_home(lines):
+    """OpenCode's home screen: the placeholder box (older builds) or, as measured on 1.18.34,
+    nothing at all but the working-directory line. A conversation view always carries the
+    `┃` input bars and a model line, so those never read as home."""
+    plain = [_plain(line).strip() for line in lines]
+    shown = [text for text in plain if text]
+    if any(text.startswith("\u2503") for text in shown):
+        return any(_OPENCODE_HOME_PLACEHOLDER in "".join(text.split()).lower() for text in shown) \
+            and _draft_state("opencode", lines) == "empty"
+    return 0 < len(shown) <= 2 and shown[-1][:1] in ("/", "~")
+
+
+def _clear_observe(target, req, request_path):
+    """The new conversation, seen: its session id (`-` when the harness has none yet), or None.
+
+    Hook-side proof first (the booking's `observed`, written by the new session's start hook),
+    then herdr's own session id for the pane (Claude/Codex), then OpenCode's home screen."""
+    old = req.get("sid")
+    for round_no in range(_CLEAR_OBSERVE_ROUNDS):
+        held = _read_json(Path(request_path))
+        seen = (held or {}).get("observed") or {}
+        if seen.get("sid") and seen.get("sid") != old:
+            return str(seen["sid"])
+        state, agent, _code, unavailable = _interpret_payload(_run_herdr_get(target), target)
+        sid = agent.get("session_id")
+        if not unavailable and req.get("harness") in ("claude", "codex"):
+            # The process's own session decides when it can be read; herdr's pane record can lag
+            # a /clear (or keep an older session) and is only the fallback.
+            proven = _process_session(agent.get("pane") or target, req.get("harness"))
+            if proven and _herdr_lags(req, proven):
+                proven = None           # the process check named an older session of this seat
+            if proven:
+                if proven != old:
+                    return str(proven)
+            elif sid not in (None, "-", old) and not _herdr_lags(req, sid):
+                return str(sid)
+        if not unavailable and req.get("harness") == "opencode" and state in ("idle", "done"):
+            lines = _read_screen(target)
+            if lines is not None and _opencode_home(lines):
+                return "-"
+        if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
+            if req.get("harness") == "opencode":
+                _wait_for_home(target, _CLEAR_OBSERVE_SETTLE_MS)
+            else:
+                _settle(target, _CLEAR_OBSERVE_SETTLE_MS)
+    return None
+
+
+def cmd_clear(args):
+    """session-tidy auto-clear: type the harness's own new-conversation command into `target`.
+
+    The last judgement and the only pane input of the clear flow. `--request` is the seat's
+    booking (`session_tidy_clear.py`); the command is typed only when all of these hold now:
+
+    * the booking is the current one (nonce), unexpired, no prompt was submitted since the card,
+      the card is the booked generation;
+    * the pane is the booked one, runs the booked harness (and session, where herdr names it),
+      and is idle or done (never working, never blocked);
+    * the visible screen shows no selection/permission form and the input box is read as empty
+      (a Claude suggestion or a Codex placeholder is empty; anything undecidable is not).
+
+    Both looks (`_clear_look`) are taken, the second immediately before the single
+    `herdr agent prompt`; herdr offers no send conditional on the pane's revision, so a keystroke
+    landing between that look and the send cannot be ruled out -- hence no trailer, no Enter
+    retry, and nothing is ever re-sent after a doubtful result.
+
+    `cleared=true` only with evidence the conversation changed (start hook note, new herdr
+    session id, OpenCode home); otherwise `unverified`. Exit 0 true / 3 skipped / 1 failed /
+    5 unverified. One ledger row (`kind=notice`, `action=clear` in the receipt) per judgement.
+    """
+    import session_tidy_clear as clear
+    if _herdr_missing():
+        print("cleared=failed reason=herdr-not-found")
+        return _CLEAR_EXIT["failed"]
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req is None:
+        print(f"cleared=skipped reason={why}")
+        return _CLEAR_EXIT["skipped"]
+    harness, old_sid, target = req.get("harness"), req.get("sid"), args.target
+    command = _CLEAR_COMMAND.get(harness)
+    started = time.monotonic()
+    new_session, pane = None, (req.get("seat") or {}).get("pane")
+
+    def finish(outcome, reason=None, agent=None):
+        nonlocal pane
+        if isinstance(agent, dict) and agent.get("pane") not in (None, "-"):
+            pane = agent.get("pane")
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        receipt = (f"action=clear cleared={outcome} harness={harness} old_session={old_sid} "
+                   f"new_session={new_session or '-'} ms={elapsed_ms}" + (f" reason={reason}" if reason else ""))
+        try:
+            _record(to_harness=harness or "unknown", to_name=target, kind="notice",
+                    summary_text=f"[notice] action=clear {outcome} {command or ''}".strip(),
+                    to_session_id=old_sid, to_pane=pane, ref=[], status=_CLEAR_LEDGER_STATUS[outcome],
+                    receipt=receipt, from_identity=(old_sid, harness, _project_of(req.get("cwd"))),
+                    from_name=_from_name(harness, old_sid))
+        except Exception:
+            pass        # the verdict below is the result; a ledger hiccup must not change it
+        line = (f"cleared={outcome} target={target} harness={harness} old_session={old_sid} "
+                f"new_session={new_session or '-'}" + (f" reason={reason}" if reason else ""))
+        print(line)
+        return _CLEAR_EXIT[outcome]
+
+    if not command:
+        return finish("skipped", "unsupported-harness")
+    reason, agent = _clear_look(target, req)
+    if reason:
+        return finish("skipped" if not reason.startswith(("herdr-", "agent-not-found")) else "failed", reason, agent)
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req is None:
+        return finish("skipped", why, agent)
+    reason, agent = _clear_look(target, req)          # the look immediately before the one send
+    if reason:
+        return finish("skipped" if not reason.startswith(("herdr-", "agent-not-found")) else "failed", reason, agent)
+    rc, payload = _herdr_prompt(target, command, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+    if rc is None:
+        return finish("failed", "herdr-invocation-failed", agent)
+    if rc != 0:
+        return finish("failed", _herdr_error_reason(payload, rc), agent)
+    new_session = _clear_observe(target, req, args.request)
+    if new_session is None:
+        return finish("unverified", "new-session-not-observed", agent)
+    return finish("true", None, agent)
+
+
 def _herdr_error_reason(payload, rc):
     error = payload.get("error") if isinstance(payload, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
@@ -1822,6 +2363,13 @@ def build_parser():
     p_prompt.add_argument("--wait-idle-ms", type=int, default=0,
                           help="defer the send until a working target settles (0 = send now; measured: mid-turn sends submit)")
     p_prompt.set_defaults(func=cmd_prompt)
+
+    p_clear = sub.add_parser("clear")
+    p_clear.add_argument("target")
+    p_clear.add_argument("--request", required=True,
+                         help="the seat's auto-clear booking (session_tidy_clear.py)")
+    p_clear.add_argument("--nonce", default=None, help="the booking's nonce, when the caller holds one")
+    p_clear.set_defaults(func=cmd_clear)
 
     p_mode = sub.add_parser("steward")
     p_mode.add_argument("state", choices=("on", "off"))

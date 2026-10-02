@@ -776,6 +776,22 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(len(self.calls), 3)
 
+    def test_same_seat_successor_resumes_a_live_attempt_without_a_new_launch(self):
+        # After a /clear the registered parent_sid stays the old session; the seat handover
+        # lets the new session at the same pane reuse the live attempt instead of being refused.
+        self.start()
+        before = len(self.calls)
+        W.default_parent_session_id.return_value = "successor"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor") as owns:
+            result = self.start()
+        self.assertEqual(result["state"], "preparing", result)
+        self.assertEqual(len(self.calls), before)
+        owns.assert_called()
+        self.assertIn("parent_sid=parent", self.jobs.read_text())          # the registered identity is untouched
+        W.default_parent_session_id.return_value = "stranger"
+        with mock.patch("dispatch_seat_handover.owns", side_effect=lambda meta, session, jobs=None: session == "successor"):
+            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+
     def test_resume_keeps_native_parent_when_gateway_transport_has_advanced(self):
         self.start()
         with mock.patch.dict(os.environ, {"AGENT_CODEX_MANAGED_GATEWAY": "1", "AGENT_DISPATCH_CHILD": "0"}), \

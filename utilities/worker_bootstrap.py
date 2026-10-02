@@ -3,8 +3,13 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -42,6 +47,42 @@ STAGE_NODE_CONTRACT = {
     "report": "code-report",
     "reporting": "code-report",
 }
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Reader-facing report gates whose format is specified outside their stage contract.
+REPORT_CONTRACT_REFERENCES = {
+    "lab-report": ("skills/autopilot-lab/references/eval-procedure.md",
+                   "skills/autopilot-lab/references/data-contract.md"),
+    "research-report": ("skills/autopilot-research/references/report-generation.md",),
+    "draft-finalize": ("skills/autopilot-draft/references/pipeline-steps.md",),
+    "audit-report": ("skills/audit/references/report-and-autofix.md",),
+}
+
+# Vocabulary a unit may declare under its optional `bootstrap:` frontmatter block.
+BOOTSTRAP_MEMORY_TOPICS = {
+    "report-format": "report 보고서 양식 format template layout style 문체 html 산출물 deliverable "
+                     "figure 그림 시각화 table 표",
+}
+BOOTSTRAP_EXEMPLAR_KINDS = ("deliverable",)
+BOOTSTRAP_STAGE_TYPES = ("stage", "review", "support")
+
+# gate -> (HTML patterns, MD patterns) under <cycle>/artifacts, fixed depth, earlier wins.
+DELIVERABLE_EXEMPLARS = {
+    "lab-report": (
+        ("report/index.html", "experiments/*/report/index.html", "experiments/*/report/report.html",
+         "experiments/*/report.html", "experiments/*/html_report/index.html"),
+        ("report/REPORT.md", "experiments/*/report/REPORT.md", "experiments/*/REPORT.md"),
+    ),
+    "code-report": ((), ("final_report.md", "plans/*/final_report.md", "plans/final_report.md")),
+    "research-report": (("report/*.html", "research/*/report/*.html"),
+                        ("report/*.md", "research/*/report/*.md")),
+    "design-handoff": (("designs/*/05_handoff/*.html",), ("designs/*/05_handoff/*.md",)),
+    "draft-finalize": (("documents/*/*.html",), ("documents/*/*.md",)),
+    "audit-report": ((), ("reviews/audit-report.md",)),
+}
+_EXEMPLAR_MIN_BYTES = 1024
+_MEMORY_BLOCK_MAX_BYTES = 6144
 
 
 def profile_worker_type(root: Path, profile: str | None) -> str | None:
@@ -127,6 +168,55 @@ def unit_persona_body(root: Path, unit: str | None) -> str | None:
         return None
     text = path.read_text(encoding="utf-8")
     return _FRONTMATTER_RE.sub("", text, count=1).strip()
+
+
+_BOOTSTRAP_BLOCK_RE = re.compile(r"^bootstrap:[ \t]*(?:#.*)?\n((?:[ \t]+\S.*\n?)+)", re.MULTILINE)
+
+
+def _declaration_value(raw: str):
+    raw = re.sub(r"\s+#.*$", "", raw.strip()).strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        return tuple(v.strip().strip("\"'") for v in raw[1:-1].split(",") if v.strip())
+    return raw.strip("\"'")
+
+
+@functools.lru_cache(maxsize=64)
+def _parse_bootstrap_declaration(path: str, mtime_ns: int) -> dict:
+    text = Path(path).read_text(encoding="utf-8")
+    front = _FRONTMATTER_RE.match(text)
+    block = _BOOTSTRAP_BLOCK_RE.search(front.group(0)) if front else None
+    if not block:
+        return {}
+    found: dict = {}
+    for line in block.group(1).splitlines():
+        key, sep, value = line.strip().partition(":")
+        if not sep or key.startswith("#"):
+            continue
+        parsed = _declaration_value(value)
+        if key in ("memory", "gates"):
+            parsed = parsed if isinstance(parsed, tuple) else ((parsed,) if parsed else ())
+        elif key == "exemplar":
+            parsed = parsed if isinstance(parsed, str) else ""
+        else:
+            continue
+        if parsed:
+            found[key] = parsed
+    return found
+
+
+def unit_bootstrap_declaration(root: Path, unit: str | None) -> dict:
+    """Read a unit's optional flat ``bootstrap:`` frontmatter block; any failure is ``{}``.
+
+    Only stdlib regex is used (no YAML on the dispatch hot path). Keys:
+    ``memory`` (tuple), ``exemplar`` (str), ``gates`` (tuple); absent keys are omitted.
+    """
+    try:
+        path = unit_persona_path(root, unit)
+        if path is None:
+            return {}
+        return dict(_parse_bootstrap_declaration(str(path), path.stat().st_mtime_ns))
+    except Exception:
+        return {}
 
 
 def artifact_cycle_environment(environ) -> dict[str, str]:
@@ -471,6 +561,22 @@ def render_worker_bootstrap(root: Path, worker_type: str, unit: str | None = Non
     return "\n\n".join(fragments) + "\n"
 
 
+@functools.lru_cache(maxsize=8)
+def _gate_contracts_cached(path: str, mtime_ns: int) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    table = data.get("completion_gate_contracts")
+    return table if isinstance(table, dict) else {}
+
+
+def _gate_contracts(root: Path | None) -> dict:
+    """The portable ``completion_gate_contracts`` table; ``{}`` when unreadable."""
+    try:
+        path = Path(root or _REPO_ROOT) / "capabilities" / "topologies.json"
+        return _gate_contracts_cached(str(path), path.stat().st_mtime_ns)
+    except (OSError, ValueError):
+        return {}
+
+
 def assigned_contract(
     *,
     capability: str,
@@ -483,20 +589,37 @@ def assigned_contract(
 ) -> str:
     """Resolve the assigned portable contract without consulting worker role.
 
-    A completion gate names the stage contract when that contract exists in
-    the portable catalog. Otherwise the entry capability remains the readable
-    contract and the immutable route node supplies the narrower assignment.
+    The gate table is the source: a ``capability-doc`` gate names its contract
+    file stem, any other gate kind is read through the entry capability. The
+    node-id fallback (plan/execute/test/report -> code-*) is autopilot-code
+    legacy only, so another capability's ``report`` node is not read as code-report.
     """
     if worker_type == "frame":
         return unit or "plan/frame"  # The injected unit is the contract, not the owner recipe.
     if explicit:
         return explicit
     if worker_type in {"stage", "review", "support"}:
-        if completion_gate and root and (root / "capabilities" / f"{completion_gate}.md").is_file():
+        entry = _gate_contracts(root).get(completion_gate) if completion_gate else None
+        if isinstance(entry, dict):
+            if entry.get("kind") == "capability-doc" and entry.get("contract"):
+                return Path(str(entry["contract"])).stem
+            return capability
+        if completion_gate and root and (Path(root) / "capabilities" / f"{completion_gate}.md").is_file():
             return completion_gate
-        if route_node and route_node.lower() in STAGE_NODE_CONTRACT:
+        if capability == "autopilot-code" and route_node and route_node.lower() in STAGE_NODE_CONTRACT:
             return STAGE_NODE_CONTRACT[route_node.lower()]
     return capability
+
+
+def _report_reference_line(args) -> str:
+    if getattr(args, "worker_type", None) != "stage":
+        return ""
+    refs = REPORT_CONTRACT_REFERENCES.get(getattr(args, "completion_gate", None) or "", ())
+    existing = [str(_REPO_ROOT / rel) for rel in refs if (_REPO_ROOT / rel).is_file()]
+    if not existing:
+        return ""
+    return ("- This node's report format is specified in: " + ", ".join(existing)
+            + " — read their report/bundle sections before writing.\n")
 
 
 def contract_read_prompt(args, harness: str) -> str:
@@ -505,13 +628,179 @@ def contract_read_prompt(args, harness: str) -> str:
         return ("- Your frame unit contract is already included above. Read its named inputs within "
                 "the requested scope; no owner capability Skill or full harness bootstrap is needed.\n")
     if harness == "codex":
-        return (f"- Read only $AGENT_HOME/adapters/codex/skills/{args.assigned_contract}/SKILL.md; "
+        line = (f"- Read only $AGENT_HOME/adapters/codex/skills/{args.assigned_contract}/SKILL.md; "
                 "the typed bootstrap above already contains the exact portable unit persona.\n")
-    if harness == "claude":
-        return (f"- Read only the exposed {args.assigned_contract} Skill, named artifacts, and selected specialization. "
+    elif harness == "claude":
+        line = (f"- Read only the exposed {args.assigned_contract} Skill, named artifacts, and selected specialization. "
                 "General Claude custom subagents may still inherit project CLAUDE.md; do not manually load a full harness bootstrap.\n")
-    return (f"- Read only the assigned {args.assigned_contract} Skill/mode and named artifact inputs. "
-            "Project instruction auto-load is not treated as physically masked; do not manually load a full harness bootstrap.\n")
+    else:
+        line = (f"- Read only the assigned {args.assigned_contract} Skill/mode and named artifact inputs. "
+                "Project instruction auto-load is not treated as physically masked; do not manually load a full harness bootstrap.\n")
+    return line + _report_reference_line(args)
+
+
+def _cycle_candidates(roots: list[Path], current_cycle: Path | None, deadline: float):
+    """Yield cycle dirs: the current campaign first, then the whole project, newest name first."""
+    def children(path: Path) -> list[Path]:
+        try:
+            with os.scandir(path) as it:
+                return sorted((Path(e.path) for e in it if e.is_dir(follow_symlinks=False)),
+                              key=lambda q: q.name, reverse=True)
+        except OSError:
+            return []
+
+    seen: set[Path] = set()
+    if current_cycle is not None:
+        for cycle in children(current_cycle.parent):
+            seen.add(cycle.resolve())
+            yield cycle
+    rest: list[Path] = []
+    for root in roots:
+        for campaign in children(root / "campaigns"):
+            if time.monotonic() >= deadline:
+                break
+            rest.extend(children(campaign))
+    for cycle in sorted(rest, key=lambda q: q.name, reverse=True):
+        try:
+            key = cycle.resolve()
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            yield cycle
+
+
+def _first_valid(artifacts: Path, patterns) -> Path | None:
+    for pattern in patterns:
+        try:
+            for match in sorted(artifacts.glob(pattern)):
+                rel = match.relative_to(artifacts)
+                if "_internal" in rel.parts or match.is_symlink() or not match.is_file():
+                    continue
+                if match.stat().st_size >= _EXEMPLAR_MIN_BYTES:
+                    return match
+        except OSError:
+            continue
+    return None
+
+
+def _deliverable_exemplars(gate, artifact_root, environ, *, deadline_s: float = 1.5,
+                           max_cycles: int = 60) -> list[Path]:
+    """Newest sealed cycle's completed deliverable(s) for ``gate``: first MD and first HTML."""
+    patterns = DELIVERABLE_EXEMPLARS.get(gate or "")
+    if not patterns or not artifact_root:
+        return []
+    deadline = time.monotonic() + deadline_s
+    base = Path(artifact_root)
+    roots = [base]
+    sibling = {".agent_reports": ".claude_reports", ".claude_reports": ".agent_reports"}.get(base.name)
+    if sibling and (base.parent / sibling).is_dir():
+        roots.append(base.parent / sibling)
+    unique: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved not in unique:
+            unique.append(resolved)
+    cycle_env = artifact_cycle_environment(environ)
+    cycle_dir = cycle_env["AGENT_ARTIFACT_CYCLE_DIR"] or (
+        str(Path(cycle_env["AGENT_ARTIFACT_OUTPUT_DIR"]).parent) if cycle_env["AGENT_ARTIFACT_OUTPUT_DIR"] else "")
+    current = Path(cycle_dir).resolve() if cycle_dir else None
+    html_patterns, md_patterns = patterns
+    inspected = 0
+    for cycle in _cycle_candidates(unique, current, deadline):
+        if inspected >= max_cycles or time.monotonic() >= deadline:
+            break
+        try:
+            if current is not None and cycle.resolve() == current:
+                continue
+            inspected += 1
+            if not (cycle / "manifest.json").is_file():
+                continue
+            artifacts = cycle / "artifacts"
+            found = [p for p in (_first_valid(artifacts, md_patterns), _first_valid(artifacts, html_patterns)) if p]
+        except OSError:
+            continue
+        if found:
+            return found
+    return []
+
+
+def _query_tokens(task: str, worktree: str | None) -> str:
+    """Project-name tokens plus up to 24 task words; path/URL-like and numeric tokens are dropped."""
+    def usable(token: str) -> bool:
+        return len(token) >= 2 and not token.isdigit() and not any(c in token for c in "/=:")
+
+    picked = [t for t in (re.split(r"[-_.]", Path(worktree).name) if worktree else []) if usable(t)]
+    task_words: list[str] = []
+    for raw in (task or "")[:1200].split():
+        token = raw.strip(".,;:()[]{}\"'`*#<>")
+        if usable(token) and token not in task_words:
+            task_words.append(token)
+    return " ".join(dict.fromkeys(picked + task_words[:24]))
+
+
+def _bootstrap_memory_block(topics, task, worktree, *, root=None, timeout_s: float = 3.0,
+                            environ=None) -> str:
+    """Bounded read-only preference bodies through ``mem bootstrap-context``; failure is ``""``."""
+    q1 = " ".join(BOOTSTRAP_MEMORY_TOPICS[t] for t in topics if t in BOOTSTRAP_MEMORY_TOPICS)
+    if not q1 or not worktree:
+        return ""
+    mem = Path(root or _REPO_ROOT) / "tools" / "memory" / "mem.py"
+    cmd = [sys.executable, str(mem), "bootstrap-context", "--cwd", str(worktree), "--query", q1]
+    q2 = _query_tokens(task, worktree)
+    if q2:
+        cmd += ["--query", q2]
+    cmd += ["--limit", "4", "--max-bytes", str(_MEMORY_BLOCK_MAX_BYTES)]
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=str(worktree),
+                              env=dict(environ) if environ is not None else os.environ.copy())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    if done.returncode != 0:
+        return ""
+    out = done.stdout.encode("utf-8")[:_MEMORY_BLOCK_MAX_BYTES].decode("utf-8", "ignore").strip()
+    return out
+
+
+def unit_bootstrap_prompt(args, task: str, environ, *, root: Path | None = None) -> str:
+    """Material a unit declared in its ``bootstrap:`` frontmatter, or ``""``.
+
+    Runtime-supplied and read-only. A unit without a declaration receives nothing
+    (no subprocess, no scan); any failure drops the material, never the launch.
+    """
+    try:
+        root = Path(root or _REPO_ROOT)
+        decl = unit_bootstrap_declaration(root, getattr(args, "unit", None))
+        if not decl or getattr(args, "worker_type", None) not in BOOTSTRAP_STAGE_TYPES:
+            return ""
+        gate = getattr(args, "completion_gate", None)
+        if decl.get("gates") and gate not in decl["gates"]:
+            return ""
+        lines = []
+        if decl.get("exemplar") in BOOTSTRAP_EXEMPLAR_KINDS:
+            found = _deliverable_exemplars(gate, getattr(args, "artifact_root", None), environ)
+            if found:
+                shown = "; ".join(f"{p} ({max(1, round(p.stat().st_size / 1024))} KB)" for p in found)
+                lines.append(
+                    f"- Format exemplar — a completed {gate} deliverable from this project: {shown}\n"
+                    "  Follow its section order, layout, tone, and visualization style. "
+                    "Take every fact only from your assigned inputs.\n"
+                    "  For HTML, skim the structure; do not load embedded media.\n")
+        memory = _bootstrap_memory_block(decl.get("memory", ()), task, getattr(args, "worktree", None),
+                                         root=root, environ=environ)
+        if memory:
+            lines.append("- Saved preferences from memory (reference only; apply only what fits your assignment; "
+                         "do not write, curate, or sync memory):\n" + memory + "\n")
+        if not lines:
+            return ""
+        return ("Unit bootstrap material (runtime-supplied, read-only reference):\n" + "".join(lines)
+                + "- If format guidance and your inputs disagree: content follows the inputs, "
+                  "format follows these conventions.\n\n")
+    except Exception:
+        return ""
 
 
 def handoff_template() -> str:

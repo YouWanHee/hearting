@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""Same-seat handover: who now answers for a registered depth-1 attempt.
+
+A cleared window (``/clear``, ``/new``) is a new session id at the same herdr pane.  The
+registry row of a depth-1 owner/frame the old session (A) launched still says
+``parent_sid=A`` -- that stays, it is the registered identity the receipt, digest, worker
+environment and gate paths are signed with.  What changes is *who may resume it and who
+receives its completion*: the next session at the same pane (B).
+
+The relation is one fact in two files under the session-tidy state folder:
+
+``handover/<seat>.json``   the snapshot ``session_tidy.py enqueue`` takes: the registered
+                           depth-1 attempts the tidying session answers for.  A card's
+                           text never grants anything; only this runtime-made snapshot does.
+``sessions/<seat>.jsonl``  the seat ledger; ``run_hook`` appends one ``event=handover`` row
+                           (A -> B, with the bindings) when it sees B's confirmed start.
+
+Rules: one direction (A -> B), the same pane only, a confirmed clear only (a ``clear`` start
+source or the clear booking's own observation; OpenCode has no start hook, so its first
+message in a new session after the snapshot), never A -> B and A -> C, B -> C only through
+B's own next tidy.  Everything here is read-only except :func:`record_locked` /
+:func:`write_snapshot_locked` (caller holds the seat lock).
+
+Two questions, two functions:
+
+* :func:`effective_parent` / :func:`owns` -- which session may resume the attempt (B).
+* :func:`storage_recipients` -- which pending-delivery directories (A's, keyed by the
+  registered ``parent_sid``) hold records addressed to B, and for which attempts.
+
+Both answer "the registered parent" whenever there is no relation, so a call without a
+handover behaves exactly as before.  No failure here may block a caller: every public
+function returns the registered answer on any error.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+from pathlib import Path
+import shlex
+import sys
+import time
+from typing import Iterable, Optional
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+ROOT = HERE.parent
+SCHEMA = 1
+ROW_EVENT = "handover"
+WORKER_TYPES = frozenset({"owner", "frame", "review"})
+OPEN_ROW_STATUSES = frozenset({"open", "running"})
+LINE_MAX_BYTES = 520
+MAX_BINDINGS = 12
+KEEP_ROWS = 40
+
+
+def _st():
+    import session_tidy
+    return session_tidy
+
+
+def _meta(pipe: str) -> dict:
+    pairs = {}
+    for part in pipe.split(","):
+        key, sep, value = part.partition("=")
+        if sep and key.strip():
+            pairs[key.strip()] = value
+    return pairs
+
+
+def _jobs_key(jobs) -> str:
+    return str(Path(jobs).resolve(strict=False))
+
+
+def route_identity(meta: dict) -> tuple:
+    """(route id, route hash, node) of a registry row: owner rows carry the route as ``route_id`` too."""
+    return (meta.get("owner_route_id") or meta.get("route_id") or "",
+            meta.get("owner_route_hash") or meta.get("route_hash") or "",
+            meta.get("route_node") or "")
+
+
+def eligible_row(meta: dict) -> bool:
+    """A route-bound depth-1 owner/frame; depth-2, route-free and unregistered rows never qualify."""
+    route, digest, _ = route_identity(meta)
+    return (meta.get("dispatch_depth") == "1" and meta.get("worker_type") in WORKER_TYPES
+            and bool(meta.get("parent_sid")) and bool(meta.get("attempt_id")) and bool(route) and bool(digest))
+
+
+def latest_rows(jobs) -> dict:
+    """``attempt_id -> (status, metadata)`` from a registry file (last line of an attempt wins)."""
+    rows: dict = {}
+    try:
+        text = Path(jobs).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return rows
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        meta = _meta(fields[5])
+        if meta.get("attempt_id"):
+            rows[meta["attempt_id"]] = (fields[1], meta)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
+
+def _snapshot_dir() -> Path:
+    return _st().state_root() / "handover"
+
+
+def _snapshot_path(seat_key: str) -> Path:
+    return _snapshot_dir() / f"{seat_key}.json"
+
+
+def read_snapshot(seat_key: str) -> Optional[dict]:
+    data = _st().read_json(_snapshot_path(seat_key))
+    if isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("bindings"), list) \
+            and isinstance(data.get("from"), dict):
+        return data
+    return None
+
+
+def _all_snapshots() -> list[dict]:
+    out = []
+    try:
+        names = sorted(p for p in _snapshot_dir().glob("*.json") if p.is_file() and not p.is_symlink())
+    except OSError:
+        return out
+    for path in names:
+        data = read_snapshot(path.stem)
+        if data:
+            out.append(data)
+    return out
+
+
+def handover_rows(seat) -> list[dict]:
+    """The seat ledger's handover rows, oldest first."""
+    rows = [e for e in _st()._read_ledger_lines(seat) if e.get("event") == ROW_EVENT and e.get("from")]
+    return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
+
+
+def _seat_of(key: str, snapshot: Optional[dict] = None):
+    st = _st()
+    data = (snapshot or {}).get("seat") if snapshot else None
+    if isinstance(data, dict) and data.get("key") == key:
+        return st.Seat(str(data.get("kind") or "pane"), key, str(data.get("pane") or ""),
+                       str(data.get("harness") or ""), str(data.get("project_key") or ""))
+    return st.Seat("pane", key)
+
+
+def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None):
+    """The pane seat of this process, or None outside a herdr pane (project seats never hand over).
+    A Codex session in the shared app-server daemon has no pane variable: its pane is found the way
+    ``session_tidy.resolve_seat`` finds it."""
+    st = _st()
+    env = os.environ if env is None else env
+    pane = (env.get("HERDR_PANE_ID") or "").strip()
+    if not pane and harness == "codex" and sid:
+        pane = st.codex_pane_for_session(sid)
+    return st.Seat("pane", st._digest("pane", pane), pane, "", "") if pane else None
+
+
+# ---------------------------------------------------------------------------
+# Bindings: which registered attempts a session answers for
+# ---------------------------------------------------------------------------
+
+def binding_of(jobs, meta: dict) -> dict:
+    route, digest, node = route_identity(meta)
+    return {"jobs": _jobs_key(jobs), "attempt": meta["attempt_id"], "route": route, "hash": digest, "node": node}
+
+
+def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
+    """A binding is exact on registry file, route id, route hash and node.  A replacement
+    attempt of the same logical node shares all four, so the lineage follows it; the attempt
+    id in the binding is the audit record, not a key."""
+    key = _jobs_key(jobs)
+    route, digest, node = route_identity(meta)
+    return any(b.get("jobs") == key and b.get("route") == route and b.get("hash") == digest
+               and b.get("node") == node for b in bindings if isinstance(b, dict))
+
+
+def effective_parent(meta: dict, jobs=None) -> str:
+    """The session that answers for ``meta``'s attempt now: the registered ``parent_sid``, or
+    the end of its A -> B (-> C) handover chain.  Any failure answers the registered parent."""
+    registered = str(meta.get("parent_sid") or "")
+    if not registered or jobs is None or not eligible_row(meta):
+        return registered
+    try:
+        seat = _seat_for_binding(jobs, meta)
+        if seat is None:
+            return registered
+        rows = handover_rows(seat)
+        current, seen = registered, {registered}
+        for row in rows:
+            if row.get("from") == current and row.get("harness") == meta.get("parent_harness", row.get("harness")) \
+                    and _binds(row.get("bindings") or (), jobs, meta) and row.get("sid") not in seen:
+                current = str(row["sid"])
+                seen.add(current)
+        return current
+    except Exception:  # noqa: BLE001 - the registered answer is always safe
+        return registered
+
+
+def owns(meta: dict, session: str, jobs=None) -> bool:
+    """True when ``session`` is the registered parent or its confirmed same-seat successor."""
+    if not session:
+        return False
+    return meta.get("parent_sid") == session or (jobs is not None and effective_parent(meta, jobs) == session)
+
+
+def _seat_for_binding(jobs, meta: dict):
+    """The seat whose snapshot binds this exact registry/route/node, or None.  No recency, cwd
+    or pane name decides it: only an exact binding."""
+    hits = [s for s in _all_snapshots() if _binds(s["bindings"], jobs, meta)]
+    if len(hits) != 1:
+        return None
+    return _seat_of(str(hits[0]["seat"].get("key") or ""), hits[0]) if isinstance(hits[0].get("seat"), dict) else None
+
+
+def storage_recipients(session: str, env=None, harness: Optional[str] = None) -> list:
+    """``[(storage key, attempt ids | None)]``: where records addressed to ``session`` live.
+
+    The session's own key first (all its records); then one entry per registered parent it
+    took over from, limited to the attempts bound by the handover.  A pending record is
+    stored under the *registered* parent (A) and keeps its delivery id, digest, lease and
+    ack there; only the receiving session changes."""
+    out: list = [(session, None)]
+    try:
+        seat = pane_seat(env, harness, session)
+        if seat is None:
+            return out
+        owed: dict = {}
+        for row in _chain_to(handover_rows(seat), session):     # A -> B -> ... -> session
+
+            attempts = {b.get("attempt") for b in row.get("bindings") or () if isinstance(b, dict)}
+            owed.setdefault(str(row["from"]), set()).update(a for a in attempts if a)
+        for key, attempts in owed.items():
+            if key != session:
+                out.append((key, frozenset(attempts)))
+    except Exception:  # noqa: BLE001
+        return [(session, None)]
+    return out
+
+
+def _chain_to(rows: list, session: str) -> list:
+    """Rows of the handover chain that ends at ``session`` (the row into it, then the rows into its from)."""
+    chain, want, seen = [], session, set()
+    while want and want not in seen:
+        seen.add(want)
+        row = next((r for r in reversed(rows) if r.get("sid") == want), None)
+        if row is None:
+            break
+        chain.append(row)
+        want = str(row.get("from") or "")
+    return chain
+
+
+def record_for_session(record: dict, allowed: Optional[frozenset]) -> bool:
+    """Whether a record found under a storage key may be delivered to the taker: every attempt
+    of it is one the handover bound (or the key is the session's own)."""
+    if allowed is None:
+        return True
+    ids = record.get("attempt_ids")
+    return isinstance(ids, list) and bool(ids) and all(i in allowed for i in ids)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot (at enqueue) and the ledger row (at the successor's confirmed start)
+# ---------------------------------------------------------------------------
+
+def _default_jobs() -> Optional[Path]:
+    env = os.environ.get("AGENT_DISPATCH_JOBS")
+    if env:
+        return Path(env)
+    try:
+        from dispatch_contract import resolve_dispatch_state_root
+        return resolve_dispatch_state_root(ROOT, None) / "jobs.log"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _delivery_open(jobs, meta: dict) -> bool:
+    """A finished attempt still owes its completion when a pending record for it is open."""
+    try:
+        import dispatch_pending_delivery as pending
+        directory = pending.record_directory(Path(jobs).resolve(strict=False).parent, meta["parent_sid"])
+        for path in directory.glob("delivery-*.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and meta["attempt_id"] in (value.get("attempt_ids") or ()) \
+                    and value.get("state") in pending.OPEN_STATES:
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def current_bindings(harness: str, sid: str, jobs=None) -> list:
+    """The live depth-1 attempts ``sid`` answers for at ``harness``: those it registered and those
+    handed to it.  A finished one counts only while its completion record is still open."""
+    jobs = jobs or _default_jobs()
+    if jobs is None or not Path(jobs).is_file():
+        return []
+    found = []
+    for aid, (status, meta) in latest_rows(jobs).items():
+        if not eligible_row(meta) or meta.get("parent_harness", harness) != harness:
+            continue
+        if status not in OPEN_ROW_STATUSES and not (status == "done" and _delivery_open(jobs, meta)):
+            continue
+        if not owns(meta, sid, jobs):
+            continue
+        found.append(binding_of(jobs, meta))
+    return found[-MAX_BINDINGS:]
+
+
+def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] = None, jobs=None) -> int:
+    """Take (or drop) the seat's snapshot at enqueue; returns the number of bindings.  Caller holds the seat lock."""
+    st = _st()
+    now = st.now_epoch() if now is None else now
+    if seat.kind != "pane":
+        return 0
+    bindings = current_bindings(harness, sid, jobs)
+    if not bindings:
+        with contextlib.suppress(OSError):
+            os.unlink(_snapshot_path(seat.key))
+        return 0
+    st.atomic_write_json(_snapshot_path(seat.key), {
+        "schema": SCHEMA, "seat": seat.as_dict(), "from": {"harness": harness, "sid": sid},
+        "at": now, "bindings": bindings})
+    return len(bindings)
+
+
+def record_locked(seat, harness: str, sid: str, event: str, source: str, now: float) -> Optional[dict]:
+    """Append the A -> B row when ``sid`` is the confirmed successor of the snapshot's session
+    (caller holds the seat lock).  Returns the row, or None (nothing to do / not confirmed)."""
+    st = _st()
+    if seat.kind != "pane" or event not in ("start", "prompt"):
+        return None
+    snap = read_snapshot(seat.key)
+    if not snap:
+        return None
+    origin = snap["from"]
+    old = str(origin.get("sid") or "")
+    if not old or old == sid or origin.get("harness") != harness:
+        return None
+    rows = handover_rows(seat)
+    if any(r.get("sid") == sid for r in rows):
+        return None                                    # the same A -> B again: nothing to do
+    summary = st.session_summary(seat).get((harness, sid))
+    if summary is None or float(summary.get("first_seen", 0) or 0) + 1.0 < float(snap.get("at", 0) or 0):
+        return None                                    # a session older than the snapshot is not its successor
+    if not _confirmed_clear(seat, harness, old, sid, event, source):
+        return None
+    taken = {(b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) for r in rows
+             if r.get("from") == old for b in r.get("bindings") or () if isinstance(b, dict)}
+    bindings = [b for b in snap["bindings"] if isinstance(b, dict)
+                and (b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) not in taken]
+    if not bindings or len(bindings) != len(snap["bindings"]):
+        return None                                    # A -> C while A -> B stands: refused
+    row = {"ts": now, "harness": harness, "sid": sid, "event": ROW_EVENT, "from": old,
+           "source": source or ("first-message" if harness == "opencode" else "reservation"),
+           "bindings": bindings, "epoch": int((summary or {}).get("epoch", 0) or 0)}
+    path = st._ledger_path(seat)
+    st.ensure_dir(path.parent)
+    st._reject_symlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    return row
+
+
+def _confirmed_clear(seat, harness: str, old: str, sid: str, event: str, source: str) -> bool:
+    if harness == "opencode":
+        return True                # no start hook: the first message of a new session after the snapshot
+    if event == "start" and source == "clear":
+        return True
+    try:
+        import session_tidy_clear as clear
+        booking = clear.read_reservation(seat.key)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(booking) and booking.get("sid") == old and booking.get("harness") == harness and (
+        (booking.get("observed") or {}).get("sid") == sid or booking.get("new_session") == sid)
+
+
+# ---------------------------------------------------------------------------
+# The card line: the verified route and the existing resume command
+# ---------------------------------------------------------------------------
+
+def resume_line(seat, harness: str, sid: str) -> str:
+    """One line for the successor's card: the routes it took over and the existing resume command.
+    Only attempts the ledger shows handed to ``sid`` and the registry still shows open count."""
+    try:
+        rows = [r for r in handover_rows(seat) if r.get("sid") == sid]
+        if not rows:
+            return ""
+        wanted = [b for r in rows for b in r.get("bindings") or () if isinstance(b, dict)]
+        shown: dict = {}
+        for b in wanted:
+            jobs = b.get("jobs")
+            if not jobs or not Path(jobs).is_file():
+                continue
+            for aid, (status, meta) in latest_rows(jobs).items():
+                if not eligible_row(meta) or not _binds([b], jobs, meta) or not owns(meta, sid, jobs):
+                    continue
+                if status not in OPEN_ROW_STATUSES and not (status == "done" and _delivery_open(jobs, meta)):
+                    continue
+                shown.setdefault((jobs, route_identity(meta)[0]), meta.get("route_file", ""))
+        parts = []
+        for (jobs, route), route_file in list(shown.items())[:2]:
+            if route_file:
+                command = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
+                                      "start", "--route", route_file, "--jobs", jobs])
+                parts.append(f"route={route} 이어서: {command}")
+        if not parts:
+            return ""
+        text = "[이어받은 진행 작업] " + " | ".join(parts)
+        return _st()._cut_bytes(text, LINE_MAX_BYTES)[0]
+    except Exception:  # noqa: BLE001
+        return ""

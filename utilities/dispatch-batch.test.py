@@ -3949,5 +3949,28 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
         self.assertEqual(actual_prompt, BATCH.DEFAULT_PROMPT + expected_block)
 
 
+
+class NodeLaunchCommandTest(unittest.TestCase):
+    """`--qa` is dispatch-node.py's own option; after `--` it is refused as an override."""
+
+    def command(self, qa):
+        leg = {"node": "retrieval", "adapter": "codex", "slug": "s", "attempt_id": "att-x",
+               "hop": "same-harness-headless", "ordinal": 0}
+        return BATCH.node_launch_command(
+            route_path=Path("/r.json"), leg=leg, parent="owner", prompt_text="p",
+            reviewed_evidence=None, jobs=Path("/jobs.log"), parent_attempt="att-parent",
+            log_dir=None, lifecycle="detached", qa=qa)
+
+    def test_qa_goes_before_the_separator_and_passes_the_override_check(self):
+        command = self.command("standard")
+        cut = command.index("--")
+        self.assertIn("--qa", command[:cut])
+        self.assertEqual(command[command.index("--qa") + 1], "standard")
+        self.assertNotIn("--qa", command[cut:])
+        BATCH.DISPATCH_NODE.reject_generated_argument_overrides(command[cut:])
+
+    def test_unset_qa_is_omitted(self):
+        self.assertNotIn("--qa", self.command(None))
+
 if __name__ == "__main__":
     unittest.main()

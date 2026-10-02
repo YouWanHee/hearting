@@ -26,6 +26,14 @@ STATUS_LINE = {
 
 
 class ClaudeManagedSettingsTests(unittest.TestCase):
+    def setUp(self):
+        # These cases isolate retirement and the statusLine/autoMemoryEnabled merge; the
+        # identity env keys the shipped settings now manage are covered in
+        # runtime_activation.test.py (ClaudeManagedEnvTest).
+        patcher = mock.patch.object(runtime_activation, "CLAUDE_MANAGED_ENV_KEYS", ())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _fixture(self, tmp, *, auto_memory=False):
         active_root = Path(tmp) / "source"
         source_settings = active_root / "adapters" / "claude" / "settings.json"
@@ -202,6 +210,14 @@ class ClaudeManagedSettingsTests(unittest.TestCase):
 
 
 class RetiredHookMigrationTests(unittest.TestCase):
+    def setUp(self):
+        # These cases isolate retirement and the statusLine/autoMemoryEnabled merge; the
+        # identity env keys the shipped settings now manage are covered in
+        # runtime_activation.test.py (ClaudeManagedEnvTest).
+        patcher = mock.patch.object(runtime_activation, "CLAUDE_MANAGED_ENV_KEYS", ())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_upgrade_prunes_every_retired_hook_and_preserves_user_settings(self):
         import claude_settings_config as settings
         from drivers import claude, codex
@@ -260,6 +276,14 @@ HERDR_END = 'bash "$HOME/.claude/hooks/herdr-agent-state.sh" release'
 
 class SessionEndMemorySyncRetirementTests(unittest.TestCase):
     """D-82: the managed SessionEnd `mem.py sync` leaves installed settings, nothing else does."""
+    def setUp(self):
+        # These cases isolate retirement and the statusLine/autoMemoryEnabled merge; the
+        # identity env keys the shipped settings now manage are covered in
+        # runtime_activation.test.py (ClaudeManagedEnvTest).
+        patcher = mock.patch.object(runtime_activation, "CLAUDE_MANAGED_ENV_KEYS", ())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
 
     @staticmethod
     def _group(command, timeout=10):

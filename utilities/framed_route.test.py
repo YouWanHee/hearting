@@ -44,7 +44,9 @@ NODE_IDS = FRAME_IDS + ["route-decision"]
 
 # Frozen from `git show 45edc48a:capabilities/topologies.json` (the registry before the route-frame
 # recipe). They are literals, not a comparison with HEAD, so they mean the same in CI and after any
-# commit. Each global table is hashed as sha256 of its JSON (sorted keys, compact separators).
+# commit. Report-format bootstrap intentionally refreshes only the four reader-facing recipes
+# and their capability digests; the shared tables and gate contracts stay at the original baseline.
+# Each global table is hashed as sha256 of its JSON (sorted keys, compact separators).
 FROZEN_GLOBAL_TABLE_DIGESTS = {
     "schema_version": "4a44dc15364204a80fe80e9039455cc1608281820fe2b24f1e5233ade6af1dd5",
     "intensities": "965abb3701067fd845cba3196ebd2c1725c399b515a884c452ebdc3e0e05186c",
@@ -86,16 +88,16 @@ FROZEN_GLOBAL_TABLE_DIGESTS = {
 }
 FROZEN_GATE_CONTRACT_DIGEST = "53db72bbbcb6228d395819d147eb3a12eeba17161dbc06fe63cefa9389f469fb"
 FROZEN_RECIPE_COUNT = 14
-FROZEN_RECIPES_DIGEST = "21ca288a0ca277cb89f45809255d6344ba7bef72744d58cf39da10f92378a20d"
+FROZEN_RECIPES_DIGEST = "19bbbd6348c58d51a3099953ab49086bb7184efdc842d6a3914e4cbb10daa58a"
 FROZEN_CAPABILITY_REGISTRY_DIGESTS = {
     "analyze-project": "sha256:160c04dc760b81584a7d445da0733c778d7caaabd12f43d606e72a00fb9ca574",
     "analyze-user": "sha256:a787e6d28fbc54ba019dc635f462ddb9b5ffd1112f9a08ecf56dab950761899a",
     "audit": "sha256:d2e6741875289ba300b4334b9a84e1cf99fcf1a4e60c73c6c594a1bcaa65d314",
     "autopilot-apply": "sha256:317c03fb47f59789c1a12b15c1a0dcf93f60fcee57408f0ae1ab4cb45f6f7cd5",
-    "autopilot-code": "sha256:5ac6894bb49c421060551625bdcfdde3f7af9676f9f52f65373428bfb8030893",
-    "autopilot-design": "sha256:a0d62cb63ec8bd255f254417241c97856fbeae4095cde072a878f65c313cecca",
-    "autopilot-draft": "sha256:37c3b4a3fc45a5df8f199f220ef940dbc19ca8eae17e51b2b14f267053057af5",
-    "autopilot-lab": "sha256:41e59b4c50376ae247eb110b8f830693f67203d482c5017210ed89a5ac0cc55c",
+    "autopilot-code": "sha256:8f1f6572ba2e1038c0bceaf6ca411d6f0a2118bac69464429ccfd05d6fb78fe9",
+    "autopilot-design": "sha256:95ea188edc7350bc83af19a78aec602c1d6e6d84fdde553c29036be997078f46",
+    "autopilot-draft": "sha256:1f6ff17e9bd5f3cec8d38f32cd7415913ff2d9111762cda3f44b8ea718334067",
+    "autopilot-lab": "sha256:0d8abcee90861a84161e9d64df97caf2f1423ae421b1d9659b2c76ed55e92ff5",
     "autopilot-refine": "sha256:f97b337937dd64cb49ba675b9e19bda3a05077e9389a73e4ad99ffed91f46729",
     "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
     "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",

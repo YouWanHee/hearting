@@ -25,6 +25,11 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 ## Artifact Ownership
 
+The existing start choice carries `complete` or `report`. Report finishes the
+isolated apply and verify, preserves the separate branch/worktree, and stops
+before handback or merge. Complete follows only the explicitly shown handback
+scope. A failed verify never counts as completion.
+
 Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.
 
 ## Artifact Producer Lifecycle

@@ -503,6 +503,53 @@ def routed_interview(**overrides):
     return interview
 
 
+class EntryExecutionScopeTest(unittest.TestCase):
+    def test_existing_route_question_can_also_carry_the_entry_approval(self):
+        interview = routed_interview()
+        proposal = interview["route_proposals"]["by_option"]["Both (recommended)"]
+        proposal["entry_approvals"][0]["question"] = "q-scope"
+        proposal["execution_scope"] = "report"
+        errors = FI.validate(interview, intensity="standard")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(interview["questions"]), 2)
+
+    def test_existing_choice_can_offer_same_legs_as_complete_or_report_without_a_second_question(self):
+        interview = routed_interview()
+        complete = {"summary": "Prepare the full run", "legs": [LEG], "execution_scope": "complete",
+                    "entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-scope"}]}
+        report = {"summary": "Prepare and report smoke", "legs": [LEG], "execution_scope": "report",
+                  "entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-scope"}]}
+        interview["questions"][0]["options"] = [
+            {"label": "Full run", "means": "Prepare all approved work."},
+            {"label": "Smoke report", "means": "Stop after the smoke result."},
+            {"label": "No", "means": "Do not begin."},
+        ]
+        interview["route_proposals"]["by_option"] = {"Full run": complete, "Smoke report": report}
+        self.assertEqual(FI.validate(interview, intensity="standard"), [])
+        self.assertEqual(len(interview["questions"]), 2)
+        answers = good_answers(interview)
+        answers["answers"]["q-scope"]["choice"] = 0
+        self.assertEqual(FI.route_choice(interview, answers)["execution_scope"], "complete")
+        answers["answers"]["q-scope"]["choice"] = 1
+        self.assertEqual(FI.route_choice(interview, answers)["execution_scope"], "report")
+        self.assertTrue(FI.approvals_given(interview, answers, report)[0]["accepted"])
+
+    def test_report_scope_is_a_distinct_normal_selection_and_invalid_or_unanswered_is_not(self):
+        interview = routed_interview()
+        proposal = interview["route_proposals"]["by_option"]["Both (recommended)"]
+        proposal["entry_approvals"][0]["question"] = "q-scope"
+        proposal["execution_scope"] = "report"
+        answers = good_answers(interview)
+        answers["answers"]["q-scope"]["choice"] = "Both (recommended)"
+        chosen = FI.route_choice(interview, answers)
+        self.assertEqual(chosen["state"], "selected")
+        self.assertEqual(chosen["execution_scope"], "report")
+        self.assertTrue(FI.approvals_given(interview, answers, proposal)[0]["accepted"])
+        for choice, state in ((None, "unanswered"), (FI.NONE_SENTINEL, "off-menu"), (99, "unanswered")):
+            answers["answers"]["q-scope"]["choice"] = choice
+            self.assertEqual(FI.route_choice(interview, answers)["state"], state)
+
+
 class RouteProposalsTest(unittest.TestCase):
     """The optional `route_proposals` field: reference checks only, and no change without it."""
 
@@ -534,8 +581,8 @@ class RouteProposalsTest(unittest.TestCase):
         approval = interview["route_proposals"]["by_option"]["Both (recommended)"]["entry_approvals"]
         approval[0]["question"] = "q-none"
         self.assertTrue(any("no such approval question" in e for e in FI.validate(interview)))
-        approval[0]["question"] = "q-scope"                      # the route question cannot approve itself
-        self.assertTrue(any("no such approval question" in e for e in FI.validate(interview)))
+        approval[0]["question"] = "q-scope"                      # same existing route question is allowed
+        self.assertFalse(any("no such approval question" in e for e in FI.validate(interview)))
         interview = routed_interview()
         interview["questions"][1]["kind"] = "choice"
         self.assertTrue(any("an approval question is yes-no" in e for e in FI.validate(interview)))
