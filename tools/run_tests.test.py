@@ -743,11 +743,12 @@ class ChildStderrDiagnosticsFixture(RunTestsFixtureBase):
 
     SUITE = """\
         import subprocess, sys
-        child = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; print('check=failed'); sys.exit('guard reason: tuple drifted')"],
-            capture_output=True, text=True,
-        )
+        for _ in range(3):
+            child = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; print('check=failed'); sys.exit('guard reason: tuple drifted')"],
+                capture_output=True, text=True,
+            )
         quiet = subprocess.run([sys.executable, "-c", "import sys; sys.stderr.write('passing noise')"],
                                capture_output=True, text=True)
         assert quiet.returncode == 0
@@ -763,7 +764,8 @@ class ChildStderrDiagnosticsFixture(RunTestsFixtureBase):
         self.assertEqual(len(kept), 1, sorted(p.name for p in diagnostics.rglob("*")))
         text = kept[0].read_text(encoding="utf-8")
         self.assertIn("guard reason: tuple drifted", text)
-        self.assertIn("rc=1", text)
+        # Three identical failures in one process are kept once.
+        self.assertEqual(text.count("--- rc=1 "), 1, text)
         self.assertNotIn("passing noise", text)
 
     def test_passing_suite_writes_no_child_stderr(self):

@@ -156,6 +156,7 @@ import os
 import sys
 
 _DIR = os.environ.get("HEARTING_TEST_CHILD_STDERR_DIR")
+_SEEN = set()
 
 
 def _keep(proc, err):
@@ -163,18 +164,22 @@ def _keep(proc, err):
         return
     if isinstance(err, bytes):
         err = err.decode("utf-8", "replace")
+    args = proc.args
+    if not isinstance(args, (str, bytes)):
+        args = " ".join(str(item) for item in args)
+    record = (str(args)[:400], proc.returncode, err[-4000:].rstrip())
+    if record in _SEEN:
+        return
+    _SEEN.add(record)
     path = os.path.join(_DIR, "%d.log" % os.getpid())
     try:
         if os.path.getsize(path) > 1048576:
             return
     except OSError:
         pass
-    args = proc.args
-    if not isinstance(args, (str, bytes)):
-        args = " ".join(str(item) for item in args)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write("--- rc=%s pid=%d: %s\\n%s\\n" % (
-            proc.returncode, os.getpid(), str(args)[:400], err[-4000:].rstrip()))
+            record[1], os.getpid(), record[0], record[2]))
 
 
 def _patch(module):
