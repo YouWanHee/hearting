@@ -38,7 +38,6 @@ physical instruction masking.
 | Runtime worker wrappers | `adapters/claude/bin/` | `claude_setting/bin` |
 | Agents | `adapters/claude/agents/` | `claude_setting/agents` |
 | Skills | `adapters/claude/skills/` | `claude_setting/skills` |
-| Agent modes | `adapters/claude/agent-modes/` | `claude_setting/agent-modes` |
 | Hooks | `adapters/claude/hooks/` | `claude_setting/hooks` |
 | Tools | `adapters/claude/tools/` | `claude_setting/tools` |
 | Utilities | `adapters/claude/utilities/` | `claude_setting/utilities` |
@@ -279,7 +278,6 @@ paths now point at adapter-owned realization files instead of the common root:
 | Surface | Current projection | Why compatibility realization is allowed for now | Required split |
 |---|---|---|---|
 | Skills | `claude_setting/skills -> ../adapters/claude/skills` | Adapter-owned concrete Claude Skill files preserve old behavior while portable specs grow under `capabilities/` | Continue splitting semantics into `capabilities/<name>.md`; keep Claude frontmatter and runtime wording here |
-| Agent modes | `claude_setting/agent-modes -> ../adapters/claude/agent-modes` | Adapter-owned concrete mode projection files preserve current Claude behavior while `roles/MODES.md` classifies portability | Continue splitting adapter-coupled mode semantics into runtime-neutral fragments or adapter-native notes as non-Claude adapters implement equivalents |
 | Hooks | `claude_setting/hooks -> ../adapters/claude/hooks` | Adapter-owned concrete hook projection files preserve current Claude behavior; `core/HOOKS.md` names the invariant layer | Continue splitting Claude payload handling from portable invariant checks as non-Claude adapters implement equivalents |
 | Utilities | `claude_setting/utilities -> ../adapters/claude/utilities -> ../../utilities` (whole-layer symlink) | Split complete (2026-07-22): zero Claude-only utility files remain; the last delta (`agent-worklog-state.sh` local paths) moved to runtime `settings.json` env (`AGENT_NOTES_ROOT`/`CAIRN_APP`/`CAIRN_WT`; legacy `WORKLOG_BOARD_*` read fallback) | None — a future Claude-only utility delta requires deliberately reintroducing the per-file layer plus an exemptions row |
 | Tools | `claude_setting/tools -> ../adapters/claude/tools` | Adapter-owned concrete tool files preserve current Claude helper behavior while tool semantics are split | Isolate Claude session adapters under adapter or tool plugin |
@@ -300,11 +298,10 @@ mechanics live as concrete adapter projection files under
 preserves previous Claude behavior; future edits should move invariant meaning
 to `capabilities/` first, then adjust the Claude Skill wording here.
 
-Mode files now follow the same concrete projection pattern as skills:
-`claude_setting/agent-modes` points at `adapters/claude/agent-modes/`, whose
-family entries are adapter-owned files copied from the current `roles/modes/`
-content. This preserves old Claude behavior while `roles/MODES.md` continues to
-classify which fragments are portable, tool-contract-bound, or adapter-coupled.
+Claude has no separate mode projection: the `agent-modes` surface was retired
+on 2026-07-22, and dispatch reads unit bodies from the portable catalog
+`roles/units/` directly. `roles/MODES.md` classifies which units are portable,
+tool-contract-bound, or adapter-coupled.
 
 Write-denying hook gates are retired; no write preflight or core-read marker is required.
 

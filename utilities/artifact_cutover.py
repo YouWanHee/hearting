@@ -1371,10 +1371,6 @@ def _excluded(rel: str, excludes: Sequence[str]) -> bool:
     return any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in excludes)
 
 
-def _has_hidden_component(rel: str) -> bool:
-    return any(part.startswith(".") for part in rel.split("/"))
-
-
 def _prune_hidden_copies(root: Path, run_dir: Path, report: Dict[str, Any]) -> List[str]:
     """Remove copied targets whose locator cannot be a D-6 locator (an earlier
     migrate-delta copied them before the rule was applied: hidden components,

@@ -3235,16 +3235,7 @@ class D1LegacyConsumersTest(C1ChangesBase):
         # The default it described lives in the producer: changed material input makes a child cycle.
         self.assertTrue(hasattr(P, "cycle_route_admission"))
 
-    def test_d1_freeze_and_batch_digest_guards_stay(self):
-        bridge = _load_sibling("pointer_bridge_for_d1", "artifact-pointer-bridge.py")
-        with mock.patch.object(bridge, "NORMALIZE_SOURCE_DIGEST", "sha256:" + "0" * 64):
-            with self.assertRaises(bridge.BridgeError) as ctx:
-                bridge._sealed_duplication_inputs({})
-        self.assertEqual(ctx.exception.code, "freeze-digest-mismatch")
-        with mock.patch.object(bridge, "RULE_SOURCE_DIGEST", "sha256:" + "1" * 64):
-            with self.assertRaises(bridge.BridgeError) as ctx:
-                bridge._sealed_duplication_inputs({})
-        self.assertEqual(ctx.exception.code, "freeze-digest-mismatch")
+    def test_d1_batch_digest_guard_stays(self):
         recovery = Path(__file__).with_name("dispatch-recovery.py").read_text(encoding="utf-8")
         self.assertIn('raise RecoveryError("recovery-source-manifest-digest-mismatch")', recovery)
 

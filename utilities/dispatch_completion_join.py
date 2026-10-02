@@ -1653,39 +1653,6 @@ def acknowledge_supervisor_delivery(
         return True
 
 
-def consume_advance_completed_outbox(
-    path: Path | None,
-    parent_attempt_id: str,
-    rows: list[ChildRow],
-) -> set[str]:
-    """Consume no-command advance actions after current-row revalidation."""
-
-    state = read_supervisor_phase_state(path, parent_attempt_id)
-    if state is None or state.outbox is None:
-        return set()
-    pending = state.outbox.attempt_ids.difference(
-        state.outbox.consumed_attempt_ids
-    )
-    indexed = {row.attempt_id: row for row in rows}
-    completed = {
-        attempt
-        for attempt in pending
-        if attempt in indexed
-        and any(
-            isinstance(child, dict)
-            and child.get("attempt_id") == attempt
-            and child.get("delivery_classification") == "success"
-            and child.get("required_action") == "advance-completed"
-            for child in ((state.outbox.receipt or {}).get("children") or [])
-        )
-    }
-    if completed and consume_supervisor_outbox_attempts(
-        path, parent_attempt_id, completed
-    ):
-        return completed
-    return set()
-
-
 def remove_supervisor_state(path: Path | None) -> None:
     if path is None:
         return
@@ -1940,10 +1907,6 @@ def consume_parent_session_attempt(
             except OSError as exc:
                 raise JoinContractError("parent-session-state-unwritable") from exc
         return True
-
-
-def remove_parent_session_state(path: Path | None) -> None:
-    remove_supervisor_state(path)
 
 
 def _local_contract_path(
@@ -2366,20 +2329,6 @@ def _bound_dispatch_node_start(
     return not any(row.metadata.get("route_node") == node_id for row in context.rows)
 
 
-def supervisor_outbox_delivery_identity(
-    outbox: SupervisorOutbox | None,
-) -> tuple[str, tuple[tuple[str, str], ...]]:
-    """Pure identity of a delivered outbox, for the D2b unchanged-delivery test.
-
-    No I/O, no mutation -- both supervisors compare this tuple across passes
-    to decide whether a redelivery is identical to the last one.
-    """
-
-    if outbox is None:
-        return ("", ())
-    return (outbox.receipt_digest, outbox.row_revisions)
-
-
 def supervisor_receipt_satisfiable(
     command_lines: list[str],
     *,
@@ -2600,86 +2549,6 @@ def classify_supervised_shell_command(
     ):
         return None
     return SupervisorShellAction("dispatch")
-
-
-def classify_supervised_shell_command_reason(
-    *,
-    base: Path,
-    command: str,
-    open_attempt_ids: set[str],
-    parent_slug: str,
-    jobs: Path | None = None,
-    parent_attempt_id: str = "",
-    route_file: Path | None = None,
-    route_id: str = "",
-) -> str:
-    """Typed reason a Bash command failed ``classify_supervised_shell_command``.
-
-    A parallel accessor, not a change to the existing function's return type
-    (the frozen ``SupervisorShellAction`` is consumed by the hook and every
-    existing fixture). Re-parses the command on the denial path only -- never
-    called for an admitted command. One of ``unrecognized-surface``,
-    ``unknown-option``, ``shell-composition``, ``attempt-not-guarded``.
-    """
-
-    if not command or re_search_shell_composition(command):
-        return "shell-composition"
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return "shell-composition"
-    if not tokens:
-        return "unrecognized-surface"
-    extra_roots = _sealed_launch_home_roots(jobs, open_attempt_ids)
-
-    if (
-        len(tokens) >= 2
-        and _local_contract_path(base, tokens[0], "adapters/codex/bin/preflight.sh", extra_roots)
-        and tokens[1] == "harvest"
-    ):
-        options = _parse_long_options(
-            tokens[2:],
-            {"--attempt-id", "--status", "--completion", "--jobs"},
-            {"--mark-done", "--keep-home", "--failure-detail"},
-        )
-        if (
-            options is None
-            or len(options.get("--attempt-id", [])) != 1
-            or any(len(values) != 1 for values in options.values())
-        ):
-            return "unknown-option"
-        attempt = options["--attempt-id"][0]
-        if attempt not in open_attempt_ids:
-            return "attempt-not-guarded"
-        status = options.get("--status", ["open"])[0]
-        supplied_jobs = options.get("--jobs", [])
-        if status not in {"open", "done", "all"} or (
-            supplied_jobs
-            and jobs is not None
-            and Path(supplied_jobs[0]).resolve(strict=False)
-            != Path(jobs).resolve(strict=False)
-        ):
-            return "unknown-option"
-        return ""
-
-    dispatch_tokens = tokens
-    if tokens[0] in {"python", "python3"}:
-        if len(tokens) < 2:
-            return "unrecognized-surface"
-        dispatch_tokens = tokens[1:]
-    recognized_surface = (
-        _local_contract_path(base, dispatch_tokens[0], "adapters/codex/bin/preflight.sh", extra_roots)
-        or _local_contract_path(base, dispatch_tokens[0], "utilities/dispatch-batch.py", extra_roots)
-        or _local_contract_path(base, dispatch_tokens[0], "utilities/dispatch-node.py", extra_roots)
-    )
-    if not recognized_surface:
-        return "unrecognized-surface"
-    # A recognized launcher surface with anything else wrong (bad option,
-    # wrong action, unbound route/group, attempt outside the guarded set for
-    # the exact-batch/exact-node checks) -- classify_supervised_shell_command
-    # itself is the source of truth for admission; this accessor only names
-    # the coarse category once that function has already said no.
-    return "unknown-option"
 
 
 def re_search_shell_composition(command: str) -> bool:

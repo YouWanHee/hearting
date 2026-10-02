@@ -102,23 +102,23 @@ Before adding or changing OpenCode-native skills, commands, or agents:
 Design capabilities are a tool-contract exception: OpenCode has native Skill
 guidance for them, but must run the adapter visual harness before claiming full
 support. `capability-info` reports `status=tool-contract` for those capability
-entries. This does not make `roles/modes/design/*` native OpenCode modes; those
+entries. This does not make `roles/units/design/*` native OpenCode modes; those
 mode fragments remain `mode-info status=unsupported` / `fallback=reference-only`
 because they are adapter-coupled persona fragments, while the concrete
 capability path is `autopilot-design` plus the visual harness contract.
 
-`roles/modes/material/browser-fetch.md` has an OpenCode-owned executable
+`roles/units/material/browser-fetch.md` has an OpenCode-owned executable
 tool-contract surface:
 `adapters/opencode/bin/preflight.sh browser-fetch --check <url>` verifies
 rendered browser access through `adapters/opencode/tools/material/` and reports
 exit 69 when the local Playwright browser stack is unavailable.
 
-`roles/modes/material/data-script.md` is the first material mode with an
+`roles/units/material/data-script.md` is the first material mode with an
 OpenCode-owned executable tool-contract surface:
 `adapters/opencode/bin/preflight.sh data-script --check <script.py>` verifies
 generated Python analysis scripts through `adapters/opencode/tools/material/`.
 
-`roles/modes/material/figure-gen.md` has an OpenCode-owned executable
+`roles/units/material/figure-gen.md` has an OpenCode-owned executable
 tool-contract surface:
 `adapters/opencode/bin/preflight.sh figure-gen --check <script.py>` verifies
 generated matplotlib/seaborn figure scripts through
@@ -126,31 +126,31 @@ generated matplotlib/seaborn figure scripts through
 `figure-gen --verify-report <manifest.json> <report.md>` and fail closed on
 metadata, scale, claim-evidence, or hash-bound visual-review drift.
 
-`roles/modes/material/pdf-extract.md` has an OpenCode-owned executable
+`roles/units/material/pdf-extract.md` has an OpenCode-owned executable
 tool-contract surface:
 `adapters/opencode/bin/preflight.sh pdf-extract --check <file.pdf>` verifies
 local PDF text extraction through `adapters/opencode/tools/material/` and
 reports exit 69 when the local extractor is unavailable.
 
-`roles/modes/material/web-image-search.md` has an OpenCode-owned executable
+`roles/units/material/web-image-search.md` has an OpenCode-owned executable
 tool-contract surface:
 `adapters/opencode/bin/preflight.sh web-image-search --check <query>` verifies
 a configured image-search provider command through
 `adapters/opencode/tools/material/` and reports exit 69 when no provider is
 configured.
 
-`roles/modes/qa/security-review.md` is portable read-only mode guidance for
+`roles/units/qa/security-review.md` is portable read-only mode guidance for
 OpenCode. It is consumed with OpenCode file and git diff tools and does not
 project or invoke Claude's `/security-review` slash command.
 
-`roles/modes/research/claim-verify.md` has an OpenCode-owned executable
+`roles/units/research/claim-verify.md` has an OpenCode-owned executable
 tool-contract surface:
 `adapters/opencode/bin/preflight.sh claim-verify --check <claim>` verifies a
 configured external verification provider command through
 `adapters/opencode/tools/research/` and reports exit 69 when no provider is
 configured.
 
-`roles/modes/qa/test.md` has an OpenCode-owned executable tool-contract
+`roles/units/qa/test.md` has an OpenCode-owned executable tool-contract
 surface:
 `adapters/opencode/bin/preflight.sh verification-runner --check -- <command>`
 checks explicit verification commands and the same wrapper can execute them
@@ -246,7 +246,7 @@ OpenCode must not consume these Claude-native files as native configuration:
 | `adapters/claude/CLAUDE.md` | Reference only; not bootstrap |
 | `adapters/claude/agents/*.md` | Reference only; OpenCode should start from `roles/README.md`. Claude Agent frontmatter is not OpenCode agent frontmatter. |
 | `adapters/claude/hooks/*.sh` | Reference only; OpenCode has no shell hook event schema. Guards run as explicit preflight. |
-| `roles/modes/design/*` | Reference-only adapter-coupled mode fragments; concrete design work uses `autopilot-design` capability guidance plus `preflight.sh visual-harness` |
+| `roles/units/design/*` | Reference-only adapter-coupled mode fragments; concrete design work uses `autopilot-design` capability guidance plus `preflight.sh visual-harness` |
 
 ## Status Surface Boundary
 

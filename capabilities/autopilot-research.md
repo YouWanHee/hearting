@@ -31,7 +31,7 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not.
+Artifact root: `core/CONVENTIONS.md §5.1`.
 
 Research work writes to `$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/`.
 

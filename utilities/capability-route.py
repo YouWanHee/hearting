@@ -6070,16 +6070,6 @@ def write_completion_marker(
     atomic_write(canonical_path, marker)
     return marker
 
-def _find_attempt_row_status(jobs, attempt_id):
-    """Return the row status ('open'|'running'|'done') for attempt_id, or None if absent."""
-    if not jobs.is_file(): return None
-    for line in jobs.read_text(encoding="utf-8", errors="replace").splitlines():
-        fields=line.split("\t")
-        if len(fields)!=6: continue
-        metadata=dict(part.split("=",1) for part in fields[5].split(",") if "=" in part)
-        if metadata.get("attempt_id")==attempt_id: return fields[1]
-    return None
-
 def _find_attempt_row_metadata(jobs, attempt_id):
     if not jobs.is_file(): return None
     for line in jobs.read_text(encoding="utf-8",errors="replace").splitlines():

@@ -14,8 +14,8 @@ from fleet import render
 from fleet.collectors import peer_messages
 from fleet.model import DispatchJob, Session, SubAgent
 
-_EVIDENCE_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "evidence"))
+_GOLDEN_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fixtures", "connection_layer")
 
 
 def _text(segs):
@@ -432,7 +432,7 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     def test_matches_committed_golden_at_every_captured_width(self):
         for width in (60, 100, 120, 168):
             with self.subTest(width=width):
-                golden_path = os.path.join(_EVIDENCE_DIR,
+                golden_path = os.path.join(_GOLDEN_DIR,
                                            "fleet-render-r7-noledger-%d.txt" % width)
                 with open(golden_path, encoding="utf-8") as fh:
                     golden = fh.read().rstrip("\n")

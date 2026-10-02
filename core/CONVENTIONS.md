@@ -35,7 +35,7 @@ Intensity supplies the default recipe below; an explicit graph selects its stage
 Stage gates check whether output can feed the next stage. Independent QA runs only where selected, using a separate execution with a different declared persona or perspective. Same-harness review is independent (SD-160, user decision 2026-09-27; allocation order in §2.1). Further legs retain declared profile and perspective diversity. Final verification remains capability-specific. Never add an omitted plan-check or report an unexecuted check as passed.
 
 Dispatch depth is portable route topology, not process ancestry, runtime-native
-agent nesting, or proof of registry membership. Dispatch dispatch depth 0 is user-facing
+agent nesting, or proof of registry membership. Dispatch depth 0 is user-facing
 main ownership; dispatch depth 1 owns the capability pipeline; dispatch depth 2
 serves bounded review, perspective, and pipeline-stage nodes. Direct stays inline
 at dispatch depth 0. Quick is semantically one registered-headless one-shot
@@ -44,7 +44,7 @@ compatibility identity remains `worker_type=owner`, `unit=_kernel/owner`,
 `owner_model_profile`, and `one-shot-owner`; those names do not make it a
 standard+ capability owner. Standard+ fallback attempts retain their node's
 dispatch depth even when the execution surface changes from registered headless
-to a runtime-native subagent or inline. Dispatch dispatch depth 3 or greater is forbidden.
+to a runtime-native subagent or inline. Dispatch depth 3 or greater is forbidden.
 Resource runners and Claude agent-team teammate sessions are separate lifecycle
 surfaces and carry no dispatch depth.
 

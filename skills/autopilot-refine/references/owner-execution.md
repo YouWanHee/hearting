@@ -65,7 +65,7 @@ Resolve the target by fuzzy matching prompt terms against `<artifact-root>/{rese
 
 Preserve the target artifact's existing or explicitly requested language. Otherwise, use the conversation language for user-facing summaries and reports according to `<agent-home>/roles/response-policy.md`. Preserve source quotations, code, paths, identifiers, and citations.
 
-Resolve `<artifact-root>` by preferring `.agent_reports` and falling back to legacy `.claude_reports`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
+Resolve `<artifact-root>`: CONVENTIONS §5.1 (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
 
 ## Process
 

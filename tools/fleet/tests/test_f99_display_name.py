@@ -154,7 +154,7 @@ class DerivedSessionThreeSurfaceFixtureTest(_HermeticStateRoot):
     title, registry `name` = `hearting-fb`, `nameSource` = `derived` → statusline,
     Fleet, and the Herdr formatter must all resolve to ONE identical string. This
     is the pure-fixture half of that requirement (statusline/Herdr's own scripted
-    comparison lives in evidence/, since neither has a native test harness)."""
+    comparison was a one-off capture, since neither has a native test harness)."""
 
     def test_statusline_and_fleet_chain_converge_on_the_same_string(self):
         self._write_pid_record(5151, "hearting-fb", "derived")

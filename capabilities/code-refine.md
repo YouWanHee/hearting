@@ -28,7 +28,7 @@ One `code-refine` pass is one batched correction: it takes the complete 🔴 lis
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.
+Artifact root: `core/CONVENTIONS.md §5.1`; output placement: `§5`.
 
 ## Artifact Producer Lifecycle
 

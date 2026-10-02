@@ -78,7 +78,7 @@ owns the user-facing card.
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not.
+Artifact root: `core/CONVENTIONS.md §5.1`.
 
 Spec work writes to `$AGENT_ARTIFACT_OUTPUT_DIR/spec/`. The canonical current blueprint is always `$AGENT_ARTIFACT_OUTPUT_DIR/spec/prd.md`.
 

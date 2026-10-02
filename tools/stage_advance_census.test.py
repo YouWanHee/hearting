@@ -118,8 +118,7 @@ class CensusFixture(unittest.TestCase):
         self.assertEqual(route["nodes_total"], 1)
 
     def test_repo_topology_pins_the_documented_recipe_axis(self):
-        # The static numbers quoted in docs/stage-advance-canary.md come from
-        # this file and nowhere else.
+        # The static recipe-axis numbers are pinned here and nowhere else.
         self.write_route("rt-a.json", [node("plan", "runtime-eligible")])
         recipe = self.json_census(REAL_TOPOLOGIES)["recipe_axis"]
         # +9 nodes and +9 runtime-eligible: the frame bootstrap layer added two

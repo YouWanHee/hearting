@@ -41,7 +41,7 @@ contract. It is adapter-owned output, not a legacy compatibility Skill copy.
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not.
+Artifact root: `core/CONVENTIONS.md §5.1`.
 
 When invoked from a `standard+` `autopilot-code` stage cycle, write verification
 evidence only under `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/test_logs/` and

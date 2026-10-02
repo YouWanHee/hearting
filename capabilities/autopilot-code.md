@@ -36,7 +36,7 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 ## Artifact Ownership
 
-Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not.
+Artifact root: `core/CONVENTIONS.md §5.1`.
 
 Code work normally writes to `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, even when a `spec/` directory exists. `spec/` is the blueprint bucket; `plans/` is the work-cycle bucket.
 
