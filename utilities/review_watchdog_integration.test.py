@@ -310,7 +310,10 @@ class ReviewWatchdogIntegrationTest(unittest.TestCase):
             code = "import os,time; os.read(int(os.environ['REVIEW_GATE']),1); time.sleep(5)"
             handle = launch_review_watchdog(
                 [sys.executable, "-c", code], gate_fd=gate_read,
-                budget=begin_finite_watchdog(.2), attempt_id="att-timeout",
+                # Long enough that commit() always lands before the deadline on a loaded
+                # runner (0.2 s raced it: the watchdog timed out first and the commit hit a
+                # closed control pipe); the child still sleeps past it, so this is a timeout.
+                budget=begin_finite_watchdog(1.5), attempt_id="att-timeout",
                 nonce="c" * 64,
                 env={**os.environ, "REVIEW_GATE": str(gate_read)},
                 lease_release_spec={"root": str(root), "cycle_id": "cyc-timeout", "attempt_id": "att-timeout"},
@@ -321,7 +324,7 @@ class ReviewWatchdogIntegrationTest(unittest.TestCase):
             self._write_timeout_row(root / "jobs.log", receipt)
             handle.commit()
             os.close(gate_write)
-            self.assertEqual(handle.process.wait(timeout=3), 124)
+            self.assertEqual(handle.process.wait(timeout=6), 124)
             self.assertIsNotNone(json.loads(lease.read_text(encoding="utf-8"))["released_at"])
 
     def test_normal_exit_releases_exact_lease(self):
