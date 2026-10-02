@@ -319,8 +319,11 @@ def dispatch_command(
         "--narrow-verify", session["narrow_verify"],
         "--expected-round-trips", str(session["expected_round_trips"]),
         "--attempt-id", session["attempt_id"],
-        "--subsession-worktree", str(manifest["worktree"]),
     ] + [flag for file in session["fixed_files"] for flag in ("--fixed-file", file)]
+    # Plan slices pin their launch tree; a serial-chain manifest (SD-119) has none
+    # and keeps launching in the route's sealed cwd.
+    if manifest.get("worktree"):
+        command += ["--subsession-worktree", str(manifest["worktree"])]
     owner_attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
     if owner_attempt_id:
         command += ["--", "--parent-attempt-id", owner_attempt_id]
