@@ -1697,6 +1697,7 @@ def _codex_identity_candidate_ok(text: str, set_values: dict, excluded: List[str
     )
 
 
+# destructive-ok: reason=atomically publish one managed config file or discard its own temporary; boundary=the target file and one mkstemp sibling in its directory
 def _atomic_text(path: Path, text: str, mode: Optional[int] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_mode = None
