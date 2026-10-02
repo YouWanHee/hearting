@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from codex_permission_profile import commit_profile_config, config_arguments
 import json
 import queue
 import threading
@@ -705,8 +706,9 @@ def run_turn(
         "threadId": thread_id,
         "input": [{"type": "text", "text": prompt, "text_elements": []}],
         "cwd": args.worktree,
-        "sandboxPolicy": sandbox_policy(args),
     }
+    if getattr(args, "native_permission_profile", None) is None:
+        params["sandboxPolicy"] = sandbox_policy(args)
     if args.approval != "inherit":
         params["approvalPolicy"] = args.approval
     if args.model:
@@ -993,6 +995,11 @@ def main(argv: list[str] | None = None) -> int:
     command = shlex.split(args.app_server_command) if args.app_server_command else [
         "codex", "app-server", "--listen", "stdio://"
     ]
+    args.native_permission_profile = commit_profile_config(
+        args.worktree, args.writable_root, args.sandbox, args.network_access,
+    )
+    if args.native_permission_profile is not None:
+        command += config_arguments(args.native_permission_profile)
     state_path = Path(args.state_file) if args.state_file else None
     lease_path = Path(args.lease_file)
     runtime_env = dict(os.environ)
@@ -1057,9 +1064,10 @@ def main(argv: list[str] | None = None) -> int:
         server.notification("initialized")
         thread_params: dict[str, Any] = {
             "cwd": args.worktree,
-            "sandbox": args.sandbox,
             "ephemeral": True,
         }
+        if args.native_permission_profile is None:
+            thread_params["sandbox"] = args.sandbox
         if args.approval != "inherit":
             thread_params["approvalPolicy"] = args.approval
         if args.model:

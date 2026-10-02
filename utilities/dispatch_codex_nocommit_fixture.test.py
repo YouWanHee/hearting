@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""SD-69 disposable fixture: Codex linked-worktree mutation boundary.
+"""Disposable Codex linked-worktree source and commit-responsibility fixtures.
 
-Proves, against a real throwaway repo + `git worktree add` linked worktree:
-  1. writable roots include the primary `.spec-grounding` + artifact root,
-     and never the git-common-dir/`.git`.
-  2. a simulated source edit persists in the worktree and a
-     `.spec-grounding/<marker>` write lands in the PRIMARY checkout.
-  3. commit stays honestly unavailable: `no_commit=1` is recorded, no commit
-     is claimed, and route_hash/source_commit are unforged.
+Check real source placement, exact Git metadata grants for commit-expected
+single-session stages, and the retained no-commit boundary for slices.
 """
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,15 +80,17 @@ class CodexNoCommitFixtureTest(unittest.TestCase):
             "checked_worktree": str(self.linked.resolve()), "failure_scope": "none",
             "codex_command": "ok", "retry_on_isolated_worktree": 0,
         }], "native_subagent": []}
-        return ROUTE.compile_route(
-            "autopilot-code", "dev", "strong", self.linked, self.artifact,
-            signals=["shared-contract"], transport="headless", tracking="tracked",
-            tracked_gate_evidence=gate, dispatch_evidence=dispatch,
-        )
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            return ROUTE.compile_route(
+                "autopilot-code", "dev", "strong", self.linked, self.artifact,
+                signals=["shared-contract"], transport="headless", tracking="tracked",
+                tracked_gate_evidence=gate, dispatch_evidence=dispatch,
+            )
 
     def base_env(self):
         return {
-            **{key: value for key, value in os.environ.items() if key != "AGENT_DISPATCH_JOBS"},
+            **{key: value for key, value in os.environ.items()
+               if key not in {"AGENT_DISPATCH_JOBS", "AGENT_MODEL_GOVERNOR_ROOT"}},
             "AGENT_HOME": str(self.primary),
             "AGENT_ARTIFACT_ROOT": str(self.artifact),
             "AGENT_DISPATCH_ATTEMPT_ID": "att-nocommit-parent",
@@ -126,29 +125,31 @@ class CodexNoCommitFixtureTest(unittest.TestCase):
         result = subprocess.run(args, text=True, capture_output=True, env=self.base_env())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        # (1) writable roots: primary .spec-grounding + artifact root present; git metadata absent.
+        # (1) Source/artifact markers and exact Git directories are granted; the common root is not.
         command_line = next(ln for ln in result.stdout.splitlines() if ln.startswith("command="))
         command = command_line[len("command="):]
         self.assertIn(str(self.primary / ".spec-grounding"), command)
         self.assertIn(str(self.artifact), command)
-        self.assertNotIn(str(self.primary / ".git"), command)
+        tokens = shlex.split(command)
+        grants = [Path(tokens[i + 1]).resolve() for i, token in enumerate(tokens[:-1])
+                  if token in ("--add-dir", "--writable-root")]
+        self.assertNotIn((self.primary / ".git").resolve(), grants)
         common_dir = subprocess.run(
             ["git", "-C", str(self.linked), "rev-parse", "--git-common-dir"],
             text=True, capture_output=True, check=True,
         ).stdout.strip()
-        self.assertNotIn(os.path.realpath(common_dir), command)
+        self.assertNotIn(Path(os.path.realpath(common_dir)), grants)
         self.assertTrue((self.primary / ".spec-grounding").is_dir())
         self.assertEqual((self.primary / ".spec-grounding").stat().st_mode & 0o777, 0o700)
 
-        # (3) commit stays honestly unavailable — no_commit=1 recorded, prompt says so.
+        # A normal route-bound execute is commit-expected; route pins remain immutable.
         row = self.jobs.read_text(encoding="utf-8").strip().splitlines()[-1]
-        self.assertIn(",no_commit=1", row)
-        self.assertNotIn("commit=1", row.replace(",no_commit=1", ""))
+        self.assertNotIn(",no_commit=1", row)
+        self.assertIn(str((self.primary / ".git" / "worktrees" / "linked-worktree").resolve()), command)
         prompt = next(
             self.logs.glob("codex-nocommit-fixture.*.codex.prompt.txt")
         ).read_text(encoding="utf-8")
-        self.assertIn("No-commit worker (SD-69)", prompt)
-        self.assertIn("do NOT `git commit`", prompt)
+        self.assertNotIn("No-commit worker (SD-69)", prompt)
 
         # route_hash / source_commit unforged: the row's own committed evidence still matches
         # the route record's hash and the primary's real HEAD at compile time.
@@ -175,10 +176,14 @@ class CodexNoCommitFixtureTest(unittest.TestCase):
             worktree=str(worktree or self.linked), agent_home=self.primary,
         )
 
-    def test_owner_is_commit_expected_and_stage_stays_no_commit(self):
-        # SD-69 boundary is depth-2/stage-only: an owner in the same linked
-        # worktree is commit-expected and must not be flagged no-commit.
-        self.assertTrue(WH.is_no_commit_stage(self._worker_args("stage")))
+    def test_commit_expected_stage_and_declared_subsession_policy(self):
+        args = self._worker_args("stage")
+        args.commit_expected = True
+        args.route_node = "execute"
+        args.sub_session = False
+        self.assertFalse(WH.is_no_commit_stage(args))
+        args.subsession_id = "slice-1"
+        self.assertTrue(WH.is_no_commit_stage(args))
         self.assertFalse(WH.is_no_commit_stage(self._worker_args("owner")))
 
     def test_git_writable_dirs_grant_exact_metadata_for_commit_expected_runs(self):
@@ -199,6 +204,13 @@ class CodexNoCommitFixtureTest(unittest.TestCase):
         self.assertEqual(
             WH.linked_worktree_git_writable_dirs(self._worker_args("stage")), ()
         )
+        stage = self._worker_args("stage")
+        stage.commit_expected = True
+        stage.route_node = "execute"
+        stage.sub_session = False
+        self.assertEqual(tuple(WH.linked_worktree_git_writable_dirs(stage)), expected)
+        stage.subsession_id = "slice-1"
+        self.assertEqual(WH.linked_worktree_git_writable_dirs(stage), ())
         # A primary checkout needs no grant: cwd already covers .git.
         self.assertEqual(
             WH.linked_worktree_git_writable_dirs(

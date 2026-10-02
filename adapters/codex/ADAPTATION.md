@@ -599,10 +599,9 @@ before payload exec. A duplicate or already-started claim starts zero children,
 and a dead unstarted fence is retryable only after exact group quiescence.
 Standard+ dispatch-depth-1 Codex owners run with
 `sandbox_workspace_write.network_access=true` and
-`AGENT_NESTED_HEADLESS_NETWORK=1`. Their writable `CODEX_HOME` normally remains
-worktree-local. When the project
-filesystem reports foreign ownership, it uses `homes/codex/<worktree-key>`
-beneath the already writable canonical dispatch state root instead. Both paths
+`AGENT_NESTED_HEADLESS_NETWORK=1`. Their writable `CODEX_HOME` lives at
+`homes/codex/<worktree-key>` beneath the canonical dispatch state root,
+outside the source worktree. These homes
 link existing auth/config without copying or mutating credentials and keep
 nested session/app-server state inside the owner sandbox. Dispatch-depth-2 workers
 do not inherit the network widening. The outer Codex sandbox also admits only
