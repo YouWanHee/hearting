@@ -104,6 +104,7 @@ class TerminalCommitRequest:
     owner_attempt_id: str
     jobs: Path
     artifact_root: Path
+    owner_handoff: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -362,7 +363,11 @@ def select_primary_artifact(route: Mapping[str, Any], gates: Mapping[str, Any],
 def _seal_owner_envelope(*, request: TerminalCommitRequest, route: Mapping[str, Any],
                          commit_id: str, gates: Mapping[str, Any], binding: Optional[Mapping[str, Any]],
                          slot: Path, terminal_nodes: tuple[str, ...]) -> Optional[str]:
-    primary = select_primary_artifact(route, gates, binding, artifact_root=request.artifact_root)
+    selected_binding = dict(binding or {})
+    owner_hint = (request.owner_handoff or {}).get("primary")
+    if "primary" not in selected_binding and isinstance(owner_hint, str):
+        selected_binding["primary"] = owner_hint
+    primary = select_primary_artifact(route, gates, selected_binding, artifact_root=request.artifact_root)
     if primary is None:
         return None
     first_digest = _digest(primary.read_bytes())
@@ -585,11 +590,65 @@ def _binding_replays(existing, data, fresh, record) -> bool:
     if existing.path.read_bytes() == data:
         return True
     stored = existing.binding or {}
-    projection = ("campaign_id", "cycle_record_digest", "observed_state")
+    projection = {"campaign_id", "cycle_record_digest", "observed_state"}
+    if "primary" not in fresh:
+        projection.add("primary")
     if ({k: v for k, v in stored.items() if k not in projection}
             != {k: v for k, v in fresh.items() if k not in projection}):
         return False
     return cycle_identity_matches(record, stored.get("cycle_record_digest"), campaign_id=stored.get("campaign_id"))
+
+
+def _valid_cycle_primary(candidate: Any, *, root: Path, binding: Mapping[str, Any]) -> Optional[Path]:
+    if not isinstance(candidate, str) or not candidate or candidate == "-":
+        return None
+    path = Path(candidate)
+    if not path.is_absolute():
+        return None
+    path = _placed(path)
+    if not _in_root_regular(path, Path(root).resolve()):
+        return None
+    try:
+        if not path.stat().st_size:
+            return None
+        import artifact_producer
+        record = artifact_producer.read_cycle_record(Path(root), binding["cycle_id"])
+        directory = artifact_producer.cycle_dir(Path(root), record["campaign_id"],
+                                                 binding["cycle_id"], record).resolve()
+        path.resolve(strict=True).relative_to(directory)
+    except Exception:
+        return None
+    return path.resolve()
+
+
+def _exact_owner_handoff(jobs: Path, attempt: str, route: Mapping[str, Any]) -> Optional[dict[str, str]]:
+    """Inspect the exact current owner log; never infer from directory recency."""
+    try:
+        from dispatch_completion_join import exact_attempt_row
+        row = exact_attempt_row(Path(jobs), attempt)
+        meta = row.metadata
+        if meta.get("worker_type") != "owner":
+            return None
+        log_file = meta.get("log_file")
+        if not isinstance(log_file, str) or not log_file:
+            return None
+        fields = row.raw.split("\t")
+        from codex_dispatch_terminal import inspect_terminal_attempt
+        inspected = inspect_terminal_attempt(
+            log_file, worktree=fields[3], artifact_root_metadata=route.get("artifact_root"),
+            worker_type="owner")
+        if (inspected.get("state") != "valid" or inspected.get("verdict") != "PASS"
+                or inspected.get("artifact_state") != "readable"):
+            return None
+        import base64
+        encoded = inspected.get("artifact_path_b64")
+        if not isinstance(encoded, str) or not encoded:
+            return None
+        primary = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+        return {"primary": str(primary)}
+    except (OSError, UnicodeError, ValueError, TypeError, RuntimeError):
+        return None
+    return None
 
 
 def producer_binding_digest(binding_path: Path) -> str:
@@ -963,11 +1022,21 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         terminal_nodes = tuple((route.get("workflow_contract") or {}).get("terminal_nodes") or ())
         marker_digest = terminal_marker_digest(markers)
         binding_value = None
+        pending_primary = None
+        owner_hint = (request.owner_handoff or {}).get("primary")
         if producer_lifecycle_applies(route):
             binding = load_producer_binding(artifact_root=request.artifact_root,
                                             route_id=route["route_id"], owner_attempt_id=request.owner_attempt_id)
-            producer_digest = binding.digest or producer_binding_digest(binding.path)
             binding_value = binding.binding
+            selected_primary = _valid_cycle_primary(owner_hint, root=request.artifact_root,
+                                                    binding=binding_value)
+            if selected_primary is None:
+                selected_primary = _valid_cycle_primary(binding_value.get("primary"),
+                                                        root=request.artifact_root, binding=binding_value)
+            if (selected_primary is not None and binding_value.get("primary") != str(selected_primary)
+                    and existing_state_value is None):
+                pending_primary = selected_primary
+            producer_digest = binding.digest or producer_binding_digest(binding.path)
         else:
             producer_digest = _digest(_canonical({"contract": "producer-binding-not-applicable/v1",
                                                   "reason": "sealed-topology-nonproducer"}))
@@ -996,6 +1065,25 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
                 fresh_gates = _settled_gate_rows(route_module, route, request, fresh_gates)
             if terminal_marker_digest(list(fresh_gates.values())) != marker_digest:
                 raise TerminalCommitError("transaction-conflict", "claim-markers-changed")
+            if pending_primary is not None:
+                if dispatch_contract.terminal_claim_observation(
+                        request.jobs, route["route_id"], request.owner_attempt_id) is not None:
+                    raise TerminalCommitError("transaction-conflict", "terminal-claim-already-exists")
+                binding_value = {**binding_value, "primary": str(pending_primary)}
+                binding_path = producer_binding_path(
+                    request.artifact_root, route["route_id"], request.owner_attempt_id)
+                _atomic_json(binding_path, binding_value)
+                producer_digest = _digest(binding_path.read_bytes())
+                commit_id = terminal_commit_id(
+                    route_id=route["route_id"], route_hash=route["route_hash"],
+                    owner_attempt_id=request.owner_attempt_id,
+                    marker_digest=marker_digest, producer_digest=producer_digest)
+                path = _commit_state_path(request)
+                initial = {"schema_version": 1, "terminal_commit_id": commit_id,
+                           "route_id": route["route_id"], "route_hash": route["route_hash"],
+                           "owner_attempt_id": request.owner_attempt_id,
+                           "terminal_marker_digest": marker_digest,
+                           "producer_binding_digest": producer_digest, "state": "claimed"}
             dispatch_contract.claim_terminal_route_locked(
                 request.jobs, route["route_id"], request.owner_attempt_id,
                 lock_fd=jobs_lock.fileno(),
@@ -1027,8 +1115,21 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
                 raise RuntimeError("crash-after-close")
         if state.get("state") == "route-closed":
             if binding_value is not None:
+                finalize_args = {"expected_binding": binding_value}
+                primary = binding_value.get("primary")
+                if isinstance(primary, str):
+                    try:
+                        import artifact_producer
+                        record = artifact_producer.read_cycle_record(request.artifact_root,
+                                                                     binding_value["cycle_id"])
+                        directory = artifact_producer.cycle_dir(
+                            request.artifact_root, record["campaign_id"],
+                            binding_value["cycle_id"], record).resolve()
+                        finalize_args["primary"] = Path(primary).resolve(strict=True).relative_to(directory).as_posix()
+                    except (OSError, ValueError, KeyError, TypeError):
+                        finalize_args["primary"] = primary
                 services.finalize_exact_cycle(request.artifact_root, cycle_id=binding_value["cycle_id"],
-                                              expected_binding=binding_value)
+                                              **finalize_args)
                 state = _advance_state(path, commit_id, "route-closed", "producer-finalized",
                                        {"producer": "finalized"})
             else:
@@ -1353,7 +1454,12 @@ def _completion_request(jobs, status, metadata):
         Path(jobs), owner_attempt_id=metadata["attempt_id"])
     path = Path(binding.route_file if binding else metadata.get("route_file", ""))
     route = json.loads(path.read_text())
-    request = TerminalCommitRequest(path, metadata["attempt_id"], Path(jobs), Path(route["artifact_root"]))
+    handoff = _exact_owner_handoff(Path(jobs), metadata["attempt_id"], route)
+    explicit_handoff = metadata.get("owner_handoff")
+    if isinstance(explicit_handoff, Mapping) and isinstance(explicit_handoff.get("primary"), str):
+        handoff = {"primary": explicit_handoff["primary"]}
+    request = TerminalCommitRequest(path, metadata["attempt_id"], Path(jobs),
+                                    Path(route["artifact_root"]), handoff)
     verify_request_identity(request, route)
     validate_owner_route(jobs=request.jobs, route_file=path, owner_attempt_id=request.owner_attempt_id)
     return request

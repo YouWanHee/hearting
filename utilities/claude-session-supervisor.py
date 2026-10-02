@@ -166,6 +166,7 @@ def terminal_commit_adapter(args: argparse.Namespace, rows: list[object]):
         owner_attempt_id=args.parent_attempt_id,
         jobs=Path(args.jobs),
         artifact_root=Path(route.get("artifact_root", args.worktree)),
+        owner_handoff=getattr(args, "owner_handoff", None),
     )
     return dispatch_terminal_commit.settle_terminal_commit(request)
 

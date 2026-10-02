@@ -32,8 +32,9 @@ class ContinuationBudgetTest(unittest.TestCase):
                 route_id=value["route_id"],
                 route_hash=value["route_hash"],
             )
-        self.assertEqual(15, budget.ordinary)
-        self.assertEqual(15 + MODULE.TERMINAL_RESERVE_DEFAULT, budget.limit)
+        self.assertEqual(MODULE.derive_workload_ordinary(
+            declared_nodes=8, retry_slots=7, review_round_cap=2, terminal_nodes=1), budget.ordinary)
+        self.assertEqual(budget.ordinary + MODULE.TERMINAL_RESERVE_DEFAULT, budget.limit)
         self.assertEqual(budget.ordinary + budget.reserved, budget.limit)
         self.assertEqual("bound-route", budget.source)
         self.assertEqual(8, budget.declared_nodes)
@@ -182,8 +183,8 @@ class RouteIdentityHashRegressionTest(unittest.TestCase):
         self.assertEqual("bound-route", budget.source)
         self.assertEqual(8, budget.declared_nodes)
         self.assertEqual(7, budget.retry_slots)
-        self.assertEqual(15, budget.ordinary)
-        self.assertEqual(16, budget.limit)
+        self.assertGreaterEqual(budget.ordinary, MODULE.WORKLOAD_FLOOR)
+        self.assertEqual(budget.ordinary + MODULE.TERMINAL_RESERVE_DEFAULT, budget.limit)
 
     def test_pre_wp1_two_key_hash_scheme_falls_to_floor(self):
         """Control: a route whose stored `route_hash` was sealed with the old
@@ -254,6 +255,18 @@ class SealedBudgetBlockTest(unittest.TestCase):
         self.assertEqual(23, budget.limit)
         self.assertEqual(20, budget.declared_nodes)
         self.assertEqual(1, budget.reserved)
+
+    def test_preexisting_valid_twelve_plus_one_block_remains_sealed_and_unchanged(self):
+        block = {"contract_version": 1, "declared_nodes": 5, "review_round_cap": 2,
+                 "gap": 1, "retry": 1, "reserved": 1, "ordinary": 12, "limit": 13}
+        with tempfile.TemporaryDirectory() as raw:
+            route = Path(raw) / "route.json"
+            value = self._sealed_route(block)
+            route.write_text(json.dumps(value), encoding="utf-8")
+            budget = MODULE.resolve_continuation_budget(
+                route_file=route, route_id=value["route_id"], route_hash=value["route_hash"])
+        self.assertEqual("sealed-block", budget.source)
+        self.assertEqual((12, 13), (budget.ordinary, budget.limit))
 
     def test_invariant_holds_across_all_three_sources(self):
         # D47-9: limit == ordinary + reserved, and ordinary >= COMPATIBILITY_FLOOR,
@@ -361,6 +374,22 @@ class SealedBudgetBlockTest(unittest.TestCase):
         verdict2 = ledger.admit(purpose="ordinary", stalled=False, reservation_ok=False)
         self.assertFalse(verdict2.admitted)
         self.assertEqual("continuation-budget-unavailable", verdict2.refusal)
+
+
+class OwnerFinishBudgetRegressionTest(unittest.TestCase):
+    def test_workload_formula_leaves_finite_report_headroom(self):
+        with tempfile.TemporaryDirectory() as raw:
+            route = Path(raw) / "route.json"
+            value = ContinuationBudgetTest().seal({
+                "schema_version": 2,
+                "nodes": [{"id": f"node-{index}"} for index in range(5)],
+                "resume_retry_boundaries": ["node-0", "node-1"],
+            })
+            route.write_text(json.dumps(value), encoding="utf-8")
+            budget = MODULE.resolve_continuation_budget(
+                route_file=route, route_id=value["route_id"], route_hash=value["route_hash"])
+        self.assertGreaterEqual(budget.ordinary, 32)
+        self.assertEqual(budget.limit, budget.ordinary + budget.reserved)
 
 
 if __name__ == "__main__":

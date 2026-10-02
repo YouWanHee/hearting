@@ -488,5 +488,23 @@ class RegisteredOwnerInputTest(unittest.TestCase):
             self.assertEqual(sum('"text": "word' in line for line in prompt.splitlines()), 6)
 
 
+class OwnerFinishCorrectionRegressionTest(OwnerInputTest):
+    def test_parked_queued_response_explains_next_turn_delay_and_no_cancel(self):
+        from unittest import mock
+        phase = self.root / 'phase.json'
+        phase.write_text(json.dumps({'schema_version': 2, 'parent_attempt_id': self.attempt,
+                                     'phase': 'parked', 'delivered_attempt_ids': []}))
+        I.submit(self.jobs, self.attempt, 'private correction text', 'notice')
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_COMPLETION_STATE_FILE': str(phase)}):
+            result = I.inspect(self.jobs, self.attempt)
+        self.assertEqual(result.get('owner_phase'), 'parked')
+        self.assertEqual(result.get('delivery_timing'), 'next-owner-turn')
+        notice = result.get('delivery_notice', '').lower()
+        self.assertIn('next owner turn', notice)
+        self.assertIn('delay', notice)
+        self.assertIn('does not wake or cancel', notice)
+        self.assertNotIn('private correction text', json.dumps(result))
+
+
 if __name__ == '__main__':
     unittest.main()

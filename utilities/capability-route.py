@@ -23,7 +23,8 @@ import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 import owner_write_advisory as OWNER_WRITE_ADVISORY
-from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
+from dispatch_continuation_budget import (COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT,
+                                          derive_workload_ordinary)
 from dispatch_contract import (
     row_is_subsession,
     CANONICAL_PARENT_TRANSPORTS,
@@ -4007,21 +4008,23 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         nodes, capability, owner_model_profile
     )
     spec_touch=any(_scope_touches_spec(scope) for node in nodes for scope in node["write_scope"])
-    # SD-116 WP4 (D47-9): the compiler now seals the continuation budget into
-    # the route itself, sealed into `route_hash` (it is added before the hash
-    # is computed, unlike `owner_attempt_id`/`route_family_key`). `ordinary`
-    # uses the identical `max(COMPATIBILITY_FLOOR, declared_nodes+retry_slots)`
-    # derivation `dispatch_continuation_budget.resolve_continuation_budget()`
-    # already used for the pre-WP4 "bound-route" path, so `ordinary` never
-    # shrinks below the pre-SD-116 `limit` for the same route shape (D47-9).
+    # Seal the same finite workload derivation used by legacy bound routes.
     _continuation_declared_nodes=len(nodes)
     _continuation_retry_slots=len(set(recipe["resume_retry_boundaries"]))
-    _continuation_ordinary=max(
-        COMPATIBILITY_FLOOR, _continuation_declared_nodes+_continuation_retry_slots)
+    _continuation_review_round_cap=REVIEW_ROUND_CAP.max_review_rounds(effective)
+    _continuation_terminal_nodes=sum(1 for node in nodes if node.get("terminal") is True)
+    _continuation_ordinary=derive_workload_ordinary(
+        declared_nodes=_continuation_declared_nodes,
+        retry_slots=_continuation_retry_slots,
+        review_round_cap=_continuation_review_round_cap,
+        terminal_nodes=_continuation_terminal_nodes,
+    )
     continuation_budget={
       "contract_version":1,
       "declared_nodes":_continuation_declared_nodes,
-      "review_round_cap":REVIEW_ROUND_CAP.max_review_rounds(effective),
+      "review_round_cap":_continuation_review_round_cap,
+      "retry_slots":_continuation_retry_slots,
+      "terminal_nodes":_continuation_terminal_nodes,
       "gap":1,"retry":1,"reserved":TERMINAL_RESERVE_DEFAULT,
       "ordinary":_continuation_ordinary,
       "limit":_continuation_ordinary+TERMINAL_RESERVE_DEFAULT,

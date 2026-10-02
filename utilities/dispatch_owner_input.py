@@ -102,11 +102,30 @@ def _reachable(row, value, live):
     return live or (row.status in {"open", "running"} and _preconsumer(value))
 
 
-def _public(value, *, live=False, reachable=None):
+def _owner_phase(attempt):
+    """Read only the exact validated supervisor phase when its path is supplied."""
+    raw = os.environ.get("AGENT_DISPATCH_COMPLETION_STATE_FILE")
+    if not raw:
+        return "unknown"
+    try:
+        from dispatch_completion_join import read_supervisor_phase_state
+        state = read_supervisor_phase_state(Path(raw), attempt)
+        return state.phase if state is not None else "unknown"
+    except (OSError, ValueError, TypeError):
+        return "unknown"
+
+
+def _public(value, *, live=False, reachable=None, owner_phase=None):
     reachable = live if reachable is None else reachable
+    phase = owner_phase or _owner_phase(value["attempt_id"])
+    timing = ("active-turn" if value["transport"] == "codex-active-turn" and phase == "running-turn"
+              else "next-owner-turn")
+    notice = ("Queued corrections may wait for the next owner turn; a parked owner may be delayed "
+              "until joined children finish or require attention. This command does not wake or cancel the owner.")
     return {"attempt_id": value["attempt_id"], "thread_id": value["thread_id"],
             "transport": value["transport"], "accepting": value["accepting"] and reachable,
-            "supervisor_live": live,
+            "supervisor_live": live, "owner_phase": phase,
+            "delivery_timing": timing, "delivery_notice": notice,
             "requests": [{key: item[key] for key in item if key != "text"}
                          for item in value["requests"]],
             "applied": "not-verified",
