@@ -50,8 +50,9 @@ Duplicate starts are typed existing states, not evidence that a new worker ran.
 
 The route stage is the semantic gate; sessions are execution capacity. At any
 stage, you may keep one session or declare bounded serial sub-sessions under the
-same node. Use parallel sessions only through the existing sealed parallel-group
-surface with non-overlapping fixed files. Preserve one completion marker for the
+same node. Use parallel sessions only through
+`dispatch-batch.py --parallel-group execute --slices <plan.md>` with
+non-overlapping fixed files. Preserve one completion marker for the
 stage, give every sub-session `stage_authority=0`, and aggregate its phase brief,
 ledger, and bounded handoff before deciding the gate. Planned subdivision is not a
 retry. After a gate failure, dispatch only the unfinished gap recorded by the last

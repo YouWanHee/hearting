@@ -67,6 +67,7 @@ from dispatch_contract import (
     resolve_global_registry,
     resolve_agent_home as _resolve_agent_home,
     sealed_launch_home,
+    parent_lookup_worktree,
     resolve_live_parent_attempt,
     resolve_model_governor_root,
     review_governed_lease_is_held,
@@ -2581,7 +2582,13 @@ def main(argv: list[str]) -> int:
                 jobs,
                 parent_slug=args.parent_slug or "",
                 repo=repo,
-                worktree=args.worktree,
+                worktree=(
+                    parent_lookup_worktree(
+                        args.worktree, args.route_file, subsession=True,
+                        parent_attempt_id=args.parent_attempt_id,
+                    )
+                    if getattr(args, "subsession_id", None) else args.worktree
+                ),
                 expected_attempt_id=args.parent_attempt_id,
                 expected_harness=args.parent_harness,
                 expected_transport=args.parent_transport,

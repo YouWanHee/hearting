@@ -4,7 +4,7 @@
 
 ## Overview
 
-Executes an implementation plan with progress tracking. It implements individual steps as the `dev/*` unit, relies on the conductor-dispatched `impl-review` sibling node (unit `qa/code-review`) for phase review, and establishes a Git safety checkpoint.
+Executes an implementation plan with progress tracking. It implements individual steps as the `dev/*` unit, relies on the conductor-dispatched `impl-review` sibling node (unit `qa/code-review`) for phase review, and establishes a Git safety checkpoint. A parallel sub-session slice skips the checkpoint, commits and rollback: it edits only its fixed files, makes no git writes, and leaves `checklist.md` and the dev log to the owner.
 
 ## Invocation
 

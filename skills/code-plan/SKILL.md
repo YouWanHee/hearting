@@ -50,6 +50,22 @@ Date: {YYYY-MM-DD}
 
 Plan procedure, plan structure, and the single-line return contract are owned by the `plan/plan-author` unit persona; do not restate them in the prompt. The stage orchestrator receives only the unit's return line (`{path} -- {verdict}`); plan content stays in the file.
 
+## Slices Block
+
+Add a `slices` block only when the work splits into 2–4 packages that own exactly disjoint files and each can finish on its own. The block is one fenced code block whose info string is `slices`, holding a JSON list; the owner's `dispatch-batch.py --slices <plan.md>` reads it and starts the packages in parallel:
+
+````text
+```slices
+[
+  {"id": "core", "files": ["utilities/a.py", "utilities/a.test.py"], "verify": "python3 utilities/a.test.py"},
+  {"id": "docs", "files": ["core/OPERATIONS.md"], "verify": "grep -q 'new text' core/OPERATIONS.md", "brief": "only the §5.10 paragraph"}
+]
+```
+````
+
+- Required per slice: `files` (exact paths, no globs, relative to the worktree) and `verify` (one line). Optional: `id` (`[a-z0-9-]`), `brief`, `adapter`, `expected_round_trips`.
+- Write exactly one block. If the packages share a file, or one cannot finish without another, write no block: the stage then runs as one session. Do not invent a split to use the block.
+
 ## Plan-Check Assurance
 
 Derive verification rigor from the caller's `--intensity` and plan risk under [CONVENTIONS §1.1](../../core/CONVENTIONS.md#11-verification-rigor-tiers). Rigor does not select this stage: `code-plan` runs only after the caller chooses a durable `standard+` graph. `direct` skips it; `quick` uses a one-shot worker with an inline micro-plan and plan-check-lite.

@@ -1312,6 +1312,24 @@ class DispatchContractTest(unittest.TestCase):
     if proc.poll() is None:proc.kill()
     proc.wait()
 
+ def test_parent_lookup_worktree_remaps_only_for_slice_with_exact_attempt_id(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);primary=base/"primary";linked=base/"linked";foreign=base/"foreign"
+   for repo in (primary,foreign):
+    subprocess.run(["git","init","-q",str(repo)],check=True)
+   subprocess.run(["git","-C",str(primary),"-c","user.name=t","-c","user.email=t@t","commit","--allow-empty","-qm","seed"],check=True)
+   subprocess.run(["git","-C",str(primary),"worktree","add","-q","-b","linked",str(linked)],check=True)
+   route_file=base/"route.json";route_file.write_text(json.dumps({"cwd":str(primary)}))
+   lookup=lambda worktree,**kw:D.parent_lookup_worktree(worktree,str(route_file),**kw)
+   self.assertEqual(lookup(str(linked),subsession=True,parent_attempt_id="att-owner"),str(primary))
+   self.assertEqual(lookup(str(linked),subsession=True,parent_attempt_id=None),str(linked))
+   self.assertEqual(lookup(str(linked),subsession=True,parent_attempt_id=""),str(linked))
+   self.assertEqual(lookup(str(linked),subsession=False,parent_attempt_id="att-owner"),str(linked))
+   self.assertEqual(lookup(str(foreign),subsession=True,parent_attempt_id="att-owner"),str(foreign))
+   self.assertEqual(lookup(str(primary),subsession=True,parent_attempt_id="att-owner"),str(primary))
+   self.assertEqual(D.parent_lookup_worktree(str(linked),str(base/"missing.json"),subsession=True,parent_attempt_id="att-owner"),str(linked))
+   self.assertEqual(D.parent_lookup_worktree(str(linked),None,subsession=True,parent_attempt_id="att-owner"),str(linked))
+
  def test_observed_liveness_and_terminal_reconcile_are_exact_and_idempotent(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
@@ -3911,6 +3929,120 @@ def direct_extinct_metadata(attempt="att-extinct-fixture"):
  metadata=cancellation_metadata(attempt)
  metadata["registered_worker"]="1"
  return metadata
+
+
+class LinkedWorktreeSliceStartPathTest(unittest.TestCase):
+ """F13/F15/F16: a sub-session slice runs in a linked worktree of its owner's repo."""
+
+ SLICE_FIELDS=("subsession_mode=parallel,subsession_index=1,subsession_count=2,"
+               "subsession_purpose=planned,expected_round_trips=2,parallel_group=execute,"
+               "phase_brief=/b.md,state_ledger=/l.yaml,"
+               f"phase_brief_sha256={'a'*64},fixed_files_sha256={'b'*64},narrow_verify_sha256={'c'*64}")
+
+ def owner(self,attempt="att-owner",status="open",worktree="/repo"):
+  return (f"2026-10-02T00:00:00Z\t{status}\t/repo\t{worktree}\towner\t"
+          "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+          "execution_surface=registered-headless,registered_worker=1,"
+          "fallback_hop=same-harness-headless,worker_type=owner,"
+          f"attempt_id={attempt},pid=999999,pid_start=1")
+
+ def child_row(self,attempt,*,slice_=True,chain="ssc-aaaa",status="open",pid="",worktree="/repo-linked",route="rt-1",node="execute"):
+  extra=(f",subsession_id=ss-{attempt},stage_authority=0,{self.SLICE_FIELDS},session_chain_id={chain}"
+         if slice_ else "")
+  pidpart=f",pid={pid},pid_start=1" if pid else ""
+  return (f"2026-10-02T00:00:01Z\t{status}\t/repo\t{worktree}\towner\t"
+          "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+          "execution_surface=registered-headless,registered_worker=1,"
+          "fallback_hop=same-harness-headless,worker_type=stage,"
+          f"attempt_id={attempt},parent=owner,parent_attempt_id=att-owner,"
+          f"route_id={route},route_node={node}{pidpart}{extra}")
+
+ def test_f13_plain_provided_token_returns_empty_reservation_payload(self):
+  with tempfile.TemporaryDirectory() as td:
+   token="a"*32
+   with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}):
+    self.assertEqual(
+     D.reserve_governor_token(Path("governor"),Path(td),"dispatch",provided_token=token),
+     (token,{}))
+   with mock.patch.object(D,"_governor_json",
+                          return_value={"state":"unclaimed","reservation_kind":"parallel-batch"}):
+    with self.assertRaises(D.DispatchContractError):
+     D.reserve_governor_token(Path("governor"),Path(td),"dispatch",provided_token=token)
+
+ def test_f15_linked_slice_helper_needs_subsession_id_and_zero_authority(self):
+  self.assertTrue(D.is_linked_worktree_slice({"subsession_id":"ss","stage_authority":"0"}))
+  self.assertFalse(D.is_linked_worktree_slice({"stage_authority":"0"}))
+  self.assertFalse(D.is_linked_worktree_slice({"subsession_id":"ss","stage_authority":"1"}))
+  self.assertFalse(D.is_linked_worktree_slice({"subsession_id":"ss"}))
+
+ def test_f15_completion_window_accepts_slice_but_refuses_other_child(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   proc=subprocess.Popen(["sleep","30"])
+   try:
+    start=D.process_start_ticks(proc.pid)
+    owner=self.owner().replace("pid=999999,pid_start=1",f"pid={proc.pid},pid_start={start}")
+    jobs.write_text(owner+"\n")
+    slice_meta=D.parse_registry_metadata(self.child_row("att-s1").split("\t",5)[5])
+    plain_meta=D.parse_registry_metadata(self.child_row("att-p1",slice_=False).split("\t",5)[5])
+    fields=["t","open","/repo","/repo-linked","owner","m"]
+    self.assertEqual(D.parent_completion_window(jobs,fields,slice_meta),
+                     D.ParentCompletionWindow(True,"parent-live:process"))
+    self.assertEqual(D.parent_completion_window(jobs,fields,plain_meta).source,
+                     "parent-identity-foreign")
+   finally:
+    proc.kill();proc.wait(timeout=5)
+
+ def test_f15_extinction_proof_for_slice_in_linked_worktree_and_its_sibling(self):
+  rows=lambda *v:[(x.split("\t"),D.parse_registry_metadata(x.split("\t",5)[5])) for x in v]
+  parent=self.owner(status="done")
+  def child(slice_):
+   return {"attempt_schema_version":2,"dispatch_depth":2,"transport":"headless",
+           "execution_surface":"registered-headless","registered_worker":1,
+           "fallback_hop":"same-harness-headless","pid_scope":"namespace-local",
+           "launch_lifecycle":"foreground-scoped","parent_attempt_id":"att-owner",
+           "parent":"owner","repo":"/repo","worktree":"/repo-linked",
+           "route_id":"rt-1","route_file":"/route.json",
+           **({"subsession_id":"ss-slice1","stage_authority":"0","session_chain_id":"ssc-aaaa",
+               "route_node":"execute",
+               **dict(kv.split("=",1) for kv in self.SLICE_FIELDS.split(","))} if slice_ else {})}
+  sibling=(self.child_row("att-s2").replace("route_id=rt-1","route_id=rt-1,route_file=/route.json"))
+  with mock.patch.object(D,"post_exit_receipt_reason",return_value="receipt"), \
+       mock.patch.object(D,"attempt_process_quiescence",
+                         return_value=D.ProcessQuiescence("quiescent","gone")):
+   self.assertEqual(D.resolve_parent_extinction(child(True),rows(parent)).state,"proven")
+   self.assertEqual(D.resolve_parent_extinction(child(True),rows(parent,sibling)).state,"proven")
+   self.assertEqual(D.resolve_parent_extinction(child(False),rows(parent)).reason,
+                    "parent-worktree-foreign")
+   plain_sibling=self.child_row("att-p2",slice_=False).replace(
+    "route_id=rt-1","route_id=rt-1,route_file=/route.json")
+   self.assertEqual(D.resolve_parent_extinction(child(True),rows(parent,plain_sibling)).reason,
+                    "parent-route-context-conflict")
+
+ def test_f16_sibling_gate_skips_same_chain_but_not_other_chain_or_plain_attempt(self):
+  proc=subprocess.Popen(["sleep","30"])
+  try:
+   start=D.process_start_ticks(proc.pid)
+   live=lambda row:row.replace("pid=1,","pid=1,").replace(",pid_start=1",f",pid_start={start}")
+   def row(attempt,**kw):
+    return live(self.child_row(attempt,pid=str(proc.pid),**kw))
+   route={"route_id":"rt-1"}
+   mine=self.child_row("att-s2")
+   same=row("att-s1")
+   D._sibling_attempt_gate(route,"execute",Path("/none"),registry_lines=[same,mine],attempt_id="att-s2")
+   other=row("att-x1",chain="ssc-bbbb")
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D._sibling_attempt_gate(route,"execute",Path("/none"),registry_lines=[other,mine],attempt_id="att-s2")
+   self.assertEqual(caught.exception.reason,"prior-attempt-still-live")
+   plain=row("att-p1",slice_=False)
+   with self.assertRaises(D.DispatchContractError):
+    D._sibling_attempt_gate(route,"execute",Path("/none"),registry_lines=[plain,mine],attempt_id="att-s2")
+   # a non-slice starter keeps the old behaviour against a live slice
+   starter=self.child_row("att-p2",slice_=False)
+   with self.assertRaises(D.DispatchContractError):
+    D._sibling_attempt_gate(route,"execute",Path("/none"),registry_lines=[same,starter],attempt_id="att-p2")
+  finally:
+   proc.kill();proc.wait(timeout=5)
 
 
 class ObserverNamespaceExtinctTest(unittest.TestCase):

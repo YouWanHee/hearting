@@ -31,6 +31,10 @@ input to the attempt before execution; prompt text is not input authority.
 Corrections use SD-161 input revisions when there is no producer marker, keeping
 review admission separate from PASS and retaining the cap+1 verdict ceiling.
 
+## Slices Block
+
+When the plan splits into 2–4 packages that own exactly disjoint files and can each finish on their own, `plan.md` carries exactly one fenced block whose info string is `slices`: a JSON list of `{"id", "files", "verify", "brief"?, "adapter"?, "expected_round_trips"?}` (`files` are exact paths, no globs; `verify` is one line). The owner's `dispatch-batch.py --slices <plan.md>` reads it and runs the slices in parallel. A plan that cannot be split that way carries no block and runs as one session; a duplicated or malformed block also falls back to one session.
+
 ## Artifact Ownership
 
 Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.

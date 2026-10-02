@@ -54,7 +54,7 @@ from replica_batch_contract import (  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_allocation_receipt import record_allocation_receipt  # noqa: E402
 from dispatch_quality_peer import quality_peer_families  # noqa: E402
-from stage_session_contract import validate_subdivision_or_fallback  # noqa: E402
+from stage_session_contract import StageSessionError, validate_subdivision_or_fallback  # noqa: E402
 from dispatch_allocation import (  # noqa: E402
     STRATEGY as ALLOCATION_STRATEGY,
     attempt_counts,
@@ -1240,6 +1240,39 @@ def parallel_slug(prefix: str, node_id: str) -> str:
 replica_slug = parallel_slug
 
 
+def reserve_plain_slots(
+    governor: Path,
+    governor_root: Path,
+    pending_legs: list[dict[str, object]],
+    **_unused: object,
+) -> list[str]:
+    """All-or-nothing reservation of one plain dispatch slot per pending leg.
+
+    A sub-session slice is not a route-leg replica batch, so it carries no
+    `--batch-manifest` (that binds the caller to this process and to a leg
+    manifest). The governor still grants every slot or none."""
+    count = len(pending_legs)
+    result = subprocess.run(
+        [sys.executable, str(governor), "--root", str(governor_root), "reserve",
+         "--class", "dispatch", "--count", str(count), "--pid", str(os.getpid())],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        payload = {}
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if (
+        result.returncode
+        or not isinstance(tokens, list)
+        or len(tokens) != count
+        or not all(isinstance(token, str) and RESERVATION_TOKEN.fullmatch(token) for token in tokens)
+    ):
+        detail = (result.stderr or result.stdout).strip()[:512]
+        raise BatchError("governor-reservation-refused", detail or "governor-reserve-failed")
+    return tokens
+
+
 def reserve_batch(
     governor: Path,
     governor_root: Path,
@@ -1943,7 +1976,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         SUBDIVISION_ADMISSION.raise_if_parallel_entry_fail_closed(args.subdivision_manifest)
         admission = SUBDIVISION_ADMISSION.admit_batch(
             route=route, node=node, manifest_path=args.subdivision_manifest,
-            governor=governor, governor_root=governor_root, reserve=reserve_batch,
+            governor=governor, governor_root=governor_root, reserve=reserve_plain_slots,
             jobs=args.jobs,
         )
     except SUBDIVISION_ADMISSION.SubdivisionAdmissionError as exc:
@@ -1953,8 +1986,10 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
             "action": args.action,
             "parallel_group": args.parallel_group,
             "reason": exc.reason,
+            "detail": exc.detail,
             "admitted_rows": 0,
             "admitted_models": 0,
+            "next_action": _single_session_next_action(args, route),
         }, separators=(",", ":"), sort_keys=True))
         return 0
     if args.action == "dry-run":
@@ -1973,7 +2008,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         admission, parent=args.parent, jobs=jobs,
         governor_reservation_env=GOVERNOR_RESERVATION_ENV,
     )
-    print(json.dumps({
+    receipt = {
         "schema_version": 1,
         "state": "subdivision-batch-started",
         "action": args.action,
@@ -1981,8 +2016,91 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         "reservation_identity": admission.reservation_identity,
         "slice_count": len(admission.sessions),
         "sessions": results,
-    }, separators=(",", ":"), sort_keys=True))
+    }
+    if getattr(args, "slices", None):
+        receipt["chain_manifest"] = str(args.subdivision_manifest)
+        receipt["next_command"] = (
+            f"python3 $AGENT_HOME/utilities/capability-route.py complete --route {args.route} "
+            f"--node {args.parallel_group} --jobs {jobs} "
+            f"--subsession-manifest {args.subdivision_manifest} --evidence <stage evidence>"
+        )
+    print(json.dumps(receipt, separators=(",", ":"), sort_keys=True))
     return 0 if all(row.get("started") for row in results) else 1
+
+
+def _single_session_next_action(args: argparse.Namespace, route: dict[str, object]) -> str:
+    return SUBDIVISION_ADMISSION.single_session_next_action(
+        args.route, args.parallel_group, args.slug_prefix, args.parent
+    )
+
+
+def _single_session_receipt(
+    args: argparse.Namespace, route: dict[str, object], reason: str, detail: str = "",
+    *, ledger: bool = False,
+) -> int:
+    """The typed single-session descent of the one-command path. Every caller
+    runs before admission: no slot is reserved, no row written, no child made."""
+
+    if ledger:
+        record_degradation(
+            route_id=route.get("route_id"), route_node=args.parallel_group,
+            route_hash=route.get("route_hash"), dispatch_depth=2,
+            fallback_hop=None, execution_surface="registered-headless",
+            writer="dispatch-batch.py", kind="degradation",
+            reason="subdivision-disjointness-unproven",
+            detail=f"{reason}:{detail}"[:512] if detail else reason,
+        )
+    receipt = {
+        "schema_version": 2,
+        "state": "single-session-required",
+        "action": args.action,
+        "parallel_group": args.parallel_group,
+        "replica_group": args.parallel_group,
+        "reason": reason,
+        "next_action": _single_session_next_action(args, route),
+    }
+    if detail:
+        receipt["detail"] = detail
+    print(json.dumps(receipt, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+def _run_slices(args: argparse.Namespace, route: dict[str, object]) -> int:
+    """One command from a plan's `slices` block to started parallel slices; any
+    reason it cannot is the ordinary single-session descent (exit 0)."""
+
+    try:
+        slices = SUBDIVISION_ADMISSION.read_slices(args.slices)
+    except StageSessionError as exc:
+        reason, _, detail = str(exc).partition(":")
+        return _single_session_receipt(args, route, reason, detail, ledger=True)
+    if slices is None:
+        return _single_session_receipt(args, route, "plan-declared-no-slices")
+    if not os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"):
+        return _single_session_receipt(args, route, "parent-attempt-id-absent")
+    agent_home = resolve_agent_home()
+    jobs = resolve_global_registry(
+        agent_home,
+        str(args.jobs) if args.jobs else os.environ.get("AGENT_DISPATCH_JOBS"),
+        2,
+        args.action,
+    ).path
+    digest = hashlib.sha256(Path(args.slices).read_bytes()).hexdigest()[:12]
+    manifest_path = (
+        Path(jobs).parent / "subdivision" / str(route.get("route_id")) / f"{args.parallel_group}-{digest}.json"
+    )
+    try:
+        SUBDIVISION_ADMISSION.plan_slices(
+            route_path=args.route.resolve(), node_id=args.parallel_group,
+            slices_path=Path(args.slices), output_path=manifest_path,
+            worktree=args.worktree, jobs=Path(jobs),
+        )
+    except StageSessionError as exc:
+        return _single_session_receipt(
+            args, route, "subdivision-disjointness-unproven", str(exc), ledger=True
+        )
+    args.subdivision_manifest = manifest_path
+    return _run_subdivision_batch_admission(args, route)
 
 
 
@@ -2041,6 +2159,19 @@ def main(argv: list[str] | None = None) -> int:
         "violation falls back to a single session instead of raising",
     )
     parser.add_argument(
+        "--slices",
+        type=Path,
+        help="plan .md with one `slices` block (or a JSON slice list): build, admit and "
+        "start the parallel execute slices in one command; when it cannot, print the "
+        "single-session receipt",
+    )
+    parser.add_argument(
+        "--worktree",
+        type=Path,
+        help="with --slices: the route cwd or a linked worktree of the same repository "
+        "(default: the caller's worktree when it qualifies, else the route cwd)",
+    )
+    parser.add_argument(
         "--continuation",
         type=Path,
         help="official partial_group_continuation authorizing one exact gap replacement",
@@ -2062,6 +2193,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         route_path = args.route.resolve()
         route = load_route(route_path, args.action)
+        if (
+            args.slices is not None
+            and args.continuation is None
+            and not SUBDIVISION_ADMISSION.has_route_leg_group(route, args.parallel_group)
+        ):
+            return _run_slices(args, route)
         if (
             getattr(args, "subdivision_manifest", None)
             and args.continuation is None

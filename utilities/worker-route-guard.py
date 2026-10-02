@@ -78,7 +78,11 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
     try: raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc: raise _fail("route-record-invalid", str(exc)) from exc
     rid = raw.get("route_id", "unknown")
-    try: route = ROUTE.verify_route(raw, cwd)
+    # The route is verified where it was sealed. A worker in another worktree is the
+    # same-work question the cwd check below answers (warn, or refuse with the gates on);
+    # verifying at the worker's cwd instead rewrote the route cwd and then failed the
+    # exact-worktree dispatch evidence (`dispatch-evidence-worktree-mismatch`).
+    try: route = ROUTE.verify_route(raw, raw.get("cwd") or cwd)
     except (ValueError, KeyError) as exc: raise _fail("route-verification-failed", str(exc), rid) from exc
     if launch_phase is not None:
         compatible, mismatches = ROUTE.revalidate_launch_compatibility(route)
