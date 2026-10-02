@@ -426,13 +426,15 @@ artifacts. `direct` is an explicit route shown in the card with its
 reason, not a silent no-route decision.
 
 The optional `시작 승인` line appears when the selected route carries parts
-marked with `start_approval`; it lists those parts and records approval for
-this leg before it starts. Approval covers only the parts shown in this leg.
-Unapproved parts stay out and can be composed separately after approval. A
-later leg with an unapproved part, a changed `next_leg`, and the
-destructive/external notice exceptions below use this same card. The answer
-stays in the existing intent, decision record, or work request; owners and
-workers continue without waiting for an entry approval mid-run.
+marked with `start_approval`. Fold the choice into this existing confirmation:
+complete the shown scope, or run it through its report point and stop. The
+report points are lab scaffold+smoke, ship's two preparation reviews, refine's
+review+preview, and apply's isolated apply+verify. Report is a normal execution
+choice, distinct from decline, off-menu, and no answer. It does not start the
+excluded tail or next leg. The same scope and answer stay in the existing
+intent, decision record, or work request; no owner asks for another entry
+approval mid-run. New compiles finish their chosen scope without an intermediate
+approval wait. Existing sealed routes retain their gates and continuation.
 
 **Small-work notice (SD-136).** When the compiled route is `direct` or `solo`
 (`quick`) and its sealed `small_work_confirmation` is `notice` — the shipped

@@ -321,6 +321,9 @@ def _route_proposal_errors(interview: dict, questions: list) -> list[str]:
         if not isinstance(proposal, dict) or not isinstance(proposal.get("legs"), list) or not proposal["legs"]:
             errors.append(f"{where}: not a route proposal")
             continue
+        scope = proposal.get("execution_scope", "complete")
+        if scope not in ("complete", "report"):
+            errors.append(f"{where}.execution_scope: expected complete or report")
         approvals = proposal.get("entry_approvals") or []
         if not isinstance(approvals, list):
             errors.append(f"{where}.entry_approvals: must be a list")
@@ -334,8 +337,11 @@ def _route_proposal_errors(interview: dict, questions: list) -> list[str]:
             if isinstance(leg, bool) or not isinstance(leg, int) or not 0 <= leg < len(proposal["legs"]):
                 errors.append(f"{at}.leg: outside the proposal's legs")
             asked = table.get(approval["question"]) if isinstance(approval["question"], str) else None
-            if asked is None or approval["question"] == qid:
+            if asked is None:
                 errors.append(f"{at}.question: no such approval question {approval['question']!r}")
+            elif approval["question"] == qid:
+                if _text(proposal.get("execution_scope", "complete")) not in ("complete", "report"):
+                    errors.append(f"{at}.question: the route question needs an execution scope")
             elif _text(asked.get("kind")) != "yes-no":
                 errors.append(f"{at}.question: an approval question is yes-no")
             else:
@@ -389,7 +395,8 @@ def route_choice(interview: dict, answers: dict):
     if chosen["state"] == "chosen":
         proposal = (field.get("by_option") or {}).get(chosen["label"])
         return {"state": "selected" if proposal is not None else "declined", "label": chosen["label"],
-                "proposal": proposal}
+                "proposal": proposal, "execution_scope": proposal.get("execution_scope", "complete")
+                if isinstance(proposal, dict) else None}
     return {"state": chosen["state"], "label": None, "proposal": None}
 
 
@@ -413,8 +420,12 @@ def approvals_given(interview: dict, answers: dict, proposal) -> list:
     for approval in proposal.get("entry_approvals") or []:
         question = table.get(approval.get("question"))
         chosen = resolve_answer(question, given.get(approval.get("question"))) if question else {"state": "unanswered", "label": None, "index": None}
+        same_route_question = (isinstance(interview.get("route_proposals"), dict)
+                               and approval.get("question") == interview["route_proposals"].get("question"))
+        accepted = (chosen["state"] == "chosen" if same_route_question else
+                    chosen["state"] == "chosen" and _approves(question, chosen["index"]))
         rows.append({"key": approval.get("key"), "leg": approval.get("leg"), "question": approval.get("question"),
-                     "label": chosen["label"], "accepted": chosen["state"] == "chosen" and _approves(question, chosen["index"])})
+                     "label": chosen["label"], "accepted": accepted})
     return rows
 
 
@@ -599,6 +610,7 @@ def _route_lines(interview: dict, answers: dict, scope: dict) -> list[str]:
                   "unanswered": "the route question was not answered"}.get(choice["state"], "no route was proposed")
         return lines + [f"No route was selected ({reason}); no step starts automatically and the next route is chosen separately."]
     lines.append(f"Selected route: {_inline(proposal.get('summary')) or '-'}")
+    lines.append(f"Execution scope: {proposal.get('execution_scope', 'complete')}")
     for index, leg in enumerate(proposal.get("legs") or []):
         graph = ",".join(leg.get("graph") or []) or "whole recipe"
         lines.append(f"- Leg {index}: {leg.get('capability')} / {leg.get('mode') or 'default mode'} / "
