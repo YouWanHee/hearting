@@ -17,6 +17,21 @@
 - 전송 중(`sending`)에 감독자가 끊기면 `delivery-unknown`이며 자동 재전송하지 않는다.
   새 게이트나 수동 복구 절차는 없다.
 
+## 2026-10-02 갱신: BLOCKED로 끝난 owner에게 보낸 답
+
+- owner가 선언된 사람 게이트 없이 사람 확인(예: 전량 실행 승인)이 필요해 `BLOCKED`로 끝나면,
+  `start`는 `owner-blocked`(`required_action=answer-blocked-owner`)와 owner 보고서·`correction_command`를 준다.
+- 그 `correction_command`에 `--message-file <답.txt>`를 붙여 보내면 답이 `retained`로 저장된다.
+  같은 호출 안에서 공용 `start`가 돌아 같은 route에 교체 owner를 띄운다.
+  교체 owner는 그 답을 첫 입력으로 받는다(`dispatch_replacement`의 `corrected`).
+  돌려받는 값은 `start` 영수증 그대로이고(`parent_next` 포함), 따로 실행할 복구 명령은 없다.
+- 답할 때마다 한 번씩 이어 간다. 사용량 한도 멈춤처럼 '쉼'이라 교체 예산을 쓰지 않는다.
+  교체 owner가 또 BLOCKED로 끝나도 다음 답으로 다시 이어 간다.
+- 선언된 사람 게이트에서 멈춘 owner는 지금처럼 `release`로 답한다.
+- PASS·FAIL 등 다른 이유로 끝난 owner에게 보낸 교정은 지금처럼 `owner-input-unavailable-retain-correction`이다.
+- 예전 attempt id로 보낸 답은 교체 계보를 따라 지금 일하는 owner에게 간다(`redirected_from`).
+- route를 띄운 세션이 아닌 곳에서 보낸 답은 저장만 된다. 그 세션의 다음 `start`가 이 답으로 이어 간다.
+
 ## 사용
 
 `capability-route.py start` 결과의 `correction_command`로 기존 owner의 수신 상태를
@@ -31,7 +46,7 @@ python3 "$AGENT_HOME/utilities/capability-route.py" correct \
 
 파일 인자를 빼면 읽기 전용 상태 조회이다. 같은 본문은 같은 요청 ID로 재조회되며
 중복 전달되지 않는다. 의도적으로 별개의 요청을 보낼 때만 새 `--request-id`를 지정한다.
-이 명령은 새 route, owner, child를 만들지 않는다. 부모/운영자가 전달한 문맥이며
+실행 중인 owner에게 보낼 때 이 명령은 새 route, owner, child를 만들지 않는다(BLOCKED로 끝난 owner는 위 2026-10-02 갱신 참조). 부모/운영자가 전달한 문맥이며
 사용자 승인이나 완료 증거를 새로 만들어 주지 않는다.
 
 ## 누가 무엇을 끝까지 처리하는가

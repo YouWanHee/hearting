@@ -26,8 +26,19 @@ def add_arguments(parser):
 
 
 def is_review_node(node):
+    return is_plan_review_node(node) or is_spec_review_node(node)
+
+
+def is_plan_review_node(node):
     return (isinstance(node, dict) and node.get("unit") == "qa/plan-review"
             and node.get("kind") == "review-worker")
+
+
+def is_spec_review_node(node):
+    return (isinstance(node, dict) and node.get("id") == "review"
+            and node.get("unit") == "research/plan-review"
+            and node.get("kind") == "review-worker"
+            and node.get("completion_gate") == "spec-review")
 
 
 def has_plan_producer(route, node):
@@ -74,7 +85,10 @@ def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None,
         return None
     explicit = _file(reviewed_evidence) if reviewed_evidence else None
     if retry_of:
-        source_meta, original = predecessor_binding(jobs, retry_of, route, node)
+        source_meta, original = predecessor_binding(
+            jobs, retry_of, route, node, allow_legacy_unbound=is_spec_review_node(node))
+        if original is None:
+            return explicit
         if explicit is not None and explicit != {k: original[k] for k in ("path", "sha256")}:
             same_work_or_refuse("reviewed-evidence-replacement-mismatch")
             original = {**original, **explicit}
@@ -98,6 +112,8 @@ def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None,
                 "marker_digest": proof["current_marker_digest"],
             }}
         if explicit is None:
+            if is_spec_review_node(node):
+                return None
             raise DC.DispatchContractError("reviewed-evidence-required", str(node.get("id")))
         return explicit
     producer = next(n for n in route["nodes"] if n.get("id") == "plan")
@@ -225,7 +241,7 @@ def _route_node(metadata):
     return route, node
 
 
-def predecessor_binding(jobs, attempt_id, route, node):
+def predecessor_binding(jobs, attempt_id, route, node, *, allow_legacy_unbound=False):
     from dispatch_replacement import _rows
     try:
         rows = _rows(Path(jobs).read_text().splitlines())
@@ -234,10 +250,18 @@ def predecessor_binding(jobs, attempt_id, route, node):
     if attempt_id not in rows:
         raise DC.DispatchContractError("reviewed-evidence-source-missing", attempt_id)
     metadata = rows[attempt_id][1]
-    if any(metadata.get(key) != value for key, value in (
+    same_route = all(metadata.get(key) == value for key, value in (
             ("route_id", route["route_id"]), ("route_hash", route["route_hash"]),
-            ("route_node", node["id"]))):
+            ("route_node", node["id"])))
+    if not same_route:
         same_work_or_refuse("reviewed-evidence-replacement-mismatch")
+    if allow_legacy_unbound and same_route:
+        binding_path = _path(jobs, attempt_id)
+        try:
+            binding_path.lstat()
+        except FileNotFoundError:
+            if not metadata.get(KEY):
+                return metadata, None
     return metadata, read_binding(jobs, metadata, verify_current=True)
 
 
@@ -307,9 +331,14 @@ def prepare_request(args):
     if candidate is None:
         candidate = resolve_input(route, node, args.jobs_path,
                                   getattr(args, "reviewed_evidence", None), retry_of=prior)
+    if candidate is None:
+        args.review_input_candidate = None
+        return None
     if prior:
-        source_meta, _ = predecessor_binding(args.jobs_path, prior, route, node)
-        args.review_input_source = {"attempt_id": prior, "binding_digest": source_meta[KEY]}
+        source_meta, source_binding = predecessor_binding(
+            args.jobs_path, prior, route, node, allow_legacy_unbound=is_spec_review_node(node))
+        if source_binding is not None:
+            args.review_input_source = {"attempt_id": prior, "binding_digest": source_meta[KEY]}
     previous = getattr(args, "review_input_candidate", None)
     if previous is not None and previous != candidate:
         same_work_or_refuse("reviewed-evidence-changed", candidate["path"])
@@ -348,6 +377,8 @@ def validate_revision_admission(jobs, metadata, binding):
     route, node = _route_node(metadata)
     if node is None or not is_review_node(node):
         return
+    if is_spec_review_node(node):
+        return
     module = _route_module()
     try:
         lines = Path(jobs).read_text().splitlines()
@@ -374,6 +405,8 @@ def validate_launch(jobs, metadata):
         return None
     route, node = _route_node(metadata)
     if node is not None and is_review_node(node):
+        if is_spec_review_node(node):
+            return None
         raise DC.DispatchContractError("reviewed-evidence-unproven", str(metadata.get("attempt_id")))
     return None
 

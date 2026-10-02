@@ -704,6 +704,17 @@ class WorkStartTest(unittest.TestCase):
                          ('needs-attention','human-gate-revise-owner-parked','report-gate-revision'))
         self.assertEqual(len(self.calls),3)
 
+    def test_an_owner_blocked_outside_any_gate_points_at_its_answer_not_a_new_route(self):
+        owner=self._parked_owner_row()
+        with mock.patch('dispatch_replacement.owner_parked_gate',return_value=None):
+            result=self.start()
+        self.assertEqual((result['state'],result['reason'],result['required_action']),
+                         ('needs-attention','owner-blocked','answer-blocked-owner'),result)
+        self.assertIn('--attempt-id '+owner,result['correction_command'])
+        for token in ('correction_command','--message-file','replacement owner','Do not close or recompose'):
+            self.assertIn(token,result['next_step'])
+        self.assertEqual(len(self.calls),3)   # nothing new launched while it waits
+
     def test_released_parked_owner_continues_through_replacement(self):
         owner=self._parked_owner_row()
         row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)
@@ -1467,6 +1478,74 @@ class GroupContextStartTest(GF.fixture.ProducerTestBase):
         result = GF.P.prepare_route_artifact_env(path, start=True, jobs=self.jobs)
         self.assertEqual(result["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"], self.group)
         self.assertEqual(GF.P.prepare_route_artifact_env(path, start=False, jobs=self.jobs), result)
+
+
+class CorrectAnswerContinuationTest(unittest.TestCase):
+    """`correct` to an owner that ended BLOCKED continues its route in the same call."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.router = load("work_start_correct_router_test", W.ROOT / "utilities/capability-route.py")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.jobs = Path(self.tmp.name) / "jobs.log"; self.jobs.touch()
+        self.answer = Path(self.tmp.name) / "answer.md"; self.answer.write_text("approved: start the full run\n")
+        self.route_path = Path(self.tmp.name) / "route.json"; self.route_path.write_text("{}")
+
+    def correct(self, *, submitted, receipt=None, current="att-owner", blocked_answers=()):
+        calls = []
+        def start_work(route, path, jobs, **kwargs):
+            calls.append((path, jobs))
+            return receipt
+        argv = ["capability-route.py", "correct", "--jobs", str(self.jobs), "--attempt-id", "att-owner",
+                "--message-file", str(self.answer)]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
+                mock.patch.object(self.router, "_current_owner_attempt", return_value=current), \
+                mock.patch("dispatch_owner_input.submit", return_value=submitted) as submit, \
+                mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=list(blocked_answers)), \
+                mock.patch.object(W, "start_work", side_effect=start_work), \
+                mock.patch.object(W, "_rows", return_value={current: ("done", {"note": "dead-worker-blocked"})}), \
+                mock.patch("dispatch_replacement._route", return_value=(self.route_path, {})), \
+                mock.patch.object(self.router, "verify_route", side_effect=lambda route, *a, **k: route), \
+                mock.patch.object(self.router, "_record_route_chain"):
+            code = self.router.main()
+        return code, json.loads(out.getvalue()), calls, submit
+
+    def test_the_parent_s_answer_continues_the_route_and_returns_the_start_receipt(self):
+        receipt = {"state": "running", "owner_attempt_id": "att-replacement", "parent_next": "end-turn"}
+        code, result, calls, _ = self.correct(submitted={"retained": True, "request_id": "input-1"}, receipt=receipt)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [(self.route_path, self.jobs)])
+        self.assertEqual((result["state"], result["parent_next"], result["owner_attempt_id"]),
+                         ("running", "end-turn", "att-replacement"))
+        self.assertEqual(result["correction"], {"retained": True, "request_id": "input-1"})
+
+    def test_another_session_s_answer_is_kept_and_names_who_continues_it(self):
+        receipt = {"state": "needs-attention", "reason": "replacement-parent-identity-unproven",
+                   "next_step": "generic"}
+        code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=receipt)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("session that started this route", result["next_step"])
+        self.assertTrue(result["correction"]["retained"])
+
+    def test_an_answer_to_a_live_owner_is_only_queued(self):
+        code, result, calls, _ = self.correct(submitted={"request_id": "input-1", "duplicate": False})
+        self.assertEqual((code, calls), (0, []))
+        self.assertNotIn("correction", result)
+
+    def test_an_answer_queued_as_the_owner_ended_blocked_still_continues_the_route(self):
+        receipt = {"state": "running", "owner_attempt_id": "att-replacement", "parent_next": "end-turn"}
+        code, result, calls, _ = self.correct(submitted={"request_id": "input-1", "duplicate": False},
+                                              receipt=receipt, blocked_answers=[{"id": "input-1"}])
+        self.assertEqual((code, len(calls), result["state"]), (0, 1, "running"))
+
+    def test_an_older_attempt_id_reaches_the_owner_doing_the_work_now(self):
+        code, result, calls, submit = self.correct(submitted={"request_id": "input-1"}, current="att-replacement")
+        self.assertEqual(submit.call_args.args[1], "att-replacement")
+        self.assertEqual(result["redirected_from"], "att-owner")
 
 
 if __name__ == "__main__":

@@ -896,6 +896,14 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
         self.assertFalse([r for r in rules if r.startswith("Bash(git push")])
         owner = self._resolve("allowlist", worker_type="owner")
         self.assertIn("Bash(git commit *)", owner["allowed_tools"])     # SD-69 commit-expected owner
+        with tempfile.TemporaryDirectory() as td:
+            route_file = Path(td) / "route.json"
+            route_file.write_text(json.dumps({"nodes": [{"id": "execute", "commit_expected": True}]}))
+            stage = self._resolve("allowlist", route_file=str(route_file), route_node="execute")
+            self.assertIn("Bash(git commit *)", stage["allowed_tools"])
+            sliced = self._resolve("allowlist", route_file=str(route_file), route_node="execute",
+                                   subsession_id="slice-1", stage_authority=0)
+            self.assertNotIn("Bash(git commit *)", sliced["allowed_tools"])
         args = _shell_command_args(resolved_permission_posture=posture)
         command = WH.shell_command(args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
         self.assertIn("--permission-mode acceptEdits", command)

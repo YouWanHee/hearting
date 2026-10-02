@@ -1116,6 +1116,115 @@ class ReplacementTest(unittest.TestCase):
         self.assertIn('never started',text)
         self.assertNotIn('You replace exact-dead attempt',text)
 
+    def _blocked_owner(self):
+        """An owner that ended BLOCKED with its input channel opened at launch, as its supervisor leaves it."""
+        import dispatch_owner_input as I
+        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-worker-blocked', 'failure_class': 'blocked'}
+        self.write(meta, 'open')
+        I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
+        return meta
+
+    def _answer(self, aid='att-source', text='approved: start the full run', request_id='answer-1'):
+        import dispatch_owner_input as I
+        return I.submit(self.jobs, aid, text, request_id)
+
+    def _launch(self, aid='att-source'):
+        commands = []
+        with mock.patch('dispatch_capacity_evidence.harness_hold', return_value=None), \
+                mock.patch('dispatch_replacement_batch.command', return_value=None):
+            result = R.advance(self.jobs, aid, authority_check=lambda *_: True, resume_capacity=True,
+                               run=lambda command, **kw: commands.append(command)
+                               or SimpleNamespace(returncode=0, stdout='', stderr=''))
+        return result, commands
+
+    def test_an_owner_that_ended_blocked_continues_once_its_answer_arrives(self):
+        self._blocked_owner()
+        fields, meta = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertIsNone(R.death_kind(fields, meta, jobs=self.jobs))   # waiting, not dead
+        self.assertEqual(R.advance(self.jobs, 'att-source', authority_check=lambda *_: True,
+                                   resume_capacity=True)['state'], 'not-applicable')
+        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
+        self.assertTrue(self._answer()['retained'])
+        self.assertEqual(R.death_kind(fields, meta, jobs=self.jobs), R.CORRECTED)
+        # Only an explicit start (or the answer's own `correct`) launches; a supervisor tick does not.
+        tick = R.advance(self.jobs, 'att-source', authority_check=lambda *_: True,
+                         run=lambda *a, **k: self.fail('a tick launched'))
+        self.assertEqual(tick, {'state': 'not-applicable'})
+        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'))
+        record = result['record']
+        self.assertEqual(record['proof']['death_kind'], R.CORRECTED)
+        self.assertEqual(record['logical_node']['after_capacity'], 'att-source')
+        import dispatch_owner_input as I
+        self.assertEqual(record['proof']['corrections'],
+                         [{'id': 'answer-1', 'digest': I._digest('approved: start the full run')}])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        for expected in ('ended BLOCKED and a person has answered it', 'approved: start the full run',
+                         'do not ask for it again', '<owner-corrections>'):
+            self.assertIn(expected, text)
+        self.assertNotIn('You replace exact-dead attempt', text)
+
+    def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
+        import dispatch_owner_input as I
+        meta = {**self.meta, 'worker_type': 'owner'}
+        self.write(meta, 'open')
+        I.initialize_owner_input(self.jobs, 'att-source', 'claude-next-turn')
+        self.assertFalse(I.submit(self.jobs, 'att-source', 'approved: go', 'early').get('retained'))
+        self.write({**meta, 'note': 'dead-worker-blocked', 'failure_class': 'blocked'})
+        fields, row = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertEqual(R.death_kind(fields, row, jobs=self.jobs), R.CORRECTED)
+        record = self.claim()
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('approved: go', text)
+
+    def test_a_changed_pinned_answer_is_refused_rather_than_sent(self):
+        self._blocked_owner()
+        self._answer()
+        record = self.claim()
+        import dispatch_owner_input as I
+        path = I._path(self.jobs, 'att-source')
+        value = json.loads(path.read_text())
+        value['requests'][0]['text'] = 'something else'
+        value['requests'][0]['digest'] = I._digest('something else')
+        path.write_text(json.dumps(value))
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                    jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertEqual(caught.exception.reason, 'replacement-correction-drift')
+
+    def test_a_gate_park_keeps_its_own_answer_path(self):
+        self._parked_owner(self._raise())
+        import dispatch_owner_input as I
+        lines = self.jobs.read_text().replace('\tdone\t', '\topen\t')
+        self.jobs.write_text(lines)
+        I.initialize_owner_input(self.jobs, 'att-source', 'claude-next-turn')
+        self.jobs.write_text(lines.replace('\topen\t', '\tdone\t'))
+        self._answer()
+        fields, meta = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertIsNone(R.death_kind(fields, meta, jobs=self.jobs))
+        with self.assertRaises(D.DispatchContractError):
+            self.claim()
+
+    def test_an_answered_replacement_that_ends_blocked_again_continues_again(self):
+        self._blocked_owner()
+        self._answer()
+        first = self.claim()
+        successor = self._successor(first, self.meta | {'worker_type': 'owner'}, status='open')
+        import dispatch_owner_input as I
+        I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+        successor = self._die(successor, note='dead-worker-blocked', failure_class='blocked')
+        self._answer(successor['attempt_id'], 'approved: phase two as well', 'answer-2')
+        result, commands = self._launch(successor['attempt_id'])
+        self.assertNotEqual(result.get('reason'), 'automatic-replacement-exhausted', result)
+        self.assertEqual(len(commands), 1)
+        second = result['record']
+        self.assertNotEqual(second['family_id'], first['family_id'])
+        self.assertEqual(second['logical_node']['after_capacity'], successor['attempt_id'])
+
     def test_stage_worker_capacity_death_is_not_a_replacement_source(self):
         self.write({**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity','failure_class':'capacity'})
         self.assertIsNone(R.death_kind(['now','done'],R._rows(self.jobs.read_text().splitlines())['att-source'][1]))

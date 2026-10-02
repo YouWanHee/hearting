@@ -26,6 +26,28 @@ _OPA_SPEC.loader.exec_module(OPA)
 
 
 class WorkerBootstrapTest(unittest.TestCase):
+    def test_stage_commit_policy_normalizes_sealed_and_legacy_inputs(self):
+        args = SimpleNamespace(worker_type="stage", commit_expected=True,
+                               subsession_id=None, stage_authority=1)
+        self.assertTrue(W.stage_commit_enabled(args))
+        with tempfile.TemporaryDirectory() as directory:
+            route_path = Path(directory) / "route.json"
+            args.route_file, args.route_node = str(route_path), "execute"
+            route_path.write_text(json.dumps({"nodes": [{"id": "execute", "commit_expected": False}]}))
+            self.assertFalse(W.stage_commit_enabled(args), "sealed policy beats the legacy value")
+            route_path.write_text(json.dumps({"nodes": [{"id": "execute", "commit_expected": True}]}))
+            args.commit_expected = False
+            self.assertTrue(W.stage_commit_enabled(args))
+            args.subsession_id = "slice-1"
+            self.assertFalse(W.stage_commit_enabled(args))
+            args.subsession_id, args.stage_authority = None, 0
+            self.assertFalse(W.stage_commit_enabled(args))
+            args.stage_authority, args.worker_type = 1, "owner"
+            self.assertFalse(W.stage_commit_enabled(args))
+            args.worker_type = "stage"
+            route_path.write_text("broken JSON")
+            self.assertFalse(W.stage_commit_enabled(args))
+
     def test_issued_cycle_context_supplies_missing_output_directory(self):
         env = {"AGENT_ARTIFACT_CYCLE_ID": "cyc-test", "AGENT_ARTIFACT_CYCLE_DIR": "/issued/cycle"}
         values = W.artifact_cycle_environment(env)
@@ -264,6 +286,36 @@ class NodeScopeTest(unittest.TestCase):
             prompt = W.assignment_prompt(args, "do the research", {})
             self.assertIn("no open cycle is bound", prompt)
             self.assertNotIn(str(root / "artifact_root"), prompt)
+
+    def test_source_and_test_scope_stay_in_worktree_while_reports_use_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "linked-worktree"
+            (worktree / "tests").mkdir(parents=True)
+            (worktree / "module.py").write_text("before\n", encoding="utf-8")
+            route_file = root / "route.json"
+            route_file.write_text(json.dumps({
+                "route_id": "rt-source-scope", "cwd": str(worktree),
+                "artifact_root": str(root / "artifacts"),
+                "nodes": [{"id": "execute", "outputs": ["dev_logs/execute.md"],
+                           "write_scope": ["source/**", "source-alternative/**", "tests/**",
+                                           str(root / "explicit-artifact.md")]}],
+            }), encoding="utf-8")
+            cycle_output = root / "canonical" / "artifacts"
+            args = SimpleNamespace(worker_type="stage", route_file=str(route_file), route_node="execute")
+            prompt = W.assignment_prompt(args, "edit module", {
+                "AGENT_ARTIFACT_OUTPUT_DIR": str(cycle_output),
+            })
+            self.assertIn(str(worktree), prompt)
+            self.assertIn(str(worktree / "tests"), prompt)
+            self.assertIn(str(cycle_output / "dev_logs" / "execute.md"), prompt)
+            self.assertIn(str(root / "explicit-artifact.md"), prompt)
+            self.assertNotIn(str(cycle_output / "source"), prompt)
+            (worktree / "module.py").write_text("after\n", encoding="utf-8")
+            (cycle_output / "dev_logs").mkdir(parents=True)
+            (cycle_output / "dev_logs" / "execute.md").write_text("handoff\n", encoding="utf-8")
+            self.assertEqual((worktree / "module.py").read_text(), "after\n")
+            self.assertTrue((cycle_output / "dev_logs" / "execute.md").is_file())
 
 
 class OwnerGatePromptTest(unittest.TestCase):

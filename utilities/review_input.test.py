@@ -69,6 +69,110 @@ class ReviewInputTest(unittest.TestCase):
         self.assert_reason('reviewed-evidence-required', R.resolve_input, self.route, node, self.jobs)
         self.assertIsNone(R.resolve_input(self.route, {'id': 'execute'}, self.jobs))
 
+    def test_spec_review_accepts_explicit_evidence_and_keeps_no_input_legacy_path(self):
+        node = {'id': 'review', 'kind': 'review-worker', 'unit': 'research/plan-review',
+                'completion_gate': 'spec-review', 'depends_on': ['research']}
+        route = {'route_id': 'rt-spec-review', 'route_hash': 'sha256:spec-route',
+                 'nodes': [{'id': 'research'}, node], 'effective_intensity': 'standard'}
+        candidate = R.resolve_input(route, node, self.jobs, self.evidence)
+        self.assertEqual(candidate['path'], str(self.evidence.resolve()))
+        self.assertEqual(candidate['sha256'], hashlib.sha256(self.evidence.read_bytes()).hexdigest())
+        self.assertIsNone(R.resolve_input(route, node, self.jobs))
+        route_file = self.root / 'spec-route.json'
+        route_file.write_text(json.dumps(route))
+        args = SimpleNamespace(attempt_id='att-spec-review', route_file=str(route_file),
+            route_id=route['route_id'], route_hash=route['route_hash'], route_node='review',
+            unit='research/plan-review', jobs_path=self.jobs,
+            reviewed_evidence=str(self.evidence), automatic_retry_of=None)
+        self.assertEqual(R.prepare_request(args)['sha256'], candidate['sha256'])
+        fragment = R.registration_fragment(args)
+        metadata = dict(attempt_id=args.attempt_id, route_id=args.route_id,
+            route_hash=args.route_hash, route_node=args.route_node, unit=args.unit,
+            **DC.parse_registry_metadata(fragment))
+        self.assertEqual(R.validate_launch(self.jobs, metadata)['sha256'], candidate['sha256'])
+        no_input = SimpleNamespace(attempt_id='att-spec-legacy', route_file=str(route_file),
+            route_id=route['route_id'], route_hash=route['route_hash'], route_node='review',
+            unit='research/plan-review', jobs_path=self.jobs, reviewed_evidence=None,
+            automatic_retry_of=None)
+        self.assertIsNone(R.prepare_request(no_input))
+        self.assertIsNone(R.validate_launch(self.jobs, {
+            'attempt_id': no_input.attempt_id, 'route_id': route['route_id'],
+            'route_hash': route['route_hash'], 'route_node': 'review', 'unit': no_input.unit,
+        }))
+
+    def _spec_retry(self, *, route_id='rt-spec-retry', binding=None):
+        node = {'id': 'review', 'kind': 'review-worker', 'unit': 'research/plan-review',
+                'completion_gate': 'spec-review', 'depends_on': ['research']}
+        route = {'route_id': route_id, 'route_hash': 'sha256:spec-retry-route',
+                 'nodes': [{'id': 'research'}, node], 'effective_intensity': 'standard'}
+        metadata = {'attempt_id': 'att-spec-predecessor', 'route_id': route_id,
+                    'route_hash': route['route_hash'], 'route_node': 'review'}
+        if binding is not None:
+            metadata[R.KEY] = binding
+        self.jobs.write_text('now\tdone\twt\tbranch\tslug\t' + ','.join(
+            f'{key}={value}' for key, value in metadata.items()) + '\n')
+        return route, node
+
+    def test_spec_retry_preserves_existing_binding_integrity_errors(self):
+        route, node = self._spec_retry(binding='sha256:stale-registry-digest')
+        bindings = self.root / 'review-inputs'
+        bindings.mkdir()
+        (bindings / 'att-spec-predecessor.json').write_text('{corrupt')
+        self.assert_reason('reviewed-evidence-unproven', R.resolve_input,
+                           route, node, self.jobs, self.evidence, retry_of='att-spec-predecessor')
+
+    def test_spec_retry_does_not_replace_predecessor_whose_original_bytes_changed(self):
+        route, node = self._spec_retry()
+        original = R.resolve_input(route, node, self.jobs, self.evidence)
+        predecessor = {'attempt_id': 'att-spec-predecessor', 'route_id': route['route_id'],
+                       'route_hash': route['route_hash'], 'route_node': node['id']}
+        binding_digest = R.seal_binding(self.jobs, predecessor, original)
+        self._spec_retry(binding=binding_digest)
+        self.evidence.write_text('replacement bytes')
+        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+            self.assert_reason('reviewed-evidence-changed', R.resolve_input,
+                               route, node, self.jobs, self.evidence, retry_of='att-spec-predecessor')
+
+    def test_spec_retry_legacy_absent_binding_allows_no_input_and_explicit_input(self):
+        route, node = self._spec_retry()
+        self.assertIsNone(R.resolve_input(route, node, self.jobs, retry_of='att-spec-predecessor'))
+        candidate = R.resolve_input(route, node, self.jobs, self.evidence,
+                                    retry_of='att-spec-predecessor')
+        self.assertEqual(candidate['sha256'], hashlib.sha256(self.evidence.read_bytes()).hexdigest())
+
+    def test_spec_retry_missing_claimed_binding_is_unproven(self):
+        route, node = self._spec_retry(binding='sha256:registered-binding')
+        self.assert_reason('reviewed-evidence-unproven', R.resolve_input,
+                           route, node, self.jobs, self.evidence,
+                           retry_of='att-spec-predecessor')
+
+    def test_spec_retry_wrong_route_predecessor_is_not_legacy_absence(self):
+        route, node = self._spec_retry(route_id='rt-current')
+        self._spec_retry(route_id='rt-other')
+        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+            self.assert_reason('reviewed-evidence-replacement-mismatch', R.resolve_input,
+                               route, node, self.jobs, self.evidence, retry_of='att-spec-predecessor')
+
+    def test_spec_retry_wrong_route_bound_predecessor_keeps_gates_off_continuation(self):
+        predecessor_route, node = self._spec_retry(route_id='rt-other')
+        predecessor = {'attempt_id': 'att-spec-predecessor',
+                       'route_id': predecessor_route['route_id'],
+                       'route_hash': predecessor_route['route_hash'], 'route_node': node['id']}
+        candidate = R.resolve_input(predecessor_route, node, self.jobs, self.evidence)
+        binding_digest = R.seal_binding(self.jobs, predecessor, candidate)
+        self._spec_retry(route_id='rt-other', binding=binding_digest)
+        route = {'route_id': 'rt-current', 'route_hash': predecessor_route['route_hash'],
+                 'nodes': [{'id': 'research'}, node], 'effective_intensity': 'standard'}
+        replacement = self.root / 'replacement.md'
+        replacement.write_text('baseline gates-off continuation')
+
+        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'off'}):
+            resolved = R.resolve_input(route, node, self.jobs, replacement,
+                                       retry_of='att-spec-predecessor')
+
+        self.assertEqual(resolved['path'], str(replacement.resolve()))
+        self.assertEqual(resolved['sha256'], hashlib.sha256(replacement.read_bytes()).hexdigest())
+
     def test_binding_is_exact_write_once_and_historical_read_survives_edit(self):
         candidate = self.seal()
         self.assertEqual(R.seal_binding(self.jobs, self.meta, candidate), self.meta[R.KEY])
@@ -243,6 +347,7 @@ class ReviewInputTest(unittest.TestCase):
         self.route_file.write_text(json.dumps(self.route))
         for harness in ('codex','claude','opencode'):
             with self.subTest(harness=harness),contextlib.ExitStack() as stack:
+                self.route_file.write_text(json.dumps(self.route))
                 path=R.ROOT/'adapters'/harness/'bin/dispatch-headless.py'
                 spec=importlib.util.spec_from_file_location('input_main_'+harness,path)
                 wrapper=importlib.util.module_from_spec(spec);spec.loader.exec_module(wrapper)
@@ -292,6 +397,35 @@ class ReviewInputTest(unittest.TestCase):
                 self.assertIn('reviewed-evidence-',output)
                 self.assertIn('child_spawned=0',output)
                 spawn.assert_not_called()
+
+                # The exact autopilot-spec review node accepts optional input on
+                # all siblings, while the same registered launch remains valid
+                # with no input for its legacy behavior.
+                spec_node={'id':'review','kind':'review-worker','unit':'research/plan-review',
+                    'completion_gate':'spec-review','depends_on':['research'],'dispatch_depth':1,
+                    'commit_expected':False}
+                spec_route={**self.route,'capability':'autopilot-spec','route_id':'rt-spec-'+harness,
+                    'route_hash':'sha256:spec-'+harness,'nodes':[{'id':'research'},spec_node]}
+                self.route_file.write_text(json.dumps(spec_route))
+                argv[argv.index('--start')]='--register'
+                argv[argv.index('--worker-mode')+1]='research/plan-review'
+                argv[argv.index('--unit')+1]='research/plan-review'
+                argv[argv.index('--route-id')+1]=spec_route['route_id']
+                argv[argv.index('--route-hash')+1]=spec_route['route_hash']
+                argv[argv.index('--route-node')+1]='review'
+                argv[argv.index('--slug')+1]='spec-'+harness
+                argv[argv.index('--attempt-id')+1]='att-spec-'+harness
+                argv=argv[:argv.index('--reviewed-evidence')]
+                code,output=run(argv)
+                self.assertEqual(code,0,output)
+                unbound=DC.parse_registry_metadata(jobs.read_text().splitlines()[-1].split('\t')[5])
+                self.assertNotIn(R.KEY,unbound)
+                argv[argv.index('--attempt-id')+1]='att-spec-evidence-'+harness
+                argv+=['--reviewed-evidence',str(evidence)]
+                code,output=run(argv)
+                self.assertEqual(code,0,output)
+                bound=DC.parse_registry_metadata(jobs.read_text().splitlines()[-1].split('\t')[5])
+                self.assertEqual(R.read_binding(jobs,bound)['path'],str(evidence))
 
     def test_all_three_wrapper_parsers_share_single_public_option(self):
         parser = argparse.ArgumentParser()

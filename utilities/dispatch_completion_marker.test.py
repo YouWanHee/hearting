@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -648,6 +649,96 @@ class CompletionMarkerTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("artifact-outside-bound-cycle", result.stdout + result.stderr)
             self.assertEqual(sorted(cycle_canonical_dir.glob("plan.*.json")), listing_before)
+
+    def _gates_off_cycle_route(self, name):
+        """A standard route bound to an open cycle, with `plan` completed inline from cycle evidence."""
+        import artifact_producer as P
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, name)
+        issued = P.begin(self.artifact, route_file=route_path, capability=route["capability"],
+                         intensity=route["effective_intensity"], require_cycle=True)
+        evidence = Path(issued["cycle_dir"]) / "artifacts" / "plan.md"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        evidence.write_text("plan v1\n", encoding="utf-8")
+        completed = self.complete(route_path, "plan", evidence)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        marker_path = self.stable_dispatch / "completion" / route["route_id"] / "plan.json"
+        return route, route_path, evidence, marker_path
+
+    def test_gates_off_an_evidence_edit_is_history_and_revise_still_records_it(self):
+        """The BC deadlock (2026-10-02): with gates off, continuation read the edited
+        evidence as current while `revise` refused it as unchanged. Both now read the
+        same comparison -- recorded digest vs. the evidence -- and an operation that
+        proceeds on the edited completion keeps the edit as one history line; reads
+        (including a dry-run) write nothing."""
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "off"}, clear=True):
+            route, route_path, evidence, marker_path = self._gates_off_cycle_route("route-gates-off-edit.json")
+            plan = next(n for n in route["nodes"] if n["id"] == "plan")
+            recorded = json.loads(marker_path.read_text())["evidence"]["sha256"]
+            evidence.write_text("plan v2, corrected after the smoke run\n", encoding="utf-8")
+            history = D.evidence_change_history_path(marker_path, "plan")
+            listing = sorted(p.name for p in marker_path.parent.iterdir())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                for _ in range(2):
+                    currency = D.evidence_currency(route, plan, marker_path)
+                    self.assertEqual(currency.state, "current")
+                D.completion_marker_gate(str(route_path), "plan-check", "dry-run", self.agent_home, self.jobs)
+            self.assertNotIn("revised-unrecorded", err.getvalue())
+            self.assertEqual(sorted(p.name for p in marker_path.parent.iterdir()), listing)
+            # An operation that proceeds on `plan` keeps the edit, once.
+            evidence_check = evidence.with_name("plan-check.md")
+            evidence_check.write_text("plan-check ok\n", encoding="utf-8")
+            completed = self.complete(route_path, "plan-check", evidence_check)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertNotIn("revised-unrecorded", completed.stderr)
+            D.note_evidence_change(route, plan, marker_path)
+            lines = [json.loads(line) for line in history.read_text().splitlines()]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual((lines[0]["previous_sha256"], lines[0]["sha256"], lines[0]["reason"]),
+                             (recorded, currency.evidence_digest, "evidence-changed-after-completion"))
+            for key in ("observed_at", "observed_by", "evidence_changed_at", "observed_in"):
+                self.assertTrue(lines[0][key], key)
+            listed = ROUTE._route_revisions(route)
+            self.assertEqual([(row["node"], row["basis"], row["of_evidence_sha256"], row["evidence_sha256"])
+                              for row in listed], [("plan", "automatic", recorded, currency.evidence_digest)])
+            revised = self.revise(route_path, "plan", evidence, basis="owner-correction",
+                                  reason="fixture: corrected after the smoke run")
+            self.assertEqual(revised.returncode, 0, revised.stdout + revised.stderr)
+            self.assertEqual(json.loads(marker_path.read_text())["sequence"], 2)
+            listed = ROUTE._route_revisions(route)
+            # One shape for both kinds of history row.
+            self.assertEqual({frozenset(row) for row in listed}, {frozenset(listed[0])})
+            self.assertEqual(sorted(row["basis"] for row in listed), ["automatic", "owner-correction"])
+            again = self.revise(route_path, "plan", evidence, basis="owner-correction",
+                                reason="fixture: nothing new")
+            self.assertNotEqual(again.returncode, 0)
+            self.assertIn("revision-evidence-unchanged", again.stdout + again.stderr)
+
+    def test_revise_unchanged_means_the_named_evidence_equals_the_recorded_digest(self):
+        """One rule in both gate modes: a revision is owed exactly when the evidence it
+        names differs from the digest the marker recorded."""
+        for gates in ("on", "off"):
+            with self.subTest(gates=gates), \
+                    mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": gates}, clear=True):
+                route, route_path, evidence, marker_path = self._gates_off_cycle_route(f"route-unchanged-{gates}.json")
+                same_bytes = evidence.with_name("plan-copy.md")
+                same_bytes.write_text("plan v1\n", encoding="utf-8")
+                if gates == "on":
+                    # The marker's own file was edited, but the named evidence carries the recorded bytes.
+                    evidence.write_text("plan v1, edited in place\n", encoding="utf-8")
+                    refused = self.revise(route_path, "plan", same_bytes, basis="owner-correction",
+                                          reason="fixture: same bytes, new path")
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("revision-evidence-unchanged", refused.stdout + refused.stderr)
+                else:
+                    # The marker's own file is untouched; the named evidence differs.
+                    different = evidence.with_name("plan-v2.md")
+                    different.write_text("plan v2 at a new path\n", encoding="utf-8")
+                    allowed = self.revise(route_path, "plan", different, basis="owner-correction",
+                                          reason="fixture: new evidence, new path")
+                    self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+                    self.assertEqual(json.loads(marker_path.read_text())["evidence"]["path"], str(different))
 
     def test_a_sd154_9_execute_revision_records_descendant_commits(self):
         """A-SD154-9 (plan A-2): an `execute` revision is a code change, not

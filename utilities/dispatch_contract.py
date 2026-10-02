@@ -9,7 +9,7 @@ import base64
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import errno
 import fcntl
 import hashlib
@@ -6858,6 +6858,7 @@ def completion_marker_gate(
         return
     missing = []
     markers = {}
+    proceeding = []
     blocked: list[tuple[str, AttemptReadiness]] = []
     for dep in node.get("depends_on", []):
         marker_path = next(
@@ -6931,6 +6932,7 @@ def completion_marker_gate(
             missing.append(dep)
             continue
         markers[dep] = marker
+        proceeding.append((dep_node, marker_path, marker))
         readiness = completion_attempt_readiness(
             route,
             dep_node,
@@ -6969,6 +6971,11 @@ def completion_marker_gate(
         registry_lines=registry_lines,
         attempt_id=attempt_id,
     )
+    if action == "start":
+        # The start proceeds on these predecessors: keep any gates-off edit of
+        # their evidence as history. The dry-run preview writes nothing.
+        for dep_node, marker_path, marker in proceeding:
+            note_evidence_change(route, dep_node, marker_path, marker)
 
 
 _ROUTE_MODULE: object | None = None
@@ -7346,6 +7353,125 @@ class GateCurrency(NamedTuple):
     evidence_digest: str | None = None
 
 
+def evidence_change_history_path(marker_path: Path, node_id: str) -> Path:
+    """The append-only history of a node's evidence edits after its marker."""
+    return marker_path.parent / f"{node_id}.evidence-changes.jsonl"
+
+
+def record_evidence_change(
+    route: Mapping[str, object],
+    node: Mapping[str, object],
+    marker_path: Path,
+    marker: Mapping[str, object],
+    digest: str,
+) -> None:
+    """Record one evidence edit after its completion marker; never refuse it.
+
+    Gates off (the default), an artifact stays editable after its stage
+    completed (user decision 2026-10-01): the edit is kept as one history line
+    -- when, by whom, why, and the digest it replaced -- instead of a refusal.
+    The same change is written once however often it is read, and a failed
+    write never stops the work it describes.
+    """
+    node_id = str(node.get("id"))
+    evidence = marker.get("evidence") if isinstance(marker.get("evidence"), dict) else {}
+    path = evidence_change_history_path(marker_path, node_id)
+    try:
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            last = None
+            for line in handle.read().splitlines():
+                if line.strip():
+                    last = line
+            previous = None
+            if last is not None:
+                try:
+                    previous = json.loads(last)
+                except ValueError:
+                    previous = None
+            if (isinstance(previous, dict) and previous.get("sha256") == digest
+                    and previous.get("marker_sequence") == marker.get("sequence")):
+                return
+            changed_at = None
+            evidence_path = Path(str(evidence.get("path") or ""))
+            try:
+                changed_at = datetime.fromtimestamp(
+                    evidence_path.stat().st_mtime, tz=timezone.utc,
+                ).isoformat().replace("+00:00", "Z")
+            except (OSError, ValueError):
+                pass
+            command = [Path(sys.argv[0]).name] if sys.argv and sys.argv[0] else []
+            command += [arg for arg in sys.argv[1:] if not arg.startswith("-")][:1]
+            record = {
+                "schema_version": 1,
+                "route_id": route.get("route_id"),
+                "node_id": node_id,
+                "marker_sequence": marker.get("sequence"),
+                "evidence_path": evidence.get("path"),
+                "marker_sha256": evidence.get("sha256"),
+                "previous_sha256": (previous.get("sha256") if isinstance(previous, dict)
+                                    and previous.get("marker_sequence") == marker.get("sequence")
+                                    else evidence.get("sha256")),
+                "sha256": digest,
+                "reason": "evidence-changed-after-completion",
+                "evidence_changed_at": changed_at,
+                "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "observed_by": (os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+                                or os.environ.get("CLAUDE_SESSION_ID")
+                                or os.environ.get("CODEX_THREAD_ID")
+                                or os.environ.get("OPENCODE_SESSION_ID") or "operator"),
+                "observed_in": " ".join(command) or None,
+            }
+            handle.seek(0, os.SEEK_END)
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+    except OSError:
+        return
+
+
+def note_evidence_change(
+    route: Mapping[str, object],
+    node: Mapping[str, object],
+    marker_path: Path,
+    marker: Mapping[str, object] | None = None,
+) -> None:
+    """Keep a gates-off evidence edit as history at an operation that proceeds on the marker.
+
+    Called by continuation, a stage start, `complete` and a replacement owner's
+    claim -- never by a read (dry-run, status, Fleet), which stays write-free.
+    With gates on the edit is still `revised-unrecorded` and this records nothing.
+    """
+    if gates_on():
+        return
+    try:
+        marker = marker if marker is not None else json.loads(marker_path.read_text(encoding="utf-8"))
+        currency = evidence_currency(route, dict(node), marker_path, dict(marker))
+    except (OSError, ValueError, TypeError, DispatchContractError):
+        return
+    evidence = marker.get("evidence") if isinstance(marker.get("evidence"), dict) else {}
+    if (currency.state == "current" and currency.evidence_digest
+            and currency.evidence_digest != evidence.get("sha256")):
+        record_evidence_change(route, node, marker_path, marker, currency.evidence_digest)
+
+
+def evidence_change_history(marker_path: Path, node_id: str) -> list[dict[str, object]]:
+    """Every recorded evidence edit of one node, oldest first (read-only)."""
+    try:
+        lines = evidence_change_history_path(marker_path, node_id).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 def evidence_currency(
     route: dict[str, object],
     node: dict[str, object],
@@ -7401,7 +7527,9 @@ def evidence_currency(
     if digest != evidence_record.get("sha256"):
         node_id = str(node.get("id"))
         if not gates_on():
-            same_work_or_refuse("completion-evidence-revised-unrecorded", node_id)
+            # Gates off an edit is not a refusal (nor a warning line). This read
+            # stays a read: the operations that proceed on the marker keep the
+            # edit as history (`note_evidence_change`).
             return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
         return GateCurrency(
             "revised-unrecorded", "completion-evidence-revised-unrecorded",
