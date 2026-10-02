@@ -19,6 +19,10 @@ Execute an implementation plan with progress tracking
 
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
+## Slice Mode
+
+A worker assigned a parallel sub-session slice (phase brief, fixed files, `stage_authority=0`) edits only its fixed files and runs only its verify command. It makes no git writes — no safety checkpoint, phase commit, checkout, restore, stash, reset or rollback — and leaves `checklist.md` and the dev log to the owner. A file outside the list stops the slice with a handoff to the owner.
+
 ## Artifact Ownership
 
 Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.

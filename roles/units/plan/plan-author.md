@@ -102,10 +102,11 @@ semantics and are not mandatory literal headings):
    - Each step specifies the target file and expected changes.
    - Mark dependency order between phases and between steps within a phase.
    - Independent steps within the same phase can be parallelized during execution.
-   - For each execution slice, include a machine-readable `slice` block with
-     `fixed_files`, one `narrow_verify` command, and `expected_round_trips`.
-     `fixed_files` is exhaustive for that slice; use a codemod slice for a broad
-     mechanical change rather than listing an unbounded glob.
+   - When the work splits into 2-4 packages with exactly disjoint files that can
+     each finish on their own, add one fenced `slices` block to `plan.md`: a JSON
+     list of `{"id", "files", "verify", "brief"?}`. `files` is exhaustive for that
+     slice (exact paths; use a codemod slice for a broad mechanical change rather
+     than an unbounded glob). Otherwise add no block; the stage runs as one session.
    - Add optional phase hints `session_hint: single|serial|parallel` and
      `ownership` for non-overlapping parallel files. These are advisory inputs to
      the dispatch-depth-1 owner, which retains the decision to split or combine
