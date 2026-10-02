@@ -1814,8 +1814,16 @@ def _unmerge_codex_identity_config(
         return []
     if text.count(inserted) != 1:
         return []
+    remaining = text.replace(inserted, "", 1)
+    # Activation backs up a config it found, so no backup means activation created this
+    # file; once the block is gone nothing of the user's is left in it.
+    created_by_activation = not config.with_name(CODEX_IDENTITY_BACKUP).exists()
     if not dry_run:
-        _atomic_text(config, text.replace(inserted, "", 1))
+        if not remaining.strip() and created_by_activation:
+            # destructive-ok: reason=remove the config file activation created for its block alone; boundary=$CODEX_HOME/config.toml left empty with no pre-activation backup
+            config.unlink()
+        else:
+            _atomic_text(config, remaining)
     return [str(config)]
 
 
