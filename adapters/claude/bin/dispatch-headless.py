@@ -122,6 +122,7 @@ from worker_bootstrap import (
     assigned_contract,
     profile_worker_type,
     render_worker_bootstrap,
+    route_node_commit_expected,
     runtime_progress_prompt,
     resolve_worker_type,
 )
@@ -977,7 +978,7 @@ def _claude_settings_paths(worktree: str | Path | None = None) -> tuple[Path, ..
 
 
 def _allowlist_rules(agent_home: Path, worktree: str | Path | None, artifact_root: str | Path | None,
-                     worker_type: str | None) -> tuple[str, ...]:
+                     worker_type: str | None, *, commit_expected: bool = False) -> tuple[str, ...]:
     """The explicit allow rules a registered worker/owner contractually needs (never bare Bash)."""
     rules: list[str] = []
     for name in HARNESS_ALLOWLIST_UTILITIES:
@@ -989,8 +990,9 @@ def _allowlist_rules(agent_home: Path, worktree: str | Path | None, artifact_roo
             f"Bash({utility})",
         ]
     rules += list(_READ_ONLY_GIT_RULES)
-    if worker_type == "owner":
-        # SD-69: only owners are commit-expected; depth-2 stages are no-commit workers.
+    if worker_type == "owner" or commit_expected:
+        # Route-bound single-session mutation workers may commit when the sealed
+        # node says so; declared slices never receive this allowlist.
         rules += list(_OWNER_COMMIT_GIT_RULES)
     rules += list(_TEST_RUNNER_RULES)
     # Edit rules also govern Write (Write path rules are never consulted);
@@ -1051,8 +1053,21 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
         elif _settings_disable_bypass(settings_paths):
             mode, reason = "allowlist", "settings-disable-bypass"
     agent_home = Path(str(getattr(args, "agent_home", "") or ROOT))
+    worker_type = getattr(args, "worker_type", None)
+    commit_expected = worker_type == "owner"
+    if worker_type == "stage" and getattr(args, "route_file", None) and getattr(args, "route_node", None):
+        try:
+            route = json.loads(Path(args.route_file).read_text(encoding="utf-8"))
+            commit_expected = route_node_commit_expected(
+                route, args.route_node, worker_type,
+                subsession_id=getattr(args, "subsession_id", None),
+                stage_authority=getattr(args, "stage_authority", 1),
+            )
+        except (OSError, ValueError, TypeError):
+            commit_expected = False
     allowed = _allowlist_rules(
-        agent_home, worktree, getattr(args, "artifact_root", None), getattr(args, "worker_type", None)
+        agent_home, worktree, getattr(args, "artifact_root", None), worker_type,
+        commit_expected=commit_expected,
     )
     return {
         "mode": mode,

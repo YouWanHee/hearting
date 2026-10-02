@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
+from codex_permission_profile import commit_profile_config, config_arguments
 from dispatch_contract import (
     _atomic_registry_replace,
     workflow_completion_receipt,  # noqa: E402
@@ -123,6 +124,7 @@ from worker_bootstrap import (
     render_worker_bootstrap,
     runtime_progress_prompt,
     resolve_worker_type,
+    route_node_commit_expected,
 )
 from stage_session_runtime import (  # noqa: E402
     add_arguments as add_stage_session_arguments,
@@ -885,16 +887,25 @@ def _is_linked_worktree(worktree, agent_home) -> bool:
 
 
 def is_no_commit_stage(args: argparse.Namespace) -> bool:
-    """SD-69: a linked-worktree Codex depth-2 mutation stage never commits.
-
-    The boundary is contractual, not a sandbox impossibility: parallel stages
-    must not race HEAD, so the owner integrates and commits once after the
-    stage's own PASS gate (core/OPERATIONS.md SD-69). A dispatch-depth-1 owner
-    is commit-expected in its linked worktree and gets the exact primary Git
-    metadata directories via `linked_worktree_git_writable_dirs` instead.
-    """
+    """Enforce no-commit only for route nodes or slices that are not commit-expected."""
+    worker_type = getattr(args, "worker_type", None)
+    route_path = getattr(args, "route_file", None)
+    if route_path and getattr(args, "route_node", None):
+        try:
+            route = json.loads(Path(route_path).read_text(encoding="utf-8"))
+            expected = route_node_commit_expected(
+                route, args.route_node, worker_type,
+                subsession_id=getattr(args, "subsession_id", None),
+                stage_authority=getattr(args, "stage_authority", 1),
+            )
+        except (OSError, ValueError, TypeError):
+            expected = False
+    else:
+        expected = (worker_type == "stage" and bool(getattr(args, "commit_expected", False))
+                    and not getattr(args, "subsession_id", None)
+                    and getattr(args, "stage_authority", 1) != 0)
     return (
-        getattr(args, "worker_type", None) == "stage"
+        worker_type == "stage" and not expected
         and _worktree_mutating_write_scope(getattr(args, "write_scope", None))
         and _is_linked_worktree(args.worktree, args.agent_home)
     )
@@ -903,19 +914,36 @@ def is_no_commit_stage(args: argparse.Namespace) -> bool:
 def linked_worktree_git_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     """Primary Git metadata dirs a commit-expected linked-worktree run needs.
 
-    Codex resolves a linked worktree's real git dir and allows it on its own
-    only under the default ``~/.codex`` home; with any custom ``CODEX_HOME``
-    (the masked dispatch home) that built-in allowance is inactive and
-    ``git commit`` fails on ``index.lock`` with EROFS (verified against
-    codex-cli 0.148.0, 2026-08-21). The wrapper therefore grants the exact
+    Modern Codex protects resolved Git metadata even when legacy writable
+    roots include it. The command builders project these existing grants into
+    a native permissions profile when available. The wrapper grants the exact
     directories a commit touches: the per-worktree git dir plus the common
     dir's ``objects``/``refs``/``logs``. The common-dir root itself stays
     ungranted so ``hooks/`` and ``config`` remain read-only — a worker must
     not be able to plant code a later unsandboxed session would execute.
-    Only the dispatch-depth-1 owner is commit-expected; every other worker
-    type (including non-mutating depth-2 stages) gets no Git metadata grant.
+    Owners retain their existing grant. A single-session stage gets the same
+    narrow grant only when its sealed route node is commit-expected; slices and
+    all other workers get no Git metadata grant.
     """
-    if getattr(args, "worker_type", None) != "owner":
+    worker_type = getattr(args, "worker_type", None)
+    commit_expected_stage = False
+    if worker_type == "stage":
+        route_path = getattr(args, "route_file", None)
+        if route_path and getattr(args, "route_node", None):
+            try:
+                route = json.loads(Path(route_path).read_text(encoding="utf-8"))
+                commit_expected_stage = route_node_commit_expected(
+                    route, args.route_node, worker_type,
+                    subsession_id=getattr(args, "subsession_id", None),
+                    stage_authority=getattr(args, "stage_authority", 1),
+                )
+            except (OSError, ValueError, TypeError):
+                commit_expected_stage = False
+        else:
+            commit_expected_stage = (bool(getattr(args, "commit_expected", False))
+                                     and not getattr(args, "subsession_id", None)
+                                     and getattr(args, "stage_authority", 1) != 0)
+    if worker_type != "owner" and not commit_expected_stage:
         return ()
     dirs = _worktree_git_dirs(getattr(args, "worktree", ""))
     if dirs is None:
@@ -1415,8 +1443,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         for writable_dir in route_bound_worker_writable_dirs(args):
             command += ["--writable-root", str(writable_dir)]
         for writable_dir in linked_worktree_git_writable_dirs(args):
-            # SD-69: a commit-expected linked-worktree run gets the exact
-            # primary Git metadata dirs; no-commit stages get none of these.
+            # Commit-expected linked-worktree runs get exact Git metadata dirs.
+            # No-commit stages receive none of these roots.
             command += ["--writable-root", str(writable_dir)]
         if getattr(args, "execution_access_grant", None) is not None:
             for writable_dir in args.execution_access_grant.additional_writable_roots:
@@ -1473,16 +1501,21 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         # independent of the owner-only nested_headless_network network grant.
         cmd += ["--add-dir", str(writable_dir)]
     for writable_dir in linked_worktree_git_writable_dirs(args):
-        # SD-69: only a commit-expected linked-worktree owner gets the exact
-        # primary Git metadata dirs a commit touches; the common-dir root
-        # itself, hooks/, and config stay ungranted, and every other worker
-        # type (no-commit mutation stages included) gets none of these.
+        # Commit-expected linked-worktree workers get exact Git metadata dirs;
+        # the common-dir root, hooks/, and config stay ungranted.
         cmd += ["--add-dir", str(writable_dir)]
     if getattr(args, "execution_access_grant", None) is not None:
         for writable_dir in args.execution_access_grant.additional_writable_roots:
             cmd += ["--add-dir", str(writable_dir)]
-    cmd += ["--sandbox", effective_runtime_sandbox(args)]
-    if args.nested_headless_network:
+    profile = commit_profile_config(
+        args.worktree, [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"],
+        effective_runtime_sandbox(args), args.nested_headless_network,
+    )
+    if profile is not None:
+        cmd += config_arguments(profile)
+    else:
+        cmd += ["--sandbox", effective_runtime_sandbox(args)]
+    if args.nested_headless_network and profile is None:
         cmd += ["-c", "sandbox_workspace_write.network_access=true"]
     if args.resolved_model_settings["source"] != "inherit":
         model = args.resolved_model_settings["model"]
@@ -1836,17 +1869,13 @@ def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
 
 
 def nested_codex_home_path(worktree: Path, jobs: Path | None = None) -> Path:
-    """Select existing writable runtime scope without touching a foreign NAS home."""
+    """Select the external canonical runtime-home scope for this worktree."""
     def owned_directory_or_ancestor(path):
         while not path.exists() and not path.is_symlink():
             path = path.parent
         return path.is_dir() and not path.is_symlink() and path.stat().st_uid == os.geteuid()
 
     worktree = Path(worktree).resolve()
-    preferred = worktree / ".dispatch" / "nested-codex-home"
-    if (preferred.resolve().is_relative_to(worktree)
-            and owned_directory_or_ancestor(preferred)):
-        return preferred
     canonical_jobs = Path(jobs or os.environ.get("AGENT_DISPATCH_JOBS", ""))
     if canonical_jobs.is_absolute():
         state_root = dispatch_state_root(canonical_jobs)
@@ -2083,19 +2112,8 @@ def resolve_agent_home() -> Path:
 
 
 def ensure_runtime_home_projection(worktree: Path) -> Path | None:
-    """Expose the active Codex session store to Fleet without copying runtime state."""
-    runtime_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
-    link = worktree / ".dispatch" / "codex-home"
-    try:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        if link.is_symlink():
-            link.unlink()
-        elif link.exists():
-            return None
-        link.symlink_to(runtime_home, target_is_directory=True)
-        return link
-    except OSError:
-        return None
+    """Deprecated observation hook; liveness resolves canonical external homes."""
+    return None
 
 
 def check_runtime_projection(worktree: str, require_hook_trust: bool) -> int:

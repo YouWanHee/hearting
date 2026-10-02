@@ -265,6 +265,36 @@ class NodeScopeTest(unittest.TestCase):
             self.assertIn("no open cycle is bound", prompt)
             self.assertNotIn(str(root / "artifact_root"), prompt)
 
+    def test_source_and_test_scope_stay_in_worktree_while_reports_use_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "linked-worktree"
+            (worktree / "tests").mkdir(parents=True)
+            (worktree / "module.py").write_text("before\n", encoding="utf-8")
+            route_file = root / "route.json"
+            route_file.write_text(json.dumps({
+                "route_id": "rt-source-scope", "cwd": str(worktree),
+                "artifact_root": str(root / "artifacts"),
+                "nodes": [{"id": "execute", "outputs": ["dev_logs/execute.md"],
+                           "write_scope": ["source/**", "source-alternative/**", "tests/**",
+                                           str(root / "explicit-artifact.md")]}],
+            }), encoding="utf-8")
+            cycle_output = root / "canonical" / "artifacts"
+            args = SimpleNamespace(worker_type="stage", route_file=str(route_file), route_node="execute")
+            prompt = W.assignment_prompt(args, "edit module", {
+                "AGENT_ARTIFACT_OUTPUT_DIR": str(cycle_output),
+            })
+            self.assertIn(str(worktree), prompt)
+            self.assertIn(str(worktree / "tests"), prompt)
+            self.assertIn(str(cycle_output / "dev_logs" / "execute.md"), prompt)
+            self.assertIn(str(root / "explicit-artifact.md"), prompt)
+            self.assertNotIn(str(cycle_output / "source"), prompt)
+            (worktree / "module.py").write_text("after\n", encoding="utf-8")
+            (cycle_output / "dev_logs").mkdir(parents=True)
+            (cycle_output / "dev_logs" / "execute.md").write_text("handoff\n", encoding="utf-8")
+            self.assertEqual((worktree / "module.py").read_text(), "after\n")
+            self.assertTrue((cycle_output / "dev_logs" / "execute.md").is_file())
+
 
 class OwnerGatePromptTest(unittest.TestCase):
     """The owner's assignment names the approval gate on a node it executes itself.
