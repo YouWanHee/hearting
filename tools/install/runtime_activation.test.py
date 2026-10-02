@@ -675,5 +675,292 @@ class ClaudeHookGroupIdentityTest(unittest.TestCase):
             )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _write_tmp(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+class ClaudeManagedEnvTest(unittest.TestCase):
+    """Claude's settings `env` blanks inherited caller names and foreign ids; activation installs it without clobbering."""
+
+    KEYS = ("AGENT_DISPATCH_CALLER_HARNESS", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID")
+
+    def _release(self, root: Path) -> Path:
+        release = root / "release"
+        (release / "adapters/claude").mkdir(parents=True)
+        shipped = json.loads((REPO_ROOT / "adapters/claude/settings.json").read_text(encoding="utf-8"))
+        (release / "adapters/claude/settings.json").write_text(json.dumps({
+            "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "true"}]}]},
+            "statusLine": {"type": "command", "command": activation.CLAUDE_STATUSLINE_COMMAND},
+            "autoMemoryEnabled": False,
+            "env": shipped.get("env", {}),
+        }), encoding="utf-8")
+        return release
+
+    def _merge(self, config: Path, release: Path, previous=None) -> dict:
+        original = activation._config_path
+        activation._config_path = lambda *_args, **_kwargs: config
+        try:
+            return activation._merge_claude_settings(release, previous)
+        finally:
+            activation._config_path = original
+
+    def test_the_shipped_settings_manage_the_four_identity_keys(self):
+        self.assertEqual(set(activation.CLAUDE_MANAGED_ENV_KEYS), set(self.KEYS))
+
+    def test_merge_adds_the_keys_and_keeps_an_unrelated_user_env_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "settings.json"
+            config.write_text(json.dumps({"env": {"MY_OWN": "keep"}}), encoding="utf-8")
+            result = self._merge(config, release)
+            env = json.loads(config.read_text(encoding="utf-8"))["env"]
+            for key in self.KEYS:
+                self.assertEqual(env[key], "", key)
+            self.assertEqual(env["MY_OWN"], "keep")
+            self.assertEqual(result["conflicts"], [])
+
+    def test_a_user_changed_value_is_a_reported_conflict_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "settings.json"
+            config.write_text(json.dumps({"env": {"AGENT_DISPATCH_CALLER_HARNESS": "mine"}}),
+                              encoding="utf-8")
+            result = self._merge(config, release)
+            self.assertIn("env.AGENT_DISPATCH_CALLER_HARNESS", result["conflicts"])
+            self.assertEqual(
+                json.loads(config.read_text(encoding="utf-8"))["env"]["AGENT_DISPATCH_CALLER_HARNESS"],
+                "mine")
+
+
+class CodexIdentityConfigTest(unittest.TestCase):
+    """Codex clears inherited identity through one delimited block in `$CODEX_HOME/config.toml`."""
+
+    BEGIN = "# >>> hearting harness identity (managed by runtime activation; edit outside this block) >>>"
+    END = "# <<< hearting harness identity <<<"
+    EXCLUDED = ("AGENT_DISPATCH_CALLER_HARNESS", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
+                "OPENCODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION")
+
+    def _release(self, root: Path) -> Path:
+        release = root / "release"
+        fragment = release / "adapters/codex/config"
+        fragment.mkdir(parents=True)
+        (fragment / "harness-identity.toml").write_bytes(
+            (REPO_ROOT / "adapters/codex/config/harness-identity.toml").read_bytes())
+        return release
+
+    def _call(self, name, config: Path, *args):
+        original = activation._config_path
+        activation._config_path = lambda *_a, **_k: config
+        try:
+            return getattr(activation, name)(*args)
+        finally:
+            activation._config_path = original
+
+    def _merge(self, config, release, previous=None):
+        return self._call("_merge_codex_identity_config", config, release, previous, "global")
+
+    def _unmerge(self, config, state, dry_run=False):
+        return self._call("_unmerge_codex_identity_config", config, state, "global", dry_run)
+
+    def _effective(self, config: Path):
+        import tomllib
+        policy = tomllib.loads(config.read_text(encoding="utf-8")).get("shell_environment_policy", {})
+        return policy.get("set", {}), policy.get("filters", {})
+
+    def _assert_clears_inherited(self, config: Path):
+        values, filters = self._effective(config)
+        self.assertNotIn("AGENT_DISPATCH_CALLER_HARNESS", values)
+        self.assertNotIn("AGENT_DISPATCH_CURRENT_HARNESS", filters)
+        for key in self.EXCLUDED:
+            self.assertEqual(filters.get(key), "exclude", key)
+
+    def test_an_absent_config_gets_the_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "home" / "config.toml"
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["kind"], "codex-config-merged")
+            self.assertEqual(result["conflicts"], [])
+            self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
+            self._assert_clears_inherited(config)
+
+    def test_the_block_is_appended_after_user_content_and_the_rest_stays_runtime_owned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            original = 'model = "x"\n\n[projects."/a"]\ntrust_level = "trusted"\n'
+            config.write_text(original, encoding="utf-8")
+            self._merge(config, self._release(root))
+            text = config.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(original))
+            self._assert_clears_inherited(config)
+            self.assertTrue((root / "config.toml.pre-harness-identity").is_file())
+            self.assertEqual((root / "config.toml.pre-harness-identity").read_text(encoding="utf-8"), original)
+
+    def test_a_second_merge_is_byte_identical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            config.write_text('model = "x"\n', encoding="utf-8")
+            release = self._release(root)
+            first = self._merge(config, release)
+            once = config.read_bytes()
+            self._merge(config, release, {"managed_config": {"codex_identity": first["managed_config"]}})
+            self.assertEqual(config.read_bytes(), once)
+
+    def test_a_user_policy_with_legacy_arrays_or_a_partial_filters_table_is_a_conflict_and_unchanged(self):
+        for label, body in (
+            ("exclude", '[shell_environment_policy]\nexclude = ["AWS_*"]\n'),
+            ("include_only", '[shell_environment_policy]\ninclude_only = ["PATH"]\n'),
+            ("inline filters", '[shell_environment_policy]\nfilters = { "FOO" = "exclude" }\n'),
+            ("partial filters", '[shell_environment_policy.filters]\n"FOO" = "exclude"\n'),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text(body, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                self.assertTrue(result["conflicts"], label)
+                self.assertEqual(config.read_text(encoding="utf-8"), body)
+
+    def test_a_user_table_that_already_has_the_effective_values_is_satisfied_without_a_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            body = ('[shell_environment_policy]\ninherit = "core"\n'
+                    '[shell_environment_policy.set]\nFOO = "1"\n'
+                    '[shell_environment_policy.filters]\n'
+                    + "".join('"%s" = "exclude"\n' % key for key in self.EXCLUDED))
+            config.write_text(body, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["conflicts"], [])
+            self.assertIsNone(result["managed_config"])
+            self.assertEqual(config.read_text(encoding="utf-8"), body)
+
+    def test_a_user_set_table_is_not_a_conflict_and_stays_untouched(self):
+        # The block defines only `filters`; a user `set` (even one naming a caller on purpose)
+        # lives beside it and Codex applies `set` after the exclusions.
+        for body in ('[shell_environment_policy]\nset = { FOO = "1" }\n',
+                     '[shell_environment_policy.set]\nAGENT_DISPATCH_CALLER_HARNESS = "claude"\n'):
+            with self.subTest(body), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text(body, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                self.assertEqual(result["conflicts"], [])
+                self.assertTrue(config.read_text(encoding="utf-8").startswith(body))
+                self.assertEqual(self._effective(config)[0], self._effective(
+                    _write_tmp(root / "user-only.toml", body))[0])
+                _, filters = self._effective(config)
+                for key in self.EXCLUDED:
+                    self.assertEqual(filters.get(key), "exclude", key)
+
+    def test_a_block_from_the_previous_declaration_is_replaced_not_stacked(self):
+        # An earlier build of this block also set the caller name; refresh swaps in the current text.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            release = self._release(root)
+            old_inserted = (
+                "\n" + self.BEGIN + '\n[shell_environment_policy.set]\nAGENT_DISPATCH_CALLER_HARNESS = "codex"\n'
+                '[shell_environment_policy.filters]\n"CLAUDE_CODE_SESSION_ID" = "exclude"\n' + self.END + "\n")
+            config.write_text('model = "x"\n' + old_inserted, encoding="utf-8")
+            previous = {"managed_config": {"codex_identity": {"inserted": old_inserted}}}
+            result = self._merge(config, release, previous)
+            self.assertEqual(result["conflicts"], [])
+            text = config.read_text(encoding="utf-8")
+            self.assertEqual(text.count(self.BEGIN), 1)
+            self.assertNotIn("AGENT_DISPATCH_CALLER_HARNESS = ", text)
+            self._assert_clears_inherited(config)
+
+    def test_a_user_policy_table_without_set_or_filters_gets_the_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            config.write_text('[shell_environment_policy]\ninherit = "all"\n', encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["conflicts"], [])
+            self._assert_clears_inherited(config)
+
+    def test_deactivate_removes_only_the_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            original = 'model = "x"\n\n[projects."/a"]\ntrust_level = "trusted"\n'
+            config.write_text(original, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            changed = self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(changed, [str(config)])
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_deactivate_removes_a_config_activation_created(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "home" / "config.toml"
+            result = self._merge(config, self._release(root))
+            changed = self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(changed, [str(config)])
+            self.assertFalse(config.exists())
+
+    def test_deactivate_keeps_an_empty_config_the_user_had(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            config.write_text("", encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertTrue(config.is_file())
+            self.assertEqual(config.read_text(encoding="utf-8"), "")
+
+    def test_deactivate_leaves_a_block_the_user_edited(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            result = self._merge(config, self._release(root))
+            edited = config.read_text(encoding="utf-8").replace('"CLAUDECODE"', '"MINE"')
+            config.write_text(edited, encoding="utf-8")
+            self.assertEqual(
+                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}), [])
+            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+
+    def test_invalid_toml_takes_the_existing_activation_error_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            config.write_text("not = [valid", encoding="utf-8")
+            with self.assertRaisesRegex(activation.ActivationError, "invalid Codex config"):
+                self._merge(config, self._release(root))
+            self.assertEqual(config.read_text(encoding="utf-8"), "not = [valid")
+
+    def test_a_release_without_the_fragment_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            empty_release = root / "old-release"
+            empty_release.mkdir()
+            result = self._merge(config, empty_release)
+            self.assertIsNone(result["managed_config"])
+            self.assertFalse(config.exists())
+
+    def test_health_reports_missing_then_clean_and_names_conflicts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "config.toml"
+            config.write_text('model = "x"\n', encoding="utf-8")
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"), (True, []))
+            self._merge(config, release)
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"), (False, []))
+            config.write_text('[shell_environment_policy]\nexclude = ["A"]\n', encoding="utf-8")
+            missing, conflicts = self._call("_codex_identity_health", config, release, "global")
+            self.assertTrue(conflicts)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

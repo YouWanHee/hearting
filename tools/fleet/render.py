@@ -3601,6 +3601,56 @@ def _fold_completed_child(job):
         and getattr(projection, "source", None) == "route-exact"
         and getattr(projection, "node_state", None) in _FOLD_CHILD_ROUTE_STATES
     )
+
+
+def _fold_finished_frame_child(job):
+    """Whether one frame leg is finished (fold-candidate, not the fold decision).
+
+    F-105 (backlog O2, user 2026-10-01): a completed frame branch (frame /
+    frame-alternative) kept a full dispatch row on the parent session card,
+    sitting next to the next round's live rows. Only genuinely finished legs
+    qualify — a terminal `done` registry word, or a stale row the exact route
+    projection settles as done / reconciling. Anything else (working, queued,
+    unknown, or stale without route proof) may be live or failed work and is
+    never a candidate. Non-frame rows (owners, stages) never qualify here; they
+    keep their own cards. Whether a candidate actually folds is decided per
+    route group by `_finished_frame_fold_ids`, and `a` / --all reveals folded
+    legs, like every other fold.
+    """
+    if getattr(job, "worker_type", None) != "frame":
+        return False
+    if getattr(job, "liveness", None) in _FOLD_CHILD_LIVENESS:
+        return True
+    projection = getattr(job, "work_projection", None)
+    return (
+        getattr(job, "liveness", None) == "stale"
+        and getattr(projection, "source", None) == "route-exact"
+        and getattr(projection, "node_state", None) in _FOLD_CHILD_ROUTE_STATES
+    )
+
+
+def _finished_frame_fold_ids(kids):
+    """Ids of frame legs to fold, grouped by route.
+
+    A finished leg folds only together with its whole route group: while any
+    leg of the same route still runs, the pair stays on screen (that is the
+    phase the operator watches). Once every leg of the route is finished, the
+    whole group folds at once — so a previous round never sits next to the
+    next round's live rows, and an owner card never shares its card with stale
+    frame boxes. A killed leg leaves no registry row, so an absent sibling
+    never blocks the fold; a stale leg without route proof does (it may be a
+    failure and keeps its context visible).
+    """
+    by_route = {}
+    for kid in kids:
+        if _is_plugin_agent(kid) or getattr(kid, "worker_type", None) != "frame":
+            continue
+        by_route.setdefault(getattr(kid, "route_id", None), []).append(kid)
+    fold = set()
+    for group in by_route.values():
+        if group and all(_fold_finished_frame_child(kid) for kid in group):
+            fold.update(id(kid) for kid in group)
+    return fold
 # The detached (owner-off-screen) variant of the fold above. Wider than in-card `done` on
 # purpose: inside a card, `stale`/`dead` still read against their owner's context, but with
 # the owner gone there is nothing to monitor and no card to belong to — done, stale and dead
@@ -4613,7 +4663,75 @@ def _gpu_process_rows(gpu, indent, width):
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
         row = [(indent + "    ", None), ("↳ ", "dim"), (command, "dim")]
         rows.append(_clip_segs(row, width)[0])
+        progress = _gpu_progress_row(process, indent, width)
+        if progress:
+            rows.append(progress)
     return rows
+
+
+# A tqdm-shaped line (`desc: NN%|bar| n/total [elapsed<left, rate, k=v]`, metrics may also
+# follow the bracket) is compacted by shape alone; any other line is shown clipped as is.
+_PROGRESS_TQDM_RE = re.compile(
+    r"^(?P<desc>.*?)\s*(?P<pct>\d{1,3}(?:\.\d+)?)%\s*\|[^|]*\|\s*"
+    r"(?P<count>[\d.]+[kMGTPE]?/[\d.]+[kMGTPE]?)(?P<rest>.*)$")
+_PROGRESS_LEFT_RE = re.compile(r"\s*\[[^<\]]*<\s*(?P<left>\d[\d:]*)")
+_PROGRESS_METRIC_RE = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*=[^\s,;\[\]]+")
+_PROGRESS_STALLED_S = 300
+_PROGRESS_BODY_CACHE = {}   # {(pid, line): compact text}; the line changes per probe, not per frame
+
+
+def _progress_body(line):
+    match = _PROGRESS_TQDM_RE.match(line)
+    if not match:
+        return line
+    desc = match.group("desc").strip().rstrip(":").strip()[:24]
+    parts = [" ".join(part for part in (desc, match.group("pct") + "%",
+                                        match.group("count")) if part)]
+    rest = match.group("rest")
+    left = _PROGRESS_LEFT_RE.match(rest)
+    if left:
+        parts.append(left.group("left") + " left")
+    metrics = _PROGRESS_METRIC_RE.findall(rest)[:2]
+    if metrics:
+        parts.append(" ".join(metrics))
+    return " · ".join(parts)
+
+
+def _progress_age(age_s):
+    if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) or age_s < 0:
+        return None, None
+    age_s = int(age_s)
+    if age_s > _PROGRESS_STALLED_S:
+        minutes = age_s // 60
+        return ("stalled %dm" % minutes if minutes < 120
+                else "stalled %dh" % (minutes // 60)), "lvl_y"
+    return ("%ds ago" % age_s if age_s < 60 else "%dm ago" % (age_s // 60)), "dim"
+
+
+def _gpu_progress_row(process, indent, width):
+    """One dim line of the process's latest file-redirected output, or None."""
+    progress = process.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    line = _gpu_safe_text(progress.get("line")).strip()
+    if not line:
+        return None
+    key = (process.get("pid"), line)
+    body = _PROGRESS_BODY_CACHE.get(key)
+    if body is None:
+        if len(_PROGRESS_BODY_CACHE) >= 256:
+            _PROGRESS_BODY_CACHE.clear()
+        body = _PROGRESS_BODY_CACHE[key] = _progress_body(line)
+    prefix = [(indent + "      ", None), ("↳ ", "dim")]
+    age_text, age_key = _progress_age(progress.get("age_s"))
+    suffix = [(" · ", "dim"), (age_text, age_key)] if age_text else []
+    # The age is the stall signal, so the body yields width before it does.
+    room = width - sum(_dw(text) for text, _key in prefix + suffix)
+    if room >= 2:
+        segs = prefix + [(_clip_w(body, room), "dim")] + suffix
+    else:
+        segs = prefix + ([(age_text, age_key)] if age_text else [(body, "dim")])
+    return _clip_segs(segs, width)[0]
 
 
 def _fresh_compute_hosts():
@@ -6104,8 +6222,13 @@ def _drawn_group_jobs(classified, shown):
             continue  # ambiguous duplicate id: only the first row draws the dispatch tree
         if s.session_id:
             claimed.add(s.session_id)
-        for kid in classified["children"].get(s.session_id, []):
+        session_kids = classified["children"].get(s.session_id, [])
+        folded_frame_ids = (set() if _SHOW_ALL
+                            else _finished_frame_fold_ids(session_kids))
+        for kid in session_kids:
             if not _is_plugin_agent(kid):  # a plugin row is drawn without a GPU strip
+                if id(kid) in folded_frame_ids:
+                    continue  # F-105: finished route group, folded with its siblings
                 _walk(kid)
     for job in classified["orphans"]:
         if not _is_plugin_agent(job):
@@ -6798,7 +6921,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             elif s.session_id:
                 rendered_parent_sids.add(s.session_id)
             plugin_kids = [kid for kid in kids if _is_plugin_agent(kid)]
-            dispatch_kids = [kid for kid in kids if not _is_plugin_agent(kid)]
+            # F-105: finished frame legs fold away in whole route groups (see
+            # `_finished_frame_fold_ids`). Filter them out of the drawn kids
+            # once, so the child count, the card check below, and the
+            # dispatch-tree walk all see the same visible set.
+            folded_frame_ids = (set() if _SHOW_ALL
+                                else _finished_frame_fold_ids(kids))
+            dispatch_kids = [kid for kid in kids
+                             if not _is_plugin_agent(kid)
+                             and id(kid) not in folded_frame_ids]
             nested_n = (len(dispatch_kids)
                         + sum(len(job_children.get(k.slug, [])) for k in dispatch_kids))
             if s.liveness == "stale":

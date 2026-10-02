@@ -44,7 +44,10 @@ NODE_IDS = FRAME_IDS + ["route-decision"]
 
 # Frozen from `git show 45edc48a:capabilities/topologies.json` (the registry before the route-frame
 # recipe). They are literals, not a comparison with HEAD, so they mean the same in CI and after any
-# commit. Each global table is hashed as sha256 of its JSON (sorted keys, compact separators).
+# commit. Report-format bootstrap intentionally refreshes only the four reader-facing recipes
+# and their capability digests. Entry approvals refresh only refine's preview approval mark,
+# review output, and the corresponding catalog/recipe digests; gate contracts stay unchanged.
+# Each global table is hashed as sha256 of its JSON (sorted keys, compact separators).
 FROZEN_GLOBAL_TABLE_DIGESTS = {
     "schema_version": "4a44dc15364204a80fe80e9039455cc1608281820fe2b24f1e5233ade6af1dd5",
     "intensities": "965abb3701067fd845cba3196ebd2c1725c399b515a884c452ebdc3e0e05186c",
@@ -82,21 +85,21 @@ FROZEN_GLOBAL_TABLE_DIGESTS = {
     "human_gate_positions": "fc45768a57481792e0643d4bec1faae15743411bc06096fdb1740f632f0707b0",
     "artifact_buckets": "ccbd32ef24b84897147e3d1a0862a824d9c6f893a12aed07f53c9f77724cb835",
     "producer_lifecycle": "a9f26a373d2e3af19f55be8c37b8cd0126f30165cdfa0407ef0242aa7c2f9816",
-    "part_catalog": "6888a60d9d25370095d9aa74fd9f0210d7d82be4d87350290c4f8b48e5ecf9c1",
+    "part_catalog": "140a47c84be0fd96a60a52747010a06e7dded5fcb77725a22ca450fdb233ce23",
 }
 FROZEN_GATE_CONTRACT_DIGEST = "53db72bbbcb6228d395819d147eb3a12eeba17161dbc06fe63cefa9389f469fb"
 FROZEN_RECIPE_COUNT = 14
-FROZEN_RECIPES_DIGEST = "21ca288a0ca277cb89f45809255d6344ba7bef72744d58cf39da10f92378a20d"
+FROZEN_RECIPES_DIGEST = "be19089591319912719893b9d2a2f14aca38f900a76b54bfb1c310b060dcf674"
 FROZEN_CAPABILITY_REGISTRY_DIGESTS = {
     "analyze-project": "sha256:160c04dc760b81584a7d445da0733c778d7caaabd12f43d606e72a00fb9ca574",
     "analyze-user": "sha256:a787e6d28fbc54ba019dc635f462ddb9b5ffd1112f9a08ecf56dab950761899a",
     "audit": "sha256:d2e6741875289ba300b4334b9a84e1cf99fcf1a4e60c73c6c594a1bcaa65d314",
     "autopilot-apply": "sha256:317c03fb47f59789c1a12b15c1a0dcf93f60fcee57408f0ae1ab4cb45f6f7cd5",
-    "autopilot-code": "sha256:5ac6894bb49c421060551625bdcfdde3f7af9676f9f52f65373428bfb8030893",
-    "autopilot-design": "sha256:a0d62cb63ec8bd255f254417241c97856fbeae4095cde072a878f65c313cecca",
-    "autopilot-draft": "sha256:37c3b4a3fc45a5df8f199f220ef940dbc19ca8eae17e51b2b14f267053057af5",
-    "autopilot-lab": "sha256:41e59b4c50376ae247eb110b8f830693f67203d482c5017210ed89a5ac0cc55c",
-    "autopilot-refine": "sha256:f97b337937dd64cb49ba675b9e19bda3a05077e9389a73e4ad99ffed91f46729",
+    "autopilot-code": "sha256:8f1f6572ba2e1038c0bceaf6ca411d6f0a2118bac69464429ccfd05d6fb78fe9",
+    "autopilot-design": "sha256:95ea188edc7350bc83af19a78aec602c1d6e6d84fdde553c29036be997078f46",
+    "autopilot-draft": "sha256:1f6ff17e9bd5f3cec8d38f32cd7415913ff2d9111762cda3f44b8ea718334067",
+    "autopilot-lab": "sha256:0d8abcee90861a84161e9d64df97caf2f1423ae421b1d9659b2c76ed55e92ff5",
+    "autopilot-refine": "sha256:1721bbf230492a6f2c1994924a938e2e4c451ea21b7d16165ab9647d6e5f5e7a",
     "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
     "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",
     "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb",

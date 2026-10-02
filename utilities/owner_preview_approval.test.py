@@ -227,6 +227,11 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
     the receipt says `human-gate-not-raised` instead.
     """
 
+    def test_existing_sealed_route_keeps_preview_gate_and_binding(self):
+        fixture = self.build()
+        self.assertIn(self.PREVIEW, fixture.route["human_gates"])
+        self.assertTrue(any(row.get("gate") == self.PREVIEW for row in fixture.route["human_gate_bindings"]))
+
     def test_a_pass_with_no_raise_does_not_settle_and_start_asks_the_existing_question_for_any_harness(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):

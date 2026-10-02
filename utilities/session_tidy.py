@@ -14,9 +14,11 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py status [--json] [--cwd D]
         Print where the state lives and what is waiting.
 
-    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D]
+    session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D] [--no-clear]
         Queue the memory tidy and return at once (one line); the detached runner
-        ``session_tidy_runner.py`` does the work and leaves a result notice.
+        ``session_tidy_runner.py`` does the work and leaves a result notice.  Inside
+        herdr it also books the window's auto-clear (``session_tidy_clear.py``);
+        ``--no-clear`` keeps the window and cancels a pending booking.
     session_tidy.py handoff <target> [--harness H] [--session-id S] [--cwd D]
         Deliver this seat's card to a peer session through ``peer-steward.py prompt``
         and report its typed verdict (``prompted=...``) and exit code on one line.
@@ -27,13 +29,20 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
     cards/<seat>.json|.md   latest card (canonical JSON + readable text)
     card-history/<seat>/    bounded older cards
     sessions/<seat>.jsonl   seat ledger: one line per hook/card event
-    consumed/<seat>.json    who already received the latest card generation
+    consumed/<seat>.json    who already received the latest card generation (+ the "참고할 기억" revision)
     reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
     notices/<seat>.json     result lines waiting for the next start/prompt
     locks/<seat>.lock       flock for the read-modify-write above
+    prompt-seq/<seat>.json  count of real prompts submitted at the seat (card/enqueue compare it)
+    clear/<seat>.json       the one pending auto-clear reservation (``session_tidy_clear.py``)
     watermarks/  decisions/pending/  runs/  queue/  runner.lock   (other slices)
 
 The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project.
+A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
+pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
+caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
+a ``/clear``), else -- for the first hook after an auto-clear -- the one window waiting for its
+successor.  No match or several -> the project seat, quietly.
 A worker marker is checked before the pane: a worker that inherited its
 supervisor's pane id gets no card, ledger line or notice.
 """
@@ -49,7 +58,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import stat
+import subprocess
 import sys
 import time
 from typing import Callable, Iterator, Optional
@@ -58,10 +69,14 @@ SCHEMA = 1
 HARNESSES = ("claude", "codex", "opencode")
 CARD_BODY_MAX_BYTES = 8 * 1024
 INJECTION_MAX_BYTES = 2400
+MEMORY_REFS_MAX = 8                 # "참고할 기억" (card layer B): records listed
+MEMORY_REFS_BYTES = 1200            # ... and the bytes their lines may take
+CARD_MIN_WHEN_BUNDLED = 900         # the card keeps at least this much room when B rides along
 NOTICE_MAX_BYTES = 500
 CARD_HISTORY_KEEP = 20
 LEDGER_FOLD_LINES = 500
 LEDGER_KEEP_RAW = 100
+HANDOVER_KEEP_ROWS = 40
 PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
@@ -278,9 +293,110 @@ def seat_for_project(harness: str, project_key: str) -> Seat:
     return Seat("project", _digest("project", harness, project_key), "", harness, project_key)
 
 
-def resolve_seat(harness: Optional[str], cwd=None, env=None) -> Seat:
+HERDR_LOOKUP_TIMEOUT_SEC = 2.0      # a hook has a few seconds in total
+
+
+def _herdr_executable() -> Optional[str]:
+    try:
+        import session_tidy_clear
+        return session_tidy_clear.herdr_command()
+    except BaseException:  # noqa: BLE001 - no herdr, no lookup
+        return shutil.which("herdr")
+
+
+def _herdr_codex_agents() -> Optional[list[dict]]:
+    """The Codex entries of ``herdr agent list``; None when herdr cannot be asked (missing, slow,
+    unreadable).  Read-only: nothing is typed or changed."""
+    exe = _herdr_executable()
+    if not exe:
+        return None
+    try:
+        done = subprocess.run([exe, "agent", "list"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=HERDR_LOOKUP_TIMEOUT_SEC)
+        agents = (json.loads(done.stdout or "").get("result") or {}).get("agents")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+    if not isinstance(agents, list):
+        return None
+    return [a for a in agents if isinstance(a, dict) and a.get("agent") == "codex" and a.get("pane_id")]
+
+
+def _agent_session(agent: dict) -> str:
+    session = agent.get("agent_session")
+    return str(session.get("value") or "") if isinstance(session, dict) else ""
+
+
+def _real(path) -> str:
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        return os.path.realpath(str(path))
+    return ""
+
+
+def _pane_seat_of(pane: str) -> Seat:
+    return Seat("pane", _digest("pane", pane), pane, "codex", "")
+
+
+def ledger_precedes(seat: Seat, older: str, newer: str, harness: str = "codex") -> bool:
+    """True when this seat's own ledger saw session ``older`` strictly before session ``newer``."""
+    try:
+        rows = session_summary(seat)
+        a, b = rows.get((harness, older)), rows.get((harness, newer))
+        return bool(a and b and float(a["first_seen"]) < float(b["first_seen"]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _successor_pane(sid: str, agents: list[dict], cwd: str) -> list[str]:
+    """The window whose auto-clear is under way, for the first hook of the session it started.
+
+    herdr keeps showing the cleared session, and the shared daemon gives the TUI no rollout to
+    read, so the new thread cannot be proven.  It is taken only when everything points at one
+    window: exactly one Codex window of herdr works in this directory, its booking is still
+    waiting for the successor, and herdr shows the booked session there or an older one of the seat."""
+    here = [a for a in agents if _real(a.get("foreground_cwd") or a.get("cwd") or "") == _real(cwd)]
+    if len(here) != 1:
+        return []
+    pane = str(here[0]["pane_id"])
+    try:
+        import session_tidy_clear
+        booking = session_tidy_clear.read_reservation(_pane_seat_of(pane).key)
+    except BaseException:  # noqa: BLE001
+        return []
+    ok = bool(booking) and booking.get("harness") == "codex" and booking.get("status") in ("reserved", "unverified") \
+        and booking.get("sid") not in (sid, "") \
+        and (_agent_session(here[0]) == booking.get("sid")
+             or ledger_precedes(_pane_seat_of(pane), _agent_session(here[0]), str(booking.get("sid")))) \
+        and _real(booking.get("cwd") or "") == _real(cwd) \
+        and (booking.get("seat") or {}).get("pane") == pane
+    return [pane] if ok else []
+
+
+def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
+    """The herdr pane of a Codex session that has no ``HERDR_PANE_ID`` -- exactly one, else "".
+
+    In order: the pane whose herdr session is this thread; the pane whose seat ledger already
+    knows this thread (herdr's value can lag a ``/clear`` for good); for the first hook after a
+    clear (``source=clear``) the one window whose auto-clear is waiting for its successor."""
+    if not sid:
+        return ""
+    agents = _herdr_codex_agents()
+    if agents is None:
+        return ""
+    panes = [str(a["pane_id"]) for a in agents if _agent_session(a) == sid]
+    if not panes:
+        panes = [str(a["pane_id"]) for a in agents
+                 if ("codex", sid) in session_summary(_pane_seat_of(str(a["pane_id"])))]
+    if not panes and source == "clear" and cwd:
+        panes = _successor_pane(sid, agents, cwd)
+    return panes[0] if len(set(panes)) == 1 else ""
+
+
+def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] = None,
+                 source: str = "") -> Seat:
     env = os.environ if env is None else env
     pane = (env.get("HERDR_PANE_ID") or "").strip()
+    if not pane and harness == "codex" and sid:
+        pane = codex_pane_for_session(sid, str(cwd or ""), source)
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
     return seat_for_project(harness or "unknown", project_key_for(cwd))
@@ -311,6 +427,8 @@ def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
+        if item.get("event") == "handover":     # a relation row (dispatch_seat_handover), not a session event
+            continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
         row = out.setdefault(key, {"harness": key[0], "sid": key[1], "first_seen": item.get("first_seen", item.get("ts", 0)),
                                    "last_seen": 0, "epoch": 0, "transcript": "", "cwd": "",
@@ -374,6 +492,9 @@ def _fold_ledger(seat: Seat) -> None:
     lines = _read_ledger_lines(seat)
     if len(lines) <= LEDGER_FOLD_LINES:
         return
+    # Handover rows (A -> B, with their bindings) are the seat's authority record: they stay raw.
+    relations = [l for l in lines if l.get("event") == "handover"][-HANDOVER_KEEP_ROWS:]
+    lines = [l for l in lines if l.get("event") != "handover"]
     recent = lines[-LEDGER_KEEP_RAW:]
     older = lines[:-LEDGER_KEEP_RAW]
     folded: dict[tuple[str, str], dict] = {}
@@ -387,7 +508,7 @@ def _fold_ledger(seat: Seat) -> None:
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]
-    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + recent)
+    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + relations + recent)
     atomic_write(_ledger_path(seat), body.encode("utf-8"))
 
 
@@ -424,7 +545,7 @@ def read_latest_card(seat: Seat) -> Optional[dict]:
 
 
 def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
-               now: Optional[float] = None) -> dict:
+               now: Optional[float] = None, prompt_seq: Optional[int] = None) -> dict:
     """Write the seat's newest card (caller holds the seat lock)."""
     now = now_epoch() if now is None else now
     body = sanitize_body(body)
@@ -441,6 +562,10 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
         "cwd": cwd,
         "body": body,
     }
+    if prompt_seq is not None:
+        card["prompt_seq"] = int(prompt_seq)    # lets enqueue notice a prompt typed after the card
+    if previous and isinstance(previous.get("memory_refs"), dict):
+        card["memory_refs"] = previous["memory_refs"]   # layer B outlives the card: only its revision moves it
     if previous:
         history = ensure_dir(state_root() / "card-history" / seat.key)
         atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
@@ -448,9 +573,83 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
             with contextlib.suppress(OSError):
                 old.unlink()
     atomic_write_json(card_json_path(seat), card)
-    header = f"# session card {generation} — {card['authored_at']} ({harness} {sid[:8]})\n\n"
-    atomic_write(card_text_path(seat), (header + body + "\n").encode("utf-8"))
+    atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
     return card
+
+
+def render_card_text(card: dict) -> str:
+    """The readable card file: header, the card body (layer A), and the "참고할 기억" section (layer B)."""
+    author = card.get("author") or {}
+    header = (f"# session card {card.get('generation')} — {card.get('authored_at')} "
+              f"({author.get('harness', '')} {str(author.get('sid', ''))[:8]})\n\n")
+    text = header + str(card.get("body", "")) + "\n"
+    refs = card.get("memory_refs")
+    if isinstance(refs, dict) and refs.get("revision"):
+        text += "\n" + build_memory_injection(refs, MEMORY_REFS_BYTES + 600) + "\n"
+    return text
+
+
+STATUS_LABEL = {"applied": "정돈 결과", "partial": "일부만 반영", "failed": "정돈을 끝내지 못함"}
+
+
+def build_memory_injection(refs: dict, room: int) -> str:
+    """The "참고할 기억" section within ``room`` UTF-8 bytes: ids and headlines only, never a record body.
+
+    The header, the coverage/reason lines and the result path always survive; list lines are dropped
+    from the end first and counted as "외 N건".
+    """
+    head = f"[참고할 기억] 묶음 {refs.get('batch', '')} — {STATUS_LABEL.get(refs.get('status'), '')}".rstrip(" —")
+    tail = [str(refs[k]) for k in ("coverage",) if refs.get(k)]
+    if refs.get("detail"):
+        tail.append(f"사유: {refs['detail']}")
+    items = [f"- {r.get('id', '')} [{r.get('kind', '')}] {r.get('headline', '')}" for r in refs.get("refs") or []
+             if isinstance(r, dict)]
+    hidden = int(refs.get("more") or 0)
+    path = f"전체 결과: {refs['result_path']}" if refs.get("result_path") else ""
+    fixed = [head] + tail + ([path] if path else [])
+    room = max(0, room)
+    used = sum(len(x.encode("utf-8")) + 1 for x in fixed)
+    shown: list = []
+    for line in items:
+        size = len(line.encode("utf-8")) + 1
+        if used + size + (24 if len(shown) + 1 < len(items) or hidden else 0) > room:
+            break
+        shown.append(line)
+        used += size
+    omitted = len(items) - len(shown) + hidden
+    lines = [head] + shown + ([f"외 {omitted}건"] if omitted else []) + tail + ([path] if path else [])
+    return _cut_bytes("\n".join(lines), room)[0] if room else ""
+
+
+def update_memory_refs(seat: Seat, *, batch: str, status: str, refs: list, more: int = 0, coverage: str = "",
+                       detail: str = "", result_path: str = "", source_generation: Optional[int] = None,
+                       now: Optional[float] = None) -> Optional[dict]:
+    """Set the latest card's layer B ("참고할 기억") for a finished tidy batch; takes the seat lock.
+
+    Only ``memory_refs`` changes: the card's body, author, time and generation stay, so layer A is
+    never handed out again because of this.  ``revision`` rises by one per batch result for the seat
+    and is what the hooks hand out once.  The same batch with the same result changes nothing, and a
+    batch that finishes after a newer card was written still lands here (marked with the generation
+    it was queued under).  No card, no layer: ``None``.
+    """
+    now = now_epoch() if now is None else now
+    with seat_lock(seat.key):
+        card = read_latest_card(seat)
+        if not card:
+            return None
+        old = card.get("memory_refs") if isinstance(card.get("memory_refs"), dict) else {}
+        new = {"batch": batch, "status": status, "refs": refs, "more": int(more), "coverage": coverage,
+               "detail": detail, "result_path": result_path}
+        if old and all(old.get(k) == v for k, v in new.items()):
+            return old
+        new["revision"] = int(old.get("revision", 0) or 0) + 1
+        new["source_generation"] = int(card.get("generation", 0) or 0) if source_generation is None \
+            else int(source_generation)
+        new["updated"] = iso_utc(now)
+        card["memory_refs"] = new
+        atomic_write_json(card_json_path(seat), card)
+        atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
+        return new
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +658,15 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
 
 def _consumed_path(seat: Seat) -> Path:
     return state_root() / "consumed" / f"{seat.key}.json"
+
+
+def _write_consumed(seat: Seat, **fields) -> None:
+    """Merge ``fields`` into the seat's consumption file (layer A and layer B receipts are independent)."""
+    consumed = read_json(_consumed_path(seat))
+    data = dict(consumed) if isinstance(consumed, dict) else {}
+    data.update(fields)
+    data["schema"] = SCHEMA
+    atomic_write_json(_consumed_path(seat), data)
 
 
 def _receipt(harness: str, sid: str, epoch: int) -> str:
@@ -471,6 +679,32 @@ def _reread_path(harness: str, sid: str) -> Path:
 
 def _notices_path(seat: Seat) -> Path:
     return state_root() / "notices" / f"{seat.key}.json"
+
+
+def _prompt_seq_path(seat: Seat) -> Path:
+    return state_root() / "prompt-seq" / f"{seat.key}.json"
+
+
+def read_prompt_seq(seat: Seat) -> int:
+    """How many real prompts were submitted at this seat (0 before the first one)."""
+    data = read_json(_prompt_seq_path(seat))
+    try:
+        return max(0, int(data.get("seq", 0))) if isinstance(data, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_prompt_seq(seat: Seat, harness: str, sid: str, now: float) -> int:
+    """Count one real prompt (caller holds the seat lock).
+
+    A file of its own, written for every prompt: the ledger throttles prompt lines and
+    folds old ones, and neither may lose a request that decides whether the window is
+    still safe to clear.
+    """
+    seq = read_prompt_seq(seat) + 1
+    atomic_write_json(_prompt_seq_path(seat), {"schema": SCHEMA, "seq": seq, "at": now,
+                                              "harness": harness, "sid": sid})
+    return seq
 
 
 def write_notice(seat: Seat, text: str, *, author_harness: str = "", author_sid: str = "",
@@ -566,7 +800,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
     if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact"):
         return ""
     now = now_epoch() if now is None else now
-    seat = resolve_seat(harness, cwd or None, env)
+    seat = resolve_seat(harness, cwd or None, env, sid, source)
     with seat_lock(seat.key):
         if reread:
             saved = read_json(_reread_path(harness, sid))
@@ -576,6 +810,8 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if text and emit:
                 emit(text)
             return text
+        if event == "prompt":
+            bump_prompt_seq(seat, harness, sid, now)
         prior = session_summary(seat).get((harness, sid))
         # SessionStart(source=compact) and a separate compact event describe the same
         # compaction; count it once.
@@ -585,6 +821,17 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                            cwd=cwd, now=now, bump_epoch=compacting)
         if event == "compact":
             return ""
+        if event == "start" and seat.kind == "pane":
+            with contextlib.suppress(BaseException):    # a hook never fails for the clear note
+                import session_tidy_clear
+                session_tidy_clear.note_start_locked(seat, harness, sid, now)
+        # The one place a same-seat handover (A -> B) is recorded: B's confirmed start/first prompt.
+        handed = None
+        handover = None
+        if seat.kind == "pane" and event in ("start", "prompt"):
+            with contextlib.suppress(BaseException):    # a hook never fails for the handover
+                import dispatch_seat_handover as handover
+                handed = handover.record_locked(seat, harness, sid, event, source, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
         notices = pending_notices(seat, harness, sid, now=now)
@@ -595,6 +842,9 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             parts.append(notice_block)
         card = read_latest_card(seat)
         card_due = False
+        memory_due = False
+        memory = None
+        resume_text = ""
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
@@ -605,9 +855,34 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             taken = isinstance(consumed, dict) and consumed.get("generation") == card.get("generation") \
                 and bool(consumed.get("receipts"))
             card_due = eligible and not taken
+            # Layer B ("참고할 기억") has its own revision and its own receipt: a session that already
+            # took card generation N still gets a newer B once, and the writer of the card (who
+            # could be cleared next) does not use it up before the new session can see it.
+            memory = card.get("memory_refs") if isinstance(card.get("memory_refs"), dict) else None
+            taken_rev = int(consumed.get("memory_revision", 0) or 0) if isinstance(consumed, dict) else 0
+            memory_due = bool(memory) and eligible and int(memory.get("revision", 0) or 0) > taken_rev
+            used = len(notice_block.encode("utf-8")) + (1 if notice_block else 0)
+            # The verified route and the existing resume command, one line, with the card B receives.
+            if handover is not None and (card_due or handed):
+                resume_text = handover.resume_line(seat, harness, sid)
+                used += len(resume_text.encode("utf-8")) + (1 if resume_text else 0)
+            room = INJECTION_MAX_BYTES - used
+            memory_text = ""
+            if memory_due:
+                wanted = build_memory_injection(memory, MEMORY_REFS_BYTES + 600)
+                memory_text = build_memory_injection(
+                    memory, min(len(wanted.encode("utf-8")), room - CARD_MIN_WHEN_BUNDLED - 1) if card_due else room)
+                room -= len(memory_text.encode("utf-8")) + 1
+            if resume_text:
+                parts.append(resume_text)
             if card_due:
-                room = INJECTION_MAX_BYTES - len(notice_block.encode("utf-8")) - (1 if notice_block else 0)
                 parts.append(build_card_injection(card, card_text_path(seat), now, room))
+            if memory_text:
+                parts.append(memory_text)
+        if not card and handed and handover is not None:
+            resume_text = handover.resume_line(seat, harness, sid)
+            if resume_text:
+                parts.append(resume_text)
         text = "\n".join(parts)
         if not text:
             return ""
@@ -617,14 +892,24 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             receipts = list(consumed.get("receipts", [])) if isinstance(consumed, dict) \
                 and consumed.get("generation") == card.get("generation") else []
             receipts.append(_receipt(harness, sid, epoch))
-            atomic_write_json(_consumed_path(seat), {"schema": SCHEMA, "generation": card["generation"],
-                                                     "receipts": receipts[-200:]})
+            _write_consumed(seat, generation=card["generation"], receipts=receipts[-200:])
+        if memory_due:
+            consumed = read_json(_consumed_path(seat))
+            same = isinstance(consumed, dict) and consumed.get("memory_revision") == memory["revision"]
+            receipts = list(consumed.get("memory_receipts", [])) if same else []
+            receipts.append(_receipt(harness, sid, epoch))
+            _write_consumed(seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
         if notices:
             shown = {n["id"] for n in notices}
             data = read_json(_notices_path(seat))
             rest = [i for i in (data.get("items", []) if isinstance(data, dict) else []) if i.get("id") not in shown]
             atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest})
-        atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": text, "at": now})
+        # OpenCode re-emits this cache every turn: a later "참고할 기억" is added to what the session
+        # already received instead of replacing it.
+        earlier = read_json(_reread_path(harness, sid))
+        kept = str(earlier.get("text") or "") if isinstance(earlier, dict) and earlier.get("epoch") == epoch else ""
+        cached = _cut_bytes(kept + "\n" + text, 2 * INJECTION_MAX_BYTES)[0] if kept else text
+        atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": cached, "at": now})
         return text
 
 
@@ -658,7 +943,7 @@ def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     if not sid:
         harness, sid = session_from_env(harness)
     detected = harness or session_from_env(None)[0]
-    seat = resolve_seat(detected, cwd)
+    seat = resolve_seat(detected, cwd, sid=sid)
     if not sid or not harness:
         ledger_row = latest_session(seat, harness)
         if ledger_row is None and seat.kind == "project" and not detected:
@@ -692,7 +977,7 @@ def cmd_card(args) -> int:
     seat, harness, sid = caller
     with seat_lock(seat.key):
         record_event(seat, harness, sid, "card", cwd=cwd)
-        write_card(seat, harness, sid, body, cwd=cwd)
+        write_card(seat, harness, sid, body, cwd=cwd, prompt_seq=read_prompt_seq(seat))
     print(f"card={card_text_path(seat)} seat={seat.key}")
     return 0
 
@@ -709,8 +994,17 @@ def cmd_enqueue(args) -> int:
     seat, harness, sid = caller
     import session_tidy_runner as runner
     transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
+    import session_tidy_clear as clear
+    with contextlib.suppress(BaseException):    # the tidy goes ahead even if the snapshot cannot be taken
+        import dispatch_seat_handover as handover
+        with seat_lock(seat.key):
+            handover.write_snapshot_locked(seat, harness, sid)
     item = runner.enqueue_item(seat, harness, sid, cwd, transcript)
-    print(f"enqueue={item['id']} seat={seat.key} status=queued")
+    try:
+        booked = clear.schedule_for_enqueue(seat, harness, sid, cwd, opt_out=bool(args.no_clear))
+    except BaseException as exc:  # noqa: BLE001 - the tidy is queued; the window is left alone
+        booked = f"clear=manual reason=internal-{type(exc).__name__} hint={clear.CLEAR_COMMAND.get(harness, '/clear')}"
+    print(f"enqueue={item['id']} seat={seat.key} status=queued {booked}")
     return 0
 
 
@@ -754,7 +1048,7 @@ def _queue_counts(seat: Seat) -> dict:
 
 def cmd_status(args) -> int:
     harness, sid = session_from_env(None)
-    seat = resolve_seat(harness, args.cwd or os.getcwd())
+    seat = resolve_seat(harness, args.cwd or os.getcwd(), sid=sid)
     card = read_latest_card(seat)
     notices = read_json(_notices_path(seat))
     info = {
@@ -801,6 +1095,8 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--harness", choices=HARNESSES)
     enqueue.add_argument("--session-id")
     enqueue.add_argument("--cwd")
+    enqueue.add_argument("--no-clear", action="store_true",
+                         help="keep this window: no auto-clear (cancels a pending one)")
     enqueue.set_defaults(func=cmd_enqueue)
     handoff = sub.add_parser("handoff", help="deliver this seat's card to a peer session")
     handoff.add_argument("target")

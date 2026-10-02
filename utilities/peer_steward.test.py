@@ -432,11 +432,14 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         import contextlib
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))):
+                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))), \
+             mock.patch.object(peer_steward, "_BIND_PROCESS_SECONDS", 0.1), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.02):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
         self.assertIn("session_id=-", out.getvalue())
+        self.assertIn("session_bind=no-process", out.getvalue())
 
     def test_the_receipt_names_the_identity_when_there_is_one(self):
         import io
@@ -638,6 +641,243 @@ if verb == "wait":
 print(json.dumps(info)); sys.exit(0)
 '''
 
+
+class StartSessionBindTest(_TmpRootMixin, unittest.TestCase):
+    """`start --kind codex` binds the launched thread when the launcher can prove it.
+
+    A TUI attached to the shared Codex daemon holds no rollout file and the daemon creates
+    the thread's rollout about a second after the TUI starts, so Fleet sees an anonymous
+    row (several same-cwd starts overlap its start-time window). The launcher is the one
+    party that saw the launch: it notes the rollouts that exist before `herdr agent start`
+    and, afterwards, takes exactly one new root rollout for the target cwd as the session.
+    Zero or several new rollouts is no proof: no guess, `session_id=-`, and the start is
+    never failed or blocked beyond the bound.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp_root / "codex-home"
+        (self.home / "sessions" / "2026" / "10" / "02").mkdir(parents=True)
+        self.project = self.tmp_root / "project"
+        self.project.mkdir()
+        self.registry = self.tmp_root / "registry"
+        os.environ["CODEX_HOME"] = str(self.home)
+        os.environ["FLEET_SESSION_REGISTRY_DIR"] = str(self.registry)
+        # the "TUI": a real process, so /proc has a start time and a cwd for it
+        self.tui = subprocess.Popen(["sleep", "60"], cwd=str(self.project))
+        self.addCleanup(self.tui.wait)
+        self.addCleanup(self.tui.kill)
+        self.late = []        # rollouts the "daemon" writes after the TUI is up
+        self.calls = []
+
+    def _rollout(self, sid, cwd=None, created=None, originator="codex-tui", source="vscode"):
+        created = created if created is not None else time.time()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(created)) + ".%03dZ" % (int(created * 1000) % 1000)
+        meta = {"id": sid, "timestamp": stamp, "cwd": str(cwd or self.project),
+                "originator": originator, "source": source}
+        path = self.home / "sessions" / "2026" / "10" / "02" / (
+            "rollout-%s-%s.jsonl" % (stamp[:19].replace(":", "-"), sid))
+        path.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
+        return path
+
+    def _fake_herdr(self, argv, **_kwargs):
+        self.calls.append(list(argv))
+        if argv[:3] == ["herdr", "agent", "start"]:
+            return _herdr_json({"result": {"agent": {"name": argv[3], "agent": "codex",
+                                                     "pane_id": "w1:pM"}}})
+        if argv[:3] == ["herdr", "pane", "process-info"]:
+            for write in self.late:
+                write()
+            self.late = []
+            return _herdr_json({"result": {"process_info": {"foreground_processes": [
+                {"pid": self.tui.pid, "argv": ["codex", "--cd", str(self.project)]}]}}})
+        return _herdr_json({"result": {"pane": {}}})
+
+    def _start(self, *extra, kind="codex", name="bl-c1"):
+        import io
+        import contextlib
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", name, "--kind", kind, "--pane", "w1:pM",
+                                    *(["--cwd", str(self.project)] if kind == "codex" else []), *extra])
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    def _registry_record(self):
+        path = self.registry / "codex" / ("%d.json" % self.tui.pid)
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def _proc_start(self):
+        raw = Path("/proc/%d/stat" % self.tui.pid).read_text()
+        return raw[raw.rindex(")") + 1:].split()[19]
+
+    def test_one_new_root_rollout_is_the_launched_session(self):
+        sid = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
+        self.late.append(lambda: self._rollout(sid))
+        out = self._start()
+        self.assertIn("session_id=" + sid, out)
+        self.assertIn("session_bind=bound", out)
+        record = self._registry_record()
+        self.assertEqual(record["sessionId"], sid)
+        self.assertEqual(record["procStart"], self._proc_start())
+        self.assertEqual(record["cwd"], os.path.realpath(str(self.project)))
+        self.assertEqual(record["name"], "bl-c1")
+        self.assertNotEqual(record.get("nameSource"), "derived")
+        self.assertEqual(record["harness"], "codex")
+        self.assertEqual(record["pid"], self.tui.pid)
+        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
+        self.assertEqual(sent[0]["to"]["session_id"], sid)
+
+    def test_two_new_root_rollouts_are_never_guessed(self):
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000001"))
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000002"))
+        out = self._start()
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=ambiguous", out)
+        self.assertIsNone(self._registry_record())
+
+    def test_no_new_rollout_within_the_bound_times_out_without_failing(self):
+        started = time.time()
+        out = self._start()
+        self.assertLess(time.time() - started, 5)
+        self.assertIn("started=true", out)
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=timeout", out)
+        self.assertIsNone(self._registry_record())
+
+    def test_a_rollout_that_existed_before_the_start_is_never_taken(self):
+        self._rollout("01a0fa57-0000-7000-8000-0000000000aa")
+        out = self._start()
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=timeout", out)
+        sid = "01a0fa57-0000-7000-8000-0000000000bb"
+        self.late.append(lambda: self._rollout(sid))
+        self.assertIn("session_id=" + sid, self._start(name="bl-c2"))
+
+    def test_other_cwd_subagent_and_stale_rollouts_are_ignored(self):
+        other = self.tmp_root / "elsewhere"
+        other.mkdir()
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c1", cwd=other))
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c2",
+                                               source={"subagent": {"parent": "x"}}))
+        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c3",
+                                               created=time.time() - 3600))
+        out = self._start()
+        self.assertIn("session_id=-", out)
+        self.assertIn("session_bind=timeout", out)
+        self.assertIsNone(self._registry_record())
+
+    def test_a_session_id_herdr_already_gave_is_kept_and_not_searched_for(self):
+        def with_session(argv, **kwargs):
+            if argv[:3] == ["herdr", "agent", "start"]:
+                self.calls.append(list(argv))
+                return _herdr_json({"result": {"agent": {
+                    "name": argv[3], "agent": "codex",
+                    "agent_session": {"value": "herdr-given-sid"}}}})
+            return self._fake_herdr(argv, **kwargs)
+        import io
+        import contextlib
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=with_session), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             contextlib.redirect_stdout(out):
+            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=herdr-given-sid", out.getvalue())
+        self.assertNotIn("session_bind=", out.getvalue())
+        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
+
+    def test_other_harnesses_are_not_searched_for_a_rollout(self):
+        out = self._start(kind="claude")
+        self.assertNotIn("session_bind=", out)
+        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
+
+    def test_the_cwd_defaults_to_the_launched_process_cwd(self):
+        sid = "01a0fa57-0000-7000-8000-0000000000d1"
+        self.late.append(lambda: self._rollout(sid))
+        import io
+        import contextlib
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
+             contextlib.redirect_stdout(out):
+            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=" + sid, out.getvalue())
+
+    def test_a_missing_proc_start_keeps_the_thread_id_but_writes_no_registry_record(self):
+        # Fleet rejects a record without a matching procStart, so none is written and the
+        # receipt says the binding is unregistered; the start itself is neither failed nor blocked.
+        sid = "01a0fa57-0000-7000-8000-0000000000e1"
+        self.late.append(lambda: self._rollout(sid))
+        with mock.patch.object(peer_steward, "_proc_start_ticks", return_value=None):
+            out = self._start()
+        self.assertIn("started=true", out)
+        self.assertIn("session_id=" + sid, out)
+        self.assertIn("session_bind=bound-unregistered", out)
+        self.assertNotIn("session_bind=bound ", out + " ")
+        self.assertIsNone(self._registry_record())
+        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
+        self.assertEqual(sent[0]["to"]["session_id"], sid)
+
+    def test_a_registry_write_that_fails_is_reported_unregistered_not_bound(self):
+        sid = "01a0fa57-0000-7000-8000-0000000000e2"
+        self.late.append(lambda: self._rollout(sid))
+        registry = peer_steward._session_registry()
+        with mock.patch.object(registry, "write", side_effect=OSError("read-only registry")):
+            out = self._start()
+        self.assertIn("session_id=" + sid, out)
+        self.assertIn("session_bind=bound-unregistered", out)
+
+
+class BindDeadlineConfirmationTest(unittest.TestCase):
+    """A single candidate counts only after a second observation, also at the deadline.
+
+    A rollout first seen on the final poll cannot be told apart from a concurrent same-cwd
+    start, so the bind ends as `timeout` instead of taking it.
+    """
+
+    def _bind(self, sightings):
+        """Run `_bind_codex_session` on a fake clock; `sightings[i]` is the poll-i rollout list."""
+        clock = {"now": 0.0}
+        polls = iter(sightings)
+        fake_time = mock.Mock()
+        fake_time.monotonic = lambda: clock["now"]
+        fake_time.sleep = lambda seconds: clock.__setitem__("now", clock["now"] + seconds)
+        fake_time.time = time.time
+        with mock.patch.object(peer_steward, "time", fake_time), \
+             mock.patch.object(peer_steward, "_fleet_codex_collector", return_value=object()), \
+             mock.patch.object(peer_steward, "_pane_codex_pid", return_value=4242), \
+             mock.patch.object(peer_steward, "_new_root_rollouts",
+                               side_effect=lambda *a, **k: next(polls, sightings[-1])), \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.25):
+            return peer_steward._bind_codex_session("w1:pM", "/work", "/home", set(), 0.0)
+
+    def test_a_candidate_first_seen_on_the_final_poll_is_not_bound(self):
+        # polls at t=0, .25, .5, .75 -- the candidate appears only on the last one
+        state, sid, pid, cwd = self._bind([[], [], [], ["sid-late"]])
+        self.assertEqual((state, sid), ("timeout", None))
+        self.assertEqual((pid, cwd), (4242, "/work"))
+
+    def test_a_candidate_seen_on_the_last_two_polls_is_bound(self):
+        state, sid, _pid, _cwd = self._bind([[], [], ["sid-ok"], ["sid-ok"]])
+        self.assertEqual((state, sid), ("bound", "sid-ok"))
+
+    def test_a_candidate_that_changes_on_the_final_poll_is_not_bound(self):
+        state, sid, _pid, _cwd = self._bind([[], [], ["sid-a"], ["sid-b"]])
+        self.assertEqual((state, sid), ("timeout", None))
+
+    def test_a_candidate_that_vanishes_before_confirmation_is_not_bound(self):
+        state, sid, _pid, _cwd = self._bind([["sid-a"], [], [], []])
+        self.assertEqual((state, sid), ("timeout", None))
 
 
 class _WatchMixin(_TmpRootMixin):
@@ -889,12 +1129,22 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             path = (_HERE / name).resolve()
             self.assertTrue(path.exists(), f"{name} missing")
             tree = ast.parse(path.read_text())
+            # The one bounded wait: `start` looks for the launched Codex thread's rollout for
+            # at most `_BIND_SECONDS`. It is launch bookkeeping, not a watch.
+            bounded_launch_bind = {
+                inner
+                for fn in ast.walk(tree)
+                if isinstance(fn, ast.FunctionDef) and fn.name == "_bind_codex_session"
+                for inner in ast.walk(fn)
+            }
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call):
                     func = node.func
                     dotted = (
                         isinstance(func, ast.Attribute) and func.attr == "sleep"
                     ) or (isinstance(func, ast.Name) and func.id == "sleep")
+                    if dotted and node in bounded_launch_bind:
+                        continue
                     self.assertFalse(dotted, f"{path.name} must not sleep")
                 if isinstance(node, ast.While):
                     test = node.test
@@ -1693,7 +1943,7 @@ class FromNameBareSubprocessTest(unittest.TestCase):
 class CurrentSessionIdentityDelegationTest(unittest.TestCase):
     """F-<next> fleet-route-chain-r2 plan §3 B-3: `_current_session_identity` delegates to
     `dispatch_parent_completion.interactive_parent_identity` first, keeping the prior
-    claude > codex > opencode > AGENT_SESSION_ID fallback for the ambiguous/unset case."""
+    AGENT_SESSION_ID fallback for the ambiguous/unset case; a native id is never guessed."""
 
     _ENV_KEYS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
                  "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "AGENT_SESSION_ID",
@@ -1715,11 +1965,25 @@ class CurrentSessionIdentityDelegationTest(unittest.TestCase):
                              AGENT_DISPATCH_CALLER_HARNESS="codex"):
             self.assertEqual(peer_steward._current_session_identity(), ("sid-x", "codex"))
 
-    def test_ambiguous_multiple_sessions_falls_back_to_legacy_priority(self):
+    def test_ambiguous_multiple_sessions_records_unknown_sender(self):
         # No explicit caller harness + two sessions set -> interactive_parent_identity()
-        # raises caller-harness-ambiguous; the prior claude-first order still applies.
+        # raises caller-harness-ambiguous. The sender is unknown, never the first of the
+        # claude > codex > opencode guesses (that named a Codex thread `claude [bc]`).
         with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x"):
-            self.assertEqual(peer_steward._current_session_identity(), ("sid-c", "claude"))
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
+
+    def test_ambiguous_env_keeps_the_agent_session_id_fallback(self):
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x",
+                             AGENT_SESSION_ID="sid-legacy"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-legacy", "unknown"))
+
+    def test_explicit_name_without_its_sid_never_takes_foreign_sid(self):
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", AGENT_DISPATCH_CALLER_HARNESS="codex"):
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
+
+    def test_invalid_explicit_name_never_takes_a_native_sid(self):
+        with self._clean_env(CODEX_THREAD_ID="sid-x", AGENT_DISPATCH_CALLER_HARNESS="gemini"):
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
 
     def test_single_session_delegates_cleanly(self):
         with self._clean_env(CODEX_THREAD_ID="sid-solo"):
@@ -1732,6 +1996,349 @@ class CurrentSessionIdentityDelegationTest(unittest.TestCase):
     def test_nothing_set_returns_empty_unknown(self):
         with self._clean_env():
             self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
+
+
+# --- clear (session-tidy auto-clear) ---------------------------------------------------
+
+RULE = "─" * 40
+CLAUDE_EMPTY = "\x1b[0m\x1b[38;2;80;80;80m❯ \x1b[0m\x1b[38;2;255;255;255m[earlier message]\x1b[0m\n\n" \
+    + RULE + "\n❯ \r\n" + RULE + "\n  \U0001f4c1 proj │ main\n  bypass permissions on\n"
+CLAUDE_SUGGESTION = "❯ earlier\n\n" + RULE + "\n❯ \x1b[2mrun the tests again\x1b[0m\n" + RULE + "\n  footer\n"
+CLAUDE_DRAFT = "❯ earlier\n\n" + RULE + "\n❯ half typed text\n" + RULE + "\n  footer\n"
+CLAUDE_DRAFT_SECOND_LINE = RULE + "\n❯ \x1b[2m\x1b[0m\n  second line of a draft\n" + RULE + "\n  footer\n"
+CLAUDE_FORM = "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n"
+CODEX_EMPTY = "recap line\n\n\n\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n  proj · master · Context 85% used\n"
+CODEX_DRAFT = "recap line\n\x1b[1m›\x1b[0m fix the flaky test\n\n  proj · master\n"
+CODEX_POPUP = "recap line\n\x1b[1m›\x1b[0m \n  /clear   start a new chat\n  /compact summarize\n"
+OPENCODE_EMPTY = "     ▣  Build · Model · 46m\n\n  ┃\n  ┃\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n   /path/to/project\n"
+OPENCODE_WIDE_EMPTY = "     \u25a3  Build \u00b7 Model\n\n  \u2503" + " " * 60 + "\n  \u2503" + " " * 60 + "\n  \u2503" + " " * 120 + "/path/to/project:\n  \u2503  Build \u00b7 Model OpenCode Go" + " " * 80 + "main\n  \u2579\u2580\u2580\u2580\u2580\u2580\n"
+OPENCODE_DRAFT = "     ▣  Build · Model\n\n  ┃  hello there\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
+OPENCODE_HOME_BLANK = "\n" * 12 + "  /path/to/project:main\n\n"     # 1.18.34: nothing but the cwd line
+OPENCODE_HOME = "\n\n  ┃  Ask anything... \"Fix broken tests\"\n  ┃\n  ┃  Build auto · Model OpenCode Go\n  ╹▀▀▀▀▀\n"
+NO_BOX = "just some output\nwith no prompt box at all\n"
+
+
+class _ClearWorld:
+    """A fake herdr: one pane whose agent record and visible screen change as the test says."""
+
+    def __init__(self, harness="claude", sid="sid-A", status="idle", pane="w1:pX", screens=None,
+                 new_sid="sid-B", home_after=None):
+        self.harness, self.sid, self.status, self.pane = harness, sid, status, pane
+        self.screens = list(screens or [CLAUDE_EMPTY])
+        self.new_sid, self.home_after = new_sid, home_after
+        self.sent = False
+        self.calls = []
+        self.prompt_rc = 0
+        self.reads = 0
+
+    def agent(self):
+        sid = self.new_sid if (self.sent and self.new_sid) else self.sid
+        return {"agent": self.harness, "agent_status": self.status, "name": "w", "pane_id": self.pane,
+                "agent_session": ({"agent": self.harness, "kind": "id", "value": sid}
+                                  if self.harness != "opencode" else None)}
+
+    def run(self, argv, **kw):
+        self.calls.append(list(argv))
+        if argv[:3] == ["herdr", "agent", "get"] or argv[:3] == ["herdr", "agent", "wait"]:
+            return _herdr_json({"id": "x", "result": {"agent": self.agent(), "type": "agent_info"}})
+        if argv[:3] == ["herdr", "agent", "read"]:
+            if self.sent and self.home_after is not None:
+                screen = self.home_after
+            else:
+                screen = self.screens[min(self.reads, len(self.screens) - 1)]
+                self.reads += 1
+            return subprocess.CompletedProcess(argv, 0 if screen is not None else 1,
+                                               stdout=screen or "", stderr="")
+        if argv[:3] == ["herdr", "pane", "process-info"]:
+            return _herdr_json({"id": "x", "result": {"process_info": {"foreground_processes": [
+                {"name": self.harness, "pid": 4242}]}, "type": "pane_process_info"}})
+        if argv[:3] == ["herdr", "agent", "prompt"]:
+            if self.prompt_rc == 0:
+                self.sent = True
+            return subprocess.CompletedProcess(argv, self.prompt_rc, stdout="{}", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    def typed(self):
+        return [c for c in self.calls if c[:3] in (["herdr", "agent", "prompt"], ["herdr", "agent", "send-keys"])]
+
+
+class ClearTest(_TmpRootMixin, unittest.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        import session_tidy as st
+        import session_tidy_clear as clear
+        self.st, self.clear = st, clear
+        self.seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "claude", "")
+        self.path = clear.reservation_path(self.seat.key)
+
+    def book(self, harness="claude", sid="sid-A", pane="w1:pX", seq=0, deadline_in=600):
+        st, clear = self.st, self.clear
+        seat = st.Seat("pane", st._digest("pane", pane), pane, harness, "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, harness, sid, "card body", prompt_seq=seq)
+            clear._write_reservation({
+                "schema": 1, "nonce": "n0nce", "status": "reserved", "created": now, "deadline": now + deadline_in,
+                "seat": {"kind": "pane", "key": seat.key, "pane": pane, "harness": harness, "project_key": ""},
+                "harness": harness, "sid": sid, "cwd": str(self.tmp_root),
+                "card_generation": card["generation"], "prompt_seq": seq})
+        self.path = clear.reservation_path(seat.key)
+        return seat
+
+    def clear_cmd(self, world, nonce="n0nce", extra=()):
+        argv = ["clear", world.pane, "--request", str(self.path), *( ["--nonce", nonce] if nonce else [] ), *extra]
+        printed = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(argv)
+        return rc, (printed[-1] if printed else "")
+
+    def rows(self):
+        return [r for r in self._all_records() if r.get("kind") == "notice"]
+
+    # -- success ------------------------------------------------------------------------
+
+    def test_an_idle_claude_with_an_empty_box_gets_exactly_one_clear_and_it_is_true(self):
+        self.book()
+        world = _ClearWorld(screens=[CLAUDE_EMPTY])
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("cleared=true", line)
+        self.assertIn("old_session=sid-A", line)
+        self.assertIn("new_session=sid-B", line)
+        prompts = [c for c in world.calls if c[:3] == ["herdr", "agent", "prompt"]]
+        self.assertEqual(prompts, [["herdr", "agent", "prompt", "w1:pX", "/clear"]])   # no trailer, no wait
+        self.assertEqual([c for c in world.calls if c[:3] == ["herdr", "agent", "send-keys"]], [])
+
+    def test_a_claude_suggestion_is_an_empty_box_but_typed_text_is_not(self):
+        for screen, expect in ((CLAUDE_SUGGESTION, "cleared=true"), (CLAUDE_DRAFT, "reason=draft"),
+                               (CLAUDE_DRAFT_SECOND_LINE, "reason=draft")):
+            with self.subTest(screen=screen[:30]):
+                self.book()
+                world = _ClearWorld(screens=[screen])
+                rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                self.assertEqual(rc, 0 if expect == "cleared=true" else 3)
+                self.assertEqual(len(world.typed()), 1 if rc == 0 else 0)
+
+    def test_codex_placeholder_is_empty_a_draft_or_a_popup_is_not(self):
+        for screen, expect in ((CODEX_EMPTY, "cleared=true"), (CODEX_DRAFT, "reason=draft"),
+                               (CODEX_POPUP, "reason=draft-unknown")):
+            with self.subTest(screen=screen[:40]):
+                self.book(harness="codex", sid="thr-A")
+                world = _ClearWorld(harness="codex", sid="thr-A", screens=[screen], new_sid="thr-B")
+                rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                self.assertEqual(len(world.typed()), 1 if expect == "cleared=true" else 0)
+
+    def test_opencode_types_new_and_the_home_screen_is_the_proof(self):
+        self.book(harness="opencode", sid="ses_A")
+        world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
+                            home_after=OPENCODE_HOME)
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "cleared=true" in line), (0, True), line)
+        self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "/new"]])
+        for after, expect in ((OPENCODE_HOME_BLANK, "cleared=true"), (OPENCODE_EMPTY, "cleared=unverified"),
+                              ("\n\n", "cleared=unverified")):
+            with self.subTest(after=after[:20]):
+                self.book(harness="opencode", sid="ses_A")
+                world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
+                                    home_after=after)
+                with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                self.assertEqual(len(world.typed()), 1, line)
+        # OpenCode's pane stays `done` through /new, so the pause between looks is a wait for the
+        # screen (event-driven), not the idle wait that would return at once.
+        self.book(harness="opencode", sid="ses_A")
+        world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
+                            home_after=OPENCODE_EMPTY)
+        with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 3):
+            rc, line = self.clear_cmd(world)
+        self.assertIn("cleared=unverified", line)
+        self.assertEqual(len([c for c in world.calls if c[:3] == ["herdr", "pane", "wait-output"]]), 2)
+        for screen, reason in ((OPENCODE_DRAFT, "draft"), (NO_BOX, "draft-unknown")):
+            self.book(harness="opencode", sid="ses_A")
+            world = _ClearWorld(harness="opencode", sid="ses_A", screens=[screen], new_sid=None)
+            rc, line = self.clear_cmd(world)
+            self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
+
+    # -- doubt is "not cleared": zero input ---------------------------------------------------
+
+    def test_working_blocked_unreadable_and_form_screens_get_no_input(self):
+        cases = (({"status": "working"}, "not-idle-working"), ({"status": "blocked"}, "form-open"),
+                 ({"status": "unknown"}, "not-idle-unknown"), ({"screens": [None]}, "screen-unknown"),
+                 ({"screens": [CLAUDE_FORM]}, "form-open"), ({"screens": [NO_BOX]}, "draft-unknown"))
+        for kwargs, reason in cases:
+            with self.subTest(reason=reason):
+                self.book()
+                world = _ClearWorld(**kwargs)
+                rc, line = self.clear_cmd(world)
+                self.assertEqual(rc, 3, line)
+                self.assertIn(f"reason={reason}", line)
+                self.assertEqual(world.typed(), [])
+
+    def test_a_draft_that_appears_between_the_two_looks_is_never_typed_over(self):
+        self.book()
+        world = _ClearWorld(screens=[CLAUDE_EMPTY, CLAUDE_DRAFT])      # the user starts typing after look 1
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=draft" in line, world.typed()), (3, True, []), line)
+
+    def test_a_new_request_expiry_a_stale_nonce_or_a_finished_booking_get_no_input(self):
+        seat = self.book(seq=0)
+        with self.st.seat_lock(seat.key):
+            self.st.bump_prompt_seq(seat, "claude", "sid-A", time.time())
+        world = _ClearWorld()
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=new-input" in line), (3, True))
+        self.book(deadline_in=-5)
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=expired" in line), (3, True))
+        self.book()
+        rc, line = self.clear_cmd(world, nonce="another")
+        self.assertEqual((rc, "reason=superseded" in line), (3, True))
+        self.assertEqual(world.typed(), [])
+        self.assertEqual(self.rows(), [])                               # a dead request leaves no ledger row
+
+    def test_the_target_must_be_the_booked_pane_harness_and_session(self):
+        for kwargs, label in (({"harness": "codex"}, "harness"), ({"sid": "someone-else"}, "session")):
+            with self.subTest(label):
+                self.book()
+                world = _ClearWorld(**kwargs)
+                rc, line = self.clear_cmd(world)
+                self.assertEqual((rc, "reason=target-changed" in line, world.typed()), (3, True, []), line)
+        self.book()
+        world = _ClearWorld()
+        world.pane = "w9:pZ"
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "reason=target-changed" in line), (3, True))
+
+    def test_the_new_session_is_the_process_one_when_herdr_reports_a_stale_session(self):
+        for proof, expect in (("sid-NEW", "cleared=true"), ("sid-A", "cleared=unverified")):
+            with self.subTest(process_says=proof):
+                self.book()
+                world = _ClearWorld(sid="sid-A", new_sid="sid-stale-older")   # herdr names an older session
+                with mock.patch("fleet.collectors.claude.session_id_of_process", return_value=proof), \
+                        mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertIn(expect, line)
+                if expect == "cleared=true":
+                    self.assertIn("new_session=sid-NEW", line)
+
+    def test_a_pane_record_that_lags_a_clear_is_settled_by_the_process_not_guessed(self):
+        # herdr still reports the session before the previous /clear; the process knows better.
+        for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
+            with self.subTest(process_says=proof):
+                self.book()
+                world = _ClearWorld(sid="sid-before-the-last-clear", new_sid="sid-B")
+                with mock.patch("fleet.collectors.claude.session_id_of_process",
+                                side_effect=lambda pid: "sid-B" if world.sent else proof):
+                    rc, line = self.clear_cmd(world)
+                self.assertEqual(len(world.typed()), expect_typed, line)
+                self.assertEqual("cleared=true" in line, bool(expect_typed), line)
+                if not expect_typed:
+                    self.assertIn("reason=target-changed", line)
+
+    def test_a_pane_record_without_a_session_id_is_cleared_only_when_the_process_names_the_booked_one(self):
+        # herdr names no session (`-`): not a confirmed match -- only the process can vouch for it.
+        for harness, collector in (("claude", "claude"), ("codex", "codex")):
+            for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
+                with self.subTest(harness=harness, process_says=proof):
+                    self.book(harness=harness)
+                    screen = CLAUDE_EMPTY if harness == "claude" else CODEX_EMPTY
+                    world = _ClearWorld(harness=harness, sid=None, new_sid=None, screens=[screen])
+                    with mock.patch(f"fleet.collectors.{collector}.session_id_of_process", return_value=proof), \
+                            mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                        rc, line = self.clear_cmd(world)
+                    self.assertEqual(len(world.typed()), expect_typed, line)
+                    if not expect_typed:
+                        self.assertEqual((rc, "reason=target-changed" in line), (3, True), line)
+
+    def test_a_codex_pane_record_that_trails_the_seat_ledger_is_not_a_changed_target(self):
+        # Shared app-server daemon: no rollout for the process check, herdr keeps the session
+        # before the last clear.  The seat ledger (both sessions' hooks at this pane) orders them.
+        st = self.st
+        seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "codex", "")
+        with st.seat_lock(seat.key):
+            st.record_event(seat, "codex", "sid-A", "prompt", cwd="/w", now=time.time() - 100)
+            st.record_event(seat, "codex", "sid-B", "prompt", cwd="/w", now=time.time() - 50)
+        for herdr_says, typed in (("sid-A", 1), ("sid-never-seen", 0), ("sid-B", 1)):
+            with self.subTest(herdr_says=herdr_says):
+                self.book(harness="codex", sid="sid-B")
+                world = _ClearWorld(harness="codex", sid=herdr_says, new_sid=None, screens=[CODEX_EMPTY])
+                # the process check may name the older session too (same-cwd fallback of the board)
+                with mock.patch("fleet.collectors.codex.session_id_of_process",
+                                return_value="sid-A" if herdr_says == "sid-A" else None), \
+                        mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                    rc, line = self.clear_cmd(world)
+                self.assertEqual(len(world.typed()), typed, line)
+                if typed:
+                    # the lagging value is never taken for the new session
+                    self.assertIn("cleared=unverified", line)
+                    self.assertNotIn("new_session=sid-A", line)
+                else:
+                    self.assertIn("reason=target-changed", line)
+
+    # -- after the send: never a second one -------------------------------------------------
+
+    def test_a_send_that_cannot_be_confirmed_is_unverified_and_nothing_else_is_typed(self):
+        self.book()
+        world = _ClearWorld(new_sid=None)                               # herdr keeps the old id, no hook note
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 5, line)
+        self.assertIn("cleared=unverified", line)
+        self.assertEqual(len(world.typed()), 1)                         # one /clear, no Enter retry, no resend
+
+    def test_the_start_hook_note_alone_proves_the_new_conversation(self):
+        seat = self.book()
+        world = _ClearWorld(new_sid=None)
+        original = world.run
+
+        def run(argv, **kw):
+            result = original(argv, **kw)
+            if argv[:3] == ["herdr", "agent", "prompt"]:               # the new session's start hook fires
+                with self.st.seat_lock(seat.key):
+                    self.clear.note_start_locked(seat, "claude", "sid-NEW", time.time() + 1)
+            return result
+        world.run = run
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "new_session=sid-NEW" in line), (0, True), line)
+
+    def test_a_failing_herdr_prompt_is_failed_and_herdr_missing_is_failed(self):
+        self.book()
+        world = _ClearWorld()
+        world.prompt_rc = 1
+        rc, line = self.clear_cmd(world)
+        self.assertEqual((rc, "cleared=failed" in line), (1, True), line)
+        printed = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value=None), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(["clear", "w1:pX", "--request", str(self.path)])
+        self.assertEqual((rc, printed[-1]), (1, "cleared=failed reason=herdr-not-found"))
+
+    def test_every_judged_call_leaves_one_notice_ledger_row_with_the_action(self):
+        self.book()
+        self.clear_cmd(_ClearWorld(screens=[CLAUDE_DRAFT]))
+        self.book()
+        self.clear_cmd(_ClearWorld(screens=[CLAUDE_EMPTY]))
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["kind"] == "notice" and "action=clear" in r["delivery"]["receipt"] for r in rows))
+        self.assertIn("cleared=skipped", rows[0]["delivery"]["receipt"])
+        self.assertIn("cleared=true", rows[1]["delivery"]["receipt"])
+        self.assertEqual((rows[1]["to"]["pane"], rows[1]["from"]["session_id"]), ("w1:pX", "sid-A"))
+
+    def test_the_screen_reader_decides_from_layout_not_from_wishful_text(self):
+        lines = peer_steward._screen_lines
+        draft = peer_steward._draft_state
+        self.assertEqual(draft("claude", lines(CLAUDE_EMPTY)), "empty")
+        self.assertEqual(draft("claude", lines(RULE + "\n❯ typed\n")), "nonempty")   # no closing rule: still a draft
+        self.assertEqual(draft("claude", lines(RULE + "\n❯\n")), "unknown")           # box never closes: unknown
+        self.assertEqual(draft("codex", lines("›\n")), "empty")
+        self.assertEqual(draft("opencode", lines("  ┃  just text\n")), "unknown")      # a single bar line is no box
+        self.assertEqual(draft("unheard-of", lines(CLAUDE_EMPTY)), "unknown")
 
 
 if __name__ == "__main__":

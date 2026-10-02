@@ -1,1 +1,0 @@
-../../../tools/worktree-lock.sh

@@ -55,6 +55,18 @@ def _registry_lines(jobs: Path, inherited: bool) -> list[str]:
         return []
 
 
+def _on_a_branch(cwd, commit) -> bool:
+    """True when ``commit`` is on a local or remote-tracking branch, not only the checkout's HEAD.
+
+    Work done in a linked worktree and merged through a PR lands on the remote main before
+    anyone moves the shared checkout, and moving it under live routes is not the finisher's job.
+    """
+    found = subprocess.run(["git", "-C", cwd, "for-each-ref", "--count=1", "--contains", commit,
+                            "--format=%(refname)", "refs/heads", "refs/remotes"],
+                           capture_output=True, text=True)
+    return found.returncode == 0 and bool(found.stdout.strip())
+
+
 def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, Any]:
     root = Path(route["artifact_root"]).resolve(strict=True)
     route_file = Path(route_file)
@@ -182,8 +194,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         raise InlineFinishError("finish-commit-invalid")
     ancestor = subprocess.run(["git", "-C", route["cwd"], "merge-base", "--is-ancestor", source, commit], capture_output=True)
     head = subprocess.run(["git", "-C", route["cwd"], "rev-parse", "HEAD"], capture_output=True, text=True)
-    commit_reachable = subprocess.run(["git", "-C", route["cwd"], "merge-base", "--is-ancestor", commit, "HEAD"], capture_output=True)
-    if ancestor.returncode or head.returncode or commit_reachable.returncode:
+    if ancestor.returncode or head.returncode or not _on_a_branch(route["cwd"], commit):
         raise InlineFinishError("finish-commit-not-source-descendant")
     # Tracked edits inside this direct node's declared scope are not admissible.
     scope = (node.get("write_scope") or [])
@@ -266,10 +277,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                     or current_route.get("route_hash") != intent["route_hash"]
                     or api.route_hash(current_route) != intent["route_hash"]):
                 raise InlineFinishError("finish-route-drift")
-            current_head = api._head_commit(route["cwd"])
-            if not current_head or subprocess.run(
-                    ["git", "-C", route["cwd"], "merge-base", "--is-ancestor", intent["commit"], current_head],
-                    capture_output=True).returncode:
+            if not _on_a_branch(route["cwd"], intent["commit"]):
                 raise InlineFinishError("finish-commit-drift")
             if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
                 raise InlineFinishError("finish-active-review-lease")

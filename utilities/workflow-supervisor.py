@@ -1042,7 +1042,8 @@ def create_local_frame_gate_delivery(route, gate, artifact, jobs_path, epoch, *,
                     and parse_registry_metadata(line.split("\t")[5]).get("attempt_id") == attempt]
         if len(metadata) != 1:
             raise SupervisorError("frame-gate-parent-binding-mismatch")
-        if metadata[0].get("parent_sid") != session:
+        from dispatch_seat_handover import owns   # the launching session, or its same-seat successor
+        if not owns(metadata[0], session, Path(jobs_path)):
             if gates_on():
                 raise SupervisorError("frame-gate-parent-binding-mismatch")
             same_work_or_refuse("frame-gate-parent-binding-mismatch")

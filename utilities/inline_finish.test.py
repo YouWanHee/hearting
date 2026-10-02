@@ -448,6 +448,29 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertIn("finish-commit-not-source-descendant", refused.stderr)
         self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
 
+    def _descendant_commit(self, branch=None):
+        tree = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD^{tree}"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        commit = subprocess.run(["git", "-C", str(self.repo), "commit-tree", tree, "-p", "HEAD",
+                                 "-m", "merged elsewhere"],
+                                check=True, capture_output=True, text=True).stdout.strip()
+        if branch:
+            subprocess.run(["git", "-C", str(self.repo), "update-ref", branch, commit], check=True)
+        return commit
+
+    def test_a_result_merged_on_another_branch_finishes_without_moving_head(self):
+        # A linked-worktree PR lands on the remote main while the shared checkout's HEAD stays put.
+        commit = self._descendant_commit("refs/remotes/origin/main")
+        self.command.extend(["--commit", commit])
+        finished = self.finish()
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+
+    def test_a_descendant_on_no_branch_is_refused(self):
+        self.command.extend(["--commit", self._descendant_commit()])
+        refused = self.finish()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("finish-commit-not-source-descendant", refused.stderr)
+
     def test_active_review_lease_is_refused_before_intent(self):
         lease_path = artifact_producer._review_lease_path(self.root, self.cycle["cycle_id"], "att-review")
         lease_path.parent.mkdir(parents=True, exist_ok=True)

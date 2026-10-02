@@ -17,6 +17,8 @@ const checkpointTrigger = path.join(root, "utilities", "artifact_checkpoint_trig
 const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
+const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
+const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_patch", "bash"])
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 const promptBySession = new Map()
 const turnBySession = new Map()
@@ -361,6 +363,18 @@ function promptText(output) {
     .join("\n")
 }
 
+// The inherited caller name and the other harnesses' session identity variables, blanked in
+// OpenCode tool commands. The worker marker AGENT_DISPATCH_CURRENT_HARNESS is left alone.
+const inheritedIdentityEnv = [
+  "AGENT_DISPATCH_CALLER_HARNESS",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_SESSION_ID",
+  "CLAUDECODE",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CODEX_THREAD_ID",
+  "CODEX_SESSION_ID",
+]
+
 export const AgentHarnessGuards = async (ctx) => {
   // Record plugin-load marker once per plugin init. In a headless dispatch the
   // runtime child inherits OPENCODE_DISPATCH_SLUG, so this proves the plugin
@@ -467,19 +481,33 @@ export const AgentHarnessGuards = async (ctx) => {
     runWorkerState("compact-before", input || {})
   },
   "shell.env": async (input, output) => {
-    // Sessionless compiles/binds are a real runtime state (undocumented
-    // sessionID, only typed optional upstream), not a theoretical one — never
-    // throw here, and set nothing when input.sessionID is absent.
-    const sid = input && input.sessionID
-    if (!sid || !output) return
+    // A harness clears the inherited caller name and every other harness's session id from
+    // its own tool commands (core/OPERATIONS.md); its own session id is then the only
+    // identity evidence and nothing exported here names a harness. The plugin env is merged
+    // over the inherited one. Sessionless compiles/binds are a real runtime state (undocumented sessionID,
+    // only typed optional upstream), not a theoretical one — never throw here, and set
+    // OPENCODE_SESSION_ID only when input.sessionID is present.
+    if (!output) return
     if (!output.env) output.env = {}
-    output.env.OPENCODE_SESSION_ID = sid
+    for (const key of inheritedIdentityEnv) output.env[key] = ""
+    const sid = input && input.sessionID
+    if (sid) output.env.OPENCODE_SESSION_ID = sid
   },
   // The two kept write gates (hooks/core-write-guard.py): installed release copies
   // and the shared checkout seen from a linked worktree. Anything else is allowed.
   "tool.execute.before": async (input, output) => {
     for (const file of targetFiles(ctx, input.tool || {}, output.args || {})) {
       const result = spawnSync("python3", [coreWriteGuard, "--check", file, "--cwd", baseDir(ctx)], {
+        encoding: "utf8",
+      })
+      if (result.status === 1) throw new Error((result.stdout || "").trim())
+    }
+    // The route presence gate (utilities/route_presence_gate.py): a session's first source
+    // edit, commit or long run in a folder needs a route there. Anything else passes.
+    const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
+    if (routeGateTools.has(toolName)) {
+      const result = spawnSync("python3", [routePresenceGate, "--opencode"], {
+        input: JSON.stringify({ tool: toolName, args: output.args || {}, sessionID: input.sessionID || "", cwd: baseDir(ctx) }),
         encoding: "utf8",
       })
       if (result.status === 1) throw new Error((result.stdout || "").trim())

@@ -488,5 +488,53 @@ class RegisteredOwnerInputTest(unittest.TestCase):
             self.assertEqual(sum('"text": "word' in line for line in prompt.splitlines()), 6)
 
 
+class OwnerFinishCorrectionRegressionTest(OwnerInputTest):
+    def test_parked_queued_response_explains_next_turn_delay_and_no_cancel(self):
+        from unittest import mock
+        phase = self.root / 'phase.json'
+        phase.write_text(json.dumps({'schema_version': 2, 'parent_attempt_id': self.attempt,
+                                     'phase': 'parked', 'delivered_attempt_ids': []}))
+        I.submit(self.jobs, self.attempt, 'private correction text', 'notice')
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_COMPLETION_STATE_FILE': str(phase)}):
+            result = I.inspect(self.jobs, self.attempt)
+        self.assertEqual(result.get('owner_phase'), 'parked')
+        self.assertEqual(result.get('delivery_timing'), 'next-owner-turn')
+        notice = result.get('delivery_notice', '').lower()
+        self.assertIn('next owner turn', notice)
+        self.assertIn('delay', notice)
+        self.assertIn('does not wake or cancel', notice)
+        self.assertNotIn('private correction text', json.dumps(result))
+
+    def test_codex_active_turn_without_exact_phase_reports_unavailable_timing(self):
+        from unittest import mock
+        I.submit(self.jobs, self.attempt, 'private correction text', 'phase-missing')
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('AGENT_DISPATCH_COMPLETION_STATE_FILE', None)
+            result = I.inspect(self.jobs, self.attempt)
+        self.assertEqual(result.get('owner_phase'), 'unknown')
+        self.assertEqual(result.get('delivery_timing'), 'phase-unavailable')
+        self.assertIn('timing is unknown', result.get('delivery_notice', '').lower())
+        self.assertNotIn('private correction text', json.dumps(result))
+
+    def test_codex_active_turn_with_exact_running_phase_reports_active_turn(self):
+        from unittest import mock
+        phase = self.root / 'phase-running.json'
+        phase.write_text(json.dumps({'schema_version': 2, 'parent_attempt_id': self.attempt,
+                                     'phase': 'running-turn', 'delivered_attempt_ids': []}))
+        I.submit(self.jobs, self.attempt, 'private correction text', 'phase-running')
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_COMPLETION_STATE_FILE': str(phase)}):
+            result = I.inspect(self.jobs, self.attempt)
+        self.assertEqual(result.get('owner_phase'), 'running-turn')
+        self.assertEqual(result.get('delivery_timing'), 'active-turn')
+
+    def test_queued_claude_and_opencode_remain_next_owner_turn(self):
+        for transport in ('claude-next-turn', 'opencode-next-turn'):
+            with self.subTest(transport=transport):
+                value = json.loads(I._path(self.jobs, self.attempt).read_text())
+                value['transport'] = transport
+                result = I._public(value, owner_phase='unknown')
+                self.assertEqual(result.get('delivery_timing'), 'next-owner-turn')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -46,6 +46,12 @@ LOCAL = "local"
 OWNER_CLAIMS = ".process-owners.json"
 OWNER_CLAIMS_LOCK = ".process-owners.lock"
 OWNER_CLAIMS_SCHEMA = 1
+# `stop` kills the tmux session before the run shell can write its own exit
+# code, so the stop itself records the outcome: 128 + SIGTERM(15), the same
+# value an operator previously wrote by hand (PAYLOAD_EXIT=143).
+STOP_EXIT_CODE = 143
+STOP_REASON_DEFAULT = "stopped"
+STOP_REASON_FILENAME = "stop_reason"
 SSH_BRIDGE_MAX_PROCESSES = 8192
 SSH_BRIDGE_MAX_SOCKET_ROWS = 32768
 SSH_BRIDGE_MAX_FDS = 256
@@ -155,6 +161,13 @@ def _record_claim(run_root, claim):
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _normalize_hostname(value):
+    """One comparison form for a hostname value ("" when not usable)."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().rstrip(".").casefold()
+
+
 def is_self(host):
     """True when this entry describes the machine we are already running on.
 
@@ -163,12 +176,24 @@ def is_self(host):
     host `local` would make the file machine-specific and turn moving the
     session host into an edit on every server. A declared `hostname` is matched
     against this machine's own, since an inventory label (`moving4`) and the
-    system hostname (`workstation`) need not agree.
+    system hostname (`workstation`) need not agree. The declaration may also be
+    a short name (`moving4` for `moving4.iip.lab`) or a list of names, of which
+    any one matching is enough.
     """
     if host.get("ssh_host") == LOCAL:
         return True
     declared = host.get("hostname")
-    return bool(declared) and declared == socket.gethostname()
+    names = declared if isinstance(declared, (list, tuple)) else [declared]
+    local = _normalize_hostname(socket.gethostname())
+    local_first = local.split(".", 1)[0]
+    for name in names:
+        candidate = _normalize_hostname(name)
+        if not candidate:
+            continue
+        if (candidate == local or candidate == local_first
+                or candidate.split(".", 1)[0] == local):
+            return True
+    return False
 
 
 def ssh_prefix(host):
@@ -510,11 +535,13 @@ import ipaddress
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from stat import S_ISREG
 
 try:
     OWNER_CLAIMS = json.loads(os.environ.get("HEARTING_OWNER_CLAIMS_JSON", "[]"))
@@ -758,7 +785,7 @@ COMMAND_ARGV_MAX = 32
 COMMAND_CELLS_MAX = 160
 
 
-def command_text(values):
+def command_text(values, cells_max=COMMAND_CELLS_MAX):
     # One control-free, display-bounded line from already bounded argv bytes.
     words = []
     for raw in list(values)[:COMMAND_ARGV_MAX]:
@@ -777,7 +804,7 @@ def command_text(values):
     for char in joined:
         width = (0 if unicodedata.combining(char) else
                  2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1)
-        if cells + width > COMMAND_CELLS_MAX:
+        if cells + width > cells_max:
             break
         out.append(char)
         cells += width
@@ -822,6 +849,57 @@ def process_cwd(pid, expected_start):
             or any(ord(char) < 32 or ord(char) == 127 for char in target)):
         return None
     return target
+
+
+PROGRESS_TAIL_BYTES = 4096
+PROGRESS_CELLS_MAX = 200
+ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_])")
+
+
+def process_progress(pid, expected_start):
+    # Last line of a file-redirected stdout/stderr; pipes, ttys and failures stay absent.
+    before = proc_stat(pid)
+    if (before is None or before["start"] != expected_start or not same_euid(pid)):
+        return None
+    chosen = None
+    for fd in (1, 2):
+        path = "/proc/%d/fd/%d" % (pid, fd)
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        if S_ISREG(info.st_mode) and (chosen is None or info.st_mtime > chosen[1].st_mtime):
+            chosen = (path, info)
+    if chosen is None:
+        return None
+    path, info = chosen
+    try:
+        # A fresh read-only description: the process's own offset is untouched,
+        # and a pipe swapped in after the stat is never read.
+        handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(handle)
+        if (not S_ISREG(opened.st_mode) or opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino):
+            return None
+        raw = os.pread(handle, PROGRESS_TAIL_BYTES,
+                       max(0, opened.st_size - PROGRESS_TAIL_BYTES))
+    except OSError:
+        return None
+    finally:
+        os.close(handle)
+    after = proc_stat(pid)
+    if (after is None or after["start"] != expected_start or not same_euid(pid)):
+        return None
+    text = ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
+    for piece in reversed(re.split(r"[\r\n]", text)):
+        line = command_text([piece], PROGRESS_CELLS_MAX)
+        if line:
+            return {"line": line, "age_s": max(0, int(time.time() - opened.st_mtime))}
+    return None
 
 
 def process_elapsed_s(start_ticks, uptime):
@@ -1102,6 +1180,9 @@ else:
         }
         if session_owner is not None:
             process["session_owner"] = session_owner
+        progress = process_progress(pid, stat["start"]) if stat is not None else None
+        if progress is not None:
+            process["progress"] = progress
         gpu = by_uuid.get(uuid)
         if gpu is None:
             payload["unmatched_processes"].append(process)
@@ -1440,9 +1521,81 @@ def _run_state(config, run_id):
             exit_code = int(exit_path.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             exit_code = None
+    stop_reason = _read_stop_reason(run_dir)
     return {"run_id": run_id, "dir": run_dir, "meta": meta,
-            "exit_code": exit_code,
+            "exit_code": exit_code, "stop_reason": stop_reason,
             "state": "finished" if exit_code is not None else "running"}
+
+
+def _stop_reason_path(run_dir):
+    return Path(run_dir) / STOP_REASON_FILENAME
+
+
+def _read_stop_reason(run_dir):
+    try:
+        text = _stop_reason_path(run_dir).read_text(
+            encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    return text.splitlines()[0][:64]
+
+
+def _record_stop(run_dir, exit_code=STOP_EXIT_CODE, reason=STOP_REASON_DEFAULT):
+    """Record a stop without overwriting a natural finish.
+
+    The exit file is written only when the run shell did not write one
+    (the tmux kill lands first). A concurrent natural finish that appears
+    between the kill and this call is left alone. Returns True when the
+    exit file was written by this call.
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    exit_path = run_dir / "exit_code"
+    wrote_exit = False
+    if not exit_path.is_file():
+        try:
+            exit_path.write_text(f"{exit_code}\n", encoding="utf-8")
+            wrote_exit = True
+        except OSError:
+            return False
+    else:
+        try:
+            int(exit_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            try:
+                exit_path.write_text(f"{exit_code}\n", encoding="utf-8")
+                wrote_exit = True
+            except OSError:
+                return False
+    if wrote_exit and reason:
+        try:
+            _stop_reason_path(run_dir).write_text(f"{reason}\n",
+                                                  encoding="utf-8")
+        except OSError:
+            pass
+    return wrote_exit
+
+
+def _tmux_session_alive(host, run_id, timeout=CONNECT_TIMEOUT):
+    """Best-effort tmux liveness: True/False, or None when unknown.
+
+    Unknown covers a missing tmux binary (e.g. nohup-backed runs), an
+    unreachable host, or any probe failure: the caller must keep showing
+    "running" rather than declaring the run gone.
+    """
+    script = (f"command -v tmux >/dev/null 2>&1 || exit 2; "
+              f"tmux has-session -t {shlex.quote(run_id)} 2>/dev/null")
+    try:
+        result = remote(host, script, timeout=timeout)
+    except Exception:
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
 
 
 def cmd_runs(args):
@@ -1461,16 +1614,42 @@ def cmd_runs(args):
         rows.append(state)
         if len(rows) >= args.limit:
             break
+    for row in rows:
+        if row["exit_code"] is None and not row.get("stop_reason"):
+            host_name = row["meta"].get("host")
+            alive = None
+            if host_name:
+                try:
+                    (_name, host), = _select(config, [host_name])
+                except ConfigError:
+                    alive = None
+                else:
+                    alive = _tmux_session_alive(host, row["run_id"])
+            row["stale"] = (alive is False)
+            row["state"] = "stopped" if alive is False else "running"
+        else:
+            row["stale"] = False
+            if row["exit_code"] is None and row.get("stop_reason"):
+                row["state"] = "stopped"
     if args.json:
         print(json.dumps([{k: (str(v) if k == "dir" else v)
-                           for k, v in row.items()} for row in rows],
+                           for k, v in row.items() if k != "session_alive"}
+                          for row in rows],
                          ensure_ascii=False, sort_keys=True))
         return 0
     for row in rows:
-        tail = (f"exit {row['exit_code']}" if row["exit_code"] is not None
-                else "running")
+        if row["exit_code"] is not None:
+            reason = row.get("stop_reason")
+            tail = (f"exit {row['exit_code']} ({reason})" if reason
+                    else f"exit {row['exit_code']}")
+        elif row.get("stale"):
+            tail = "stopped (gone)"
+        elif row.get("stop_reason"):
+            tail = f"stopped ({row['stop_reason']})"
+        else:
+            tail = "running"
         command = " ".join(row["meta"].get("command") or [])
-        print(f"  {row['run_id']:<34} {tail:<10} {command[:60]}")
+        print(f"  {row['run_id']:<34} {tail:<20} {command[:60]}")
     if not rows:
         print("  (none)")
     return 0
@@ -1487,7 +1666,9 @@ def cmd_tail(args):
     for line in lines[-args.lines:]:
         print(line)
     if state["exit_code"] is not None:
-        print(f"-- finished, exit {state['exit_code']} --")
+        reason = state.get("stop_reason")
+        suffix = f" ({reason})" if reason else ""
+        print(f"-- finished, exit {state['exit_code']}{suffix} --")
     return 0
 
 
@@ -1501,7 +1682,26 @@ def cmd_stop(args):
     (name, host), = _select(config, [host_name])
     result = remote(host, f"tmux kill-session -t {shlex.quote(args.run_id)} "
                           f"2>/dev/null && echo stopped || echo 'not running'")
-    print((result.stdout or result.stderr).strip())
+    output = (result.stdout or result.stderr).strip()
+    print(output)
+    if result.returncode != 0:
+        return 0
+    killed = "stopped" in output.splitlines()
+    if killed:
+        should_record = True
+    else:
+        # Already no session (legacy stale or finished): record only when
+        # tmux is present and confirms the session is gone, never for
+        # unknown hosts (missing tmux, unreachable) where a nohup-backed
+        # run may still be alive.
+        should_record = (_tmux_session_alive(host, args.run_id) is False)
+    if should_record:
+        fresh = _run_state(config, args.run_id)
+        if fresh["exit_code"] is None and not fresh.get("stop_reason"):
+            try:
+                _record_stop(fresh["dir"])
+            except OSError as exc:
+                print(f"note: could not record stop: {exc}", file=sys.stderr)
     return 0
 
 

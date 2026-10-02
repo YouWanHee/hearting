@@ -6,15 +6,19 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+from dispatch_contract import process_launch_identity
 from dispatch_lifecycle import begin_finite_watchdog
 from review_watchdog import (
+    _identity,
     _reap_child,
     _receipt,
     _run_watchdog,
@@ -302,29 +306,86 @@ class ReviewWatchdogIntegrationTest(unittest.TestCase):
             type(budget)(1.25, 100, 1_250_000_100, float("nan"))
 
     def test_timeout_reaps_child_and_releases_exact_lease(self):
+        # The watchdog loop runs in this process and the test owns its clock:
+        # the deadline passes only after COMMIT was consumed (the watchdog then
+        # closes its control end), so the post-commit timeout is exercised no
+        # matter how slowly a loaded runner admits the child. A wall-clock
+        # budget raced the admission here: at 0.2s, COMMIT met a closed pipe.
+        # The child, its reap and the lease release stay real.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            marker = root / "marker"
+            jobs = root / "jobs.log"
             lease = self._seed_lease(root, "cyc-timeout", "att-timeout")
+            ready_read, ready_write = os.pipe()
+            control_read, control_write = os.pipe()
             gate_read, gate_write = os.pipe()
-            code = "import os,time; os.read(int(os.environ['REVIEW_GATE']),1); time.sleep(5)"
-            handle = launch_review_watchdog(
-                [sys.executable, "-c", code], gate_fd=gate_read,
-                # Long enough that commit() always lands before the deadline on a loaded
-                # runner (0.2 s raced it: the watchdog timed out first and the commit hit a
-                # closed control pipe); the child still sleeps past it, so this is a timeout.
-                budget=begin_finite_watchdog(1.5), attempt_id="att-timeout",
-                nonce="c" * 64,
-                env={**os.environ, "REVIEW_GATE": str(gate_read)},
-                lease_release_spec={"root": str(root), "cycle_id": "cyc-timeout", "attempt_id": "att-timeout"},
-                jobs=root / "jobs.log",
-            )
-            os.close(gate_read)
-            receipt = handle.read_ready(1.0)
-            self._write_timeout_row(root / "jobs.log", receipt)
-            handle.commit()
-            os.close(gate_write)
-            self.assertEqual(handle.process.wait(timeout=6), 124)
+            expired = threading.Event()
+            receipts = []
+            consumed = []
+
+            def launcher():
+                try:
+                    line = b""
+                    while not line.endswith(b"\n"):
+                        chunk = os.read(ready_read, 4096)
+                        if not chunk:
+                            return
+                        line += chunk
+                    receipt = json.loads(line)
+                    receipts.append(receipt)
+                    self._write_timeout_row(jobs, receipt)
+                    os.write(control_write, b"COMMIT\n")
+                    os.close(gate_write)
+                    # POLLERR is reported once the watchdog closed the read end.
+                    poller = select.poll()
+                    poller.register(control_write, 0)
+                    consumed.extend(poller.poll(10_000))
+                finally:
+                    expired.set()
+
+            own_pid = os.getpid()
+
+            def identity(pid):
+                # The detached watchdog leads its own process group; this
+                # in-process stand-in need not, and only that check is relaxed.
+                return process_launch_identity(pid) if pid == own_pid else _identity(pid)
+
+            helper = threading.Thread(target=launcher)
+            code = "import os,time; os.read(int(os.environ['REVIEW_GATE']),1); time.sleep(60)"
+            result = None
+            try:
+                helper.start()
+                with mock.patch.dict(os.environ, {"REVIEW_GATE": str(gate_read)}), \
+                     mock.patch("review_watchdog._identity", side_effect=identity), \
+                     mock.patch("review_watchdog.remaining_watchdog_seconds",
+                                side_effect=lambda *_a, **_k: 0.0 if expired.is_set() else 1.0):
+                    result = _run_watchdog(
+                        attempt_id="att-timeout", budget=begin_finite_watchdog(60),
+                        readiness_fd=ready_write, control_fd=control_read, gate_fd=gate_read,
+                        child_argv=[sys.executable, "-c", code], nonce="c" * 64,
+                        lease_release_spec={"root": str(root), "cycle_id": "cyc-timeout", "attempt_id": "att-timeout"},
+                        jobs=jobs,
+                    )
+            finally:
+                expired.set()
+                helper.join(10)
+                if receipts and result is None:
+                    # _run_watchdog raised before its own reap: leave no child.
+                    try:
+                        os.killpg(int(receipts[0]["child"]["pgid"]), signal.SIGKILL)
+                    except (OSError, KeyError, ValueError):
+                        pass
+                for fd in (ready_read, control_write, gate_write):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self.assertFalse(helper.is_alive())
+            self.assertTrue(consumed, "the watchdog never consumed COMMIT")
+            self.assertEqual(result, 124)
+            child_pid = int(receipts[0]["child"]["pid"])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
             self.assertIsNotNone(json.loads(lease.read_text(encoding="utf-8"))["released_at"])
 
     def test_normal_exit_releases_exact_lease(self):

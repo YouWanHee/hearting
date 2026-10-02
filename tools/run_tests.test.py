@@ -670,6 +670,23 @@ class RetryFixture(RunTestsFixtureBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "attempts.txt").read_text(), "1")
 
+    def test_unlisted_failure_that_passes_alone_is_flaky_pass(self):
+        # A suite with no baseline row that fails in the main run gets one serial
+        # retry; passing alone means load/timing, reported but not fatal.
+        self.write_retry_suite("fail-pass")
+        result, rows = self.run_fixture([], extra_args=["--retries", "1"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows[0]["verdict"], "FLAKY-PASS")
+        self.assertIn("policy=unlisted-serial-retry", rows[0]["detail"])
+        self.assertEqual((self.root / "attempts.txt").read_text(), "2")
+
+    def test_unlisted_failure_that_fails_again_still_fails(self):
+        self.write_retry_suite("all-fail")
+        result, rows = self.run_fixture([], extra_args=["--retries", "1"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(rows[0]["verdict"], "FAIL")
+        self.assertEqual((self.root / "attempts.txt").read_text(), "2")
+
     def test_kind_mismatch_wins_over_flaky_aggregate(self):
         self.write_retry_suite("mismatch")
         result, rows = self.run_fixture(self.baseline(), extra_args=["--retries", "1"])
@@ -715,6 +732,64 @@ class RetryFixture(RunTestsFixtureBase):
                 f"run stderr attempt {number}",
                 (diagnostics / row["stderr_path"]).read_text(encoding="utf-8"),
             )
+
+
+class ChildStderrDiagnosticsFixture(RunTestsFixtureBase):
+    """A failing suite's diagnostics keep the stderr of a child it captured.
+
+    The fixture asserts only on the child's stdout, as the completion-marker
+    suite did when the route guard's reason never reached the CI artifact.
+    """
+
+    SUITE = """\
+        import subprocess, sys
+        for _ in range(3):
+            child = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; print('check=failed'); sys.exit('guard reason: tuple drifted')"],
+                capture_output=True, text=True,
+            )
+        quiet = subprocess.run([sys.executable, "-c", "import sys; sys.stderr.write('passing noise')"],
+                               capture_output=True, text=True)
+        assert quiet.returncode == 0
+        assert "reason=expected" in child.stdout, child.stdout
+    """
+
+    def test_failing_suite_keeps_captured_child_stderr(self):
+        write_suite(self.root, "swallow.test.py", self.SUITE)
+        diagnostics = self.root / "diagnostics"
+        result, rows = self.run_fixture([], extra_args=["--diagnostics-dir", str(diagnostics)])
+        self.assertEqual(rows[0]["verdict"], "FAIL", result.stdout + result.stderr)
+        kept = list(diagnostics.glob("*/attempt-001.child-stderr.txt"))
+        self.assertEqual(len(kept), 1, sorted(p.name for p in diagnostics.rglob("*")))
+        text = kept[0].read_text(encoding="utf-8")
+        self.assertIn("guard reason: tuple drifted", text)
+        # Three identical failures in one process are kept once.
+        self.assertEqual(text.count("--- rc=1 "), 1, text)
+        self.assertNotIn("passing noise", text)
+
+    def test_passing_suite_writes_no_child_stderr(self):
+        write_suite(self.root, "swallow.test.py",
+                    self.SUITE.replace('"reason=expected" in', '"check=failed" in'))
+        diagnostics = self.root / "diagnostics"
+        result, rows = self.run_fixture([], extra_args=["--diagnostics-dir", str(diagnostics)])
+        self.assertEqual(rows[0]["verdict"], "PASS", result.stdout + result.stderr)
+        self.assertEqual(list(diagnostics.glob("*/*.child-stderr.txt")), [])
+
+    def test_hook_leaves_the_callers_result_unchanged(self):
+        runner = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            env = runner.build_isolated_env(Path(td))
+            probe = subprocess.run(
+                [sys.executable, "-c",
+                 "import subprocess, sys; r = subprocess.run([sys.executable, '-c', "
+                 "'import sys; sys.exit(\"why\")'], capture_output=True, text=True); "
+                 "print(r.returncode, repr(r.stderr))"],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(probe.stdout.strip(), "1 'why\\n'", probe.stderr)
+            self.assertIn("why", runner.collect_child_stderr(env))
+            self.assertEqual(runner.collect_child_stderr(env), "")
 
 
 class DiagnosticConfinementTest(RunTestsFixtureBase):

@@ -13,7 +13,20 @@ import route_identity as ROUTE_IDENTITY
 
 
 COMPATIBILITY_FLOOR = 12
+WORKLOAD_FLOOR = 32
 TERMINAL_RESERVE_DEFAULT = 1
+
+
+def derive_workload_ordinary(*, declared_nodes: int, retry_slots: int,
+                             review_round_cap: int, terminal_nodes: int) -> int:
+    """Finite conservative headroom for dispatch, review and final collection."""
+    values = (declared_nodes, retry_slots, review_round_cap, terminal_nodes)
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+        raise ValueError("continuation workload dimensions must be non-negative integers")
+    if review_round_cap < 1:
+        raise ValueError("review round cap must be positive")
+    return max(WORKLOAD_FLOOR,
+               4 * declared_nodes + 4 * retry_slots * (review_round_cap + 2) + terminal_nodes + 2)
 
 
 @dataclass(frozen=True)
@@ -155,8 +168,19 @@ def resolve_continuation_budget(
     if len(retry_ids) != len(boundaries) or not set(retry_ids).issubset(node_ids):
         return ContinuationBudget(COMPATIBILITY_FLOOR, "compatibility-floor")
     retry_slots = len(set(retry_ids))
+    import review_round_cap
+    sealed_budget = route.get("continuation_budget")
+    cap = sealed_budget.get("review_round_cap") if isinstance(sealed_budget, dict) else None
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+        cap = review_round_cap.max_review_rounds(route.get("effective_intensity", "standard"))
+    contract = route.get("workflow_contract") or {}
+    terminals = contract.get("terminal_nodes")
+    if not isinstance(terminals, list) or not terminals:
+        terminals = [node for node in nodes if isinstance(node, dict) and node.get("terminal") is True]
+    terminal_count = len(terminals) or 1
     return ContinuationBudget(
-        max(COMPATIBILITY_FLOOR, len(node_ids) + retry_slots),
+        derive_workload_ordinary(declared_nodes=len(node_ids), retry_slots=retry_slots,
+                                 review_round_cap=cap, terminal_nodes=terminal_count),
         "bound-route",
         declared_nodes=len(node_ids),
         retry_slots=retry_slots,

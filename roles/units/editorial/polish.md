@@ -12,6 +12,10 @@ io:
 tools: []
 branches: [direct, pipeline]
 aliases: {}
+bootstrap:
+  memory: [report-format]
+  exemplar: deliverable
+  gates: [audit-report]
 ---
 
 # Unit: editorial/polish

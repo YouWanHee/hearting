@@ -19,6 +19,11 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # nodes replacing the removed `frame`/`frame-contrarian` parallel group).
 # 2026-09-27 SD-160: only group digests re-frozen after removing required
 # cross-harness axes; node fields, width, persona and budget remain unchanged.
+# 2026-09-30 report-format-bootstrap: only node digests of the four reader-facing report nodes
+# (code report, design handoff, draft finalize, lab report) re-frozen for role `deep editor` +
+# `balanced-deep`; group digests and every other node field are unchanged.
+# 2026-10-02 entry approvals: only refine review's declared preview output changes;
+# all other node fields and parallel group digests remain at their pinned values.
 PRESERVED_FULL_FIELD_DIGESTS = {
     # Added with the compiler-internal framed recipe (v3.0 part 3): two `top` frame legs and the
     # model-less runtime terminal. No other entry moves.
@@ -43,15 +48,15 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "a9b802f929cb1efdf839e4bae6f9f7c03bad3466d6193b9ff23d22a4ba9faaa9",
     ),
     ("autopilot-code", ('audit', 'debug', 'dev')): (
-        "98bbd87ff7440870fc16e8a1dd8beb6cf13bf3c2385a3fb8d17b848674078f4a",
+        "2a5544328e29101bdb53dc3c649ff74adff685375e86999938189628a274ed1a",
         "c04f23733b6f6ad650d53b8997143b735c771631b5eaa8fb8679bb2f38555cbc",
     ),
     ("autopilot-design", ('default',)): (
-        "6417f8e67ea088edc2ee40703ea44e5aae2c0c27c7ca623d1deb408ebf00b1e8",
+        "450e191eb79a83aabbcdd0430d9dd0fe1dc5361e28799b29560edeb9b333b3d7",
         "535ac7afb655d7d8040841733ed2b46bb7cb7d467279b7ed83cf34496659fca5",
     ),
     ("autopilot-draft", ('doc', 'paper', 'presentation')): (
-        "948eae0caa20b7f15d45cf51635fc2d58d8bf13b96edc2325a0061570a2caa77",
+        "dc91956ddb9d5cc79f171fabaa3258d6bb13cb9df07fcdb0f8bf26bafa2429dc",
         "e51f3d86b5ead6ac1573610fe55fb0994de2b86658fb1ef09a6c227bc487b0cb",
     ),
     ("autopilot-lab", ('setup',)): (
@@ -59,14 +64,13 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "d06d03e9406c69a6d152d7c828ae6f271f5a3bf6588790d6d7b9d8509b7df964",
     ),
     ("autopilot-lab", ('eval',)): (
-        "df6ae2485880a9b4edd9c284409c3a3491862d2a8aeb4de274d685870dc83527",
+        "57a8d1b68a185d2c68aa2a67fd1a11ea0e928017b7cd30018c9ebb5edc544eb8",
         "0a81c46ba217f0b843cf8f2b2386c8fe1412c0029f59b3c112f13b1f7e19edda",
     ),
-    # refine re-frozen again the same cycle: `review` keeps its
-    # `preview-disposition` human-gate continuation (user decision 2026-09-10 --
-    # an approval before the edit applies, not a direction gate to absorb).
+    # The base recipe retains the legacy preview gate; scoped new compiles
+    # remove its wait and the review now produces the actual report preview.
     ("autopilot-refine", ('default',)): (
-        "f0aa0bf8bbbb0c9dff3ab060674bc0a9c7d23a40e46d823e48817aef0ae5206f",
+        "719b9c8854a41f7494a6fc3a6ed6e2bed2bff2367dbad37bf958d52345af03ec",
         "e3ccd3e7ac35fe27b3fa77ae5a9744d8dbee11c8ccf223a1c258aaaf905d889d",
     ),
     ("autopilot-research", ('academic', 'market', 'technology')): (

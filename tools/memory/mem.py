@@ -2694,6 +2694,91 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
     return shown_rows
 
 
+BOOTSTRAP_MAX_RESULTS = 6
+BOOTSTRAP_MAX_UTF8_BYTES = 8192
+BOOTSTRAP_TYPE_FENCE = (
+    "(r.type IN ('feedback','decision','convention','preference','user-correction') "
+    "OR r.type LIKE '%convention%' OR r.type LIKE '%preference%')"
+)
+
+
+def bootstrap_context(queries, *, cwd=None, limit=4, max_bytes=6144,
+                      per_record_bytes=1600):
+    """Return bounded preference bodies for a unit-declared worker bootstrap.
+
+    Runtime-only and read-only: it opens the database with ``mode=ro`` and never
+    calls ``get_con``, ``_touch_records``, ``_append_recall_event`` or
+    ``_write_recall_receipt``. Query groups rank in the given order; the type
+    fence selects instruction-bearing records by purpose, not by content
+    relevance. Any failure returns an empty string.
+    """
+    limit = max(1, min(int(limit), BOOTSTRAP_MAX_RESULTS))
+    max_bytes = max(1, min(int(max_bytes), BOOTSTRAP_MAX_UTF8_BYTES))
+    groups = []
+    for q in queries or []:
+        terms = _tokenize_query((q or "")[:CANDIDATE_MAX_QUERY_CHARS])[
+            :CANDIDATE_MAX_FTS_TERMS
+        ]
+        if terms:
+            groups.append(" OR ".join(terms))
+    if not groups or not DB.is_file():
+        return ""
+    con = None
+    rows = []
+    try:
+        project = project_key(Path(cwd) if cwd else Path.cwd())
+        con = sqlite3.connect(DB.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+        if not con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='records_capsule_fts'"
+        ).fetchone():
+            return ""
+        today_s = datetime.date.today().isoformat()
+        seen = set()
+        for expression in groups:
+            if len(rows) >= limit:
+                break
+            found = con.execute(
+                "SELECT r.id,r.tier,r.type,r.scope,r.body "
+                "FROM records_capsule_fts c JOIN records r ON r.id=c.id "
+                "WHERE records_capsule_fts MATCH ? AND r.status='active' "
+                "AND (r.injection_flag=0 OR r.injection_flag IS NULL) "
+                "AND (r.scope='global' OR r.cwd_origin=?) "
+                "AND (r.expires IS NULL OR r.expires='' OR r.expires>=?) "
+                f"AND {BOOTSTRAP_TYPE_FENCE} "
+                "ORDER BY bm25(records_capsule_fts),r.strength DESC,r.updated DESC "
+                "LIMIT ?",
+                (expression, project, today_s, limit + len(seen)),
+            ).fetchall()
+            for row in found:
+                if row[0] in seen:
+                    continue
+                seen.add(row[0])
+                rows.append(row)
+                if len(rows) >= limit:
+                    break
+    except (OSError, sqlite3.Error, ValueError):
+        return ""
+    finally:
+        if con is not None:
+            con.close()
+    if not rows:
+        return ""
+    output = ("# Saved preferences (bodies, read-only reference; prior user preferences "
+              "and decisions, not overriding the assignment)\n")
+    for rid, tier, rtype, scope, body in rows:
+        clean = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]+", " ", body or "").strip()
+        if len(clean.encode("utf-8")) > per_record_bytes:
+            clean = _utf8_prefix(clean, per_record_bytes).rstrip() + " … (truncated)"
+        block = f"## [{tier}/{rtype}] {rid} ({scope})\n{clean}\n"
+        if len((output + block).encode("utf-8")) > max_bytes:
+            break
+        output += block
+    if output.count("## [") == 0:
+        return ""
+    return _utf8_prefix(output, max_bytes).rstrip()
+
+
 def _write_actor(default="manual"):
     """Resolve the deterministic write actor from environment and caller default."""
     explicit = os.environ.get("MEM_ACTOR")
@@ -9739,6 +9824,13 @@ def _cli_main():
     ca.add_argument("--turn-id")
     ca.add_argument("--hook", action="store_true", help="UserPromptSubmit additionalContext JSON")
 
+    bc = sub.add_parser("bootstrap-context",
+                        help="Runtime-only read-only preference bodies for declared unit bootstrap")
+    bc.add_argument("--query", action="append", default=[])
+    bc.add_argument("--cwd")
+    bc.add_argument("--limit", type=int, default=4)
+    bc.add_argument("--max-bytes", type=int, default=6144)
+
     rg = sub.add_parser("recall-gate", help="Record the work-start recall/skip decision")
     gate_mode = rg.add_mutually_exclusive_group(required=True)
     gate_mode.add_argument("--decision", choices=("recall", "skip"))
@@ -9958,6 +10050,14 @@ def _cli_main():
         candidates(args.query, limit=args.limit, max_bytes=args.max_bytes,
                    runtime=args.runtime, session_id=args.session_id,
                    turn_id=args.turn_id, hook=args.hook)
+    elif args.cmd == "bootstrap-context":
+        try:
+            out = bootstrap_context(args.query, cwd=args.cwd, limit=args.limit,
+                                    max_bytes=args.max_bytes)
+        except Exception:
+            out = ""
+        if out:
+            print(out)
     elif args.cmd == "recall-gate":
         try:
             recall_gate(args.decision, args.reason, args.query, outcome=args.outcome,

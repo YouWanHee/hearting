@@ -5654,6 +5654,46 @@ class ContinuationBudgetSealedBlockTest(unittest.TestCase):
   self.assertEqual(route["continuation_budget"]["limit"],budget.limit)
 
 
+class OwnerFinishBudgetRegressionTest(unittest.TestCase):
+ def test_compiler_and_resolver_share_workload_formula(self):
+  import dispatch_continuation_budget as BUDGET
+  route=R.compile_route(**TestRoute().args())
+  block=route["continuation_budget"]
+  self.assertGreaterEqual(block["ordinary"],32)
+  self.assertEqual(block["ordinary"],BUDGET.derive_workload_ordinary(
+   declared_nodes=block["declared_nodes"], retry_slots=block["retry_slots"],
+   review_round_cap=block["review_round_cap"], terminal_nodes=block["terminal_nodes"]))
+
+ def test_correct_cli_prints_the_shared_correction_delivery_notice(self):
+  sys.path.insert(0, str(P.parent))
+  import dispatch_owner_input as owner_input
+  import dispatch_contract
+  attempt="att-parent"
+  jobs=Path(tempfile.mkdtemp())/"jobs.log"
+  lease=dispatch_contract.supervisor_lease_path(jobs,attempt)
+  jobs.parent.mkdir(parents=True,exist_ok=True)
+  jobs.write_text("2026-10-02T00:00:00Z\topen\t/repo\t/wt\towner\t"
+   +"attempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,"
+   +"registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=codex,"
+   +"completion_delivery=app-server-supervised,supervisor_lease=flock-v1,"
+   +f"supervisor_lease_file={lease},supervisor_lease_nonce={'d'*64},attempt_id={attempt},"
+   +"owner_route_id=rt-fixture,owner_route_hash=sha256:"+"a"*64+",route_id=rt-fixture,route_hash=sha256:"+"a"*64+",parent_sid=fixture\n")
+  with dispatch_contract.hold_supervisor_lease(jobs,attempt,lease):
+   owner_input.OwnerInput(jobs,attempt,"thread-fixture","codex-active-turn",lambda _event:None)
+   owner_input.submit(jobs,attempt,"private", "request-cli")
+   result=subprocess.run([sys.executable,str(P),"correct","--attempt-id",attempt,"--jobs",str(jobs)],
+    capture_output=True,text=True,check=False)
+  self.assertEqual(0,result.returncode,result.stderr)
+  value=json.loads(result.stdout)
+  self.assertIn("delivery_notice",value)
+  self.assertIn("does not wake or cancel",value["delivery_notice"])
+
+
+class OwnerFinishCorrectionRegressionTest(OwnerFinishBudgetRegressionTest):
+ def test_cli_delivery_notice_regression(self):
+  self.test_correct_cli_prints_the_shared_correction_delivery_notice()
+
+
 class FrameSummaryContractTest(unittest.TestCase):
  """A50-9 / N3 / R2-3: shards/frame/frame-summary.json contract, documented in
  skills/autopilot-code/references/owner-execution.md and
@@ -6329,6 +6369,42 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_old_refine_route_uses_exact_git_show_catalog_and_unrelated_digest_drift_stays_stale(self):
+  import subprocess
+  current = R.TOPO.load_registry()
+  # Keep the pre-entry-scope catalog in a private repository: this checkout's
+  # HEAD already includes the change once committed, and moves again on merge.
+  old_catalog = json.loads(json.dumps(current))
+  transaction = old_catalog["part_catalog"]["parts"]["autopilot-refine:transaction"]
+  self.assertEqual(transaction.pop("start_approval"), "preview")
+  recipe = next(row for row in old_catalog["recipes"] if row["capability"] == "autopilot-refine")
+  review = next(node for node in recipe["standard_plus"]["nodes"] if node["id"] == "review")
+  review["outputs"].remove("reviews/refine/preview.md")
+  repo = Path(self._tmp_home.name) / "old-catalog-repo"
+  (repo / "capabilities").mkdir(parents=True)
+  (repo / "capabilities/topologies.json").write_text(json.dumps(old_catalog, indent=2) + "\n")
+  subprocess.run(["git", "init", "-q", str(repo)], check=True)
+  subprocess.run(["git", "add", "capabilities/topologies.json"], cwd=repo, check=True)
+  subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                  "commit", "-qm", "Before entry scope"], cwd=repo, check=True)
+  git_show_registry = json.loads(subprocess.check_output(
+   ["git","show","HEAD:capabilities/topologies.json"],cwd=repo,text=True))
+  reconstructed = R._entry_scope_legacy_registry(current)
+  self.assertEqual(R.TOPO.registry_digest(git_show_registry),R.TOPO.registry_digest(reconstructed))
+  with mock.patch.object(R.TOPO,"load_registry",return_value=git_show_registry):
+   route=self.compose(capability="autopilot-refine",capability_mode="default",shape="staged",
+                      graph="review,transaction",slug="old-refine")
+  fixture=Path(self._tmp_home.name)/"git-show-old-refine-route.json"
+  fixture.write_bytes(R.canonical(route)+b"\n")
+  self.assertEqual(json.loads(fixture.read_text()),route)
+  self.assertNotIn("entry_scope_contract_version",route)
+  self.assertIn("preview-disposition",route.get("human_gates",[]))
+  R.verify_route(route,R.ROOT)
+  tampered=json.loads(R.canonical(current)); tampered["registry_fixture_unrelated_change"]=True
+  with mock.patch.object(R.TOPO,"load_registry",return_value=tampered), mock.patch.object(R,"gates_on",return_value=True):
+   with self.assertRaisesRegex(ValueError,"registry"):
+    R.verify_route(route,R.ROOT)
+
  def evidence(self):
   return self.dispatch(self.nested(parent="claude",child="claude"),self.nested(parent="claude",child="codex"))
  def compose(self,**kw):
@@ -6337,6 +6413,72 @@ class ComposeRouteTest(TestRoute):
   # A compose fixture that names no stream opts out explicitly, exactly as a caller must.
   if d.get("campaign_key") is None and d.get("parent_cycle_id") is None and "unassigned" not in d: d["unassigned"]=True
   return R.compose_route(**d)
+ def test_complete_scope_keeps_each_full_graph_without_an_extra_preview_wait(self):
+  registry=R.TOPO.load_registry()
+  with tempfile.TemporaryDirectory() as tmp:
+   for capability,mode in (("autopilot-lab","setup"),("autopilot-ship","default"),
+                           ("autopilot-refine","default"),("autopilot-apply","default")):
+    with self.subTest(capability=capability):
+     recipe=next(row for row in registry["recipes"] if row["capability"]==capability and mode in row["modes"])
+     expected=[node["id"] for node in recipe["standard_plus"]["nodes"]]
+     route=self.compose(capability=capability,capability_mode=mode,shape="staged",graph=None,
+                        slug="complete-"+capability,artifact_root=tmp,execution_scope="complete")
+     self.assertEqual([node["id"] for node in route["nodes"]],expected)
+     self.assertEqual(route["entry_execution_scope"],"complete")
+     self.assertEqual(R.verify_route(route,R.ROOT)["entry_execution_scope"],"complete")
+     self.assertNotIn("preview-disposition",route.get("human_gates",[]))
+
+ def test_report_scope_graphless_routes_end_at_each_capabilitys_declared_review_boundary(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   cases=(
+    ("autopilot-lab","setup",["scaffold","smoke"],["smoke"]),
+    ("autopilot-ship","default",["release-setup","security-review","release-review"],
+     ["security-review","release-review"]),
+    ("autopilot-refine","default",["review"],["review"]),
+    ("autopilot-apply","default",["apply","verify"],["verify"]),
+   )
+   for capability,mode,expected,terminals in cases:
+    with self.subTest(capability=capability):
+     route=self.compose(capability=capability,capability_mode=mode,shape="staged",graph=None,
+                        slug="report-"+capability,artifact_root=tmp,execution_scope="report")
+     self.assertEqual([node["id"] for node in route["nodes"]],expected)
+     self.assertEqual([node["id"] for node in route["nodes"] if node.get("terminal") is True],terminals)
+     self.assertEqual(R.verify_route(route,R.ROOT)["entry_execution_scope"],"report")
+     self.assertFalse(R.terminal_gate_proven(R.terminal_gate_observation(route)),
+                      "report cannot finish before every declared terminal review/verify marker exists")
+     self.assertFalse(any(node.get("id") in {"full-run","deploy","transaction","handback"}
+                          for node in route["nodes"]))
+     if capability=="autopilot-ship":
+      by_id={node["id"]:node for node in route["nodes"]}
+      self.assertEqual(by_id["security-review"]["depends_on"],["release-setup"])
+      self.assertEqual(by_id["release-review"]["depends_on"],["release-setup"])
+      self.assertEqual(route["completion_gates"], ["ship-release","ship-security","ship-setup"])
+
+ def test_report_scope_without_explicit_graph_uses_base_prefix_and_direct_scope_reaches_owner(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   report=self.compose(capability="autopilot-lab",capability_mode="setup",shape="staged",graph=None,
+                       slug="lab-report",artifact_root=tmp,execution_scope="report",
+                       work_request={"text":"Prepare the smoke report.","owner_harness":"codex"})
+   self.assertEqual([n["id"] for n in report["nodes"]], ["scaffold","smoke"])
+   self.assertEqual(report["entry_execution_scope"],"report")
+   self.assertEqual(report["work_request"]["text"].splitlines()[-1],"Execution scope: report")
+   self.assertEqual(R.verify_route(report,R.ROOT)["entry_execution_scope"],"report")
+   malformed=json.loads(R.canonical(report))
+   malformed["entry_scope_contract_version"]=True
+   malformed["route_hash"]=R.route_hash(malformed)
+   malformed["route_id"]=R.ROUTE_IDENTITY.route_id_from_hash(malformed["route_hash"])
+   with self.assertRaisesRegex(ValueError,"route nodes differ from the declared recipe"):
+    R.verify_route(malformed,R.ROOT)
+   direct=self.compose(capability="autopilot-refine",capability_mode="default",shape="direct",graph=None,
+                       slug="refine-review-only",artifact_root=tmp,execution_scope="report",
+                       work_request={"text":"Review only.","owner_harness":"codex"},dispatch_evidence=None)
+   self.assertEqual(direct["entry_execution_scope"],"report")
+   self.assertIn("Execution scope: report",direct["work_request"]["text"])
+   self.assertIn("실행 범위 report",R.compose_card(direct))
+   self.assertNotIn("시작 승인 preview",R.compose_card(direct))
+   self.assertNotIn("preview-disposition",direct.get("human_gates",[]))
+   R.verify_route(direct,R.ROOT)
+
  def test_work_request_is_sealed_and_cannot_be_replaced_at_resume(self):
   request={"text":"Run the accepted commands, including exit 7.","owner_harness":"opencode"}
   route=self.compose(work_request=request,profile="light")
@@ -7659,6 +7801,57 @@ class RouteChainWriterTest(ComposeRouteTest):
    route=self.compose(artifact_root=tmp)
    err=self._emit(route,tmp)
    self.assertIn("route_chain_written=1 harness=codex",err)
+ def _tool_shell_env(self,parent,child,sid):
+  """The child harness's tool-command env, built from the shipped adapter configs."""
+  fixtures=str(P.parent/"fixtures")
+  if fixtures not in sys.path: sys.path.insert(0,fixtures)
+  import harness_tool_env as E
+  try:
+   inherited=E.daemon_started_from(E.tool_shell_env(parent,{},"parent-sid-"+parent))
+   return E.tool_shell_env(child,inherited,sid)
+  except E.ToolMissing as exc:
+   self.skipTest(str(exc))
+ def test_compose_records_codex_ledger_in_claude_started_daemon_env(self):
+  # A Codex thread served by the shared daemon that a Claude tool shell started: its tool
+  # commands carry the thread id AND the starter's Claude session id (the SR_CorrNet incident).
+  env=self._tool_shell_env("claude","codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1")
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{**env,"AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=1 harness=codex",err)
+   self.assertNotIn("reason=no-identity",err)
+   self.assertEqual([line["route_id"] for line in self.RC.read_tail("codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1")],
+                    [route["route_id"]])
+   self.assertEqual(self.RC.read_tail("claude","parent-sid-claude"),[])
+ def test_compose_never_records_claude_when_the_codex_block_is_not_installed(self):
+  # Partial rollout: Claude's env is installed, Codex's block is not. The Claude-started daemon's
+  # Codex thread carries its own id next to the stale Claude one and NO exported harness name, so
+  # the writer finds it ambiguous and records nothing -- never a Claude ledger line.
+  fixtures=str(P.parent/"fixtures")
+  if fixtures not in sys.path: sys.path.insert(0,fixtures)
+  import harness_tool_env as E
+  try:
+   inherited=E.daemon_started_from(E.tool_shell_env("claude",{},"parent-sid-claude"))
+   env=E.tool_shell_env("codex",inherited,"01a0f6a2-785d-7503-bb78-368d1a1eaab1",installed=False)
+  except E.ToolMissing as exc:
+   self.skipTest(str(exc))
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{**env,"AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=0",err)
+   self.assertNotIn("harness=claude",err)
+   self.assertEqual(self.RC.read_tail("claude","parent-sid-claude"),[])
+   self.assertEqual(self.RC.read_tail("codex","01a0f6a2-785d-7503-bb78-368d1a1eaab1"),[])
+ def test_compose_caller_follows_tool_shell_harness(self):
+  from dispatch_parent_completion import default_parent_harness
+  for parent,child in (("claude","codex"),("codex","claude"),("claude","opencode"),("opencode","codex")):
+   with self.subTest(parent=parent,child=child):
+    env=self._tool_shell_env(parent,child,"child-sid-"+child)
+    with mock.patch.dict(os.environ,env):
+     # the expression compose evaluates for `--parent-harness` (capability-route.py)
+     self.assertEqual(default_parent_harness("claude"),child)
  def test_plan_invalid_refuses_before_route_write(self):
   import types
   with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-plan-invalid"}):
@@ -7960,6 +8153,72 @@ class SealedFrameProfileCompatibilityTest(unittest.TestCase):
    self.assertEqual(path.read_bytes(),before,"resuming never rewrites the sealed route")
    self.assertEqual([(n["id"],n["model_profile"]) for n in self.frames(json.loads(path.read_text()))],
     [("frame","top"),("frame-alternative","deep")])
+
+
+class EntryExecutionScopeTest(unittest.TestCase):
+ def test_quick_and_direct_shapes_expose_their_internal_approval_parts(self):
+  self.assertEqual(R.declared_start_approvals({"capability":"autopilot-refine","shape":"solo"}),
+                   [("preview","autopilot-refine:transaction")])
+  self.assertEqual(R.declared_start_approvals({"capability":"autopilot-apply","shape":"direct"}),
+                   [("handback","autopilot-apply:handback")])
+
+ def test_report_scope_projection_stops_before_catalogued_approval_for_host_and_borrowed_parts(self):
+  registry = R.TOPO.load_registry()
+  cases = [
+   ({"capability":"autopilot-lab","shape":"staged","graph":["scaffold","smoke","full-run","run-verify"]},
+    ["scaffold","smoke"]),
+   ({"capability":"autopilot-ship","shape":"staged","graph":["release-setup","security-review","release-review","deploy","post-deploy-verify"]},
+    ["release-setup","security-review","release-review"]),
+   ({"capability":"autopilot-refine","shape":"staged","graph":["review","transaction"]}, ["review"]),
+   ({"capability":"autopilot-apply","shape":"staged","graph":["apply","verify","handback"]}, ["apply","verify"]),
+   ({"capability":"autopilot-code","shape":"staged","graph":["plan","autopilot-lab:smoke","autopilot-lab:full-run","test"]},
+    ["plan","autopilot-lab:smoke"]),
+  ]
+  for leg, expected in cases:
+   original = list(leg["graph"])
+   with self.subTest(leg=leg):
+    projected = R.project_entry_execution_scope(leg, "report", registry=registry)
+    self.assertEqual(projected["graph"], expected)
+    self.assertEqual(leg["graph"], original)
+
+ def test_route_plan_scope_applies_to_first_leg_only(self):
+  record={"decision":{"approvals":{"execution_scope":"report"}}}
+  self.assertEqual(R.route_plan_execution_scope({"index":0,"record":record}),"report")
+  self.assertIsNone(R.route_plan_execution_scope({"index":1,"record":record}))
+  self.assertIsNone(R.route_plan_execution_scope({"index":True,"record":record}))
+
+ def test_scope_marker_rejects_boolean_and_unversioned_markers(self):
+  for version, scope in ((True, "report"), (1, "x"), (None, "report")):
+   with self.subTest(version=version, scope=scope):
+    self.assertFalse(R.valid_entry_execution_scope_marker(version, scope))
+  self.assertTrue(R.valid_entry_execution_scope_marker(1, "report"))
+
+ def test_scoped_refine_completion_requires_actual_preview_but_legacy_is_unchanged(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   route={"entry_scope_contract_version":1,"capability":"autopilot-refine"}
+   node={"id":"review"}
+   with self.assertRaisesRegex(ValueError,"completion-evidence-unreadable"):
+    R._require_entry_scope_review_preview(route,node,Path(tmp))
+   preview=Path(tmp)/"reviews/refine/preview.md"; preview.parent.mkdir(parents=True); preview.write_text("diff\n")
+   self.assertEqual(R._require_entry_scope_review_preview(route,node,Path(tmp)),preview)
+   route.pop("entry_scope_contract_version")
+   self.assertIsNone(R._require_entry_scope_review_preview(route,node,Path(tmp)))
+
+ def test_old_registry_bridge_restores_the_mark_and_preview_output_as_one_exact_snapshot(self):
+  current = R.TOPO.load_registry()
+  old = R._entry_scope_legacy_registry(current)
+  self.assertIsNotNone(old)
+  current_parts = R.TOPO.part_catalog(current)["parts"]
+  old_parts = R.TOPO.part_catalog(old)["parts"]
+  self.assertEqual(current_parts["autopilot-refine:transaction"]["start_approval"], "preview")
+  self.assertNotIn("start_approval", old_parts["autopilot-refine:transaction"])
+  current_recipe = next(x for x in current["recipes"] if x["capability"] == "autopilot-refine")
+  old_recipe = next(x for x in old["recipes"] if x["capability"] == "autopilot-refine")
+  self.assertIn("reviews/refine/preview.md", next(n for n in current_recipe["standard_plus"]["nodes"] if n["id"] == "review")["outputs"])
+  self.assertNotIn("reviews/refine/preview.md", next(n for n in old_recipe["standard_plus"]["nodes"] if n["id"] == "review")["outputs"])
+  tampered = json.loads(R.canonical(current)); tampered["unrelated_registry_fixture"] = True
+  reconstructed = R._entry_scope_legacy_registry(tampered)
+  self.assertNotEqual(R.TOPO.registry_digest(reconstructed), R.TOPO.registry_digest(old))
 
 
 if __name__=="__main__": unittest.main()
