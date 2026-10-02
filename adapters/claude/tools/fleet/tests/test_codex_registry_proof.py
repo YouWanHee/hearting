@@ -1,0 +1,1 @@
+../../../../../tools/fleet/tests/test_codex_registry_proof.py

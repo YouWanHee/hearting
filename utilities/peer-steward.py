@@ -16,6 +16,7 @@ it; and `ack` makes an at-least-once wake idempotent to display. `wait` keeps
 its bounded-foreground semantics unchanged.
 """
 import argparse
+import calendar
 import fcntl
 import hashlib
 import importlib.util
@@ -59,24 +60,20 @@ _PERMISSION_FLAGS = {
 
 def _current_session_identity():
     """`(session_id, harness)` — delegates to `dispatch_parent_completion
-    .interactive_parent_identity` (the portable first-source-of-truth, F-<next> plan §3 B-3)
-    when it can resolve one unambiguous caller harness; falls back to the prior
-    claude > codex > opencode > AGENT_SESSION_ID priority otherwise (an explicit caller
-    harness env still wins there too, so a genuinely ambiguous or unset environment keeps
-    its exact prior behavior)."""
+    .interactive_parent_identity`, the one resolver every identity consumer shares, so the
+    sender of a peer message is the harness the route-chain writer and compose name.
+
+    Never guesses a native id: when the resolver finds the caller ambiguous or invalid, or
+    an explicit harness name has no session id of its own, the sender stays unknown
+    (`AGENT_SESSION_ID` if set, else `("", "unknown")`) and the message is still recorded.
+    The old claude > codex > opencode fallback named a Codex thread `claude [bc]`."""
     try:
         from dispatch_parent_completion import interactive_parent_identity
         harness, sid = interactive_parent_identity()
         if sid:
             return sid, harness
-    except Exception:   # caller-harness-ambiguous/invalid -> fall through to legacy order
+    except Exception:   # caller-harness-ambiguous/invalid -> sender unknown, never guessed
         pass
-    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        return os.environ["CLAUDE_CODE_SESSION_ID"], "claude"
-    if os.environ.get("CODEX_THREAD_ID"):
-        return os.environ["CODEX_THREAD_ID"], "codex"
-    if os.environ.get("OPENCODE_SESSION_ID"):
-        return os.environ["OPENCODE_SESSION_ID"], "opencode"
     if os.environ.get("AGENT_SESSION_ID"):
         return os.environ["AGENT_SESSION_ID"], "unknown"
     return "", "unknown"
@@ -470,6 +467,178 @@ def _pane_is_managed(pane):
     return False if processes else None
 
 
+# A Codex TUI attached to the shared app-server daemon holds no rollout file of its own, and
+# the daemon creates the thread's rollout about a second after the TUI starts. Fleet can then
+# only match a TUI to its thread by start time, which several same-cwd starts a few seconds
+# apart defeat on purpose (no guessing), so the row stays anonymous and herdr learns nothing.
+# `start` is the one party that saw the launch: it notes which rollouts exist before the
+# launch and afterwards takes exactly ONE new root rollout for the target cwd as the session.
+# Zero or several is no proof, so nothing is bound and the receipt says why. Bookkeeping, not
+# a gate: it adds no flag or required input and never fails the start; the bound is the wait.
+_BIND_SECONDS = 15.0
+_BIND_POLL_SECONDS = 0.5
+_BIND_PROCESS_SECONDS = 3.0      # how long to wait for the pane's `codex` process to appear
+_BIND_START_SLACK_SECONDS = 2.0
+
+
+def _codex_home_dir():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def _rollout_paths(home):
+    """Every rollout file name under the Codex sessions tree (names only, nothing is read)."""
+    found = set()
+    for root, _dirs, names in os.walk(os.path.join(home, "sessions")):
+        for name in names:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                found.add(os.path.join(root, name))
+    return found
+
+
+def _fleet_codex_collector():
+    """`fleet.collectors.codex`, whose rollout helpers (`_rollout_meta`, `_is_subagent`,
+    `_sid`) are reused instead of re-parsing rollouts here. ``None`` on any failure."""
+    if _session_registry() is None:
+        return None
+    try:
+        from fleet.collectors import codex as collector
+        return collector
+    except Exception:
+        return None
+
+
+def _pane_codex_pid(pane):
+    """Pid of the pane's foreground `codex` process, from `herdr pane process-info`."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+        info = (payload.get("result") or {}).get("process_info") or {}
+        processes = info.get("foreground_processes") or []
+    except Exception:
+        return None
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        argv = [str(part) for part in (process.get("argv") or [])]
+        if argv and os.path.basename(argv[0]) == "codex" and process.get("pid"):
+            try:
+                return int(process["pid"])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _proc_cwd(pid):
+    try:
+        return os.path.realpath(os.readlink("/proc/%d/cwd" % int(pid)))
+    except (OSError, ValueError):
+        return None
+
+
+def _rollout_created_at(meta, path):
+    stamp = meta.get("timestamp")
+    if isinstance(stamp, str):
+        try:
+            return calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _new_root_rollouts(collector, home, before, cwd, launched_at):
+    """Thread ids of root rollouts for ``cwd`` created at/after the launch and not in ``before``."""
+    found = []
+    for path in sorted(_rollout_paths(home) - before):
+        meta = collector._rollout_meta(path)
+        if not meta or collector._is_subagent(meta):
+            continue
+        if os.path.realpath(str(meta.get("cwd") or "")) != cwd:
+            continue
+        if _rollout_created_at(meta, path) < launched_at - _BIND_START_SLACK_SECONDS:
+            continue
+        sid = collector._sid(path)
+        if sid:
+            found.append(sid)
+    return found
+
+
+def _bind_codex_session(pane, pane_cwd, home, before, launched_at):
+    """`(state, session_id, pid, cwd)`; state is bound|ambiguous|timeout|no-process|unavailable.
+
+    A single candidate is confirmed once more one poll later, so a second same-cwd launch that
+    lands a moment after the first is seen as ambiguous rather than silently taken. A candidate
+    first seen on the final poll never got that second look, so the bind ends as `timeout`."""
+    collector = _fleet_codex_collector()
+    if collector is None:
+        return "unavailable", None, None, None
+    began = time.monotonic()
+    deadline = began + _BIND_SECONDS
+    pid = cwd = None
+    candidate = None
+    while time.monotonic() < deadline:
+        if pid is None:
+            pid = _pane_codex_pid(pane)
+        if pid is not None and cwd is None:
+            cwd = pane_cwd or _proc_cwd(pid)
+        if cwd:
+            found = _new_root_rollouts(collector, home, before, cwd, launched_at)
+            if len(found) > 1:
+                return "ambiguous", None, pid, cwd
+            if len(found) == 1:
+                if candidate == found[0]:
+                    return "bound", found[0], pid, cwd
+                candidate = found[0]
+            else:
+                candidate = None
+        if pid is None and time.monotonic() - began >= _BIND_PROCESS_SECONDS:
+            break
+        time.sleep(_BIND_POLL_SECONDS)
+    return ("timeout" if pid is not None and cwd else "no-process"), None, pid, cwd
+
+
+def _proc_start_ticks(pid):
+    """/proc/<pid>/stat field 22 as a str (the registry's PID-reuse guard), else None."""
+    try:
+        raw = Path("/proc/%d/stat" % int(pid)).read_text()
+        rest = raw[raw.rindex(")") + 1:].split()
+        return None if rest[0] in ("Z", "X") else rest[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_bound_registry(pid, session_id, cwd, name):
+    """Fleet's tier-1 record for the launched TUI, so Fleet (and through it herdr) names it.
+
+    Written only with a nonempty procStart: Fleet rejects a record without a matching process
+    start time, so one written without it would claim a binding nobody can use. Returns whether
+    a usable record was written."""
+    proc_start = _proc_start_ticks(pid)
+    if not proc_start:
+        return False
+    registry = _session_registry()
+    if registry is None:
+        return False
+    try:
+        registry.write("codex", pid, {
+            "sessionId": session_id,
+            "cwd": cwd,
+            "startedAt": int(time.time() * 1000),
+            "procStart": proc_start,
+            "name": name,
+            "nameSource": "user",
+            "kind": "codex-tui",
+            "entrypoint": "peer-steward-start",
+            "harness": "codex",
+        })
+        return True
+    except Exception:
+        return False
+
+
 # The harness flag that puts a launched session in a chosen directory. `herdr agent
 # start` has none of its own — the agent it starts inherits the PANE's shell cwd — so
 # `--cwd` used to move nothing but this CLI process: a session started with
@@ -504,6 +673,12 @@ def cmd_start(args):
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
     ingress_note = _ensure_pane_ingress(args.pane, args.kind)
+
+    bind_home = bind_before = None
+    launched_at = time.time()
+    if args.kind == "codex":
+        bind_home = _codex_home_dir()
+        bind_before = _rollout_paths(bind_home)
 
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
@@ -551,6 +726,18 @@ def cmd_start(args):
         failure_reason = (code if isinstance(code, str)
                           and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", code)
                           else "herdr-start-error" if payload_error else "herdr-start-failed")
+    # herdr names no Codex thread for a daemon-attached TUI; the launcher proves it from the
+    # one new root rollout (see the block comment above `_BIND_SECONDS`).
+    session_bind = None
+    if started and isinstance(agent_block, dict) and args.kind == "codex" and not started_sid:
+        session_bind, bound_sid, tui_pid, tui_cwd = _bind_codex_session(
+            args.pane, pane_cwd, bind_home, bind_before, launched_at)
+        if session_bind == "bound":
+            started_sid = bound_sid
+            # The thread id stays in the ledger and receipt either way; only the Fleet registry
+            # projection needs the process start time.
+            if not _write_bound_registry(tui_pid, bound_sid, tui_cwd, args.name):
+                session_bind = "bound-unregistered"
     _record(
         to_harness=args.kind, to_name=args.name, kind="steer",
         summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
@@ -567,19 +754,18 @@ def cmd_start(args):
             {"harness": args.kind, "session_id": started_sid, "name": args.name},
             "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
         )
-    # `session_id=-` is the launch-time signal that this session will have no identity
-    # anywhere downstream: no ledger endpoint, no board badge, nothing to steer by name.
-    # It used to be visible only hours later as a nameless row (measured 2026-09-10: a
-    # codex session started here came up unmanaged because the pane's PATH had no
-    # hearting wrapper on it, so no tier-1 record was ever written). Saying it at the
-    # launch is the difference between a known gap and a mystery.
+    # `session_id=-` is the launch-time signal that nothing proved which session this is
+    # (no ledger endpoint, no board badge, nothing to steer by name); `session_bind=` says
+    # why for a Codex start (timeout | ambiguous | no-process | unavailable), `bound` when
+    # the launcher itself proved the thread id, and `bound-unregistered` when it did but Fleet's
+    # registry record could not be written (no process start time to guard PID reuse).
     #
     # `cwd=` only when one was asked for: it is the receipt that the flag was honored,
     # and an unasked-for value would cost an extra herdr call on every start.
     # `managed=` is read off the started process, not inferred from how it was launched.
-    # An unmanaged Codex writes no session record, so it has no id, no badge and no way to
-    # be addressed later — that has to be visible at the launch, not discovered hours
-    # later as a nameless row on the board.
+    # Interactive managed ingress is retired, so `managed=false` is no longer a defect
+    # signal; the field stays for receipt compatibility and `session_id=` is what says
+    # whether the session got an identity.
     managed = "-"
     if started and _MANAGED_INGRESS.get(args.kind):
         verdict = _pane_is_managed(args.pane)
@@ -588,6 +774,7 @@ def cmd_start(args):
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
         f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'} "
         f"managed={managed}"
+        + (f" session_bind={session_bind}" if session_bind else "")
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
