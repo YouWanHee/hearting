@@ -41,10 +41,6 @@ if [ -n "$missing_tools" ]; then
 fi
 
 # Outputs belong to this run's mktemp directory, including across clones.
-# Keep the separate source lock: tools/adaptation-guard.test.sh temporarily
-# rewrites tracked adapter files that this suite reads.
-. "$ROOT/tools/worktree-lock.sh"
-worktree_lock_acquire "$ROOT" 900 || exit 70
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

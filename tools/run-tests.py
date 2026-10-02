@@ -52,13 +52,10 @@ DEFAULT_JOBS = 4
 # its strict-doctor assertions depend on host load (the same GitHub runner
 # fingerprint has produced both ``exit-nonzero`` and ``assertion`` failures).
 # Keep it in the full corpus and report, but run it only after the profile's
-# parallel batch has drained. ``generated-projections`` rewrites
-# harness-manifest.json and the generated projections in the checkout itself,
-# so a suite reading them beside it can parse a half-written manifest or seal a
-# route against a sentinel registry; it waits for the same drain.
+# parallel batch has drained. A suite that rewrites repository files does it in
+# its own copy (tools/checkout-copy.sh), so none waits here for that reason.
 SERIAL_SUITES = frozenset({
     "tools/install/projection-completeness.test.sh",
-    "tools/generated-projections.test.sh",
 })
 
 PRUNE_DIRS = {".git", ".dispatch", "__pycache__", "node_modules",

@@ -11,11 +11,14 @@ export PYTHONDONTWRITEBYTECODE=1
 unset AGENT_ARTIFACT_ROOT AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-# Shared with every other suite that reads or writes this checkout; see
-# tools/worktree-lock.sh for why it is anchored at the git dir.
-. "$ROOT/tools/worktree-lock.sh"
-worktree_lock_acquire "$ROOT" 900 || exit 70
 TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+# This suite edits harness-manifest.json and regenerates every projection; do
+# it in a private copy so peer suites never read the live checkout mid-edit
+# (tools/checkout-copy.sh).
+. "$ROOT/tools/checkout-copy.sh"
+checkout_copy "$ROOT" "$TMP/repo" || { rm -rf "$TMP"; echo "not ok - checkout copy" >&2; exit 1; }
+ROOT="$TMP/repo"
 MANIFEST="$ROOT/harness-manifest.json"
 TARGET="$ROOT/adapters/codex/skills/post-it/SKILL.md"
 PLUGIN_HOOKS_JSON="$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/hooks/hooks.json"
@@ -28,13 +31,6 @@ HOOK_GIT_DIR=$(git -C "$ROOT" rev-parse --absolute-git-dir)
   cd "$ROOT"
   GIT_DIR="$HOOK_GIT_DIR" "$ROOT/tools/git-hooks/pre-push" >/dev/null
 )
-
-restore() {
-  cp "$TMP/harness-manifest.json" "$MANIFEST"
-  python3 "$ROOT/tools/generate.py" >/dev/null 2>&1 || true
-  rm -rf "$TMP"
-}
-trap restore EXIT HUP INT TERM
 
 python3 - "$MANIFEST" <<'PY'
 import json, sys
