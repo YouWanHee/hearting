@@ -2394,12 +2394,16 @@ class GateCarrierTest(unittest.TestCase):
         with mock.patch.object(rewake, "_recipient_gate_records") as scan:
             self.assertFalse(rewake._open_gate_pending(launch))     # no write: no scan
             scan.assert_not_called()
-        rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
-                                      claim_owner="session-sweep:x:1:1", lease_seconds=0.05)
+        claimed = rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
+                                                claim_owner="session-sweep:x:1:1",
+                                                lease_seconds=120.0)
         self.assertFalse(rewake._open_gate_pending(launch))         # write: scanned, lease live
-        time.sleep(0.08)
-        # no directory write since, but the lease seen at the last scan expired
-        self.assertTrue(rewake._open_gate_pending(launch))
+        # no directory write since, but the lease seen at the last scan expired;
+        # the clock is stepped past the deadline, not slept past a short lease
+        # that a stalled claim fsync can outlive before the scan above runs
+        with mock.patch.object(rewake.time, "monotonic_ns",
+                               return_value=claimed["claim_deadline_ns"] + 1):
+            self.assertTrue(rewake._open_gate_pending(launch))
         # the registry was read once for the whole sequence
         with mock.patch.object(rewake, "current_attempt_row") as row:
             rewake._open_gate_pending(launch)
