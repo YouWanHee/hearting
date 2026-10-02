@@ -882,6 +882,11 @@ class CiLikeProfileFixture(unittest.TestCase):
                                 capture_output=True, text=True, env=env)
         self.assertEqual(listed.stdout.strip(), str(repo))
 
+    def test_isolated_env_puts_the_checkout_under_test_on_the_import_path(self):
+        repo = self.root / "repo"
+        env = self.mod.build_isolated_env(self.root / "iso", repo)
+        self.assertEqual(env["PYTHONPATH"], str(repo))
+
     def test_isolated_env_switches_the_workflow_group_review_off(self):
         # Sealing a cycle in a suite must not start a background model review.
         for env in (self.mod.build_isolated_env(self.root / "iso"),

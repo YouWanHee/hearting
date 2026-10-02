@@ -292,6 +292,10 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
         if key in os.environ:
             env[key] = os.environ[key]
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # A suite runs as `python3 <suite>`, so sys.path[0] is the suite's own
+    # directory; suites that import `tools.fleet...` need the checkout root
+    # (seven of them failed on import in every CI run until 2026-10-02).
+    env["PYTHONPATH"] = str(repo_root)
     # Gates ship switched off; the suites still exercise them.
     env["HEARTING_GATES"] = "on"
     # A suite that seals a cycle must not start the background workflow-group review.
