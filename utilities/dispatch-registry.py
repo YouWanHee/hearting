@@ -36,6 +36,7 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                authoritative_process_identities,
                                close_attempt_row,
                                close_attempt_row_if,
+                               launched_attempt_identity,
                                exact_process_group_signal_authority,
                                NAMESPACE_EXTINCT_REASON,
                                namespace_gone,
@@ -84,6 +85,9 @@ from dispatch_completion_join import (  # noqa: E402
     ChildRow,
     JoinContractError,
     classify_exact_route_free_review_outcome,
+    _route_free_support_row,
+    apply_exact_route_free_support_classification,
+    classify_exact_route_free_support_outcome,
     close_finished_child,
     current_attempt_row,
     exact_attempt_row,
@@ -634,6 +638,18 @@ def _foreground_binding(meta):
         return None
 
 
+def _support_binding(row):
+    try:
+        fields = row["raw"].split("\t")
+        return (
+            str(row["meta"]["attempt_id"]), int(row["meta"]["pid"]),
+            str(row["meta"]["pid_start"]), int(row["meta"]["pgid"]),
+            str(row["meta"].get("log_file", "")), launched_attempt_identity(fields),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _same_host_foreground_stage_receipt(row):
     """Recover only a finished stage whose exact local process and output are proved.
 
@@ -858,6 +874,23 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
         return "legacy-read-only", "legacy-attempt-row", None
     if row.get("attempt_contract_status") != "current":
         return "contract-invalid", row.get("attempt_contract_status", "invalid"), None
+    if _route_free_support_row(ChildRow(
+        row["order"], row["status"], row["slug"], meta.get("attempt_id", ""),
+        row["raw"], meta,
+    )):
+        if expected_binding is None:
+            return "active", "support-binding-required", None
+        fresh = current_attempt_row(args.jobs, expected_binding[0])
+        if fresh is None:
+            return "contract-invalid", "support-row-missing", None
+        process = attempt_process_quiescence(fresh.metadata)
+        classification = classify_exact_route_free_support_outcome(
+            fresh, jobs=args.jobs, expected_attempt_id=expected_binding[0],
+            expected_pid=expected_binding[1], expected_pid_start=expected_binding[2],
+            expected_pgid=expected_binding[3], quiescence=process,
+            expected_log_file=expected_binding[4], selected_identity=expected_binding[5],
+        )
+        return classification.as_registry_tuple()
     if _foreground_review_candidate(row["meta"]):
         # The selected row is the admission boundary.  Its binding is never
         # reconstructed from the row being classified: refresh first, then
@@ -1211,6 +1244,11 @@ def reconcile(rows, args):
         selected_binding = (
             _foreground_binding(row["meta"])
             if _foreground_review_candidate(row["meta"])
+            else _support_binding(row)
+            if _route_free_support_row(ChildRow(
+                row["order"], row["status"], row["slug"], row["meta"].get("attempt_id", ""),
+                row["raw"], row["meta"],
+            ))
             else None
         )
         category, reason, note = classify(
@@ -1279,6 +1317,42 @@ def reconcile(rows, args):
                 "revalidated": closed if args.apply else None,
                 "cascade": [], "cleanup": None,
                 "summary_owner": {"state": "not-applied", "reason": "exact-attempt-only"},
+            })
+            continue
+        if selected_binding is not None and len(selected_binding) == 6 and _route_free_support_row(
+            ChildRow(row["order"], row["status"], row["slug"], meta.get("attempt_id", ""), row["raw"], meta)
+        ):
+            exact_repair_only = True
+            fresh = current_attempt_row(args.jobs, meta["attempt_id"])
+            completion = "not-attempted"
+            closed = False
+            if fresh is not None:
+                classification = classify_exact_route_free_support_outcome(
+                    fresh, jobs=args.jobs, expected_attempt_id=selected_binding[0],
+                    expected_pid=selected_binding[1], expected_pid_start=selected_binding[2],
+                    expected_pgid=selected_binding[3], quiescence=attempt_process_quiescence(fresh.metadata),
+                    expected_log_file=selected_binding[4], selected_identity=selected_binding[5],
+                )
+                category, reason, note = classification.as_registry_tuple()
+                if args.apply:
+                    completion = apply_exact_route_free_support_classification(
+                        fresh, jobs=args.jobs, classification=classification,
+                        selected_identity=selected_binding[5], expected_log_file=selected_binding[4],
+                        expected_pid=selected_binding[1], expected_pid_start=selected_binding[2],
+                        expected_pgid=selected_binding[3],
+                    )
+                    latest = current_attempt_row(args.jobs, meta["attempt_id"])
+                    closed = bool(latest and latest.status not in OPEN)
+            decisions.append({
+                "attempt_id": meta["attempt_id"], "slug": row["slug"],
+                "category": "support-settlement-committed" if closed else
+                            "support-settlement-ready" if not args.apply else
+                            "support-settlement-pending" if completion == "pending" else
+                            "support-settlement-revalidation-veto",
+                "reason": reason, "proposed_note": note,
+                "revalidated": closed if args.apply else None, "closed": closed,
+                "completion": completion, "cascade": [], "cleanup": None,
+                "summary_owner": {"state": "not-applied", "reason": "semantic-support-settlement"},
             })
             continue
         # The reap watcher seals `attempt-tagged-residue-v1` and exits, so

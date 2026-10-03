@@ -772,6 +772,16 @@ join retains every owned attempt, including `done` rows, until the exact process
 group and tagged descendants are settled. `dispatch-reconcile --attempt <id>
 --apply` uses the same bounded cleanup proof authority on terminal rows; it
 preserves the result, marker, and delivery receipt and grants no retry credit.
+For the exact route-free registered depth-1 support tuple
+`ops/session-tidy-memory` / `session-tidy-memory`, the post-exit join, reaper,
+and normal reconcile consumer also settle the existing semantic terminal result
+after exact process quiescence. They use the supervisor's recorded verdict,
+typed failure and evidence; `artifact: -` is a valid handoff and does not grant
+route, review, or owner completion authority. PASS is `completed-supervisor`
+with `failure_class=pass`; FAIL, BLOCKED, and typed runtime, capacity, auth, or
+contract results retain their existing failure note and evidence. An absent or
+incomplete result stays unproven, and process exit alone is not a semantic
+result. Existing terminal history and explicit stop remain unchanged.
 Missing observation keeps the cleanup obligation and its durable supervision
 notice open. A later proof settles it without a new model turn or cancellation.
 Historical artifact and residue seals remain audit evidence: a valid artifact

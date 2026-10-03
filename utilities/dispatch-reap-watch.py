@@ -33,8 +33,11 @@ from codex_dispatch_terminal import terminal_envelope_observed
 from dispatch_completion_join import (
     JoinContractError,
     _route_free_review_row,
+    _route_free_support_row,
     apply_exact_route_free_review_classification,
+    apply_exact_route_free_support_classification,
     classify_exact_route_free_review_outcome,
+    classify_exact_route_free_support_outcome,
     close_finished_child,
     close_wrapper_pass,
     exact_attempt_row,
@@ -42,6 +45,7 @@ from dispatch_completion_join import (
 )
 from dispatch_degradation import record_degradation
 from dispatch_supervisor_terminal import missing_result_terminal
+from dispatch_contract import launched_attempt_identity
 
 
 def attempt_record(
@@ -167,6 +171,8 @@ def watch(args: argparse.Namespace) -> int:
         or not attempt_scan_namespace_authority(metadata)
     ):
         return 69
+    selected_identity = launched_attempt_identity(initial[0])
+    selected_log_file = metadata.get("log_file", "")
 
     while process_start_ticks(args.pid) == args.pid_start:
         time.sleep(args.interval)
@@ -239,6 +245,31 @@ def watch(args: argparse.Namespace) -> int:
     if not annotated:
         return 65
     row = exact_attempt_row(args.jobs, args.attempt_id)
+    if _route_free_support_row(row):
+        try:
+            classification = classify_exact_route_free_support_outcome(
+                row, jobs=args.jobs, expected_attempt_id=args.attempt_id,
+                expected_pid=args.pid, expected_pid_start=args.pid_start,
+                expected_pgid=args.pgid,
+                quiescence=attempt_process_quiescence(row.metadata),
+                expected_log_file=selected_log_file,
+                selected_identity=selected_identity,
+            )
+            result = apply_exact_route_free_support_classification(
+                row, jobs=args.jobs, classification=classification,
+                selected_identity=selected_identity, expected_log_file=selected_log_file,
+                expected_pid=args.pid, expected_pid_start=args.pid_start, expected_pgid=args.pgid,
+            )
+            current = exact_attempt_row(args.jobs, args.attempt_id)
+            if (current.status not in {"done", "killed", "cancelled"}
+                    or launched_attempt_identity(current.raw.split("\t")) != selected_identity):
+                print("support-completion-apply-failed: " + (result or "terminal-row-unverified"), file=sys.stderr)
+                return 65
+            if current.status == "done":
+                materialize_after_terminal_close(args.jobs, args.attempt_id)
+            return 0
+        except (DispatchContractError, JoinContractError, OSError, ValueError):
+            return 65
     if _route_free_review_row(row):
         try:
             quiescence = attempt_process_quiescence(row.metadata)
