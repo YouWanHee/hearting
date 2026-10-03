@@ -569,9 +569,9 @@ ephemeral App Server thread and record same-thread, same-turn numeric usage in
 the exact attempt JSONL. If that pre-inference probe fails, they retain the raw
 `codex exec --ephemeral --json` path. Both paths keep stdout JSONL, attempt
 records, and completion markers durable; route continuation validates those
-harness records rather than resuming a worker rollout. Missing or invalid
-active usage or context-window values remain unknown; cumulative totals do not
-stand in for active context. The App Server owner keeps its existing supervised
+harness records rather than resuming a worker rollout. Active context comes
+exclusively from observed last usage and its context window; missing or invalid
+values remain unknown. The App Server owner keeps its existing supervised
 live ephemeral thread across turns. This policy does not change owner
 supervision or interactive sessions.
 
