@@ -15,7 +15,7 @@ class CodexArgvCwdTest(unittest.TestCase):
 
     def test_relative_uses_launch_cwd_and_unknown_keeps_observed(self):
         self.assertEqual(codex_effective_cwd(
-            ["codex", "-C", "project"], "/tmp/changed", "/tmp/start"),
+            ["codex", "-C", "project"], "/tmp/start/project", "/tmp/start"),
             "/tmp/start/project")
         # PWD read from /proc/<pid>/environ is the initial environment value.
         # When it agrees with the observed cwd, it still gives the base for a
@@ -25,6 +25,9 @@ class CodexArgvCwdTest(unittest.TestCase):
             "/tmp/start/project")
         self.assertEqual(codex_effective_cwd(
             ["codex", "-C", "project"], "/tmp/observed", None), "/tmp/observed")
+        self.assertEqual(codex_effective_cwd(
+            ["codex", "-C", "project"], "/tmp/unrelated", "/tmp/start"),
+            "/tmp/unrelated")
 
     def test_value_options_are_consumed_before_root_options(self):
         self.assertEqual(codex_effective_cwd(

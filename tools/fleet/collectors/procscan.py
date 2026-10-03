@@ -188,10 +188,19 @@ def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
     if not path.is_absolute():
         if not launch_cwd or not Path(launch_cwd).is_absolute():
             return observed_cwd
-        # `launch_cwd` is supplied from the initial /proc/<pid>/environ PWD,
-        # not reconstructed from the process's current cwd. It may differ from
-        # observed_cwd after chdir; joining against it avoids double-appending.
-        path = Path(launch_cwd) / path
+        # `launch_cwd` is supplied from initial /proc/<pid>/environ PWD, not
+        # reconstructed from current cwd. Accept it only when proc cwd agrees
+        # with the launch base (not moved yet) or the resolved argv target
+        # (already moved by Codex); otherwise PWD and proc evidence conflict.
+        try:
+            launch_base = Path(launch_cwd).resolve(strict=False)
+            effective = (launch_base / path).resolve(strict=False)
+            observed = Path(observed_cwd).resolve(strict=False) if observed_cwd else None
+            if observed not in {launch_base, effective}:
+                return observed_cwd
+            return str(effective)
+        except (OSError, RuntimeError, ValueError):
+            return observed_cwd
     try:
         return str(path.resolve(strict=False))
     except (OSError, RuntimeError, ValueError):
