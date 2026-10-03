@@ -2,10 +2,10 @@
 import hashlib
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -118,6 +118,7 @@ class RecordRejectionTest(unittest.TestCase):
             )
             self.assertIsInstance(result, tuple)
             self.assertEqual(result[0], "launch-tuple-evidence-unrecorded")
+            self.assertIn("FileExistsError:", result[1])
             # record absence == unspent (§5.4) -- the verdict for this tuple
             # is conservative, and nothing about a launch decision changed.
             spent = LT.spent_tuples(state_root, "rt-lt", "execute", route_hash="sha256:route")
@@ -130,19 +131,35 @@ class RecordRejectionTest(unittest.TestCase):
             root.mkdir()
             lock_path = root / "rt-lt.jsonl.lock"
             holder = subprocess.Popen([sys.executable, "-c", (
-                "import fcntl,time,sys; f=open(sys.argv[1],'a+'); "
-                "fcntl.flock(f,fcntl.LOCK_EX); time.sleep(.5)"), str(lock_path)])
+                "import fcntl,sys; f=open(sys.argv[1],'a+'); "
+                "fcntl.flock(f,fcntl.LOCK_EX); print('READY', flush=True); "
+                "sys.stdin.buffer.read(1)"), str(lock_path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
-                time.sleep(.05)
+                ready, _, _ = select.select([holder.stdout], [], [], 2)
+                self.assertTrue(ready, "lock holder did not acquire the real flock")
+                self.assertEqual(holder.stdout.readline().strip(), "READY")
                 result = LT.record_rejection(
                     state_root, route=ROUTE, node=NODE, tuple_key=TUPLE_KEY,
                     rejection_class="allocation-skip", evidence_ref="usage-claude",
                     owner_attempt_id="att-owner",
                 )
             finally:
+                holder.stdin.write("!")
+                holder.stdin.flush()
                 holder.wait(timeout=2)
+                holder.stdin.close()
+                holder.stdout.close()
             self.assertIsInstance(result, tuple)
             self.assertEqual(result[0], "launch-tuple-evidence-unrecorded")
+            self.assertEqual(result[1], "write-failed")
+            resumed = LT.record_rejection(
+                state_root, route=ROUTE, node=NODE, tuple_key=TUPLE_KEY,
+                rejection_class="allocation-skip", evidence_ref="usage-claude",
+                owner_attempt_id="att-owner",
+            )
+            self.assertIsInstance(resumed, Path)
+            self.assertIn(TUPLE_KEY, LT.spent_tuples(state_root, "rt-lt", "execute", route_hash="sha256:route"))
 
 
 class SpentTuplesTest(unittest.TestCase):

@@ -31,6 +31,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import py_compile
 import re
@@ -43,6 +44,7 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT = 600
@@ -1454,6 +1456,36 @@ def load_durations(path: Path) -> dict[str, float]:
             durations[suite_path] = value
     if not header_seen:
         raise BaselineError(f"{path}: missing header {DURATION_COLUMNS}")
+    return durations
+
+
+def collapse_replicated_report_durations(rows: Iterable[dict[str, str]]) -> dict[str, float]:
+    """Collapse replicated suite rows only when their observed duration agrees.
+
+    Full-run report rows carry the suite result's first execution duration while
+    verdicts may aggregate retries. The report schema does not expose per-attempt
+    duration or attempt identity, so a conflicting duplicate is ambiguous and is
+    never averaged, maximized, or selected by row order.
+    """
+    durations: dict[str, float] = {}
+    for row in rows:
+        suite = row.get("suite_path", "").strip()
+        raw = row.get("duration_s", "").strip()
+        if not suite:
+            raise BaselineError("report duration row has an empty suite_path")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise BaselineError(f"report duration for {suite} is not numeric: {raw!r}") from None
+        if not math.isfinite(value) or value < 0:
+            raise BaselineError(f"report duration for {suite} must be finite and non-negative")
+        previous = durations.get(suite)
+        if previous is not None and previous != value:
+            raise BaselineError(
+                f"ambiguous duplicate duration for {suite}: {previous:g} vs {value:g}; "
+                "report schema has no attempt identity"
+            )
+        durations[suite] = value
     return durations
 
 

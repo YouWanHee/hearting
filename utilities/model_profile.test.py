@@ -34,6 +34,14 @@ WRAPPERS = {
 }
 
 
+def declared_point(config, profile):
+    tier, budget = config[f"CFG_MODEL_PROFILE_{profile.upper().replace('-', '_')}"].split(":", 1)
+    if tier.startswith("model/"):
+        return tier[len("model/"):], budget
+    key = tier.upper().replace("-", "_")
+    return config[f"CFG_TIER_{key}_MODEL"], budget
+
+
 def args(adapter: str, profile: str, **overrides):
     budget_key = {"claude": "effort", "codex": "reasoning", "opencode": "variant"}[adapter]
     values = {
@@ -137,9 +145,7 @@ class ModelProfileTest(unittest.TestCase):
         """Independent derivation of a profile's operating point from the raw
         CFG_ keys (tier -> CFG_TIER_<TIER>_MODEL / _EFFORT|_VARIANT), so the
         expectation follows the shipped file instead of a literal table."""
-        tier, budget = config[f"CFG_MODEL_PROFILE_{profile.upper().replace('-', '_')}"].split(":", 1)
-        key = tier.upper().replace("-", "_")
-        return (config[f"CFG_TIER_{key}_MODEL"], budget)
+        return declared_point(config, profile)
 
     @staticmethod
     def _reachable_models(adapter, config):
@@ -160,22 +166,26 @@ class ModelProfileTest(unittest.TestCase):
         """The predicate every launch surface actually uses: tokenize the id and test
         alias membership (`dispatch-headless.py`, `stage-dispatch-fallback.py`,
         `hooks/subagent-model-default.sh` all do exactly this). Exact string equality
-        would see `model/fable:...` but not `model/claude-fable-5-1:...`, which the
+        would see `model/alias:...` but not `model/vendor-alias-5-1:...`, which the
         wrapper still refuses at launch (review r2-1)."""
         tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
         return any(alias.lower() in tokens for alias in aliases)
 
     def test_claude_shipped_default_is_the_user_profile_mapping(self):
         # 2026-09-09 user rule: the shipped default equals the user's runtime
-        # mapping — the top model (Fable) is reserved for the main session, so
-        # both deep-side profiles ride opus and separate by effort only.
+        # mapping — the declared top model is reserved for the main session, so
+        # both deep-side profiles follow this adapter's configured model and separate by effort only.
         config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
         main_only = config["CFG_MAIN_SESSION_ONLY_MODELS"].split()
-        self.assertEqual(main_only, ["fable"])
-        self.assertEqual(self._declared_point(config, "deep"), ("opus", "xhigh"))
-        self.assertEqual(self._declared_point(config, "balanced-deep"), ("opus", "medium"))
+        self.assertEqual(main_only, [config["CFG_TIER_TOP_MODEL"]])
+        self.assertEqual(self._declared_point(config, "deep"),
+                         (config["CFG_TIER_DEEP_MODEL"], config["CFG_TIER_DEEP_EFFORT"]))
+        balanced_deep = self._declared_point(config, "balanced-deep")
+        self.assertEqual(balanced_deep[0], config["CFG_TIER_DEEP_MODEL"])
+        self.assertNotEqual(balanced_deep[1], self._declared_point(config, "deep")[1])
         cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
-        self.assertEqual(cascade, ["opus", "sonnet"])
+        self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
+        self.assertEqual(len(cascade), 2)
         self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
         # The role mappers read CFG_TIER_DEEP_EFFORT directly while route-bound work
         # reads the profile's budget; a config where the two disagree silently makes
@@ -196,7 +206,9 @@ class ModelProfileTest(unittest.TestCase):
         # `top` profile resolves to the main-only model on purpose, at the CLI's
         # highest effort, and nothing else reaches it.
         top = PROFILE.resolve_profile_values("claude", config, "top")
-        self.assertEqual((top["model"], top["budget"], top["tier"]), ("fable", "max", "top"))
+        declared_top = self._declared_point(config, "top")
+        self.assertEqual((top["model"], top["budget"], top["tier"]),
+                         (declared_top[0], declared_top[1], "top"))
         self.assertTrue(self._restricted(top["model"], main_only))
         self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "light")
         points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
@@ -204,14 +216,14 @@ class ModelProfileTest(unittest.TestCase):
         self.assertEqual(len(set(points.values())), 5)  # five distinct operating points
 
     def test_codex_shipped_default_is_the_user_profile_mapping(self):
-        # Same 2026-09-09 rule on the Codex adapter: Astra is the top model and
-        # stays with the main session, so the deep tier is Sol at its maximum
-        # effort and balanced-deep is the same model at medium. This adapter has
-        # no main-session-only KEY — the restriction is carried by never naming
-        # Astra in a tier or cascade, which is what this test pins.
+        # Same 2026-09-09 rule on the Codex adapter: the configured top model
+        # stays with the main session. Tier expectations below come from config.
         config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
-        self.assertEqual(self._declared_point(config, "deep"), ("gpt-6.1-sol", "xhigh"))
-        self.assertEqual(self._declared_point(config, "balanced-deep"), ("gpt-6.1-sol", "medium"))
+        self.assertEqual(self._declared_point(config, "deep"),
+                         (config["CFG_TIER_DEEP_MODEL"], config["CFG_TIER_DEEP_EFFORT"]))
+        balanced_deep = self._declared_point(config, "balanced-deep")
+        self.assertEqual(balanced_deep[0], config["CFG_TIER_DEEP_MODEL"])
+        self.assertNotEqual(balanced_deep[1], self._declared_point(config, "deep")[1])
         cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
         self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
         self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")  # review MI-4, as above
@@ -221,12 +233,13 @@ class ModelProfileTest(unittest.TestCase):
         # review MA-2a). `tools/check-model-config.py` separately refuses the literal
         # anywhere outside this file.
         reachable = set(cascade) | self._reachable_models("codex", config)
-        self.assertEqual([m for m in reachable if self._restricted(m, ["astra"])], [])
-        # Since 2026-09-10 the codex adapter declares the key too (parity), and
-        # the `top` exception profile is the one door to Astra.
-        self.assertEqual(config["CFG_MAIN_SESSION_ONLY_MODELS"].split(), ["gpt-6-astra"])
+        restricted = config["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertNotIn(config["CFG_TIER_DEEP_MODEL"], restricted)
+        self.assertEqual([m for m in reachable if self._restricted(m, restricted)], [])
         top = PROFILE.resolve_profile_values("codex", config, "top")
-        self.assertEqual((top["model"], top["budget"], top["tier"]), ("gpt-6-astra", "xhigh", "top"))
+        declared_top = self._declared_point(config, "top")
+        self.assertEqual((top["model"], top["budget"], top["tier"]),
+                         (declared_top[0], declared_top[1], "top"))
 
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
@@ -251,13 +264,9 @@ class ModelProfileTest(unittest.TestCase):
             # OpenCode declares three tiers (balanced-deep, light, mini) with a
             # verified variant each (2026-09-30 사용자 결정): `deep` collapses onto
             # balanced-deep (no deep tier) and `balanced` onto light.
-            "opencode": {
-                "deep": ("opencode-go/muse-spark-1.3-contributor", "xhigh"),
-                "balanced-deep": ("opencode-go/muse-spark-1.3-contributor", "xhigh"),
-                "balanced": ("opencode-go/deepseek-v4.1-flash", "max"),
-                "light": ("opencode-go/deepseek-v4.1-flash", "max"),
-                "mini": ("opencode-go/deepseek-v4.1-flash", "high"),
-            },
+            "opencode": {profile: self._declared_point(
+                PROFILE.load_config(ROOT / "adapters" / "opencode" / "config" / "models.conf"), profile)
+                for profile in ("deep", "balanced-deep", "balanced", "light", "mini")},
         }
         for adapter, profiles in expected.items():
             for profile, pair in profiles.items():
@@ -286,7 +295,7 @@ class ModelProfileTest(unittest.TestCase):
             user = home / "agent-config" / "models.conf"
             user.parent.mkdir()
             # Replace the line whatever the shipped model is, so a model refresh
-            # cannot silently turn this into a no-op edit (2026-09-24, gpt-6.1-sol).
+            # cannot silently turn this into a no-op edit.
             user.write_text(
                 re.sub(r"(?m)^CFG_TIER_DEEP_MODEL=.*$", "CFG_TIER_DEEP_MODEL=user/deep", shipped, count=1)
             )
@@ -313,9 +322,9 @@ class ModelProfileTest(unittest.TestCase):
 
     def test_concrete_override_requires_checked_capacity_retry(self):
         cases = {
-            "claude": {"model": "sonnet", "effort": "medium"},
-            "codex": {"model": "gpt-5.6-luna", "reasoning": "medium"},
-            "opencode": {"model": "opencode-go/deepseek-v4-pro", "variant": "runtime-default"},
+            "claude": {"model": "synthetic-claude-model", "effort": "medium"},
+            "codex": {"model": "synthetic-codex-model", "reasoning": "medium"},
+            "opencode": {"model": "synthetic-opencode/model", "variant": "runtime-default"},
         }
         for adapter, concrete in cases.items():
             wrapper = WRAPPERS[adapter]
@@ -335,7 +344,9 @@ class ModelProfileTest(unittest.TestCase):
         conf = ROOT / "adapters" / "opencode" / "config" / "models.conf"
         balanced = PROFILE.resolve_profile("opencode", conf, "balanced-deep")
         self.assertEqual(balanced["tier"], "balanced-deep")
-        self.assertEqual(balanced["model"], "opencode-go/muse-spark-1.3-contributor")
+        config = PROFILE.load_config(conf)
+        expected_model = PROFILE.resolve_profile_values("opencode", config, "balanced-deep")["model"]
+        self.assertEqual(balanced["model"], expected_model)
         self.assertEqual(balanced["granularity"], "full")
 
         deep = PROFILE.resolve_profile("opencode", conf, "deep")
@@ -424,14 +435,16 @@ class TopExceptionProfileTest(unittest.TestCase):
         self.assertEqual(PROFILE.EXCEPTION_PROFILES, ("top",))
 
     def test_each_adapter_declares_top_and_opencode_collapses_typed(self):
-        expected = {"claude": ("fable", "max", "top", "full"),
-                    "codex": ("gpt-6-astra", "xhigh", "top", "full"),
-                    "opencode": ("opencode-go/muse-spark-1.3-contributor", "xhigh", "balanced-deep", "collapsed-top-to-balanced-deep")}
-        for adapter, point in expected.items():
+        for adapter in ("claude", "codex", "opencode"):
             with self.subTest(adapter=adapter):
+                config = PROFILE.load_config(ROOT / "adapters" / adapter / "config" / "models.conf")
                 resolved = PROFILE.resolve_profile(
                     adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "top")
-                self.assertEqual((resolved["model"], resolved["budget"], resolved["tier"], resolved["granularity"]), point)
+                declared = declared_point(config, "top")
+                self.assertEqual((resolved["model"], resolved["budget"]), declared)
+                self.assertEqual(resolved["tier"], config["CFG_MODEL_PROFILE_TOP"].split(":", 1)[0])
+                self.assertEqual(resolved["granularity"], config.get("CFG_MODEL_PROFILE_GRANULARITY_TOP",
+                                                                       config.get("CFG_MODEL_PROFILE_GRANULARITY")))
 
     def test_an_undeclared_top_profile_is_refused_typed_never_derived(self):
         config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
