@@ -789,7 +789,7 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertEqual(row["reason"], "owner-live")
         self.assertAlmostEqual(row["until"] - time.time(), route_autoclose.RECHECK_SECONDS, delta=120)
 
-    def test_non_automatic_closure_keeps_its_existing_finish_refusal(self):
+    def test_normal_finish_consumes_prior_unproven_close(self):
         route_file, route = self.compose("hand-closed", "codex", "session-1")
         record = self.write_artifact(route)
         self.run_as("codex", "session-1", "close", "--route", route_file, "--allow-unproven")
@@ -797,8 +797,11 @@ class RouteAutocloseTest(unittest.TestCase):
         summary.write_text("done\n")
         done = self.run_as("codex", "session-1", "finish", "--route", route_file, "--evidence",
                            self.cycle_dir(record) / "artifacts/documents/report.md", "--summary-file", summary)
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("finish-route-already-closed", done.stderr + done.stdout)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        outcome = self.outcome(route_file)
+        self.assertTrue(outcome["terminal_gate_proven"])
+        manifest = json.loads((self.cycle_dir(record) / "manifest.json").read_text())
+        self.assertEqual(manifest["cycle"]["state"], "completed")
 
     def test_the_sweeping_session_keeps_its_own_routes(self):
         route_file, _route = self.compose("mine", "codex", "session-1")

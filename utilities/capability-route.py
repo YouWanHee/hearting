@@ -5320,15 +5320,37 @@ def _outcome_replay_matches(existing, *, route_id, route_hash,
     if existing.get("route_id") != route_id or existing.get("route_hash") != route_hash:
         return False
     if inline_finish_id is not None:
-        return (existing.get("inline_finish_id") == inline_finish_id
-                and existing.get("terminal_marker_digest") == terminal_marker_digest
-                and existing.get("producer_binding_digest") == producer_binding_digest
-                and existing.get("summary_digest") == summary_digest
-                and existing.get("head_commit") == inline_commit)
+        return all(existing.get(key) == value for key, value in (
+            ("inline_finish_id", inline_finish_id),
+            ("terminal_marker_digest", terminal_marker_digest),
+            ("producer_binding_digest", producer_binding_digest),
+            ("summary_digest", summary_digest),
+            ("head_commit", inline_commit),
+        ))
+    if existing.get("terminal_gate_proven") is False:
+        # A recorded unproven close is a real record with a real identity: what it stored stays
+        # authoritative even when a caller omits it, so a matching commit cannot hide a foreign
+        # owner/binding/marker. (An already-proven outcome replays on the baseline rule below.)
+        for key, supplied in (("terminal_commit_id", terminal_commit_id),
+                              ("terminal_owner_attempt_id", owner_attempt_id),
+                              ("producer_binding_digest", producer_binding_digest),
+                              ("terminal_marker_digest", terminal_marker_digest)):
+            stored = existing.get(key)
+            if stored is not None and supplied != stored:
+                return False
     if terminal_commit_id is None and owner_attempt_id is None and producer_binding_digest is None:
         # Legacy callers retain the historical route/hash/optional-marker rule.
         return (terminal_marker_digest is None
                 or existing.get("terminal_marker_digest") == terminal_marker_digest)
+    # A caller that names an identity axis is compared on the axes it names;
+    # a matching commit cannot hide an explicitly named owner/binding/marker
+    # that the recorded outcome contradicts.
+    for key, supplied in (("terminal_owner_attempt_id", owner_attempt_id),
+                          ("producer_binding_digest", producer_binding_digest),
+                          ("terminal_marker_digest", terminal_marker_digest)):
+        stored = existing.get(key)
+        if supplied is not None and stored is not None and supplied != stored:
+            return False
     if terminal_commit_id is not None and existing.get("terminal_commit_id") == terminal_commit_id:
         return True
     return (owner_attempt_id is not None and producer_binding_digest is not None
@@ -5336,6 +5358,235 @@ def _outcome_replay_matches(existing, *, route_id, route_hash,
             and existing.get("terminal_owner_attempt_id") == owner_attempt_id
             and existing.get("producer_binding_digest") == producer_binding_digest
             and existing.get("terminal_marker_digest") == terminal_marker_digest)
+
+
+def _current_terminal_identity(route, gates, owner_attempt_id):
+    """The terminal tuple the runtime holds now for one candidate owner (read-only).
+
+    Built only from state that already exists: the exact terminal markers just observed, the
+    owner's terminal-commit slot, and its producer binding. An owner that neither holds a slot
+    for this very marker set nor is the attempt that wrote a terminal marker is not provably
+    current, and nothing is returned for it. Under the producer lifecycle the binding axes come from the
+    binding held now, or from this owner's verified claimed slot when no binding file exists; with neither,
+    no producer authority exists and nothing is returned, so a caller's or an old record's values never fill it in."""
+    dtc = dispatch_terminal_commit
+    try:
+        rows = list(gates.values())
+        marker_digest = dtc.terminal_marker_digest(rows)
+        slot = dtc.terminal_slot(Path(route["artifact_root"]), route["route_id"], owner_attempt_id)
+        state = None
+        if (slot / "terminal-commit.json").is_file():
+            state = json.loads((slot / "terminal-commit.json").read_text(encoding="utf-8"))
+    except (dtc.TerminalCommitError, OSError, ValueError, KeyError, TypeError):
+        return {}
+    producer_digest = None
+    if (isinstance(state, dict) and state.get("owner_attempt_id") == owner_attempt_id
+            and state.get("route_id") == route["route_id"] and state.get("route_hash") == route["route_hash"]
+            and state.get("terminal_marker_digest") == marker_digest
+            and isinstance(state.get("producer_binding_digest"), str)
+            and state.get("terminal_commit_id") == dtc.terminal_commit_id(
+                route_id=route["route_id"], route_hash=route["route_hash"], owner_attempt_id=owner_attempt_id,
+                marker_digest=marker_digest, producer_digest=state["producer_binding_digest"])):
+        producer_digest = state["producer_binding_digest"]
+    elif owner_attempt_id not in {row.get("attempt_id") for row in rows}:
+        return {}
+    current = {"terminal_owner_attempt_id": owner_attempt_id, "terminal_marker_digest": marker_digest}
+    try:
+        if dtc.producer_lifecycle_applies(route):
+            try:
+                binding = dtc.load_producer_binding(artifact_root=Path(route["artifact_root"]),
+                                                    route_id=route["route_id"], owner_attempt_id=owner_attempt_id)
+            except dtc.TerminalCommitError as exc:
+                # No binding file: only this owner's verified claimed slot still knows its binding, and a
+                # file that exists but is unusable proves nothing. Without either, no producer authority.
+                if exc.code != "producer-binding-required" or producer_digest is None:
+                    return {}
+            else:
+                if binding.digest is None or (binding.binding or {}).get("route_hash") != route["route_hash"]:
+                    return {}
+                producer_digest = binding.digest  # the binding held now, whatever an older claim recorded
+        elif producer_digest is None:
+            producer_digest = dtc._digest(dtc._canonical({"contract": "producer-binding-not-applicable/v1",
+                                                         "reason": "sealed-topology-nonproducer"}))
+    except (dtc.TerminalCommitError, OSError, ValueError, KeyError, TypeError):
+        return {}
+    current["producer_binding_digest"] = producer_digest
+    current["terminal_commit_id"] = dtc.terminal_commit_id(
+        route_id=route["route_id"], route_hash=route["route_hash"], owner_attempt_id=owner_attempt_id,
+        marker_digest=marker_digest, producer_digest=producer_digest)
+    return current
+
+
+def _promote_historical_false_outcome(route, route_file, existing, raw, *, jobs=None,
+                                     terminal_commit_id=None, owner_attempt_id=None,
+                                     producer_binding_digest=None, terminal_marker_digest=None,
+                                     inline_finish_id=None, summary_digest=None, inline_commit=None):
+    """Consume a later exact terminal proof while retaining the original false bytes."""
+    if (not isinstance(existing, dict) or existing.get("terminal_gate_proven") is not False
+            or existing.get("autoclose") is not None
+            or existing.get("disposition") in ("abandoned", "operator-decision", "cancelled")
+            or route.get("stop_reason") is not None or route.get("workflow_state") == "CANCELLED"
+            or existing.get("route_id") != route.get("route_id")
+            or existing.get("route_hash") != route.get("route_hash")
+            or existing.get("route_file") != str(Path(route_file).resolve())
+            or existing.get("cwd") != route.get("cwd")):
+        return existing, False
+    try:
+        import artifact_producer
+        route_on_disk = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        if (not isinstance(route_on_disk, dict)
+                or route_on_disk.get("route_id") != route.get("route_id")
+                or route_on_disk.get("route_hash") != route.get("route_hash")):
+            return existing, False
+        cycle_record = artifact_producer.route_cycle_for(Path(route["artifact_root"]), route_on_disk)
+        if cycle_record is not None:
+            if cycle_record.get("abandon_reason") or cycle_record.get("deleted_at"):
+                return existing, False
+            if cycle_record.get("state") == "sealed":
+                manifest_path = artifact_producer._record_cycle_manifest_path(Path(route["artifact_root"]), cycle_record)
+                manifest = artifact_producer._read_json(manifest_path) if manifest_path.is_file() else None
+                if not isinstance(manifest, dict) or (manifest.get("cycle") or {}).get("state") != "active":
+                    return existing, False
+    except ImportError:
+        return existing, False
+    except artifact_producer.ProducerError:
+        return existing, False
+    except (OSError, ValueError, KeyError, TypeError):
+        return existing, False
+    try:
+        import inline_finish
+        pending = inline_finish.pending_state(Path(route["artifact_root"]), route["route_id"])
+    except (OSError, ValueError):
+        return existing, False
+    if pending and pending.get("state") != "finished" and not (
+            inline_finish_id is not None
+            and pending.get("inline_finish_id") == inline_finish_id
+            and pending.get("state") in ("node-completed", "route-closed")):
+        return existing, False
+    cleanup_scope = dispatch_terminal_commit.require_current_cleanup(
+        "close-forward-recovery", target=Path(route_file), jobs=jobs)
+    if cleanup_scope is not None and (
+            not terminal_commit_id or terminal_commit_id != cleanup_scope.terminal_commit_id
+            or owner_attempt_id != cleanup_scope.owner_attempt_id
+            or not producer_binding_digest):
+        return existing, False
+    # What the false record names decides how strictly "now" must be read: a stored owner/commit is a
+    # registered tuple, so the markers are observed per exact attempt, as the owner's own close does.
+    exact = any(value is not None for value in (
+        terminal_commit_id, owner_attempt_id, existing.get("terminal_commit_id"),
+        existing.get("terminal_owner_attempt_id")))
+    if exact and jobs is None:
+        jobs = _compose_default_jobs()  # a close that names no registry reads the one this execution runs under
+    gates = terminal_gate_observation(route, jobs=jobs, exact_terminal=exact)
+    if terminal_gate_proven(gates) is not True:
+        return existing, False
+    if existing.get("inline_finish_id") is not None:
+        # An inline finish's tuple is consumed by that same intent's finish, never by a caller naming none.
+        if inline_finish_id is None:
+            raise ValueError("route-close-outcome-conflict")
+        if terminal_marker_digest is None:
+            terminal_marker_digest = "sha256:" + hashlib.sha256(
+                json.dumps(gates, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        identity_matches = _outcome_replay_matches(
+            existing, route_id=route["route_id"], route_hash=route["route_hash"],
+            terminal_commit_id=terminal_commit_id, owner_attempt_id=owner_attempt_id,
+            producer_binding_digest=producer_binding_digest,
+            terminal_marker_digest=terminal_marker_digest, inline_finish_id=inline_finish_id,
+            summary_digest=summary_digest, inline_commit=inline_commit)
+    else:
+        registered = ("terminal_commit_id", "terminal_owner_attempt_id", "producer_binding_digest")
+        if inline_finish_id is not None and any(existing.get(key) is not None for key in registered):
+            raise ValueError("route-close-outcome-conflict")  # a registered owner's record is not an inline finish's
+        # The caller names the tuple it holds, or none: either way it is compared with the tuple the
+        # runtime holds now for the recorded (or named) owner, never filled in from the history.
+        owner = owner_attempt_id if owner_attempt_id is not None else existing.get("terminal_owner_attempt_id")
+        current = _current_terminal_identity(route, gates, owner) if owner is not None else {}
+        if owner is not None and "terminal_owner_attempt_id" not in current:
+            raise ValueError("route-close-outcome-conflict")  # not the owner of the marker observed now
+        supplied = {
+            "terminal_commit_id": terminal_commit_id,
+            "terminal_owner_attempt_id": owner_attempt_id,
+            "producer_binding_digest": producer_binding_digest,
+            "terminal_marker_digest": terminal_marker_digest,
+        }
+        effective = {}
+        for key, value in supplied.items():
+            if value is not None and current.get(key) is not None and value != current[key]:
+                raise ValueError("route-close-outcome-conflict")
+            effective[key] = value if value is not None else current.get(key)
+        identity_matches = all(existing.get(key) is None or existing.get(key) == effective[key]
+                               for key in supplied)
+        if existing.get("summary_digest") is not None:
+            identity_matches = identity_matches and existing.get("summary_digest") == summary_digest
+        terminal_marker_digest = effective["terminal_marker_digest"] or "sha256:" + hashlib.sha256(
+            json.dumps(gates, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if not identity_matches:
+        raise ValueError("route-close-outcome-conflict")
+    from datetime import datetime, timezone
+    promoted = dict(existing)
+    promoted.update(terminal_gate_proven=True, terminal_gates=gates,
+                    terminal_gate_promoted_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    historical_false_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+                    terminal_marker_digest=terminal_marker_digest)
+    if terminal_commit_id is not None:
+        promoted["terminal_commit_id"] = terminal_commit_id
+    if owner_attempt_id is not None:
+        promoted["terminal_owner_attempt_id"] = owner_attempt_id
+    if producer_binding_digest is not None:
+        promoted["producer_binding_digest"] = producer_binding_digest
+    if inline_finish_id is not None:
+        promoted.update(inline_finish_id=inline_finish_id, summary_digest=summary_digest, head_commit=inline_commit)
+    target = outcome_path(route_file)
+    retained = target.with_name(f"{Path(route_file).stem}.historical-false-{hashlib.sha256(raw).hexdigest()[:16]}.outcome.json")
+    with _exclusive_lock(target.with_name(f".{Path(route_file).stem}.outcome.lock")):
+        current_raw = target.read_bytes()
+        if current_raw != raw:
+            current = json.loads(current_raw.decode("utf-8"))
+            if (current.get("historical_false_sha256") == "sha256:" + hashlib.sha256(raw).hexdigest()
+                    and current.get("terminal_gate_proven") is True
+                    and _outcome_replay_matches(
+                        current, route_id=route["route_id"], route_hash=route["route_hash"],
+                        terminal_commit_id=terminal_commit_id, owner_attempt_id=owner_attempt_id,
+                        producer_binding_digest=producer_binding_digest,
+                        terminal_marker_digest=terminal_marker_digest, inline_finish_id=inline_finish_id,
+                        summary_digest=summary_digest, inline_commit=inline_commit)):
+                return current, False
+            raise ValueError("route-close-outcome-conflict")
+        from workflow_state import WorkflowLedger
+        try:
+            workflow = WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).read_only_state()
+        except (OSError, ValueError):
+            return existing, False
+        if workflow["workflow_state"] == "CANCELLED" or workflow["journal_unreadable"]:
+            return existing, False
+        # The retained copy is created complete or not at all (temp + link), so an
+        # interrupted promotion never leaves a partial file that would turn the
+        # normal retry into a permanent conflict. A short prefix of the same
+        # bytes left by an older interrupted write is completed in place.
+        kept = retained.read_bytes() if retained.exists() else None
+        if kept is not None and kept != raw and not (len(kept) < len(raw) and raw.startswith(kept)):
+            raise ValueError("route-close-history-conflict")
+        if kept != raw:
+            fd, temporary = tempfile.mkstemp(prefix=".historical-false-", dir=retained.parent)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(raw); handle.flush(); os.fsync(handle.fileno())
+                if kept is None:
+                    os.link(temporary, retained)
+                else:
+                    os.replace(temporary, retained)
+                dfd = os.open(str(retained.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+        atomic_write(target, promoted)
+    return promoted, True
 
 def close_route(route, route_file, commit=None, summary=None, publication=None,
                 allow_unproven=True, jobs=None, expected_terminal_marker_digest=None,
@@ -5379,7 +5630,25 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
         raise ValueError("publication-unknown-result")
     target=outcome_path(route_file)
     if target.exists():
-        existing=json.loads(target.read_text(encoding="utf-8"))
+        raw = target.read_bytes()
+        existing=json.loads(raw.decode("utf-8"))
+        if existing.get("terminal_gate_proven") is False:
+            promoted, changed = _promote_historical_false_outcome(
+                route, route_file, existing, raw, jobs=jobs,
+                terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
+                producer_binding_digest=expected_producer_binding_digest,
+                terminal_marker_digest=expected_terminal_marker_digest,
+                inline_finish_id=inline_finish_id, summary_digest=expected_summary_digest,
+                inline_commit=inline_commit)
+            if changed:
+                return promoted, True
+            if promoted is not existing and promoted.get("terminal_gate_proven") is True:
+                return promoted, False  # a concurrent close already consumed it; report the current record
+            if all(value is None for value in (terminal_commit_id, expected_owner_attempt_id,
+                    expected_producer_binding_digest, expected_terminal_marker_digest, inline_finish_id)):
+                # A caller that names no identity claims none: the record is not consumed (the terminal gate
+                # is not proven yet, or the tuple it names is not for this caller) and nothing foreign is taken.
+                return existing, False
         if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
                 terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
                 producer_binding_digest=expected_producer_binding_digest,
@@ -7339,6 +7608,32 @@ def complete_node(
         try:
             materialize_after_terminal_close(Path(jobs), attempt_id)
         except Exception:  # noqa: BLE001 -- a committed close is never unwound by delivery-layer failure
+            pass
+    if isinstance(artifact_root, str) and isinstance(route_id, str) and route_id:
+        try:
+            route_file = canonical_route_path(artifact_root, route_id)
+            outcome_file = outcome_path(route_file)
+            raw = outcome_file.read_bytes()
+            prior = json.loads(raw.decode("utf-8"))
+            if (prior.get("terminal_gate_proven") is False
+                    and prior.get("inline_finish_id") is None and prior.get("summary_digest") is None):
+                # A false record that carries a registered tuple is compared with the tuple the runtime
+                # holds now for that owner (the promotion reads it); one that carries none keeps the
+                # marker digest of this completion. An inline finish's record is that finish's to close.
+                identity_bearing = any(prior.get(key) is not None for key in (
+                    "terminal_commit_id", "terminal_owner_attempt_id", "producer_binding_digest",
+                    "terminal_marker_digest"))
+                marker_digest = None
+                if not identity_bearing:
+                    gates = terminal_gate_observation(route, jobs=jobs, exact_terminal=attempt_id is not None)
+                    marker_digest = "sha256:" + hashlib.sha256(
+                        json.dumps(gates, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                _promote_historical_false_outcome(
+                    route, route_file, prior, raw, jobs=jobs,
+                    terminal_marker_digest=marker_digest)
+        except (OSError, ValueError, TypeError):
+            # Completion is already committed; any unconsumed sidecar remains for
+            # the established close/finalize retry path to inspect.
             pass
     _launch_open_cycle_checkpoint(route)
     return marker, row

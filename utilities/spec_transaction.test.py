@@ -352,6 +352,260 @@ class CycleLayoutTest(unittest.TestCase):
   self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=begun["cycle_id"])
   return self.P.admit_shared(self.artifact,cycle_id=begun["cycle_id"],kind="spec",source="spec",key="spec")
 
+ def _shared_components(self):
+  r,f,b=self._cycle("component-base")
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  for rel,body in {"a/prd.md":"# A\n\n## Rule\nbefore\n", "a/extra.md":"keep\n",
+                   "a/_internal/versions/v3/prd.md":"older a\n",
+                   "b/prd.md":"# B\nbefore\n", "b/_internal/versions/v9/prd.md":"older b\n"}.items():
+   target=spec/rel; target.parent.mkdir(parents=True,exist_ok=True); target.write_text(body)
+  self._close(r,f); self.P.finalize(self.artifact,cycle_id=b["cycle_id"])
+  return self.P.admit_shared(self.artifact,cycle_id=b["cycle_id"],kind="spec",source="spec",key="spec")
+
+ def _publish_components(self,r,f,b):
+  self._close(r,f); self.P.finalize(self.artifact,cycle_id=b["cycle_id"])
+  return self.P.admit_shared(self.artifact,cycle_id=b["cycle_id"],kind="spec",source="spec",key="spec")
+
+ def test_normal_direct_component_transaction_snapshots_and_admits_its_exact_base(self):
+  initial=self._shared_components()
+  r=R.compile_route("autopilot-spec","update","direct",self.repo,self.artifact,
+                    predicates=self.PT.ALL,transport=None,inline_reason="atomic-direct",
+                    tracking="tracked",tracked_gate_evidence=self.PT.gate_evidence(),slug="component-input")
+  binding=self.L.admit_runtime_route(self.artifact,r); f=Path(binding.route_file)
+  b=self.P.begin(self.artifact,route_file=f,capability="autopilot-spec",intensity="direct")
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  self.assertFalse((spec/"a").exists()); self.assertFalse((spec/"b").exists())
+  self.assertFalse((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).exists())
+  env={**HERMETIC_ENV,"AGENT_ARTIFACT_CYCLE_DIR":b["cycle_dir"],"AGENT_ARTIFACT_ROOT":str(self.artifact)}
+  command=[sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(self.artifact),
+           "--worktree",str(self.repo),"--route",str(f),"--node","inline","--spec-root","a","--",
+           sys.executable,"-c","import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('# A\\n\\n## Rule\\nafter\\n')"]
+  result=subprocess.run(command,env=env,text=True,capture_output=True)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertFalse((spec/"b").exists())
+  self.assertEqual((spec/"a/_internal/versions/v4/prd.md").read_text(),"# A\n\n## Rule\nbefore\n")
+  self.assertEqual((spec/"a/_internal/versions/v3/prd.md").read_text(),"older a\n")
+  before=self.P._spec_bytes(spec)
+  published=self._publish_components(r,f,b)
+  output=self.P._spec_bytes(Path(published["revision_dir"]),revision=True)
+  self.assertEqual(output["b/prd.md"],b"# B\nbefore\n")
+  self.assertIn(b"after\n",output["a/prd.md"])
+  self.assertEqual(self.P._spec_bytes(spec),before)
+  self.assertEqual(published["spec_merge"]["source_files"],self.P._spec_inventory(before))
+  retry=self.P.admit_shared(self.artifact,cycle_id=b["cycle_id"],kind="spec",source="spec",key="spec")
+  self.assertEqual(retry["status"],"reused")
+  self.assertEqual(retry["shared_reference_revision_id"],published["shared_reference_revision_id"])
+
+ def test_initial_scoped_publication_admits_only_its_selected_component(self):
+  r,f,b=self._cycle("component-initial"); spec=Path(b["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  (spec/"a").mkdir(); (spec/"a/prd.md").write_text("# A\nfirst\n")
+  before=self.P._spec_bytes(spec)
+  published=self._publish_components(r,f,b)
+  output=self.P._spec_bytes(Path(published["revision_dir"]),revision=True)
+  self.assertEqual(output["a/prd.md"],b"# A\nfirst\n")
+  self.assertFalse(any(p.startswith("b/") for p in output))
+  self.assertEqual(self.P._spec_bytes(spec),before)
+  retry=self.P.admit_shared(self.artifact,cycle_id=b["cycle_id"],kind="spec",source="spec",key="spec")
+  self.assertEqual(retry["shared_reference_revision_id"],published["shared_reference_revision_id"])
+
+ def test_initial_scoped_publication_refuses_foreign_payload_before_publication(self):
+  r,f,b=self._cycle("component-initial-foreign"); spec=Path(b["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  for component in ("a","b"):
+   target=spec/component/"prd.md"; target.parent.mkdir(parents=True); target.write_text("# "+component+"\n")
+  with self.assertRaises(self.P.ProducerError) as caught:self._publish_components(r,f,b)
+  self.assertEqual(caught.exception.code,"source-manifest-mismatch")
+  self.assertIsNone(self.P.find_reference_by_key(self.artifact,"spec","spec"))
+  self.assertEqual(list(self.P.shared_journal_path(self.artifact,"probe").parent.glob("*.json")),[])
+
+ def test_scoped_post_publish_interruption_recovers_exact_output_without_mutating_source(self):
+  from unittest import mock
+  initial=self._shared_components()
+  r,f,b=self._cycle("component-publish-interruption"); spec=Path(b["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  (spec/"a/prd.md").write_text("# A\n\n## Rule\nours\n")
+  l,lf,lb=self._cycle("component-publish-latest"); latest_spec=Path(lb["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(latest_spec,self.artifact,spec_root=latest_spec/"b")
+  (latest_spec/"b/prd.md").write_text("# B\nlatest\n")
+  winner=self._publish_components(l,lf,lb)
+  before=self.P._spec_bytes(spec)
+  with mock.patch.object(self.P,"_commit_shared",side_effect=RuntimeError("post-publish interruption")):
+   with self.assertRaises(RuntimeError):self._publish_components(r,f,b)
+  record=self.P.read_cycle_record(self.artifact,b["cycle_id"])
+  manifest=self.P._record_cycle_manifest_path(self.artifact,record); manifest_before=manifest.read_bytes()
+  journal_path=next(self.P.shared_journal_path(self.artifact,"probe").parent.glob("*.json"))
+  journal=json.loads(journal_path.read_text()); output=self.artifact/journal["target"]
+  original=(output/"a/prd.md").read_bytes()
+  self.assertEqual((output/"b/prd.md").read_bytes(),b"# B\nlatest\n")
+  (output/"a/prd.md").write_bytes(b"corruption")
+  self.assertTrue(self.P._recover_locked(self.artifact)["unresolved"])
+  reference=self.P.find_reference_by_key(self.artifact,"spec","spec")
+  self.assertEqual(reference["latest_revision_id"],winner["shared_reference_revision_id"])
+  (output/"a/prd.md").write_bytes(original)
+  self.assertEqual(self.P._recover_locked(self.artifact)["unresolved"],[])
+  self.assertFalse(journal_path.exists())
+  retry=self.P.admit_shared(self.artifact,cycle_id=b["cycle_id"],kind="spec",source="spec",key="spec")
+  self.assertEqual(retry["shared_reference_revision_id"],journal["revision_id"])
+  self.assertEqual(self.P._spec_bytes(spec),before)
+  self.assertEqual(manifest.read_bytes(),manifest_before)
+
+ def test_scoped_candidate_merges_latest_other_component_and_rejects_overlap(self):
+  initial=self._shared_components()
+  a,af,ab=self._cycle("component-a"); ap=Path(ab["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(ap,self.artifact,spec_root=ap/"a")
+  (ap/"a/prd.md").write_text("# A\n\n## Rule\nours\n")
+  l,lf,lb=self._cycle("component-latest"); lp=Path(lb["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(lp,self.artifact,spec_root=lp/"b"); (lp/"b/prd.md").write_text("# B\nlatest\n")
+  self._publish_components(l,lf,lb)
+  merged=self._publish_components(a,af,ab)
+  output=self.P._spec_bytes(Path(merged["revision_dir"]),revision=True)
+  self.assertEqual(output["b/prd.md"],b"# B\nlatest\n")
+  self.assertIn(b"ours\n",output["a/prd.md"])
+  x,xf,xb=self._cycle("component-conflict"); xp=Path(xb["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(xp,self.artifact,spec_root=xp/"a")
+  (xp/"a/prd.md").write_text("# A\n\n## Rule\nX\n")
+  y,yf,yb=self._cycle("component-winner"); yp=Path(yb["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(yp,self.artifact,spec_root=yp/"a"); (yp/"a/prd.md").write_text("# A\n\n## Rule\nY\n")
+  self._publish_components(y,yf,yb)
+  with self.assertRaises(self.P.ProducerError) as caught:self._publish_components(x,xf,xb)
+  self.assertEqual(caught.exception.code,"shared-spec-conflict")
+
+ def test_component_seed_retry_and_scope_extension_preserve_edits_and_deletions(self):
+  self._shared_components(); r,f,b=self._cycle("component-retry")
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  (spec/"a/prd.md").write_text("edited\n"); (spec/"a/extra.md").unlink()
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"b")
+  self.assertEqual((spec/"a/prd.md").read_text(),"edited\n")
+  self.assertFalse((spec/"a/extra.md").exists())
+  self.assertEqual((spec/"b/prd.md").read_text(),"# B\nbefore\n")
+  receipt=json.loads((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())
+  self.assertEqual(receipt["components"],["a","b"])
+  self.assertEqual(receipt["component_seeds"],{"a":True,"b":True})
+  TX.seed_cycle_spec(spec,self.artifact)
+  self.assertIsNone(json.loads((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())["components"])
+  self.assertFalse((spec/"a/extra.md").exists())
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertIsNone(json.loads((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())["components"])
+
+ def test_narrow_owner_seed_uses_declared_scope_before_any_transaction(self):
+  self.assertIsNone(self.P.spec_scope_components(["spec/<component>/prd.md"]))
+  self._shared_components(); r,f,b=self._cycle("component-preseed")
+  TX.preseed_owner_cycle(self.artifact,Path(b["cycle_dir"]),route={"nodes":[{"write_scope":["spec/a/**"]}]})
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  self.assertTrue((spec/"a/prd.md").is_file()); self.assertFalse((spec/"b").exists())
+
+ def test_component_seed_interruption_retries_original_base_without_restoring_completed_component(self):
+  from unittest.mock import patch
+  self._shared_components(); r,f,b=self._cycle("component-interrupted")
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  original=TX.PRODUCER._write_atomic; calls=[]
+  def interrupted(path,data):
+   if path.is_relative_to(spec/"a"):
+    calls.append(str(path))
+    if len(calls)==2:raise OSError("seed interrupted")
+   return original(path,data)
+  with patch.object(TX.PRODUCER,"_write_atomic",interrupted):
+   with self.assertRaises(OSError):TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertFalse(json.loads((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())["seed_complete"])
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertTrue((spec/"a/prd.md").exists()); self.assertFalse((spec/"b").exists())
+
+ def test_partial_component_seed_write_retries_exact_base_and_history_after_latest_moves(self):
+  from unittest import mock
+  initial=self._shared_components(); r,f,b=self._cycle("component-partial-write")
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  base_dir=Path(initial["revision_dir"]); base_before=self.P._spec_bytes(base_dir,revision=True)
+  original_open,original_fdopen=os.open,os.fdopen; opened={}; partial=[]
+  def track_open(path,*args,**kwargs):
+   fd=original_open(path,*args,**kwargs); opened[fd]=Path(path); return fd
+  class PartialWriter:
+   def __init__(self,handle,path):self.handle,self.path=handle,path
+   def __enter__(self):self.handle.__enter__(); return self
+   def __exit__(self,*args):return self.handle.__exit__(*args)
+   def __getattr__(self,name):return getattr(self.handle,name)
+   def write(self,data):
+    self.handle.write(data[:4]); self.handle.flush()
+    partial.append(self.path.read_bytes())
+    raise OSError("after four actual bytes")
+  def partial_fdopen(fd,*args,**kwargs):
+   handle=original_fdopen(fd,*args,**kwargs); path=opened[fd]
+   if path.parent==spec/"a" and path.name.startswith(".prd.md.tmp-"):
+    return PartialWriter(handle,path)
+   return handle
+  with mock.patch.object(os,"open",track_open),mock.patch.object(os,"fdopen",partial_fdopen):
+   with self.assertRaises(OSError):TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertEqual(partial,[base_before["a/prd.md"][:4]])
+  self.assertFalse((spec/"a/prd.md").exists())
+  self.assertEqual(list((spec/"a").glob(".prd.md.tmp-*")),[])
+  receipt=json.loads((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())
+  self.assertFalse(receipt["seed_complete"]); self.assertEqual(receipt["component_seeds"],{"a":False})
+  self.assertEqual(receipt["revision_id"],initial["shared_reference_revision_id"])
+  l,lf,lb=self._cycle("component-partial-write-latest"); latest=Path(lb["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(latest,self.artifact,spec_root=latest/"b")
+  (latest/"b/prd.md").write_text("# B\nlatest\n")
+  self._publish_components(l,lf,lb)
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  receipt=json.loads((spec/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())
+  self.assertEqual(receipt["revision_id"],initial["shared_reference_revision_id"])
+  self.assertTrue(receipt["seed_complete"]); self.assertEqual(receipt["component_seeds"],{"a":True})
+  self.assertEqual((spec/"a/prd.md").read_bytes(),base_before["a/prd.md"])
+  self.assertEqual((spec/"a/_internal/versions/v3/prd.md").read_bytes(),base_before["a/_internal/versions/v3/prd.md"])
+  self.assertFalse((spec/"b").exists())
+  self.assertEqual(self.P._spec_bytes(base_dir,revision=True),base_before)
+  (spec/"a/prd.md").write_text("completed seed edit\n"); (spec/"a/extra.md").unlink()
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertEqual((spec/"a/prd.md").read_text(),"completed seed edit\n")
+  self.assertFalse((spec/"a/extra.md").exists())
+
+ def test_scoped_admission_refuses_foreign_payload_and_real_component_deletion(self):
+  self._shared_components()
+  for foreign in (True,False):
+   with self.subTest(foreign=foreign):
+    r,f,b=self._cycle("component-negative-"+str(foreign)); spec=Path(b["cycle_dir"])/"artifacts/spec"
+    TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+    if foreign:
+     (spec/"b").mkdir(); (spec/"b/prd.md").write_text("foreign\n")
+    else:
+     import shutil
+     shutil.rmtree(spec/"a")
+    with self.assertRaises(self.P.ProducerError) as caught:self._publish_components(r,f,b)
+    self.assertEqual(caught.exception.code,"source-manifest-mismatch" if foreign else "component-set-regressed")
+
+
+ def test_component_retry_recognizes_history_carried_only_by_an_earlier_revision(self):
+  from unittest.mock import patch
+  self._shared_components(); r,f,b=self._cycle("component-older-history")
+  full=Path(b["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(full,self.artifact)
+  (full/"a/_internal/versions/v3/prd.md").unlink()
+  self._publish_components(r,f,b)
+  r,f,b=self._cycle("component-history-interrupted"); spec=Path(b["cycle_dir"])/"artifacts/spec"
+  original=TX.PRODUCER._write_atomic
+  def interrupted(path,data):
+   if path == spec/"a/extra.md":raise OSError("after old history")
+   return original(path,data)
+  with patch.object(TX.PRODUCER,"_write_atomic",interrupted):
+   with self.assertRaises(OSError):TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertEqual((spec/"a/_internal/versions/v3/prd.md").read_text(),"older a\n")
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  self.assertTrue((spec/"a/prd.md").is_file()); self.assertFalse((spec/"b").exists())
+
+ def test_malformed_component_receipt_refuses_without_reseeding(self):
+  self._shared_components(); r,f,b=self._cycle("component-bad-receipt")
+  spec=Path(b["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+  receipt_path=spec/TX.PRODUCER.SPEC_BASE_RECEIPT; before=json.loads(receipt_path.read_text())
+  (spec/"a/extra.md").unlink()
+  for states in ("bad",{"a":False}):
+   receipt_path.write_text(json.dumps({**before,"component_seeds":states}))
+   with self.assertRaises(self.P.ProducerError) as caught:TX.seed_cycle_spec(spec,self.artifact,spec_root=spec/"a")
+   self.assertEqual(caught.exception.code,"shared-base-invalid")
+   self.assertFalse((spec/"a/extra.md").exists())
+
+
  def _second_reference(self, key="cairn-spec"):
   route,route_file,begun=self._cycle("older-reference")
   spec=Path(begun["cycle_dir"])/"artifacts/spec"; spec.mkdir(parents=True)
@@ -517,11 +771,11 @@ class CycleLayoutTest(unittest.TestCase):
   first=self._shared_v1()
   _r,_f,begun=self._cycle("interrupted-seed")
   base=Path(begun["cycle_dir"])/"artifacts/spec"
-  original=Path.write_bytes
+  original=TX.PRODUCER._write_atomic
   def interrupt(path,data):
    if path.name=="prd.md": raise OSError("interrupted")
    return original(path,data)
-  with mock.patch.object(Path,"write_bytes",interrupt):
+  with mock.patch.object(TX.PRODUCER,"_write_atomic",interrupt):
    with self.assertRaises(OSError): TX.seed_cycle_spec(base,self.artifact)
   receipt=(base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes()
   self.assertEqual(json.loads(receipt)["revision_id"],first["shared_reference_revision_id"])
@@ -559,11 +813,11 @@ class CycleLayoutTest(unittest.TestCase):
   first=self._shared_v1()
   _r,_f,begun=self._cycle("partial-original")
   base=Path(begun["cycle_dir"])/"artifacts/spec"
-  original=Path.write_bytes
+  original=TX.PRODUCER._write_atomic
   def interrupt(path,data):
    if path.name=="prd.md": raise OSError("interrupted")
    return original(path,data)
-  with mock.patch.object(Path,"write_bytes",interrupt):
+  with mock.patch.object(TX.PRODUCER,"_write_atomic",interrupt):
    with self.assertRaises(OSError): TX.seed_cycle_spec(base,self.artifact)
   route,route_file,new=self._cycle("other-publisher")
   output=Path(new["cycle_dir"])/"artifacts/spec"
@@ -604,11 +858,11 @@ class CycleLayoutTest(unittest.TestCase):
   self._shared_v1()
   _r,_f,begun=self._cycle("edited-partial")
   base=Path(begun["cycle_dir"])/"artifacts/spec"
-  original=Path.write_bytes
+  original=TX.PRODUCER._write_atomic
   def interrupt(path,data):
    if path.name=="prd.md": raise OSError("interrupted")
    return original(path,data)
-  with mock.patch.object(Path,"write_bytes",interrupt):
+  with mock.patch.object(TX.PRODUCER,"_write_atomic",interrupt):
    with self.assertRaises(OSError): TX.seed_cycle_spec(base,self.artifact)
   (base/"prd.md").write_text("user edit\n")
   with self.assertRaises(self.P.ProducerError) as exc: TX.seed_cycle_spec(base,self.artifact)
