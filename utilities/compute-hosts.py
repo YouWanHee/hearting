@@ -1247,13 +1247,15 @@ def epoch_scan_file(handle, size, key, cache):
         off, state, tail = max(0, size - window), epoch_fresh_state(), b""
         aligned = off == 0
     if cache.get("path"):
+        head_total, head_checked = None, False
         if generation and "head_total" in entry:
-            head_total = entry["head_total"]
+            head_total, head_checked = entry["head_total"], True
         else:
             try:
                 head_total = epoch_head_total(handle, size)
+                head_checked = True
             except OSError:
-                head_total = None
+                pass    # Failed reads stay eligible for the next normal probe.
         # Header never supplies n/bar/done. Previously observed tail totals win.
         if state["of"] is None:
             state["of"] = (entry["state"]["of"] if generation
@@ -1302,7 +1304,9 @@ def epoch_scan_file(handle, size, key, cache):
             lead = min(off, EPOCH_ANCHOR_BYTES)
             tail = os.pread(handle, lead, off - lead)
         cache["files"][key] = {"off": off, "anchor": epoch_anchor(tail), "skip": not aligned,
-                               "state": state, "head_total": head_total, "seen": time.time()}
+                               "state": state, "seen": time.time()}
+        if head_checked:
+            cache["files"][key]["head_total"] = head_total
         cache["dirty"] = True
     return state if current else None
 

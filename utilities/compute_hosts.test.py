@@ -1250,6 +1250,30 @@ class ProbeEpochTest(unittest.TestCase):
         self.assertEqual(again, view)
         self.assertEqual([row for row in reads if row[0] == 0], [])
 
+    def test_transient_header_read_failure_recovers_on_the_next_normal_probe(self):
+        log = self.head_log("transient.log", b"max_epoch: 200\n")
+        pread = os.pread
+        heads = []
+        def fail_header(fd, count, offset):
+            if offset == 0 and count == 65536:
+                heads.append((offset, count))
+                raise OSError("one transient header read failure")
+            return pread(fd, count, offset)
+        with mock.patch.object(os, "pread", side_effect=fail_header):
+            self.assertEqual(self.probe(log), {"n": "7"})
+        self.assertEqual(heads, [(0, 65536)])
+        (entry,) = self.cached().values()
+        self.assertNotIn("head_total", entry)
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7", "of": 200})
+        self.assertEqual([row for row in reads if row[0] == 0], [(0, 65536, 65536)])
+        (entry,) = self.cached().values()
+        self.assertEqual(entry["head_total"], 200)
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7", "of": 200})
+        self.assertEqual([row for row in reads if row[0] == 0], [])
+        self.assertEqual(sum(row[2] for row in reads), 4096 + 64)
+
     def test_no_total_header_is_cached_across_incremental_and_large_gap_reads(self):
         log = self.head_log("negative.log", b"num_per_epoch=20000\nwarmup_epochs: 5\n")
         view, reads = self.measured_probe(log)
