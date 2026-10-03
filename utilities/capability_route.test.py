@@ -1736,6 +1736,63 @@ class TestRoute(unittest.TestCase):
    self.assertEqual(R.outcome_path(path).read_bytes(),raw)
    self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
 
+ def test_actual_cancelled_workflow_keeps_historical_false_and_does_not_repair_cache(self):
+  import workflow_state
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   self.assertTrue(R.terminal_gate_proven(R.terminal_gate_observation(route,jobs=jobs)))
+   ledger=workflow_state.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+   for state in ("READY","RUNNING","CANCELLED"):
+    ledger.set_workflow_state(state,actor="fixture",evidence={"reason":"user stop"})
+   ledger.state_path.write_text('{"workflow_state":"RUNNING"}\n',encoding="utf-8")
+   journal=ledger.journal_path.read_bytes(); cache=ledger.state_path.read_bytes()
+   self.assertNotIn("workflow_state",route)
+   kept,created=R.close_route(route,path,jobs=jobs)
+   self.assertFalse(created); self.assertFalse(kept["terminal_gate_proven"])
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+   self.assertEqual(ledger.read_only_state()["workflow_state"],"CANCELLED")
+   self.assertEqual(ledger.journal_path.read_bytes(),journal)
+   self.assertEqual(ledger.state_path.read_bytes(),cache)
+
+ def test_actual_workflow_cancellation_keeps_already_proven_replay(self):
+  import workflow_state
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   proven,created=R.close_route(route,path,jobs=jobs)
+   self.assertTrue(created and proven["terminal_gate_proven"])
+   ledger=workflow_state.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+   self.assertFalse(ledger.root.exists())  # no ledger is required or created by consumption
+   for state in ("READY","RUNNING","CANCELLED"):
+    ledger.set_workflow_state(state,actor="fixture",evidence={"reason":"later user stop"})
+   proven_bytes=R.outcome_path(path).read_bytes()
+   replay,created=R.close_route(route,path,jobs=jobs)
+   self.assertFalse(created); self.assertTrue(replay["terminal_gate_proven"])
+   self.assertEqual(R.outcome_path(path).read_bytes(),proven_bytes)
+   self.assertEqual(ledger.read_only_state()["workflow_state"],"CANCELLED")
+
+ def test_workflow_cancelled_after_terminal_observation_prevents_false_publication(self):
+  import workflow_state
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   ledger=workflow_state.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+   observe=R.terminal_gate_observation
+   def cancel_after_observation(*args,**kwargs):
+    gates=observe(*args,**kwargs)
+    self.assertTrue(R.terminal_gate_proven(gates))
+    for state in ("READY","RUNNING","CANCELLED"):
+     ledger.set_workflow_state(state,actor="fixture",evidence={"reason":"user stop"})
+    return gates
+   with mock.patch.object(R,"terminal_gate_observation",side_effect=cancel_after_observation):
+    kept,created=R.close_route(route,path,jobs=jobs)
+   self.assertFalse(created); self.assertFalse(kept["terminal_gate_proven"])
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+   self.assertEqual(ledger.read_only_state()["workflow_state"],"CANCELLED")
+
  def test_historical_false_close_identity_conflict_is_not_masked_and_keeps_bytes(self):
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
    route,node,path,jobs,evidence,raw=self._false_closed_route(tmp,terminal_commit_id="a"*40,expected_owner_attempt_id="att-a")

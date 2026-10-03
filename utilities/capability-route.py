@@ -5552,6 +5552,13 @@ def _promote_historical_false_outcome(route, route_file, existing, raw, *, jobs=
                         summary_digest=summary_digest, inline_commit=inline_commit)):
                 return current, False
             raise ValueError("route-close-outcome-conflict")
+        from workflow_state import WorkflowLedger
+        try:
+            workflow = WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).read_only_state()
+        except (OSError, ValueError):
+            return existing, False
+        if workflow["workflow_state"] == "CANCELLED" or workflow["journal_unreadable"]:
+            return existing, False
         # The retained copy is created complete or not at all (temp + link), so an
         # interrupted promotion never leaves a partial file that would turn the
         # normal retry into a permanent conflict. A short prefix of the same

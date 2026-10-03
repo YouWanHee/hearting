@@ -376,6 +376,25 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 if marker_digest != state.get("terminal_marker_digest"): raise InlineFinishError("finish-marker-drift")
             outcome_path = api.outcome_path(route_file)
             binding = make_binding(marker_digest)
+            if state["state"] == "route-closed":
+                try:
+                    recorded_outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise InlineFinishError("finish-outcome-missing-or-corrupt") from exc
+                if _digest(json.dumps(recorded_outcome, sort_keys=True).encode()) != state.get("outcome_digest"):
+                    raise InlineFinishError("finish-outcome-drift")
+                if recorded_outcome.get("terminal_gate_proven") is False:
+                    if not api._outcome_replay_matches(
+                            recorded_outcome, route_id=route["route_id"], route_hash=route["route_hash"],
+                            terminal_marker_digest=marker_digest, inline_finish_id=intent_id,
+                            summary_digest=intent["summary_sha256"], inline_commit=commit,
+                            producer_binding_digest=_digest(json.dumps(
+                                binding, sort_keys=True, separators=(",", ":")).encode())):
+                        raise InlineFinishError("finish-outcome-conflict")
+                    # Re-enter the existing close step durably before consuming the false record.
+                    # If close publishes and then stops, its normal replay updates this same intent.
+                    state.update(state="node-completed")
+                    _atomic(state_path, state)
             if state["state"] == "node-completed":
                 _fault("before-close")
                 if not outcome_path.is_file():

@@ -2244,6 +2244,33 @@ class FinalizeStateConflictTest(ProducerTestBase):
         return (manifest_path.read_bytes(), json.dumps(record, sort_keys=True),
                 json.dumps(index.manifests[cycle_id], sort_keys=True), P.journal_path(self.root, cycle_id).exists())
 
+    def _cancel_workflow_for_latch(self, route):
+        import workflow_state
+        ledger = workflow_state.WorkflowLedger(route["route_id"], route["route_hash"], jobs=self.jobs)
+        for state in ("READY", "RUNNING", "CANCELLED"):
+            ledger.set_workflow_state(state, actor="fixture", evidence={"reason": "user stop"})
+        return ledger
+
+    def test_actual_cancelled_workflow_keeps_provisional_finalize_and_refresh_active(self):
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()
+        ledger = self._cancel_workflow_for_latch(route)
+        ledger.state_path.write_text('{"workflow_state":"RUNNING"}\n', encoding="utf-8")
+        journal, cache = ledger.journal_path.read_bytes(), ledger.state_path.read_bytes()
+        before = self._state_snapshot(cycle_id, manifest_path)
+        proven = R.outcome_path(route_file).read_bytes()
+        self.assertNotIn("workflow_state", route)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertEqual(self._state_snapshot(cycle_id, manifest_path), before)
+        refreshed = P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+        self.assertNotEqual(refreshed.get("status"), "emitted", refreshed)
+        self.assertEqual(self._state_snapshot(cycle_id, manifest_path), before)
+        self.assertEqual(R.outcome_path(route_file).read_bytes(), proven)
+        self.assertEqual(ledger.read_only_state()["workflow_state"], "CANCELLED")
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+        self.assertEqual(ledger.state_path.read_bytes(), cache)
+
     def test_provisional_active_payload_edit_and_completion_land_in_one_revision(self):
         route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close(
             extra_payload=True)
@@ -2336,6 +2363,8 @@ class FinalizeStateConflictTest(ProducerTestBase):
             if injection == "lease":
                 patch = mock.patch.object(P, "_live_review_lease", return_value={"lease": "live"})
                 patch.start(); patches.append(patch)
+            elif injection == "cancelled-workflow":
+                self._cancel_workflow_for_latch(route)
             else:
                 outcome = json.loads(R.outcome_path(route_file).read_text())
                 outcome["disposition"] = "abandoned"
@@ -2358,6 +2387,9 @@ class FinalizeStateConflictTest(ProducerTestBase):
 
     def test_observed_refresh_completion_candidate_with_abandoned_outcome_after_candidate_is_superseded(self):
         self._assert_stale_completion_candidate_is_superseded("abandoned-outcome")
+
+    def test_observed_refresh_completion_candidate_with_cancelled_workflow_is_superseded(self):
+        self._assert_stale_completion_candidate_is_superseded("cancelled-workflow")
 
     def _assert_first_completion_negative_keeps_active(self, mutate):
         route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()

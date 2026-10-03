@@ -5426,6 +5426,12 @@ def _provisional_completion_context(root: Path, record: Mapping[str, Any],
         route_module = artifact_lifecycle._load_capability_route()
         gates = route_module.terminal_gate_observation(
             sealed_route, exact_terminal=outcome.get("terminal_commit_id") is not None)
+        from workflow_state import WorkflowLedger
+        workflow = WorkflowLedger(
+            sealed_route["route_id"], sealed_route["route_hash"],
+            jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None).read_only_state()
+        if workflow["workflow_state"] == "CANCELLED" or workflow["journal_unreadable"]:
+            return None
     except (artifact_lifecycle.LifecycleError, OSError, ValueError, UnicodeError):
         return None
     if (sealed_route.get("route_hash") != route.get("route_hash")
