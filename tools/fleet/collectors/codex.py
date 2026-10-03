@@ -1112,8 +1112,13 @@ def session_id_of_process(pid, live_codex=None):
     except (OSError, ValueError):
         return None
     from . import procscan
+    # /proc/<pid>/environ retains the environment supplied at execve. Pass its
+    # PWD explicitly as the launch-base candidate; it is independent of current
+    # cwd and may differ after Codex applies --cd or otherwise changes directory.
+    initial_env = procscan.read_environ(pid)
+    initial_launch_pwd = initial_env.get("PWD")
     cwd = procscan.codex_effective_cwd(
-        procscan._read_argv(pid), cwd, procscan.read_environ(pid).get("PWD"))
+        procscan._read_argv(pid), cwd, initial_launch_pwd)
     if procscan.is_shared_codex_daemon(pid):
         return None
     path = _proc_rollout(pid, cwd, _home())
@@ -1124,7 +1129,7 @@ def session_id_of_process(pid, live_codex=None):
         return registered
     if procscan._comm_of(pid) != "codex":
         return None                     # procscan lists only `codex` itself as a runtime
-    env = procscan.read_environ(pid)
+    env = initial_env
     home = env.get("CODEX_HOME") or (
         os.path.join(env["HOME"], ".codex") if env.get("HOME") else None)
     if not home:
