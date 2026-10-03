@@ -374,7 +374,31 @@ class EvidenceCacheTests(unittest.TestCase):
             self.assertNotIn(leaked, text)
         self.assertEqual(len(data["native"][0]["e"]), 2)
         self.assertEqual([p.name for p in self.home.glob("jobs.log*")],
-                         ["jobs.log", "jobs.log.capacity-cache.json"])
+                         ["jobs.log", "jobs.log.capacity-cache.json",
+                          "jobs.log.capacity-cache.json.lock"])
+
+    def test_concurrent_shared_miss_builds_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        self.write(scope=False)
+        self.settle()
+        barrier = threading.Barrier(8)
+        original = Q._build_snapshot
+
+        def counted(*args, **kwargs):
+            time.sleep(0.03)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(Q, "_build_snapshot", side_effect=counted) as build:
+            def consume(_):
+                barrier.wait(timeout=2)
+                return Q.usage_states(self.jobs, now=self.now + 10, env=self.env)
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                answers = list(pool.map(consume, range(8)))
+        self.assertEqual(len(set(tuple(sorted(x.items())) for x in answers)), 1)
+        self.assertEqual(build.call_count, 1)
 
     def test_same_answers_with_and_without_the_cache_across_now_scope_and_model(self):
         other = {**self.env}

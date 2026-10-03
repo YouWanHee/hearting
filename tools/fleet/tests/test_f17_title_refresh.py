@@ -1041,7 +1041,13 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
         rt.subprocess.run = counting_run
         try:
             first = rt.selected_providers()
-            second = rt.selected_providers()
+            real_spec = rt.importlib.util.spec_from_file_location
+            loaded = []
+            def recording_spec(name, location, *args, **kwargs):
+                loaded.append(str(location))
+                return real_spec(name, location, *args, **kwargs)
+            with mock.patch.object(rt.importlib.util, "spec_from_file_location", side_effect=recording_spec):
+                second = rt.selected_providers()
         finally:
             rt.subprocess.run = real_run
             for key, value in saved.items():
@@ -1051,6 +1057,8 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
                     os.environ[key] = value
         self.assertEqual(first, second)
         self.assertLessEqual(len(calls), 1)
+        self.assertFalse(any(path.endswith("harness-capacity.py") or path.endswith("dispatch_allocation.py")
+                             for path in loaded))
 
     def test_cascade_skips_an_uninstalled_leader(self):
         """An absent first quality peer must fall through, not go blank."""
