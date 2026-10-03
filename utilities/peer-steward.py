@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -381,7 +382,7 @@ def _managed_ingress_dir(kind):
 
 
 def _pane_has_agent(pane):
-    """True when herdr already sees an agent in this pane.
+    """Return pane-occupied, pane-unknown, or None for an observed empty pane.
 
     Typing into a pane that is running an agent would inject text into that agent's
     prompt. `herdr agent start` requires a bare shell prompt for the same reason, so this
@@ -392,25 +393,48 @@ def _pane_has_agent(pane):
                               text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
     except Exception:
-        return True          # unreadable pane: assume occupied, type nothing
+        return "pane-unknown"  # unreadable pane: type nothing
     block = (payload.get("result") or {}).get("pane") if isinstance(payload, dict) else None
     if not isinstance(block, dict):
-        return True
-    return bool(block.get("agent"))
+        return "pane-unknown"
+    return "pane-occupied" if block.get("agent") else None
 
 
-def _ensure_pane_ingress(pane, kind):
+def _wait_for_shell_prompt(pane, timeout_ms=None):
+    """Observe an idle shell prompt before sending cwd/PATH bootstrap text."""
+    timeout_ms = int(timeout_ms or _herdr_get_timeout())
+    try:
+        proc = subprocess.run(
+            ["herdr", "pane", "wait-output", "--regex",
+             r"(?m)(?:^|[ ])(?:[$#%❯])\s*$", pane,
+             "--source", "visible", "--timeout", str(timeout_ms)],
+            capture_output=True, text=True, timeout=max(1, timeout_ms / 1000 + 1))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _ensure_pane_ingress(pane, kind, cwd=None):
     """Put hearting's launcher wrapper first on the PANE's PATH. Returns a typed reason.
 
     ``None`` means nothing was needed or nothing was typed; any other value names why, and
     is carried into the launch receipt so an unmanaged launch can never be silent.
     """
     directory = _managed_ingress_dir(kind)
-    if directory is None:
+    bootstrap_cwd = cwd if kind == "claude" and cwd else None
+    if directory is None and bootstrap_cwd is None:
         return None
-    if _pane_has_agent(pane):
-        return "pane-occupied"
-    line = 'export PATH="%s:$PATH"' % directory
+    pane_state = _pane_has_agent(pane)
+    if pane_state:
+        return pane_state
+    if not _wait_for_shell_prompt(pane):
+        return _native_trust_reason(kind, _read_screen(pane)) or "shell-readiness-timeout"
+    commands = []
+    if bootstrap_cwd:
+        commands.append("cd -- %s" % shlex.quote(bootstrap_cwd))
+    if directory:
+        commands.append('export PATH="%s:$PATH"' % directory)
+    line = " && ".join(commands)
     try:
         text = subprocess.run(["herdr", "pane", "send-text", pane, line],
                               capture_output=True, text=True, timeout=5)
@@ -659,20 +683,20 @@ def cmd_start(args):
     if args.cwd:
         flag = _CWD_FLAG.get(args.kind)
         pane_cwd = os.path.realpath(os.path.expanduser(str(args.cwd)))
-        if not flag:
-            print(f"started=false reason=cwd-unsupported-by-{args.kind} "
-                  f"agent={args.kind} name={args.name} pane={args.pane} cwd={pane_cwd} "
-                  f"hint=start the pane in that directory, then start the agent")
-            return 1
         if not os.path.isdir(pane_cwd):
             print(f"started=false reason=cwd-not-a-directory agent={args.kind} "
                   f"name={args.name} pane={args.pane} cwd={pane_cwd}")
             return 1
-        cwd_flag = [flag, pane_cwd]
+        if flag:
+            cwd_flag = [flag, pane_cwd]
 
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
-    ingress_note = _ensure_pane_ingress(args.pane, args.kind)
+    ingress_note = _ensure_pane_ingress(args.pane, args.kind, pane_cwd)
+    if ingress_note:
+        print(f"started=false reason={ingress_note} agent={args.kind} name={args.name} "
+              f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else ""))
+        return 1
 
     bind_home = bind_before = None
     launched_at = time.time()
@@ -683,7 +707,8 @@ def cmd_start(args):
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
     prefix = list(_PERMISSION_FLAGS.get(args.kind, [])) if mode == "bypass" else []
-    full_agent_args = prefix + cwd_flag + agent_args
+    project_arg = [pane_cwd] if args.kind == "opencode" and pane_cwd else []
+    full_agent_args = prefix + cwd_flag + project_arg + agent_args
 
     # herdr `agent start <NAME> --kind --pane` — the display name is a required
     # positional (herdr 0.8+ prints `unknown option: <kind>` and starts nothing when
@@ -726,6 +751,7 @@ def cmd_start(args):
         failure_reason = (code if isinstance(code, str)
                           and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", code)
                           else "herdr-start-error" if payload_error else "herdr-start-failed")
+    trust_wait = _native_trust_reason(args.kind, _read_screen(args.pane)) if started else None
     # herdr names no Codex thread for a daemon-attached TUI; the launcher proves it from the
     # one new root rollout (see the block comment above `_BIND_SECONDS`).
     session_bind = None
@@ -774,6 +800,7 @@ def cmd_start(args):
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
         f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'} "
         f"managed={managed}"
+        + (f" ready=false reason={trust_wait}" if trust_wait else "")
         + (f" session_bind={session_bind}" if session_bind else "")
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
@@ -2063,6 +2090,19 @@ def _read_screen(target):
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         return None
     return _screen_lines(proc.stdout)
+
+
+def _native_trust_reason(harness, lines):
+    """Name an observed native folder trust screen without interacting with it."""
+    if not lines:
+        return None
+    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
+    patterns = {
+        "codex": ("trustthisfolder", "trustthisworkspace", "doyoutrustthisproject"),
+        "claude": ("trustthisfolder", "trustthisproject", "doyoutrustthecontentsofthisfolder"),
+        "opencode": ("trustthisfolder", "trustthisproject", "doyoutrustthisproject"),
+    }
+    return "native-trust-wait" if any(token in flat for token in patterns.get(harness, ())) else None
 
 
 def _process_session(pane, harness):

@@ -9,6 +9,7 @@ process holding that cwd; the liveness layer paints it stale/dead — honest obs
 no fragile broker-vs-leaf heuristics).
 """
 import os
+from pathlib import Path
 import re
 import subprocess
 
@@ -96,6 +97,122 @@ def read_environ(pid):
             k, v = kv.split(b"=", 1)
             env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
     return env
+
+
+def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
+    """Resolve Codex root cwd options from argv tokens, keeping ambiguity observed.
+
+    Only root options before a subcommand or positional prompt are considered. The
+    NUL-delimited argv is authoritative; a prompt, shell payload, or subcommand flag
+    must never become a process identity.
+    """
+    if not isinstance(argv, (list, tuple)):
+        return observed_cwd
+    tokens = list(argv)
+    if not tokens or os.path.basename(str(tokens[0])) != "codex":
+        return observed_cwd
+    target = None
+    # Keep this list in step with the installed root-level `codex --help`.
+    # Values must be consumed as argv tokens: a model/config/image value can
+    # itself resemble an option and must never be reinterpreted as one.
+    value_options = {
+        "--config", "-c", "--enable", "--disable", "--remote",
+        "--remote-auth-token-env", "--local-provider", "--model", "-m",
+        "--profile", "-p", "--sandbox", "-s", "--add-dir",
+        "--ask-for-approval", "-a", "--cd", "-C", "--image", "-i",
+    }
+    flag_options = {
+        "--oss", "--strict-config", "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust", "--worktree", "--no-alt-screen",
+        "--no-daemon", "--search", "--help", "-h", "--version", "-V",
+    }
+    attached_short = ("-c", "-m", "-p", "-s", "-a", "-C", "-i")
+    subcommands = {"exec", "app-server", "login", "logout", "mcp", "completion",
+                   "features", "debug", "apply", "resume", "fork", "cloud", "agents",
+                   "remote-control", "update", "doctor", "sandbox", "queue", "archive",
+                   "delete", "migrate-rollouts", "unarchive", "help", "review", "exec-server",
+                   "plugin"}
+    i = 1
+    while i < len(tokens):
+        token = str(tokens[i])
+        if token == "--":
+            break
+        if token in subcommands or not token.startswith("-"):
+            break
+        if token in {"--cd", "-C"}:
+            if i + 1 < len(tokens) and str(tokens[i + 1]) != "--":
+                target = str(tokens[i + 1])
+            break
+        if token.startswith("--cd="):
+            target = token.partition("=")[2]
+            break
+        if token in flag_options:
+            i += 1
+            continue
+        if token in value_options:
+            if (i + 1 >= len(tokens) or str(tokens[i + 1]) == "--"
+                    or str(tokens[i + 1]).startswith("-")):
+                break
+            if token in {"--image", "-i"}:
+                # --image accepts one or more files. The parser's next option
+                # begins a new argument; bare tokens remain image values.
+                i += 1
+                while i < len(tokens) and not str(tokens[i]).startswith("-"):
+                    i += 1
+                continue
+            i += 2
+            continue
+        if token.startswith("--") and "=" in token:
+            option = token.partition("=")[0]
+            if option in value_options:
+                if option in {"--cd", "-C"}:
+                    target = token.partition("=")[2]
+                    break
+                i += 1
+                continue
+        attached = next((short for short in attached_short
+                         if token.startswith(short) and len(token) > len(short)), None)
+        if attached:
+            if attached == "-C":
+                target = token[len(attached):]
+                break
+            i += 1
+            continue
+        # An unknown option's arity is unknown. Stop rather than mistaking a
+        # following option-looking value for Codex's workspace root.
+        break
+    if not target or "\x00" in target:
+        return observed_cwd
+    path = Path(target).expanduser()
+    if not path.is_absolute():
+        if not launch_cwd or not Path(launch_cwd).is_absolute():
+            return observed_cwd
+        # `launch_cwd` is supplied from initial /proc/<pid>/environ PWD, not
+        # reconstructed from current cwd. Accept it only when proc cwd agrees
+        # with the launch base (not moved yet) or the resolved argv target
+        # (already moved by Codex); otherwise PWD and proc evidence conflict.
+        try:
+            launch_base = Path(launch_cwd).resolve(strict=False)
+            effective = (launch_base / path).resolve(strict=False)
+            observed = Path(observed_cwd).resolve(strict=False) if observed_cwd else None
+            if observed not in {launch_base, effective}:
+                return observed_cwd
+            return str(effective)
+        except (OSError, RuntimeError, ValueError):
+            return observed_cwd
+    try:
+        return str(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return observed_cwd
+
+
+def _read_argv(pid):
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as handle:
+            return [part.decode("utf-8", "replace") for part in handle.read().split(b"\0") if part]
+    except (OSError, TypeError, ValueError):
+        return []
 
 
 def read_proc_start(pid):
@@ -629,6 +746,11 @@ def scan(harness_filter=None):
         if is_terminal_state(pid):
             continue
         cwd, orphan = _read_cwd(pid)
+        if comm == "codex":
+            proc_argv = _read_argv(pid)
+            initial_env = read_environ(pid)
+            initial_launch_pwd = initial_env.get("PWD")
+            cwd = codex_effective_cwd(proc_argv, cwd, initial_launch_pwd)
         # app-server companion marker: codex-only, literal "app-server" token in args.
         # Interactive `codex`/`codex exec` never carries this token, so the gate cannot
         # false-positive on interactive sessions. COLUMNS is pinned to 100000 for the ps

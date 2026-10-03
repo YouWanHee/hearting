@@ -195,6 +195,26 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertIn(f"--writable-root {self.scoped}", command)
         self.assertNotIn("--add-dir", command)
 
+    def test_all_adapter_execution_surfaces_consume_the_same_request(self) -> None:
+        expected = str(self.request_file.resolve())
+        rows = (
+            (self.codex, "codex-exec"),
+            (self.claude, "claude-cli"),
+            (self.opencode, "opencode"),
+        )
+        for module, runtime in rows:
+            grant = module.bind_execution_access_request(
+                expected,
+                environ=self.env,
+                context=self.context,
+                is_child=False,
+                parent=None,
+                runtime=runtime,
+            )
+            self.assertIsNotNone(grant)
+            self.assertEqual(Path(expected), grant.source_path)
+            self.assertEqual((self.scoped.resolve(),), grant.writable_roots)
+
     def test_codex_network_receipt_matches_applied_boolean_flag(self) -> None:
         self.write_request(
             network={"required": True, "reason": "fetch", "hosts": []}

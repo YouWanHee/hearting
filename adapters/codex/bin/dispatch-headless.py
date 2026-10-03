@@ -167,7 +167,10 @@ from execution_access import (  # noqa: E402
     ExecutionAccessError,
     adapter_default_roots,
     bind_request as bind_execution_access_request,
+    load_parent_effective_grant,
+    publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
+    request_path as execution_access_request_path,
 )
 # Verification rigor is derived from intensity via resolve_qa
 # (dispatch_mode_contract.py, the single qa/intensity SoT — CONVENTIONS §1.1).
@@ -2698,18 +2701,28 @@ def main(argv: list[str]) -> int:
                 else ()
             ),
         )
+        access_context = AccessContext.build(
+            worktree=args.worktree,
+            artifact_root=args.artifact_root,
+            dispatch_state_root=dispatch_state_root(args.jobs_path),
+            agent_home=args.agent_home,
+            environ=os.environ,
+        )
+        access_parent = None
+        if args.dispatch_depth >= 2 and execution_access_request_path(args.execution_access_file, os.environ) is not None:
+            if args.parent_binding is None:
+                raise ExecutionAccessError("execution-access-exceeds-parent:parent-grant-unknown")
+            access_parent = load_parent_effective_grant(
+                jobs=args.jobs_path,
+                parent_attempt_id=args.parent_binding.attempt_id,
+                context=access_context,
+            )
         args.execution_access_grant = bind_execution_access_request(
             args.execution_access_file,
             environ=os.environ,
-            context=AccessContext.build(
-                worktree=args.worktree,
-                artifact_root=args.artifact_root,
-                dispatch_state_root=dispatch_state_root(args.jobs_path),
-                agent_home=args.agent_home,
-                environ=os.environ,
-            ),
+            context=access_context,
             is_child=args.dispatch_depth >= 2,
-            parent=None,
+            parent=access_parent,
             runtime=(
                 "codex-app-server"
                 if args.resolved_completion_delivery == "app-server-supervised"
@@ -2902,6 +2915,8 @@ def main(argv: list[str]) -> int:
             ),
             **stage_session_environment(args),
         }
+        if args.execution_access_grant is not None:
+            dispatch_env["AGENT_DISPATCH_EXECUTION_ACCESS_FILE"] = str(args.execution_access_grant.source_path)
         if args.worker_role:
             dispatch_env["AGENT_DISPATCH_WORKER_ROLE"] = args.worker_role
         else:
@@ -3021,6 +3036,17 @@ def main(argv: list[str]) -> int:
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("codex", dispatch_env))
+        if args.route_id and args.route_hash:
+            effective_path, effective_sha256 = publish_effective_grant(
+                jobs=jobs, attempt_id=args.attempt_id, route_id=args.route_id,
+                route_hash=args.route_hash,
+                runtime=("codex-app-server" if args.resolved_completion_delivery == "app-server-supervised" else "codex-exec"),
+                sandbox=effective_runtime_sandbox(args), grant=args.execution_access_grant,
+                default_writable_roots=default_roots,
+                network_allowed=args.nested_headless_network,
+            )
+            launch_metadata["execution_access_effective_file"] = str(effective_path)
+            launch_metadata["execution_access_effective_sha256"] = effective_sha256
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         try:

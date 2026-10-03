@@ -5,13 +5,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[2]
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from fleet import fleet, render, model  # noqa: E402
-from fleet.collectors import dispatch, resolve_parent_edges  # noqa: E402
+from fleet.collectors import dispatch, resolve_parent_edges, _mark_dispatch_child_sessions  # noqa: E402
 from fleet.model import DispatchJob, Session  # noqa: E402
 
 
@@ -137,6 +138,84 @@ class ManagedDispatchParentTest(unittest.TestCase):
         job.parent_sid = "exact-parent"
         text = self.rendered([parent], job)
         self.assertNotIn("(orphan)", text)
+
+    def test_anonymous_root_is_not_hidden_by_a_cwd_only_dispatch_row(self):
+        root = Session(harness="codex", pid=10, cwd="/work/repo", session_id=None,
+                       slug="repo", liveness="working",
+                       exec_child={"pid": 11, "comm": "node", "ownership_verified": True})
+        job = DispatchJob(key="code", slug="worker", cwd="/work/repo", is_child=True,
+                          harness="codex", source="jobs", liveness="working")
+        _mark_dispatch_child_sessions([root], [job])
+        self.assertFalse(root.is_child)
+        self.assertIsNone(root.session_id)
+
+    def test_resolved_root_parent_and_exec_job_render_once_under_exact_edge(self):
+        root = Session(harness="codex", pid=10, cwd="/work/repo", session_id="root-sid",
+                       slug="repo", title="unmanaged root", liveness="working",
+                       exec_child={"pid": 11, "comm": "node", "ownership_verified": True})
+        job = DispatchJob(key="code", slug="exec-worker", cwd="/work/repo-wt",
+                          parent_sid="root-sid", parent_cwd="/work/repo", is_child=True,
+                          harness="codex", source="jobs", liveness="working")
+        _mark_dispatch_child_sessions([root], [job])
+        resolve_parent_edges([root], [job])
+        text = self.rendered([root], job)
+        self.assertEqual(text.count("unmanaged root"), 1)
+        self.assertIn("exec-worker", text)
+        self.assertNotIn("(orphan)", text)
+
+    def test_collect_cwd_resolver_exact_exec_ancestry_and_parent_card_join(self):
+        """The root option, root rollout, owned exec chain and parent edge join once."""
+        from fleet.collectors import codex, procscan
+        from fleet.collectors.procscan import codex_effective_cwd
+        import uuid
+
+        with tempfile.TemporaryDirectory() as td:
+            launch = str(Path(td) / "shell")
+            target = str(Path(td) / "project")
+            Path(launch).mkdir()
+            Path(target).mkdir()
+            effective = codex_effective_cwd(["codex", "--cd", target], launch)
+            sid = str(uuid.uuid4())
+            rollout = str(Path(td) / "codex" / "sessions" / "2026" / "10" / "03" /
+                          ("rollout-2026-10-03T00-00-00-000Z-" + sid + ".jsonl"))
+            tree = {4242: (1, 3600, "codex"), 4244: (4242, 170, "node")}
+            identities = {4242: (1, "200"), 4244: (4242, "202")}
+            with mock.patch.object(procscan, "_exec_identity", side_effect=identities.get), \
+                 mock.patch.object(procscan, "read_environ",
+                                   return_value={"AGENT_DISPATCH_ATTEMPT_ID": "att-fleet-fixture"}), \
+                 mock.patch.object(procscan, "_exec_is_wrapper", return_value=False):
+                owned = procscan.exec_child(4242, tree, procscan.children_index(tree),
+                                            min_age=0, expected_start="200",
+                                            attempt_id="att-fleet-fixture")
+            self.assertTrue(owned["ownership_verified"])
+            self.assertEqual([row["pid"] for row in owned["ancestry"]], [4242, 4244])
+
+            readlink = os.readlink
+            with mock.patch.object(codex.os, "readlink",
+                                   side_effect=lambda path: effective if path == "/proc/4242/cwd" else readlink(path)), \
+                 mock.patch.object(procscan, "_read_argv", return_value=["codex", "--cd", target]), \
+                 mock.patch.object(procscan, "read_environ", return_value={"PWD": launch}), \
+                 mock.patch.object(procscan, "is_shared_codex_daemon", return_value=False), \
+                 mock.patch.object(codex, "_proc_rollout",
+                                   side_effect=lambda pid, cwd, home: rollout if cwd == effective else None), \
+                 mock.patch.object(codex, "_home", return_value=str(Path(td) / "codex")):
+                resolved_sid = codex.session_id_of_process(4242, lambda: [])
+            self.assertEqual(resolved_sid, sid)
+
+            root = Session(harness="codex", pid=4242, cwd=effective,
+                           session_id=resolved_sid, slug="project", title="unmanaged root",
+                           liveness="working", exec_child=owned)
+            job = DispatchJob(key="code", slug="exec-worker", cwd=str(Path(td) / "worker"),
+                              parent_sid=resolved_sid, parent_cwd=launch, is_child=True,
+                              harness="codex", source="jobs", liveness="working")
+            _mark_dispatch_child_sessions([root], [job])
+            resolve_parent_edges([root], [job])
+            text = self.rendered([root], job)
+            self.assertEqual(job._parent_edge_sid, sid)
+            self.assertFalse(job._parent_edge_promoted_orphan)
+            self.assertEqual(text.count("unmanaged root"), 1)
+            self.assertIn("exec-worker", text)
+            self.assertNotIn("(orphan)", text)
 
     def test_registry_sidecar_path_is_normalized_and_preserved_in_json(self):
         sidecar = MANAGED + "/managed-sidecars/batch.jsonl"

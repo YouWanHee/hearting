@@ -53,6 +53,12 @@ def _mark_dispatch_child_sessions(sessions, jobs):
         for j in child_jobs:
             if s.harness != j.harness:
                 continue
+            # A cwd-only dispatch record cannot identify an anonymous/root session:
+            # absent parent identity is missing evidence, not proof that this session
+            # is the runtime child. Direct procscan child markers and exact session
+            # joins elsewhere remain the stronger association evidence.
+            if not getattr(j, 'parent_sid', None):
+                continue
             if not _same_path(s.cwd, j.cwd):
                 continue
             if (j.harness, os.path.realpath(j.cwd)) in represented:
