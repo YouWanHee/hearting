@@ -252,6 +252,53 @@ class RenderConsumesLedgerTest(unittest.TestCase):
             layout="wide", term_width=term_width,
         ))
 
+    @staticmethod
+    def _known_support(**metadata_overrides):
+        metadata = {
+            "attempt_schema_version": "2", "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": "1",
+            "dispatch_depth": "1", "worker_type": "support",
+            "unit": "ops/session-tidy-memory", "assigned_contract": "session-tidy-memory",
+        }
+        metadata.update(metadata_overrides)
+        job = DispatchJob(
+            key="support", slug="tidy-memory", worker_type="support",
+            unit="ops/session-tidy-memory", assigned_contract="session-tidy-memory",
+            registered_worker=True, dispatch_depth=1, depth=1, source="jobs",
+            status="done", liveness="dead",
+        )
+        job._registry_metadata = metadata
+        return job
+
+    def test_known_parentless_support_uses_existing_standalone_bucket(self):
+        job = self._known_support()
+        classified = render._classify_group_jobs("jobs", [job], [])
+        self.assertIn(job, classified["loops_jobs"])
+        self.assertNotIn(job, classified["orphans"])
+
+    def test_support_with_parent_identity_remains_orphan_or_nested(self):
+        cases = (
+            self._known_support(parent_attempt_id="att-parent"),
+            self._known_support(parent_sid="sid-parent"),
+            self._known_support(parent_slug="owner", dispatch_depth="2"),
+            self._known_support(route_id="route"),
+        )
+        for job in cases:
+            with self.subTest(metadata=job._registry_metadata):
+                classified = render._classify_group_jobs("jobs", [job], [])
+                self.assertNotIn(job, classified["loops_jobs"])
+                self.assertIn(job, classified["orphans"])
+
+    def test_support_requires_actual_registry_metadata(self):
+        job = DispatchJob(
+            key="support", slug="unverified", worker_type="support",
+            unit="ops/session-tidy-memory", assigned_contract="session-tidy-memory",
+            registered_worker=True, dispatch_depth=1, depth=1,
+        )
+        classified = render._classify_group_jobs("jobs", [job], [])
+        self.assertNotIn(job, classified["loops_jobs"])
+        self.assertIn(job, classified["orphans"])
+
     def test_grace_held_edge_renders_without_orphan_marker(self):
         # Parent is filtered off-screen (stale) this tick, but the ledger confirmed the
         # edge — render must not fall back to its own shown_sids check and orphan it.
@@ -377,6 +424,24 @@ class RenderConsumesLedgerTest(unittest.TestCase):
         self.assertIn("live-parent", rendered)
         self.assertNotIn("CL/sid-p", rendered)
         self.assertIn("live-child", rendered)
+
+
+class KnownParentlessSupportTest(unittest.TestCase):
+    def test_metadata_complete_known_support_is_standalone(self):
+        job = DispatchJob(
+            key="support", slug="tidy-memory", worker_type="support",
+            unit="ops/session-tidy-memory", assigned_contract="session-tidy-memory",
+            registered_worker=True, dispatch_depth=1, depth=1,
+        )
+        job._registry_metadata = {
+            "attempt_schema_version": "2", "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": "1",
+            "dispatch_depth": "1", "worker_type": "support",
+            "unit": "ops/session-tidy-memory", "assigned_contract": "session-tidy-memory",
+        }
+        classified = render._classify_group_jobs("jobs", [job], [])
+        self.assertEqual(classified["loops_jobs"], [job])
+        self.assertEqual(classified["orphans"], [])
 
 
 class L3EnvSidRecoveryTest(unittest.TestCase):

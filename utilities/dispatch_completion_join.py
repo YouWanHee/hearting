@@ -52,17 +52,20 @@ from dispatch_contract import (  # noqa: E402
     foreground_review_eligible,
     validate_review_output_binding,
     close_attempt_row,
+    close_attempt_row_if,
     marker_bound_delivery_transaction,
     marker_bound_process_identity,
     observed_attempt_liveness,
     parse_registry_metadata,
     process_identity_disposition,
+    launched_attempt_identity,
     reconcile_attempt_terminal,
     residue_live_pids,
     resolve_attempt_cleanup,
     resolve_residue_drain,
     row_is_subsession,
     tagged_residue_receipt,
+    validate_attempt_metadata,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 import dispatch_subsession_advance as subsession_advance  # noqa: E402
@@ -73,7 +76,9 @@ from codex_dispatch_terminal import (  # noqa: E402
     terminal_envelope_observed,
 )
 from dispatch_degradation import record_degradation  # noqa: E402
-from dispatch_supervisor_terminal import missing_result_terminal  # noqa: E402
+from dispatch_supervisor_terminal import (  # noqa: E402
+    classify_supervisor_log, missing_result_terminal,
+)
 from dispatch_registry_cache import registry_lines  # noqa: E402
 
 INVALID_ENVELOPE_CLASSIFIER_SOURCE = "completion-join-invalid-envelope-v1"
@@ -3027,7 +3032,31 @@ def settle_finished_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
     """
     reason = ""
     try:
-        if _route_free_review_row(row):
+        support = _route_free_support_row(row)
+        if support:
+            expected = (row.attempt_id, int(row.metadata.get("pid", "0")),
+                        row.metadata.get("pid_start", ""), int(row.metadata.get("pgid", "0")))
+            fresh = exact_attempt_row(jobs, row.attempt_id)
+            selected_identity = launched_attempt_identity(row.raw.split("\t"))
+            if launched_attempt_identity(fresh.raw.split("\t")) != selected_identity:
+                return {"attempt_id": row.attempt_id, "closed": False,
+                        "reason": "support-binding-mismatch"}
+            if fresh.status not in OPEN_STATES:
+                return {"attempt_id": row.attempt_id, "closed": True, "reason": "terminal-committed"}
+            classification = classify_exact_route_free_support_outcome(
+                fresh, jobs=jobs, expected_attempt_id=expected[0], expected_pid=expected[1],
+                expected_pid_start=expected[2], expected_pgid=expected[3],
+                quiescence=attempt_process_quiescence(fresh.metadata),
+                expected_log_file=row.metadata.get("log_file", ""),
+                selected_identity=launched_attempt_identity(row.raw.split("\t")),
+            )
+            reason = apply_exact_route_free_support_classification(
+                fresh, jobs=jobs, classification=classification,
+                selected_identity=launched_attempt_identity(row.raw.split("\t")),
+                expected_log_file=row.metadata.get("log_file", ""),
+                expected_pid=expected[1], expected_pid_start=expected[2], expected_pgid=expected[3],
+            )
+        elif _route_free_review_row(row):
             expected = (row.attempt_id, int(row.metadata.get("pid", "0")),
                         row.metadata.get("pid_start", ""), int(row.metadata.get("pgid", "0")))
             fresh = exact_attempt_row(jobs, row.attempt_id)
@@ -3042,6 +3071,9 @@ def settle_finished_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
         else:
             reason = close_finished_child(row, jobs=jobs)
         current = exact_attempt_row(jobs, row.attempt_id)
+        if support and launched_attempt_identity(current.raw.split("\t")) != selected_identity:
+            return {"attempt_id": row.attempt_id, "closed": False,
+                    "reason": "support-binding-mismatch"}
         if current.status == "done" and current.metadata.get("workflow_completion") == "runtime-v1":
             from dispatch_terminal_commit import owner_completion_pending
             materialize_after_terminal_close(jobs, current.attempt_id)
@@ -3654,6 +3686,137 @@ class ExactReviewClassification:
 
     def as_registry_tuple(self) -> tuple[str, str, str | None]:
         return self.state, self.reason, self.note
+
+
+def _route_free_support_row(row: ChildRow) -> bool:
+    metadata = row.metadata
+    try:
+        validate_attempt_metadata(metadata)
+    except DispatchContractError:
+        return False
+    return (
+        metadata.get("attempt_schema_version") == "2"
+        and metadata.get("transport") == "headless"
+        and metadata.get("execution_surface") == "registered-headless"
+        and metadata.get("registered_worker") == "1"
+        and metadata.get("dispatch_depth") == "1"
+        and metadata.get("worker_type") == "support"
+        and metadata.get("unit") == "ops/session-tidy-memory"
+        and metadata.get("assigned_contract") == "session-tidy-memory"
+        and not any(metadata.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)
+    )
+
+
+def classify_exact_route_free_support_outcome(
+    row: ChildRow, *, jobs: str | Path, expected_attempt_id: str,
+    expected_pid: int, expected_pid_start: str, expected_pgid: int,
+    quiescence: ProcessQuiescence, expected_log_file: str,
+    selected_identity: tuple[object, ...],
+) -> ExactReviewClassification:
+    """Classify the exact semantic handoff for one known route-free support row."""
+    if not _route_free_support_row(row):
+        return ExactReviewClassification("contract-invalid", "support-ineligible",
+                                         None, "pending")
+    if (not expected_attempt_id or expected_pid <= 0 or expected_pgid != expected_pid
+            or not expected_pid_start or not expected_log_file):
+        return ExactReviewClassification("active", "support-binding-incomplete", None, "pending")
+    if (row.attempt_id != expected_attempt_id
+            or launched_attempt_identity(row.raw.split("\t")) != selected_identity
+            or row.metadata.get("pid") != str(expected_pid)
+            or row.metadata.get("pid_start") != expected_pid_start
+            or row.metadata.get("pgid") != str(expected_pgid)
+            or row.metadata.get("log_file", "") != expected_log_file):
+        return ExactReviewClassification("contract-invalid", "support-binding-mismatch",
+                                         None, "pending")
+    try:
+        unique = exact_attempt_row(Path(jobs), expected_attempt_id)
+    except (JoinContractError, OSError):
+        return ExactReviewClassification("contract-invalid", "support-row-not-unique",
+                                         None, "pending")
+    if unique.raw != row.raw:
+        return ExactReviewClassification("contract-invalid", "support-row-refreshed",
+                                         None, "pending")
+    if quiescence.state != "quiescent":
+        return ExactReviewClassification("active", f"support-process-{quiescence.reason}", None, "pending")
+    terminal = classify_supervisor_log(row.metadata.get("log_file"), row.metadata.get("harness", ""))
+    if terminal.reconcile_reason in {
+        "terminal-log-missing", "terminal-log-unreadable", "terminal-event-missing",
+    }:
+        terminal = missing_result_terminal(row.metadata)
+    if terminal.note == "completed-supervisor" and terminal.failure_class == "pass":
+        return ExactReviewClassification("done", "support-supervisor-pass", terminal.note,
+                                         "typed-close", terminal.evidence())
+    if terminal.failure_class == "fail":
+        state = "dead-worker-fail"
+    elif terminal.failure_class == "blocked":
+        state = "dead-worker-blocked"
+    else:
+        state = "terminal-handoff"
+    return ExactReviewClassification(state, terminal.reconcile_reason or terminal.terminal_event,
+                                     terminal.note, "typed-close", terminal.evidence())
+
+
+def apply_exact_route_free_support_classification(
+    row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification,
+    selected_identity: tuple[object, ...], expected_log_file: str,
+    expected_pid: int, expected_pid_start: str, expected_pgid: int,
+) -> str:
+    """Commit only a fresh, still-unique semantic decision through exact-row CAS."""
+    if classification.close_action == "pending":
+        return "pending"
+    if row.status not in OPEN_STATES:
+        return "terminal-history-preserved"
+    # The locked predicate validates this exact decision. A second unlocked
+    # classification could supply a different payload during an ABA log change.
+    evidence = classification.evidence
+    note = classification.note
+    committed = close_attempt_row_if(
+        Path(jobs), row.attempt_id, note,
+        lambda fields: _support_cas_matches(
+            Path(jobs), fields, row.attempt_id, selected_identity, expected_log_file,
+            expected_pid, expected_pid_start, expected_pgid, classification,
+        ),
+        evidence=evidence,
+    )
+    if not committed:
+        return "support-settlement-revalidation-veto"
+    try:
+        current = exact_attempt_row(Path(jobs), row.attempt_id)
+    except (JoinContractError, OSError):
+        return "support-settlement-commit-unverified"
+    if (current.status != "done" or current.metadata.get("note") != note
+            or launched_attempt_identity(current.raw.split("\t")) != selected_identity):
+        return "support-settlement-commit-unverified"
+    materialize_after_terminal_close(Path(jobs), row.attempt_id)
+    return "support-settlement-committed"
+
+
+def _support_cas_matches(
+    jobs: Path, fields: list[str], attempt_id: str, selected_identity: tuple[object, ...],
+    expected_log_file: str, expected_pid: int, expected_pid_start: str, expected_pgid: int,
+    selected: ExactReviewClassification,
+) -> bool:
+    try:
+        current = exact_attempt_row(jobs, attempt_id)
+        if (current.status not in OPEN_STATES or current.raw.split("\t") != fields
+                or not _route_free_support_row(current)
+                or launched_attempt_identity(fields) != selected_identity
+                or current.metadata.get("log_file", "") != expected_log_file
+                or current.metadata.get("pid") != str(expected_pid)
+                or current.metadata.get("pid_start") != expected_pid_start
+                or current.metadata.get("pgid") != str(expected_pgid)):
+            return False
+        decision = classify_exact_route_free_support_outcome(
+            current, jobs=jobs, expected_attempt_id=attempt_id,
+            expected_pid=expected_pid, expected_pid_start=expected_pid_start,
+            expected_pgid=expected_pgid, quiescence=attempt_process_quiescence(current.metadata),
+            expected_log_file=expected_log_file, selected_identity=selected_identity,
+        )
+        return (decision.state == selected.state and decision.reason == selected.reason
+                and decision.note == selected.note and decision.evidence == selected.evidence
+                and decision.close_action != "pending")
+    except (DispatchContractError, JoinContractError, OSError, ValueError, TypeError):
+        return False
 
 
 def _route_free_review_row(row: ChildRow) -> bool:

@@ -6150,6 +6150,50 @@ def _shown_group_sessions(group_sessions):
             [s for s in group_sessions if session_parent_visible(s)])
 
 
+def _known_parentless_support_job(job):
+    """Purely recognize the one registered route-free support display tuple."""
+    metadata = getattr(job, "_registry_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    if not (
+        metadata.get("attempt_schema_version") == "2"
+        and metadata.get("transport") == "headless"
+        and metadata.get("execution_surface") == "registered-headless"
+        and metadata.get("registered_worker") == "1"
+        and metadata.get("dispatch_depth") == "1"
+        and metadata.get("worker_type") == "support"
+        and metadata.get("unit") == "ops/session-tidy-memory"
+        and metadata.get("assigned_contract") == "session-tidy-memory"
+        and not any(metadata.get(key) for key in (
+            "route_file", "route_id", "route_hash", "route_node", "registry_digest",
+            "write_scope", "completion_gate", "owner_route_file", "owner_route_id",
+            "owner_route_hash", "batch_route_id", "batch_route_node",
+        ))
+        and not any(metadata.get(key) for key in (
+            "parent_attempt_id", "parent_sid", "parent_session_id", "parent",
+            "parent_slug", "parent_cwd", "parent_worktree", "parent_managed_dir",
+            "managed_sidecar_log",
+        ))
+    ):
+        return False
+    if not (
+        getattr(job, "registered_worker", False) is True
+        and getattr(job, "worker_type", None) == "support"
+        and getattr(job, "unit", None) == "ops/session-tidy-memory"
+        and getattr(job, "assigned_contract", None) == "session-tidy-memory"
+        and getattr(job, "dispatch_depth", None) == 1
+        and getattr(job, "depth", 1) == 1
+    ):
+        return False
+    return not any((
+        getattr(job, "parent_attempt_id", None), getattr(job, "parent_sid", None),
+        getattr(job, "parent_slug", None), getattr(job, "parent_cwd", None),
+        getattr(job, "parent_managed_dir", None), getattr(job, "is_child", False),
+        getattr(job, "_parent_edge_sid", None), getattr(job, "_parent_edge_promoted_orphan", False),
+        getattr(job, "_parent_edge_confirmed", False),
+    ))
+
+
 def _classify_group_jobs(name, group_jobs, shown):
     """Where each emitted dispatch job of a group is drawn (pure, no drawing).
 
@@ -6263,6 +6307,8 @@ def _classify_group_jobs(name, group_jobs, shown):
                 loops_jobs.append(j)
             else:
                 orphans.append(j)
+        elif _known_parentless_support_job(j):
+            loops_jobs.append(j)
         elif j.key in _LOOPS_KEYS or is_drill_case:
             loops_jobs.append(j)
         else:
