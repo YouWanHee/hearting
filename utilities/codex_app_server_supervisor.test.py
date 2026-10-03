@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import hashlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -1079,6 +1080,76 @@ class OneTurnStageTransportTest(unittest.TestCase):
             if scenario == "failed":
                 self.assertTrue(any(row.get("type") == "dispatch.supervisor.turn.failed"
                                      for row in rows))
+
+    def test_named_permission_profile_is_applied_without_turn_sandbox_override(self):
+        profile = {"default_permissions": "profile-test",
+                   "permissions": {"profile-test": {
+                       "filesystem": {str(self.root): "write"},
+                       "network": {"enabled": True}}}}
+        captured = {}
+
+        class FakeServer:
+            def __init__(self, command, cwd, env):
+                captured["command"] = command
+                captured["cwd"] = cwd
+                self.events = [
+                    {"method": "item/completed", "params": {"turnId": "turn-profile",
+                     "item": {"type": "agentMessage", "id": "final",
+                              "text": chr(10).join(("artifact: -", "verdict: PASS",
+                                                    "blocker: none"))}}},
+                    {"method": "turn/completed", "params": {
+                     "turn": {"id": "turn-profile", "status": "completed"}}},
+                ]
+
+            def request(self, method, params):
+                captured.setdefault("requests", []).append((method, params))
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-profile"}}
+                if method == "turn/start":
+                    return {"turn": {"id": "turn-profile"}}
+                return {}
+
+            def notification(self, method):
+                captured.setdefault("notifications", []).append(method)
+
+            def next_event(self):
+                return self.events.pop(0)
+
+            def close(self):
+                captured["closed"] = True
+
+        args = self.supervisor.parser().parse_args([
+            "--one-turn", "--worktree", str(self.root), "--sandbox", "workspace-write",
+            "--approval", "on-request", "--network-access", "--writable-root", str(self.root),
+            "--model", "model-pinned", "--reasoning", "xhigh", "--primary-git-commit",
+        ])
+        output = io.StringIO()
+        with mock.patch.object(self.supervisor, "commit_profile_config", return_value=profile) as build, \
+             mock.patch.object(self.supervisor, "config_arguments", return_value=["--profile-test"]), \
+             mock.patch.object(self.supervisor, "AppServer", FakeServer), \
+             mock.patch.object(self.supervisor.sys, "stdin", io.StringIO("prompt")), \
+             mock.patch.object(self.supervisor.sys, "stdout", output):
+            result = self.supervisor.run_one_turn(args)
+        self.assertEqual(result, 0)
+        build.assert_called_once_with(
+            str(self.root), [str(self.root)], "workspace-write", True,
+            primary_commit=True,
+        )
+        self.assertIn("--profile-test", captured["command"])
+        self.assertEqual(captured["cwd"], str(self.root))
+        requests = dict(captured["requests"])
+        thread = requests["thread/start"]
+        turn = requests["turn/start"]
+        self.assertEqual(thread["cwd"], str(self.root))
+        self.assertIs(thread["ephemeral"], True)
+        self.assertEqual(thread["approvalPolicy"], "on-request")
+        self.assertNotIn("sandbox", thread)
+        self.assertEqual(turn["threadId"], "thread-profile")
+        self.assertEqual(turn["model"], "model-pinned")
+        self.assertEqual(turn["effort"], "xhigh")
+        self.assertNotIn("sandboxPolicy", turn)
+        self.assertTrue(captured["closed"])
+        self.assertIn('"type":"turn.completed"', output.getvalue())
 
 
 class ActiveTurnDeadlineParityTest(unittest.TestCase):
