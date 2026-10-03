@@ -121,8 +121,8 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
     state_path, lock_path = base / "finish.json", base / "finish.lock"
     prior_state = _read(state_path)
     if not prior_state and api.outcome_path(route_file).exists():
-        # The runtime closed this route after it sat unused (route_autoclose.py);
-        # a session returning to it is done, not refused.
+        # Autoclose remains terminal. A historical false is consumable only
+        # after this exact route now has a current, fully proven terminal gate.
         try:
             closure = json.loads(api.outcome_path(route_file).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -131,7 +131,22 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             print("capability-route: route already closed automatically; nothing left to finish", file=sys.stderr)
             return {"schema": "finish_receipt_v1", "route_id": route["route_id"], "route_hash": route["route_hash"],
                     "state": "already-closed-automatically", "autoclose": closure["autoclose"]}
-        raise InlineFinishError("finish-route-already-closed")
+        if (closure.get("terminal_gate_proven") is not False
+                or closure.get("route_id") != route["route_id"]
+                or closure.get("route_hash") != route["route_hash"]
+                or closure.get("route_file") != str(route_file)
+                or closure.get("cwd") != route.get("cwd")
+                or closure.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
+            raise InlineFinishError("finish-route-already-closed")
+        # Stored identity cannot disappear merely because this caller has no
+        # prior inline intent from which to supply it.
+        if any(closure.get(key) is not None for key in (
+                "terminal_commit_id", "terminal_owner_attempt_id", "producer_binding_digest",
+                "inline_finish_id", "summary_digest")):
+            raise InlineFinishError("finish-route-outcome-conflict")
+        # `finish` itself is the normal completion consumer: it still validates
+        # the evidence, caller, route binding, and cleanup before it publishes
+        # the terminal marker and current outcome.
     # A finish that already completed is replayed from what it recorded (§45 D-127):
     # the evidence file, the summary, or a manifest revision may have changed since.
     finished = bool(prior_state and prior_state.get("state") == "finished")
@@ -349,7 +364,15 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                         expected_producer_binding_digest=_digest(json.dumps(binding,sort_keys=True,separators=(",", ":")).encode()))
                 else:
                     outcome = json.loads(outcome_path.read_text())
-                    if (outcome.get("route_hash") != route["route_hash"]
+                    if outcome.get("terminal_gate_proven") is False:
+                        outcome, _ = api.close_route(
+                            route, route_file, commit, summary_text, allow_unproven=False,
+                            expected_terminal_marker_digest=marker_digest,
+                            inline_finish_id=intent_id, inline_commit=commit,
+                            expected_summary_digest=intent["summary_sha256"],
+                            expected_producer_binding_digest=_digest(
+                                json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()))
+                    elif (outcome.get("route_hash") != route["route_hash"]
                             or outcome.get("terminal_marker_digest") != marker_digest
                             or outcome.get("inline_finish_id") != intent_id
                             or outcome.get("summary_digest") != intent["summary_sha256"]

@@ -4728,6 +4728,18 @@ def finalize(
             # request fingerprint needed to prove "same retry" (D-8).
             published = _published_cycle_state(root, record)
             if published != state:
+                if published == "active" and state == "completed":
+                    refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
+                                                      crash_after_manifest=crash_after_manifest,
+                                                      prescan=prescan, last_try=_last_try)
+                    latest = read_cycle_record(root, cycle_id)
+                    completed_state = _published_cycle_state(root, latest) if latest else None
+                    if completed_state != "completed":
+                        raise ProducerError(
+                            "finalize-state-conflict",
+                            f"{cycle_id}: requested=completed published_cycle_state=active storage_state=sealed",
+                        )
+                    return _finish({**refreshed, "storage_state": "sealed", "cycle_state": "completed"})
                 raise ProducerError(
                     "finalize-state-conflict",
                     f"{cycle_id}: requested={state} published_cycle_state={published} storage_state=sealed",
@@ -5389,6 +5401,81 @@ def _leaf_terminal_additions(root: Path, record: Mapping[str, Any], document: Ma
     return {"row": row, "event": event, "binding": binding, "route": sealed_route}
 
 
+def _provisional_completion_projection(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
+                                       facts: Sequence[Tuple[str, str, int]], *, revision_id: str,
+                                       allocator: artifact_identity.IdAllocator,
+                                       now: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Bind exact late terminal proof to one provisional active cycle revision."""
+    if not isinstance(document.get("cycle"), Mapping) or document["cycle"].get("state") != "active":
+        return None
+    try:
+        route = _finalize_route(root, record)
+    except ProducerError:
+        return None
+    if (route.get("artifact_root") is None
+            or _live_review_lease(root, record["cycle_id"]) is not None
+            or not route_is_closed(root, route)
+            or not cycle_route_admission(root, record, route, finalize=True).allow):
+        return None
+    try:
+        binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
+            root, route_lineage.canonical_route_path(root, route["route_id"]),
+            expected_root_id=document.get("artifact_root_id"))
+        outcome_raw = Path(binding.outcome_file).read_bytes()
+        outcome = json.loads(outcome_raw.decode("utf-8"))
+        route_module = artifact_lifecycle._load_capability_route()
+        gates = route_module.terminal_gate_observation(
+            sealed_route, exact_terminal=outcome.get("terminal_commit_id") is not None)
+    except (artifact_lifecycle.LifecycleError, OSError, ValueError, UnicodeError):
+        return None
+    if (sealed_route.get("route_hash") != route.get("route_hash")
+            or route_module.terminal_gate_proven(gates) is not True):
+        return None
+    if (outcome.get("route_id") != binding.route_id
+            or outcome.get("route_hash") != binding.route_hash
+            or outcome.get("route_file") != binding.route_file
+            or outcome.get("terminal_gate_proven") is not True
+            or outcome.get("autoclose") is not None
+            or outcome.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
+        return None
+    rows = [row for row in document.get("routes", []) or [] if isinstance(row, dict)
+            and row.get("artifact_root_id") == binding.artifact_root_id
+            and row.get("route_id") == binding.route_id and row.get("route_hash") == binding.route_hash]
+    if len(rows) != 1 or rows[0].get("terminal_marker") != "pending" or rows[0].get("terminal_evidence_id"):
+        return None
+    candidate = json.loads(json.dumps(document))
+    candidate["manifest_revision_id"] = revision_id
+    candidate["cycle"]["state"] = "completed"
+    when = _rfc3339(now)
+    cycle_digest = _digest(_canonical([[rel, digest, size] for rel, digest, size in facts]))
+    provenance = {"source_manifest_id": document["manifest_id"], "source_revision_id": revision_id,
+                  "producer_route_id": binding.route_id, "algorithm_version": ALGORITHM_VERSION,
+                  "schema_version": 1, "source_digest": cycle_digest}
+    cycle_event = {"event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+                   "stream_sequence": 1, "event_type": "cycle.completed", "target_id": record["cycle_id"],
+                   "actor": {"kind": "producer", "id": record["producer_id"]}, "recorded_at": when,
+                   "provenance": provenance, "evidence_ids": [], "payload": {}}
+    terminal_event = {"event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+                      "stream_sequence": 1, "event_type": "route.terminal.recorded",
+                      "target_id": record["cycle_id"],
+                      "actor": {"kind": "system", "id": "capability-route"}, "recorded_at": when,
+                      "provenance": provenance, "evidence_ids": [], "payload": {}}
+    row = next(row for row in candidate["routes"] if row.get("artifact_root_id") == binding.artifact_root_id
+               and row.get("route_id") == binding.route_id and row.get("route_hash") == binding.route_hash)
+    row["terminal_evidence_id"] = terminal_event["event_id"]
+    candidate["events"] = list(candidate.get("events", [])) + [cycle_event, terminal_event]
+    try:
+        candidate = artifact_lifecycle._derive_terminal_evidence(candidate, binding, sealed_route)
+        decision = artifact_lifecycle.evaluate_cycle_completion(
+            candidate, content_root=_record_cycle_manifest_path(root, record).parent,
+            route_file=route_lineage.canonical_route_path(root, binding.route_id),
+            expected_root_id=binding.artifact_root_id, payload_verified=False,
+            inline_finish_id=outcome.get("inline_finish_id"))
+    except (artifact_lifecycle.LifecycleError, OSError, ValueError):
+        return None
+    return candidate if decision.ok else None
+
+
 def _binding_route_unrecorded(manifest_path: Path, binding: Mapping[str, Any]) -> bool:
     """Whether the binding names a route (by id, or by hash) the current manifest has no row for."""
     document = _read_json(manifest_path) if _path_entry_present(manifest_path) else None
@@ -5672,8 +5759,14 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
                  for r in document.get("artifact_revisions", []) or [] if isinstance(r, dict)]
         changes = {"added": [], "modified": [], "removed": []}
     revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
-    additions = _leaf_terminal_additions(root, record, document, facts, allocator=alloc,
-                                         revision_id=revision_id, now=now)
+    provisional = _provisional_completion_projection(root, record, refreshed or document, facts,
+                                                     revision_id=revision_id, allocator=alloc, now=now)
+    if provisional is not None:
+        refreshed = provisional
+        additions = None
+    else:
+        additions = _leaf_terminal_additions(root, record, document, facts, allocator=alloc,
+                                             revision_id=revision_id, now=now)
     if additions is not None:
         base = json.loads(json.dumps(refreshed if refreshed is not None
                                      else dict(document, manifest_revision_id=revision_id)))
@@ -6301,6 +6394,12 @@ def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: f
     facts = [(rel, digest_, size) for rel, (digest_, size, _fp) in sorted(scan.facts.items())]
     refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=clock,
                                              removable=gone)
+    if scan.complete:
+        revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
+        provisional = _provisional_completion_projection(root, record, refreshed or document, facts,
+                                                         revision_id=revision_id, allocator=alloc, now=clock)
+        if provisional is not None:
+            refreshed = provisional
     result = {"status": "unchanged", **base, "changes": changes, "complete": scan.complete,
               "cursor": scan.cursor, "walked": budget.walked, "hashed_bytes": budget.hashed_bytes,
               "excluded_hidden": scan.excluded, "excluded_symlinks": scan.excluded_symlinks,

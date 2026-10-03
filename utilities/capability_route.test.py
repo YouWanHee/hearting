@@ -1680,6 +1680,46 @@ class TestRoute(unittest.TestCase):
    self.assertTrue(outcome["terminal_gate_proven"])
    self.assertTrue(outcome["terminal_gates"][node["id"]]["passed"])
    self.assertEqual(outcome["terminal_gates"][node["id"]]["reason"],"completion-marker-verified")
+ def test_historical_false_close_consumes_exact_later_marker_and_retains_raw_bytes(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact_root=Path(tmp)/"artifacts"; artifact_root.mkdir()
+   # The route is compiled against its own root so its hash and lineage stay
+   # valid; the cycle/lineage gate reads the on-disk record.
+   route=R.compile_route(**self.args(artifact_root=str(artifact_root)))
+   node=route["nodes"][0]
+   jobs=Path(tmp)/"jobs.log"; jobs.write_text("",encoding="utf-8")
+   path=R.canonical_routes_dir(artifact_root)/f"{route['route_id']}.json"
+   path.parent.mkdir(parents=True); path.write_text(json.dumps(route),encoding="utf-8")
+   evidence=Path(tmp)/"evidence.txt"; evidence.write_text("terminal evidence",encoding="utf-8")
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+    first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs)
+    self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+    raw=R.outcome_path(path).read_bytes()
+    R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+    current,created=R.close_route(route,path,jobs=jobs)
+   self.assertTrue(created)
+   self.assertTrue(current["terminal_gate_proven"])
+   self.assertEqual(R.outcome_path(path).read_bytes(),json.dumps(current,indent=2,ensure_ascii=False).encode()+b"\n")
+   retained=list(path.parent.glob(f"{path.stem}.historical-false-*.outcome.json"))
+   self.assertEqual(len(retained),1)
+   self.assertEqual(retained[0].read_bytes(),raw)
+   replay,recreated=R.close_route(route,path,jobs=jobs)
+   self.assertFalse(recreated); self.assertTrue(replay["terminal_gate_proven"])
+   self.assertEqual(retained[0].read_bytes(),raw)
+
+ def test_outcome_replay_cannot_hide_identity_conflict_behind_matching_commit(self):
+  existing={"route_id":"rt-0123456789abcdef","route_hash":"sha256:"+"a"*64,
+            "terminal_commit_id":"commit-a","terminal_owner_attempt_id":"attempt-a",
+            "producer_binding_digest":"sha256:"+"b"*64}
+  self.assertFalse(R._outcome_replay_matches(
+   existing,route_id=existing["route_id"],route_hash=existing["route_hash"],
+   terminal_commit_id="commit-a",owner_attempt_id="attempt-b",
+   producer_binding_digest=existing["producer_binding_digest"]))
+  self.assertFalse(R._outcome_replay_matches(
+   existing,route_id=existing["route_id"],route_hash=existing["route_hash"],
+   terminal_commit_id="commit-a",owner_attempt_id=None,
+   producer_binding_digest=existing["producer_binding_digest"]))
+
  def test_close_records_null_only_without_terminal_nodes(self):
   # Red before P2: the field was absent entirely, so `None` and `False` were
   # indistinguishable -- this pins that a historical terminal-less route reports `None`,
@@ -5200,7 +5240,7 @@ class SourceCensusTest(unittest.TestCase):
   # The producer's inline binding check calls cycle_route_admission above,
   # then compares the pending finish intent's route ID with that admitted
   # binding. This is finish-tuple integrity, not another cycle selection.
-  "_inline_producer_binding_check",
+  "_inline_producer_binding_check","_provisional_completion_projection",
   # The shared helper `_finalize_route` and `cycle_route_admission` consult
   # before a lineage-fork/superseded refusal. Its route-id comparison is a
   # visited-set guard so a lineage loop never reads as closed; it selects no

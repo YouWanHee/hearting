@@ -664,10 +664,10 @@ python3 utilities/capability-route.py close --route <route.json> [--commit <sha>
 python3 utilities/capability-route.py status --artifact-root <dir> --open-only
 ```
 
-`close` does not refuse a route whose terminal node has not completed. It closes
-it, records `terminal_gate_proven=false`, and prints one `terminal-gate-unproven`
-line; the record cannot be proven later, so complete the terminal node first when
-you can. `--allow-unproven` is still accepted and changes nothing.
+`close` may preserve `terminal_gate_proven=false`; later exact completion on the
+same route is consumed by complete/finish/close/finalize (artifact-path-contract
+§46). Identity conflicts, live or unknown work, explicit stop/CANCELLED, and
+abandoned/autoclose outcomes remain unpromoted. `--allow-unproven` keeps its meaning.
 
 For producer-backed work, the controller's transaction is **terminal proof →
 route close → cycle finalize (the completion record) → workflow COMPLETE**. Eligible direct inline
@@ -676,10 +676,10 @@ order. Shared admission applies only to
 shared kinds after finalize; it is never a prerequisite for the terminal marker.
 Finalize records the cycle's completion as of that moment and does not lock the
 cycle: its files stay editable, movable and deletable afterwards (artifact-path-contract §45).
-A cycle finalized while its route is open (`finalize --allow-open-route`) stays
-`active` in its manifest; a later close, proven or not, leaves it there, and
-campaign closure lists it as `sealed-unproven` with the route's recorded proof
-state.
+Open-route finalize is provisionally `active`; exact completion and cleanup let
+finalize or refresh publish a new `completed` revision for that cycle, even with
+unchanged payload, preserving prior history (artifact-path-contract §46).
+Explicit abandoned cycles remain unpromoted.
 
 During the same session, a verified OPEN route for the same named campaign may
 also govern writes in a related integration worktree. The guard requires the

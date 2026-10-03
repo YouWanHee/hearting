@@ -166,6 +166,22 @@ class PublicInlineFinishTest(unittest.TestCase):
         replay = self.finish()
         self.assertEqual(replay.returncode, 0, replay.stderr + replay.stdout)
 
+    def test_first_finish_consumes_same_route_historical_false_close(self):
+        initial, created = CAP.close_route(self.route, self.route_file, allow_unproven=True, jobs=self.jobs)
+        self.assertTrue(created)
+        self.assertFalse(initial["terminal_gate_proven"])
+        original = CAP.outcome_path(self.route_file).read_bytes()
+        result = self.finish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertTrue(receipt["inline_finish_id"])
+        outcome = json.loads(CAP.outcome_path(self.route_file).read_text(encoding="utf-8"))
+        self.assertTrue(outcome["terminal_gate_proven"])
+        retained = list(self.route_file.parent.glob(
+            f"{self.route_file.stem}.historical-false-*.outcome.json"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), original)
+
     def test_public_compose_start_finish_cli_flow_and_campaign_seal(self):
         receipt = self.finish()
         self.assertEqual(receipt.returncode, 0, receipt.stderr)

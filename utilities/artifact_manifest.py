@@ -1572,25 +1572,72 @@ def validate_update(
     for key in ("events", "routes"):
         before = [r for r in previous.get(key, []) or []]
         after = [r for r in document.get(key, []) or []]
-        if after[: len(before)] != before:
+        provisional_completion = (
+            isinstance(previous.get("cycle"), dict)
+            and previous["cycle"].get("state") == "active"
+            and isinstance(document.get("cycle"), dict)
+            and document["cycle"].get("state") == "completed")
+        if after[: len(before)] != before and not (key == "routes" and provisional_completion):
             violations.append(Violation(
                 "update-earlier-%s-changed" % key, "$.%s" % key,
                 "a refreshed document keeps every earlier %s exactly" % key))
         elif key == "events":
+            provisional_completion = (
+                isinstance(previous.get("cycle"), dict)
+                and previous["cycle"].get("state") == "active"
+                and isinstance(document.get("cycle"), dict)
+                and document["cycle"].get("state") == "completed")
+            allowed = {"artifact.revision.recorded", "route.terminal.recorded"}
+            if provisional_completion:
+                allowed.add("cycle.completed")
             for row in after[len(before):]:
-                if not isinstance(row, dict) or row.get("event_type") not in (
-                        "artifact.revision.recorded", "route.terminal.recorded"):
+                if not isinstance(row, dict) or row.get("event_type") not in allowed:
                     violations.append(Violation(
                         "update-event-type-not-allowed", "$.events",
-                        "only a revision record or a later route's terminal record may follow"))
+                        "only a revision or the exact provisional-completion terminal events may follow"))
     before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
     after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
+    provisional_completion = before_cycle.get("state") == "active" and after_cycle.get("state") == "completed"
     for key in ("cycle_id", "campaign_id", "state", "parent_cycle_id", "started_on", "input_digest"):
-        if key in changeable_cycle_fields:
+        if key in changeable_cycle_fields and key != "state":
             continue  # a move or a new parent (§45 D-126) says which fields it may change
         if before_cycle.get(key) != after_cycle.get(key):
-            violations.append(Violation(
-                "update-cycle-field-changed", "$.cycle.%s" % key, "a refresh does not change the cycle"))
+            if not (key == "state" and provisional_completion):
+                violations.append(Violation(
+                    "update-cycle-field-changed", "$.cycle.%s" % key, "a refresh does not change the cycle"))
+    if provisional_completion:
+        before_routes = [row for row in previous.get("routes", []) or [] if isinstance(row, dict)]
+        after_routes = [row for row in document.get("routes", []) or [] if isinstance(row, dict)]
+        if len(before_routes) != len(after_routes):
+            violations.append(Violation("update-completion-route-count-changed", "$.routes",
+                                        "provisional completion keeps the exact route set"))
+        else:
+            changed = []
+            for index, (old, new_row) in enumerate(zip(before_routes, after_routes)):
+                if old == new_row:
+                    continue
+                allowed_row = dict(old)
+                allowed_row["terminal_marker"] = new_row.get("terminal_marker")
+                allowed_row["terminal_evidence_id"] = new_row.get("terminal_evidence_id")
+                if (old.get("terminal_marker") != "pending" or old.get("terminal_evidence_id")
+                        or not new_row.get("terminal_marker") or not new_row.get("terminal_evidence_id")
+                        or allowed_row != new_row):
+                    violations.append(Violation("update-completion-route-identity-changed",
+                                                "$.routes[%d]" % index,
+                                                "only pending terminal evidence on the same route may bind"))
+                changed.append(new_row)
+            suffix = [row for row in (document.get("events") or [])[len(previous.get("events") or []):]
+                      if isinstance(row, dict)]
+            cycle_events = [row for row in suffix if row.get("event_type") == "cycle.completed"
+                            and row.get("target_id") == after_cycle.get("cycle_id")]
+            terminal_events = [row for row in suffix if row.get("event_type") == "route.terminal.recorded"
+                               and row.get("target_id") == after_cycle.get("cycle_id")]
+            if len(changed) != 1 or len(cycle_events) != 1 or len(terminal_events) != 1:
+                violations.append(Violation("update-completion-event-binding-invalid", "$.events",
+                                            "one exact route and one pair of terminal events are required"))
+            elif changed[0].get("terminal_evidence_id") != terminal_events[0].get("event_id"):
+                violations.append(Violation("update-completion-event-binding-invalid", "$.routes",
+                                            "the terminal route row must name its appended event"))
     for key in ("manifest_id", "artifact_root_id", "repository_id"):
         if previous.get(key) != document.get(key):
             violations.append(Violation(
