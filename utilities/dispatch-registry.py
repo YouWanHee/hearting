@@ -1342,7 +1342,9 @@ def reconcile(rows, args):
                         expected_pgid=selected_binding[3],
                     )
                     latest = current_attempt_row(args.jobs, meta["attempt_id"])
-                    closed = bool(latest and latest.status not in OPEN)
+                    closed = bool(latest and latest.status not in OPEN
+                                  and launched_attempt_identity(latest.raw.split("\t"))
+                                  == selected_binding[5])
             decisions.append({
                 "attempt_id": meta["attempt_id"], "slug": row["slug"],
                 "category": "support-settlement-committed" if closed else

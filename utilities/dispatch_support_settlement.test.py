@@ -175,6 +175,97 @@ class SupportSettlementTest(unittest.TestCase):
         self.assertEqual(current.metadata.get("failure_class"), "protocol")
         self.assertEqual(current.metadata.get("note"), "dead-missing-result")
 
+    def test_log_aba_commits_the_decision_validated_under_cas(self):
+        for first, middle in (("PASS", "FAIL"), ("FAIL", "PASS"), ("BLOCKED", "PASS")):
+            with self.subTest(first=first, middle=middle):
+                row = self.row(verdict=first)
+                identity = CONTRACT.launched_attempt_identity(row.raw.split("\t"))
+                selected = JOIN.classify_exact_route_free_support_outcome(
+                    row, jobs=self.jobs, expected_attempt_id=row.attempt_id,
+                    expected_pid=4321, expected_pid_start="42", expected_pgid=4321,
+                    quiescence=self.quiescent(), expected_log_file=str(self.log),
+                    selected_identity=identity,
+                )
+                self.write_log(middle)
+                writer = JOIN.close_attempt_row_if
+
+                def restore_before_cas(*args, **kwargs):
+                    self.write_log(first)
+                    return writer(*args, **kwargs)
+
+                with mock.patch.object(JOIN, "attempt_process_quiescence", self.quiescent), \
+                     mock.patch.object(JOIN, "close_attempt_row_if", restore_before_cas):
+                    outcome = JOIN.apply_exact_route_free_support_classification(
+                        row, jobs=self.jobs, classification=selected, selected_identity=identity,
+                        expected_log_file=str(self.log), expected_pid=4321,
+                        expected_pid_start="42", expected_pgid=4321,
+                    )
+                current = JOIN.exact_attempt_row(self.jobs, row.attempt_id)
+                self.assertEqual(outcome, "support-settlement-committed")
+                self.assertEqual(current.metadata.get("note"), selected.note)
+                for key, value in selected.evidence.items():
+                    self.assertEqual(current.metadata.get(key), value)
+
+    def test_cas_rechecks_quiescence_binding_duplicates_and_stop(self):
+        for change in ("live", "unverifiable", "pid_start", "log_file", "namespace", "duplicate", "cancelled"):
+            with self.subTest(change=change):
+                row = self.row()
+                before = self.jobs.read_text()
+                writer = JOIN.close_attempt_row_if
+                probe = [self.quiescent()]
+                expected = [before]
+
+                def change_before_cas(*args, **kwargs):
+                    if change in {"live", "unverifiable"}:
+                        probe[0] = CONTRACT.ProcessQuiescence(change, "fixture-new-observation")
+                    elif change == "duplicate":
+                        expected[0] = before + before
+                    elif change == "cancelled":
+                        expected[0] = before.replace("\topen\t", "\tcancelled\t", 1)
+                    else:
+                        old, new = {
+                            "pid_start": ("pid_start=42", "pid_start=43"),
+                            "log_file": (str(self.log), str(self.base / "foreign.claude.jsonl")),
+                            "namespace": ("pid_observer_ns=test-ns", "pid_observer_ns=foreign-ns"),
+                        }[change]
+                        expected[0] = before.replace(old, new, 1)
+                    self.jobs.write_text(expected[0])
+                    return writer(*args, **kwargs)
+
+                with mock.patch.object(JOIN, "attempt_process_quiescence", lambda *_: probe[0]), \
+                     mock.patch.object(JOIN, "close_attempt_row_if", change_before_cas):
+                    result = JOIN.settle_finished_attempt(self.jobs, row)
+                self.assertEqual(self.jobs.read_text(), expected[0])
+                self.assertEqual(result["closed"], change == "cancelled")
+
+        # A terminal row with a different admitted binding cannot settle the
+        # caller's stale attempt; preserving history does not grant identity.
+        row = self.row()
+        self.jobs.write_text(row.raw.replace("\topen\t", "\tdone\t", 1)
+                             .replace("pid_start=42", "pid_start=43", 1) + "\n")
+        result = JOIN.settle_finished_attempt(self.jobs, row)
+        self.assertFalse(result["closed"])
+        self.assertEqual(result["reason"], "support-binding-mismatch")
+
+    def test_duplicate_settlement_sibling_and_terminal_history_are_unchanged(self):
+        row = self.row()
+        sibling = row.raw.replace("att-support", "att-sibling")
+        self.jobs.write_text(row.raw + "\n" + sibling + "\n")
+        with mock.patch.object(JOIN, "attempt_process_quiescence", self.quiescent):
+            self.assertTrue(JOIN.settle_finished_attempt(self.jobs, row)["closed"])
+            committed = self.jobs.read_bytes()
+            self.assertTrue(JOIN.settle_finished_attempt(self.jobs, row)["closed"])
+        self.assertEqual(self.jobs.read_bytes(), committed)
+        self.assertEqual(self.jobs.read_text().splitlines()[1], sibling)
+        for status in ("done", "killed", "cancelled"):
+            with self.subTest(status=status):
+                row = self.row(status=status)
+                original = row.raw + ",note=dead-runtime-exit,failure_class=runtime\n"
+                self.jobs.write_text(original)
+                row = JOIN.exact_attempt_row(self.jobs, row.attempt_id)
+                self.assertTrue(JOIN.settle_finished_attempt(self.jobs, row)["closed"])
+                self.assertEqual(self.jobs.read_text(), original)
+
     def test_reaper_drained_path_uses_shared_settlement(self):
         row = self.row()
         args = types.SimpleNamespace(

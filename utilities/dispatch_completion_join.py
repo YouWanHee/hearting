@@ -3032,10 +3032,15 @@ def settle_finished_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
     """
     reason = ""
     try:
-        if _route_free_support_row(row):
+        support = _route_free_support_row(row)
+        if support:
             expected = (row.attempt_id, int(row.metadata.get("pid", "0")),
                         row.metadata.get("pid_start", ""), int(row.metadata.get("pgid", "0")))
             fresh = exact_attempt_row(jobs, row.attempt_id)
+            selected_identity = launched_attempt_identity(row.raw.split("\t"))
+            if launched_attempt_identity(fresh.raw.split("\t")) != selected_identity:
+                return {"attempt_id": row.attempt_id, "closed": False,
+                        "reason": "support-binding-mismatch"}
             if fresh.status not in OPEN_STATES:
                 return {"attempt_id": row.attempt_id, "closed": True, "reason": "terminal-committed"}
             classification = classify_exact_route_free_support_outcome(
@@ -3066,6 +3071,9 @@ def settle_finished_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
         else:
             reason = close_finished_child(row, jobs=jobs)
         current = exact_attempt_row(jobs, row.attempt_id)
+        if support and launched_attempt_identity(current.raw.split("\t")) != selected_identity:
+            return {"attempt_id": row.attempt_id, "closed": False,
+                    "reason": "support-binding-mismatch"}
         if current.status == "done" and current.metadata.get("workflow_completion") == "runtime-v1":
             from dispatch_terminal_commit import owner_completion_pending
             materialize_after_terminal_close(jobs, current.attempt_id)
@@ -3758,13 +3766,10 @@ def apply_exact_route_free_support_classification(
         return "pending"
     if row.status not in OPEN_STATES:
         return "terminal-history-preserved"
-    terminal = classify_supervisor_log(row.metadata.get("log_file"), row.metadata.get("harness", ""))
-    if terminal.reconcile_reason in {
-        "terminal-log-missing", "terminal-log-unreadable", "terminal-event-missing",
-    }:
-        terminal = missing_result_terminal(row.metadata)
-    evidence = terminal.evidence()
-    note = terminal.note
+    # The locked predicate validates this exact decision. A second unlocked
+    # classification could supply a different payload during an ABA log change.
+    evidence = classification.evidence
+    note = classification.note
     committed = close_attempt_row_if(
         Path(jobs), row.attempt_id, note,
         lambda fields: _support_cas_matches(
@@ -3779,7 +3784,8 @@ def apply_exact_route_free_support_classification(
         current = exact_attempt_row(Path(jobs), row.attempt_id)
     except (JoinContractError, OSError):
         return "support-settlement-commit-unverified"
-    if current.status != "done" or current.metadata.get("note") != note:
+    if (current.status != "done" or current.metadata.get("note") != note
+            or launched_attempt_identity(current.raw.split("\t")) != selected_identity):
         return "support-settlement-commit-unverified"
     materialize_after_terminal_close(Path(jobs), row.attempt_id)
     return "support-settlement-committed"
