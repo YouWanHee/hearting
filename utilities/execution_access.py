@@ -185,19 +185,31 @@ def _task_target_reference(route: Mapping[str, object]) -> tuple[tuple[str, ...]
     end = next((index for index in range(start + 1, len(lines))
                 if lines[index].startswith("## ")), len(lines))
     input_lines = lines[start + 1:end]
-    preview_rows = [line for line in input_lines if line.startswith("- 미리보기(사용자가 본 것): ")]
     target_rows = [line for line in input_lines if line.startswith("- 루트 목록과 경로: ")]
-    if len(preview_rows) != 1 or len(target_rows) != 1:
+    if not target_rows:
         return None
+    if len(target_rows) != 1:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS target reference is ambiguous"
+        )
+    preview_rows = [line for line in input_lines if line.startswith("- 미리보기(사용자가 본 것): ")]
+    if len(preview_rows) != 1:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS target requires one paired preview reference"
+        )
     target = target_rows[0]
     match = re.fullmatch(
         r"- 루트 목록과 경로: ([A-Za-z0-9_./-]+) 의 ROOTS 표\(([^()]*)\)", target
     )
     if not match:
-        return None
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS target reference has an unsupported shape"
+    )
     manifest_reference, names_text = match.groups()
     if manifest_reference != "previews/run_all.sh":
-        return None
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS input is not the supported direct preview table"
+        )
     names = tuple(part.strip() for part in names_text.split(","))
     if (not names or len(names) > MAX_ROOTS or any(not re.fullmatch(r"[A-Za-z0-9_-]+", n) for n in names)
             or len(names) != len(set(names))):
@@ -205,23 +217,66 @@ def _task_target_reference(route: Mapping[str, object]) -> tuple[tuple[str, ...]
             "execution-access-target-input-invalid", "ROOTS target names are ambiguous"
         )
     preview_match = re.fullmatch(
-        r"- 미리보기\(사용자가 본 것\): (\.agent_reports/_scratch/[A-Za-z0-9_./-]+)/previews/<루트>\.md",
+        r"- 미리보기\(사용자가 본 것\): ([A-Za-z0-9_./-]+)/previews/<루트>\.md",
         preview_rows[0],
     )
     if not preview_match:
         raise ExecutionAccessError(
             "execution-access-target-input-invalid", "preview and ROOTS paths are not a supported pair"
         )
-    base = Path(cwd_value).expanduser().resolve(strict=False)
-    relative_base = Path(preview_match.group(1))
-    manifest = (base / relative_base / manifest_reference).resolve(strict=False)
+    preview_base = Path(preview_match.group(1))
+    if preview_base.is_absolute() or ".." in preview_base.parts:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "preview reference must stay relative to its source root"
+        )
+    if preview_base.parts[:1] == (".agent_reports",):
+        try:
+            route_root_value = Path(str(route.get("artifact_root") or ""))
+            if not route_root_value.is_absolute():
+                raise ValueError("route artifact root must be absolute")
+            canonical_root = route_root_value.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid",
+                f"route artifact root is unavailable: {type(exc).__name__}",
+            ) from exc
+        relative_base = Path(*preview_base.parts[1:])
+        manifest = canonical_root / relative_base / manifest_reference
+        try:
+            manifest.resolve(strict=False).relative_to(canonical_root)
+        except ValueError as exc:
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid", "ROOTS input escapes the canonical artifact root"
+            ) from exc
+    else:
+        if preview_base.parts[:1] and preview_base.parts[0].startswith(".agent_reports"):
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid",
+                "artifact-relative references must use the canonical .agent_reports prefix",
+            )
+        source_root = Path(cwd_value).expanduser().resolve(strict=False)
+        manifest = source_root / preview_base / manifest_reference
+        try:
+            manifest.resolve(strict=False).relative_to(source_root)
+        except ValueError as exc:
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid", "ROOTS input escapes the route source directory"
+            ) from exc
     return names, manifest
 
 
 def read_roots_data(path: str | Path, selected_names: Iterable[str]) -> ResolvedTaskTargets:
     """Read only the delimited ROOTS data block; never execute its shell script."""
 
-    manifest = Path(path).resolve(strict=False)
+    manifest = Path(path).expanduser()
+    if not manifest.is_absolute():
+        manifest = manifest.absolute()
+    try:
+        resolved_manifest = manifest.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", f"ROOTS input path is invalid: {type(exc).__name__}"
+        ) from exc
     raw = _read_bounded_regular_file(manifest, MAX_TASK_TARGET_SCRIPT_BYTES)
     try:
         text = raw.decode("utf-8")
@@ -271,7 +326,7 @@ def read_roots_data(path: str | Path, selected_names: Iterable[str]) -> Resolved
             "execution-access-target-input-invalid", "a selected ROOTS name is missing or duplicated"
         )
     return ResolvedTaskTargets(
-        manifest_path=manifest,
+        manifest_path=resolved_manifest,
         manifest_sha256=hashlib.sha256(raw).hexdigest(),
         selected_names=names,
         writable_roots=tuple(_unique_paths(rows[name] for name in names)),
@@ -350,6 +405,7 @@ def prepare_task_request(route: Mapping[str, object], jobs: str | Path) -> Path 
         "schema_version": 1,
         "route_id": route_id,
         "route_hash": route_hash,
+        "artifact_root": str(Path(str(route.get("artifact_root") or "")).resolve(strict=False)),
         "manifest_path": str(targets.manifest_path),
         "manifest_sha256": targets.manifest_sha256,
         "selected_names": list(targets.selected_names),

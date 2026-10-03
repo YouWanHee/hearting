@@ -409,8 +409,17 @@ def _start(route, path, jobs, node, harness, run):
         try:
             prepared = prepare_task_request(route, jobs)
         except ExecutionAccessError as exc:
-            prepared = None
             access_diagnostic = f"{exc.reason}: {exc.detail}"
+            # An explicit target input was recognized but could not be safely
+            # prepared. Preserve the existing typed execution-access reason
+            # and stop before dispatch-owner can take its default grant path.
+            return {
+                "attempt_id": attempt_id(route, node),
+                "exit_code": 69,
+                "receipt": f"check=failed\nreason={exc.reason}\ndetail={exc.detail}\nchild_spawned=0\n",
+                "diagnostic": "",
+                "execution_access_diagnostic": access_diagnostic,
+            }
         if prepared is not None:
             command += ["--execution-access-file", str(prepared)]
     result = run(command, text=True, capture_output=True, check=False)
@@ -1320,6 +1329,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     if "reason=frame-harness-unavailable" in receipt_lines and "child_spawned=0" in receipt_lines:
                         return {**result, "state": "needs-attention", "reason": "frame-harness-unavailable",
                                 "frame_attempts": sorted(attempts)}
+                    launch_reason = _launch_failure_reason(result["launches"][-1])
+                    if launch_reason.startswith("execution-access-"):
+                        return {**result, "state": "needs-attention", "reason": launch_reason,
+                                "frame_attempts": sorted(attempts)}
                     if (node["id"] == "frame-alternative" and result["launches"][-1]["exit_code"] == 75
                             and "check=deferred" in receipt_lines
                             and "reason=frame-first-attempt-pending" in receipt_lines
@@ -1401,6 +1414,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     if aid not in rows:
         if refusal:
             return _capacity_wait(result, aid, "owner", refusal, resume, clock)
+        launch_reason = _launch_failure_reason(result["launches"][-1]) if result["launches"] else "-"
+        if launch_reason.startswith("execution-access-"):
+            return {**result, "state": "needs-attention", "reason": launch_reason,
+                    "launch_reason": launch_reason, "required_action": "correct-route-input"}
         if result["launches"] and _launch_failure_reason(result["launches"][-1]).partition(":")[0] == "admission-busy":
             # The launcher's preparation timed out on a held admission lock before any row existed.
             return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted",

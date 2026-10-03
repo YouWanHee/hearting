@@ -59,20 +59,32 @@ class WorkStartTest(unittest.TestCase):
         self.current = mock.patch.object(W, "current_delivery_state", side_effect=self.delivery)
         self.current.start(); self.addCleanup(self.current.stop)
 
-    def test_start_prepares_direct_root_table_request_and_keeps_explicit_request(self):
-        project = Path(self.tmp.name) / "project"
-        manifest = project / ".agent_reports/_scratch/flow/previews/run_all.sh"
+    def test_start_and_resume_prepare_the_same_canonical_root_request(self):
+        primary = Path(self.tmp.name) / "primary"
+        project = Path(self.tmp.name) / "linked"
+        primary.mkdir()
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        subprocess.run(["git", "-C", str(primary), "-c", "user.name=Fixture", "-c",
+                        "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b", "fixture-linked", str(project)], check=True)
+        artifact_root = primary / ".agent_reports"
+        artifact_root.mkdir()
+        manifest = artifact_root / "_scratch/flow/previews/run_all.sh"
         manifest.parent.mkdir(parents=True)
         manifest.write_text(
-            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\n"
+            "done <<'ROOTS'\nalpha|/tmp/canonical-alpha/.agent_reports\n"
             "beta|/tmp/beta/.agent_reports\nextra|/tmp/extra/.agent_reports\nROOTS\n",
             encoding="utf-8",
         )
+        shadow = project / ".agent_reports/_scratch/flow/previews/run_all.sh"
+        shadow.parent.mkdir(parents=True)
+        shadow.write_text("done <<'ROOTS'\nalpha|/tmp/shadow-alpha/.agent_reports\nROOTS\n", encoding="utf-8")
         route = {
             **self.route,
             "route_id": "rt-direct-targets",
             "route_hash": "sha256:" + "a" * 64,
             "cwd": str(project),
+            "artifact_root": str(artifact_root),
             "work_request": {"text": (
                 "## 입력\n"
                 "- 미리보기(사용자가 본 것): .agent_reports/_scratch/flow/previews/<루트>.md\n"
@@ -95,9 +107,37 @@ class WorkStartTest(unittest.TestCase):
         request_path = Path(calls[0][calls[0].index("--execution-access-file") + 1])
         request = json.loads(request_path.read_text(encoding="utf-8"))
         self.assertEqual(
-            ["/tmp/alpha/.agent_reports", "/tmp/beta/.agent_reports"],
+            ["/tmp/beta/.agent_reports", "/tmp/canonical-alpha/.agent_reports"],
             request["writable_roots"],
         )
+
+        # start and resume use the same preparation entry point and therefore
+        # reuse the exact route-bound request, including its full digest.
+        W._start(route, route_file, self.jobs, "owner", "codex", run)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(calls[0][calls[0].index("--execution-access-file") + 1],
+                         calls[1][calls[1].index("--execution-access-file") + 1])
+        request_path = Path(calls[1][calls[1].index("--execution-access-file") + 1])
+        self.assertEqual(request, json.loads(request_path.read_text()))
+        from execution_access import AccessContext
+        access_env = {"HOME": str(Path(self.tmp.name) / "home")}
+        context = AccessContext.build(
+            worktree=project,
+            artifact_root=artifact_root,
+            dispatch_state_root=Path(self.tmp.name) / "dispatch-state",
+            agent_home=W.ROOT,
+            environ=access_env,
+        )
+        for adapter_name, runtime in (("codex", "codex-exec"), ("claude", "claude-cli"),
+                                      ("opencode", "opencode")):
+            adapter = load("work_start_access_" + adapter_name,
+                           W.ROOT / "adapters" / adapter_name / "bin/dispatch-headless.py")
+            grant = adapter.bind_execution_access_request(
+                str(request_path), environ=access_env, context=context,
+                is_child=False, parent=None, runtime=runtime,
+            )
+            self.assertEqual(request_path.resolve(), grant.source_path)
+            self.assertEqual(tuple(Path(value) for value in request["writable_roots"]), grant.writable_roots)
 
         explicit_calls = []
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": "/tmp/existing-request.json"}):
@@ -105,6 +145,38 @@ class WorkStartTest(unittest.TestCase):
                      lambda command, **kwargs: (explicit_calls.append(command)
                          or subprocess.CompletedProcess(command, 0, "started=1\n", "")))
         self.assertNotIn("--execution-access-file", explicit_calls[0])
+
+    def test_invalid_explicit_roots_stop_before_launch_with_typed_error(self):
+        project = Path(self.tmp.name) / "project"
+        project.mkdir()
+        artifact_root = project / ".agent_reports"
+        manifest = artifact_root / "_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("done <<'ROOTS'\nalpha|relative/root\nROOTS\n", encoding="utf-8")
+        route = {
+            **self.route,
+            "route_id": "rt-invalid-targets",
+            "route_hash": "sha256:" + "b" * 64,
+            "cwd": str(project),
+            "artifact_root": str(artifact_root),
+            "work_request": {"text": (
+                "## 입력\n"
+                "- 미리보기(사용자가 본 것): .agent_reports/_scratch/flow/previews/<루트>.md\n"
+                "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha)\n"
+            ), "owner_harness": "codex"},
+        }
+        route_file = Path(self.tmp.name) / "invalid-route.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        calls = []
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+            result = W.start_work(route, route_file, self.jobs,
+                                  run=lambda command, **kwargs: calls.append(command))
+        self.assertEqual([], calls)
+        self.assertEqual("needs-attention", result["state"])
+        self.assertEqual("execution-access-target-input-invalid", result["reason"])
+        self.assertIn("reason=execution-access-target-input-invalid", result["launches"][0]["receipt"])
+        self.assertIn("child_spawned=0", result["launches"][0]["receipt"])
 
     def observe(self, **kw):
         return {"state": "ready" if self.ready else "timeout", "children": []}
