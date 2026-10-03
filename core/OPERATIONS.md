@@ -772,7 +772,7 @@ join retains every owned attempt, including `done` rows, until the exact process
 group and tagged descendants are settled. `dispatch-reconcile --attempt <id>
 --apply` uses the same bounded cleanup proof authority on terminal rows; it
 preserves the result, marker, and delivery receipt and grants no retry credit.
-For the exact route-free registered depth-1 support tuple
+For the exact route-free registered dispatch-depth-1 support tuple
 `ops/session-tidy-memory` / `session-tidy-memory`, the post-exit join, reaper,
 and normal reconcile consumer settle the existing semantic terminal result
 after exact process quiescence. The shared log classifier's `process_exit` is
