@@ -406,6 +406,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
             if argv[:3] == ["herdr", "pane", "get"]:
                 return _herdr_json({"result": {"pane": {}}})
             if argv[:3] == ["herdr", "pane", "wait-output"]:
+                time.sleep(0.01)  # delayed shell prompt is observed before bootstrap
                 return _herdr_json({"result": {"pane": {}}})
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
@@ -417,6 +418,8 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         argvs = [c[0][0] for c in run_mock.call_args_list]
         send = next(argv for argv in argvs if argv[:3] == ["herdr", "pane", "send-text"])
         self.assertEqual(send[-1], "cd -- " + shlex.quote(os.path.realpath(str(self.tmp_root))))
+        ready = next(argv for argv in argvs if argv[:3] == ["herdr", "pane", "wait-output"])
+        self.assertLess(argvs.index(ready), argvs.index(send))
         self.assertLess(argvs.index(send), argvs.index(_agent_start_cmd(run_mock)))
 
     def test_opencode_uses_the_interactive_positional_project_argument(self):

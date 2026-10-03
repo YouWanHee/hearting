@@ -55,8 +55,8 @@ def _mark_dispatch_child_sessions(sessions, jobs):
                 continue
             # A cwd-only dispatch record cannot identify an anonymous/root session:
             # absent parent identity is missing evidence, not proof that this session
-            # is the runtime child. Exact process/session association is handled above
-            # by procscan markers and below by the recorded child identity.
+            # is the runtime child. Direct procscan child markers and exact session
+            # joins elsewhere remain the stronger association evidence.
             if not getattr(j, 'parent_sid', None):
                 continue
             if not _same_path(s.cwd, j.cwd):
