@@ -5366,7 +5366,9 @@ def _current_terminal_identity(route, gates, owner_attempt_id):
     Built only from state that already exists: the exact terminal markers just observed, the
     owner's terminal-commit slot, and its producer binding. An owner that neither holds a slot
     for this very marker set nor is the attempt that wrote a terminal marker is not provably
-    current, and nothing is returned for it. Axes with no existing state are simply absent."""
+    current, and nothing is returned for it. Under the producer lifecycle the binding axes come from the
+    binding held now, or from this owner's verified claimed slot when no binding file exists; with neither,
+    no producer authority exists and nothing is returned, so a caller's or an old record's values never fill it in."""
     dtc = dispatch_terminal_commit
     try:
         rows = list(gates.values())
@@ -5391,16 +5393,23 @@ def _current_terminal_identity(route, gates, owner_attempt_id):
     current = {"terminal_owner_attempt_id": owner_attempt_id, "terminal_marker_digest": marker_digest}
     try:
         if dtc.producer_lifecycle_applies(route):
-            binding = dtc.load_producer_binding(artifact_root=Path(route["artifact_root"]),
-                                                route_id=route["route_id"], owner_attempt_id=owner_attempt_id)
-            if binding.digest is None or (binding.binding or {}).get("route_hash") != route["route_hash"]:
-                return current
-            producer_digest = binding.digest  # the binding held now, whatever an older claim recorded
+            try:
+                binding = dtc.load_producer_binding(artifact_root=Path(route["artifact_root"]),
+                                                    route_id=route["route_id"], owner_attempt_id=owner_attempt_id)
+            except dtc.TerminalCommitError as exc:
+                # No binding file: only this owner's verified claimed slot still knows its binding, and a
+                # file that exists but is unusable proves nothing. Without either, no producer authority.
+                if exc.code != "producer-binding-required" or producer_digest is None:
+                    return {}
+            else:
+                if binding.digest is None or (binding.binding or {}).get("route_hash") != route["route_hash"]:
+                    return {}
+                producer_digest = binding.digest  # the binding held now, whatever an older claim recorded
         elif producer_digest is None:
             producer_digest = dtc._digest(dtc._canonical({"contract": "producer-binding-not-applicable/v1",
                                                          "reason": "sealed-topology-nonproducer"}))
     except (dtc.TerminalCommitError, OSError, ValueError, KeyError, TypeError):
-        return current
+        return {}
     current["producer_binding_digest"] = producer_digest
     current["terminal_commit_id"] = dtc.terminal_commit_id(
         route_id=route["route_id"], route_hash=route["route_hash"], owner_attempt_id=owner_attempt_id,

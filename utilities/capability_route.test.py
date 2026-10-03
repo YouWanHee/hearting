@@ -1772,26 +1772,23 @@ class TestRoute(unittest.TestCase):
 
  def test_identity_bearing_false_close_is_consumed_by_the_same_actual_tuple_once(self):
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
-   route,node,attempt,path,jobs,publish=self._registered_terminal_route(tmp)
-   binding="sha256:"+hashlib.sha256(json.dumps(
-    {"route_id":route["route_id"],"route_hash":route["route_hash"],"node":node["id"]},sort_keys=True).encode()).hexdigest()
-   commit="c"*40
-   first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,terminal_commit_id=commit,
-    expected_owner_attempt_id=attempt,expected_producer_binding_digest=binding)
-   self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
-   raw=R.outcome_path(path).read_bytes()
-   gate=publish()  # the actual current marker: its attempt is the registered terminal owner
+   # The owner's real current state: marker, producer binding file and claimed slot for that marker, with the
+   # earlier close recorded unproven under the tuple that slot holds.
+   route,node,attempt,path,jobs,status,actual,raw=self._actual_false_close(tmp)
+   status("done")
+   gate=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
    self.assertTrue(gate["passed"],gate); self.assertEqual(gate["attempt_id"],attempt)
-   marker_digest=R.dispatch_terminal_commit.terminal_marker_digest([gate])
-   for foreign in (dict(terminal_commit_id=commit,expected_owner_attempt_id="att-foreign",expected_producer_binding_digest=binding),
-                   dict(terminal_commit_id=commit,expected_owner_attempt_id=attempt,expected_producer_binding_digest="sha256:"+"0"*64),
-                   dict(terminal_commit_id="d"*40,expected_owner_attempt_id=attempt,expected_producer_binding_digest=binding)):
+   commit=actual["terminal_commit_id"]; binding=actual["expected_producer_binding_digest"]
+   marker_digest=actual["expected_terminal_marker_digest"]
+   self.assertEqual(marker_digest,R.dispatch_terminal_commit.terminal_marker_digest([gate]))
+   for foreign in (dict(actual,expected_owner_attempt_id="att-foreign"),
+                   dict(actual,expected_producer_binding_digest="sha256:"+"0"*64),
+                   dict(actual,terminal_commit_id="d"*64)):
     with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
-     R.close_route(route,path,jobs=jobs,expected_terminal_marker_digest=marker_digest,**foreign)
+     R.close_route(route,path,jobs=jobs,**foreign)
    self.assertEqual(R.outcome_path(path).read_bytes(),raw)
    self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
-   tuple_args=dict(terminal_commit_id=commit,expected_owner_attempt_id=gate["attempt_id"],
-    expected_producer_binding_digest=binding,expected_terminal_marker_digest=marker_digest)
+   tuple_args=dict(actual)
    current,created=R.close_route(route,path,jobs=jobs,**tuple_args)
    self.assertTrue(created); self.assertTrue(current["terminal_gate_proven"])
    self.assertEqual((current["terminal_commit_id"],current["terminal_owner_attempt_id"],
@@ -1887,6 +1884,41 @@ class TestRoute(unittest.TestCase):
     self.assertFalse(created); self.assertEqual(replay,current)
    self.assertEqual(R.outcome_path(path).read_bytes(),settled)
    self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+
+ def test_historical_binding_and_commit_are_not_proven_when_the_current_binding_file_is_absent(self):
+  # The owner's slot (digest/id) is the only current record left once the binding file is gone; the
+  # earlier false close names another digest and the id computed from it.
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   T=R.dispatch_terminal_commit
+   route,node,attempt,path,jobs,status,actual,_=self._actual_false_close(tmp)
+   foreign="sha256:"+"5"*64
+   foreign_id=T.terminal_commit_id(route_id=route["route_id"],route_hash=route["route_hash"],owner_attempt_id=attempt,
+    marker_digest=actual["expected_terminal_marker_digest"],producer_digest=foreign)
+   self.assertNotEqual(foreign_id,actual["terminal_commit_id"])
+   held=dict(actual,terminal_commit_id=foreign_id,expected_producer_binding_digest=foreign)
+   R.outcome_path(path).unlink()   # temporary fixture: record the historical false afresh
+   first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,**held)
+   self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+   raw=R.outcome_path(path).read_bytes()
+   status("done")
+   binding_file=T.producer_binding_path(Path(route["artifact_root"]).resolve(),route["route_id"],attempt)
+   slot_file=T.terminal_slot(Path(route["artifact_root"]).resolve(),route["route_id"],attempt)/"terminal-commit.json"
+   slot=slot_file.read_bytes()
+   for present in (True,False):
+    if not present:
+     binding_file.unlink()
+    for label,kwargs in (("nothing named",{}),("historical tuple re-supplied",held)):
+     with self.subTest(binding_file=present,caller=label):
+      with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+       R.close_route(route,path,jobs=jobs,**kwargs)
+      self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+      self.assertEqual(slot_file.read_bytes(),slot)
+      self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+   # With neither a binding file nor a verified slot there is no producer authority at all.
+   slot_file.unlink()
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,jobs=jobs,**held)
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
 
  def test_identity_bearing_false_close_is_not_taken_by_another_owner_or_binding(self):
   # The false record names an earlier owner (its own slot, binding and marker set); the marker held now

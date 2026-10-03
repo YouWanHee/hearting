@@ -3939,6 +3939,105 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                 finally:
                     fixture.doCleanups()
 
+    def _foreign_binding_false(self, *, drop_binding):
+        """The actual claim (owner row, producer binding, child marker, claimed slot) plus an earlier unproven
+        close that recorded the current owner and marker but ANOTHER producer binding digest and the commit id
+        computed from it. The slot keeps the legitimate digest and id; `drop_binding` removes the binding file
+        of this temporary fixture root, so only the slot still knows the current binding."""
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        self._closed_owner(jobs,owner)
+        crashed=terminal.settle_terminal_commit(request,terminal.TerminalCommitServices(crash_after="claim-after"))
+        self.assertNotEqual(crashed.result,"completed",crashed)
+        state=json.loads(terminal._commit_state_path(request).read_text())
+        self.assertEqual(state["state"],"claimed")
+        foreign="sha256:"+"5"*64
+        self.assertNotEqual(foreign,state["producer_binding_digest"])
+        foreign_id=terminal.terminal_commit_id(route_id=route["route_id"],route_hash=route["route_hash"],
+            owner_attempt_id=owner,marker_digest=state["terminal_marker_digest"],producer_digest=foreign)
+        self.assertNotEqual(foreign_id,state["terminal_commit_id"])
+        held=dict(terminal_commit_id=foreign_id,expected_owner_attempt_id=owner,
+                  expected_producer_binding_digest=foreign,
+                  expected_terminal_marker_digest=state["terminal_marker_digest"])
+        unproven={"report":{"passed":False,"reason":"completion-attempt-not-current"}}
+        with mock.patch.object(R,"terminal_gate_observation",return_value=unproven):
+            first,created=R.close_route(route,route_file,allow_unproven=True,jobs=jobs,**held)
+        self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+        raw=R.outcome_path(route_file).read_bytes()
+        binding_path=terminal.producer_binding_path(self.root,route["route_id"],owner)
+        self.assertTrue(binding_path.is_file())
+        if drop_binding:
+            binding_path.unlink()
+        return route,route_file,jobs,owner,result,request,raw,state,held,binding_path
+
+    def _foreign_binding_snapshot(self, route_file, request, result, binding_path):
+        import dispatch_terminal_commit as terminal
+        return dict(outcome=R.outcome_path(route_file).read_bytes(),
+                    slot=terminal._commit_state_path(request).read_bytes(),
+                    binding=binding_path.read_bytes() if binding_path.is_file() else None,
+                    cycle_state=P.read_cycle_record(self.root,result["cycle_id"])["state"],
+                    retained=sorted(p.name for p in Path(route_file).parent.glob("*.historical-false-*")))
+
+    def test_historical_foreign_binding_false_is_not_consumed_while_the_current_binding_exists(self):
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state,held,binding_path=self._foreign_binding_false(drop_binding=False)
+            before=self._foreign_binding_snapshot(route_file,request,result,binding_path)
+            for label,kwargs in (("nothing named",{}),("historical tuple re-supplied",held)):
+                with self.subTest(label):
+                    with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+                        R.close_route(route,route_file,**kwargs)
+                    self.assertEqual(before,self._foreign_binding_snapshot(route_file,request,result,binding_path))
+
+    def test_historical_foreign_tuple_is_not_proven_by_resupply_when_the_binding_file_is_absent(self):
+        """The binding file is gone but the claimed slot still holds the current digest/id: a caller that
+        re-supplies the historical (other digest, other id) cannot make it the current proof."""
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state,held,binding_path=self._foreign_binding_false(drop_binding=True)
+            before=self._foreign_binding_snapshot(route_file,request,result,binding_path)
+            for label,kwargs in (("historical tuple re-supplied",held),("nothing named",{})):
+                with self.subTest(label):
+                    with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+                        R.close_route(route,route_file,**kwargs)
+                    self.assertEqual(before,self._foreign_binding_snapshot(route_file,request,result,binding_path))
+            self.assertEqual(before["retained"],[])
+            self.assertNotEqual(before["cycle_state"],"sealed")
+
+    def test_complete_hook_does_not_consume_a_foreign_binding_false_when_the_binding_file_is_absent(self):
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state,held,binding_path=self._foreign_binding_false(drop_binding=True)
+            before=self._foreign_binding_snapshot(route_file,request,result,binding_path)
+            with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+                R._promote_historical_false_outcome(route,route_file,json.loads(raw),raw,jobs=jobs)
+            self.assertEqual(before,self._foreign_binding_snapshot(route_file,request,result,binding_path))
+
+    def test_actual_slot_tuple_is_consumed_even_when_the_binding_file_is_absent(self):
+        """The current tuple is derived from the verified claimed slot, so the real tuple still promotes once."""
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state=self._claimed_owner_with_false_close()
+            import dispatch_terminal_commit as terminal
+            terminal.producer_binding_path(self.root,route["route_id"],owner).unlink()
+            out,created=R.close_route(route,route_file)
+            self.assertTrue(created); self.assertTrue(out["terminal_gate_proven"])
+            self.assertEqual((out["terminal_commit_id"],out["producer_binding_digest"]),
+                             (state["terminal_commit_id"],state["producer_binding_digest"]))
+            retained=list(Path(route_file).parent.glob("*.historical-false-*.outcome.json"))
+            self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+
+    def test_unsettled_false_close_is_returned_unchanged_and_does_not_seal_the_cycle(self):
+        import dispatch_terminal_commit as terminal
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state=self._claimed_owner_with_false_close()
+            unproven={"report":{"passed":False,"reason":"completion-attempt-not-current"}}
+            manifest=Path(result["cycle_dir"])/"manifest.json"
+            manifest_before=manifest.read_bytes() if manifest.exists() else None
+            with mock.patch.object(R,"terminal_gate_observation",return_value=unproven):
+                out,created=R.close_route(route,route_file)
+            self.assertFalse(created); self.assertFalse(out["terminal_gate_proven"])
+            self.assertNotEqual(P.read_cycle_record(self.root,result["cycle_id"])["state"],"sealed")
+            self.assertEqual(manifest.read_bytes() if manifest.exists() else None,manifest_before)
+            self.assertEqual(R.outcome_path(route_file).read_bytes(),raw)
+            self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
+
     def test_default_services_close_finalize_envelope_and_replay(self):
         import dispatch_terminal_commit as terminal
         route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
