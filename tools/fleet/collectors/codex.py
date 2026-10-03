@@ -1194,6 +1194,82 @@ def _process_started_at(sess):
     return boot + ticks / clock_ticks
 
 
+_START_MATCH_MAX_VERTICES = 256
+_START_MATCH_MAX_EDGES = 16384
+
+
+def _unique_full_matching(edges):
+    """Return a unique process→root matching, or None for unknown/ambiguous graphs.
+
+    The iterative augmenting-path search is O(P·E). After one perfect matching
+    is found, an alternating cycle in the directed unmatched-edge graph is exactly
+    the condition for a second perfect matching; Kahn's cycle check is O(P+E).
+    """
+    process_ids = list(edges)
+    roots = set().union(*(edges[pid] for pid in process_ids)) if process_ids else set()
+    edge_count = sum(len(edges[pid]) for pid in process_ids)
+    if (not process_ids or len(process_ids) != len(roots)
+            or len(process_ids) + len(roots) > _START_MATCH_MAX_VERTICES
+            or edge_count > _START_MATCH_MAX_EDGES):
+        return None
+
+    root_owner, process_root = {}, {}
+    for start_pid in process_ids:
+        queue = [start_pid]
+        parent_process = {start_pid: None}
+        parent_root = {}
+        free_root = None
+        cursor = 0
+        while cursor < len(queue) and free_root is None:
+            pid = queue[cursor]
+            cursor += 1
+            for root in edges[pid]:
+                if root in parent_root:
+                    continue
+                parent_root[root] = pid
+                owner = root_owner.get(root)
+                if owner is None:
+                    free_root = root
+                    break
+                if owner not in parent_process:
+                    parent_process[owner] = root
+                    queue.append(owner)
+        if free_root is None:
+            return None
+        root = free_root
+        while root is not None:
+            pid = parent_root[root]
+            previous_root = parent_process[pid]
+            root_owner[root] = pid
+            process_root[pid] = root
+            root = previous_root
+
+    outgoing = {pid: set() for pid in process_ids}
+    indegree = {pid: 0 for pid in process_ids}
+    for pid in process_ids:
+        for root in edges[pid]:
+            if root == process_root[pid]:
+                continue
+            owner = root_owner.get(root)
+            if owner is None:
+                return None
+            if owner not in outgoing[pid]:
+                outgoing[pid].add(owner)
+                indegree[owner] += 1
+    ready = [pid for pid, degree in indegree.items() if degree == 0]
+    removed = 0
+    while ready:
+        pid = ready.pop()
+        removed += 1
+        for neighbor in outgoing[pid]:
+            indegree[neighbor] -= 1
+            if indegree[neighbor] == 0:
+                ready.append(neighbor)
+    if removed != len(process_ids):
+        return None
+    return process_root
+
+
 def process_rollouts(sessions, home):
     """Which rollout each live Codex process is running → ``(paths, claimed)``.
 
@@ -1220,75 +1296,189 @@ def process_rollouts(sessions, home):
 
 
 def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
-    """Reserve only mutually unique root rollouts by exact process start.
+    """Consume a component only when its exact-start full matching is unique.
 
-    Incident 2026-08-10: two direct Codex TUIs in Eiren_invest held no rollout
-    fd.  Their root rollouts were uniquely separated by exact process start, but
-    the minute-rounded fallback saw both roots plus a subagent and left both
-    rows anonymous.  A pair is accepted only when the process has one candidate
-    and that rollout has one candidate process. Ambiguous graphs remain unknown.
+    The observed candidate graph need not be the world's complete cohort. Thus
+    ambiguity, malformed observations, and bounded-work refusals remain unknown.
     """
-    by_cwd = {}
-    for sess in sessions:
-        if (
-            getattr(sess, "harness", None) != "codex"
-            or not getattr(sess, "cwd", None)
-            or sess.pid in paths
-            or getattr(sess, "app_server", False)
-            or getattr(sess, "managed_dir", None)
-            or getattr(sess, "is_child", False)
-        ):
-            continue
-        started = _process_started_at(sess)
-        if started is not None:
-            by_cwd.setdefault(sess.cwd, []).append((sess, started))
+    from . import procscan
 
-    index = _index(home)
+    by_cwd = {}
+    registry_claims = {}
+    registry_owners = {}
+    eligible = []
+    for sess in sessions:
+        if (getattr(sess, "harness", None) != "codex"
+                or not getattr(sess, "cwd", None)
+                or getattr(sess, "app_server", False)
+                or getattr(sess, "managed_dir", None)
+                or getattr(sess, "is_child", False)):
+            continue
+        eligible.append(sess)
+        sid = _registered_thread(sess.pid)
+        if sid:
+            registry_claims[sess.pid] = sid
+            registry_owners.setdefault(sid, set()).add(sess.pid)
+
+    # A registry row reserves its full SID even when multiple validated PIDs
+    # claim it. Only a sole owner may recover a missing path, and never by
+    # duplicating a path already held independently through an open FD.
+    initially_claimed = set(claimed)
+    fd_owned_sids = {_sid(path) for path in paths.values() if _sid(path)}
+    for sid in registry_owners:
+        claimed.add(sid)
+    for sess in eligible:
+        sid = registry_claims.get(sess.pid)
+        if sid:
+            if (len(registry_owners[sid]) == 1 and sess.pid not in paths
+                    and sid not in initially_claimed and sid not in fd_owned_sids):
+                registered_path = exact_rollout_for_session_id(sid, homes=[home])
+                if registered_path:
+                    registered_meta = _rollout_meta(registered_path)
+                    if (isinstance(registered_meta, dict)
+                            and _sid(registered_path) == sid
+                            and os.path.realpath(registered_meta.get("cwd") or "")
+                            == os.path.realpath(sess.cwd)):
+                        paths[sess.pid] = registered_path
+            continue
+        if sess.pid in paths:
+            continue
+        cwd = os.path.realpath(sess.cwd)
+        by_cwd.setdefault(cwd, []).append((sess, _process_started_at(sess)))
+
+    index = {}
+    for indexed_cwd, indexed_paths in _index(home).items():
+        index.setdefault(os.path.realpath(indexed_cwd), []).extend(indexed_paths)
     for cwd, started_sessions in by_cwd.items():
+        # A missing process start can affect membership of any observed edge in
+        # this bucket. Keep the old single-process control when it has no peer.
+        if any(started is None for _sess, started in started_sessions):
+            if len(started_sessions) > 1:
+                continue
+            started_sessions = [(sess, started) for sess, started in started_sessions
+                                if started is not None]
+        if not started_sessions:
+            continue
+
+        roots_by_sid = {}
+        invalid_paths = set()
+        invalid_observation = False
+        for indexed_path in index.get(cwd, []):
+            path = os.path.realpath(indexed_path)
+            meta = _rollout_meta(path)
+            if not isinstance(meta, dict) or not meta:
+                invalid_observation = True
+                continue
+            meta_cwd = meta.get("cwd")
+            if not isinstance(meta_cwd, str) or not meta_cwd:
+                invalid_observation = True
+                continue
+            if os.path.realpath(meta_cwd) != cwd or _is_subagent(meta):
+                continue
+            sid = _sid(path)
+            if not sid:
+                invalid_observation = True
+                continue
+            declared = []
+            malformed_declared = False
+            for field in ("id", "session_id"):
+                if field not in meta:
+                    continue
+                value = meta[field]
+                if (not isinstance(value, str)
+                        or _sid("rollout-declared-%s.jsonl" % value) != value):
+                    malformed_declared = True
+                    continue
+                declared.append(value)
+            created = _session_created(meta)
+            if created is None:
+                invalid_observation = True
+                continue
+            if (malformed_declared or any(value != sid for value in declared)
+                    or len(set(declared)) > 1):
+                invalid_paths.add(path)
+            roots_by_sid.setdefault(sid, set()).add(path)
+        if invalid_observation:
+            continue
+
+        duplicate_sids = {sid for sid, candidates in roots_by_sid.items()
+                          if len(candidates) > 1}
+        duplicate_paths = {path for sid in duplicate_sids
+                           for path in roots_by_sid[sid]}
+        roots = {path: sid for sid, candidates in roots_by_sid.items()
+                 if sid not in claimed for path in candidates}
         edges = {}
+        process_homes = {}
+        for sess, _started in started_sessions:
+            env = procscan.read_environ(sess.pid)
+            raw_home = env.get("CODEX_HOME") or (
+                os.path.join(env["HOME"], ".codex") if env.get("HOME") else None)
+            process_homes[sess.pid] = (
+                os.path.realpath(os.path.abspath(raw_home)) if raw_home else None)
         for sess, started in started_sessions:
+            if registry_claims.get(sess.pid):
+                continue
+            if process_homes[sess.pid] and process_homes[sess.pid] != os.path.realpath(os.path.abspath(home)):
+                continue
             candidates = set()
-            for path in index.get(cwd, []):
-                sid = _sid(path)
-                if not sid or sid in claimed:
-                    continue
+            for path, sid in roots.items():
                 meta = _rollout_meta(path)
-                if _is_subagent(meta):
-                    continue
-                if os.path.realpath(meta.get("cwd") or "") != os.path.realpath(cwd):
-                    continue
                 created = _session_created(meta)
-                if created is None:
-                    continue
-                delay = created - started
-                if -_START_MATCH_BEFORE_SEC <= delay <= _START_MATCH_AFTER_SEC:
-                    candidates.add(path)
+                if created is not None:
+                    delay = created - started
+                    if -_START_MATCH_BEFORE_SEC <= delay <= _START_MATCH_AFTER_SEC:
+                        candidates.add(path)
             if candidates:
                 edges[sess.pid] = candidates
 
-        while edges:
-            owners = {}
-            for pid, candidates in edges.items():
-                for path in candidates:
-                    owners.setdefault(path, set()).add(pid)
-            pairs = sorted(
-                (pid, next(iter(candidates)))
-                for pid, candidates in edges.items()
-                if len(candidates) == 1
-                and len(owners.get(next(iter(candidates)), ())) == 1
-            )
-            if not pairs:
-                break
-            assigned_pids = {pid for pid, _path in pairs}
-            assigned_paths = {path for _pid, path in pairs}
-            for pid, path in pairs:
-                paths[pid] = path
-                claimed.add(_sid(path))
-            edges = {
-                pid: candidates - assigned_paths
-                for pid, candidates in edges.items()
-                if pid not in assigned_pids and candidates - assigned_paths
-            }
+        roots_to_pids = {}
+        for pid, candidates in edges.items():
+            for path in candidates:
+                roots_to_pids.setdefault(path, set()).add(pid)
+        unseen = set(edges)
+        while unseen:
+            first = unseen.pop()
+            component_pids, component_roots = {first}, set()
+            queue = [first]
+            while queue:
+                pid = queue.pop()
+                for path in edges[pid]:
+                    if path in component_roots:
+                        continue
+                    component_roots.add(path)
+                    for owner in roots_to_pids[path]:
+                        if owner not in component_pids:
+                            component_pids.add(owner)
+                            unseen.discard(owner)
+                            queue.append(owner)
+            component = {pid: edges[pid] & component_roots for pid in component_pids}
+            if component_roots & (invalid_paths | duplicate_paths):
+                continue
+            matching = _unique_full_matching(component)
+            if matching is None:
+                continue
+
+            if len(component_pids) > 1:
+                sessions_by_pid = {sess.pid: sess for sess, _started in started_sessions}
+                safe = True
+                for pid in component_pids:
+                    sess = sessions_by_pid[pid]
+                    if str(procscan.read_proc_start(pid) or "") != str(sess.proc_start or ""):
+                        safe = False
+                        break
+                    if (not process_homes[pid]
+                            or process_homes[pid] != os.path.realpath(os.path.abspath(home))):
+                        safe = False
+                        break
+                if not safe:
+                    continue
+
+            assigned_sids = [_sid(path) for path in matching.values()]
+            if (None in assigned_sids or len(set(assigned_sids)) != len(assigned_sids)
+                    or any(sid in claimed for sid in assigned_sids)):
+                continue
+            paths.update(matching)
+            claimed.update(assigned_sids)
 
 
 def _fallback_candidates(sess, home, claimed, now):
