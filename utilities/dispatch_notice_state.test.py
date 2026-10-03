@@ -87,7 +87,8 @@ class NoticeTest(unittest.TestCase):
         route["route_hash"] = route_hash(route)
         self.path.write_text(json.dumps(route))
         self.route = route
-        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"])
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"],
+                         parent_attempt_id="att-owner")
         self.write_row()
         record = self.seed("advance-completed")
         reader = SimpleNamespace(terminal_gate_observation=lambda *a, **k: {
@@ -112,7 +113,8 @@ class NoticeTest(unittest.TestCase):
         route["route_hash"] = route_hash(route)
         self.path.write_text(json.dumps(route))
         self.route = route
-        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"])
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"],
+                         parent_attempt_id="att-owner")
         self.write_row()
         record = self.seed("advance-completed")
         # Regress the pre-fix seam in isolation: a route-wide PASS used to retire
@@ -135,7 +137,8 @@ class NoticeTest(unittest.TestCase):
         route["route_hash"] = route_hash(route)
         self.path.write_text(json.dumps(route))
         self.route = route
-        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"])
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"],
+                         parent_attempt_id="att-owner")
         self.write_row()
         record = self.seed("advance-completed")
         reader = SimpleNamespace(terminal_gate_observation=lambda *a, **k: {
@@ -197,6 +200,82 @@ class NoticeTest(unittest.TestCase):
                         "route_hash": case.route["route_hash"], "route_file": str(case.path),
                         "parent_sid": "parent"}
             self.assertFalse(notice.framed_decision_consumed(record, metadata, case.jobs))
+        finally:
+            case.doCleanups()
+
+    def test_materialized_single_frame_notice_stops_after_exact_decision(self):
+        import dispatch_completion_join as join
+        source = Path(__file__).with_name("framed_route.test.py")
+        spec = importlib.util.spec_from_file_location("notice_production_frame_fixture", source)
+        framed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(framed)
+        case = framed.FramedEndingTest(
+            "test_proceed_with_no_proposal_fixes_a_none_record_and_ends_the_route")
+        case.setUp()
+        try:
+            records = []
+            for node in case.route["nodes"][:2]:
+                attempt = "att-notice-" + node["id"]
+                metadata = dict(
+                    attempt_schema_version="2", dispatch_depth="1", transport="headless",
+                    execution_surface="registered-headless", registered_worker="1",
+                    fallback_hop="same-harness-headless", worker_type="frame",
+                    attempt_id=attempt, route_id=case.route["route_id"],
+                    route_hash=case.route["route_hash"], route_file=str(case.path),
+                    route_node=node["id"], parent_sid="parent", harness="claude",
+                    parent_completion_delivery="claude-parent-runtime",
+                    launch_claimed="1", launch_started="1", pid="99999999", pid_start="1",
+                    pgid="99999999", pid_scope="host-visible", process_exit="0",
+                    launch_lifecycle="foreground-scoped", launch_outcome="governed-process-reaped",
+                    group_reap_proof="pgid-empty-v1", group_reap_pgid="99999999",
+                    note="completed-supervisor", failure_class="pass")
+                line = "now\topen\t/r\t/w\t" + node["id"] + "\t" + ",".join(
+                    key + "=" + value for key, value in metadata.items()) + "\n"
+                with case.jobs.open("a") as stream:
+                    stream.write(line)
+                framed.R.complete_node(case.route, node, node["id"],
+                    case.output / "shards" / node["id"] / "direction-brief.md",
+                    jobs=case.jobs, attempt_id=attempt)
+                fields = next(line.split("\t") for line in case.jobs.read_text().splitlines()
+                              if join.parse_registry_metadata(line.split("\t")[-1]).get("attempt_id") == attempt)
+                path = join.materialize_pending_delivery(case.jobs, fields)
+                self.assertIsNotNone(path)
+                record = json.loads(path.read_text())
+                self.assertEqual(record["attempt_ids"], [attempt])
+                self.assertEqual(record["parent_attempt_id"], "-")
+                self.assertTrue(notice.notice_is_current(record, jobs=case.jobs))
+                records.append(record)
+            claimed, _ = sweep.sweep_deliver(case.jobs.parent, "claude-parent-runtime", "parent")
+            self.assertEqual(len(claimed), 2)
+            for record in claimed:
+                pending.mark_sent_ambiguous(case.jobs.parent, "parent", record["delivery_id"],
+                                            claim_owner=record["claim_owner"])
+            case.settle()
+            for record in records:
+                self.assertFalse(notice.notice_is_current(record, jobs=case.jobs))
+                for change in (
+                    {"attempt_ids": ["att-unconsumed"]},
+                    {"recipient_digest": pending.recipient_digest("other")},
+                    {"parent_attempt_id": "att-other"},
+                    {"route_node": "execute"},
+                ):
+                    with self.subTest(change=change):
+                        self.assertTrue(notice.notice_is_current(dict(record, **change), jobs=case.jobs))
+            late = max(record["claim_deadline_ns"] for record in claimed) + 8 * 60 * 10**9
+            self.assertEqual(sweep.sweep_deliver(case.jobs.parent, "claude-parent-runtime", "parent",
+                                              now_ns=late)[0], [])
+            for record in records:
+                stored = pending.read(case.jobs.parent, "parent", record["delivery_id"])
+                self.assertEqual(stored["state"], "rejected")
+            # The existing attempts counter counts claims, including the
+            # reclaim that retires an obsolete notice. It is not an emit
+            # count; the carrier returned no second notification above.
+            before = [pending.read(case.jobs.parent, "parent", record["delivery_id"])
+                      for record in records]
+            self.assertEqual(sweep.sweep_deliver(case.jobs.parent, "claude-parent-runtime", "parent",
+                                              now_ns=late + 8 * 60 * 10**9)[0], [])
+            self.assertEqual(before, [pending.read(case.jobs.parent, "parent", record["delivery_id"])
+                                      for record in records])
         finally:
             case.doCleanups()
 

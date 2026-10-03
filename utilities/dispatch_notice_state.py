@@ -6,6 +6,7 @@ This is not a second delivery queue or a workflow outcome writer.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -59,15 +60,20 @@ def route_obligation_closed(metadata: dict, jobs: Path) -> bool:
 
 
 def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
-    """Prove that this recipient consumed the exact two-frame decision notice.
+    """Prove that this recipient consumed this frame's exact completion notice.
 
     The terminal marker is useful only together with the immutable decision
     artifact, both current frame markers, and the pending notice's own identity.
     A route-wide PASS by itself is not a consumption receipt.
     """
-    parent_attempt = record.get("parent_attempt_id")
-    if (not parent_attempt
-            or parent_attempt not in {metadata.get("attempt_id"), metadata.get("parent_attempt_id")}):
+    from dispatch_completion_join import pending_record_identity
+    _route_id, route_node, parent_attempt = pending_record_identity(metadata, jobs)
+    attempts = record.get("attempt_ids")
+    if (record.get("parent_attempt_id") != parent_attempt
+            or record.get("route_node") != route_node
+            or route_node not in {"frame", "frame-alternative"}
+            or not metadata.get("attempt_id")
+            or attempts != [metadata["attempt_id"]]):
         return False
     parent_sid = metadata.get("parent_sid")
     if not isinstance(parent_sid, str) or not parent_sid:
@@ -92,19 +98,39 @@ def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
             raise ValueError("notice-terminal-gate-reader-unavailable")
         capability_route = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(capability_route)
-    gates = capability_route.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)
+    # route-decision is the existing depth-0 runtime terminal, with no
+    # registered process/attempt link. Read its semantic marker, then bind
+    # those exact bytes below; the two frame workers still require the full
+    # exact-attempt reader.
+    gates = capability_route.terminal_gate_observation(route, jobs=jobs)
     terminal = gates.get("route-decision")
-    if not terminal or terminal.get("passed") is not True or terminal.get("current") is not True:
+    if (not terminal or terminal.get("passed") is not True or terminal.get("current") is not True
+            or not terminal.get("marker_digest") or not terminal.get("evidence")):
         return False
 
     # The terminal marker binds the actual route_decision_v1 file bytes. Read
     # that record through its canonical validator, and reject a changed or
     # unreadable evidence file instead of treating terminality as receipt.
-    evidence_path = Path(terminal.get("evidence") or "")
+    marker_path = capability_route.completion_dir(route["route_id"], jobs=jobs) / "route-decision.json"
+    marker_bytes = marker_path.read_bytes()
+    marker = json.loads(marker_bytes)
+    if (hashlib.sha256(marker_bytes).hexdigest() != terminal.get("marker_digest")
+            or marker.get("route_id") != route["route_id"]
+            or marker.get("route_hash") != route["route_hash"]
+            or marker.get("node_id") != "route-decision"
+            or marker.get("completion_gate") != "route-decision"
+            or marker.get("registered_worker") is not False
+            or marker.get("attempt_id") is not None
+            or marker.get("dispatch_depth") != 0
+            or marker.get("execution_surface") != "inline"):
+        return False
+    marker_evidence = marker.get("evidence") or {}
+    evidence_path = Path(marker_evidence.get("path") or "")
     if not evidence_path.is_absolute():
         return False
     import dispatch_contract
-    if dispatch_contract.evidence_digest(evidence_path) != terminal.get("evidence_digest"):
+    if (str(evidence_path) != terminal.get("evidence")
+            or dispatch_contract.evidence_digest(evidence_path) != marker_evidence.get("sha256")):
         return False
     decision_record = route_plan.read_record(evidence_path)
     frame_route = decision_record["decision"]["frame_route"]
@@ -129,7 +155,7 @@ def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
     # readiness; their evidence paths and bytes must also match the briefs that
     # the decision record sealed.
     nodes = {node.get("id"): node for node in route.get("nodes", [])}
-    frame_attempts = []
+    frame_attempts = {}
     briefs = {item.get("node"): item for item in decision_record["decision"].get("briefs", [])
               if isinstance(item, dict)}
     for node_id in ("frame", "frame-alternative"):
@@ -143,22 +169,20 @@ def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
         brief = briefs.get(node_id)
         if not brief or not isinstance(brief.get("path"), str) or not isinstance(brief.get("sha256"), str):
             return False
-        output_dir = evidence_path.parents[2]
-        expected_brief = f"shards/{node_id}/direction-brief.md"
+        brief_path = cycle_dir / "artifacts" / "shards" / node_id / "direction-brief.md"
+        expected_brief = brief_path.relative_to(artifact_root).as_posix()
         if brief["path"] != expected_brief:
             return False
-        brief_path = output_dir / expected_brief
         if (Path(proof.get("evidence") or "").resolve() != brief_path.resolve()
                 or route_plan.file_digest(brief_path) != brief["sha256"]):
             return False
-        frame_attempts.append(proof["attempt_id"])
+        frame_attempts[node_id] = proof["attempt_id"]
 
-    attempts = record.get("attempt_ids")
-    if (not isinstance(attempts, list) or len(attempts) != 2
-            or not all(isinstance(attempt, str) and attempt for attempt in attempts)
-            or len(set(attempts)) != 2 or set(attempts) != set(frame_attempts)):
-        return False
-    return True
+    # The existing producer creates one durable notice per frame attempt,
+    # including the no-parent-attempt sentinel for depth-0 frame callers.
+    # Both frame proofs must be current, but only this notice's own node and
+    # attempt are its delivery obligation; it never owes its sibling's notice.
+    return frame_attempts[route_node] == attempts[0]
 
 
 def _gate_resolution(entries: list, gate: str, delivery: str) -> dict:
