@@ -1826,6 +1826,141 @@ class TestRoute(unittest.TestCase):
     R.close_route(route,path,jobs=jobs,**dict(args,terminal_commit_id="d"*40,expected_owner_attempt_id="att-foreign"))
    self.assertEqual(R.outcome_path(path).read_bytes(),raw)
 
+
+ def _actual_terminal_state(self,route,attempt,gate):
+  # What an owner's own settle leaves for the current marker: the root identity, its producer
+  # binding file and the terminal-commit slot, all built with the real terminal-commit functions.
+  import artifact_admission
+  T=R.dispatch_terminal_commit; root=Path(route["artifact_root"]).resolve()
+  ident=artifact_admission.ensure_root_identity(root)
+  binding={"schema_version":1,"contract":T.CONTRACT,"owner_attempt_id":attempt,"route_id":route["route_id"],
+   "route_hash":route["route_hash"],"artifact_root":str(root),
+   "root_identity":{"repository_id":ident.repository_id,"artifact_root_id":ident.artifact_root_id},
+   "cycle_id":"cyc_"+"a"*32}
+  bpath=T.producer_binding_path(root,route["route_id"],attempt)
+  T._write_exclusive(bpath,T._canonical(binding)+b"\n")
+  producer=T._digest(bpath.read_bytes()); marker=T.terminal_marker_digest([gate])
+  commit=T.terminal_commit_id(route_id=route["route_id"],route_hash=route["route_hash"],owner_attempt_id=attempt,
+   marker_digest=marker,producer_digest=producer)
+  T._atomic_json(T.terminal_slot(root,route["route_id"],attempt)/"terminal-commit.json",
+   {"schema_version":1,"terminal_commit_id":commit,"route_id":route["route_id"],"route_hash":route["route_hash"],
+    "owner_attempt_id":attempt,"terminal_marker_digest":marker,"producer_binding_digest":producer,"state":"claimed"})
+  return dict(terminal_commit_id=commit,expected_owner_attempt_id=attempt,
+   expected_producer_binding_digest=producer,expected_terminal_marker_digest=marker)
+
+ def _actual_false_close(self,tmp):
+  # The owner's marker exists but its attempt row is not settled, so the close is recorded unproven
+  # with the real tuple the settled row will later have.
+  route,node,attempt,path,jobs,publish=self._registered_terminal_route(tmp)
+  settled=jobs.read_text()
+  def status(value):
+   fields=settled.rstrip("\n").split("\t"); fields[1]=value; jobs.write_text("\t".join(fields)+"\n")
+  status("running"); R._publish_completion_locked(route,node,node["id"],Path(tmp)/"result.md",
+   attempt_id=attempt,attempt_metadata=R.parse_registry_metadata(settled.split("\t",5)[5]),jobs=jobs)
+  self.assertFalse(R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]["passed"])
+  status("done"); gate=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+  self.assertTrue(gate["passed"],gate); self.assertEqual(gate["attempt_id"],attempt)
+  actual=self._actual_terminal_state(route,attempt,gate)
+  status("running")
+  first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,**actual)
+  self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+  return route,node,attempt,path,jobs,status,actual,R.outcome_path(path).read_bytes()
+
+ def test_identity_bearing_false_close_is_consumed_by_a_normal_close_from_the_actual_current_tuple(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,status,actual,raw=self._actual_false_close(tmp)
+   same,created=R.close_route(route,path,jobs=jobs)   # not settled yet: nothing is consumed, nothing is refused
+   self.assertFalse(created); self.assertFalse(same["terminal_gate_proven"])
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   status("done")
+   current,created=R.close_route(route,path)   # no identity or registry argument, as finalize_direct_quick closes
+   self.assertTrue(created); self.assertTrue(current["terminal_gate_proven"])
+   self.assertEqual((current["terminal_commit_id"],current["terminal_owner_attempt_id"],
+    current["producer_binding_digest"],current["terminal_marker_digest"]),
+    tuple(actual[key] for key in ("terminal_commit_id","expected_owner_attempt_id",
+     "expected_producer_binding_digest","expected_terminal_marker_digest")))
+   retained=list(path.parent.glob("*.historical-false-*.outcome.json"))
+   self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+   settled=R.outcome_path(path).read_bytes()
+   for args in ({},actual):
+    replay,created=R.close_route(route,path,jobs=jobs,**args)
+    self.assertFalse(created); self.assertEqual(replay,current)
+   self.assertEqual(R.outcome_path(path).read_bytes(),settled)
+   self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+
+ def test_identity_bearing_false_close_is_not_taken_by_another_owner_or_binding(self):
+  # The false record names an earlier owner (its own slot, binding and marker set); the marker held now
+  # is another owner's. Neither a caller naming nothing nor one handing the old tuple back takes it.
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,publish=self._registered_terminal_route(tmp)
+   current=publish(); self.assertTrue(current["passed"],current)
+   old=dict(current,attempt_id="att-old-owner",marker_digest="e"*64)
+   old_tuple=self._actual_terminal_state(route,"att-old-owner",old)
+   self.assertNotEqual(old_tuple["expected_terminal_marker_digest"],R.dispatch_terminal_commit.terminal_marker_digest([current]))
+   fields=jobs.read_text().rstrip("\n").split("\t"); settled=jobs.read_text()
+   jobs.write_text("\t".join(fields[:1]+["running"]+fields[2:])+"\n")
+   first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,**old_tuple)
+   self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+   raw=R.outcome_path(path).read_bytes(); jobs.write_text(settled)
+   own=self._actual_terminal_state(route,attempt,current)
+   for label,kw in (("nothing named",{}),("the old tuple again",old_tuple),("the current tuple",own),
+                    ("the old owner under the current marker",dict(old_tuple,expected_terminal_marker_digest=own["expected_terminal_marker_digest"]))):
+    with self.subTest(label), self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+     R.close_route(route,path,jobs=jobs,**kw)
+    self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+    self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+
+ def test_normal_complete_consumes_an_identity_bearing_false_close_from_the_actual_tuple_once(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,status,actual,raw=self._actual_false_close(tmp)
+   status("done")
+   evidence=Path(tmp)/"result.md"
+   marker=json.loads((R.completion_dir(route["route_id"],jobs=jobs)/f"{node['id']}.json").read_text())
+   # the owner's normal complete: its marker is published by the completion path, then the hook reads the state
+   with mock.patch.object(R,"_complete_node_locked",return_value=(marker,{"status":"closed"})), \
+        mock.patch.object(R,"materialize_after_terminal_close"):
+    R.complete_node(route,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+   current=json.loads(R.outcome_path(path).read_text())
+   self.assertTrue(current["terminal_gate_proven"])
+   self.assertEqual(current["historical_false_sha256"],"sha256:"+hashlib.sha256(raw).hexdigest())
+   self.assertEqual((current["terminal_commit_id"],current["terminal_owner_attempt_id"],
+    current["producer_binding_digest"],current["terminal_marker_digest"]),
+    tuple(actual[key] for key in ("terminal_commit_id","expected_owner_attempt_id",
+     "expected_producer_binding_digest","expected_terminal_marker_digest")))
+   retained=list(path.parent.glob("*.historical-false-*.outcome.json"))
+   self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+   settled=R.outcome_path(path).read_bytes()
+   with mock.patch.object(R,"_complete_node_locked",return_value=(marker,{"status":"closed"})), \
+        mock.patch.object(R,"materialize_after_terminal_close"):
+    R.complete_node(route,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)   # a repeated complete
+   self.assertEqual(R.outcome_path(path).read_bytes(),settled)
+   self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+
+ def test_normal_complete_leaves_an_identity_bearing_false_close_of_another_binding_untouched(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,status,actual,raw=self._actual_false_close(tmp)
+   status("done")
+   T=R.dispatch_terminal_commit; bpath=T.producer_binding_path(Path(route["artifact_root"]),route["route_id"],attempt)
+   stored=json.loads(bpath.read_text()); stored["cycle_id"]="cyc_"+"b"*32; bpath.write_bytes(T._canonical(stored)+b"\n")
+   marker=json.loads((R.completion_dir(route["route_id"],jobs=jobs)/f"{node['id']}.json").read_text())
+   with mock.patch.object(R,"_complete_node_locked",return_value=(marker,{"status":"closed"})), \
+        mock.patch.object(R,"materialize_after_terminal_close"):
+    R.complete_node(route,node,node["id"],Path(tmp)/"result.md",jobs=jobs,attempt_id=attempt)
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+
+ def test_identity_bearing_false_close_with_another_binding_is_not_consumed(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,status,actual,raw=self._actual_false_close(tmp)
+   status("done")
+   T=R.dispatch_terminal_commit; bpath=T.producer_binding_path(Path(route["artifact_root"]),route["route_id"],attempt)
+   stored=json.loads(bpath.read_text()); stored["cycle_id"]="cyc_"+"b"*32; bpath.write_bytes(T._canonical(stored)+b"\n")
+   for label,kw in (("nothing named",{}),("the recorded tuple",actual)):
+    with self.subTest(label), self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+     R.close_route(route,path,jobs=jobs,**kw)
+    self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+    self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+
  def _retained_name(self,path,raw):
   return path.with_name(f"{path.stem}.historical-false-{hashlib.sha256(raw).hexdigest()[:16]}.outcome.json")
 

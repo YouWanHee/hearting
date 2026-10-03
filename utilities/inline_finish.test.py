@@ -11,12 +11,15 @@ import sys
 import tempfile
 import concurrent.futures
 import unittest
+import unittest.mock
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import artifact_lifecycle
 import artifact_producer
+import dispatch_terminal_commit
+import inline_finish
 
 CAP_SPEC = importlib.util.spec_from_file_location(
     "inline_finish_capability_route", ROOT / "utilities/capability-route.py")
@@ -227,6 +230,95 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.summary.write_text("Finished the inline route.\n", encoding="utf-8")
         resumed = self.finish()
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+    def _inline_identity_false_close(self, **different):
+        """A false close that carries this inline execution's own actual tuple, with no finish state left.
+
+        The marker, intent id and binding are the ones a real first finish made (it is stopped right
+        after its marker); the close is recorded while that gate reads unproven, as an earlier
+        caller could have, and the finish state is then absent, so the next finish is a first one."""
+        crashed = self.finish("after-marker")
+        self.assertNotEqual(crashed.returncode, 0)
+        state_path = self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        record = artifact_producer.route_cycle_for(self.root, self.route)
+        identity = artifact_lifecycle.read_root_identity(self.root)
+        campaign = artifact_producer.campaign_or_tombstone(self.root, record["campaign_id"])
+        binding = {"kind": "inline_producer_binding_v1", "artifact_root_id": identity.artifact_root_id,
+                   "campaign_key": campaign.get("key"), "campaign_id": record["campaign_id"],
+                   "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
+                   "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                   "cycle_record_digest": dispatch_terminal_commit.cycle_identity_digest(record),
+                   "terminal_marker_digest": state["terminal_marker_digest"],
+                   "evidence_sha256": state["intent"]["evidence_sha256"], "inline_finish_id": state["inline_finish_id"]}
+        held = dict(inline_finish_id=state["inline_finish_id"], inline_commit=state["intent"]["commit"],
+                    expected_terminal_marker_digest=state["terminal_marker_digest"],
+                    expected_summary_digest=state["intent"]["summary_sha256"],
+                    expected_producer_binding_digest=inline_finish._digest(
+                        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()))
+        held.update(different)
+        recorded_commit = held.pop("commit", state["intent"]["commit"])
+        state_path.unlink()
+        unproven = {"inline": {"passed": False, "reason": "completion-attempt-not-current"}}
+        with unittest.mock.patch.object(CAP, "terminal_gate_observation", return_value=unproven):
+            outcome, created = CAP.close_route(
+                self.route, self.route_file, recorded_commit, "an earlier caller's close",
+                allow_unproven=True, jobs=self.jobs, **held)
+        self.assertTrue(created)
+        self.assertFalse(outcome["terminal_gate_proven"])
+        self.assertEqual(outcome["inline_finish_id"], held["inline_finish_id"])
+        return CAP.outcome_path(self.route_file).read_bytes(), state_path
+
+    def test_first_inline_finish_consumes_a_historical_false_close_carrying_its_own_inline_tuple(self):
+        original, state_path = self._inline_identity_false_close()
+        result = self.finish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        outcome = json.loads(CAP.outcome_path(self.route_file).read_text(encoding="utf-8"))
+        self.assertTrue(outcome["terminal_gate_proven"])
+        self.assertEqual(outcome["inline_finish_id"], receipt["inline_finish_id"])
+        retained = list(self.route_file.parent.glob(f"{self.route_file.stem}.historical-false-*.outcome.json"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), original)
+        self.assertEqual(artifact_producer.read_cycle_record(self.root, self.cycle["cycle_id"])["state"], "sealed")
+        settled = CAP.outcome_path(self.route_file).read_bytes()
+        again = self.finish()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(json.loads(again.stdout)["replay"])
+        self.assertEqual(CAP.outcome_path(self.route_file).read_bytes(), settled)
+        self.assertEqual(len(list(self.route_file.parent.glob("*.historical-false-*.outcome.json"))), 1)
+
+    def test_first_inline_finish_with_its_own_inline_tuple_resumes_after_each_crash_once(self):
+        original, state_path = self._inline_identity_false_close()
+        for fault in ("after-claim", "after-close-write", "after-manifest"):
+            crashed = self.finish(fault)
+            self.assertNotEqual(crashed.returncode, 0, fault)
+        resumed = self.finish()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        retained = list(self.route_file.parent.glob(f"{self.route_file.stem}.historical-false-*.outcome.json"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), original)
+        self.assertTrue(json.loads(CAP.outcome_path(self.route_file).read_text(encoding="utf-8"))["terminal_gate_proven"])
+
+    def test_first_inline_finish_refuses_a_false_close_whose_inline_tuple_is_not_its_own(self):
+        for label, different in (("another intent", dict(inline_finish_id="0" * 64)),
+                                 ("another summary", dict(expected_summary_digest="1" * 64)),
+                                 ("another commit", dict(commit="2" * 40)),
+                                 ("another marker", dict(expected_terminal_marker_digest="3" * 64)),
+                                 ("another binding", dict(expected_producer_binding_digest="4" * 64))):
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                original, state_path = self._inline_identity_false_close(**different)
+                marker_file = CAP.completion_dir(self.route["route_id"]) / "inline.json"
+                marker_before = marker_file.read_bytes()
+                refused = self.finish()
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("finish-route-outcome-conflict", refused.stderr)
+                self.assertEqual(CAP.outcome_path(self.route_file).read_bytes(), original)
+                self.assertEqual(marker_file.read_bytes(), marker_before)
+                self.assertFalse(state_path.exists())  # nothing was claimed
+                self.assertEqual(list(self.route_file.parent.glob("*.historical-false-*")), [])
 
     def test_identity_bearing_historical_false_close_is_not_taken_over_by_a_first_inline_finish(self):
         # A false record that names a registered owner's tuple is that owner's: the inline

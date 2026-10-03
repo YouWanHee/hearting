@@ -120,6 +120,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
     base = root / ".runtime" / "inline-finish" / "v1" / route["route_id"]
     state_path, lock_path = base / "finish.json", base / "finish.lock"
     prior_state = _read(state_path)
+    historical_false = None
     if not prior_state and api.outcome_path(route_file).exists():
         # Autoclose remains terminal. A historical false is consumable only
         # after this exact route now has a current, fully proven terminal gate.
@@ -138,12 +139,13 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 or closure.get("cwd") != route.get("cwd")
                 or closure.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
             raise InlineFinishError("finish-route-already-closed")
-        # Stored identity cannot disappear merely because this caller has no
-        # prior inline intent from which to supply it.
-        if any(closure.get(key) is not None for key in (
-                "terminal_commit_id", "terminal_owner_attempt_id", "producer_binding_digest",
-                "inline_finish_id", "summary_digest")):
+        # A registered owner's tuple is that owner's: an inline caller (never a registered one) cannot
+        # take it over. An inline tuple is compared below with the intent, marker and binding this
+        # finish builds now, before anything is claimed.
+        if (any(closure.get(key) is not None for key in ("terminal_commit_id", "terminal_owner_attempt_id"))
+                or (closure.get("producer_binding_digest") is not None and closure.get("inline_finish_id") is None)):
             raise InlineFinishError("finish-route-outcome-conflict")
+        historical_false = closure
         # `finish` itself is the normal completion consumer: it still validates
         # the evidence, caller, route binding, and cleanup before it publishes
         # the terminal marker and current outcome.
@@ -243,6 +245,16 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         # what it recorded stands (the receipt is not rewritten, nor is it cancelled).
         intent = dict(recorded_intent)
     intent_id = _digest(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode())
+
+    def make_binding(marker_digest):
+        return {"kind":"inline_producer_binding_v1", "artifact_root_id":identity.artifact_root_id,
+                "campaign_key":campaign.get("key"), "campaign_id":record["campaign_id"],
+                "cycle_id":record["cycle_id"], "producer_id":record["producer_id"],
+                "route_id":route["route_id"], "route_hash":route["route_hash"],
+                "cycle_record_digest":dispatch_terminal_commit.cycle_identity_digest(record),
+                "terminal_marker_digest":marker_digest, "evidence_sha256":intent["evidence_sha256"],
+                "inline_finish_id":intent_id}
+
     base.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -304,13 +316,29 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                     raise InlineFinishError("finish-evidence-drift")
                 raise InlineFinishError("finish-intent-conflict")
             replayed_at_entry = state is not None
+            marker_file = api.completion_dir(route["route_id"]) / (node["id"] + ".json")
             if not state:
+                if historical_false is not None and any(historical_false.get(key) is not None for key in (
+                        "inline_finish_id", "terminal_marker_digest")):
+                    # The recorded tuple is compared with what this finish holds now, before a claim: for an
+                    # inline record the same intent, summary, commit and binding, and for either the marker
+                    # already written (a marker this finish would write now has bytes no record could name).
+                    held_marker = marker_file.read_bytes() if marker_file.is_file() else None
+                    held_digest = _digest(held_marker) if held_marker is not None else None
+                    inline = historical_false.get("inline_finish_id") is not None
+                    if (held_digest is None or historical_false.get("terminal_marker_digest") != held_digest
+                            or (inline and (
+                                historical_false.get("inline_finish_id") != intent_id
+                                or historical_false.get("summary_digest") != intent["summary_sha256"]
+                                or historical_false.get("head_commit") != commit
+                                or historical_false.get("producer_binding_digest") != _digest(json.dumps(
+                                    make_binding(held_digest), sort_keys=True, separators=(",", ":")).encode())))):
+                        raise InlineFinishError("finish-route-outcome-conflict")
                 _fault("before-claim")
                 state = {"schema":"inline_finish_v1", "inline_finish_id":intent_id, "intent":intent,
                          "claimant_session":sid, "state":"claimed"}
                 _atomic(state_path, state)
                 _fault("after-claim")
-            marker_file = api.completion_dir(route["route_id"]) / (node["id"] + ".json")
             if state["state"] == "claimed":
                 _fault("before-marker")
                 if not marker_file.is_file():
@@ -347,13 +375,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 marker_digest = _digest(marker_raw)
                 if marker_digest != state.get("terminal_marker_digest"): raise InlineFinishError("finish-marker-drift")
             outcome_path = api.outcome_path(route_file)
-            binding = {"kind":"inline_producer_binding_v1", "artifact_root_id":identity.artifact_root_id,
-                       "campaign_key":campaign.get("key"), "campaign_id":record["campaign_id"],
-                       "cycle_id":record["cycle_id"], "producer_id":record["producer_id"],
-                       "route_id":route["route_id"], "route_hash":route["route_hash"],
-                       "cycle_record_digest":dispatch_terminal_commit.cycle_identity_digest(record),
-                       "terminal_marker_digest":marker_digest, "evidence_sha256":intent["evidence_sha256"],
-                       "inline_finish_id":intent_id}
+            binding = make_binding(marker_digest)
             if state["state"] == "node-completed":
                 _fault("before-close")
                 if not outcome_path.is_file():

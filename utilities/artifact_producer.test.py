@@ -3858,6 +3858,87 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
         self.assertEqual(jobs.read_bytes(),conflicted)
         self.assertEqual(manifest.read_bytes(),sealed)
 
+    def _claimed_owner_with_false_close(self, **different):
+        """The owner's real claim (terminal-commit slot, producer binding, current marker) and, before it
+        settles, an earlier caller's close recorded unproven with the tuple that claim holds."""
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        self._closed_owner(jobs,owner)
+        crashed=terminal.settle_terminal_commit(
+            request,terminal.TerminalCommitServices(crash_after="claim-after"))
+        self.assertNotEqual(crashed.result,"completed",crashed)
+        state=json.loads(terminal._commit_state_path(request).read_text())
+        self.assertEqual(state["state"],"claimed")
+        held=dict(terminal_commit_id=state["terminal_commit_id"],expected_owner_attempt_id=owner,
+                  expected_producer_binding_digest=state["producer_binding_digest"],
+                  expected_terminal_marker_digest=state["terminal_marker_digest"])
+        held.update(different)
+        unproven={"report":{"passed":False,"reason":"completion-attempt-not-current"}}
+        with mock.patch.object(R,"terminal_gate_observation",return_value=unproven):
+            first,created=R.close_route(route,route_file,allow_unproven=True,jobs=jobs,**held)
+        self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+        return route,route_file,jobs,owner,result,request,R.outcome_path(route_file).read_bytes(),state
+
+    def test_identity_bearing_false_close_of_the_actual_claim_is_consumed_by_a_normal_close_and_sealed_once(self):
+        import dispatch_terminal_commit as terminal
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state=self._claimed_owner_with_false_close()
+            current,created=R.close_route(route,route_file)  # no identity, no registry: the runtime reads its own state
+            self.assertTrue(created); self.assertTrue(current["terminal_gate_proven"])
+            self.assertEqual((current["terminal_commit_id"],current["terminal_owner_attempt_id"],
+                              current["producer_binding_digest"],current["terminal_marker_digest"]),
+                             (state["terminal_commit_id"],owner,state["producer_binding_digest"],
+                              state["terminal_marker_digest"]))
+            retained=list(Path(route_file).parent.glob("*.historical-false-*.outcome.json"))
+            self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+            settled_outcome=R.outcome_path(route_file).read_bytes()
+            settled=terminal.settle_terminal_commit(request)  # the owner's own settlement carries on from its claim
+            self.assertEqual(settled.result,"completed",settled)
+            manifest=Path(result["cycle_dir"])/"manifest.json"
+            self.assertEqual(json.loads(manifest.read_text())["cycle"]["state"],"completed")
+            self.assertEqual(R.outcome_path(route_file).read_bytes(),settled_outcome)
+            self.assertEqual(len(list(Path(route_file).parent.glob("*.historical-false-*.outcome.json"))),1)
+            sealed=manifest.read_bytes()
+            self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
+            self.assertEqual(manifest.read_bytes(),sealed)
+            events=json.loads(sealed)["events"]
+            self.assertEqual(len([e for e in events if e["event_type"]=="cycle.completed"]),1)
+            self.assertEqual(len([e for e in events if e["event_type"]=="route.terminal.recorded"]),1)
+
+    def test_owner_settlement_consumes_its_own_identity_bearing_false_close_once(self):
+        import dispatch_terminal_commit as terminal
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(self._tmp.name)/"jobs.log")}):
+            route,route_file,jobs,owner,result,request,raw,state=self._claimed_owner_with_false_close()
+            settled=terminal.settle_terminal_commit(request)
+            self.assertEqual(settled.result,"completed",settled)
+            outcome=json.loads(R.outcome_path(route_file).read_text())
+            self.assertTrue(outcome["terminal_gate_proven"])
+            self.assertEqual(outcome["terminal_commit_id"],state["terminal_commit_id"])
+            retained=list(Path(route_file).parent.glob("*.historical-false-*.outcome.json"))
+            self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+            self.assertEqual(P.read_cycle_record(self.root,result["cycle_id"])["state"],"sealed")
+
+    def test_identity_bearing_false_close_of_another_owner_is_not_consumed_or_sealed(self):
+        import dispatch_terminal_commit as terminal
+        for label,different in (("another owner",dict(expected_owner_attempt_id="att-other-owner")),
+                                ("another binding",dict(expected_producer_binding_digest="sha256:"+"9"*64)),
+                                ("another marker",dict(expected_terminal_marker_digest="sha256:"+"8"*64)),
+                                ("another commit",dict(terminal_commit_id="7"*64))):
+            with self.subTest(label):
+                fixture=TerminalTransactionIntegrationTest(); fixture.setUp()
+                try:
+                    with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(fixture._tmp.name)/"jobs.log")}):
+                        route,route_file,jobs,owner,result,request,raw,state=fixture._claimed_owner_with_false_close(**different)
+                        with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+                            R.close_route(route,route_file)  # nothing named: still not this owner's marker
+                        settled=terminal.settle_terminal_commit(request)
+                        self.assertNotEqual(settled.result,"completed",settled)
+                        self.assertEqual(R.outcome_path(route_file).read_bytes(),raw)
+                        self.assertEqual(list(Path(route_file).parent.glob("*.historical-false-*")),[])
+                        self.assertNotEqual(P.read_cycle_record(fixture.root,result["cycle_id"])["state"],"sealed")
+                finally:
+                    fixture.doCleanups()
+
     def test_default_services_close_finalize_envelope_and_replay(self):
         import dispatch_terminal_commit as terminal
         route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
