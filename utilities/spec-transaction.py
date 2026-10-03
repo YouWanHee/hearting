@@ -84,8 +84,93 @@ def select_seed_reference(artifact: Path, receipt: dict | None, *, reference_id:
     return None
 
 
+def seed_component_spec(spec_base, artifact, reference, receipt, components):
+    """Prepare only the selected components, continuing the original base on retry."""
+    receipt_path = spec_base/PRODUCER.SPEC_BASE_RECEIPT
+    ref_id = (reference or {}).get("shared_reference_id")
+    base = PRODUCER._spec_admission_base(artifact, spec_base, ref_id, None) if receipt else (reference or {}).get("latest_revision_id")
+    if base and base not in (reference or {}).get("revisions", []):
+        raise PRODUCER.ProducerError("shared-base-invalid", str(base))
+    tree, record = PRODUCER._verified_shared_spec(artifact, ref_id, base) if base else ({}, {})
+    if receipt is not None and receipt.get("components") is None:
+        components = None  # a completed whole-tree upgrade cannot narrow again
+    states = (receipt or {}).get("component_seeds", {})
+    if not isinstance(states, dict):
+        raise PRODUCER.ProducerError("shared-base-invalid", "component seed")
+    done = dict(states)
+    recorded = (receipt or {}).get("components")
+    if receipt is not None and (
+            not isinstance(receipt.get("seed_complete"), bool)
+            or (receipt["seed_complete"] and not all(done.values()))
+            or (recorded is not None and (not isinstance(recorded, list)
+                or not recorded or any(not isinstance(c, str) for c in recorded)
+                or recorded != sorted(set(recorded)) or set(recorded) != set(done)))):
+        raise PRODUCER.ProducerError("shared-base-invalid", "component seed")
+    if any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", k)
+           or not isinstance(v, bool) for k, v in done.items()):
+        raise PRODUCER.ProducerError("shared-base-invalid", "component seed")
+    # A later whole-tree transaction prepares the remainder without resurrecting
+    # an edit or deletion in a component whose first seed already completed.
+    wanted = set(components) if components is not None else PRODUCER.component_set(tree) - {"revision.json"}
+    pending = wanted - {c for c, complete in done.items() if complete}
+    seed_tree = dict(tree)
+    history_paths = set()
+    if base:
+        revisions = artifact/"shared/spec"/ref_id/"revisions"
+        for other in sorted(revisions.iterdir()):
+            if not other.is_dir() or other.name == base:
+                continue
+            for src in sorted(other.rglob("prd.md")):
+                rel = src.relative_to(other)
+                parts = rel.parts
+                if (len(parts) < 4 or parts[0] not in pending or parts[-4] != "_internal"
+                        or parts[-3] != "versions" or not re.fullmatch(r"v[0-9]+", parts[-2])):
+                    continue
+                if src.is_file() and not src.is_symlink() and rel.as_posix() not in seed_tree:
+                    seed_tree[rel.as_posix()] = src.read_bytes()
+                    history_paths.add(rel.as_posix())
+    for path in spec_base.rglob("*"):
+        rel = path.relative_to(spec_base).as_posix()
+        if rel == PRODUCER.SPEC_BASE_RECEIPT or "_internal/research/" in rel:
+            continue
+        if path.is_symlink():
+            raise PRODUCER.ProducerError("shared-base-unproven", rel)
+        if not path.is_file() or done.get(rel.split("/", 1)[0]) is True:
+            continue
+        if rel not in seed_tree or path.read_bytes() != seed_tree[rel]:
+            raise PRODUCER.ProducerError("shared-seed-state-unproven" if receipt else "shared-base-unproven", rel)
+    scoped = sorted(set((receipt or {}).get("components") or []) | wanted) if components is not None else None
+    for c in pending:
+        done[c] = False
+    receipt = {"schema_version": 1, "reference_id": ref_id, "revision_id": base,
+               "content_digest": record.get("content_digest"), "components": scoped,
+               "component_seeds": done, "seed_complete": not pending}
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    PRODUCER._write_atomic(receipt_path, PRODUCER._json_bytes(receipt))
+    copied = history = 0
+    for rel, data in sorted(seed_tree.items()):
+        if rel == PRODUCER.SPEC_BASE_RECEIPT or rel.split("/", 1)[0] not in pending:
+            continue
+        dst = spec_base/rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            PRODUCER._write_atomic(dst, data)
+            if rel in history_paths:
+                history += 1
+            else:
+                copied += 1
+    for c in pending:
+        done[c] = True
+    receipt.update(component_seeds=done, seed_complete=True)
+    PRODUCER._write_atomic(receipt_path, PRODUCER._json_bytes(receipt))
+    return {"status": "seeded" if copied or history else "seed-skipped", "components": scoped,
+            "files": copied, "history_versions": history, "spec_base": str(spec_base), "base_revision_id": base}
+
+
+
 def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None,
-                    *, reference_id: str | None = None, key: str | None = None):
+                    *, reference_id: str | None = None, key: str | None = None,
+                    components: tuple[str, ...] | None = None):
     """W7C cycle layout: a fresh cycle's `artifacts/spec` is empty, so the
     transaction would see no pre-image and write no `_internal/versions/vN`
     snapshot -- which is why operators copied the previous version by hand
@@ -117,6 +202,11 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
     if receipt is not None and not isinstance(receipt,dict):
         raise PRODUCER.ProducerError("shared-base-invalid",PRODUCER.SPEC_BASE_RECEIPT)
     reference=select_seed_reference(artifact,receipt,reference_id=reference_id,key=key)
+    if components is None and spec_root is not None:
+        rel = spec_root.relative_to(spec_base)
+        components = (rel.parts[0],) if rel.parts else None
+    if (receipt is None and components is not None) or (receipt is not None and "components" in receipt):
+        return seed_component_spec(spec_base, artifact, reference, receipt, components)
     latest=(reference or {}).get("latest_revision_id")
     ref_id=(reference or {}).get("shared_reference_id")
     revision=artifact/"shared"/"spec"/ref_id/"revisions"/latest if ref_id and latest else None
@@ -199,7 +289,7 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
             if len(kept_paths)<20: kept_paths.append(rel.as_posix())
             continue
         dst.parent.mkdir(parents=True,exist_ok=True)
-        dst.write_bytes(src.read_bytes()); copied+=1
+        PRODUCER._write_atomic(dst, src.read_bytes()); copied+=1
     history=0
     revisions_dir=revision.parent
     if revisions_dir.name=="revisions":
@@ -215,7 +305,7 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
                 dst=spec_base/rel
                 if dst.exists() or src.is_symlink() or not src.is_file():
                     continue
-                dst.parent.mkdir(parents=True,exist_ok=True); dst.write_bytes(src.read_bytes()); history+=1
+                dst.parent.mkdir(parents=True,exist_ok=True); PRODUCER._write_atomic(dst, src.read_bytes()); history+=1
     receipt["seed_complete"]=True
     PRODUCER._write_atomic(receipt_path,PRODUCER._json_bytes(receipt))
     if has_prd and copied==0 and history==0:
@@ -225,7 +315,7 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
             "preexisting_files":preexisting,"kept_existing":kept,"kept_existing_paths":kept_paths,"spec_base":str(spec_base)}
 
 
-def preseed_owner_cycle(artifact: Path, cycle_dir: Path, *, wait_timeout: float = 600):
+def preseed_owner_cycle(artifact: Path, cycle_dir: Path, *, wait_timeout: float = 600, route=None):
     """Seed before research/review, outside producer admission's lock.
 
     The transaction also takes this lock before reading producer state. Begin
@@ -243,7 +333,9 @@ def preseed_owner_cycle(artifact: Path, cycle_dir: Path, *, wait_timeout: float 
                 if time.monotonic()>=deadline:
                     raise PRODUCER.ProducerError("spec-lock-timeout",str(lock_path))
                 time.sleep(.05)
-        return seed_cycle_spec(cycle_dir/"artifacts/spec",artifact)
+        components = PRODUCER.spec_scope_components(
+            scope for node in (route or {}).get("nodes", []) for scope in node.get("write_scope", [])) if route else None
+        return seed_cycle_spec(cycle_dir/"artifacts/spec", artifact, components=components)
 
 
 def legacy_spec_state(artifact: Path):
@@ -474,6 +566,13 @@ def main():
         emit({"status":"blocked","reason":"spec-touch-not-declared","route_id":route["route_id"],"route_file":args.route},args.events); return 65
     if not any((scope[:-3] if scope.endswith("/**") else scope)=="spec" or (scope[:-3] if scope.endswith("/**") else scope).startswith("spec/") for scope in node["write_scope"]):
         emit({"status":"blocked","reason":"route-node-scope-mismatch","route_id":route["route_id"],"node_id":node["id"]},args.events); return 65
+    node_components = PRODUCER.spec_scope_components(node["write_scope"])
+    if node_components is not None:
+        if not component and len(node_components) == 1:
+            component = node_components[0]
+            spec_root = spec_base/component
+        if not component or component.split("/", 1)[0] not in node_components:
+            emit({"status":"blocked","reason":"route-node-scope-mismatch","route_id":route["route_id"],"node_id":node["id"]},args.events); return 65
     lock_path=artifact/".pipeline-lock"; lock_path.parent.mkdir(parents=True,exist_ok=True)
     with lock_path.open("a+",encoding="utf-8") as lock:
         blocked=False

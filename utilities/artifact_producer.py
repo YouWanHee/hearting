@@ -2590,16 +2590,17 @@ def begin(root: Path, **kwargs: Any) -> Dict[str, Any]:
         artifact_cycle_titles.emit_after_checkpoint(root, {"cycle_id": result["cycle_id"]})
     if (kwargs.get("node_id") is None and result.get("layout") == "cycle"
             and kwargs.get("capability") == "autopilot-spec"):
-        # The admission lock has been released. Seed before a review worker can
-        # write verdict.json; the later transaction retries the same receipt.
+        # The admission lock has been released. Standard+ seeds before a review
+        # worker can write verdict.json. Direct has no preceding review worker;
+        # its transaction selects the seed through the existing --spec-root.
         route = load_route(Path(root).resolve(), resolve_route_argument(Path(root).resolve(), Path(kwargs["route_file"])))
-        if route.get("spec_touch"):
+        if route.get("spec_touch") and route["effective_intensity"] != "direct":
             import importlib.util
             module_path = Path(__file__).with_name("spec-transaction.py")
             spec = importlib.util.spec_from_file_location("spec_transaction_preseed", module_path)
             transaction = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(transaction)
-            transaction.preseed_owner_cycle(Path(root).resolve(), Path(result["cycle_dir"]))
+            transaction.preseed_owner_cycle(Path(root).resolve(), Path(result["cycle_dir"]), route=route)
     return result
 
 
@@ -7147,18 +7148,64 @@ def _verified_shared_spec(root: Path, ref_id: str, revision_id: str):
     return tree, record
 
 
+def spec_scope_components(scopes: Iterable[str]) -> Optional[Tuple[str, ...]]:
+    """The components already named by a spec write scope; None means the whole tree."""
+    selected = set()
+    for scope in scopes:
+        parts = str(scope).split("/")
+        if parts[0] != "spec":
+            continue
+        if (len(parts) < 3 or any(c in parts[1] for c in "*?[")
+                or parts[1] in {"_internal", "<component>"}):
+            return None
+        selected.add(parts[1])
+    return tuple(sorted(selected))
+
+
+def _spec_seed_components(source_tree: Mapping[str, bytes]) -> Optional[Tuple[str, ...]]:
+    raw = source_tree.get(SPEC_BASE_RECEIPT)
+    if raw is None:
+        return None
+    try:
+        receipt = json.loads(raw)
+        components = receipt.get("components")
+        if components is None:
+            return None  # existing whole-tree receipts retain their meaning
+        valid = (isinstance(components, list) and bool(components)
+                 and components == sorted(set(components))
+                 and all(isinstance(c, str) and re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", c) for c in components)
+                 and receipt.get("seed_complete") is True
+                 and receipt.get("component_seeds") == {c: True for c in components})
+    except (ValueError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise ProducerError("shared-base-invalid", "component seed")
+    outside = [p for p in source_tree if p != SPEC_BASE_RECEIPT and p.split("/", 1)[0] not in components]
+    if outside:
+        raise ProducerError("source-manifest-mismatch", "outside seeded components: " + ",".join(sorted(outside)))
+    return tuple(components)
+
+
+
 def _merge_spec_publication(root: Path, reference: Mapping[str, Any], base_id: str,
                             latest_id: str, source_tree: Mapping[str, bytes], drop_decisions: Sequence[Mapping[str, str]] = ()):
     import spec_merge
     ids = reference.get("revisions", [])
+    components = _spec_seed_components(source_tree)
     if (not base_id or not latest_id or base_id not in ids or latest_id not in ids
-            or len(ids) != len(set(ids)) or ids.index(base_id) >= ids.index(latest_id)):
+            or len(ids) != len(set(ids)) or ids.index(base_id) > ids.index(latest_id)
+            or (base_id == latest_id and components is None)):
         raise ProducerError("shared-base-mismatch", f"unproven ancestry: {base_id} -> {latest_id}")
     ref_id = reference["shared_reference_id"]
     base, base_record = _verified_shared_spec(root, ref_id, base_id)
     latest, latest_record = _verified_shared_spec(root, ref_id, latest_id)
+    candidate = dict(source_tree)
+    if components is not None:
+        # O is a scoped delta: absence outside its scope is no decision to delete.
+        candidate = {**{p: b for p, b in base.items()
+                        if p.split("/", 1)[0] not in components}, **candidate}
     dropped = {row["name"] for row in drop_decisions}
-    missing = component_set(base) - component_set(source_tree) - dropped
+    missing = component_set(base) - component_set(candidate) - dropped
     if missing:
         raise ProducerError("component-set-regressed", ",".join(sorted(missing)))
     if dropped - component_set(latest):
@@ -7168,11 +7215,11 @@ def _merge_spec_publication(root: Path, reference: Mapping[str, Any], base_id: s
     for component in component_set(base):
         def subtree(tree):
             return {p: b for p, b in tree.items() if p.split("/", 1)[0] == component}
-        b, o, l = subtree(base), subtree(source_tree), subtree(latest)
+        b, o, l = subtree(base), subtree(candidate), subtree(latest)
         if (not o and l and l != b) or (not l and o and o != b):
             raise ProducerError("shared-spec-conflict", f"{component}: component-delete-modify")
     try:
-        merged, evidence = spec_merge.merge_trees(base, dict(source_tree), latest)
+        merged, evidence = spec_merge.merge_trees(base, candidate, latest)
     except spec_merge.MergeConflict as exc:
         raise ProducerError("shared-spec-conflict", str(exc)) from exc
     source_files = _spec_inventory(source_tree)
@@ -7545,7 +7592,9 @@ def admit_shared(
             if expected:
                 if not _legacy_adopted_spec_base(root, reference or {}, expected):
                     _verified_shared_spec(root, reference_id, expected)
-            if expected != latest_id:
+            source_tree = _spec_bytes(source_path)
+            components = _spec_seed_components(source_tree)
+            if expected != latest_id or (components is not None and expected is not None):
                 if not expected or not latest_id:
                     _check_shared_base(expected, latest_id)
                 if expected not in reference.get("revisions", []) or latest_id not in reference.get("revisions", []):
@@ -7557,7 +7606,8 @@ def admit_shared(
                 base_tree, _ = _verified_shared_spec(root, reference_id, expected)
                 # Preserve the original omission guard relative to the actual
                 # base. Only additions from latest have carry-forward authority.
-                missing_base = component_set(base_tree) - component_set(source_tree) - set(drop_components)
+                missing_base = (component_set(base_tree) - component_set(source_tree) - set(drop_components)
+                                if components is None else set())
                 if missing_base:
                     raise ProducerError("component-set-regressed", ",".join(sorted(missing_base)))
                 merged_tree, merge_proof = _merge_spec_publication(root, reference, expected, latest_id, source_tree, drop_decisions)
