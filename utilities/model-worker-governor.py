@@ -227,11 +227,18 @@ def default_root() -> Path:
     resolver = Path(__file__).resolve().with_name("artifact-root.sh")
     if not resolver.is_file():
         raise RuntimeError(f"artifact-root-resolution-failed: resolver missing: {resolver}")
+    resolver_env = os.environ.copy()
+    artifact_hint = resolver_env.get("AGENT_ARTIFACT_ROOT")
+    if artifact_hint and not Path(artifact_hint).is_absolute():
+        # A legacy relative hint must not split capacity across worktrees or
+        # stop the caller. Let the existing resolver find the project root.
+        resolver_env.pop("AGENT_ARTIFACT_ROOT")
     resolved = subprocess.run(
         [str(resolver), str(Path.cwd())],
         check=False,
         capture_output=True,
         text=True,
+        env=resolver_env,
     )
     if resolved.returncode != 0 or not resolved.stdout.strip():
         detail = resolved.stderr.strip() or f"resolver exit={resolved.returncode}"

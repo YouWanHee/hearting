@@ -172,7 +172,7 @@ class BacklogPerformanceTest(unittest.TestCase):
                     root / ".runtime" / "model-worker-governor",
                 )
 
-    def test_governor_relative_artifact_override_is_rejected_by_canonical_resolver(self):
+    def test_governor_relative_artifact_hint_uses_canonical_project_root(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir()
@@ -183,9 +183,12 @@ class BacklogPerformanceTest(unittest.TestCase):
             utilities.mkdir()
             with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": ".agent_reports"}, clear=False):
                 os.environ.pop("AGENT_MODEL_GOVERNOR_ROOT", None)
-                with self.assertRaisesRegex(RuntimeError, "artifact-root-resolution-failed"):
-                    with mock.patch.object(GOVERNOR.Path, "cwd", return_value=utilities):
-                        GOVERNOR.default_root()
+                with mock.patch.object(GOVERNOR.Path, "cwd", return_value=utilities):
+                    self.assertEqual(
+                        GOVERNOR.default_root(),
+                        reports / ".runtime" / "model-worker-governor",
+                    )
+                self.assertFalse((utilities / ".agent_reports").exists())
 
     def test_governor_cli_explicit_root_works_with_relative_artifact_environment(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
@@ -228,9 +231,14 @@ class BacklogPerformanceTest(unittest.TestCase):
             self.assertIn("usage:", result.stdout.lower())
             self.assertFalse((fixture / ".agent_reports").exists())
 
-    def test_governor_cli_implicit_root_preserves_relative_artifact_refusal(self):
+    def test_governor_cli_implicit_root_resolves_relative_artifact_hint(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
             fixture = Path(temp_dir)
+            subprocess.run(["git", "init", "-q", str(fixture)], check=True)
+            reports = fixture / ".agent_reports"
+            reports.mkdir()
+            caller = fixture / "utilities"
+            caller.mkdir()
             env = {
                 "AGENT_ARTIFACT_ROOT": ".agent_reports",
                 "HOME": str(fixture / "home"),
@@ -238,16 +246,15 @@ class BacklogPerformanceTest(unittest.TestCase):
             }
             result = subprocess.run(
                 [sys.executable, str(GOVERNOR_PATH), "status"],
-                cwd=fixture,
+                cwd=caller,
                 env=env,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("artifact-root-resolution-failed", result.stderr)
-            self.assertIn("AGENT_ARTIFACT_ROOT must be an absolute path", result.stderr)
-            self.assertFalse((fixture / ".agent_reports").exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((reports / ".runtime" / "model-worker-governor" / "state.json").is_file())
+            self.assertFalse((caller / ".agent_reports").exists())
 
     def test_governor_linked_caller_uses_primary_root_and_legacy_fallback(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
@@ -266,15 +273,21 @@ class BacklogPerformanceTest(unittest.TestCase):
             subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b", "linked", str(linked)], check=True)
             utilities = linked / "utilities"
             utilities.mkdir()
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("AGENT_ARTIFACT_ROOT", None)
-                os.environ.pop("AGENT_MODEL_GOVERNOR_ROOT", None)
-                with mock.patch.object(GOVERNOR.Path, "cwd", return_value=utilities):
-                    linked_root = GOVERNOR.default_root()
-                    self.assertEqual(linked_root, primary_reports / ".runtime" / "model-worker-governor")
-                    GOVERNOR.acquire(linked_root, "dispatch", total=5, budget=1)
-                    self.assertTrue((linked_root / "state.json").is_file())
-                    self.assertFalse((utilities / ".agent_reports").exists())
+            for caller in (primary, utilities):
+                for hint in (None, ".agent_reports"):
+                    with self.subTest(caller=caller, artifact_hint=hint):
+                        with mock.patch.dict(os.environ, {}, clear=False):
+                            os.environ.pop("AGENT_MODEL_GOVERNOR_ROOT", None)
+                            if hint is None:
+                                os.environ.pop("AGENT_ARTIFACT_ROOT", None)
+                            else:
+                                os.environ["AGENT_ARTIFACT_ROOT"] = hint
+                            with mock.patch.object(GOVERNOR.Path, "cwd", return_value=caller):
+                                linked_root = GOVERNOR.default_root()
+                                self.assertEqual(linked_root, primary_reports / ".runtime" / "model-worker-governor")
+                                GOVERNOR.acquire(linked_root, "dispatch", total=5, budget=10)
+                                self.assertTrue((linked_root / "state.json").is_file())
+                                self.assertFalse((utilities / ".agent_reports").exists())
 
             legacy = base / "legacy"
             legacy.mkdir()
