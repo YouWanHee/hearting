@@ -4727,13 +4727,13 @@ _PROGRESS_EPOCH_RE = re.compile(r"\d{1,7}(?:\.\d{1,4})?\Z")
 
 
 def _progress_epoch(epoch):
-    """`ep 3/200`, or `ep 2 done` once an epoch's finishing lines were seen; else None."""
+    """`Epoch 3/200`, or `Epoch 2 done` once an epoch's finishing lines were seen; else None."""
     if not isinstance(epoch, dict):
         return None
     number = epoch.get("n")
     if not isinstance(number, str) or not _PROGRESS_EPOCH_RE.match(number):
         return None
-    text = "ep " + number
+    text = "Epoch " + number
     total = epoch.get("of")
     if isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7:
         text += "/%d" % total
@@ -4745,7 +4745,7 @@ def _progress_epoch_segments(epoch):
     if text is None:
         return ()
     number = epoch["n"]
-    parts = [("ep ", "dim"), (number, "resource_active")]
+    parts = [("Epoch ", "dim"), (number, "resource_active")]
     total = epoch.get("of")
     if isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7:
         parts.extend((("/", "dim"), (str(total), "dim")))
