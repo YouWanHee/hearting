@@ -206,6 +206,7 @@ def _backup(path: Path, payload: bytes, mode: int) -> Path:
             safe_fs._fsync_parent(candidate)
             return candidate
         except BaseException:
+            # destructive-ok: reason=discard an incomplete exclusive backup; boundary=one backup leaf created with O_EXCL by this invocation
             candidate.unlink(missing_ok=True)
             raise
     raise ModelSettingsError(f"could not allocate an exclusive backup beside {path}")
@@ -343,4 +344,5 @@ def _parse_bytes(raw: bytes) -> dict[str, str]:
             stream.write(raw)
         return model_config.parse_config(name, allow_symlink=False)
     finally:
+        # destructive-ok: reason=discard the private candidate parser input; boundary=one mkstemp leaf created by this invocation
         Path(name).unlink(missing_ok=True)

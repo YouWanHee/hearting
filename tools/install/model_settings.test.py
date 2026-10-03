@@ -17,6 +17,7 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "utilities"))
 import installer
+import fixture_env
 import model_settings as settings
 import model_config
 import model_profile
@@ -28,19 +29,11 @@ class ModelSettingsCliTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="model-settings-test-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.home = self.root / "home"
-        self.state = self.root / "state"
-        self.home.mkdir()
-        self.env = {
-            "AGENT_HOME": str(ROOT),
-            "HOME": str(self.home),
-            "CODEX_HOME": str(self.home / ".codex"),
-            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
-            "XDG_STATE_HOME": str(self.state),
-            "XDG_CONFIG_HOME": str(self.home / ".config"),
-            "HEARTING_FIXTURE_ROOT": str(self.root),
-        }
-        self.env_patch = mock.patch.dict(os.environ, self.env, clear=False)
+        self.env = fixture_env.build_environment(self.root, ROOT)
+        fixture_env.prepare_environment(self.env)
+        self.home = Path(self.env["HOME"])
+        self.state = Path(self.env["XDG_STATE_HOME"])
+        self.env_patch = mock.patch.dict(os.environ, self.env, clear=True)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
 
@@ -310,6 +303,7 @@ class ModelSettingsCliTest(unittest.TestCase):
         def race(auth, payload, mode, **kwargs):
             temporary = path.with_name("successor.tmp")
             temporary.write_bytes(successor)
+            # destructive-ok: reason=simulate a noncooperating successor before the CAS check; boundary=two exact config leaves inside this test's temporary runtime home
             os.replace(temporary, path)
             return original_atomic(auth, payload, mode, **kwargs)
 
