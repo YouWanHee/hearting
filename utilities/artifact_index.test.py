@@ -265,6 +265,18 @@ class TestIndex(unittest.TestCase):
         with self.assertRaises(ValueError):
             ix.parse(payload)
 
+    def test_public_parse_copies_payload_while_owned_parse_adopts_private_rows(self):
+        payload = ix.to_payload(ix.empty(self.root_id))
+        payload["stable_ids"]["stable_1"] = {"kind": "artifact", "cycle_id": "cyc_1", "manifest_id": "man_1"}
+        public = ix.parse(payload)
+        public.stable_ids["stable_1"]["cycle_id"] = "changed"
+        self.assertEqual(payload["stable_ids"]["stable_1"]["cycle_id"], "cyc_1")
+        owned_payload = ix.to_payload(ix.empty(self.root_id))
+        owned_payload["stable_ids"]["stable_2"] = {"kind": "artifact", "cycle_id": "cyc_2", "manifest_id": "man_2"}
+        owned = ix._parse_owned(owned_payload)
+        self.assertIs(owned.stable_ids, owned_payload["stable_ids"])
+        self.assertIs(owned.stable_ids["stable_2"], owned_payload["stable_ids"]["stable_2"])
+
     # -- F1b: the index is closed at every depth, not only the top level -----
 
     def test_parse_rejects_forged_nested_manifest_row(self):

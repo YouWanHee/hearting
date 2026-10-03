@@ -334,8 +334,8 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _usage_counter(value: Any) -> int | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-        return int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**63 - 1:
+        return value
     return None
 
 
@@ -921,10 +921,14 @@ def _seal_terminal_handoff_or_raise(
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
+    value.add_argument("--one-turn", action="store_true",
+                       help=argparse.SUPPRESS)
     value.add_argument("--worktree", required=True)
     from dispatch_contract import inherited_jobs_argument
-    value.add_argument("--jobs", **inherited_jobs_argument())
-    value.add_argument("--parent-attempt-id", required=True)
+    jobs_options = inherited_jobs_argument()
+    jobs_options["required"] = False
+    value.add_argument("--jobs", **jobs_options)
+    value.add_argument("--parent-attempt-id")
     value.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"), required=True)
     value.add_argument("--approval", choices=("untrusted", "on-request", "never", "inherit"), default="never")
     value.add_argument("--network-access", action="store_true")
@@ -946,7 +950,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--route-id", default="")
     value.add_argument("--route-hash", default="")
     value.add_argument("--state-file", default=os.environ.get("AGENT_DISPATCH_COMPLETION_STATE_FILE"))
-    value.add_argument("--lease-file", required=True)
+    value.add_argument("--lease-file")
     value.add_argument("--app-server-command", default=os.environ.get("CODEX_APP_SERVER_COMMAND"))
     value.add_argument("--join-command", default=os.environ.get("AGENT_DISPATCH_JOIN_COMMAND"))
     value.add_argument(
@@ -964,8 +968,86 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def run_one_turn(args: argparse.Namespace) -> int:
+    """Run a single stage/review turn without entering owner supervision."""
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        emit({"type": "dispatch.supervisor.error", "reason": "initial-prompt-empty"})
+        return 64
+
+    command = shlex.split(args.app_server_command) if args.app_server_command else [
+        "codex", "app-server", "--listen", "stdio://"
+    ]
+    args.native_permission_profile = commit_profile_config(
+        args.worktree, args.writable_root, args.sandbox, args.network_access,
+        primary_commit=args.primary_git_commit,
+    )
+    if args.native_permission_profile is not None:
+        command += config_arguments(args.native_permission_profile)
+
+    server: AppServer | None = None
+    completed_thread: str | None = None
+    result_code = 70
+    try:
+        server = AppServer(command, args.worktree, dict(os.environ))
+        server.request(
+            "initialize",
+            {"clientInfo": {"name": "hearting-dispatch-stage",
+                            "title": "Hearting Dispatch Stage", "version": "1"},
+             "capabilities": None},
+        )
+        server.notification("initialized")
+        thread_params: dict[str, Any] = {"cwd": args.worktree, "ephemeral": True}
+        if args.native_permission_profile is None:
+            thread_params["sandbox"] = args.sandbox
+        if args.approval != "inherit":
+            thread_params["approvalPolicy"] = args.approval
+        if args.model:
+            thread_params["model"] = args.model
+        thread_result = server.request("thread/start", thread_params)
+        thread = thread_result.get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+            raise SupervisorError("thread-start-response-invalid")
+        thread_id = thread["id"]
+        run_turn(
+            server, thread_id=thread_id, prompt=prompt, args=args
+        )
+        completed_thread = thread_id
+        # A completed model turn has the same process-success boundary as raw
+        # codex exec. The wrapper classifies the final handoff from this log;
+        # FAIL/BLOCKED and invalid handoffs are not transport failures.
+        result_code = 0
+    except TurnFailed as exc:
+        emit({"type": "dispatch.supervisor.error", "reason": "app-server-turn-failed"})
+    except (DispatchContractError, JoinContractError, SupervisorError) as exc:
+        reason = exc.reason if isinstance(exc, DispatchContractError) else str(exc)
+        emit({"type": "dispatch.supervisor.error", "reason": reason[:240]})
+    except Exception as exc:
+        emit({"type": "dispatch.supervisor.error",
+              "reason": f"supervisor-internal-{type(exc).__name__}"})
+    finally:
+        if server is not None:
+            try:
+                server.close()
+            except Exception as exc:
+                emit({"type": "dispatch.supervisor.error",
+                      "reason": f"app-server-close-{type(exc).__name__}"})
+                completed_thread = None
+                result_code = 70
+    if completed_thread is not None:
+        emit({"type": "turn.completed", "thread_id": completed_thread})
+    return result_code
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if args.one_turn:
+        return run_one_turn(args)
+    if not args.jobs:
+        argument_parser.error("--jobs or AGENT_DISPATCH_JOBS is required outside --one-turn")
+    if not args.parent_attempt_id or not args.lease_file:
+        argument_parser.error("--parent-attempt-id and --lease-file are required outside --one-turn")
     continuation_budget = resolve_continuation_budget(
         explicit=args.max_continuations,
         route_file=args.route_file,

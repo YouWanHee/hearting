@@ -881,20 +881,10 @@ def selected_providers(profile="mini", pin_env="FLEET_TITLE_PROVIDER"):
         defaults_spec = importlib.util.spec_from_file_location(
             "fleet_dispatch_defaults", home / "utilities" / "dispatch-defaults.py"
         )
-        capacity_spec = importlib.util.spec_from_file_location(
-            "fleet_harness_capacity", home / "utilities" / "harness-capacity.py"
-        )
-        allocation_spec = importlib.util.spec_from_file_location(
-            "fleet_dispatch_allocation", home / "utilities" / "dispatch_allocation.py"
-        )
-        if not all(spec and spec.loader for spec in (defaults_spec, capacity_spec, allocation_spec)):
+        if not defaults_spec or not defaults_spec.loader:
             return PROVIDER_ORDER
         defaults = importlib.util.module_from_spec(defaults_spec)
-        capacity = importlib.util.module_from_spec(capacity_spec)
-        allocation_module = importlib.util.module_from_spec(allocation_spec)
         defaults_spec.loader.exec_module(defaults)
-        capacity_spec.loader.exec_module(capacity)
-        allocation_spec.loader.exec_module(allocation_module)
         config = defaults.load_and_validate(
             defaults.default_config_path(), defaults.default_topology_path()
         )
@@ -907,6 +897,18 @@ def selected_providers(profile="mini", pin_env="FLEET_TITLE_PROVIDER"):
         cached = _cached_provider_order(cache)
         if cached:
             return cached
+        capacity_spec = importlib.util.spec_from_file_location(
+            "fleet_harness_capacity", home / "utilities" / "harness-capacity.py"
+        )
+        allocation_spec = importlib.util.spec_from_file_location(
+            "fleet_dispatch_allocation", home / "utilities" / "dispatch_allocation.py"
+        )
+        if not all(spec and spec.loader for spec in (capacity_spec, allocation_spec)):
+            return PROVIDER_ORDER
+        capacity = importlib.util.module_from_spec(capacity_spec)
+        allocation_module = importlib.util.module_from_spec(allocation_spec)
+        capacity_spec.loader.exec_module(capacity)
+        allocation_spec.loader.exec_module(allocation_module)
         states = {name: "ok" for name in PROVIDER_ORDER}
         usage = subprocess.run(
             [str(home / "utilities" / "usage-check.sh"), "--harness", "all", "--jobs", str(jobs)],

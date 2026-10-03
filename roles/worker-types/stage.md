@@ -8,7 +8,9 @@ worker or create dispatch depth 3. A checked runtime-native helper is allowed
 only under the bounded helper contract in `roles/worker-bootstrap.md`.
 
 A normal single-session route node with `commit_expected: true` commits its own
-validated work. A declared sub-session is no-commit and hands its verified
+validated work, including tracked documentation and configuration examples it
+changed. Source ownership follows the assigned scope, not filename extension.
+A declared sub-session is no-commit and hands its verified
 changes to the stage owner for the post-gate commit.
 
 An owner-level scope decision recorded in your assignment is a boundary you

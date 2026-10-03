@@ -71,7 +71,9 @@ class BacklogPerformanceTest(unittest.TestCase):
                                "canonicalizations": 0, "writes": 0, "write_bytes": 0,
                                "lock_held_seconds": 0.0}
                     lock_started = {}
-                    old_load, old_parse = ADMISSION.load_index, INDEX.parse
+                    old_load = ADMISSION.load_index
+                    parse_name = "_parse_owned" if hasattr(INDEX, "_parse_owned") else "parse"
+                    old_parse = getattr(INDEX, parse_name)
                     old_canonical, old_write = INDEX.canonical_bytes, ADMISSION._write_index
                     old_acquire, old_release = ADMISSION._acquire_lock, ADMISSION._release_lock
 
@@ -108,7 +110,7 @@ class BacklogPerformanceTest(unittest.TestCase):
                         return old_release(root, fd)
 
                     with mock.patch.object(ADMISSION, "load_index", side_effect=load), \
-                         mock.patch.object(INDEX, "parse", side_effect=parse), \
+                         mock.patch.object(INDEX, parse_name, side_effect=parse), \
                          mock.patch.object(INDEX, "canonical_bytes", side_effect=canonical), \
                          mock.patch.object(ADMISSION, "_write_index", side_effect=write), \
                          mock.patch.object(ADMISSION, "_acquire_lock", side_effect=acquire), \

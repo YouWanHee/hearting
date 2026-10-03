@@ -580,7 +580,12 @@ class GpuProgressLineRenderTest(unittest.TestCase):
             "\u21b3 TRAIN 76% 15135/20000 \u00b7 39:00 left \u00b7 "
             "L_se=1.18e-02 L_loc=2.67e-03",
         ])
-        self.assertTrue(all(key in (None, "dim") for _text, key in rows[1]))
+        styles = {part: key for part, key in rows[1] if part}
+        self.assertEqual(styles["TRAIN"], "resource_active")
+        self.assertEqual(styles["76%"], "lvl_g")
+        self.assertEqual(styles["15135/20000"], "dim")
+        self.assertEqual(styles["L_se="], "dim")
+        self.assertEqual(styles["1.18e-02"], "resource_active")
 
     def test_epoch_leads_the_progress_line(self):
         rows = render._gpu_process_rows(self.gpu(
@@ -589,10 +594,10 @@ class GpuProgressLineRenderTest(unittest.TestCase):
             {"line": "Epoch(train) [3][100/1250] loss: 0.5", "age_s": 5,
              "epoch": {"n": "1.25", "of": 3}}), "  ", 168)
         text = [render._plain(row).strip() for row in rows]
-        self.assertEqual(text[1], "\u21b3 ep 3/200 \u00b7 TRAIN 76% 15135/20000 \u00b7 39:00 left "
+        self.assertEqual(text[1], "\u21b3 Epoch 3/200 \u00b7 TRAIN 76% 15135/20000 \u00b7 39:00 left "
                                   "\u00b7 L_se=1.18e-02 L_loc=2.67e-03")
-        self.assertTrue(text[3].startswith("\u21b3 ep 2 done \u00b7 TRAIN 76%"), text[3])
-        self.assertEqual(text[5], "\u21b3 ep 1.25/3 \u00b7 Epoch(train) [3][100/1250] loss: 0.5")
+        self.assertTrue(text[3].startswith("\u21b3 Epoch 2 done \u00b7 TRAIN 76%"), text[3])
+        self.assertEqual(text[5], "\u21b3 Epoch 1.25/3 \u00b7 Epoch(train) [3][100/1250] loss: 0.5")
 
     def test_malformed_epoch_is_ignored(self):
         for epoch in ({"n": 3}, {"n": "3; rm -rf"}, {"n": ""}, "ep 3", None, {"of": 5},
@@ -601,8 +606,8 @@ class GpuProgressLineRenderTest(unittest.TestCase):
                 (_command, progress) = render._gpu_process_rows(
                     self.gpu({"line": "step 9", "age_s": 1, "epoch": epoch}), "", 120)
                 self.assertEqual(render._plain(progress).strip(), "\u21b3 step 9")
-        self.assertEqual(render._progress_epoch({"n": "4", "of": True}), "ep 4")
-        self.assertEqual(render._progress_epoch({"n": "4", "of": 0, "done": "yes"}), "ep 4")
+        self.assertEqual(render._progress_epoch({"n": "4", "of": True}), "Epoch 4")
+        self.assertEqual(render._progress_epoch({"n": "4", "of": 0, "done": "yes"}), "Epoch 4")
 
     def test_epoch_keeps_its_place_and_the_age_at_narrow_width(self):
         for width in (60, 40):
@@ -610,8 +615,31 @@ class GpuProgressLineRenderTest(unittest.TestCase):
                 {"line": self.TQDM, "age_s": 900, "epoch": {"n": "12", "of": 100}}), "    ", width)
             text = render._plain(progress)
             self.assertLessEqual(render._dw(text), width)
-            self.assertIn("ep 12/100 \u00b7 ", text)
+            self.assertIn("Epoch 12/100", text)
             self.assertTrue(text.endswith("stalled 15m"), text)
+
+    def test_epoch_done_and_tqdm_percent_color_only_their_own_evidence(self):
+        rows = render._gpu_process_rows(self.gpu(
+            {"line": "validation: 100%|##########| 200/200 [00:10<00:00, 20it/s]",
+             "age_s": 0, "epoch": {"n": "4", "of": 8, "done": True}},
+            {"line": "eval: 0%|          | 0/100 [00:00<?, ?it/s, error_rate=0.00]",
+             "age_s": 300}), "", 120)
+        done, metric = rows[1], rows[3]
+        self.assertIn(("done", "lvl_g"), done)
+        self.assertIn(("100%", "lvl_g"), done)
+        self.assertNotIn(("complete", "lvl_g"), done)
+        self.assertIn(("0%", "lvl_g"), metric)
+        self.assertIn(("error_rate=", "dim"), metric)
+        self.assertNotIn(("error_rate=", "lvl_r"), metric)
+
+    def test_only_explicit_leading_waiting_or_error_text_gets_status_color(self):
+        rows = render._gpu_process_rows(self.gpu(
+            {"line": "waiting: remote worker slot", "age_s": 0},
+            {"line": "ERROR: checkpoint write failed", "age_s": 0},
+            {"line": "error_rate=0.00 in validation output", "age_s": 0}), "", 120)
+        self.assertIn(("waiting:", "lvl_y"), rows[1])
+        self.assertIn(("ERROR:", "lvl_r"), rows[3])
+        self.assertTrue(all(key in (None, "dim") for _text, key in rows[5]))
 
     def test_stock_tqdm_postfix_and_unknown_remaining_time(self):
         self.assertEqual(
@@ -648,18 +676,24 @@ class GpuProgressLineRenderTest(unittest.TestCase):
 
     def test_compaction_is_cached_per_pid_and_line(self):
         gpu = self.gpu({"line": self.TQDM, "age_s": 8})
-        with mock.patch.object(render, "_progress_body",
-                               wraps=render._progress_body) as body:
+        with mock.patch.object(render, "_progress_body_segments",
+                               wraps=render._progress_body_segments) as body:
             for _frame in range(3):
                 render._gpu_process_rows(gpu, "", 120)
             gpu["processes"][0]["progress"] = {"line": self.TQDM + " ", "age_s": 9}
             render._gpu_process_rows(gpu, "", 120)
         self.assertEqual(body.call_count, 1)
         gpu["processes"][0]["progress"] = {"line": "TRAIN: 77%|#| 15136/20000", "age_s": 0}
-        with mock.patch.object(render, "_progress_body",
-                               wraps=render._progress_body) as body:
+        with mock.patch.object(render, "_progress_body_segments",
+                               wraps=render._progress_body_segments) as body:
             render._gpu_process_rows(gpu, "", 120)
         self.assertEqual(body.call_count, 1)
+
+    def test_compaction_cache_remains_bounded(self):
+        for pid in range(257):
+            render._gpu_progress_row(
+                {"pid": pid, "progress": {"line": "step %d" % pid}}, "", 120)
+        self.assertLessEqual(len(render._PROGRESS_BODY_CACHE), 256)
 
 
 if __name__ == "__main__":

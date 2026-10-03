@@ -585,6 +585,10 @@ approval. A router may expose one direct owner-reference index, but no
 pre-approval reference may contain execution procedure. The confirmation is
 one-time for an unchanged approved route and scope.
 
+An existing decision that fixes the work carries any actual understanding-check
+answer through the existing stage input without an extra frame or second
+approval; an absent answer stays absent.
+
 ### 0.5. Post-Execution Completion Report
 
 After a material-work attempt, the user-facing main agent closes the flow with

@@ -71,7 +71,8 @@ def base_environ() -> dict:
 # inspect_terminal_attempt() -- shared across both harnesses -- accept them.
 FAKE_CODEX_SCRIPT = (
     "#!/usr/bin/env python3\n"
-    "import json, os, time\n"
+    "import json, os, sys, time\n"
+    "if sys.argv[1:2] == ['app-server']: sys.exit(69)\n"
     "open(os.environ['FAKE_PID_FILE'], 'w').write(str(os.getpid()))\n"
     "open(os.environ['FAKE_SENTINEL'], 'w').write(os.environ['AGENT_DISPATCH_ATTEMPT_ID'])\n"
     "while os.path.exists(os.environ['FAKE_SENTINEL']): time.sleep(0.01)\n"

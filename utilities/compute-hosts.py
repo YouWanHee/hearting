@@ -918,7 +918,8 @@ def progress_last_line(raw):
 # cache keeps (file identity, read offset, content anchor, epoch state), so a probe
 # reads only bytes written since the last probe; a file seen for the first time is
 # read once, forward over at most its last EPOCH_FIRST_SCAN_BYTES, possibly across
-# several probes. Every failure leaves the epoch absent and never the line.
+# several probes. One bounded header read also caches an explicit total (or its
+# absence) per validated generation. Every failure leaves the line available.
 EPOCH_CACHE_NAME = "progress-epochs-v1-%s.json"
 EPOCH_CACHE_BYTES_MAX = 256 * 1024
 EPOCH_CACHE_ENTRIES_MAX = 64
@@ -926,6 +927,7 @@ EPOCH_CACHE_TTL_S = 86400
 EPOCH_FIRST_SCAN_BYTES = 32 * 1024 * 1024
 EPOCH_GAP_BYTES = 64 * 1024 * 1024
 EPOCH_NOCACHE_BYTES = 64 * 1024
+EPOCH_HEAD_BYTES = 64 * 1024
 EPOCH_CHUNK_BYTES = 1024 * 1024
 EPOCH_PROBE_SECONDS = 0.4
 EPOCH_PROBE_BYTES = 48 * 1024 * 1024
@@ -942,7 +944,7 @@ EPOCH_MARK = re.compile(
 EPOCH_IDENT = frozenset(b"abcdefghijklmnopqrstuvwxyz0123456789_")
 EPOCH_LOOKBACK = (b"per ", b"per-", b"each ", b"every ")
 EPOCH_TOTAL_LEAD = re.compile(rb"(?:^|[^a-z0-9_])(?:max|num|n|nb|total)[ _]?\Z")
-EPOCH_TOTAL = re.compile(rb"epoch(s?)['\"]?\s*[:=]\s*(\d{1,6})(?!\d)")
+EPOCH_TOTAL = re.compile(rb"epoch(s?)['\"]?\s*[:=]\s*(\d{1,6})(?![a-z0-9_./])")
 EPOCH_BAR = re.compile(
     rb"([^\r\n|]*?)\s*\d{1,3}(?:\.\d+)?%\s*\|[^|\r\n]{0,384}\|\s*[\d.]+[kmgtpe]?/([\d.]+[kmgtpe]?)")
 EPOCH_START_WORD = re.compile(rb"(?<![a-z])(?:start(?:ing|ed)?|begin(?:ning)?)(?![a-z])")
@@ -1066,7 +1068,14 @@ def epoch_cached(value):
         return None
     if not all(epoch_valid_bar(state[name]) for name in ("ref", "first", "bar")):
         return None
-    return {"off": off, "anchor": anchor, "skip": skip, "state": dict(state)}
+    entry = {"off": off, "anchor": anchor, "skip": skip, "state": dict(state)}
+    # Missing in older entries; None is a checked negative result, not a retry.
+    if "head_total" in value:
+        head = value["head_total"]
+        if head is None or (isinstance(head, int) and not isinstance(head, bool)
+                            and 0 < head < 1000000):
+            entry["head_total"] = head
+    return entry
 
 
 def epoch_anchor(tail):
@@ -1174,18 +1183,35 @@ def epoch_apply(state, data, start, end, mark):
     state["first"] = state["bar"] = None
 
 
+def epoch_explicit_total(data, at):
+    total = EPOCH_TOTAL.match(data, at)
+    if total is not None and not data[max(0, at - 16):at].endswith(
+            (*EPOCH_LOOKBACK, b"warmup ", b"warm-up ")) and (
+            EPOCH_TOTAL_LEAD.search(data[max(0, at - 7):at])
+            or (total.group(1) and not (at and data[at - 1] in EPOCH_IDENT))):
+        value = int(total.group(2))
+        return value if value > 0 else None
+    return None
+
+
+def epoch_head_total(handle, size):
+    raw = os.pread(handle, min(size, EPOCH_HEAD_BYTES), 0)
+    # An integer cut by the bounded read must not become a shorter valid total.
+    data = ANSI_ESCAPE_BYTES.sub(b"", raw).lower() + (b"_" if len(raw) < size else b"")
+    totals = {value for word in EPOCH_WORD.finditer(data)
+              if (value := epoch_explicit_total(data, word.start())) is not None}
+    return next(iter(totals)) if len(totals) == 1 else None
+
+
 def epoch_scan(state, chunk):
     # chunk ends at a line break; the state carries across chunks and probes.
     data = ANSI_ESCAPE_BYTES.sub(b"", chunk).lower()
     low = piece_end = 0
     for word in EPOCH_WORD.finditer(data):
         at = word.start()
-        total = EPOCH_TOTAL.match(data, at)
-        if total is not None and (
-                EPOCH_TOTAL_LEAD.search(data[max(0, at - 7):at])
-                or (total.group(1) and not (at and data[at - 1] in EPOCH_IDENT))):
-            if 0 < int(total.group(2)):
-                state["of"] = int(total.group(2))
+        total = epoch_explicit_total(data, at)
+        if total is not None:
+            state["of"] = total
             continue
         if at < piece_end:
             continue
@@ -1208,17 +1234,32 @@ def epoch_scan(state, chunk):
 def epoch_scan_file(handle, size, key, cache):
     # The file's epoch state once read up to its newest line break, else None.
     entry = epoch_cached(cache["files"].get(key)) if cache.get("path") else None
-    resumed = False
-    if entry is not None and entry["off"] <= size and size - entry["off"] <= EPOCH_GAP_BYTES:
+    generation = False
+    if entry is not None and entry["off"] <= size:
         lead = min(entry["off"], EPOCH_ANCHOR_BYTES)
         tail = os.pread(handle, lead, entry["off"] - lead)
-        resumed = len(tail) == lead and epoch_anchor(tail) == entry["anchor"]
+        generation = len(tail) == lead and epoch_anchor(tail) == entry["anchor"]
+    resumed = generation and size - entry["off"] <= EPOCH_GAP_BYTES
     if resumed:
         off, state, aligned = entry["off"], entry["state"], not entry["skip"]
     else:
         window = EPOCH_FIRST_SCAN_BYTES if cache.get("path") else EPOCH_NOCACHE_BYTES
         off, state, tail = max(0, size - window), epoch_fresh_state(), b""
         aligned = off == 0
+    if cache.get("path"):
+        head_total, head_checked = None, False
+        if generation and "head_total" in entry:
+            head_total, head_checked = entry["head_total"], True
+        else:
+            try:
+                head_total = epoch_head_total(handle, size)
+                head_checked = True
+            except OSError:
+                pass    # Failed reads stay eligible for the next normal probe.
+        # Header never supplies n/bar/done. Previously observed tail totals win.
+        if state["of"] is None:
+            state["of"] = (entry["state"]["of"] if generation
+                           and entry["state"]["of"] is not None else head_total)
     first, current = off, False
     while off < size:
         if time.monotonic() > cache["deadline"] or cache["budget"] <= 0:
@@ -1258,9 +1299,14 @@ def epoch_scan_file(handle, size, key, cache):
             break
     else:
         current = True
-    if cache.get("path") and (resumed or off != first):
+    if cache.get("path"):
+        if not resumed and off == first and off:
+            lead = min(off, EPOCH_ANCHOR_BYTES)
+            tail = os.pread(handle, lead, off - lead)
         cache["files"][key] = {"off": off, "anchor": epoch_anchor(tail), "skip": not aligned,
                                "state": state, "seen": time.time()}
+        if head_checked:
+            cache["files"][key]["head_total"] = head_total
         cache["dirty"] = True
     return state if current else None
 
