@@ -1170,9 +1170,12 @@ class ProbeEpochTest(unittest.TestCase):
         size = log.stat().st_size
         with mock.patch.object(os, "pread", wraps=os.pread) as pread:
             self.assertIsNone(self.probe(log))       # budget spent: not current yet
-        # The first scan starts at the window, never at the head of the file.
-        self.assertEqual(min(call.args[2] for call in pread.call_args_list),
-                         size - 64 * 1024)
+        # A single bounded header read supplements, rather than widens, the tail scan.
+        reads = [(call.args[1], call.args[2]) for call in pread.call_args_list]
+        self.assertEqual([length for length, offset in reads if offset == 0], [64 * 1024])
+        self.assertEqual(min(offset for _length, offset in reads if offset), size - 64 * 1024)
+        self.assertLessEqual(sum(length for length, offset in reads if offset and offset != size - 4096),
+                             8192 + 64)
         views = [self.probe(log) for _ in range(12)]
         self.assertEqual(views[-1], {"n": "8"})
         (entry,) = self.cached().values()
@@ -1202,6 +1205,120 @@ class ProbeEpochTest(unittest.TestCase):
                 self.assertEqual(entry["state"]["n"], "4")
         path.unlink()
         self.assertEqual(self.probe(log), {"n": "4", "of": 9})
+
+    def head_log(self, name, header, tail=b"Epoch 7\n", upto=10):
+        self.ns.update(EPOCH_FIRST_SCAN_BYTES=2048, EPOCH_CHUNK_BYTES=2048)
+        return self.write(name, header, b"noise\n" * 12000, tail,
+                          bars(b"train", 50, upto=upto))
+
+    def measured_probe(self, log, **kwargs):
+        reads = []
+        pread = os.pread
+        def measured(fd, count, offset):
+            raw = pread(fd, count, offset)
+            reads.append((offset, count, len(raw)))
+            return raw
+        with mock.patch.object(os, "pread", side_effect=measured):
+            view = self.probe(log, **kwargs)
+        return view, reads
+
+    def test_bounded_header_total_does_not_supply_the_current_epoch(self):
+        log = self.head_log("head.log", b"Epoch 99\n{'max_epoch': 200}\n")
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7", "of": 200})
+        head = [row for row in reads if row[0] == 0]
+        self.assertEqual(head, [(0, 65536, 65536)])
+        self.assertLessEqual(sum(row[2] for row in reads), 65536 + 4096 + 2048)
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7", "of": 200})
+        self.assertEqual([row for row in reads if row[0] == 0], [])
+        self.assertEqual(sum(row[2] for row in reads), 4096 + 64)
+
+    def test_old_cache_without_header_result_is_backfilled_once(self):
+        log = self.head_log("old.log", b"max_epoch: 200\n")
+        self.assertEqual(self.probe(log), {"n": "7", "of": 200})
+        (path,) = self.cache_dir.glob("progress-epochs-v1-*.json")
+        old = self.cached()
+        (entry,) = old.values()
+        entry.pop("head_total")
+        entry["state"]["of"] = None
+        path.write_text(json.dumps({"files": old}))
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7", "of": 200})
+        self.assertEqual([row for row in reads if row[0] == 0], [(0, 65536, 65536)])
+        again, reads = self.measured_probe(log)
+        self.assertEqual(again, view)
+        self.assertEqual([row for row in reads if row[0] == 0], [])
+
+    def test_no_total_header_is_cached_across_incremental_and_large_gap_reads(self):
+        log = self.head_log("negative.log", b"num_per_epoch=20000\nwarmup_epochs: 5\n")
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7"})
+        self.assertEqual([row for row in reads if row[0] == 0], [(0, 65536, 65536)])
+        (entry,) = self.cached().values()
+        self.assertIn("head_total", entry)
+        self.assertIsNone(entry["head_total"])
+        appended = b"\nEpoch 8\n" + bars(b"train", 50, upto=20)
+        self.write("negative.log", appended, mode="ab")
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "8"})
+        self.assertEqual([row for row in reads if row[0] == 0], [])
+        self.assertEqual(sum(row[2] for row in reads), 4096 + 64 + len(appended))
+        self.ns["EPOCH_GAP_BYTES"] = 1024
+        self.write("negative.log", b"noise\n" * 1000, b"Epoch 9\n",
+                   bars(b"train", 50, upto=30), mode="ab")
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "9"})
+        self.assertEqual([row for row in reads if row[0] == 0], [])
+
+    def test_tail_total_wins_and_invalid_or_ambiguous_header_totals_stay_unknown(self):
+        log = self.head_log("tail.log", b"max_epoch: 200\n", b"Epoch 7/300\n")
+        self.assertEqual(self.probe(log), {"n": "7", "of": 300})
+        self.ns["EPOCH_GAP_BYTES"] = 1024
+        self.write("tail.log", b"noise\n" * 1000, b"Epoch 8\n",
+                   bars(b"train", 50, upto=20), mode="ab")
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "8", "of": 300})
+        self.assertEqual([row for row in reads if row[0] == 0], [])
+        cases = (b"max_epoch: false\n", b"max_epoch: 0\n", b"max_epoch: 200.5\n",
+                 b"max_epoch: 200e3\n", b"max_epoch: '200'\n",
+                 b"max_epoch: 200\nnum_epochs: 300\n",
+                 b"num_per_epoch=20000\nwarmup_epochs: 5\nevery epochs: 8\n")
+        for index, header in enumerate(cases):
+            with self.subTest(header=header):
+                log = self.head_log("invalid%d.log" % index, header)
+                self.assertEqual(self.probe(log), {"n": "7"})
+                self.assertEqual([row for row in self.measured_probe(log)[1] if row[0] == 0], [])
+
+    def test_bounded_header_never_accepts_a_cut_integer(self):
+        log = self.head_log("cut.log", b"x\n" * (65536 // 2 - 7) + b"max_epoch: 200\n")
+        self.assertEqual(self.probe(log), {"n": "7"})
+
+    def test_header_result_is_rechecked_after_rotation_truncation_or_anchor_mismatch(self):
+        log = self.head_log("generation.log", b"max_epoch: 200\n")
+        self.assertEqual(self.probe(log), {"n": "7", "of": 200})
+        log = self.head_log("generation.log", b"max_epoch: 300\n", b"Epoch 6\n", upto=11)
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "6", "of": 300})
+        self.assertEqual([row for row in reads if row[0] == 0], [(0, 65536, 65536)])
+        self.write("generation.log", b"max_epoch: 400\nEpoch 1\n", bars(b"train", 50, upto=10))
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "1", "of": 400})
+        self.assertEqual(len([row for row in reads if row[0] == 0 and row[1] == log.stat().st_size]), 2)
+        log.rename(self.root / "generation.log.old")
+        log = self.head_log("generation.log", b"max_epoch: 500\n")
+        view, reads = self.measured_probe(log)
+        self.assertEqual(view, {"n": "7", "of": 500})
+        self.assertEqual([row for row in reads if row[0] == 0], [(0, 65536, 65536)])
+
+    def test_cache_unavailable_does_not_add_header_reads_to_its_existing_tail_budget(self):
+        log = self.head_log("uncached.log", b"max_epoch: 200\n")
+        self.ns["EPOCH_NOCACHE_BYTES"] = 2048
+        for _probe in range(2):
+            view, reads = self.measured_probe(log, cache_dir=False)
+            self.assertEqual(view, {"n": "7"})
+            self.assertEqual([row for row in reads if row[0] == 0], [])
+            self.assertEqual(sum(row[2] for row in reads), 4096 + 2048)
 
     def test_unsafe_or_missing_cache_dir_reads_only_a_small_tail(self):
         self.ns["EPOCH_NOCACHE_BYTES"] = 2048
