@@ -5,6 +5,7 @@ tests for `artifact_lifecycle.py`. Every fixture uses an isolated
 real canonical registry or routes directory.
 """
 import importlib.util
+import hashlib
 import json
 import os
 import sys
@@ -449,6 +450,31 @@ class ArtifactLifecycleCompletionTest(LifecycleTestBase):
             document if document is not None else fx["document"],
             content_root=fx["content_dir"], route_file=fx["route_file"],
         )
+
+    def test_recorded_owner_terminal_uses_outcome_row_without_worker_marker(self):
+        from types import SimpleNamespace
+        route = {"route_id": "rt-recorded-owner", "route_hash": "hash",
+                 "nodes": [{"id": "owner", "terminal": True, "kind": "capability-owner",
+                            "unit": "_kernel/owner", "dispatch_depth": 1,
+                            "terminal_gate": "code-report"}]}
+        proof = {"passed": True, "current": True, "source": "owner-terminal",
+                 "route_id": route["route_id"], "route_hash": route["route_hash"],
+                 "node_id": "owner", "completion_gate": "code-report", "attempt_id": "att-owner",
+                 "evidence_digest": "a" * 64, "marker_digest": "b" * 64}
+        directory = self.root / "completion"
+        directory.mkdir()
+        route_module = SimpleNamespace(
+            completion_dir=lambda _route_id: directory,
+            owner_executed_terminal=lambda node: node.get("kind") == "capability-owner",
+        )
+        self.assertEqual(L._marker_digest(route_module, route, recorded=True,
+                                          recorded_gates={"owner": proof}),
+                         "sha256:" + hashlib.sha256(
+                             json.dumps([{"node_id": "owner", "sha256": "sha256:" + "b" * 64}],
+                                        sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+        route["nodes"][0]["kind"] = "pipeline-stage"
+        with self.assertRaisesRegex(L.LifecycleError, "completion-terminal-marker-unverified"):
+            L._marker_digest(route_module, route, recorded=True, recorded_gates={"owner": proof})
 
     def test_baseline_fixture_is_complete(self):
         fx = self._fixture()

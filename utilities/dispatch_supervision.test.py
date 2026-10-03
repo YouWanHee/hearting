@@ -43,6 +43,17 @@ class ResponsibilityTest(unittest.TestCase):
                     decision = policy.decide_attempt("done", {"harness": harness, "note": "completed-marker"}, process_state=state)
                     self.assertEqual((decision.outcome, decision.action, decision.retry_allowed), ("succeeded", action, False))
 
+    def test_supervisor_exit_closed_route_does_not_hide_live_child_cleanup(self):
+        from types import SimpleNamespace
+        self.jobs.write_text(row("att-child", status="done", workflow_completion="runtime-v1"))
+        with mock.patch("dispatch_notice_state.route_obligation_closed", return_value=True), \
+             mock.patch.object(contract, "observed_attempt_liveness",
+                               return_value=SimpleNamespace(process_state="live", process_reason="pid-live")), \
+             mock.patch("codex_dispatch_terminal.terminal_envelope_observed", return_value=False):
+            self.assertTrue(supervision._pending(
+                {"att-child": ("done", {**CURRENT, "attempt_id": "att-child", "workflow_completion": "runtime-v1"})},
+                ["att-child"], self.jobs, reason="supervisor-exited"))
+
     def test_unverified_admission_cleanup_cannot_retry_from_terminal_word(self):
         for harness in ("claude", "codex", "opencode"):
             for state in ("live", "unverifiable"):

@@ -7,6 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
+from route_identity import route_hash
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WATCH = ROOT / "utilities" / "dispatch-orphan-watch.py"
@@ -20,13 +22,15 @@ class OrphanWatchTest(unittest.TestCase):
         self.jobs = self.base / "jobs.log"
         self.route_id = "rt-watch"
         self.route = self.base / "route.json"
-        self.route.write_text(json.dumps({
+        route = {
             "route_id": self.route_id,
             "nodes": [
                 {"id": "plan", "depends_on": []},
                 {"id": "execute", "depends_on": ["plan"]},
             ],
-        }))
+        }
+        route["route_hash"] = route_hash(route)
+        self.route.write_text(json.dumps(route))
         marker_dir = self.home / ".dispatch" / "completion" / self.route_id
         marker_dir.mkdir(parents=True)
         (marker_dir / "plan.json").write_text(json.dumps({"node_id": "plan"}))
@@ -87,7 +91,8 @@ class OrphanWatchTest(unittest.TestCase):
             f"{supervised_metadata}\n"
             "2026-07-19T00:00:01Z\topen\t/r\t/w\tchild\t"
             f"{current},dispatch_depth=2,route_id={self.route_id},"
-            f"route_file={self.route},route_node=execute,attempt_id=att-child,"
+            f"route_file={self.route},route_hash={json.loads(self.route.read_text())['route_hash']},"
+            "route_node=execute,attempt_id=att-child,"
             f"parent=owner,parent_attempt_id=att-watch,pid={child_pid},"
             f"pid_start={child_start}{child_group}\n"
         )
@@ -142,6 +147,11 @@ class OrphanWatchTest(unittest.TestCase):
 
     def test_terminal_owner_waits_then_finishes_child_cleanup(self):
         self.write_rows(completed_owner=True)
+        self.route.with_suffix(".outcome.json").write_text(json.dumps({
+            "route_id": self.route_id,
+            "route_hash": json.loads(self.route.read_text())["route_hash"],
+            "terminal_gate_proven": True,
+        }))
         before = self.jobs.read_text()
         watcher = self.watcher()
         time.sleep(0.08)

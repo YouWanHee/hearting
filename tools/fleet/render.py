@@ -4679,25 +4679,48 @@ _PROGRESS_TQDM_RE = re.compile(
     r"(?P<count>[\d.]+[kMGTPE]?/[\d.]+[kMGTPE]?)(?P<rest>.*)$")
 _PROGRESS_LEFT_RE = re.compile(r"\s*\[[^<\]]*<\s*(?P<left>\d[\d:]*)")
 _PROGRESS_METRIC_RE = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*=[^\s,;\[\]]+")
+_PROGRESS_LEADING_STATE_RE = re.compile(r"^(?P<state>waiting:|ERROR:|error:)(?:\s*)(?P<detail>.*)$")
 _PROGRESS_STALLED_S = 300
-_PROGRESS_BODY_CACHE = {}   # {(pid, line): compact text}; the line changes per probe, not per frame
+_PROGRESS_BODY_CACHE = {}   # {(pid, line): immutable compact segments}; bounded below
 
 
-def _progress_body(line):
+def _progress_body_segments(line):
     match = _PROGRESS_TQDM_RE.match(line)
     if not match:
-        return line
+        state = _PROGRESS_LEADING_STATE_RE.match(line)
+        if state:
+            key = "lvl_y" if state.group("state") == "waiting:" else "lvl_r"
+            parts = [(state.group("state"), key)]
+            if state.group("detail"):
+                parts.extend([(" ", "dim"), (state.group("detail"), "dim")])
+            return tuple(parts)
+        return ((line, "dim"),)
     desc = match.group("desc").strip().rstrip(":").strip()[:24]
-    parts = [" ".join(part for part in (desc, match.group("pct") + "%",
-                                        match.group("count")) if part)]
+    parts = []
+
+    fields = [(desc, "resource_active") if desc else None,
+              (match.group("pct") + "%", "lvl_g"), (match.group("count"), "dim")]
+    for field in fields:
+        if field is not None:
+            if parts:
+                parts.append((" ", "dim"))
+            parts.append(field)
     rest = match.group("rest")
     left = _PROGRESS_LEFT_RE.match(rest)
     if left:
-        parts.append(left.group("left") + " left")
+        parts.extend(((" · ", "dim"), (left.group("left") + " left", "dim")))
     metrics = _PROGRESS_METRIC_RE.findall(rest)[:2]
-    if metrics:
-        parts.append(" ".join(metrics))
-    return " · ".join(parts)
+    for index, metric in enumerate(metrics):
+        label, value = metric.split("=", 1)
+        if parts:
+            parts.append((" · " if index == 0 else " ", "dim"))
+        parts.extend(((label + "=", "dim"), (value, "resource_active")))
+    return tuple(parts) or ((line, "dim"),)
+
+
+def _progress_body(line):
+    """The historical compact plain-text form of one training line."""
+    return "".join(text for text, _key in _progress_body_segments(line))
 
 
 _PROGRESS_EPOCH_RE = re.compile(r"\d{1,7}(?:\.\d{1,4})?\Z")
@@ -4717,6 +4740,20 @@ def _progress_epoch(epoch):
     return text + " done" if epoch.get("done") is True else text
 
 
+def _progress_epoch_segments(epoch):
+    text = _progress_epoch(epoch)
+    if text is None:
+        return ()
+    number = epoch["n"]
+    parts = [("ep ", "dim"), (number, "resource_active")]
+    total = epoch.get("of")
+    if isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7:
+        parts.extend((("/", "dim"), (str(total), "dim")))
+    if epoch.get("done") is True:
+        parts.extend(((" ", "dim"), ("done", "lvl_g")))
+    return tuple(parts)
+
+
 def _progress_age(age_s):
     # Only a stall is worth a suffix: a live run rewrites its log every few seconds,
     # so a fresh age read "0s ago" on every frame and said nothing.
@@ -4730,8 +4767,29 @@ def _progress_age(age_s):
     return None, None
 
 
+def _clip_progress_segments(segs, width):
+    """Clip role segments to the same text, including ellipsis, as the old plain row."""
+    if sum(_dw(text) for text, _key in segs) <= width:
+        return list(segs)
+    room = max(0, width - 1)  # reserve the historical one-cell ellipsis
+    out = []
+    used = 0
+    for text, key in segs:
+        if used >= room:
+            break
+        piece = _clip_w(text, room - used, ellipsis="")
+        if piece:
+            out.append((piece, key))
+            used += _dw(piece)
+        if _dw(piece) < _dw(text):
+            break
+    if width > 0:
+        out.append(("…", "dim"))
+    return out
+
+
 def _gpu_progress_row(process, indent, width):
-    """One dim line of the process's latest file-redirected output, or None."""
+    """One compact, role-colored line from the process snapshot, or None."""
     progress = process.get("progress")
     if not isinstance(progress, dict):
         return None
@@ -4743,19 +4801,20 @@ def _gpu_progress_row(process, indent, width):
     if body is None:
         if len(_PROGRESS_BODY_CACHE) >= 256:
             _PROGRESS_BODY_CACHE.clear()
-        body = _PROGRESS_BODY_CACHE[key] = _progress_body(line)
-    epoch = _progress_epoch(progress.get("epoch"))
+        body = _PROGRESS_BODY_CACHE[key] = _progress_body_segments(line)
+    epoch = _progress_epoch_segments(progress.get("epoch"))
+    body = list(body)
     if epoch:
-        body = epoch + " · " + body
+        body = list(epoch) + [(" · ", "dim")] + body
     prefix = [(indent + "      ", None), ("↳ ", "dim")]
     age_text, age_key = _progress_age(progress.get("age_s"))
     suffix = [(" · ", "dim"), (age_text, age_key)] if age_text else []
     # The age is the stall signal, so the body yields width before it does.
     room = width - sum(_dw(text) for text, _key in prefix + suffix)
     if room >= 2:
-        segs = prefix + [(_clip_w(body, room), "dim")] + suffix
+        segs = prefix + _clip_progress_segments(body, room) + suffix
     else:
-        segs = prefix + ([(age_text, age_key)] if age_text else [(body, "dim")])
+        segs = prefix + ([(age_text, age_key)] if age_text else body)
     return _clip_segs(segs, width)[0]
 
 

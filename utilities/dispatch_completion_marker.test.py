@@ -715,6 +715,29 @@ class CompletionMarkerTest(unittest.TestCase):
             self.assertNotEqual(again.returncode, 0)
             self.assertIn("revision-evidence-unchanged", again.stdout + again.stderr)
 
+    def test_missing_completed_evidence_is_history_only_with_gates_off(self):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "off"}, clear=True):
+            route, _route_path, evidence, marker_path = self._gates_off_cycle_route("route-gates-off-delete.json")
+            node = next(n for n in route["nodes"] if n["id"] == "plan")
+            recorded = json.loads(marker_path.read_text())["evidence"]["sha256"]
+            evidence.unlink()
+            currency = D.evidence_currency(route, node, marker_path)
+            self.assertEqual((currency.state, currency.reason, currency.evidence_digest),
+                             ("current", "completion-evidence-recorded-missing", recorded))
+            D.note_evidence_change(route, node, marker_path)
+            D.note_evidence_change(route, node, marker_path)
+            history = [json.loads(line) for line in
+                       D.evidence_change_history_path(marker_path, "plan").read_text().splitlines()]
+            self.assertEqual(len(history), 1)
+            self.assertEqual((history[0]["change_kind"], history[0]["reason"], history[0]["sha256"]),
+                             ("missing", "evidence-missing-after-completion", recorded))
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
+            route, _route_path, evidence, marker_path = self._gates_off_cycle_route("route-gates-on-delete.json")
+            evidence.unlink()
+            node = next(n for n in route["nodes"] if n["id"] == "plan")
+            self.assertEqual(D.evidence_currency(route, node, marker_path).reason,
+                             "completion-evidence-unreadable")
+
     def test_revise_unchanged_means_the_named_evidence_equals_the_recorded_digest(self):
         """One rule in both gate modes: a revision is owed exactly when the evidence it
         names differs from the digest the marker recorded."""

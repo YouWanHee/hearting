@@ -84,11 +84,10 @@ def _check_row_shape(section: str, key: Any, row: Any, expected: frozenset) -> N
         raise ValueError("index {0} key must be a non-empty string".format(section))
     if not isinstance(row, dict):
         raise ValueError("index {0}[{1!r}] row must be an object".format(section, key))
-    got = set(row.keys())
-    if got != set(expected):
+    if row.keys() != expected:
         raise ValueError(
             "index {0}[{1!r}] row keys {2} do not match the closed shape {3}".format(
-                section, key, sorted(got), sorted(expected)
+                section, key, sorted(row), sorted(expected)
             )
         )
     for field_name, value in row.items():
@@ -119,7 +118,7 @@ def _check_row_shape(section: str, key: Any, row: Any, expected: frozenset) -> N
             )
 
 
-def parse(payload: Mapping[str, Any]) -> IndexDocument:
+def _parse(payload: Mapping[str, Any], *, owned: bool) -> IndexDocument:
     if not isinstance(payload, dict):
         raise ValueError("index payload must be an object")
     extra = set(payload.keys()) - _INDEX_KEYS
@@ -148,16 +147,29 @@ def parse(payload: Mapping[str, Any]) -> IndexDocument:
             raise ValueError("index routes[{0!r}] must be an object".format(root_id))
         for route_id, row in bucket.items():
             _check_row_shape("routes[{0!r}]".format(root_id), route_id, row, _ROUTE_ROW_SHAPE)
+    copy_rows = (lambda rows: rows) if owned else (lambda rows: {k: dict(v) for k, v in rows.items()})
+    copy_routes = ((lambda rows: rows) if owned else
+                   (lambda rows: {k: {rk: dict(rv) for rk, rv in v.items()} for k, v in rows.items()}))
     return IndexDocument(
         schema_version=payload["schema_version"],
         artifact_root_id=payload["artifact_root_id"],
-        stable_ids={k: dict(v) for k, v in payload["stable_ids"].items()},
-        routes={k: {rk: dict(rv) for rk, rv in v.items()} for k, v in payload["routes"].items()},
-        event_ids={k: dict(v) for k, v in payload["event_ids"].items()},
-        streams={k: dict(v) for k, v in payload["streams"].items()},
-        manifests={k: dict(v) for k, v in payload["manifests"].items()},
-        cycles={k: dict(v) for k, v in payload["cycles"].items()},
+        stable_ids=copy_rows(payload["stable_ids"]),
+        routes=copy_routes(payload["routes"]),
+        event_ids=copy_rows(payload["event_ids"]),
+        streams=copy_rows(payload["streams"]),
+        manifests=copy_rows(payload["manifests"]),
+        cycles=copy_rows(payload["cycles"]),
     )
+
+
+def parse(payload: Mapping[str, Any]) -> IndexDocument:
+    """Validate and copy a public payload so its mutable rows stay independent."""
+    return _parse(payload, owned=False)
+
+
+def _parse_owned(payload: Dict[str, Any]) -> IndexDocument:
+    """Validate a private JSON-loader result and adopt its already-owned rows."""
+    return _parse(payload, owned=True)
 
 
 def to_payload(index: IndexDocument) -> Dict[str, Any]:
@@ -174,6 +186,21 @@ def to_payload(index: IndexDocument) -> Dict[str, Any]:
 
 
 def canonical_bytes(index: IndexDocument) -> bytes:
+    sections = (index.stable_ids, index.routes, index.event_ids, index.streams,
+                index.manifests, index.cycles)
+    if all(type(section) is dict for section in sections) and all(
+        type(bucket) is dict for bucket in index.routes.values()
+    ):
+        return _manifest_canonical_bytes({
+            "schema_version": index.schema_version,
+            "artifact_root_id": index.artifact_root_id,
+            "stable_ids": index.stable_ids,
+            "routes": index.routes,
+            "event_ids": index.event_ids,
+            "streams": index.streams,
+            "manifests": index.manifests,
+            "cycles": index.cycles,
+        })
     return _manifest_canonical_bytes(to_payload(index))
 
 
@@ -429,7 +456,9 @@ def apply(
             }
 
     for root_id, route_id in declared_routes(document):
-        bucket = dict(routes.get(root_id, {}))
+        bucket = routes.get(root_id)
+        if bucket is None:
+            bucket = {}
         bucket[route_id] = {"cycle_id": cycle_id, "route_hash": None}
         routes[root_id] = bucket
 

@@ -713,7 +713,7 @@ def load_index(root: Path) -> artifact_index.IndexDocument:
     if payload is None:
         identity = ensure_root_identity(root)
         return artifact_index.empty(identity.artifact_root_id)
-    return artifact_index.parse(payload)
+    return artifact_index._parse_owned(payload)
 
 
 def _write_index(root: Path, index: artifact_index.IndexDocument) -> None:

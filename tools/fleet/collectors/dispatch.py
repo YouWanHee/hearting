@@ -1676,6 +1676,15 @@ def _enrich_codex_attempt_session(job):
     if parsed.get("thread_ambiguity"):
         job.association_ambiguity = "multiple-attempt-thread-ids"
         thread_id = None
+        # Every payload item in this one attempt is thread-scoped, including the
+        # supervisor usage event and open command item. Once the exact attempt log
+        # contains multiple thread ids, none of its counters, activity, or exec
+        # labels can be assigned to this worker without borrowing a thread's data.
+        parsed = dict(parsed, token_usage=None, activity=None, exec_tool=None)
+        job._runtime_session_id = None
+        job.context = None
+        job.ctx_pct = None
+        job._context_evidence = None
     elif thread_id:
         job._runtime_session_id = thread_id
     activity = parsed.get("activity")

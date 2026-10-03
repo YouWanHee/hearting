@@ -7577,6 +7577,8 @@ def record_evidence_change(
     marker_path: Path,
     marker: Mapping[str, object],
     digest: str,
+    *,
+    change_kind: str = "edited",
 ) -> None:
     """Record one evidence edit after its completion marker; never refuse it.
 
@@ -7604,7 +7606,8 @@ def record_evidence_change(
                 except ValueError:
                     previous = None
             if (isinstance(previous, dict) and previous.get("sha256") == digest
-                    and previous.get("marker_sequence") == marker.get("sequence")):
+                    and previous.get("marker_sequence") == marker.get("sequence")
+                    and previous.get("change_kind", "edited") == change_kind):
                 return
             changed_at = None
             evidence_path = Path(str(evidence.get("path") or ""))
@@ -7627,7 +7630,9 @@ def record_evidence_change(
                                     and previous.get("marker_sequence") == marker.get("sequence")
                                     else evidence.get("sha256")),
                 "sha256": digest,
-                "reason": "evidence-changed-after-completion",
+                "change_kind": change_kind,
+                "reason": ("evidence-missing-after-completion" if change_kind == "missing"
+                           else "evidence-changed-after-completion"),
                 "evidence_changed_at": changed_at,
                 "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "observed_by": (os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
@@ -7663,8 +7668,11 @@ def note_evidence_change(
     except (OSError, ValueError, TypeError, DispatchContractError):
         return
     evidence = marker.get("evidence") if isinstance(marker.get("evidence"), dict) else {}
-    if (currency.state == "current" and currency.evidence_digest
-            and currency.evidence_digest != evidence.get("sha256")):
+    if currency.state == "current" and currency.reason == "completion-evidence-recorded-missing":
+        record_evidence_change(route, node, marker_path, marker, str(evidence.get("sha256") or ""),
+                               change_kind="missing")
+    elif (currency.state == "current" and currency.evidence_digest
+          and currency.evidence_digest != evidence.get("sha256")):
         record_evidence_change(route, node, marker_path, marker, currency.evidence_digest)
 
 
@@ -7729,13 +7737,38 @@ def evidence_currency(
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
     evidence_path_str = str(evidence_record.get("path") or "")
     evidence_path = Path(evidence_path_str) if evidence_path_str else None
-    digest = None
-    if evidence_path is not None and evidence_path.is_absolute():
+    if evidence_path is None or not evidence_path.is_absolute():
+        return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
+    if not os.path.lexists(evidence_path):
+        # Keep the same recorded-move resolution as evidence_digest before
+        # classifying an absent original locator as deleted evidence.
         try:
-            digest = evidence_digest(evidence_path)
-        except (OSError, ValueError):
-            digest = None
-    if digest is None:
+            from artifact_producer import resolve_placed_output
+            evidence_path = resolve_placed_output(evidence_path)
+        except (ImportError, OSError, ValueError):
+            pass
+    try:
+        evidence_path.lstat()
+    except FileNotFoundError:
+        # evidence_digest intentionally normalizes a missing path to a typed
+        # ValueError; inspect the directory entry first so only true absence
+        # can take the recorded-history branch.
+        try:
+            marker_stat = marker_path.lstat()
+            recorded_sha = evidence_record.get("sha256")
+            if (not gates_on() and stat.S_ISREG(marker_stat.st_mode)
+                    and isinstance(recorded_sha, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", recorded_sha)):
+                return GateCurrency("current", "completion-evidence-recorded-missing",
+                                    evidence_digest=recorded_sha)
+        except OSError:
+            pass
+        return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
+    except OSError:
+        return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
+    try:
+        digest = evidence_digest(evidence_path)
+    except (OSError, ValueError):
         return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
     if digest != evidence_record.get("sha256"):
         node_id = str(node.get("id"))

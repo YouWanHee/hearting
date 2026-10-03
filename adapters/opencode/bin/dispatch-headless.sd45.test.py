@@ -20,19 +20,21 @@ class NestedRuntimeTest(unittest.TestCase):
             user_config.mkdir(parents=True)
             config_file = user_config / "opencode.json"
             config_file.write_text('{"model":"fixture/light"}')
-            values = WH.prepare_nested_runtime(worktree, "att-runtime-one", env)
+            state_root = root / "dispatch-state"
+            state_root.mkdir()
+            values = WH.prepare_nested_runtime(worktree, "att-runtime-one", env, state_root)
             self.assertEqual(env["XDG_DATA_HOME"], str(source.parent))
             projected = Path(values["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
             self.assertTrue(projected.is_symlink())
             self.assertEqual(projected.resolve(), config_file)
             for path in values.values():
-                self.assertTrue(Path(path).is_relative_to(worktree))
+                self.assertTrue(Path(path).is_relative_to(state_root))
                 self.assertEqual(Path(path).stat().st_mode & 0o777, 0o700)
             link = Path(values["XDG_DATA_HOME"]) / "opencode" / "auth.json"
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.resolve(), auth)
-            self.assertEqual(WH.prepare_nested_runtime(worktree, "att-runtime-one", env), values)
-            other = WH.prepare_nested_runtime(worktree, "att-runtime-two", env)
+            self.assertEqual(WH.prepare_nested_runtime(worktree, "att-runtime-one", env, state_root), values)
+            other = WH.prepare_nested_runtime(worktree, "att-runtime-two", env, state_root)
             self.assertNotEqual(values, other)
             self.assertEqual(auth.read_text(), '{"fixture":{}}')
 
@@ -40,9 +42,11 @@ class NestedRuntimeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); worktree = root / "worktree"; worktree.mkdir()
             outside = root / "outside"; outside.mkdir()
-            (worktree / ".dispatch").symlink_to(outside, target_is_directory=True)
-            with self.assertRaisesRegex(WH.DispatchContractError, "outside-worktree"):
-                WH.prepare_nested_runtime(worktree, "att-runtime", {})
+            state_root = root / "dispatch-state"
+            state_root.mkdir()
+            (state_root / "opencode-runtime").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(WH.DispatchContractError, "outside-state-root"):
+                WH.prepare_nested_runtime(worktree, "att-runtime", {}, state_root)
 
 
 def isolated_dispatch_env(**updates):

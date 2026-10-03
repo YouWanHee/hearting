@@ -7,6 +7,7 @@ scope hashing; legacy evidence without a launch scope remains diagnostic only.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -15,8 +16,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import tempfile
 import time
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platforms without advisory flock use direct reads
+    fcntl = None
 
 HARNESSES = ("claude", "codex", "opencode")
 WINDOWS = {"five_hour": 6 * 3600, "seven_day": 8 * 86400,
@@ -304,6 +310,69 @@ def _snapshot(jobs, now, lines=None):
             "horizon": now, "cacheable": _DISK_CACHE and stable and _settled(key), "dirty": True}
 
 
+@contextmanager
+def _snapshot_guard(jobs, now, lines=None):
+    """Coalesce a stable shared-cache miss; normal hits never take this lock."""
+    if lines is not None or not _DISK_CACHE or fcntl is None:
+        yield _snapshot(jobs, now, lines)
+        return
+    path = Path(jobs)
+    key = _stat_key(path)
+    if key is None or not _settled(key):
+        yield _snapshot(jobs, now)
+        return
+    try:
+        cached, _earlier = _load_cache(path, now)
+    except Exception:  # noqa: BLE001 - broken cache remains a direct-read fallback
+        cached = None
+    if cached is not None:
+        yield cached
+        return
+
+    lock_fd = None
+    try:
+        lock_path = Path(str(_cache_path(path)) + ".lock")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(lock_path, flags, 0o600)
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise OSError("cache lock is not a regular file")
+        os.fchmod(lock_fd, 0o600)
+        deadline = time.monotonic() + 1.0
+        locked = False
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+    except Exception:  # noqa: BLE001 - unsupported lock/cache filesystem uses direct read
+        if lock_fd is not None:
+            os.close(lock_fd)
+        yield _snapshot(path, now)
+        return
+
+    if not locked:
+        os.close(lock_fd)
+        yield _snapshot(path, now)
+        return
+    try:
+        try:
+            cached, _earlier = _load_cache(path, now)
+        except Exception:  # noqa: BLE001
+            cached = None
+        # Another cold process may have published while this one waited.
+        yield cached if cached is not None else _snapshot(path, now)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
 def _persist(snapshot):
     """Publish the snapshot beside jobs.log: 0600, same-directory temp file, atomic replace."""
     if not (snapshot and snapshot.get("cacheable") and snapshot.get("dirty")):
@@ -386,12 +455,12 @@ def _native_observations(snapshot, env, now):
 
 def observations(jobs, *, now=None, env=None, registry_lines=None):
     now = time.time() if now is None else now
-    snapshot = _snapshot(jobs, now, registry_lines)
-    if snapshot is None:
-        return []
-    found = _native_observations(snapshot, env, now)
-    _persist(snapshot)
-    return found
+    with _snapshot_guard(jobs, now, registry_lines) as snapshot:
+        if snapshot is None:
+            return []
+        found = _native_observations(snapshot, env, now)
+        _persist(snapshot)
+        return found
 
 
 def _limit_models(profile, models, env):
@@ -511,7 +580,12 @@ def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, 
     """`(states, epochs)`: the usage state per harness and, when known, when it ends."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
-    snapshot = _snapshot(jobs, now)
+    with _snapshot_guard(jobs, now) as snapshot:
+        return _usage_snapshot(snapshot, profile=profile, models=models,
+                               unknown_window_min=unknown_window_min, now=now, env=env)
+
+
+def _usage_snapshot(snapshot, *, profile, models, unknown_window_min, now, env):
     if snapshot is None:
         return dict.fromkeys(HARNESSES, "unknown"), {}
     states = dict.fromkeys(HARNESSES, "ok")

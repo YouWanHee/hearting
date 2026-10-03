@@ -43,6 +43,13 @@ class OpencodeServerLogTest(unittest.TestCase):
         metadata.update(overrides)
         return metadata
 
+    def test_canonical_attempt_runtime_precedes_legacy_project_path(self):
+        runtime = self.base / "dispatch-state" / "opencode-runtime" / "att-1"
+        candidates = OSL._candidate_server_logs(
+            self._metadata(opencode_runtime_dir=str(runtime)))
+        self.assertEqual(candidates[0], runtime / "data" / "opencode" / "log" / "opencode.log")
+        self.assertEqual(candidates[1], self.server_log)
+
     def test_exact_session_binding(self):
         _write_jsonl(self.attempt_log, [
             {"type": "step_start", "sessionID": "ses_x111"},

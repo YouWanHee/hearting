@@ -29,6 +29,7 @@ from dispatch_completion_join import (
 from dispatch_parent_completion import default_parent_session_id, interactive_parent_identity
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
 from parent_next_directive import parent_next
+from execution_access import ExecutionAccessError, prepare_task_request
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import route_plan as RP
 
@@ -400,9 +401,33 @@ def _start(route, path, jobs, node, harness, run):
         command += ["--route-node", node]
     if harness:
         command += ["--adapter", harness]
+    access_diagnostic = ""
+    # Existing explicit requests keep precedence. For a task that directly
+    # names its ROOTS data, prepare the same request format used by the
+    # wrapper; start and resume both pass through this function.
+    if not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
+        try:
+            prepared = prepare_task_request(route, jobs)
+        except ExecutionAccessError as exc:
+            access_diagnostic = f"{exc.reason}: {exc.detail}"
+            # An explicit target input was recognized but could not be safely
+            # prepared. Preserve the existing typed execution-access reason
+            # and stop before dispatch-owner can take its default grant path.
+            return {
+                "attempt_id": attempt_id(route, node),
+                "exit_code": 69,
+                "receipt": f"check=failed\nreason={exc.reason}\ndetail={exc.detail}\nchild_spawned=0\n",
+                "diagnostic": "",
+                "execution_access_diagnostic": access_diagnostic,
+            }
+        if prepared is not None:
+            command += ["--execution-access-file", str(prepared)]
     result = run(command, text=True, capture_output=True, check=False)
-    return {"attempt_id": attempt_id(route, node), "exit_code": result.returncode,
-            "receipt": result.stdout, "diagnostic": result.stderr}
+    receipt = {"attempt_id": attempt_id(route, node), "exit_code": result.returncode,
+               "receipt": result.stdout, "diagnostic": result.stderr}
+    if access_diagnostic:
+        receipt["execution_access_diagnostic"] = access_diagnostic
+    return receipt
 
 
 def _never_started(status, meta):
@@ -1304,6 +1329,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     if "reason=frame-harness-unavailable" in receipt_lines and "child_spawned=0" in receipt_lines:
                         return {**result, "state": "needs-attention", "reason": "frame-harness-unavailable",
                                 "frame_attempts": sorted(attempts)}
+                    launch_reason = _launch_failure_reason(result["launches"][-1])
+                    if launch_reason.startswith("execution-access-"):
+                        return {**result, "state": "needs-attention", "reason": launch_reason,
+                                "frame_attempts": sorted(attempts)}
                     if (node["id"] == "frame-alternative" and result["launches"][-1]["exit_code"] == 75
                             and "check=deferred" in receipt_lines
                             and "reason=frame-first-attempt-pending" in receipt_lines
@@ -1385,6 +1414,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     if aid not in rows:
         if refusal:
             return _capacity_wait(result, aid, "owner", refusal, resume, clock)
+        launch_reason = _launch_failure_reason(result["launches"][-1]) if result["launches"] else "-"
+        if launch_reason.startswith("execution-access-"):
+            return {**result, "state": "needs-attention", "reason": launch_reason,
+                    "launch_reason": launch_reason}
         if result["launches"] and _launch_failure_reason(result["launches"][-1]).partition(":")[0] == "admission-busy":
             # The launcher's preparation timed out on a held admission lock before any row existed.
             return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted",

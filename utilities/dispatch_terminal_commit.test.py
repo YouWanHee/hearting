@@ -1723,7 +1723,7 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             placed = next(Path(fixture.root).rglob("owner-report.md"))
         self.assertIn(f"artifact: {placed.resolve()}", handoff)
 
-    def test_a_changed_or_missing_report_still_fails_the_replay(self):
+    def test_a_changed_or_missing_report_is_history_after_settlement(self):
         for harness in ("claude",):   # the damage is to the report file, whatever shape the native result had
             for damage in ("bytes", "missing"):
                 with self.subTest(harness=harness, damage=damage):
@@ -1734,8 +1734,9 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                             report.write_text("tampered after settlement")
                         else:
                             report.unlink()
-                        self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
-                        self.assertNotEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+                        self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                        replay = terminal.settle_owner_completion(jobs, "done", meta)
+                        self.assertEqual(replay.result, "completed", replay)
 
 
 class OwnerFinishPrimaryRegressionTest(_TerminalCommitFixture):

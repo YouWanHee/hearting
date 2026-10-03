@@ -3329,11 +3329,9 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                         self.assertFalse((R.completion_dir(route["route_id"],jobs=jobs)/"prd-transaction.json").exists())
                         self.assertEqual(P.read_cycle_record(fixture.root,cycle["cycle_id"])["state"],"sealed")
                         report.write_text("changed after settlement")
-                        # An owner-executed terminal node has no marker file: the route's own
-                        # observation of the owner's handoff still reads the report's bytes, so a
-                        # report edited after the settlement is still pending here.  (A worker-marker
-                        # terminal replays after an edit: see test_runtime_completion_finishes_and_replays...)
-                        self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+                        # The settled owner row preserves the completion even though an
+                        # owner-executed terminal has no worker marker file.
+                        self.assertFalse(terminal.owner_completion_pending(jobs,"done",meta))
                 finally: fixture.doCleanups()
 
     def _closed_owner(self, jobs, owner):

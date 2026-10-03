@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -16,8 +17,13 @@ from execution_access import (
     assert_within_parent,
     build_grant,
     load_request,
+    load_parent_effective_grant,
     receipt_fields,
     request_path,
+    publish_effective_grant,
+    prepare_task_request,
+    read_roots_data,
+    resolve_task_targets,
 )
 
 
@@ -376,6 +382,194 @@ class ExecutionAccessTest(unittest.TestCase):
 
         parent = ParentGrant(writable_roots=(self.root / "scoped",))
         assert_within_parent(request, parent, is_child=True)
+
+    def test_roots_reader_selects_only_named_rows_from_data_block(self) -> None:
+        manifest = self.root / "run_all.sh"
+        selected = tuple(f"project-{index}" for index in range(12))
+        rows = [f"{name}|{self.root}/external/{index}/.agent_reports"
+                for index, name in enumerate(selected)]
+        rows.append(f"unrequested-13|{self.root}/external/13/.agent_reports")
+        manifest.write_text(
+            "#!/bin/sh\ndone <<'ROOTS'\n" + "\n".join(rows) + "\nROOTS\n",
+            encoding="utf-8",
+        )
+        targets = read_roots_data(manifest, selected)
+        self.assertEqual(selected, targets.selected_names)
+        self.assertEqual(12, len(targets.writable_roots))
+        self.assertNotIn(self.root / "external/13/.agent_reports", targets.writable_roots)
+        self.assertEqual(64, len(targets.manifest_sha256))
+
+    def linked_roots_fixture(self):
+        primary = self.root / "primary"
+        linked = self.root / "linked"
+        primary.mkdir()
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        subprocess.run(["git", "-C", str(primary), "-c", "user.name=Fixture", "-c",
+                        "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b", "fixture-linked", str(linked)], check=True)
+        canonical = primary / ".agent_reports"
+        canonical.mkdir()
+        return primary, linked, canonical
+
+    @staticmethod
+    def target_route(cwd: Path, artifact_root: Path, *, preview=".agent_reports/_scratch/flow"):
+        return {
+            "route_id": "rt-test",
+            "route_hash": "sha256:" + "a" * 64,
+            "cwd": str(cwd),
+            "artifact_root": str(artifact_root),
+            "work_request": {"text": (
+                "## 입력\n"
+                f"- 미리보기(사용자가 본 것): {preview}/previews/<루트>.md\n"
+                "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha)\n"
+            )},
+        }
+
+    def test_task_target_resolution_uses_canonical_artifact_root_for_linked_worktree(self) -> None:
+        primary, linked, canonical = self.linked_roots_fixture()
+        manifest = canonical / "_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("done <<'ROOTS'\nalpha|/tmp/canonical/.agent_reports\nROOTS\n", encoding="utf-8")
+        # A same-named linked-worktree shadow carries different authority and must be ignored.
+        shadow = linked / ".agent_reports/_scratch/flow/previews/run_all.sh"
+        shadow.parent.mkdir(parents=True)
+        shadow.write_text("done <<'ROOTS'\nalpha|/tmp/shadow/.agent_reports\nROOTS\n", encoding="utf-8")
+        route = self.target_route(linked, canonical)
+        targets = resolve_task_targets(route)
+        self.assertEqual(canonical.resolve(), targets.manifest_path.parent.parent.parent.parent)
+        self.assertEqual((Path("/tmp/canonical/.agent_reports"),), targets.writable_roots)
+
+    def test_missing_canonical_roots_never_falls_back_to_linked_shadow(self) -> None:
+        _, linked, canonical = self.linked_roots_fixture()
+        shadow = linked / ".agent_reports/_scratch/flow/previews/run_all.sh"
+        shadow.parent.mkdir(parents=True)
+        shadow.write_text("done <<'ROOTS'\nalpha|/tmp/shadow/.agent_reports\nROOTS\n", encoding="utf-8")
+        with self.assertRaises(ExecutionAccessError) as raised:
+            resolve_task_targets(self.target_route(linked, canonical))
+        self.assertEqual("execution-access-target-input-invalid", raised.exception.reason)
+        self.assertIn("No such file", raised.exception.detail)
+
+    def test_canonical_roots_symlink_is_not_followed(self) -> None:
+        _, linked, canonical = self.linked_roots_fixture()
+        real = canonical / "_scratch/flow/previews/real-roots.sh"
+        real.parent.mkdir(parents=True)
+        real.write_text("done <<'ROOTS'\nalpha|/tmp/outside/.agent_reports\nROOTS\n", encoding="utf-8")
+        manifest = canonical / "_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.symlink_to(real)
+        with self.assertRaises(ExecutionAccessError) as raised:
+            resolve_task_targets(self.target_route(linked, canonical))
+        self.assertEqual("execution-access-target-input-invalid", raised.exception.reason)
+        self.assertIn("non-symlink regular file", raised.exception.detail)
+
+    def test_source_relative_target_keeps_route_cwd_and_noninput_prose_has_no_authority(self) -> None:
+        primary, linked, canonical = self.linked_roots_fixture()
+        manifest = linked / "source/_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("done <<'ROOTS'\nalpha|/tmp/source/.agent_reports\nROOTS\n", encoding="utf-8")
+        route = self.target_route(linked, canonical, preview="source/_scratch/flow")
+        targets = resolve_task_targets(route)
+        self.assertEqual(manifest.resolve(), targets.manifest_path)
+        self.assertEqual((Path("/tmp/source/.agent_reports"),), targets.writable_roots)
+        route["work_request"] = {"text": "Quoted old task: .agent_reports/_scratch/flow previews/run_all.sh ROOTS(alpha)"}
+        self.assertIsNone(resolve_task_targets(route))
+        route["work_request"] = {"text": (
+            "## 입력\n"
+            "- 미리보기(사용자가 본 것): .agent_reports-copy/_scratch/flow/previews/<루트>.md\n"
+            "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha)\n"
+        )}
+        with self.assertRaises(ExecutionAccessError) as raised:
+            resolve_task_targets(route)
+        self.assertEqual("execution-access-target-input-invalid", raised.exception.reason)
+        route["work_request"] = {"text": (
+            "## 입력\n"
+            "- 미리보기(사용자가 본 것): source/_scratch/flow/previews/<루트>.md\n"
+            "- 루트 목록과 경로: other/run.sh 의 ROOTS 표(alpha)\n"
+        )}
+        with self.assertRaises(ExecutionAccessError) as raised:
+            resolve_task_targets(route)
+        self.assertEqual("execution-access-target-input-invalid", raised.exception.reason)
+
+    def test_prepared_request_is_route_bound_and_refuses_changed_manifest(self) -> None:
+        _, cwd, artifact_root = self.linked_roots_fixture()
+        manifest = artifact_root / "_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\nROOTS\n",
+            encoding="utf-8",
+        )
+        route = {
+            "route_id": "rt-test",
+            "route_hash": "sha256:" + "a" * 64,
+            "cwd": str(cwd),
+            "artifact_root": str(artifact_root),
+            "work_request": {"text": (
+                "## 입력\n"
+                "- 미리보기(사용자가 본 것): .agent_reports/_scratch/flow/previews/<루트>.md\n"
+                "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha)\n"
+            )},
+        }
+        jobs = self.state / "jobs.log"
+        request_file = prepare_task_request(route, jobs)
+        self.assertEqual(request_file, prepare_task_request(route, jobs))
+        request = json.loads(request_file.read_text(encoding="utf-8"))
+        self.assertEqual(["/tmp/alpha/.agent_reports"], request["writable_roots"])
+        binding = json.loads(request_file.with_name("binding.json").read_text(encoding="utf-8"))
+        self.assertEqual(str(artifact_root.resolve()), binding["artifact_root"])
+        self.assertEqual([], request["read_roots"])
+        manifest.write_text(
+            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\nbeta|/tmp/beta/.agent_reports\nROOTS\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ExecutionAccessError) as raised:
+            prepare_task_request(route, jobs)
+        self.assertEqual("execution-access-cache-conflict", raised.exception.reason)
+
+    def test_parent_effective_record_is_full_digest_bound_to_live_attempt(self) -> None:
+        request = self.request(read_roots=[], justification={})
+        grant = build_grant(
+            request, runtime="codex-exec", default_writable_roots=(self.worktree,),
+            network_available=False, effective_sandbox="workspace-write",
+        )
+        jobs = self.state / "jobs.log"
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        parent_id = "att-parent"
+        route_id = "rt-parent"
+        route_hash = "sha256:" + "b" * 64
+        effective_path, digest = publish_effective_grant(
+            jobs=jobs, attempt_id=parent_id, route_id=route_id,
+            route_hash=route_hash, runtime="codex-exec", sandbox="workspace-write",
+            grant=grant, default_writable_roots=(self.worktree,), network_allowed=False,
+        )
+        metadata = {
+            "attempt_id": parent_id, "route_id": route_id, "route_hash": route_hash,
+            "runtime_sandbox": "workspace-write",
+            "execution_access_effective_file": str(effective_path),
+            "execution_access_effective_sha256": digest,
+        }
+        jobs.write_text(
+            "now\topen\t12\tparent\tparent-slug\t"
+            + ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n",
+            encoding="utf-8",
+        )
+        parent = load_parent_effective_grant(
+            jobs=jobs, parent_attempt_id=parent_id, context=self.context,
+        )
+        self.assertIn(self.worktree, parent.writable_roots)
+        self.assertIn(self.root / "scoped" / "write", parent.writable_roots)
+        self.assertFalse(parent.network_allowed)
+
+        metadata["execution_access_effective_sha256"] = "0" * 64
+        jobs.write_text(
+            "now\topen\t12\tparent\tparent-slug\t"
+            + ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ExecutionAccessError) as raised:
+            load_parent_effective_grant(
+                jobs=jobs, parent_attempt_id=parent_id, context=self.context,
+            )
+        self.assertEqual("execution-access-parent-record-digest-mismatch", raised.exception.reason)
 
     def test_runtime_grades_network_and_receipt(self) -> None:
         request = self.request(
