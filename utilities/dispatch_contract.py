@@ -7739,6 +7739,14 @@ def evidence_currency(
     evidence_path = Path(evidence_path_str) if evidence_path_str else None
     if evidence_path is None or not evidence_path.is_absolute():
         return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
+    if not os.path.lexists(evidence_path):
+        # Keep the same recorded-move resolution as evidence_digest before
+        # classifying an absent original locator as deleted evidence.
+        try:
+            from artifact_producer import resolve_placed_output
+            evidence_path = resolve_placed_output(evidence_path)
+        except (ImportError, OSError, ValueError):
+            pass
     try:
         evidence_path.lstat()
     except FileNotFoundError:
