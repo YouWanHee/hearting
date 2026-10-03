@@ -1707,6 +1707,67 @@ class TestRoute(unittest.TestCase):
    self.assertFalse(recreated); self.assertTrue(replay["terminal_gate_proven"])
    self.assertEqual(retained[0].read_bytes(),raw)
 
+ def _false_closed_route(self,tmp,**close_kw):
+  # A route compiled against its own root, closed unproven, with the canonical
+  # route file in place so the lineage gate reads a valid record.
+  artifact_root=Path(tmp)/"artifacts"; artifact_root.mkdir()
+  route=R.compile_route(**self.args(artifact_root=str(artifact_root)))
+  node=route["nodes"][0]
+  jobs=Path(tmp)/"jobs.log"; jobs.write_text("",encoding="utf-8")
+  path=R.canonical_routes_dir(artifact_root)/f"{route['route_id']}.json"
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route),encoding="utf-8")
+  evidence=Path(tmp)/"evidence.txt"; evidence.write_text("terminal evidence",encoding="utf-8")
+  first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,**close_kw)
+  self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+  return route,node,path,jobs,evidence,R.outcome_path(path).read_bytes()
+
+ def test_historical_false_close_without_marker_or_with_stop_is_not_promoted(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   again,created=R.close_route(route,path,jobs=jobs)  # no terminal marker yet
+   self.assertFalse(created); self.assertFalse(again["terminal_gate_proven"])
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   stopped=dict(route,stop_reason="user-stop")  # an explicit stop is never promoted
+   kept,created=R.close_route(stopped,path,jobs=jobs)
+   self.assertFalse(created); self.assertFalse(kept["terminal_gate_proven"])
+   cancelled=dict(route,workflow_state="CANCELLED")
+   kept,created=R.close_route(cancelled,path,jobs=jobs)
+   self.assertFalse(created); self.assertFalse(kept["terminal_gate_proven"])
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+
+ def test_historical_false_close_identity_conflict_is_not_masked_and_keeps_bytes(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp,terminal_commit_id="a"*40,expected_owner_attempt_id="att-a")
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,terminal_commit_id="b"*40,expected_owner_attempt_id="att-a",jobs=jobs)
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,terminal_commit_id="a"*40,expected_owner_attempt_id="att-foreign",jobs=jobs)
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,terminal_commit_id="a"*40,jobs=jobs)  # omitting the owner cannot skip the stored one
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+
+ def test_two_concurrent_closes_consume_historical_false_once(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   code=("import importlib.util,json,sys\n"
+         "s=importlib.util.spec_from_file_location('r',sys.argv[1]);R=importlib.util.module_from_spec(s);s.loader.exec_module(R)\n"
+         "from pathlib import Path\n"
+         "route=json.loads(Path(sys.argv[2]).read_text())\n"
+         "out,created=R.close_route(route,Path(sys.argv[2]),jobs=Path(sys.argv[3]))\n"
+         "print(json.dumps([bool(created),out['terminal_gate_proven']]))\n")
+   env=dict(os.environ,AGENT_DISPATCH_JOBS=str(jobs))
+   procs=[subprocess.Popen([sys.executable,"-c",code,str(P),str(path),str(jobs)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) for _ in range(2)]
+   results=[]
+   for proc in procs:
+    out,err=proc.communicate(timeout=120); self.assertEqual(proc.returncode,0,err); results.append(json.loads(out.strip().splitlines()[-1]))
+   self.assertEqual(sorted(r[0] for r in results),[False,True]); self.assertTrue(all(r[1] for r in results),results)
+   retained=list(path.parent.glob("*.historical-false-*.outcome.json"))
+   self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+
  def test_outcome_replay_cannot_hide_identity_conflict_behind_matching_commit(self):
   existing={"route_id":"rt-0123456789abcdef","route_hash":"sha256:"+"a"*64,
             "terminal_commit_id":"commit-a","terminal_owner_attempt_id":"attempt-a",

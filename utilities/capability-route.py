@@ -5544,6 +5544,8 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
                 inline_commit=inline_commit)
             if changed:
                 return promoted, True
+            if promoted is not existing and promoted.get("terminal_gate_proven") is True:
+                return promoted, False  # a concurrent close already consumed it; report the current record
         if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
                 terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
                 producer_binding_digest=expected_producer_binding_digest,

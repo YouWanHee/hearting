@@ -2158,6 +2158,32 @@ class FinalizeStateConflictTest(ProducerTestBase):
         self.assertEqual(index.manifests[cycle_id]["manifest_digest"], m.manifest_digest(current))
         self.assertEqual(index.cycles[cycle_id]["manifest_digest"], m.manifest_digest(current))
 
+    def test_provisional_active_without_exact_completion_stays_active_and_retry_is_once(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        evidence = self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        before = manifest_path.read_bytes()
+        R.close_route(route, route_file, jobs=self.jobs)  # unproven close: no terminal marker yet
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        refreshed = P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+        self.assertNotEqual(refreshed.get("status"), "emitted", refreshed)
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self._complete_inline_for_latch(route, evidence)
+        R.close_route(route, route_file, jobs=self.jobs)
+        P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        completed = manifest_path.read_bytes()
+        again = P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(again["cycle_state"], "completed")
+        self.assertEqual(manifest_path.read_bytes(), completed)
+        document = json.loads(completed)
+        self.assertEqual(len([r for r in document["events"] if r["event_type"] == "cycle.completed"]), 1)
+        self.assertEqual(len([r for r in document["events"] if r["event_type"] == "route.terminal.recorded"]), 1)
+
     def test_provisional_refresh_payload_unchanged_publishes_completed_revision(self):
         self.activate()
         route, route_file, result = self.begin()
