@@ -78,16 +78,13 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         if aid not in rows:
             raise SupervisionError("supervision-attempt-missing")
         status, meta = rows[aid]
-        # A supervisor can exit normally after route close while the ledger's
-        # final settlement is still being flushed. Its old wait obligation is
-        # over; a genuine closure-blocked notice remains a separate obligation.
+        # Route settlement can retire its completion wait while process cleanup
+        # remains an independent obligation. Never let route close hide a live,
+        # unknown, or conflicting execution.
         from dispatch_notice_state import route_obligation_closed
-        if reason == "supervisor-exited" and route_obligation_closed(meta, jobs):
-            continue
-        if meta.get("workflow_completion") == "runtime-v1":
-            from dispatch_terminal_commit import owner_completion_pending
-            if owner_completion_pending(jobs, status, meta):
-                return True
+        route_closed = reason == "supervisor-exited" and route_obligation_closed(meta, jobs)
+        from dispatch_contract import observed_attempt_liveness
+        from codex_dispatch_terminal import terminal_envelope_observed
         proof = observed_attempt_liveness(status, meta,
             terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
             terminal_receipt_gate=True)
@@ -95,6 +92,14 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
                                   process_reason=proof.process_reason)
         if decision.action in {"wait", "recover", "reconcile", "inspect-conflict"}:
             return True
+        # A supervisor-exited notice may be only a lagging route-settlement
+        # signal. Once that exact route is closed, do not keep it alive solely
+        # because the workflow ledger is still flushing; closure-blocked remains
+        # a distinct reason and does not take this branch.
+        if meta.get("workflow_completion") == "runtime-v1":
+            from dispatch_terminal_commit import owner_completion_pending
+            if not route_closed and owner_completion_pending(jobs, status, meta):
+                return True
     return False
 
 

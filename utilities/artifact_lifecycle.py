@@ -592,7 +592,8 @@ def validate_publication(value: str) -> Decision:
     return Decision("accept", detail={"publication": value})
 
 
-def _marker_digest(route_module: Any, route: Mapping[str, Any], *, recorded: bool = False) -> str:
+def _marker_digest(route_module: Any, route: Mapping[str, Any], *, recorded: bool = False,
+                   recorded_gates: Optional[Mapping[str, Any]] = None) -> str:
     """Digest of the terminal completion markers.
 
     Live, it reads the route's gate observation, so a marker whose evidence file has
@@ -612,12 +613,28 @@ def _marker_digest(route_module: Any, route: Mapping[str, Any], *, recorded: boo
             try:
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError as exc:
-                # An owner-executed terminal node publishes no marker file; its proof is the
-                # owner's own observation, which is all there is to read for it.
-                live = live if live is not None else route_module.terminal_gate_observation(route)
-                proof = live.get(node_id, {})
-                digest = proof.get("marker_digest")
-                if not proof.get("passed") or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                # Only a verified recorded owner row can stand in for its
+                # intentionally absent worker marker. Worker-marker absence and
+                # other read errors remain fail-closed.
+                node = next((item for item in route.get("nodes", [])
+                             if item.get("id") == node_id), {})
+                proof = (recorded_gates or {}).get(node_id, {})
+                owner_node = getattr(route_module, "owner_executed_terminal", lambda _node: False)(node)
+                digest = proof.get("marker_digest") if isinstance(proof, Mapping) else None
+                valid_owner_row = (
+                    isinstance(exc, FileNotFoundError) and owner_node
+                    and isinstance(proof, Mapping) and proof.get("passed") is True
+                    and proof.get("current") is True and proof.get("source") == "owner-terminal"
+                    and proof.get("route_id") == route.get("route_id")
+                    and proof.get("route_hash") == route.get("route_hash")
+                    and proof.get("node_id") == node_id
+                    and proof.get("completion_gate") == node.get("terminal_gate")
+                    and isinstance(proof.get("attempt_id"), str)
+                    and isinstance(proof.get("evidence_digest"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", proof["evidence_digest"])
+                    and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+                )
+                if not valid_owner_row:
                     raise LifecycleError("completion-terminal-marker-unverified", node_id) from exc
             rows.append({"node_id": node_id, "sha256": "sha256:" + digest})
     else:
@@ -787,7 +804,8 @@ def evaluate_cycle_completion(
                 "reject", (_violation("completion-terminal-marker-unverified"),)
             )
     try:
-        marker_digest = _marker_digest(route_module, route, recorded=preserved is not None)
+        marker_digest = _marker_digest(route_module, route, recorded=preserved is not None,
+                                       recorded_gates=gates if preserved is not None else None)
     except LifecycleError as exc:
         return Decision("reject", (_violation(exc.code, detail=exc.detail),))
     outcome_digest = _sha256_path(outcome_path)
