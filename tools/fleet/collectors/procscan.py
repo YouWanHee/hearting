@@ -100,17 +100,29 @@ def read_environ(pid):
 
 
 def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
-    """Resolve Codex's root option from argv tokens, keeping ambiguous relatives observed."""
+    """Resolve Codex root cwd options from argv tokens, keeping ambiguity observed.
+
+    Only root options before a subcommand or positional prompt are considered. The
+    NUL-delimited argv is authoritative; a prompt, shell payload, or subcommand flag
+    must never become a process identity.
+    """
     if not isinstance(argv, (list, tuple)):
         return observed_cwd
     tokens = list(argv)
     if not tokens or os.path.basename(str(tokens[0])) != "codex":
         return observed_cwd
     target = None
+    subcommands = {"exec", "app-server", "login", "logout", "mcp", "completion",
+                   "features", "debug", "apply", "resume", "fork", "cloud", "agents",
+                   "remote-control", "update", "doctor", "sandbox", "queue", "archive",
+                   "delete", "migrate-rollouts", "unarchive", "help", "review", "exec-server",
+                   "plugin"}
     i = 1
     while i < len(tokens):
         token = str(tokens[i])
         if token == "--":
+            break
+        if token in subcommands or not token.startswith("-"):
             break
         if token in {"--cd", "-C"}:
             if i + 1 < len(tokens) and str(tokens[i + 1]) != "--":
@@ -119,12 +131,23 @@ def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
         if token.startswith("--cd="):
             target = token.partition("=")[2]
             break
+        if token.startswith("-C") and len(token) > 2:
+            target = token[2:]
+            break
         i += 1
     if not target or "\x00" in target:
         return observed_cwd
     path = Path(target).expanduser()
     if not path.is_absolute():
         if not launch_cwd or not Path(launch_cwd).is_absolute():
+            return observed_cwd
+        # An already moved process may export its effective cwd as PWD. Resolving
+        # the relative target against that value would append it twice; without an
+        # independent launch-cwd observation, keep the proc cwd.
+        try:
+            if observed_cwd and Path(launch_cwd).resolve(strict=False) == Path(observed_cwd).resolve(strict=False):
+                return observed_cwd
+        except (OSError, RuntimeError, ValueError):
             return observed_cwd
         path = Path(launch_cwd) / path
     try:

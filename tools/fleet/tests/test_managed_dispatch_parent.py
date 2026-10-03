@@ -11,7 +11,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from fleet import fleet, render, model  # noqa: E402
-from fleet.collectors import dispatch, resolve_parent_edges  # noqa: E402
+from fleet.collectors import dispatch, resolve_parent_edges, _mark_dispatch_child_sessions  # noqa: E402
 from fleet.model import DispatchJob, Session  # noqa: E402
 
 
@@ -136,6 +136,30 @@ class ManagedDispatchParentTest(unittest.TestCase):
         job = self.job(managed_dir=MANAGED)
         job.parent_sid = "exact-parent"
         text = self.rendered([parent], job)
+        self.assertNotIn("(orphan)", text)
+
+    def test_anonymous_root_is_not_hidden_by_a_cwd_only_dispatch_row(self):
+        root = Session(harness="codex", pid=10, cwd="/work/repo", session_id=None,
+                       slug="repo", liveness="working",
+                       exec_child={"pid": 11, "comm": "node", "ownership_verified": True})
+        job = DispatchJob(key="code", slug="worker", cwd="/work/repo", is_child=True,
+                          harness="codex", source="jobs", liveness="working")
+        _mark_dispatch_child_sessions([root], [job])
+        self.assertFalse(root.is_child)
+        self.assertIsNone(root.session_id)
+
+    def test_resolved_root_parent_and_exec_job_render_once_under_exact_edge(self):
+        root = Session(harness="codex", pid=10, cwd="/work/repo", session_id="root-sid",
+                       slug="repo", title="unmanaged root", liveness="working",
+                       exec_child={"pid": 11, "comm": "node", "ownership_verified": True})
+        job = DispatchJob(key="code", slug="exec-worker", cwd="/work/repo-wt",
+                          parent_sid="root-sid", parent_cwd="/work/repo", is_child=True,
+                          harness="codex", source="jobs", liveness="working")
+        _mark_dispatch_child_sessions([root], [job])
+        resolve_parent_edges([root], [job])
+        text = self.rendered([root], job)
+        self.assertEqual(text.count("unmanaged root"), 1)
+        self.assertIn("exec-worker", text)
         self.assertNotIn("(orphan)", text)
 
     def test_registry_sidecar_path_is_normalized_and_preserved_in_json(self):

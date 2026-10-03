@@ -26,6 +26,7 @@ MAX_PATH_LENGTH = 4096
 MAX_HOSTS = 32
 MAX_TEXT_LENGTH = 500
 MAX_JSON_DEPTH = 64
+MAX_TASK_TARGET_SCRIPT_BYTES = 1024 * 1024
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -120,6 +121,261 @@ class ParentGrant:
 
 
 @dataclass(frozen=True)
+class ResolvedTaskTargets:
+    manifest_path: Path
+    manifest_sha256: str
+    selected_names: tuple[str, ...]
+    writable_roots: tuple[Path, ...]
+
+
+def _read_bounded_regular_file(path: Path, limit: int) -> bytes:
+    """Read a small input without following a symlink or accepting a special file."""
+
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise OSError("input must be a non-symlink regular file")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        after = os.fstat(descriptor)
+        if (not stat.S_ISREG(after.st_mode)
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
+            raise OSError("input changed while opening")
+        if after.st_size > limit:
+            raise OSError(f"input exceeds {limit} bytes")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > limit:
+            raise OSError(f"input exceeds {limit} bytes")
+        return raw
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid",
+            f"target manifest is not safely readable: {exc}",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _task_target_reference(route: Mapping[str, object]) -> tuple[tuple[str, ...], Path] | None:
+    """Resolve only the explicit `루트 목록과 경로` input/table pair."""
+
+    work_request = route.get("work_request")
+    cwd_value = route.get("cwd")
+    if not isinstance(work_request, dict) or not isinstance(cwd_value, str):
+        return None
+    text = work_request.get("text")
+    if not isinstance(text, str):
+        return None
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if line.strip() == "## 입력"), None)
+    if start is None:
+        return None
+    end = next((index for index in range(start + 1, len(lines))
+                if lines[index].startswith("## ")), len(lines))
+    input_lines = lines[start + 1:end]
+    preview_rows = [line for line in input_lines if line.startswith("- 미리보기(사용자가 본 것): ")]
+    target_rows = [line for line in input_lines if line.startswith("- 루트 목록과 경로: ")]
+    if len(preview_rows) != 1 or len(target_rows) != 1:
+        return None
+    target = target_rows[0]
+    match = re.fullmatch(
+        r"- 루트 목록과 경로: ([A-Za-z0-9_./-]+) 의 ROOTS 표\(([^()]*)\)", target
+    )
+    if not match:
+        return None
+    manifest_reference, names_text = match.groups()
+    if manifest_reference != "previews/run_all.sh":
+        return None
+    names = tuple(part.strip() for part in names_text.split(","))
+    if (not names or len(names) > MAX_ROOTS or any(not re.fullmatch(r"[A-Za-z0-9_-]+", n) for n in names)
+            or len(names) != len(set(names))):
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS target names are ambiguous"
+        )
+    preview_match = re.fullmatch(
+        r"- 미리보기\(사용자가 본 것\): (\.agent_reports/_scratch/[A-Za-z0-9_./-]+)/previews/<루트>\.md",
+        preview_rows[0],
+    )
+    if not preview_match:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "preview and ROOTS paths are not a supported pair"
+        )
+    base = Path(cwd_value).expanduser().resolve(strict=False)
+    relative_base = Path(preview_match.group(1))
+    manifest = (base / relative_base / manifest_reference).resolve(strict=False)
+    return names, manifest
+
+
+def read_roots_data(path: str | Path, selected_names: Iterable[str]) -> ResolvedTaskTargets:
+    """Read only the delimited ROOTS data block; never execute its shell script."""
+
+    manifest = Path(path).resolve(strict=False)
+    raw = _read_bounded_regular_file(manifest, MAX_TASK_TARGET_SCRIPT_BYTES)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS data is not UTF-8"
+        ) from exc
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "done <<'ROOTS'"]
+    if len(starts) != 1:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "expected one exact ROOTS data block"
+        )
+    start = starts[0] + 1
+    try:
+        end = lines.index("ROOTS", start)
+    except ValueError as exc:
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "ROOTS data block is unterminated"
+        ) from exc
+    rows: dict[str, Path] = {}
+    for line in lines[start:end]:
+        if not line or line.startswith("#"):
+            continue
+        name, separator, root_text = line.partition("|")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9_-]+", name) or not root_text:
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid", "ROOTS row has an invalid shape"
+            )
+        if name in rows:
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid", f"duplicate ROOTS row: {name}"
+            )
+        try:
+            literal = Path(root_text)
+            if not literal.is_absolute() or ".." in literal.parts:
+                raise ValueError("root must be an exact absolute path")
+            root = literal.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ExecutionAccessError(
+                "execution-access-target-input-invalid", f"invalid root for {name}: {exc}"
+            ) from exc
+        rows[name] = root
+    names = tuple(selected_names)
+    if len(names) != len(set(names)) or any(name not in rows for name in names):
+        raise ExecutionAccessError(
+            "execution-access-target-input-invalid", "a selected ROOTS name is missing or duplicated"
+        )
+    return ResolvedTaskTargets(
+        manifest_path=manifest,
+        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        selected_names=names,
+        writable_roots=tuple(_unique_paths(rows[name] for name in names)),
+    )
+
+
+def resolve_task_targets(route: Mapping[str, object]) -> ResolvedTaskTargets | None:
+    """Resolve targets named directly by a route's structured input section."""
+
+    reference = _task_target_reference(route)
+    if reference is None:
+        return None
+    names, manifest = reference
+    return read_roots_data(manifest, names)
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ExecutionAccessError("execution-access-cache-conflict", "cache path is a symlink")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ExecutionAccessError(
+            "execution-access-cache-unavailable", f"cannot persist prepared request: {exc}"
+        ) from exc
+
+
+def prepare_task_request(route: Mapping[str, object], jobs: str | Path) -> Path | None:
+    """Prepare the existing request format for a route's directly named roots."""
+
+    targets = resolve_task_targets(route)
+    if targets is None:
+        return None
+    route_id = route.get("route_id")
+    route_hash = route.get("route_hash")
+    if not isinstance(route_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", route_id):
+        raise ExecutionAccessError("execution-access-route-invalid", "route id is missing or invalid")
+    if not isinstance(route_hash, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", route_hash):
+        raise ExecutionAccessError("execution-access-route-invalid", "route hash is missing or invalid")
+    state_root = Path(jobs).expanduser().resolve(strict=False).parent
+    directory = state_root / "execution-access" / "routes" / route_id
+    request_path_value = directory / "request.json"
+    roots = [str(path) for path in targets.writable_roots]
+    request = {
+        "schema_version": SCHEMA_VERSION,
+        "writable_roots": roots,
+        "read_roots": [],
+        "network": {"required": False, "reason": "", "hosts": []},
+        "enforcement_required": "any",
+        "justification": {root: "Directly named approved task target" for root in roots},
+    }
+    request_bytes = _canonical_json_bytes(request)
+    normalized_request = {
+        "schema_version": SCHEMA_VERSION,
+        "writable_roots": roots,
+        "read_roots": [],
+        "network": {"required": False, "reason": "", "hosts": []},
+        "enforcement_required": "any",
+        "justification": dict(sorted(request["justification"].items())),
+    }
+    request_digest = hashlib.sha256(
+        json.dumps(normalized_request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    binding = {
+        "schema_version": 1,
+        "route_id": route_id,
+        "route_hash": route_hash,
+        "manifest_path": str(targets.manifest_path),
+        "manifest_sha256": targets.manifest_sha256,
+        "selected_names": list(targets.selected_names),
+        "writable_roots": roots,
+        "request_sha256": request_digest,
+    }
+    binding_bytes = (json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    binding_path = directory / "binding.json"
+    try:
+        existing_request = _read_bounded_regular_file(request_path_value, MAX_REQUEST_BYTES) if request_path_value.exists() else None
+        existing_binding = _read_bounded_regular_file(binding_path, MAX_REQUEST_BYTES) if binding_path.exists() else None
+    except OSError as exc:
+        raise ExecutionAccessError("execution-access-cache-conflict", "prepared request cache is unreadable") from exc
+    if existing_request is not None or existing_binding is not None:
+        if existing_request != request_bytes or existing_binding != binding_bytes:
+            raise ExecutionAccessError(
+                "execution-access-cache-conflict",
+                "the route binding or ROOTS input changed after request preparation",
+            )
+        return request_path_value
+    _atomic_write(request_path_value, request_bytes)
+    _atomic_write(binding_path, binding_bytes)
+    return request_path_value
+
+
+@dataclass(frozen=True)
 class ExecutionAccessGrant:
     request_sha256: str
     writable_roots: tuple[Path, ...]
@@ -130,6 +386,7 @@ class ExecutionAccessGrant:
     file_enforcement: str
     network_enforcement: str
     unmet: tuple[str, ...]
+    source_path: Path | None = None
 
 
 def request_path(
@@ -670,6 +927,7 @@ def build_grant(
         file_enforcement=file_grade,
         network_enforcement=network_grade,
         unmet=tuple(sorted(set(unmet))),
+        source_path=request.source_path,
     )
 
 
@@ -702,6 +960,157 @@ def bind_request(
         default_writable_roots=default_writable_roots,
         network_available=network_available,
         effective_sandbox=effective_sandbox,
+    )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def publish_effective_grant(
+    *,
+    jobs: str | Path,
+    attempt_id: str,
+    route_id: str,
+    route_hash: str,
+    runtime: str,
+    sandbox: str,
+    grant: ExecutionAccessGrant | None,
+    default_writable_roots: Iterable[str | Path],
+    network_allowed: bool,
+) -> tuple[Path, str]:
+    """Publish the exact filesystem/network effect used by one attempt."""
+
+    state_root = Path(jobs).expanduser().resolve(strict=False).parent
+    if (not re.fullmatch(r"[A-Za-z0-9._-]+", attempt_id)
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", route_id)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", route_hash)):
+        raise ExecutionAccessError("execution-access-attempt-invalid", "attempt route identity is incomplete")
+    defaults = [Path(root).expanduser().resolve(strict=False) for root in default_writable_roots]
+    requested = list(grant.writable_roots) if grant is not None else []
+    writable = [str(path) for path in _unique_paths((*defaults, *requested))]
+    read = [str(path) for path in _unique_paths(grant.read_roots if grant else ())]
+    request_file = grant.source_path if grant is not None else None
+    record = {
+        "schema_version": 1,
+        "attempt_id": attempt_id,
+        "route_id": route_id,
+        "route_hash": route_hash,
+        "runtime": runtime,
+        "sandbox": sandbox,
+        "request_path": str(request_file) if request_file else None,
+        "request_sha256": grant.request_sha256 if grant else None,
+        "writable_roots": writable,
+        "read_roots": read,
+        "network_allowed": bool(network_allowed),
+        "file_enforcement": grant.file_enforcement if grant else (
+            "os-sandbox" if runtime.startswith("codex") and sandbox == "workspace-write"
+            else "tool-permission" if runtime.startswith(("claude", "opencode")) else "none"
+        ),
+        "network_enforcement": grant.network_enforcement if grant else (
+            "os-sandbox" if runtime.startswith("codex") and sandbox == "workspace-write" else "none"
+        ),
+    }
+    raw = _canonical_json_bytes(record)
+    digest = hashlib.sha256(raw).hexdigest()
+    path = state_root / "execution-access" / "attempts" / attempt_id / "effective.json"
+    if not _is_within(path.resolve(strict=False), state_root):
+        raise ExecutionAccessError("execution-access-record-outside-state", str(path))
+    if path.exists():
+        try:
+            prior = _read_bounded_regular_file(path, MAX_REQUEST_BYTES)
+        except ExecutionAccessError:
+            raise
+        if prior != raw:
+            raise ExecutionAccessError(
+                "execution-access-record-conflict", "attempt already has a different effective grant"
+            )
+    else:
+        _atomic_write(path, raw)
+    return path, digest
+
+
+def _exact_attempt_metadata(jobs: str | Path, attempt_id: str) -> dict[str, str]:
+    matches: list[dict[str, str]] = []
+    try:
+        lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise ExecutionAccessError("execution-access-parent-row-unreadable", str(exc)) from exc
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6 or fields[1] not in {"open", "running"}:
+            continue
+        try:
+            metadata = _pairs_no_duplicates([
+                (part.split("=", 1)[0], part.split("=", 1)[1])
+                for part in fields[5].split(",") if "=" in part
+            ])
+        except (ExecutionAccessError, IndexError):
+            continue
+        if metadata.get("attempt_id") == attempt_id:
+            matches.append({str(key): str(value) for key, value in metadata.items()})
+    if len(matches) != 1:
+        raise ExecutionAccessError(
+            "execution-access-parent-row-invalid", f"expected one live attempt row, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def load_parent_effective_grant(
+    *,
+    jobs: str | Path,
+    parent_attempt_id: str,
+    context: AccessContext,
+) -> ParentGrant:
+    """Load the effective record published by the exact live parent row."""
+
+    state_root = Path(jobs).expanduser().resolve(strict=False).parent
+    row = _exact_attempt_metadata(jobs, parent_attempt_id)
+    path_value = row.get("execution_access_effective_file", "")
+    digest_value = row.get("execution_access_effective_sha256", "")
+    expected_path = state_root / "execution-access" / "attempts" / parent_attempt_id / "effective.json"
+    if path_value != str(expected_path) or not re.fullmatch(r"[0-9a-f]{64}", digest_value):
+        raise ExecutionAccessError(
+            "execution-access-parent-record-missing", "live parent row has no canonical effective record"
+        )
+    try:
+        raw = _read_bounded_regular_file(expected_path, MAX_REQUEST_BYTES)
+    except ExecutionAccessError as exc:
+        raise ExecutionAccessError("execution-access-parent-record-invalid", exc.detail) from exc
+    if hashlib.sha256(raw).hexdigest() != digest_value:
+        raise ExecutionAccessError(
+            "execution-access-parent-record-digest-mismatch", "effective grant digest does not match live row"
+        )
+    try:
+        record = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs_no_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError, ExecutionAccessError) as exc:
+        raise ExecutionAccessError("execution-access-parent-record-invalid", "effective record is invalid JSON") from exc
+    if not isinstance(record, dict) or record.get("schema_version") != 1:
+        raise ExecutionAccessError("execution-access-parent-record-invalid", "effective record schema is unsupported")
+    for key, row_key in (("attempt_id", "attempt_id"), ("route_id", "route_id"), ("route_hash", "route_hash")):
+        if not isinstance(record.get(key), str) or not record.get(key) or record[key] != row.get(row_key):
+            raise ExecutionAccessError("execution-access-parent-record-identity-mismatch", key)
+    if record.get("runtime") not in _RUNTIMES or record.get("sandbox") != row.get("runtime_sandbox"):
+        raise ExecutionAccessError("execution-access-parent-record-identity-mismatch", "runtime/sandbox")
+    for key in ("writable_roots", "read_roots"):
+        roots = record.get(key)
+        if (not isinstance(roots, list) or any(not isinstance(root, str) for root in roots)
+                or any(not Path(root).is_absolute() or str(Path(root).resolve(strict=False)) != root for root in roots)):
+            raise ExecutionAccessError("execution-access-parent-record-invalid", f"invalid {key}")
+    if type(record.get("network_allowed")) is not bool:
+        raise ExecutionAccessError("execution-access-parent-record-invalid", "network_allowed must be boolean")
+    request_path_value = record.get("request_path")
+    request_digest = record.get("request_sha256")
+    if request_path_value is not None:
+        request = load_request(request_path_value, context=context)
+        if request.request_sha256 != request_digest:
+            raise ExecutionAccessError("execution-access-parent-request-changed", "request digest changed")
+    elif request_digest is not None:
+        raise ExecutionAccessError("execution-access-parent-record-invalid", "request digest has no request path")
+    return ParentGrant(
+        writable_roots=tuple(Path(root) for root in record["writable_roots"]),
+        read_roots=tuple(Path(root) for root in record["read_roots"]),
+        network_allowed=record["network_allowed"],
     )
 
 

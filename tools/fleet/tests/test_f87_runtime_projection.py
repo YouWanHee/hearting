@@ -610,6 +610,18 @@ class PaneHeaderIdentityTest(unittest.TestCase):
         self.assertIn("--display-agent", metadata)
         self.assertIn("--title", metadata)
 
+    def test_permission_denied_optional_report_does_not_raise_or_retry(self):
+        """Pane metadata is optional: a herdr socket denial must not block the hook."""
+        from tools.fleet import herdr_projection
+        with unittest.mock.patch.object(herdr_projection.shutil, "which", return_value="/usr/bin/herdr"), \
+             unittest.mock.patch.object(herdr_projection, "session_title", return_value="summary"), \
+             unittest.mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
+             unittest.mock.patch.object(herdr_projection, "compose", return_value=("codex", "summary")), \
+             unittest.mock.patch.object(herdr_projection.subprocess, "run",
+                                        side_effect=PermissionError("Operation not permitted")) as run:
+            herdr_projection._report("codex", "sid", "pane-7", True)
+        self.assertEqual(run.call_count, 2)
+
 
 class PaneTitleLadderTest(unittest.TestCase):
     """The pane header and the board must climb ONE ladder for the same session.

@@ -972,6 +972,13 @@ gate, write, or approval authority over the session it addresses — its peer me
 advisory context between two already-running sessions, and the append-only ledger below
 is the only record of them (SD-122 §13.37.2-(1)). Six invariants govern the role:
 
+Starting a peer honors the requested project in the launched runtime: Codex receives
+`--cd`, interactive OpenCode receives its positional project, and Claude changes the
+idle pane shell's cwd before the agent starts. Any cwd or PATH bootstrap waits for an
+observed shell prompt within the existing bound. Unknown, occupied, form, and native
+trust screens receive no typed input; native trust remains a human decision and is
+reported as a wait reason, separate from whether the process was started.
+
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused
 or blocked (cross-session permission laundering forbidden); a blocked action reflects

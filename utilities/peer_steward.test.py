@@ -400,15 +400,82 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("--cd", cmd)
         self.assertIn(os.path.realpath(str(self.tmp_root)), cmd)
 
-    def test_cwd_is_refused_where_the_harness_cannot_honor_it(self):
-        # Claude Code has no working-root flag. Refusing is the point: the alternative
-        # is a session quietly working in the wrong repository.
+    def test_claude_cwd_is_quoted_and_applied_in_the_idle_pane_before_start(self):
+        import shlex
+        def fake_run(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "get"]:
+                return _herdr_json({"result": {"pane": {}}})
+            if argv[:3] == ["herdr", "pane", "wait-output"]:
+                return _herdr_json({"result": {"pane": {}}})
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run") as run_mock:
+             mock.patch.object(peer_steward.subprocess, "run",
+                                side_effect=fake_run) as run_mock:
             rc = peer_steward.main(["start", "peer-c", "--kind", "claude",
                                     "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0)
+        argvs = [c[0][0] for c in run_mock.call_args_list]
+        send = next(argv for argv in argvs if argv[:3] == ["herdr", "pane", "send-text"])
+        self.assertEqual(send[-1], "cd -- " + shlex.quote(os.path.realpath(str(self.tmp_root))))
+        self.assertLess(argvs.index(send), argvs.index(_agent_start_cmd(run_mock)))
+
+    def test_opencode_uses_the_interactive_positional_project_argument(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "opencode",
+                                    "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0)
+        cmd = _agent_start_cmd(run_mock)
+        self.assertIn(os.path.realpath(str(self.tmp_root)), cmd[cmd.index("--") + 1:])
+        self.assertNotIn("--cwd", cmd)
+
+    def test_pane_input_waits_for_shell_readiness_and_times_out_without_start(self):
+        self._ingress()
+        calls = []
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:4] == ["herdr", "pane", "wait-output", "--regex"]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="timeout")
+            return _herdr_json({"result": {"pane": {}}})
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=fake_run), \
+             mock.patch("builtins.print") as output:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
         self.assertEqual(rc, 1)
-        run_mock.assert_not_called()
+        self.assertIn("reason=shell-readiness-timeout", output.call_args[0][0])
+        self.assertFalse(any(argv[:3] == ["herdr", "pane", "send-text"] for argv in calls))
+        self.assertFalse(any(argv[:3] == ["herdr", "agent", "start"] for argv in calls))
+
+    def test_native_folder_trust_wait_is_explicit_and_unknown_screens_stay_unknown(self):
+        trust = peer_steward._screen_lines("Trust this folder? Continue only if you trust this project.")
+        unknown = peer_steward._screen_lines("Press Enter to continue")
+        self.assertEqual(peer_steward._native_trust_reason("codex", trust), "native-trust-wait")
+        self.assertIsNone(peer_steward._native_trust_reason("codex", unknown))
+
+    def test_started_process_waits_for_native_trust_without_claiming_ready(self):
+        import contextlib
+        import io
+        calls = []
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "agent", "start"]:
+                return _herdr_json(_agent_json("codex", "thread-9", "peer-c"))
+            if argv[:3] == ["herdr", "agent", "read"]:
+                return subprocess.CompletedProcess(argv, 0,
+                    stdout="Trust this folder? Do you trust this project?", stderr="")
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {"foreground_processes": []}}})
+            return _herdr_json({"result": {"pane": {}}})
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        self.assertIn("started=true", out.getvalue())
+        self.assertIn("ready=false reason=native-trust-wait", out.getvalue())
+        self.assertFalse(any(argv[:3] == ["herdr", "pane", "send-text"] for argv in calls))
 
     def test_a_cwd_that_is_not_a_directory_never_reaches_herdr(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \

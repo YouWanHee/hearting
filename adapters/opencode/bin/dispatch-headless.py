@@ -150,7 +150,10 @@ from execution_access import (  # noqa: E402
     ExecutionAccessError,
     adapter_default_roots,
     bind_request as bind_execution_access_request,
+    load_parent_effective_grant,
+    publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
+    request_path as execution_access_request_path,
 )
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity via resolve_qa
@@ -1879,20 +1882,31 @@ def main(argv: list[str]) -> int:
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
     try:
+        access_context = AccessContext.build(
+            worktree=args.worktree,
+            artifact_root=args.artifact_root,
+            dispatch_state_root=dispatch_state_root(args.jobs_path),
+            agent_home=args.agent_home,
+            environ=os.environ,
+        )
+        default_roots = adapter_default_roots(args)
+        access_parent = None
+        if args.dispatch_depth >= 2 and execution_access_request_path(args.execution_access_file, os.environ) is not None:
+            if args.parent_binding is None:
+                raise ExecutionAccessError("execution-access-exceeds-parent:parent-grant-unknown")
+            access_parent = load_parent_effective_grant(
+                jobs=args.jobs_path,
+                parent_attempt_id=args.parent_binding.attempt_id,
+                context=access_context,
+            )
         args.execution_access_grant = bind_execution_access_request(
             args.execution_access_file,
             environ=os.environ,
-            context=AccessContext.build(
-                worktree=args.worktree,
-                artifact_root=args.artifact_root,
-                dispatch_state_root=dispatch_state_root(args.jobs_path),
-                agent_home=args.agent_home,
-                environ=os.environ,
-            ),
+            context=access_context,
             is_child=args.dispatch_depth >= 2,
-            parent=None,
+            parent=access_parent,
             runtime="opencode",
-            default_writable_roots=adapter_default_roots(args),
+            default_writable_roots=default_roots,
         )
         if args.execution_access_grant is not None:
             args.opencode_config_content = scoped_external_directory_config(
@@ -2111,6 +2125,8 @@ def main(argv: list[str]) -> int:
             dispatch_env["AGENT_DISPATCH_WORKER_ROLE"] = args.worker_role
         else:
             dispatch_env.pop("AGENT_DISPATCH_WORKER_ROLE", None)
+        if args.execution_access_grant is not None:
+            dispatch_env["AGENT_DISPATCH_EXECUTION_ACCESS_FILE"] = str(args.execution_access_grant.source_path)
         if args.unit:
             dispatch_env["AGENT_DISPATCH_UNIT"] = args.unit
         else:
@@ -2198,9 +2214,21 @@ def main(argv: list[str]) -> int:
                     os.close(fence_failure_write_fd)
                 except OSError:
                     pass
-        launch_metadata = args.launch_lifecycle_resolution.metadata()
+        launch_metadata = {
+            **args.launch_lifecycle_resolution.metadata(),
+            "runtime_sandbox": "adapter-default",
+        }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("opencode", dispatch_env))
+        if args.route_id and args.route_hash:
+            effective_path, effective_sha256 = publish_effective_grant(
+                jobs=jobs, attempt_id=args.attempt_id, route_id=args.route_id,
+                route_hash=args.route_hash, runtime="opencode", sandbox="adapter-default",
+                grant=args.execution_access_grant, default_writable_roots=default_roots,
+                network_allowed=False,
+            )
+            launch_metadata["execution_access_effective_file"] = str(effective_path)
+            launch_metadata["execution_access_effective_sha256"] = effective_sha256
         if getattr(args, "nested_runtime_env", None):
             launch_metadata["opencode_runtime_dir"] = str(
                 Path(args.nested_runtime_env["XDG_DATA_HOME"]).parent)

@@ -59,6 +59,53 @@ class WorkStartTest(unittest.TestCase):
         self.current = mock.patch.object(W, "current_delivery_state", side_effect=self.delivery)
         self.current.start(); self.addCleanup(self.current.stop)
 
+    def test_start_prepares_direct_root_table_request_and_keeps_explicit_request(self):
+        project = Path(self.tmp.name) / "project"
+        manifest = project / ".agent_reports/_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\n"
+            "beta|/tmp/beta/.agent_reports\nextra|/tmp/extra/.agent_reports\nROOTS\n",
+            encoding="utf-8",
+        )
+        route = {
+            **self.route,
+            "route_id": "rt-direct-targets",
+            "route_hash": "sha256:" + "a" * 64,
+            "cwd": str(project),
+            "work_request": {"text": (
+                "## 입력\n"
+                "- 미리보기(사용자가 본 것): .agent_reports/_scratch/flow/previews/<루트>.md\n"
+                "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha, beta)\n"
+            )},
+        }
+        route_file = Path(self.tmp.name) / "direct-route.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "started=1\n", "")
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+            result = W._start(route, route_file, self.jobs, "owner", "codex", run)
+        self.assertEqual("", result.get("execution_access_diagnostic", ""))
+        self.assertIn("--execution-access-file", calls[0])
+        request_path = Path(calls[0][calls[0].index("--execution-access-file") + 1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["/tmp/alpha/.agent_reports", "/tmp/beta/.agent_reports"],
+            request["writable_roots"],
+        )
+
+        explicit_calls = []
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": "/tmp/existing-request.json"}):
+            W._start(route, route_file, self.jobs, "owner", "codex",
+                     lambda command, **kwargs: (explicit_calls.append(command)
+                         or subprocess.CompletedProcess(command, 0, "started=1\n", "")))
+        self.assertNotIn("--execution-access-file", explicit_calls[0])
+
     def observe(self, **kw):
         return {"state": "ready" if self.ready else "timeout", "children": []}
 

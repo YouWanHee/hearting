@@ -29,6 +29,7 @@ from dispatch_completion_join import (
 from dispatch_parent_completion import default_parent_session_id, interactive_parent_identity
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
 from parent_next_directive import parent_next
+from execution_access import ExecutionAccessError, prepare_task_request
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import route_plan as RP
 
@@ -400,9 +401,24 @@ def _start(route, path, jobs, node, harness, run):
         command += ["--route-node", node]
     if harness:
         command += ["--adapter", harness]
+    access_diagnostic = ""
+    # Existing explicit requests keep precedence. For a task that directly
+    # names its ROOTS data, prepare the same request format used by the
+    # wrapper; start and resume both pass through this function.
+    if not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
+        try:
+            prepared = prepare_task_request(route, jobs)
+        except ExecutionAccessError as exc:
+            prepared = None
+            access_diagnostic = f"{exc.reason}: {exc.detail}"
+        if prepared is not None:
+            command += ["--execution-access-file", str(prepared)]
     result = run(command, text=True, capture_output=True, check=False)
-    return {"attempt_id": attempt_id(route, node), "exit_code": result.returncode,
-            "receipt": result.stdout, "diagnostic": result.stderr}
+    receipt = {"attempt_id": attempt_id(route, node), "exit_code": result.returncode,
+               "receipt": result.stdout, "diagnostic": result.stderr}
+    if access_diagnostic:
+        receipt["execution_access_diagnostic"] = access_diagnostic
+    return receipt
 
 
 def _never_started(status, meta):

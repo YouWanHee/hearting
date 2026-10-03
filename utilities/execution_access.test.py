@@ -16,8 +16,13 @@ from execution_access import (
     assert_within_parent,
     build_grant,
     load_request,
+    load_parent_effective_grant,
     receipt_fields,
     request_path,
+    publish_effective_grant,
+    prepare_task_request,
+    read_roots_data,
+    resolve_task_targets,
 )
 
 
@@ -376,6 +381,121 @@ class ExecutionAccessTest(unittest.TestCase):
 
         parent = ParentGrant(writable_roots=(self.root / "scoped",))
         assert_within_parent(request, parent, is_child=True)
+
+    def test_roots_reader_selects_only_named_rows_from_data_block(self) -> None:
+        manifest = self.root / "run_all.sh"
+        selected = tuple(f"project-{index}" for index in range(12))
+        rows = [f"{name}|{self.root}/external/{index}/.agent_reports"
+                for index, name in enumerate(selected)]
+        rows.append(f"unrequested-13|{self.root}/external/13/.agent_reports")
+        manifest.write_text(
+            "#!/bin/sh\ndone <<'ROOTS'\n" + "\n".join(rows) + "\nROOTS\n",
+            encoding="utf-8",
+        )
+        targets = read_roots_data(manifest, selected)
+        self.assertEqual(selected, targets.selected_names)
+        self.assertEqual(12, len(targets.writable_roots))
+        self.assertNotIn(self.root / "external/13/.agent_reports", targets.writable_roots)
+        self.assertEqual(64, len(targets.manifest_sha256))
+
+    def test_task_target_resolution_requires_the_direct_input_pair(self) -> None:
+        cwd = self.root / "project"
+        manifest = cwd / ".agent_reports/_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\nROOTS\n",
+            encoding="utf-8",
+        )
+        route = {
+            "cwd": str(cwd),
+            "work_request": {"text": (
+                "## 입력\n"
+                "- 미리보기(사용자가 본 것): .agent_reports/_scratch/flow/previews/<루트>.md\n"
+                "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha)\n"
+            )},
+        }
+        self.assertEqual((Path("/tmp/alpha/.agent_reports"),),
+                         resolve_task_targets(route).writable_roots)
+        route["work_request"] = {"text": "Quoted old task: alpha|/tmp/alpha/.agent_reports"}
+        self.assertIsNone(resolve_task_targets(route))
+
+    def test_prepared_request_is_route_bound_and_refuses_changed_manifest(self) -> None:
+        cwd = self.root / "project"
+        manifest = cwd / ".agent_reports/_scratch/flow/previews/run_all.sh"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\nROOTS\n",
+            encoding="utf-8",
+        )
+        route = {
+            "route_id": "rt-test",
+            "route_hash": "sha256:" + "a" * 64,
+            "cwd": str(cwd),
+            "work_request": {"text": (
+                "## 입력\n"
+                "- 미리보기(사용자가 본 것): .agent_reports/_scratch/flow/previews/<루트>.md\n"
+                "- 루트 목록과 경로: previews/run_all.sh 의 ROOTS 표(alpha)\n"
+            )},
+        }
+        jobs = self.state / "jobs.log"
+        request_file = prepare_task_request(route, jobs)
+        self.assertEqual(request_file, prepare_task_request(route, jobs))
+        request = json.loads(request_file.read_text(encoding="utf-8"))
+        self.assertEqual(["/tmp/alpha/.agent_reports"], request["writable_roots"])
+        self.assertEqual([], request["read_roots"])
+        manifest.write_text(
+            "done <<'ROOTS'\nalpha|/tmp/alpha/.agent_reports\nbeta|/tmp/beta/.agent_reports\nROOTS\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ExecutionAccessError) as raised:
+            prepare_task_request(route, jobs)
+        self.assertEqual("execution-access-cache-conflict", raised.exception.reason)
+
+    def test_parent_effective_record_is_full_digest_bound_to_live_attempt(self) -> None:
+        request = self.request(read_roots=[], justification={})
+        grant = build_grant(
+            request, runtime="codex-exec", default_writable_roots=(self.worktree,),
+            network_available=False, effective_sandbox="workspace-write",
+        )
+        jobs = self.state / "jobs.log"
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        parent_id = "att-parent"
+        route_id = "rt-parent"
+        route_hash = "sha256:" + "b" * 64
+        effective_path, digest = publish_effective_grant(
+            jobs=jobs, attempt_id=parent_id, route_id=route_id,
+            route_hash=route_hash, runtime="codex-exec", sandbox="workspace-write",
+            grant=grant, default_writable_roots=(self.worktree,), network_allowed=False,
+        )
+        metadata = {
+            "attempt_id": parent_id, "route_id": route_id, "route_hash": route_hash,
+            "runtime_sandbox": "workspace-write",
+            "execution_access_effective_file": str(effective_path),
+            "execution_access_effective_sha256": digest,
+        }
+        jobs.write_text(
+            "now\topen\t12\tparent\tparent-slug\t"
+            + ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n",
+            encoding="utf-8",
+        )
+        parent = load_parent_effective_grant(
+            jobs=jobs, parent_attempt_id=parent_id, context=self.context,
+        )
+        self.assertIn(self.worktree, parent.writable_roots)
+        self.assertIn(self.root / "scoped" / "write", parent.writable_roots)
+        self.assertFalse(parent.network_allowed)
+
+        metadata["execution_access_effective_sha256"] = "0" * 64
+        jobs.write_text(
+            "now\topen\t12\tparent\tparent-slug\t"
+            + ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ExecutionAccessError) as raised:
+            load_parent_effective_grant(
+                jobs=jobs, parent_attempt_id=parent_id, context=self.context,
+            )
+        self.assertEqual("execution-access-parent-record-digest-mismatch", raised.exception.reason)
 
     def test_runtime_grades_network_and_receipt(self) -> None:
         request = self.request(
