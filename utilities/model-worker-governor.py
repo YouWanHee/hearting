@@ -223,21 +223,27 @@ def default_root() -> Path:
     """Return a path writable by both the main checkout and linked workers."""
     explicit = os.environ.get("AGENT_MODEL_GOVERNOR_ROOT")
     if explicit:
-        return Path(explicit)
-    artifact_root = os.environ.get("AGENT_ARTIFACT_ROOT")
-    if artifact_root:
-        return Path(artifact_root) / ".runtime" / "model-worker-governor"
+        return Path(explicit).expanduser().resolve(strict=False)
     resolver = Path(__file__).resolve().with_name("artifact-root.sh")
-    if resolver.is_file():
-        resolved = subprocess.run(
-            [str(resolver), str(Path.cwd())],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if resolved.returncode == 0 and resolved.stdout.strip():
-            return Path(resolved.stdout.strip()) / ".runtime" / "model-worker-governor"
-    return Path.home() / ".agent-worker-governor"
+    if not resolver.is_file():
+        raise RuntimeError(f"artifact-root-resolution-failed: resolver missing: {resolver}")
+    resolver_env = os.environ.copy()
+    artifact_hint = resolver_env.get("AGENT_ARTIFACT_ROOT")
+    if artifact_hint and not Path(artifact_hint).is_absolute():
+        # A legacy relative hint must not split capacity across worktrees or
+        # stop the caller. Let the existing resolver find the project root.
+        resolver_env.pop("AGENT_ARTIFACT_ROOT")
+    resolved = subprocess.run(
+        [str(resolver), str(Path.cwd())],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=resolver_env,
+    )
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        detail = resolved.stderr.strip() or f"resolver exit={resolved.returncode}"
+        raise RuntimeError(f"artifact-root-resolution-failed: {detail}")
+    return Path(resolved.stdout.strip()) / ".runtime" / "model-worker-governor"
 
 
 def process_observation(pid: int) -> tuple[str, str, str]:
@@ -1615,7 +1621,7 @@ def reclaimable(root: str | Path, data: dict[str, Any]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default=str(default_root()))
+    parser.add_argument("--root", default=None)
     commands = parser.add_subparsers(dest="command", required=True)
     acquire_parser = commands.add_parser("acquire")
     acquire_parser.add_argument("--class", dest="worker_class", required=True)
@@ -1654,6 +1660,8 @@ def main() -> int:
     reclaim_parser = commands.add_parser("reclaim")
     reclaim_parser.add_argument("--token", help="reclaim only this lease; default is every provable one")
     args = parser.parse_args()
+    if args.root is None:
+        args.root = str(default_root())
 
     if args.command == "acquire":
         print(acquire(args.root, args.worker_class, args.pid, label=args.label))

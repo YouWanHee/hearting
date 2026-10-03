@@ -162,7 +162,7 @@ def _stat_key(path):
         st = os.stat(path)
     except (OSError, ValueError):
         return None
-    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode]
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode, st.st_ctime_ns]
 
 
 def _settled(stat):
@@ -218,7 +218,7 @@ def _build_snapshot(lines, now, previous=None):
 
 
 def _is_stat(value):
-    return value is None or (isinstance(value, list) and len(value) == 5
+    return value is None or (isinstance(value, list) and len(value) == 6
                              and all(isinstance(v, int) and not isinstance(v, bool) for v in value))
 
 
