@@ -1060,7 +1060,11 @@ def partition_runtime_wait_children(
         if row.status == "done"
         and dispatch_contract.attempt_row_never_started(row.raw.split("\t"))
     }
-    unstarted = frozenset(unstarted_child_attempts(rest) - never_launched_terminal)
+    # Terminal claims still need reconciliation even when their start receipt
+    # was never published. They must not enter the retry-to-start path.
+    unstarted = frozenset(unstarted_child_attempts(
+        [row for row in rest if row.status not in {"done", "killed", "cancelled"}]
+    ))
     joinable = frozenset(
         candidates - chain_pending - refusal_settled - unstarted - never_launched_terminal
     )

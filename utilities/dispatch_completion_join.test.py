@@ -698,7 +698,16 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         partition = JOIN.partition_runtime_wait_children(
             self.jobs, parent, [child], {child.attempt_id}
         )
+        self.assertEqual(partition.unstarted, frozenset())
+        self.assertEqual(partition.joinable, frozenset({"att-never"}))
+
+        self.jobs.write_text(claimed.replace("\tdone\t", "\topen\t"), encoding="utf-8")
+        child = JOIN.current_children(self.jobs, parent)[0]
+        partition = JOIN.partition_runtime_wait_children(
+            self.jobs, parent, [child], {child.attempt_id}
+        )
         self.assertEqual(partition.unstarted, frozenset({"att-never"}))
+        self.assertEqual(partition.joinable, frozenset())
 
     def test_terminal_liveness_resumes_for_typed_harvest(self):
         terminal = self.root / "terminal.sh"
