@@ -880,18 +880,28 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
                              "poll-fallback")
             probe.assert_not_called()
 
-    def test_non_owner_and_depth_two_never_probe_or_supervise(self):
+    def test_non_owner_and_depth_two_keep_one_shot_completion(self):
         for overrides in (dict(dispatch_depth=2), dict(worker_type="stage"),
                           dict(worker_type="review", dispatch_depth=2)):
             with self.subTest(**overrides):
                 args = argparse.Namespace(**{**dict(completion_delivery="auto", dispatch_depth=1,
                                                     worker_type="owner", intensity="quick"), **overrides})
-                with mock.patch.object(WH, "codex_app_server_available") as probe:
-                    self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
-                    probe.assert_not_called()
+                for available in (True, False):
+                    with self.subTest(available=available), mock.patch.object(
+                            WH, "codex_app_server_available", return_value=available) as probe:
+                        self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")
+                        if args.worker_type in {"stage", "review"}:
+                            probe.assert_called_once_with()
+                            self.assertEqual(args.resolved_stage_telemetry_transport,
+                                             "app-server-one-turn" if available else "raw-exec")
+                        else:
+                            probe.assert_not_called()
+                            self.assertFalse(hasattr(args, "resolved_stage_telemetry_transport"))
                 args.completion_delivery = "supervised"
-                with self.assertRaises(WH.DispatchContractError) as caught:
-                    WH.resolve_completion_delivery(args)
+                with mock.patch.object(WH, "codex_app_server_available") as probe:
+                    with self.assertRaises(WH.DispatchContractError) as caught:
+                        WH.resolve_completion_delivery(args)
+                    probe.assert_not_called()
                 self.assertEqual(caught.exception.reason, "completion-delivery-ineligible")
 
     def test_registration_opens_input_only_for_a_supervised_delivery(self):

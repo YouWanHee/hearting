@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -850,6 +851,59 @@ class CodexAttemptTelemetryTest(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(job.to_dict()))
         visible = text(render._dispatch_summary_detail_row(job, term_width=168))
         self.assertIn("⚙ python3", visible)
+
+    def test_fake_stage_producer_output_flows_through_exact_attempt_detail(self):
+        fake = os.path.join(self.tmp.name, "app_server.py")
+        with open(fake, "w", encoding="utf-8") as stream:
+            stream.write('''import json, sys
+def send(value): print(json.dumps(value), flush=True)
+for line in sys.stdin:
+ value=json.loads(line); method=value.get("method")
+ if method == "initialize": send({"jsonrpc":"2.0","id":value["id"],"result":{}})
+ elif method == "thread/start": send({"jsonrpc":"2.0","id":value["id"],"result":{"thread":{"id":"thread-produced"}}})
+ elif method == "turn/start":
+  send({"jsonrpc":"2.0","id":value["id"],"result":{"turn":{"id":"turn-produced"}}})
+  send({"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-produced","turnId":"turn-produced","tokenUsage":{"last":{"totalTokens":50000},"total":{"totalTokens":90000},"modelContextWindow":100000,"prompt":"PRIVATE_SENTINEL","extra":{"secret":"PRIVATE_SENTINEL"}}}})
+  send({"jsonrpc":"2.0","method":"item/completed","params":{"turnId":"turn-produced","item":{"type":"agentMessage","id":"final","text":"artifact: -\\nverdict: PASS\\nblocker: none"}}})
+  send({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-produced","status":"completed"}}})
+''')
+        supervisor = os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                  "utilities", "codex-app-server-supervisor.py")
+        result = subprocess.run(
+            [sys.executable, supervisor, "--one-turn", "--worktree", self.worktree,
+             "--sandbox", "read-only", "--app-server-command", f"{sys.executable} {fake}"],
+            input="bounded stage prompt", text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        produced = [json.loads(line) for line in result.stdout.splitlines()]
+        telemetry = [row for row in produced
+                     if row.get("type") == "dispatch.supervisor.token_usage"]
+        self.assertEqual(len(telemetry), 1)
+        self.assertEqual(telemetry[0]["thread_id"], "thread-produced")
+        self.assertEqual(telemetry[0]["turn_id"], "turn-produced")
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(telemetry))
+        job = self._job()
+        self._write_rows(job, produced)
+        dispatch_collector._enrich_codex_attempt_session(job)
+        projection.attach_projections([], [job], now=100.0)
+        self.assertEqual(job.active_context_tokens, 50000)
+        self.assertEqual(job.context_window_tokens, 100000)
+        self.assertEqual(job.context.used_pct, 43)  # reserve is subtracted from numerator and window
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(job.to_dict()))
+
+    def test_cumulative_only_and_invalid_window_stay_unknown(self):
+        job = self._job()
+        self._write_rows(job, [{
+            "type": "dispatch.supervisor.token_usage", "thread_id": "thread-unknown",
+            "turn_id": "turn-unknown", "token_usage": {
+                "last": {}, "total": {"total_tokens": 90000},
+                "model_context_window": "100000"},
+        }])
+        dispatch_collector._enrich_codex_attempt_session(job)
+        projection.attach_projections([], [job], now=100.0)
+        self.assertIsNone(job.context)
+        self.assertIsNone(job.active_context_tokens)
+        self.assertIsNone(job.context_window_tokens)
 
     def test_exact_attempt_usage_without_thread_id_keeps_legacy_compatibility(self):
         job = self._job()
