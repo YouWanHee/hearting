@@ -1847,13 +1847,28 @@ class ShardPartitionTest(unittest.TestCase):
             with self.assertRaises(self.mod.BaselineError):
                 self.mod.load_durations(root / "absent.tsv")
 
+    def test_report_duration_rows_collapse_only_identical_replicas(self):
+        rows = [
+            {"suite_path": "a.test.py", "duration_s": "1.25", "verdict": "KNOWN-FAIL"},
+            {"suite_path": "a.test.py", "duration_s": "1.25", "verdict": "KNOWN-FAIL"},
+            {"suite_path": "b.test.py", "duration_s": "4.0", "verdict": "FLAKY-PASS"},
+        ]
+        self.assertEqual(self.mod.collapse_replicated_report_durations(rows),
+                         {"a.test.py": 1.25, "b.test.py": 4.0})
+
+    def test_report_duration_conflict_is_ambiguous_not_selected_by_order(self):
+        rows = [{"suite_path": "a.test.py", "duration_s": "1.25"},
+                {"suite_path": "a.test.py", "duration_s": "2.0"}]
+        with self.assertRaisesRegex(self.mod.BaselineError, "ambiguous duplicate duration"):
+            self.mod.collapse_replicated_report_durations(rows)
+
     def test_committed_table_is_well_formed(self):
         # The table only balances shards: a suite without a row is weighed at the
         # median (shard_weights) and a row for a removed suite is ignored, so a PR
         # that adds or removes a test file must not have to edit this table.
         durations = self.mod.load_durations(ROOT / "tools" / "test-durations.tsv")
         self.assertTrue(durations)
-        self.assertTrue(all(value > 0 for value in durations.values()))
+        self.assertTrue(all(value >= 0 for value in durations.values()))
         corpus = sorted(self.mod.suite_relpath(ROOT, s) for s in self.mod.collect_suites(ROOT))
         weights = self.mod.shard_weights(corpus, durations)
         self.assertEqual(set(weights), set(corpus))

@@ -1,0 +1,1 @@
+../../../../tools/install/model_settings.test.py
