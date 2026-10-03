@@ -1417,7 +1417,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         launch_reason = _launch_failure_reason(result["launches"][-1]) if result["launches"] else "-"
         if launch_reason.startswith("execution-access-"):
             return {**result, "state": "needs-attention", "reason": launch_reason,
-                    "launch_reason": launch_reason, "required_action": "correct-route-input"}
+                    "launch_reason": launch_reason}
         if result["launches"] and _launch_failure_reason(result["launches"][-1]).partition(":")[0] == "admission-busy":
             # The launcher's preparation timed out on a held admission lock before any row existed.
             return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted",
