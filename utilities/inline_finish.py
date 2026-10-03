@@ -134,7 +134,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         if (closure.get("terminal_gate_proven") is not False
                 or closure.get("route_id") != route["route_id"]
                 or closure.get("route_hash") != route["route_hash"]
-                or closure.get("route_file") != str(route_file)
+                or closure.get("route_file") != str(Path(route_file).resolve())
                 or closure.get("cwd") != route.get("cwd")
                 or closure.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
             raise InlineFinishError("finish-route-already-closed")

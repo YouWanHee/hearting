@@ -1569,24 +1569,17 @@ def validate_update(
     if previous is None or not isinstance(document, dict):
         return report
     violations: List[Violation] = []
+    before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
+    after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
+    provisional_completion = before_cycle.get("state") == "active" and after_cycle.get("state") == "completed"
     for key in ("events", "routes"):
         before = [r for r in previous.get(key, []) or []]
         after = [r for r in document.get(key, []) or []]
-        provisional_completion = (
-            isinstance(previous.get("cycle"), dict)
-            and previous["cycle"].get("state") == "active"
-            and isinstance(document.get("cycle"), dict)
-            and document["cycle"].get("state") == "completed")
         if after[: len(before)] != before and not (key == "routes" and provisional_completion):
             violations.append(Violation(
                 "update-earlier-%s-changed" % key, "$.%s" % key,
                 "a refreshed document keeps every earlier %s exactly" % key))
         elif key == "events":
-            provisional_completion = (
-                isinstance(previous.get("cycle"), dict)
-                and previous["cycle"].get("state") == "active"
-                and isinstance(document.get("cycle"), dict)
-                and document["cycle"].get("state") == "completed")
             allowed = {"artifact.revision.recorded", "route.terminal.recorded"}
             if provisional_completion:
                 allowed.add("cycle.completed")
@@ -1595,9 +1588,6 @@ def validate_update(
                     violations.append(Violation(
                         "update-event-type-not-allowed", "$.events",
                         "only a revision or the exact provisional-completion terminal events may follow"))
-    before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
-    after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
-    provisional_completion = before_cycle.get("state") == "active" and after_cycle.get("state") == "completed"
     for key in ("cycle_id", "campaign_id", "state", "parent_cycle_id", "started_on", "input_digest"):
         if key in changeable_cycle_fields and key != "state":
             continue  # a move or a new parent (§45 D-126) says which fields it may change

@@ -182,6 +182,64 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), original)
 
+    def _historical_false_close(self):
+        initial, created = CAP.close_route(self.route, self.route_file, allow_unproven=True, jobs=self.jobs)
+        self.assertTrue(created)
+        self.assertFalse(initial["terminal_gate_proven"])
+        return CAP.outcome_path(self.route_file).read_bytes()
+
+    def _assert_false_close_finish_resumes_once(self, fault):
+        original = self._historical_false_close()
+        crashed = self.finish(fault)
+        self.assertNotEqual(crashed.returncode, 0)
+        resumed = self.finish()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertTrue(json.loads(resumed.stdout)["replay"])
+        outcome_path = CAP.outcome_path(self.route_file)
+        self.assertTrue(json.loads(outcome_path.read_text(encoding="utf-8"))["terminal_gate_proven"])
+        retained = list(self.route_file.parent.glob(f"{self.route_file.stem}.historical-false-*.outcome.json"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), original)
+        settled = outcome_path.read_bytes()
+        again = self.finish()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(outcome_path.read_bytes(), settled)
+        self.assertEqual(artifact_producer.read_cycle_record(self.root, self.cycle["cycle_id"])["state"], "sealed")
+
+    def test_historical_false_close_finish_resumes_after_marker_write_crash(self):
+        self._assert_false_close_finish_resumes_once("after-marker-write")
+
+    def test_historical_false_close_finish_resumes_after_close_write_crash(self):
+        self._assert_false_close_finish_resumes_once("after-close-write")
+
+    def test_historical_false_close_finish_resumes_after_manifest_crash(self):
+        self._assert_false_close_finish_resumes_once("after-manifest")
+
+    def test_historical_false_close_finish_rejects_another_intent_and_keeps_bytes(self):
+        original = self._historical_false_close()
+        self.assertNotEqual(self.finish("after-claim").returncode, 0)
+        self.summary.write_text("a different intent\n", encoding="utf-8")
+        other = self.finish()
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("finish-intent-conflict", other.stderr)
+        self.assertEqual(CAP.outcome_path(self.route_file).read_bytes(), original)
+        self.assertEqual(list(self.route_file.parent.glob("*.historical-false-*")), [])
+        self.summary.write_text("Finished the inline route.\n", encoding="utf-8")
+        resumed = self.finish()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+    def test_identity_bearing_historical_false_close_is_not_taken_over_by_a_first_inline_finish(self):
+        # A false record that names a registered owner's tuple is that owner's: the inline
+        # caller has no prior intent from which to supply the identity, so it is not consumed here.
+        initial, created = CAP.close_route(self.route, self.route_file, allow_unproven=True, jobs=self.jobs,
+                                           terminal_commit_id="c" * 40, expected_owner_attempt_id="att-registered-owner")
+        self.assertTrue(created)
+        original = CAP.outcome_path(self.route_file).read_bytes()
+        refused = self.finish()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("finish-route-outcome-conflict", refused.stderr)
+        self.assertEqual(CAP.outcome_path(self.route_file).read_bytes(), original)
+
     def test_public_compose_start_finish_cli_flow_and_campaign_seal(self):
         receipt = self.finish()
         self.assertEqual(receipt.returncode, 0, receipt.stderr)

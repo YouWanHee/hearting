@@ -1749,6 +1749,126 @@ class TestRoute(unittest.TestCase):
    self.assertEqual(R.outcome_path(path).read_bytes(),raw)
    self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
 
+ def _registered_terminal_route(self,tmp):
+  # A quick route whose terminal node is a registered attempt: the exact-terminal gate reads
+  # the attempt row in the jobs registry, so its marker carries a real owner attempt.
+  root=Path(tmp); jobs=root/"jobs.log"; evidence=root/"result.md"
+  artifact_root=root/"artifacts"; artifact_root.mkdir()
+  route=R.compile_route(**self.args(artifact_root=str(artifact_root),requested_intensity="quick",predicates=[],
+      inline_reason=None,registered_headless_evidence=self.registered_headless()))
+  node=next(n for n in route["nodes"] if n.get("terminal")); attempt="att-terminal-current"
+  meta=dict(attempt_schema_version=2,dispatch_depth=1,transport="headless",
+      execution_surface="registered-headless",registered_worker="1",fallback_hop="same-harness-headless",
+      route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],
+      attempt_id=attempt,failure_class="pass",note="completed-marker",launch_outcome="reaped-before-publish")
+  jobs.write_text("2026-09-08T00:00:00Z\tdone\t/repo\t/wt\towner\t"+",".join(f"{k}={v}" for k,v in meta.items())+"\n")
+  evidence.write_text("terminal evidence")
+  path=R.canonical_routes_dir(artifact_root)/f"{route['route_id']}.json"
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route),encoding="utf-8")
+  def publish():
+   R._publish_completion_locked(route,node,node["id"],evidence,attempt_id=attempt,attempt_metadata=meta,jobs=jobs)
+   return R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+  return route,node,attempt,path,jobs,publish
+
+ def test_identity_bearing_false_close_is_consumed_by_the_same_actual_tuple_once(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,publish=self._registered_terminal_route(tmp)
+   binding="sha256:"+hashlib.sha256(json.dumps(
+    {"route_id":route["route_id"],"route_hash":route["route_hash"],"node":node["id"]},sort_keys=True).encode()).hexdigest()
+   commit="c"*40
+   first,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,terminal_commit_id=commit,
+    expected_owner_attempt_id=attempt,expected_producer_binding_digest=binding)
+   self.assertTrue(created); self.assertFalse(first["terminal_gate_proven"])
+   raw=R.outcome_path(path).read_bytes()
+   gate=publish()  # the actual current marker: its attempt is the registered terminal owner
+   self.assertTrue(gate["passed"],gate); self.assertEqual(gate["attempt_id"],attempt)
+   marker_digest=R.dispatch_terminal_commit.terminal_marker_digest([gate])
+   for foreign in (dict(terminal_commit_id=commit,expected_owner_attempt_id="att-foreign",expected_producer_binding_digest=binding),
+                   dict(terminal_commit_id=commit,expected_owner_attempt_id=attempt,expected_producer_binding_digest="sha256:"+"0"*64),
+                   dict(terminal_commit_id="d"*40,expected_owner_attempt_id=attempt,expected_producer_binding_digest=binding)):
+    with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+     R.close_route(route,path,jobs=jobs,expected_terminal_marker_digest=marker_digest,**foreign)
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob("*.historical-false-*")),[])
+   tuple_args=dict(terminal_commit_id=commit,expected_owner_attempt_id=gate["attempt_id"],
+    expected_producer_binding_digest=binding,expected_terminal_marker_digest=marker_digest)
+   current,created=R.close_route(route,path,jobs=jobs,**tuple_args)
+   self.assertTrue(created); self.assertTrue(current["terminal_gate_proven"])
+   self.assertEqual((current["terminal_commit_id"],current["terminal_owner_attempt_id"],
+                     current["producer_binding_digest"],current["terminal_marker_digest"]),
+                    (commit,attempt,binding,marker_digest))
+   retained=list(path.parent.glob("*.historical-false-*.outcome.json"))
+   self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
+   settled=R.outcome_path(path).read_bytes()
+   for replay_args in (tuple_args,{}):  # the same tuple, and a legacy caller naming nothing
+    replay,created=R.close_route(route,path,jobs=jobs,**replay_args)
+    self.assertFalse(created); self.assertEqual(replay,current)
+   self.assertEqual(R.outcome_path(path).read_bytes(),settled)
+   self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+
+ def test_proven_exact_replay_survives_missing_marker_and_rejects_foreign_axes(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,attempt,path,jobs,publish=self._registered_terminal_route(tmp)
+   gate=publish(); marker_digest=R.dispatch_terminal_commit.terminal_marker_digest([gate])
+   binding="sha256:"+"b"*64; commit="c"*40
+   args=dict(terminal_commit_id=commit,expected_owner_attempt_id=attempt,
+    expected_producer_binding_digest=binding,expected_terminal_marker_digest=marker_digest)
+   first,created=R.close_route(route,path,allow_unproven=False,jobs=jobs,**args)
+   self.assertTrue(created); self.assertTrue(first["terminal_gate_proven"])
+   raw=R.outcome_path(path).read_bytes()
+   for marker in R.completion_dir(route["route_id"],jobs=jobs).glob("*.json"): marker.unlink()
+   for replay_args in (args,{}):
+    replay,created=R.close_route(route,path,allow_unproven=True,jobs=jobs,**replay_args)
+    self.assertFalse(created); self.assertEqual(replay,first)
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,jobs=jobs,**dict(args,expected_owner_attempt_id="att-foreign"))
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,jobs=jobs,**dict(args,terminal_commit_id="d"*40,expected_owner_attempt_id="att-foreign"))
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+
+ def _retained_name(self,path,raw):
+  return path.with_name(f"{path.stem}.historical-false-{hashlib.sha256(raw).hexdigest()[:16]}.outcome.json")
+
+ def test_historical_false_promotion_interrupted_before_replacement_resumes_once(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   retained=self._retained_name(path,raw)
+   with mock.patch.object(R,"atomic_write",side_effect=OSError("interrupted after the retained copy")):
+    with self.assertRaises(OSError): R.close_route(route,path,jobs=jobs)
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)   # canonical false untouched
+   self.assertEqual(retained.read_bytes(),raw)               # raw history already durable, whole
+   current,created=R.close_route(route,path,jobs=jobs)       # the ordinary retry resumes it
+   self.assertTrue(created); self.assertTrue(current["terminal_gate_proven"])
+   self.assertEqual(retained.read_bytes(),raw)
+   self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+   settled=R.outcome_path(path).read_bytes()
+   lost,created=R.close_route(route,path,jobs=jobs)          # the response was lost: call again
+   self.assertFalse(created); self.assertEqual(lost,current)
+   self.assertEqual(R.outcome_path(path).read_bytes(),settled)
+   self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+
+ def test_historical_false_promotion_recovers_from_incomplete_retained_write(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   retained=self._retained_name(path,raw)
+   retained.write_bytes(raw[:len(raw)//2])  # an earlier write that stopped part-way
+   current,created=R.close_route(route,path,jobs=jobs)
+   self.assertTrue(created); self.assertTrue(current["terminal_gate_proven"])
+   self.assertEqual(retained.read_bytes(),raw)
+   self.assertEqual(list(path.parent.glob(".historical-false-*")),[])
+   self.assertEqual(len(list(path.parent.glob("*.historical-false-*.outcome.json"))),1)
+
+ def test_historical_false_promotion_refuses_a_retained_copy_that_is_not_its_prefix(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   retained=self._retained_name(path,raw); retained.write_bytes(b"{}\n")
+   with self.assertRaisesRegex(ValueError,"route-close-history-conflict"):
+    R.close_route(route,path,jobs=jobs)
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw); self.assertEqual(retained.read_bytes(),b"{}\n")
+
  def test_two_concurrent_closes_consume_historical_false_once(self):
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
    route,node,path,jobs,evidence,raw=self._false_closed_route(tmp)
@@ -1769,17 +1889,55 @@ class TestRoute(unittest.TestCase):
    self.assertEqual(len(retained),1); self.assertEqual(retained[0].read_bytes(),raw)
 
  def test_outcome_replay_cannot_hide_identity_conflict_behind_matching_commit(self):
-  existing={"route_id":"rt-0123456789abcdef","route_hash":"sha256:"+"a"*64,
-            "terminal_commit_id":"commit-a","terminal_owner_attempt_id":"attempt-a",
-            "producer_binding_digest":"sha256:"+"b"*64}
+  proven={"route_id":"rt-0123456789abcdef","route_hash":"sha256:"+"a"*64,"terminal_gate_proven":True,
+          "terminal_commit_id":"commit-a","terminal_owner_attempt_id":"attempt-a",
+          "producer_binding_digest":"sha256:"+"b"*64,"terminal_marker_digest":"sha256:"+"c"*64}
+  false=dict(proven,terminal_gate_proven=False)
+  ident=dict(route_id=proven["route_id"],route_hash=proven["route_hash"])
+  for existing in (proven,false):
+   # an explicitly named axis the record contradicts is never hidden by the matching commit
+   self.assertFalse(R._outcome_replay_matches(
+    existing,terminal_commit_id="commit-a",owner_attempt_id="attempt-b",
+    producer_binding_digest=proven["producer_binding_digest"],**ident))
+   self.assertFalse(R._outcome_replay_matches(
+    existing,terminal_commit_id="commit-a",owner_attempt_id="attempt-a",
+    producer_binding_digest="sha256:"+"d"*64,**ident))
+  # a recorded unproven close keeps its stored identity authoritative when a caller omits it
   self.assertFalse(R._outcome_replay_matches(
-   existing,route_id=existing["route_id"],route_hash=existing["route_hash"],
-   terminal_commit_id="commit-a",owner_attempt_id="attempt-b",
-   producer_binding_digest=existing["producer_binding_digest"]))
-  self.assertFalse(R._outcome_replay_matches(
-   existing,route_id=existing["route_id"],route_hash=existing["route_hash"],
-   terminal_commit_id="commit-a",owner_attempt_id=None,
-   producer_binding_digest=existing["producer_binding_digest"]))
+   false,terminal_commit_id="commit-a",owner_attempt_id=None,
+   producer_binding_digest=proven["producer_binding_digest"],**ident))
+  self.assertFalse(R._outcome_replay_matches(false,**ident))
+  # an already-proven outcome is replayed on the recorded route/hash fact
+  self.assertTrue(R._outcome_replay_matches(proven,**ident))
+  self.assertTrue(R._outcome_replay_matches(
+   proven,terminal_commit_id="commit-a",owner_attempt_id=None,
+   producer_binding_digest=proven["producer_binding_digest"],**ident))
+
+ def test_proven_outcome_replays_without_identity_arguments_and_without_marker_file(self):
+  # PR130 recorded replay: a legacy caller (CLI `close`, finalize, autoclose) repeating a close
+  # on an already-proven outcome names no identity; the recorded fact is reused whatever
+  # digest derivation the first caller stored, and a missing marker file does not undo it.
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(Path(tmp)/"jobs.log")}):
+   artifact_root=Path(tmp)/"artifacts"; artifact_root.mkdir()
+   route=R.compile_route(**self.args(artifact_root=str(artifact_root)))
+   node=route["nodes"][0]; jobs=Path(tmp)/"jobs.log"; jobs.write_text("",encoding="utf-8")
+   path=R.canonical_routes_dir(artifact_root)/f"{route['route_id']}.json"
+   path.parent.mkdir(parents=True); path.write_text(json.dumps(route),encoding="utf-8")
+   evidence=Path(tmp)/"evidence.txt"; evidence.write_text("terminal evidence",encoding="utf-8")
+   R.write_completion_marker(route,node,node["id"],evidence,jobs=jobs)
+   stored="sha256:"+"1"*64  # a digest the first caller derived its own way
+   first,created=R.close_route(route,path,allow_unproven=False,jobs=jobs,expected_terminal_marker_digest=stored)
+   self.assertTrue(created); self.assertTrue(first["terminal_gate_proven"])
+   raw=R.outcome_path(path).read_bytes()
+   again,created=R.close_route(route,path,allow_unproven=True,jobs=jobs)
+   self.assertFalse(created); self.assertEqual(again,first)
+   for marker in R.completion_dir(route["route_id"],jobs=jobs).glob("*.json"): marker.unlink()
+   evidence.write_text("edited after the proven close",encoding="utf-8")
+   again,created=R.close_route(route,path,allow_unproven=True,jobs=jobs)
+   self.assertFalse(created); self.assertEqual(again,first)
+   self.assertEqual(R.outcome_path(path).read_bytes(),raw)
+   with self.assertRaisesRegex(ValueError,"route-close-outcome-conflict"):
+    R.close_route(route,path,jobs=jobs,expected_terminal_marker_digest="sha256:"+"2"*64)
 
  def test_close_records_null_only_without_terminal_nodes(self):
   # Red before P2: the field was absent entirely, so `None` and `False` were
@@ -5301,7 +5459,7 @@ class SourceCensusTest(unittest.TestCase):
   # The producer's inline binding check calls cycle_route_admission above,
   # then compares the pending finish intent's route ID with that admitted
   # binding. This is finish-tuple integrity, not another cycle selection.
-  "_inline_producer_binding_check","_provisional_completion_projection",
+  "_inline_producer_binding_check","_provisional_completion_projection","_provisional_completion_context",
   # The shared helper `_finalize_route` and `cycle_route_admission` consult
   # before a lineage-fork/superseded refusal. Its route-id comparison is a
   # visited-set guard so a lineage loop never reads as closed; it selects no

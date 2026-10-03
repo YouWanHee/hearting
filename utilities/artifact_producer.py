@@ -5401,18 +5401,18 @@ def _leaf_terminal_additions(root: Path, record: Mapping[str, Any], document: Ma
     return {"row": row, "event": event, "binding": binding, "route": sealed_route}
 
 
-def _provisional_completion_projection(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
-                                       facts: Sequence[Tuple[str, str, int]], *, revision_id: str,
-                                       allocator: artifact_identity.IdAllocator,
-                                       now: Optional[float]) -> Optional[Dict[str, Any]]:
-    """Bind exact late terminal proof to one provisional active cycle revision."""
-    if not isinstance(document.get("cycle"), Mapping) or document["cycle"].get("state") != "active":
-        return None
+def _provisional_completion_context(root: Path, record: Mapping[str, Any],
+                                    expected_root_id: Optional[str]) -> Optional[Tuple[Any, Dict[str, Any]]]:
+    """The live conditions under which a provisional active cycle may become completed.
+
+    Route, lease, closed/admitted route, exact proven non-abandoned outcome: the one place both
+    the candidate builder and the publication re-check ask, so they cannot drift apart."""
     try:
         route = _finalize_route(root, record)
     except ProducerError:
         return None
     if (route.get("artifact_root") is None
+            or record.get("abandon_reason") or record.get("deleted_at")
             or _live_review_lease(root, record["cycle_id"]) is not None
             or not route_is_closed(root, route)
             or not cycle_route_admission(root, record, route, finalize=True).allow):
@@ -5420,7 +5420,7 @@ def _provisional_completion_projection(root: Path, record: Mapping[str, Any], do
     try:
         binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
             root, route_lineage.canonical_route_path(root, route["route_id"]),
-            expected_root_id=document.get("artifact_root_id"))
+            expected_root_id=expected_root_id)
         outcome_raw = Path(binding.outcome_file).read_bytes()
         outcome = json.loads(outcome_raw.decode("utf-8"))
         route_module = artifact_lifecycle._load_capability_route()
@@ -5438,6 +5438,43 @@ def _provisional_completion_projection(root: Path, record: Mapping[str, Any], do
             or outcome.get("autoclose") is not None
             or outcome.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
         return None
+    return binding, sealed_route, outcome
+
+
+def _evaluate_provisional_completion(root: Path, record: Mapping[str, Any], candidate: Mapping[str, Any],
+                                     binding: Any, outcome: Mapping[str, Any]) -> bool:
+    """First-completion proof of a completed candidate: required roles, payload, marker, terminal digests."""
+    try:
+        decision = artifact_lifecycle.evaluate_cycle_completion(
+            candidate, content_root=_record_cycle_manifest_path(root, record).parent,
+            route_file=route_lineage.canonical_route_path(root, binding.route_id),
+            expected_root_id=binding.artifact_root_id, payload_verified=False,
+            inline_finish_id=outcome.get("inline_finish_id"))
+    except (artifact_lifecycle.LifecycleError, OSError, ValueError):
+        return False
+    return decision.ok
+
+
+def _provisional_completion_holds(root: Path, record: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+    """Re-ask, at publication, what the candidate was built on (called under the admission lock)."""
+    context = _provisional_completion_context(root, record, candidate.get("artifact_root_id"))
+    if context is None:
+        return False
+    binding, _sealed_route, outcome = context
+    return _evaluate_provisional_completion(root, record, candidate, binding, outcome)
+
+
+def _provisional_completion_projection(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
+                                       facts: Sequence[Tuple[str, str, int]], *, revision_id: str,
+                                       allocator: artifact_identity.IdAllocator,
+                                       now: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Bind exact late terminal proof to one provisional active cycle revision."""
+    if not isinstance(document.get("cycle"), Mapping) or document["cycle"].get("state") != "active":
+        return None
+    context = _provisional_completion_context(root, record, document.get("artifact_root_id"))
+    if context is None:
+        return None
+    binding, sealed_route, outcome = context
     rows = [row for row in document.get("routes", []) or [] if isinstance(row, dict)
             and row.get("artifact_root_id") == binding.artifact_root_id
             and row.get("route_id") == binding.route_id and row.get("route_hash") == binding.route_hash]
@@ -5466,14 +5503,9 @@ def _provisional_completion_projection(root: Path, record: Mapping[str, Any], do
     candidate["events"] = list(candidate.get("events", [])) + [cycle_event, terminal_event]
     try:
         candidate = artifact_lifecycle._derive_terminal_evidence(candidate, binding, sealed_route)
-        decision = artifact_lifecycle.evaluate_cycle_completion(
-            candidate, content_root=_record_cycle_manifest_path(root, record).parent,
-            route_file=route_lineage.canonical_route_path(root, binding.route_id),
-            expected_root_id=binding.artifact_root_id, payload_verified=False,
-            inline_finish_id=outcome.get("inline_finish_id"))
     except (artifact_lifecycle.LifecycleError, OSError, ValueError):
         return None
-    return candidate if decision.ok else None
+    return candidate if _evaluate_provisional_completion(root, record, candidate, binding, outcome) else None
 
 
 def _binding_route_unrecorded(manifest_path: Path, binding: Mapping[str, Any]) -> bool:
@@ -6441,7 +6473,7 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
 
     The refresh lock is held and the admission lock is not.  The files are re-checked with
     `lstat`, then one admission section does the rest in the D-125 order: the record, the
-    current document and the index row are read again, the history lines go to the recorder, the
+    current document, a provisional completion's live conditions and the index row are read again, the history lines go to the recorder, the
     document is replaced, the index row is swapped and the record follows.  Anything that no
     longer holds writes nothing, history included, so a refresh that was not published leaves no
     line behind.  A recorder that is not there leaves the lines in the record; one that fails
@@ -6456,6 +6488,12 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
                 or _record_cycle_manifest_path(root, record) != manifest_path):
             return "superseded"
         if not _recheck_candidate(directory, manifest_path, raw, scan, changes):
+            return "superseded"
+        # An active -> completed candidate was decided from observations taken before this
+        # lock; a lease, route or outcome that moved since keeps the document as it is.
+        if ((refreshed.get("cycle") or {}).get("state") == "completed"
+                and (json.loads(raw.decode("utf-8")).get("cycle") or {}).get("state") == "active"
+                and not _provisional_completion_holds(root, record, refreshed)):
             return "superseded"
         index = artifact_admission.load_index(root)  # the one read of this locked section
         row = index.manifests.get(cycle_id)

@@ -5319,21 +5319,6 @@ def _outcome_replay_matches(existing, *, route_id, route_hash,
         return False
     if existing.get("route_id") != route_id or existing.get("route_hash") != route_hash:
         return False
-    expected = {
-        "terminal_commit_id": terminal_commit_id,
-        "terminal_owner_attempt_id": owner_attempt_id,
-        "producer_binding_digest": producer_binding_digest,
-        "terminal_marker_digest": terminal_marker_digest,
-        "inline_finish_id": inline_finish_id,
-        "summary_digest": summary_digest,
-    }
-    # A stored identity axis remains authoritative even when a replay caller
-    # omits it. In particular a matching commit cannot mask a foreign owner,
-    # producer binding, marker, or inline intent.
-    for key, supplied in expected.items():
-        stored = existing.get(key)
-        if stored is not None and supplied != stored:
-            return False
     if inline_finish_id is not None:
         return all(existing.get(key) == value for key, value in (
             ("inline_finish_id", inline_finish_id),
@@ -5342,15 +5327,37 @@ def _outcome_replay_matches(existing, *, route_id, route_hash,
             ("summary_digest", summary_digest),
             ("head_commit", inline_commit),
         ))
-    if terminal_commit_id is not None and existing.get("terminal_commit_id") != terminal_commit_id:
-        return False
-    if owner_attempt_id is not None and existing.get("terminal_owner_attempt_id") != owner_attempt_id:
-        return False
-    if producer_binding_digest is not None and existing.get("producer_binding_digest") != producer_binding_digest:
-        return False
-    if terminal_marker_digest is not None and existing.get("terminal_marker_digest") != terminal_marker_digest:
-        return False
-    return True
+    if existing.get("terminal_gate_proven") is False:
+        # A recorded unproven close is a real record with a real identity: what it stored stays
+        # authoritative even when a caller omits it, so a matching commit cannot hide a foreign
+        # owner/binding/marker. (An already-proven outcome replays on the baseline rule below.)
+        for key, supplied in (("terminal_commit_id", terminal_commit_id),
+                              ("terminal_owner_attempt_id", owner_attempt_id),
+                              ("producer_binding_digest", producer_binding_digest),
+                              ("terminal_marker_digest", terminal_marker_digest)):
+            stored = existing.get(key)
+            if stored is not None and supplied != stored:
+                return False
+    if terminal_commit_id is None and owner_attempt_id is None and producer_binding_digest is None:
+        # Legacy callers retain the historical route/hash/optional-marker rule.
+        return (terminal_marker_digest is None
+                or existing.get("terminal_marker_digest") == terminal_marker_digest)
+    # A caller that names an identity axis is compared on the axes it names;
+    # a matching commit cannot hide an explicitly named owner/binding/marker
+    # that the recorded outcome contradicts.
+    for key, supplied in (("terminal_owner_attempt_id", owner_attempt_id),
+                          ("producer_binding_digest", producer_binding_digest),
+                          ("terminal_marker_digest", terminal_marker_digest)):
+        stored = existing.get(key)
+        if supplied is not None and stored is not None and supplied != stored:
+            return False
+    if terminal_commit_id is not None and existing.get("terminal_commit_id") == terminal_commit_id:
+        return True
+    return (owner_attempt_id is not None and producer_binding_digest is not None
+            and terminal_marker_digest is not None
+            and existing.get("terminal_owner_attempt_id") == owner_attempt_id
+            and existing.get("producer_binding_digest") == producer_binding_digest
+            and existing.get("terminal_marker_digest") == terminal_marker_digest)
 
 
 def _promote_historical_false_outcome(route, route_file, existing, raw, *, jobs=None,
@@ -5462,22 +5469,32 @@ def _promote_historical_false_outcome(route, route_file, existing, raw, *, jobs=
                         summary_digest=summary_digest, inline_commit=inline_commit)):
                 return current, False
             raise ValueError("route-close-outcome-conflict")
-        if retained.exists() and retained.read_bytes() != raw:
+        # The retained copy is created complete or not at all (temp + link), so an
+        # interrupted promotion never leaves a partial file that would turn the
+        # normal retry into a permanent conflict. A short prefix of the same
+        # bytes left by an older interrupted write is completed in place.
+        kept = retained.read_bytes() if retained.exists() else None
+        if kept is not None and kept != raw and not (len(kept) < len(raw) and raw.startswith(kept)):
             raise ValueError("route-close-history-conflict")
-        if not retained.exists():
+        if kept != raw:
+            fd, temporary = tempfile.mkstemp(prefix=".historical-false-", dir=retained.parent)
             try:
-                fd = os.open(str(retained), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                if retained.read_bytes() != raw:
-                    raise ValueError("route-close-history-conflict")
-            else:
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(raw); handle.flush(); os.fsync(handle.fileno())
+                if kept is None:
+                    os.link(temporary, retained)
+                else:
+                    os.replace(temporary, retained)
                 dfd = os.open(str(retained.parent), os.O_RDONLY)
                 try:
                     os.fsync(dfd)
                 finally:
                     os.close(dfd)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
         atomic_write(target, promoted)
     return promoted, True
 
@@ -5525,15 +5542,6 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
     if target.exists():
         raw = target.read_bytes()
         existing=json.loads(raw.decode("utf-8"))
-        replay_marker_digest = expected_terminal_marker_digest
-        if (replay_marker_digest is None and existing.get("terminal_gate_proven") is True
-                and existing.get("terminal_marker_digest") is not None):
-            replay_gates = terminal_gate_observation(
-                route, jobs=jobs, exact_terminal=terminal_commit_id is not None)
-            replay_marker_digest = "sha256:" + hashlib.sha256(
-                json.dumps(replay_gates, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            if terminal_gate_proven(replay_gates) is not True:
-                raise ValueError("route-close-outcome-conflict")
         if existing.get("terminal_gate_proven") is False:
             promoted, changed = _promote_historical_false_outcome(
                 route, route_file, existing, raw, jobs=jobs,
@@ -5549,7 +5557,7 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
         if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
                 terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
                 producer_binding_digest=expected_producer_binding_digest,
-                terminal_marker_digest=replay_marker_digest,
+                terminal_marker_digest=expected_terminal_marker_digest,
                 inline_finish_id=inline_finish_id, summary_digest=expected_summary_digest,
                 inline_commit=inline_commit):
             raise ValueError("route-close-outcome-conflict")

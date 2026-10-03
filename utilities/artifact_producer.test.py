@@ -2223,6 +2223,194 @@ class FinalizeStateConflictTest(ProducerTestBase):
         manifest = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
         self.assertEqual(manifest["cycle"]["state"], "abandoned")
 
+    def _provisional_active_with_proven_close(self, extra_payload=False):
+        self.activate()
+        route, route_file, result = self.begin()
+        evidence = self.write_output(result)
+        if extra_payload:  # the terminal evidence itself must stay as the marker recorded it
+            self.write_output(result, rel="notes/extra.md", data=b"extra body\n")
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        R.close_route(route, route_file, jobs=self.jobs)
+        self._complete_inline_for_latch(route, evidence)
+        closed, created = R.close_route(route, route_file, jobs=self.jobs)
+        self.assertTrue(created and closed["terminal_gate_proven"])
+        return route, route_file, result, cycle_id, manifest_path
+
+    def _state_snapshot(self, cycle_id, manifest_path):
+        record = P.read_cycle_record(self.root, cycle_id)
+        index = adm.load_index(self.root)
+        return (manifest_path.read_bytes(), json.dumps(record, sort_keys=True),
+                json.dumps(index.manifests[cycle_id], sort_keys=True), P.journal_path(self.root, cycle_id).exists())
+
+    def test_provisional_active_payload_edit_and_completion_land_in_one_revision(self):
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close(
+            extra_payload=True)
+        prior = json.loads(manifest_path.read_text())
+        output = Path(result["cycle_dir"]) / "artifacts" / "notes/extra.md"
+        output.write_bytes(b"extra body, edited before the late proof is consumed\n")
+        refreshed = P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+        self.assertEqual(refreshed["status"], "emitted", refreshed)
+        self.assertEqual(refreshed["changes"]["modified"], ["artifacts/notes/extra.md"])
+        current = json.loads(manifest_path.read_text())
+        self.assertEqual(current["cycle"]["state"], "completed")
+        self.assertNotEqual(current["manifest_revision_id"], prior["manifest_revision_id"])
+        digests = {row["content_digest"] for row in current["artifact_revisions"]}
+        self.assertIn("sha256:" + hashlib.sha256(output.read_bytes()).hexdigest(), digests)
+        new_events = [row["event_type"] for row in current["events"][len(prior["events"]):]]
+        self.assertEqual(sorted(new_events), ["artifact.revision.recorded", "cycle.completed", "route.terminal.recorded"])
+        self.assertTrue(m.validate_update(current, previous=prior).ok)
+        self.assertEqual(adm.load_index(self.root).manifests[cycle_id]["manifest_digest"], m.manifest_digest(current))
+        # the proven outcome is a recorded fact: a later edit does not turn it back
+        output.write_bytes(b"edited again\n")
+        later = P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+        self.assertNotEqual(later.get("status"), "skipped", later)
+        self.assertEqual(json.loads(manifest_path.read_text())["cycle"]["state"], "completed")
+
+    def _assert_completion_crash_rolls_forward_once(self, publish):
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()
+        before = manifest_path.read_bytes()
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            publish(cycle_id)
+        crashed = manifest_path.read_bytes()
+        self.assertNotEqual(crashed, before)  # the commit point passed; the index still names the earlier one
+        self.assertEqual(P.status(self.root)["pending_journals"], [cycle_id])
+        P.recover(self.root)
+        self.assertEqual(manifest_path.read_bytes(), crashed)
+        current = json.loads(crashed)
+        self.assertEqual(current["cycle"]["state"], "completed")
+        self.assertEqual(len([r for r in current["events"] if r["event_type"] == "cycle.completed"]), 1)
+        self.assertEqual(len([r for r in current["events"] if r["event_type"] == "route.terminal.recorded"]), 1)
+        self.assertEqual(adm.load_index(self.root).manifests[cycle_id]["manifest_digest"], m.manifest_digest(current))
+        self.assertEqual(P.status(self.root)["pending_journals"], [])
+        again = P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(again["cycle_state"], "completed")
+        self.assertEqual(manifest_path.read_bytes(), crashed)
+
+    def test_provisional_completion_by_finalize_crash_after_manifest_rolls_forward_once(self):
+        self._assert_completion_crash_rolls_forward_once(
+            lambda cycle_id: P.finalize(self.root, cycle_id=cycle_id, state="completed", crash_after_manifest=True))
+
+    def test_provisional_completion_by_refresh_crash_after_manifest_rolls_forward_once(self):
+        def refresh(cycle_id):
+            result = P.refresh_cycle(self.root, cycle_id, trigger="explicit", crash_after_manifest=True)
+            self.fail(result)  # refresh reports a crash as AdmissionRecoveryRequired, not as a result
+        self._assert_completion_crash_rolls_forward_once(refresh)
+
+    def test_concurrent_finalize_and_refresh_complete_a_provisional_active_cycle_once(self):
+        import concurrent.futures
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()
+        calls = [lambda: P.finalize(self.root, cycle_id=cycle_id, state="completed"),
+                 lambda: P.refresh_cycle(self.root, cycle_id, trigger="explicit"),
+                 lambda: P.finalize(self.root, cycle_id=cycle_id, state="completed")]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            outcomes = []
+            for future in [pool.submit(call) for call in calls]:
+                try:
+                    outcomes.append(future.result(timeout=120))
+                except P.ProducerError as exc:  # a loser that found it already settled may only conflict cleanly
+                    outcomes.append(exc)
+        current = json.loads(manifest_path.read_text())
+        self.assertEqual(current["cycle"]["state"], "completed", outcomes)
+        self.assertEqual(len([r for r in current["events"] if r["event_type"] == "cycle.completed"]), 1)
+        self.assertEqual(len([r for r in current["events"] if r["event_type"] == "route.terminal.recorded"]), 1)
+        self.assertEqual(adm.load_index(self.root).manifests[cycle_id]["manifest_digest"], m.manifest_digest(current))
+        self.assertEqual(P.status(self.root)["pending_journals"], [])
+        settled = manifest_path.read_bytes()
+        P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(manifest_path.read_bytes(), settled)
+
+    def _assert_stale_completion_candidate_is_superseded(self, injection):
+        # The candidate is decided from observations taken before the admission lock; a review
+        # lease (or an outcome turned abandoned) that appears right after it keeps the document.
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()
+        before = self._state_snapshot(cycle_id, manifest_path)
+        original = P._provisional_completion_projection
+        patches = []
+
+        def inject(*args, **kwargs):
+            candidate = original(*args, **kwargs)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate["cycle"]["state"], "completed")
+            if injection == "lease":
+                patch = mock.patch.object(P, "_live_review_lease", return_value={"lease": "live"})
+                patch.start(); patches.append(patch)
+            else:
+                outcome = json.loads(R.outcome_path(route_file).read_text())
+                outcome["disposition"] = "abandoned"
+                R.outcome_path(route_file).write_text(json.dumps(outcome))
+            return candidate
+
+        try:
+            with mock.patch.object(P, "_provisional_completion_projection", inject):
+                refreshed = P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+        finally:
+            for patch in patches:
+                patch.stop()
+        self.assertEqual(refreshed["status"], "skipped", refreshed)
+        self.assertEqual(refreshed["reason"], "superseded", refreshed)
+        self.assertEqual(self._state_snapshot(cycle_id, manifest_path), before)
+        self.assertEqual(json.loads(manifest_path.read_text())["cycle"]["state"], "active")
+
+    def test_observed_refresh_completion_candidate_with_lease_after_candidate_is_superseded(self):
+        self._assert_stale_completion_candidate_is_superseded("lease")
+
+    def test_observed_refresh_completion_candidate_with_abandoned_outcome_after_candidate_is_superseded(self):
+        self._assert_stale_completion_candidate_is_superseded("abandoned-outcome")
+
+    def _assert_first_completion_negative_keeps_active(self, mutate):
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()
+        output = Path(result["cycle_dir"]) / "artifacts" / "plans/cycle/plan.md"
+        undo = mutate(output)
+        before = self._state_snapshot(cycle_id, manifest_path)
+        try:
+            refreshed = P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+            self.assertNotEqual(refreshed.get("status"), "emitted", refreshed)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id, state="completed")
+            self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        finally:
+            if undo:
+                undo()
+        self.assertEqual(self._state_snapshot(cycle_id, manifest_path), before)
+        self.assertEqual(json.loads(manifest_path.read_text())["cycle"]["state"], "active")
+
+    def test_first_completion_with_active_review_lease_keeps_provisional_active(self):
+        patch = mock.patch.object(P, "_live_review_lease", return_value={"lease": "live"})
+        self._assert_first_completion_negative_keeps_active(lambda output: (patch.start(), patch.stop)[1])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a mode-0 file")
+    def test_first_completion_with_unreadable_payload_keeps_provisional_active(self):
+        def mutate(output):
+            output.chmod(0)
+            return lambda: output.chmod(0o644)
+        self._assert_first_completion_negative_keeps_active(mutate)
+
+    def test_first_completion_with_nonregular_payload_keeps_provisional_active(self):
+        def mutate(output):
+            data = output.read_bytes(); output.unlink(); output.mkdir()
+            def undo():
+                output.rmdir(); output.write_bytes(data)
+            return undo
+        self._assert_first_completion_negative_keeps_active(mutate)
+
+    def test_first_completion_with_missing_required_payload_keeps_provisional_active(self):
+        # The removal itself is an ordinary payload refresh; the cycle it leaves without its
+        # required `primary` revision is not completed by the late terminal proof.
+        route, route_file, result, cycle_id, manifest_path = self._provisional_active_with_proven_close()
+        (Path(result["cycle_dir"]) / "artifacts" / "plans/cycle/plan.md").unlink()
+        P.refresh_cycle(self.root, cycle_id, trigger="explicit")
+        document = json.loads(manifest_path.read_text())
+        self.assertEqual(document["cycle"]["state"], "active")
+        self.assertEqual(document["cycle"]["outcome_criterion"]["required_artifact_roles"], ["primary"])
+        self.assertEqual([row for row in document["events"] if row["event_type"] == "cycle.completed"], [])
+        before = self._state_snapshot(cycle_id, manifest_path)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertEqual(self._state_snapshot(cycle_id, manifest_path), before)
+
     def test_allow_open_first_publication_succeeds_but_identical_retry_now_conflicts(self):
         self.activate()
         route, route_file, result = self.begin()
