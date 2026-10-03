@@ -563,11 +563,17 @@ decision, never two independently toggled ones.
 
 Registered one-shot Codex `exec` workers use `--ephemeral`: their stdout JSONL,
 attempt records and completion markers remain durable, while Codex does not save
-a resumable session. Route continuation validates those harness records rather
-than resuming a worker rollout. The App Server owner keeps its existing live
-ephemeral thread across turns; this policy does not change owner supervision or
-interactive sessions. Fleet reports unavailable worker context-window telemetry
-as unknown when only a saved rollout could have supplied it.
+a resumable session. When the existing App Server availability probe succeeds,
+registered stage and review workers instead run exactly one turn on an
+ephemeral App Server thread and record same-thread, same-turn numeric usage in
+the exact attempt JSONL. If that pre-inference probe fails, they retain the raw
+`codex exec --ephemeral --json` path. Both paths keep stdout JSONL, attempt
+records, and completion markers durable; route continuation validates those
+harness records rather than resuming a worker rollout. Missing or invalid
+active usage or context-window values remain unknown; cumulative totals do not
+stand in for active context. The App Server owner keeps its existing supervised
+live ephemeral thread across turns. This policy does not change owner
+supervision or interactive sessions.
 
 ### §5.10a. Completion Delivery (model-visible contract)
 

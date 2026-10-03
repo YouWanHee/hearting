@@ -79,6 +79,23 @@ class SD64GrantMatrix(unittest.TestCase):
         cmd = WH.shell_command(args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
         self.assertIn(_state_root_str(args), _grant_dirs(cmd))
 
+    def test_d2_stage_one_turn_and_raw_builders_keep_the_same_exact_grants(self):
+        roots = (Path("/tmp/sd64-fixture/execution-access"),)
+        raw = _args(intensity="standard", worker_type="stage", dispatch_depth=2,
+                    route_id="rt-stage-grants",
+                    execution_access_grant=argparse.Namespace(additional_writable_roots=roots))
+        raw_cmd = WH.shell_command(raw, Path("/tmp/p.txt"), Path("/tmp/l.log"))
+        one_turn = _args(intensity="standard", worker_type="stage", dispatch_depth=2,
+                         route_id="rt-stage-grants",
+                         execution_access_grant=argparse.Namespace(additional_writable_roots=roots))
+        one_turn.resolved_completion_delivery = "one-shot"
+        one_turn.resolved_stage_telemetry_transport = "app-server-one-turn"
+        app_cmd = WH.shell_command(one_turn, Path("/tmp/p.txt"), Path("/tmp/l.log"))
+        self.assertEqual(set(_grant_dirs(raw_cmd)), set(_grant_dirs(app_cmd)))
+        self.assertIn(str(roots[0]), _grant_dirs(app_cmd))
+        self.assertIn("--one-turn", app_cmd)
+        self.assertNotIn("--parent-attempt-id", app_cmd)
+
     # (e) no route_id at all -> still heartbeats/watchdog only
     def test_e_no_route_id_stays_heartbeats_watchdog_only(self):
         args = _args(intensity="quick", worker_type="owner", dispatch_depth=1, route_id=None,

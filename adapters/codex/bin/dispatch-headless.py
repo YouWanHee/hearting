@@ -1323,6 +1323,10 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
                 "completion-delivery-ineligible",
                 "supervised completion is scoped to registered dispatch-depth-1 owners",
             )
+        if getattr(args, "worker_type", None) in {"stage", "review"}:
+            args.resolved_stage_telemetry_transport = (
+                "app-server-one-turn" if codex_app_server_available() else "raw-exec"
+            )
         return "one-shot"
     standard_plus = _completion_owner(args)
     if requested == "poll":
@@ -1388,26 +1392,42 @@ def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> N
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
     writer = [sys.executable, str(ROOT / "utilities" / "codex-jsonl-writer.py"),
               "--log", str(log_path), "--attempt", str(getattr(args, "command_attempt_id", "") or ""), "--"]
-    if getattr(args, "resolved_completion_delivery", "one-shot") == "app-server-supervised":
+    owner_supervised = (
+        getattr(args, "resolved_completion_delivery", "one-shot")
+        == "app-server-supervised"
+    )
+    stage_one_turn = (
+        getattr(args, "resolved_stage_telemetry_transport", "raw-exec")
+        == "app-server-one-turn"
+    )
+    if owner_supervised or stage_one_turn:
         command = [
             sys.executable,
             str(ROOT / "utilities" / "codex-app-server-supervisor.py"),
             "--worktree", args.worktree,
-            "--jobs", str(args.jobs_path),
-            "--parent-attempt-id", args.attempt_id or "unassigned",
-            "--state-file", str(completion_state_path(args)),
-            "--lease-file", str(completion_lease_path(args)),
+        ]
+        if owner_supervised:
+            command += [
+                "--jobs", str(args.jobs_path),
+                "--parent-attempt-id", args.attempt_id or "unassigned",
+                "--state-file", str(completion_state_path(args)),
+                "--lease-file", str(completion_lease_path(args)),
+            ]
+        else:
+            command += ["--one-turn"]
+        command += [
             "--sandbox", effective_runtime_sandbox(args),
             "--approval", args.approval,
             "--writable-root", str(args.artifact_root),
         ]
         if getattr(args, "report_bundle_root", None) is not None:
             command += ["--writable-root", str(args.report_bundle_root)]
-        route = _supervisor_route(args)
-        if route:
-            command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
-        if getattr(args, "max_continuations", None) is not None:
-            command += ["--max-continuations", str(args.max_continuations)]
+        if owner_supervised:
+            route = _supervisor_route(args)
+            if route:
+                command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
+            if getattr(args, "max_continuations", None) is not None:
+                command += ["--max-continuations", str(args.max_continuations)]
         if commit_grant_target(args):
             # The supervisor builds the native profile; it only needs to know
             # whether this launch may commit (a primary checkout then gets the

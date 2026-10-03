@@ -907,6 +907,180 @@ def fake_run_result(returncode, stdout):
     )
 
 
+class OneTurnStageTransportTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        spec = importlib.util.spec_from_file_location("stage_supervisor", SUPERVISOR)
+        self.supervisor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.supervisor)
+
+    def test_usage_numeric_allowlist_preserves_zero_and_decreasing_last(self):
+        wire = {
+            "last": {"inputTokens": 0, "outputTokens": 4, "totalTokens": 4,
+                     "reasoningOutputTokens": True, "cachedInputTokens": 1.0,
+                     "x": "secret"},
+            "total": {"totalTokens": 9, "inputTokens": -1,
+                      "outputTokens": "8", "cachedInputTokens": float("inf")},
+            "modelContextWindow": 2**63,
+            "prompt": "private prompt", "extra": {"secret": "value"},
+        }
+        first = self.supervisor.normalize_token_usage(wire)
+        self.assertEqual(first, {"last": {"input_tokens": 0, "output_tokens": 4,
+                                           "total_tokens": 4},
+                                 "total": {"total_tokens": 9}})
+        lower = self.supervisor.normalize_token_usage({
+            "last": {"totalTokens": 2}, "total": {"totalTokens": 10},
+            "modelContextWindow": "100000",
+        })
+        self.assertEqual(lower["last"]["total_tokens"], 2)
+        self.assertNotIn("model_context_window", lower)
+        self.assertNotIn("model_context_window", self.supervisor.normalize_token_usage({
+            "last": {"totalTokens": 0}, "total": {},
+        }))
+        self.assertEqual(self.supervisor.normalize_token_usage({
+            "last": {"totalTokens": 2**63 - 1}, "total": {},
+            "modelContextWindow": 0,
+        }), {"last": {"total_tokens": 2**63 - 1}, "total": {},
+             "model_context_window": 0})
+        self.assertNotIn("prompt", json.dumps(first))
+
+    def test_one_turn_uses_ephemeral_thread_one_turn_and_closes_server(self):
+        fake = self.root / "fake.py"
+        trace = self.root / "trace.jsonl"
+        fake.write_text(textwrap.dedent("""\
+            import json, os, signal, sys
+            trace = os.environ['STAGE_TRACE']
+            def send(value): print(json.dumps(value), flush=True)
+            def record(value):
+                with open(trace, 'a', encoding='utf-8') as out:
+                    out.write(json.dumps(value) + '\\n')
+            def close(*_):
+                record({'event':'closed'})
+                raise SystemExit(0)
+            signal.signal(signal.SIGTERM, close)
+            turns = 0
+            for line in sys.stdin:
+                value = json.loads(line); method = value.get('method')
+                if method == 'initialize':
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{}})
+                elif method == 'initialized':
+                    record({'event':'initialized'})
+                elif method == 'thread/start':
+                    record({'event':'thread','params':value['params']})
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{'thread':{'id':'thread-self'}}})
+                elif method == 'turn/start':
+                    turns += 1
+                    record({'event':'turn','params':value['params']})
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-self'}}})
+                    send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
+                        'threadId':'thread-self','turnId':'turn-self','tokenUsage':{
+                            'last':{'totalTokens':0},'total':{'totalTokens':11},
+                            'modelContextWindow':None,'prompt':'DO_NOT_LOG'}}})
+                    send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
+                        'threadId':'foreign-thread','turnId':'turn-self','tokenUsage':{
+                            'last':{'totalTokens':99},'total':{'totalTokens':99}}}})
+                    send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
+                        'threadId':'thread-self','turnId':'foreign-turn','tokenUsage':{
+                            'last':{'totalTokens':88},'total':{'totalTokens':88}}}})
+                    send({'jsonrpc':'2.0','method':'item/completed','params':{
+                        'turnId':'turn-self','item':{'type':'agentMessage','id':'m1',
+                        'text':'artifact: -\\nverdict: PASS\\nblocker: none'}}})
+                    send({'jsonrpc':'2.0','method':'turn/completed','params':{
+                        'turn':{'id':'turn-self','status':'completed'}}})
+                elif method == 'shutdown':
+                    break
+        """), encoding="utf-8")
+        env = {**os.environ, "STAGE_TRACE": str(trace)}
+        result = subprocess.run(
+            [sys.executable, str(SUPERVISOR), "--one-turn", "--worktree", str(self.root),
+             "--sandbox", "read-only", "--app-server-command", f"{sys.executable} {fake}"],
+            input="stage assignment", text=True, capture_output=True, env=env, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        usage = [row for row in rows if row.get("type") == "dispatch.supervisor.token_usage"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["thread_id"], "thread-self")
+        self.assertEqual(usage[0]["turn_id"], "turn-self")
+        self.assertEqual(usage[0]["token_usage"]["last"]["total_tokens"], 0)
+        self.assertNotIn("prompt", json.dumps(usage))
+        self.assertEqual(sum(row.get("type") == "turn.completed" for row in rows), 1)
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        thread = next(row for row in events if row.get("event") == "thread")
+        turn = next(row for row in events if row.get("event") == "turn")
+        self.assertIs(thread["params"]["ephemeral"], True)
+        self.assertEqual(turn["params"]["threadId"], "thread-self")
+        self.assertEqual(sum(row.get("event") == "turn" for row in events), 1)
+        self.assertIn({"event": "closed"}, events)
+        self.assertNotIn("--parent-attempt-id", result.args)
+
+    def test_empty_prompt_and_app_server_eof_fail_without_terminal_success(self):
+        marker = self.root / "started"
+        fake = self.root / "eof.py"
+        fake.write_text(
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(marker)!r}).write_text('started')\n"
+            "sys.stdin.readline()\n",
+            encoding="utf-8",
+        )
+        common = [sys.executable, str(SUPERVISOR), "--one-turn", "--worktree", str(self.root),
+                  "--sandbox", "read-only", "--app-server-command", f"{sys.executable} {fake}"]
+        empty = subprocess.run(common, input=" \n", text=True, capture_output=True, timeout=10)
+        self.assertEqual(empty.returncode, 64)
+        self.assertFalse(marker.exists())
+        self.assertIn('"reason":"initial-prompt-empty"', empty.stdout)
+
+        eof = subprocess.run(common, input="stage assignment", text=True,
+                             capture_output=True, timeout=10)
+        self.assertEqual(eof.returncode, 70)
+        rows = [json.loads(line) for line in eof.stdout.splitlines()]
+        self.assertTrue(any(row.get("reason") == "app-server-eof" for row in rows))
+        self.assertFalse(any(row.get("type") == "turn.completed" for row in rows))
+
+    def test_failed_turn_missing_final_and_invalid_handoff_do_not_pass(self):
+        fake = self.root / "terminal.py"
+        fake.write_text(textwrap.dedent("""\
+            import json, os, sys
+            def send(value): print(json.dumps(value), flush=True)
+            scenario = os.environ['STAGE_SCENARIO']
+            for line in sys.stdin:
+                value=json.loads(line); method=value.get('method')
+                if method == 'initialize':
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{}})
+                elif method == 'thread/start':
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{'thread':{'id':'thread-terminal'}}})
+                elif method == 'turn/start':
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-terminal'}}})
+                    if scenario == 'failed':
+                        send({'jsonrpc':'2.0','method':'turn/completed','params':{
+                            'turn':{'id':'turn-terminal','status':'failed','error':{'message':'failed'}}}})
+                        continue
+                    if scenario != 'missing':
+                        text = 'not a handoff' if scenario == 'invalid' else 'artifact: -\\nverdict: PASS\\nblocker: none'
+                        send({'jsonrpc':'2.0','method':'item/completed','params':{
+                            'turnId':'turn-terminal','item':{'type':'agentMessage','id':'final','text':text}}})
+                    send({'jsonrpc':'2.0','method':'turn/completed','params':{
+                        'turn':{'id':'turn-terminal','status':'completed'}}})
+        """), encoding="utf-8")
+        command = [sys.executable, str(SUPERVISOR), "--one-turn", "--worktree", str(self.root),
+                   "--sandbox", "read-only", "--app-server-command", f"{sys.executable} {fake}"]
+        for scenario, expected, terminal_event in (
+                ("failed", 70, False), ("missing", 3, True), ("invalid", 3, True)):
+            result = subprocess.run(command, input="stage assignment", text=True,
+                                    capture_output=True, timeout=10,
+                                    env={**os.environ, "STAGE_SCENARIO": scenario})
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(any(row.get("type") == "turn.completed" for row in rows),
+                             terminal_event)
+            self.assertFalse(any(row.get("type") == "dispatch.supervisor.resumed" for row in rows))
+            if scenario == "failed":
+                self.assertTrue(any(row.get("type") == "dispatch.supervisor.turn.failed"
+                                     for row in rows))
+
+
 class ActiveTurnDeadlineParityTest(unittest.TestCase):
     """The Codex App Server turn has no elapsed-time deadline: a live turn that
     stays quiet across many read polls still completes on its own turn."""
