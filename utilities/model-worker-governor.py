@@ -223,21 +223,20 @@ def default_root() -> Path:
     """Return a path writable by both the main checkout and linked workers."""
     explicit = os.environ.get("AGENT_MODEL_GOVERNOR_ROOT")
     if explicit:
-        return Path(explicit)
-    artifact_root = os.environ.get("AGENT_ARTIFACT_ROOT")
-    if artifact_root:
-        return Path(artifact_root) / ".runtime" / "model-worker-governor"
+        return Path(explicit).expanduser().resolve(strict=False)
     resolver = Path(__file__).resolve().with_name("artifact-root.sh")
-    if resolver.is_file():
-        resolved = subprocess.run(
-            [str(resolver), str(Path.cwd())],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if resolved.returncode == 0 and resolved.stdout.strip():
-            return Path(resolved.stdout.strip()) / ".runtime" / "model-worker-governor"
-    return Path.home() / ".agent-worker-governor"
+    if not resolver.is_file():
+        raise RuntimeError(f"artifact-root-resolution-failed: resolver missing: {resolver}")
+    resolved = subprocess.run(
+        [str(resolver), str(Path.cwd())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        detail = resolved.stderr.strip() or f"resolver exit={resolved.returncode}"
+        raise RuntimeError(f"artifact-root-resolution-failed: {detail}")
+    return Path(resolved.stdout.strip()) / ".runtime" / "model-worker-governor"
 
 
 def process_observation(pid: int) -> tuple[str, str, str]:
