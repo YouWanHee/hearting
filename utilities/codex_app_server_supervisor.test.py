@@ -974,7 +974,6 @@ class OneTurnStageTransportTest(unittest.TestCase):
                 elif method == 'turn/start':
                     turns += 1
                     record({'event':'turn','params':value['params']})
-                    send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-self'}}})
                     send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
                         'threadId':'thread-self','turnId':'turn-self','tokenUsage':{
                             'last':{'totalTokens':0},'total':{'totalTokens':11},
@@ -985,6 +984,7 @@ class OneTurnStageTransportTest(unittest.TestCase):
                     send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
                         'threadId':'thread-self','turnId':'foreign-turn','tokenUsage':{
                             'last':{'totalTokens':88},'total':{'totalTokens':88}}}})
+                    send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-self'}}})
                     send({'jsonrpc':'2.0','method':'item/completed','params':{
                         'turnId':'turn-self','item':{'type':'agentMessage','id':'m1',
                         'text':'artifact: -\\nverdict: PASS\\nblocker: none'}}})
