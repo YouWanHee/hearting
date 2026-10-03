@@ -626,7 +626,7 @@ class AdapterV11Test(unittest.TestCase):
    for repetition in range(4):
     with self.subTest(harness=harness,repetition=repetition), tempfile.TemporaryDirectory() as td:
      root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"; fakebin.mkdir()
-     fake=fakebin/harness; fake.write_text("#!/bin/sh\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
+     fake=fakebin/harness; fake.write_text("#!/bin/sh\n[ \"$1\" = app-server ] && exit 69\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
      self.seed_parent(jobs,repo,harness=harness)
      command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout",FAKE_WORKER_TIMEOUT]
      wrapper=self.load_wrapper(harness); argv=["dispatch-headless.py",*command[2:]]
@@ -868,7 +868,7 @@ class AdapterV11Test(unittest.TestCase):
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
    fakebin=root/"bin"; fakebin.mkdir(); count=root/"child-count"
    fake=fakebin/"codex"
-   fake.write_text("#!/bin/sh\nprintf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n",encoding="utf-8")
+   fake.write_text("#!/bin/sh\n[ \"$1\" = app-server ] && exit 69\nprintf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n",encoding="utf-8")
    fake.chmod(0o755)
    command=self.command("codex","start",repo,jobs,logs)
    self.seed_parent(jobs,repo,harness="codex")
