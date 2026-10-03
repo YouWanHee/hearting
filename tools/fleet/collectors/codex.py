@@ -1305,6 +1305,8 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
 
     by_cwd = {}
     registry_claims = {}
+    registry_owners = {}
+    eligible = []
     for sess in sessions:
         if (getattr(sess, "harness", None) != "codex"
                 or not getattr(sess, "cwd", None)
@@ -1312,18 +1314,33 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
                 or getattr(sess, "managed_dir", None)
                 or getattr(sess, "is_child", False)):
             continue
+        eligible.append(sess)
         sid = _registered_thread(sess.pid)
         if sid:
             registry_claims[sess.pid] = sid
-            claimed.add(sid)
-            if sess.pid not in paths:
+            registry_owners.setdefault(sid, set()).add(sess.pid)
+
+    # A registry row reserves its full SID even when multiple validated PIDs
+    # claim it. Only a sole owner may recover a missing path, and never by
+    # duplicating a path already held independently through an open FD.
+    initially_claimed = set(claimed)
+    fd_owned_sids = {_sid(path) for path in paths.values() if _sid(path)}
+    for sid in registry_owners:
+        claimed.add(sid)
+    for sess in eligible:
+        sid = registry_claims.get(sess.pid)
+        if sid:
+            if (len(registry_owners[sid]) == 1 and sess.pid not in paths
+                    and sid not in initially_claimed and sid not in fd_owned_sids):
                 registered_path = exact_rollout_for_session_id(sid, homes=[home])
                 if registered_path:
                     registered_meta = _rollout_meta(registered_path)
                     if (isinstance(registered_meta, dict)
+                            and _sid(registered_path) == sid
                             and os.path.realpath(registered_meta.get("cwd") or "")
                             == os.path.realpath(sess.cwd)):
                         paths[sess.pid] = registered_path
+            continue
         if sess.pid in paths:
             continue
         cwd = os.path.realpath(sess.cwd)
@@ -1362,12 +1379,23 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
             if not sid:
                 invalid_observation = True
                 continue
-            declared = [value for value in (meta.get("id"), meta.get("session_id")) if value]
+            declared = []
+            malformed_declared = False
+            for field in ("id", "session_id"):
+                if field not in meta:
+                    continue
+                value = meta[field]
+                if (not isinstance(value, str)
+                        or _sid("rollout-declared-%s.jsonl" % value) != value):
+                    malformed_declared = True
+                    continue
+                declared.append(value)
             created = _session_created(meta)
             if created is None:
                 invalid_observation = True
                 continue
-            if any(value != sid for value in declared) or len(set(declared)) > 1:
+            if (malformed_declared or any(value != sid for value in declared)
+                    or len(set(declared)) > 1):
                 invalid_paths.add(path)
             roots_by_sid.setdefault(sid, set()).add(path)
         if invalid_observation:
