@@ -128,6 +128,17 @@ and symlink safety, lock ownership and process-liveness checks remain enforced.
 Historical records are preserved; bypassing identity comparisons does not
 rewrite them or turn a live process into completed work.
 
+Completion evidence has two moments. First close proves the current readable
+evidence for the exact route, owner/attempt and terminal claim; an unreadable
+or conflicting record cannot establish completion. Once the existing outcome
+and terminal claim record that proof, later edits, moves, or deletion of the
+referenced report are history about the completed work, not a reason to rerun
+or reapprove it. This does not waive marker, registry, claim, route identity,
+or process-cleanup checks. With same-work gates off, deletion of evidence for
+an already completed review follows the same recorded-history rule; the first
+completion still requires readable evidence, and gates on retain their live
+evidence check.
+
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
 Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).
@@ -775,7 +786,10 @@ A terminal `capability-owner` node is executed by the bound depth-1 owner.
 The shared terminal observer consumes that owner's exact native PASS, readable
 output, declared prerequisite proofs and quiescence. It does not require a
 second child or a synthetic worker marker. The terminal claim binds the same
-evidence digest for closure, replay and downstream consumption. A missing
+evidence digest for closure, replay and downstream consumption. The outcome's
+recorded terminal rows remain the completion snapshot when a closed cycle is
+refreshed; an owner row without a worker marker is read from that verified
+outcome, while worker marker absence remains unproven. A missing
 prerequisite keeps the executing owner responsible before exit; after exit,
 `dispatch_terminal_commit.py inspect --jobs <jobs> --attempt <id>` diagnoses the
 retained obligation and `finish` retries closure without running a model.

@@ -134,7 +134,7 @@ def _finish_recovery(args) -> bool:
     for aid in rows:
         if rows[aid][1].get("parent_attempt_id") == args.attempt_id:
             owned.add(aid)
-    if owned and _pending(rows, sorted(owned), Path(args.jobs)):
+    if owned and _pending(rows, sorted(owned), Path(args.jobs), reason="supervisor-exited"):
         materialize(Path(args.jobs), owned, reason="supervisor-exited")
         return False
     _remove_supervisor_state(args)

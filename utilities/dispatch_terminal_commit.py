@@ -897,12 +897,46 @@ _EVIDENCE_MOVED_ON = frozenset({"completion-evidence-revised-unrecorded", "compl
 
 
 def _settled_gate_rows(route_module, route, request, gates):
+    """Replay the terminal rows already bound by the closed route outcome.
+
+    The outcome/claim/commit identity remains authoritative. Live gate reads
+    can report an evidence edit or missing report after settlement, so sealed
+    replay rebuilds worker rows from the exact marker bytes and owner rows from
+    the matching recorded outcome. It never invents a worker marker for an
+    owner, and callers still prove children and current execution cleanup.
+    """
     nodes = {node.get("id"): node for node in route.get("nodes", []) if isinstance(node, dict)}
+    try:
+        outcome = json.loads(route_module.outcome_path(request.route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        outcome = None
+    recorded = outcome.get("terminal_gates") if isinstance(outcome, Mapping) else None
+    outcome_matches = (isinstance(outcome, Mapping)
+                       and outcome.get("route_id") == route.get("route_id")
+                       and outcome.get("route_hash") == route.get("route_hash")
+                       and outcome.get("terminal_gate_proven") is True
+                       and isinstance(recorded, Mapping))
     rows = {}
     for node_id, row in gates.items():
         rebuilt = None
-        if (isinstance(row, Mapping) and row.get("passed") is False
-                and row.get("reason") in _EVIDENCE_MOVED_ON and node_id in nodes):
+        node = nodes.get(node_id)
+        if node is None:
+            rows[node_id] = row
+            continue
+        if (outcome_matches and getattr(route_module, "owner_executed_terminal", lambda _node: False)(node)):
+            candidate = recorded.get(node_id)
+            if (isinstance(candidate, Mapping) and candidate.get("passed") is True
+                    and candidate.get("current") is True
+                    and candidate.get("source") == "owner-terminal"
+                    and candidate.get("route_id") == route.get("route_id")
+                    and candidate.get("route_hash") == route.get("route_hash")
+                    and candidate.get("node_id") == node_id
+                    and candidate.get("completion_gate") == node.get("terminal_gate")
+                    and isinstance(candidate.get("attempt_id"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("evidence_digest") or ""))
+                    and re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("marker_digest") or ""))):
+                rebuilt = dict(candidate)
+        if (rebuilt is None and not getattr(route_module, "owner_executed_terminal", lambda _node: False)(node)):
             try:
                 path = route_module.completion_dir(route["route_id"], jobs=request.jobs) / f"{node_id}.json"
                 raw = path.read_bytes()
@@ -1671,7 +1705,15 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         # The binding is published at owner launch by artifact_producer.bind_owner_launch,
         # or by the owner's own begin; settlement remains read-only (§13.53.3).
         ledger = workflow.WorkflowLedger(route["route_id"], route["route_hash"], jobs=request.jobs)
-        gates = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+        route_module = _route_module()
+        gates = route_module.terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+        commit_path = _commit_state_path(request)
+        try:
+            prior_state = json.loads(commit_path.read_text(encoding="utf-8")) if commit_path.exists() else None
+        except (OSError, ValueError, TypeError):
+            prior_state = None
+        if isinstance(prior_state, Mapping) and prior_state.get("state") == "owner-envelope-sealed":
+            gates = _settled_gate_rows(route_module, route, request, gates)
         missing = {node: proof.get("reason", "unproven") for node, proof in gates.items() if not proof.get("passed")}
         if missing:
             result = TerminalCommitResult("needs-owner", "terminal-marker-not-current", json.dumps(missing, sort_keys=True))

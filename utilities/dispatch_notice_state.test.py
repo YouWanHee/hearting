@@ -286,14 +286,20 @@ class NoticeTest(unittest.TestCase):
         self.assertEqual(pending.read(self.root, "parent", "delivery-notice")["state"], "claimed")
 
     def test_closed_route_retires_exited_supervisor_during_pending_settlement(self):
+        from types import SimpleNamespace
         self.meta["workflow_completion"] = "runtime-v1"
         self.write_row()
         record = supervision.materialize(self.jobs, {"att-owner"}, reason="supervisor-exited")[0]
         self.close()
-        with mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True):
+        with mock.patch("dispatch_terminal_commit.owner_completion_pending", return_value=True), \
+             mock.patch("dispatch_contract.attempt_process_quiescence",
+                        return_value=SimpleNamespace(state="quiescent", reason="registry-closed")):
+            self.assertEqual(record["receipt"]["reason"], "supervisor-exited")
+            self.assertEqual(record["receipt"]["obligation_revision"], "")
             self.assertFalse(notice.notice_is_current(record))
             # A real finishing failure is not silenced by an early close.
             blocked = supervision.materialize(self.jobs, {"att-owner"}, reason="closure-blocked")[0]
+            self.assertEqual(blocked["receipt"]["reason"], "closure-blocked")
             self.assertTrue(notice.notice_is_current(blocked))
 
     def test_gate_needs_latest_exact_raise_but_can_outlive_owner(self):
