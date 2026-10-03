@@ -1054,9 +1054,10 @@ class OneTurnStageTransportTest(unittest.TestCase):
                     send({'jsonrpc':'2.0','id':value['id'],'result':{'thread':{'id':'thread-terminal'}}})
                 elif method == 'turn/start':
                     send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-terminal'}}})
-                    if scenario == 'failed':
+                    if scenario in ('failed', 'interrupted'):
                         send({'jsonrpc':'2.0','method':'turn/completed','params':{
-                            'turn':{'id':'turn-terminal','status':'failed','error':{'message':'failed'}}}})
+                            'turn':{'id':'turn-terminal','status':scenario,
+                                    'error':{'message':scenario}}}})
                         continue
                     if scenario != 'missing':
                         text = 'not a handoff' if scenario == 'invalid' else 'artifact: -\\nverdict: PASS\\nblocker: none'
@@ -1068,7 +1069,8 @@ class OneTurnStageTransportTest(unittest.TestCase):
         command = [sys.executable, str(SUPERVISOR), "--one-turn", "--worktree", str(self.root),
                    "--sandbox", "read-only", "--app-server-command", f"{sys.executable} {fake}"]
         for scenario, expected, terminal_event in (
-                ("failed", 70, False), ("missing", 3, True), ("invalid", 3, True)):
+                ("failed", 70, False), ("interrupted", 70, False),
+                ("missing", 3, True), ("invalid", 3, True)):
             result = subprocess.run(command, input="stage assignment", text=True,
                                     capture_output=True, timeout=10,
                                     env={**os.environ, "STAGE_SCENARIO": scenario})
@@ -1077,9 +1079,9 @@ class OneTurnStageTransportTest(unittest.TestCase):
             self.assertEqual(any(row.get("type") == "turn.completed" for row in rows),
                              terminal_event)
             self.assertFalse(any(row.get("type") == "dispatch.supervisor.resumed" for row in rows))
-            if scenario == "failed":
+            if scenario in {"failed", "interrupted"}:
                 self.assertTrue(any(row.get("type") == "dispatch.supervisor.turn.failed"
-                                     for row in rows))
+                                     for row in rows), result.stdout)
 
     def test_named_permission_profile_is_applied_without_turn_sandbox_override(self):
         profile = {"default_permissions": "profile-test",
