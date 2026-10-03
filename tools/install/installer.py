@@ -40,6 +40,7 @@ import user_config
 import host_probes
 import node_runtime
 import safe_fs
+import model_settings
 from drivers import get_driver, RUNTIMES
 
 # Exit codes map one-to-one to the PRD CLI table.
@@ -171,6 +172,16 @@ def build_parser():
         help="Required together with --session-id; inferred otherwise")
     p_session_name.add_argument("--json", action="store_true")
 
+    # Explicit user-owned portable model selection; native runtime settings are separate.
+    p_model = sub.add_parser("model", help="Edit a runtime's user-owned Hearting model selection")
+    model_sub = p_model.add_subparsers(dest="model_command", required=True, parser_class=_UsageExitParser)
+    p_model_set = model_sub.add_parser("set", help="Set a declared tier, role alias, or profile model")
+    p_model_set.add_argument("harness", choices=RUNTIMES)
+    p_model_set.add_argument("target", help="tier/profile/role name; optionally prefix tier/, profile/, or role/")
+    p_model_set.add_argument("model", help="Model identifier with optional @effort or @variant")
+    p_model_set.add_argument("--dry-run", action="store_true")
+    p_model_set.add_argument("--json", action="store_true")
+
     # Source → active runtime truth.  These parsers intentionally do not inherit
     # the legacy install channel's --plugin option: linked/packaged are mutually
     # exclusive and both are fully local/offline.
@@ -288,6 +299,31 @@ def emit(result, as_json):
         for line in result.get("lines", []):
             print(line)
     return result["exit"]
+
+
+def cmd_model(args):
+    try:
+        result = model_settings.set_model(
+            args.harness, args.target, args.model,
+            runtime=paths.runtime_home(args.harness, "global"),
+            source_root=paths.agent_home(), dry_run=args.dry_run,
+        )
+    except model_settings.ModelSettingsUsageError as exc:
+        result = {
+            "operation": "model-set", "status": "invalid-arguments", "exit": EXIT_USAGE,
+            "runtime": args.harness, "config_path": None, "target": args.target,
+            "requested_model": args.model, "changed_keys": [], "backup": None,
+            "error": str(exc), "lines": [f"model set: {exc}"],
+        }
+    except (model_settings.ModelSettingsError, safe_fs.SafetyError,
+            OSError, ValueError) as exc:
+        result = {
+            "operation": "model-set", "status": "blocked", "exit": EXIT_BLOCKED,
+            "runtime": args.harness, "config_path": None, "target": args.target,
+            "requested_model": args.model, "changed_keys": [], "backup": None,
+            "error": str(exc), "lines": [f"model set: {exc}"],
+        }
+    return result
 
 
 def cmd_install(args):
@@ -1571,6 +1607,7 @@ COMMANDS = {
     "uninstall": cmd_uninstall,
     "runtime": cmd_runtime,
     "extension": cmd_extension,
+    "model": cmd_model,
     "auto-update": cmd_auto_update,
 }
 

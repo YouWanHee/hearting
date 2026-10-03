@@ -76,7 +76,8 @@ on a reduced-granularity adapter). Explicit balanced wins. Missing any other
 required key retains whole-file fallback. No loader or installer writes this
 normalization back, including on install/update/reapply/uninstall. The same
 rule derives a missing balanced dispatch policy from the user's entire light
-policy without enabling any disabled vendor.
+policy without enabling any disabled vendor. Explicit edits follow
+[Model Configuration](MODEL_CONFIG.md).
 Native runtime settings and adapter fragments remain outside
 `agent-config`.
 

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import selectors
 from types import SimpleNamespace
 import unittest
 import unittest.mock
@@ -118,13 +119,26 @@ class ActiveTurnDeadlineTest(unittest.TestCase):
     supervisor `run_turn`, which is what decides the policy."""
 
     WINDOW = 0.6
+    READINESS_HANG_GUARD = 5
     CHATTY = """
-event('step_start', part={})
+from pathlib import Path
+import os
+Path('pid').write_text(str(os.getpid()))
+ack = int(os.environ['HEARTING_ACK_FD'])
+time.sleep(float(os.environ.get('HEARTING_START_DELAY', '0')))
+ack_delay = float(os.environ.get('HEARTING_ACK_DELAY', '0'))
+def paced(kind, **values):
+    global ack_delay
+    event(kind, **values)
+    os.read(ack, 1)
+    if ack_delay:
+        time.sleep(ack_delay)
+        ack_delay = 0
+paced('step_start', part={})
 for _ in range(6):
-    time.sleep(0.3)
-    event('tool_use', part={'tool':'bash', 'callID':'c', 'state':{'status':'running'}})
-event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})
-event('step_finish', part={'reason':'stop'})
+    paced('tool_use', part={'tool':'bash', 'callID':'c', 'state':{'status':'running'}})
+paced('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})
+paced('step_finish', part={'reason':'stop'})
 """
 
     program = NativeSessionTest.program
@@ -141,19 +155,100 @@ event('step_finish', part={'reason':'stop'})
     def turn(self, **kwargs):
         return self.supervisor.run_turn(self.args, "sess", "go", resume=False, **kwargs)
 
+    def virtual_turn(self, *, startup_delay=0, ack_delay=0, **kwargs):
+        clock = SimpleNamespace(now=0.0)
+        original_selector = selectors.DefaultSelector
+        readiness_hang_guard = self.READINESS_HANG_GUARD
+
+        class Clock:
+            @staticmethod
+            def monotonic():
+                return clock.now
+
+        class ControlledSelector:
+            def __init__(self):
+                self.inner = original_selector()
+
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+            def register(self, *args, **kw):
+                return self.inner.register(*args, **kw)
+
+            def select(self, timeout=None):
+                # Real startup/ACK scheduling has its own hang guard. The
+                # production timeout argument controls only the virtual clock.
+                ready = self.inner.select(readiness_hang_guard)
+                # A ready chunk advances virtual time by less than the idle window;
+                # silence consumes the whole remaining deadline. Real readiness and
+                # the real subprocess pipe remain in use.
+                clock.now += min(0.3, timeout or 0.0) if ready else (timeout or 0.0)
+                return ready
+
+            def close(self):
+                return self.inner.close()
+
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        original_popen = runtime.subprocess.Popen
+
+        def controlled_popen(*args, **kw):
+            env = dict(os.environ)
+            env['HEARTING_ACK_FD'] = str(read_fd)
+            env['HEARTING_START_DELAY'] = str(startup_delay)
+            env['HEARTING_ACK_DELAY'] = str(ack_delay)
+            kw.update(pass_fds=(read_fd,), env=env)
+            return original_popen(*args, **kw)
+
+        real_read = os.read
+
+        def acknowledged_read(fd, size):
+            chunk = real_read(fd, size)
+            if chunk and fd != read_fd:
+                os.write(write_fd, b'!')
+            return chunk
+
+        with unittest.mock.patch.object(runtime, 'time', Clock()), \
+             unittest.mock.patch.object(runtime.selectors, 'DefaultSelector', ControlledSelector), \
+             unittest.mock.patch.object(runtime.subprocess, 'Popen', controlled_popen), \
+             unittest.mock.patch.object(runtime.os, 'read', acknowledged_read):
+            return self.turn(**kwargs), clock
+
     def test_native_live_turn_with_events_survives_past_the_window(self):
         self.program(self.CHATTY)
-        started = time.monotonic()
-        result, code = self.turn()
-        self.assertGreater(time.monotonic() - started, self.WINDOW)
+        (result, code), clock = self.virtual_turn()
+        self.assertGreater(clock.now, self.WINDOW)
         self.assertEqual(code, 0)
         self.assertEqual(result["result"], "artifact: -\nverdict: PASS\nblocker: none")
+
+    def test_real_startup_and_ack_delays_do_not_consume_virtual_deadline_under_load(self):
+        # Delay both real readiness boundaries beyond the semantic window.
+        # The load process stays owned by this fixture and is always reaped.
+        load = subprocess.Popen([sys.executable, '-c', 'while True: pass'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.program(self.CHATTY)
+            (result, code), clock = self.virtual_turn(
+                startup_delay=self.WINDOW * 1.5, ack_delay=self.WINDOW * 1.5)
+            self.assertGreater(clock.now, self.WINDOW)
+            self.assertEqual(code, 0)
+            self.assertEqual(result['result'], 'artifact: -\nverdict: PASS\nblocker: none')
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int((self.root / 'pid').read_text()), 0)
+        finally:
+            load.terminate()
+            load.wait(timeout=5)
 
     def test_native_silence_for_the_whole_window_still_times_out_and_reaps(self):
         self.program("from pathlib import Path\nimport os\nPath('pid').write_text(str(os.getpid()))\n"
                      "event('step_start', part={})\ntime.sleep(10)\n")
         with self.assertRaisesRegex(self.supervisor.SupervisorError, "opencode-turn-timeout"):
-            self.turn()
+            self.virtual_turn()
         with self.assertRaises(ProcessLookupError):
             os.kill(int((self.root / "pid").read_text()), 0)
 
@@ -181,7 +276,7 @@ event('step_finish', part={'reason':'stop'})
     def test_a_sealed_handoff_keeps_the_fixed_deadline_even_with_events(self):
         self.program(self.CHATTY)
         with self.assertRaisesRegex(self.supervisor.SupervisorError, "opencode-turn-timeout"):
-            self.turn(handoff_intent={"intent_id": "handoff"})
+            self.virtual_turn(handoff_intent={"intent_id": "handoff"})
 
 
 class SharedControllerTest(unittest.TestCase):
