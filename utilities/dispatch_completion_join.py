@@ -1050,13 +1050,24 @@ def partition_runtime_wait_children(
         and row.metadata.get("launch_started") != "1"
     )
     rest = [row for row in rows if row.attempt_id in candidates - chain_pending - refusal_settled]
+    # Join/partition and terminal proof use the same durable launch fence.
+    # A done row is ignorable only when the lock-time claim says no spawn was
+    # claimed and there is no PID or start identity; outcome labels alone are
+    # insufficient, and ambiguous/live rows stay protected.
+    import dispatch_contract
     never_launched_terminal = {
         row.attempt_id for row in rest
         if row.status == "done"
-        and row.metadata.get("launch_outcome") in {"never-launched", "reaped-before-publish"}
+        and dispatch_contract.attempt_row_never_started(row.raw.split("\t"))
     }
-    unstarted = frozenset(unstarted_child_attempts(rest) - never_launched_terminal)
-    joinable = frozenset(candidates - chain_pending - refusal_settled - unstarted)
+    # Terminal claims still need reconciliation even when their start receipt
+    # was never published. They must not enter the retry-to-start path.
+    unstarted = frozenset(unstarted_child_attempts(
+        [row for row in rest if row.status not in {"done", "killed", "cancelled"}]
+    ))
+    joinable = frozenset(
+        candidates - chain_pending - refusal_settled - unstarted - never_launched_terminal
+    )
     if chain_pending and not joinable:
         unstarted = frozenset(set(unstarted) | set(chain_pending))
         chain_pending = frozenset()
@@ -2573,6 +2584,9 @@ def current_children(
     jobs: Path,
     parent_attempt_id: str,
     expected_attempts: set[str] | None = None,
+    *,
+    route_id: str | None = None,
+    route_hash: str | None = None,
 ) -> list[ChildRow]:
     """Return latest exact-attempt rows owned by ``parent_attempt_id``.
 
@@ -2582,6 +2596,8 @@ def current_children(
 
     if not parent_attempt_id:
         raise JoinContractError("parent-attempt-id-missing")
+    if bool(route_id) != bool(route_hash):
+        raise JoinContractError("route-selection-identity-incomplete")
     try:
         lines = registry_lines(jobs)
     except FileNotFoundError:
@@ -2602,8 +2618,6 @@ def current_children(
         attempt_id = meta.get("attempt_id", "")
         if not attempt_id:
             raise JoinContractError("owned-row-attempt-id-missing")
-        if expected_attempts is not None and attempt_id not in expected_attempts:
-            continue
         latest[attempt_id] = ChildRow(
             order=order,
             status=fields[1],
@@ -2613,7 +2627,25 @@ def current_children(
             metadata=meta,
         )
 
+    has_bound_rows = any(
+        child.metadata.get("route_id") or child.metadata.get("owner_route_id")
+        for child in latest.values()
+    )
+    if route_id and route_hash and has_bound_rows:
+        # Apply selection to each attempt's latest row, not to historical
+        # rows. A replacement or route advance must not resurrect an older
+        # route generation merely because its row once matched. Entirely
+        # route-free legacy registries retain their existing parent-only view.
+        latest = {
+            attempt_id: child for attempt_id, child in latest.items()
+            if ((child.metadata.get("route_id"), child.metadata.get("route_hash"))
+                == (route_id, route_hash)
+                or (child.metadata.get("owner_route_id"), child.metadata.get("owner_route_hash"))
+                == (route_id, route_hash))
+        }
     if expected_attempts is not None:
+        latest = {attempt_id: child for attempt_id, child in latest.items()
+                  if attempt_id in expected_attempts}
         missing = expected_attempts.difference(latest)
         if missing:
             raise JoinContractError("expected-attempt-missing")

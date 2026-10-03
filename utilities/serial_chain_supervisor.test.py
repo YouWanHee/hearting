@@ -206,7 +206,8 @@ def _run_real_supervisor_flow(
                 "2026-09-10T00:00:30Z\topen\t/repo\t" + str(harness.base)
                 + "\tsibling\tattempt_schema_version=2,dispatch_depth=2,transport=headless,"
                 "execution_surface=registered-headless,registered_worker=1,launch_started=1,"
-                "attempt_id=att-sibling,parent_attempt_id=att-parent\n"
+                "attempt_id=att-sibling,parent_attempt_id=att-parent,"
+                f"route_id={route['route_id']},route_hash={route['route_hash']}\n"
             )
             harness.jobs.write_text(harness.jobs.read_text(encoding="utf-8") + sibling, encoding="utf-8")
         if proof_refusal:
@@ -292,6 +293,8 @@ def _run_real_supervisor_flow(
                 command += ["--route-file", str(harness.base / "route.json"),
                             "--route-id", route["route_id"], "--route-hash", route["route_hash"],
                             "--enable-terminal-commit"]
+            else:
+                command += ["--route-id", route["route_id"], "--route-hash", route["route_hash"]]
             env = {**os.environ, "FAKE_TRACE": str(harness.trace),
                    "AGENT_ARTIFACT_ROOT": str(harness.artifact_root),
                    "AGENT_DISPATCH_ATTEMPT_ID": "att-parent"}
@@ -772,7 +775,11 @@ class RuntimeWaitPartitionTest(unittest.TestCase):
                 "classifier_source": "subsession-chain-refusal-v1",
                 "launch_outcome": "never-launched",
             })
-        return JOIN.ChildRow(1, "done", attempt, attempt, "", metadata)
+        raw = "\t".join([
+            "ts", "done", "/repo", "/wt", attempt,
+            ",".join(f"{key}={value}" for key, value in metadata.items()),
+        ])
+        return JOIN.ChildRow(1, "done", attempt, attempt, raw, metadata)
 
     def test_only_refusal_settled_is_not_joinable_and_claimed_refusal_is_retained(self):
         rows = [self._row("att-refused", refusal=True), self._row("att-claimed", refusal=True, claimed="1")]

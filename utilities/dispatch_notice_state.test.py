@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """H6/H7: stale obligations are retired, real completion and gates survive."""
 import json
+import importlib.util
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -71,6 +73,211 @@ class NoticeTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(sweep.ack_delivered(self.root, "parent", records, acked_by="test"), 1)
         self.assertEqual(sweep.sweep_deliver(self.root, "claude-parent-runtime", "parent")[0], [])
+
+    def test_route_wide_terminal_pass_does_not_consume_a_notice(self):
+        route = {
+            "route_id": "rt-notice", "capability": "route-frame",
+            "effective_intensity": "standard",
+            "selection": {"shape": "framed"},
+            "nodes": [
+                {"id": "frame"}, {"id": "frame-alternative"},
+                {"id": "route-decision", "kind": "runtime-terminal", "terminal": True},
+            ],
+        }
+        route["route_hash"] = route_hash(route)
+        self.path.write_text(json.dumps(route))
+        self.route = route
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"],
+                         parent_attempt_id="att-owner")
+        self.write_row()
+        record = self.seed("advance-completed")
+        reader = SimpleNamespace(terminal_gate_observation=lambda *a, **k: {
+            "route-decision": {"passed": True},
+        })
+        import sys
+        with mock.patch.dict(sys.modules, {"capability_route": reader}):
+            self.assertFalse(notice.framed_decision_consumed(record, self.meta, self.jobs))
+            self.assertTrue(notice.notice_is_current(record, jobs=self.jobs))
+            child_meta = dict(self.meta, attempt_id="att-child", parent_attempt_id="att-owner")
+            self.assertFalse(notice.framed_decision_consumed(record, child_meta, self.jobs))
+            child_meta["parent_attempt_id"] = "att-another-recipient"
+            self.assertFalse(notice.framed_decision_consumed(record, child_meta, self.jobs))
+
+    def test_framed_decision_does_not_consume_foreign_attempt_or_recipient(self):
+        route = {
+            "route_id": "rt-notice", "capability": "route-frame",
+            "effective_intensity": "standard", "selection": {"shape": "framed"},
+            "nodes": [{"id": "frame"}, {"id": "frame-alternative"},
+                      {"id": "route-decision", "kind": "runtime-terminal", "terminal": True}],
+        }
+        route["route_hash"] = route_hash(route)
+        self.path.write_text(json.dumps(route))
+        self.route = route
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"],
+                         parent_attempt_id="att-owner")
+        self.write_row()
+        record = self.seed("advance-completed")
+        # Regress the pre-fix seam in isolation: a route-wide PASS used to retire
+        # a notice whose immutable recipient and attempt set belong elsewhere.
+        record = dict(record, attempt_ids=["att-foreign"], recipient_digest=pending.recipient_digest("other"))
+        reader = SimpleNamespace(terminal_gate_observation=lambda *a, **k: {
+            "route-decision": {"passed": True},
+        })
+        import sys
+        with mock.patch.dict(sys.modules, {"capability_route": reader}):
+            self.assertTrue(notice.notice_is_current(record, jobs=self.jobs))
+
+    def test_framed_decision_needs_exact_recipient_attempt_set_and_route(self):
+        route = {
+            "route_id": "rt-notice", "capability": "route-frame",
+            "effective_intensity": "standard", "selection": {"shape": "framed"},
+            "nodes": [{"id": "frame"}, {"id": "frame-alternative"},
+                      {"id": "route-decision", "kind": "runtime-terminal", "terminal": True}],
+        }
+        route["route_hash"] = route_hash(route)
+        self.path.write_text(json.dumps(route))
+        self.route = route
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"],
+                         parent_attempt_id="att-owner")
+        self.write_row()
+        record = self.seed("advance-completed")
+        reader = SimpleNamespace(terminal_gate_observation=lambda *a, **k: {
+            "route-decision": {"passed": True, "current": True},
+        })
+        import sys
+        with mock.patch.dict(sys.modules, {"capability_route": reader}):
+            for label, changed in (
+                ("foreign attempt", dict(record, attempt_ids=["att-foreign", "att-other"])),
+                ("foreign recipient", dict(record, recipient_digest=pending.recipient_digest("other"))),
+            ):
+                with self.subTest(label):
+                    self.assertTrue(notice.notice_is_current(changed, jobs=self.jobs))
+            self.assertTrue(notice.notice_is_current(
+                record, jobs=self.jobs))  # the stored digest is for parent_sid="parent"
+            foreign_session = dict(self.meta, parent_sid="other")
+            self.assertFalse(notice.framed_decision_consumed(record, foreign_session, self.jobs))
+            # A gate reader that claims PASS but reports a different digest for
+            # its evidence cannot consume this notice.
+            reader.terminal_gate_observation = lambda *a, **k: {
+                "route-decision": {"passed": True, "current": True,
+                                   "evidence": str(self.artifact), "evidence_digest": "0" * 64},
+            }
+            self.assertTrue(notice.notice_is_current(record, jobs=self.jobs))
+            foreign_route = dict(record, route_id="rt-other")
+            pending.claim(self.root, "parent", record["delivery_id"], claim_owner="owner", lease_seconds=60)
+            self.assertFalse(notice.keep_claim(self.root, "parent", record["delivery_id"],
+                                               foreign_route, "owner", jobs=self.jobs))
+            self.assertEqual(pending.read(self.root, "parent", record["delivery_id"])["state"], "claimed")
+
+    def test_real_route_decision_artifact_digest_drift_is_not_consumption(self):
+        source = Path(__file__).with_name("framed_route.test.py")
+        spec = importlib.util.spec_from_file_location("notice_framed_route_fixture", source)
+        framed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(framed)
+        case = framed.FramedEndingTest(
+            "test_proceed_with_no_proposal_fixes_a_none_record_and_ends_the_route")
+        case.setUp()
+        try:
+            ending = case.settle()
+            evidence = Path(ending["record_file"])
+            self.assertTrue(evidence.is_file())
+            before = framed.R.terminal_gate_observation(case.route, jobs=case.jobs)
+            self.assertTrue(before["route-decision"]["passed"])
+            marker_path = framed.R.completion_dir(case.route["route_id"], jobs=case.jobs) / "route-decision.json"
+            marker = json.loads(marker_path.read_text())
+            changed = evidence.read_bytes() + b"\n"
+            evidence.write_bytes(changed)
+            # The real reader may reject the drift immediately or still expose
+            # the marker row in its non-exact mode; neither outcome is enough
+            # for the exact consumer proof below.
+            framed.R.terminal_gate_observation(case.route, jobs=case.jobs)
+            import dispatch_contract
+            self.assertNotEqual(dispatch_contract.evidence_digest(evidence), marker["evidence"]["sha256"])
+            record = {"parent_attempt_id": "att-parent", "attempt_ids": ["att-a", "att-b"],
+                      "recipient_digest": pending.recipient_digest("parent"),
+                      "route_id": case.route["route_id"]}
+            metadata = {"attempt_id": "att-parent", "route_id": case.route["route_id"],
+                        "route_hash": case.route["route_hash"], "route_file": str(case.path),
+                        "parent_sid": "parent"}
+            self.assertFalse(notice.framed_decision_consumed(record, metadata, case.jobs))
+        finally:
+            case.doCleanups()
+
+    def test_materialized_single_frame_notice_stops_after_exact_decision(self):
+        import dispatch_completion_join as join
+        source = Path(__file__).with_name("framed_route.test.py")
+        spec = importlib.util.spec_from_file_location("notice_production_frame_fixture", source)
+        framed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(framed)
+        case = framed.FramedEndingTest(
+            "test_proceed_with_no_proposal_fixes_a_none_record_and_ends_the_route")
+        case.setUp()
+        try:
+            records = []
+            for node in case.route["nodes"][:2]:
+                attempt = "att-notice-" + node["id"]
+                metadata = dict(
+                    attempt_schema_version="2", dispatch_depth="1", transport="headless",
+                    execution_surface="registered-headless", registered_worker="1",
+                    fallback_hop="same-harness-headless", worker_type="frame",
+                    attempt_id=attempt, route_id=case.route["route_id"],
+                    route_hash=case.route["route_hash"], route_file=str(case.path),
+                    route_node=node["id"], parent_sid="parent", harness="claude",
+                    parent_completion_delivery="claude-parent-runtime",
+                    launch_claimed="1", launch_started="1", pid="99999999", pid_start="1",
+                    pgid="99999999", pid_scope="host-visible", process_exit="0",
+                    launch_lifecycle="foreground-scoped", launch_outcome="governed-process-reaped",
+                    group_reap_proof="pgid-empty-v1", group_reap_pgid="99999999",
+                    note="completed-supervisor", failure_class="pass")
+                line = "now\topen\t/r\t/w\t" + node["id"] + "\t" + ",".join(
+                    key + "=" + value for key, value in metadata.items()) + "\n"
+                with case.jobs.open("a") as stream:
+                    stream.write(line)
+                framed.R.complete_node(case.route, node, node["id"],
+                    case.output / "shards" / node["id"] / "direction-brief.md",
+                    jobs=case.jobs, attempt_id=attempt)
+                fields = next(line.split("\t") for line in case.jobs.read_text().splitlines()
+                              if join.parse_registry_metadata(line.split("\t")[-1]).get("attempt_id") == attempt)
+                path = join.materialize_pending_delivery(case.jobs, fields)
+                self.assertIsNotNone(path)
+                record = json.loads(path.read_text())
+                self.assertEqual(record["attempt_ids"], [attempt])
+                self.assertEqual(record["parent_attempt_id"], "-")
+                self.assertTrue(notice.notice_is_current(record, jobs=case.jobs))
+                records.append(record)
+            claimed, _ = sweep.sweep_deliver(case.jobs.parent, "claude-parent-runtime", "parent")
+            self.assertEqual(len(claimed), 2)
+            for record in claimed:
+                pending.mark_sent_ambiguous(case.jobs.parent, "parent", record["delivery_id"],
+                                            claim_owner=record["claim_owner"])
+            case.settle()
+            for record in records:
+                self.assertFalse(notice.notice_is_current(record, jobs=case.jobs))
+                for change in (
+                    {"attempt_ids": ["att-unconsumed"]},
+                    {"recipient_digest": pending.recipient_digest("other")},
+                    {"parent_attempt_id": "att-other"},
+                    {"route_node": "execute"},
+                ):
+                    with self.subTest(change=change):
+                        self.assertTrue(notice.notice_is_current(dict(record, **change), jobs=case.jobs))
+            late = max(record["claim_deadline_ns"] for record in claimed) + 8 * 60 * 10**9
+            self.assertEqual(sweep.sweep_deliver(case.jobs.parent, "claude-parent-runtime", "parent",
+                                              now_ns=late)[0], [])
+            for record in records:
+                stored = pending.read(case.jobs.parent, "parent", record["delivery_id"])
+                self.assertEqual(stored["state"], "rejected")
+            # The existing attempts counter counts claims, including the
+            # reclaim that retires an obsolete notice. It is not an emit
+            # count; the carrier returned no second notification above.
+            before = [pending.read(case.jobs.parent, "parent", record["delivery_id"])
+                      for record in records]
+            self.assertEqual(sweep.sweep_deliver(case.jobs.parent, "claude-parent-runtime", "parent",
+                                              now_ns=late + 8 * 60 * 10**9)[0], [])
+            self.assertEqual(before, [pending.read(case.jobs.parent, "parent", record["delivery_id"])
+                                      for record in records])
+        finally:
+            case.doCleanups()
 
     def test_bad_closure_is_unknown_and_preserves_claim_for_recovery(self):
         self.seed()

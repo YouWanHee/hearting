@@ -534,6 +534,14 @@ A registered headless owner yields after registering a batch; its runtime superv
 
 Shared parent-delivery selection, immutable registration checks, and pre-spawn sidecar arming belong to `utilities/dispatch_parent_completion.py` across all three adapters. A child adapter never infers the parent runtime from its own name. Select delivery by parent runtime: Codex managed parent → Codex gateway; Claude interactive parent → exact owner or exact steward-watch `asyncRewake` with an exit-2 wake for every terminal receipt, plus the SessionStart/UserPromptSubmit sweep that re-delivers any SD-111 pending record or un-acked watch receipt at the next prompt; registered Claude owner → persistent realtime stream with a sealed-terminal fast path (checked per-turn `--resume` fallback); registered Codex headless owner → its private App Server supervisor. Keep TUI client A as the only approval owner and sidecar client B control-only. Require private socket/state paths, exact terminal+quiescent membership, durable idempotency, bounded typed context, and fail-closed ambiguity. A transparent launcher must preserve and validate the real CLI, route only interactive surfaces, repair on update, and restore exactly on uninstall. If those checks are unavailable, report fallback and the missing atomic `continueIfIdle(threadId, idempotencyKey, typedContext)`/native async-rewake primitive rather than widening Stop or PreToolUse.
 
+The parent supervisor's awaited snapshot is the verified route generation and
+its exact current batch (including a validated owner-route advance). Same-parent
+attempts belonging to another route stay outside that receipt and keep their
+independent cleanup ownership; receipt equality checks remain exact. Never-started
+settlement shares the durable launch-fence proof across join, partition, and
+terminal closure. Frame notices remain pending through an ambiguous send and are
+considered consumed only after the recipient's exact route decision is recorded.
+
 ## 8. Dispatch Decision Record (SD ledger, runtime-owned)
 
 Each entry is the full original `core/OPERATIONS.md §5.10` item, moved here

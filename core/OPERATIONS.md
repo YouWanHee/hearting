@@ -324,6 +324,15 @@ Duplicate observations converge on the existing obligation; successful results
 and already accepted notifications are not replayed as retries. Read-only
 queries neither cancel work nor acquire these responsibilities.
 
+An awaited receipt contains only the exact route-bound batch, including its
+verified owner-route advance; unrelated attempts under the same parent retain
+their own execution and cleanup responsibility. A terminal row proven never
+launched by the durable launch fence does not hold replacement settlement open,
+while a claim, PID, start identity, or unavailable proof remains protected.
+Successful frame delivery stays owed until the recipient's exact route decision
+has been consumed; emitting the notice or closing the route alone is not
+consumption evidence.
+
 `dispatch_attempt_policy.py` is the shared decision table. Terminal writers,
 join/harvest, and the retry claimant consume it; the jobs lock admits at most
 one automatic successor for an exact `automatic_retry_of` predecessor. An

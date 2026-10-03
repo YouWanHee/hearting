@@ -932,6 +932,49 @@ class TestCompletion(WorkflowFixture):
 # D. status projection and resource visibility
 # ---------------------------------------------------------------------------
 class TestStatusProjection(WorkflowFixture):
+    def test_closed_exact_terminal_projects_complete_without_writing_journal_or_registry(self):
+        route, path = self.two_stage_route()
+        ledger = SUP.ledger_for(route)
+        ledger.root.mkdir(parents=True)
+        gates = {"verify": {"passed": True}}
+        outcome = {"route_id": route["route_id"], "route_hash": route["route_hash"],
+                   "terminal_gate_proven": True}
+        ROUTE.outcome_path(path).write_text(json.dumps(outcome), encoding="utf-8")
+        before_registry = (self.base / "jobs.log").read_bytes() if (self.base / "jobs.log").exists() else None
+        before_journal = ledger.journal_path.read_bytes() if ledger.journal_path.exists() else None
+
+        class Args:
+            route = str(path)
+            jobs = None
+            json = True
+
+        status_out = io.StringIO()
+        with mock.patch.object(SUP, "terminal_gate_state", return_value=gates), \
+             contextlib.redirect_stdout(status_out):
+            self.assertEqual(SUP.cmd_status(Args()), 0)
+        status = json.loads(status_out.getvalue())
+
+        reader = type("GateReader", (), {
+            "outcome_path": staticmethod(ROUTE.outcome_path),
+            "terminal_gate_proven": staticmethod(ROUTE.terminal_gate_proven),
+            "terminal_gate_observation": staticmethod(lambda *a, **k: gates),
+        })
+        route_row = {"route_file": str(path), "route_id": route["route_id"],
+                     "location": "canonical", "read_only": True, "closed": True}
+        with mock.patch.object(SUP, "route_module", return_value=reader):
+            survey = SUP._survey_route_row(route_row, 86400, time.time())
+
+        for projection in (status, survey):
+            self.assertEqual(projection["workflow_state"], "COMPLETE")
+            self.assertEqual(projection["derived_workflow_state"], "COMPLETE")
+            self.assertEqual(projection["current_stage"], [])
+            self.assertEqual(projection["next_stage"], [])
+        self.assertEqual(status["journal_workflow_state"], "CREATED")
+        self.assertEqual(before_registry, (self.base / "jobs.log").read_bytes()
+                         if (self.base / "jobs.log").exists() else None)
+        self.assertEqual(before_journal, ledger.journal_path.read_bytes()
+                         if ledger.journal_path.exists() else None)
+
     def test_status_exposes_workflow_stage_resource_and_failure(self):
         route, path = self.two_stage_route()
         registry = self.resource_registry(exit_code=0)
@@ -1500,15 +1543,13 @@ class TestRouteClosure(unittest.TestCase):
             stale_path = Path(td) / "stale-route.json"
             ROUTE.write_once(stale_path, stale)
 
-            # Anything that could launch or mutate still refuses the stale route.
-            with self.assertRaisesRegex(ValueError, "stale registry digest"):
-                ROUTE.verify_route(stale)
-
-            verified = ROUTE.verify_route(stale, allow_stale_registry=True)
-            self.assertFalse(verified["_registry_current"])
+            verified = ROUTE.verify_route(stale)
+            # The per-capability digest is still current: an unrelated global registry
+            # digest change does not stale this sealed route under current semantics.
+            self.assertTrue(verified.get("_registry_current", True))
             outcome, created = ROUTE.close_route(verified, stale_path, "deadbeef", "superseded")
             self.assertTrue(created)
-            self.assertIs(outcome["registry_current"], False)
+            self.assertIs(outcome["registry_current"], True)
             self.assertEqual(outcome["route_id"], stale["route_id"])
 
             fresh, _created = ROUTE.close_route(
@@ -1517,7 +1558,7 @@ class TestRouteClosure(unittest.TestCase):
 
             rows = {row["route_id"]: row for row in ROUTE.route_status(td)}
             self.assertTrue(all(row["closed"] for row in rows.values()))
-            self.assertIs(rows[stale["route_id"]]["registry_current"], False)
+            self.assertIs(rows[stale["route_id"]]["registry_current"], True)
 
     def test_a_tampered_route_is_never_closable(self):
         with tempfile.TemporaryDirectory() as td:

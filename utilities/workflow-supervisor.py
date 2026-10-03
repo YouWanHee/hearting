@@ -1918,29 +1918,55 @@ def _stage_projection(route, node_states):
     return running, next_stage
 
 
+def _closed_terminal_projection(route, route_file, gates, node_states, claims):
+    """Read-only proof that a closed route's exact terminal gate is current."""
+    if not route_file or not gates or claims:
+        return False
+    if any(str(row.get("state", "")).startswith("FAILED")
+           or row.get("state") == "RUNNING" for row in node_states.values()):
+        return False
+    try:
+        outcome = json.loads(route_module().outcome_path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return bool(
+        isinstance(outcome, dict)
+        and outcome.get("route_id") == route.get("route_id")
+        and outcome.get("route_hash") == route.get("route_hash")
+        and outcome.get("terminal_gate_proven") is True
+        and route_module().terminal_gate_proven(gates) is True
+    )
+
+
 def cmd_status(args):
     route = load_route(args.route)
     ledger = ledger_for(route, getattr(args, "jobs", None))
-    state = ledger.state()
+    state = ledger.read_only_state()
     armed = read_armed(ledger)
     terminal_nodes = WS.route_terminal_nodes(route)
     gates = terminal_gate_state(route, getattr(args, "jobs", None))
     node_states = state["nodes"]
+    claims = ledger.claims()
     failed = {node: row for node, row in node_states.items()
               if str(row.get("state", "")).startswith("FAILED")}
     running, next_stage = _stage_projection(route, node_states)
+    closed_complete = _closed_terminal_projection(route, args.route, gates, node_states, claims)
     derived = WS.derive_workflow_state(
         node_states, terminal_nodes,
         terminal_gates_passed=bool(gates) and all(row["passed"] for row in gates.values()),
-        pending_claims=len(ledger.claims()),
+        pending_claims=len(claims),
     )
+    if closed_complete:
+        derived = "COMPLETE"
+        running, next_stage = [], []
     payload = {
         "route_id": route["route_id"],
         "route_file": str(Path(args.route).resolve()),
         "capability": route.get("capability"),
         "capability_mode": route.get("capability_mode"),
         "effective_intensity": route.get("effective_intensity"),
-        "workflow_state": state["workflow_state"],
+        "workflow_state": "COMPLETE" if closed_complete else state["workflow_state"],
+        "journal_workflow_state": state["workflow_state"],
         "derived_workflow_state": derived,
         "updated_at": state["updated_at"],
         "current_stage": sorted(running),
@@ -1957,7 +1983,7 @@ def cmd_status(args):
                          "successors": row.get("successors"),
                          "successor_external": row.get("successor_external")}
                   for node, row in armed.items()},
-        "claims": ledger.claims(),
+        "claims": claims,
         "resource_children": resource_children(route, ledger),
         **ledger_metadata(getattr(args, "jobs", None), ledger),
     }
@@ -2293,12 +2319,17 @@ def _survey_route_row(route_row, stale_after_seconds, now):
     if ledger_known:
         workflow_state = ledger_state.get("workflow_state", "CREATED")
         running, next_stage = _stage_projection(route, node_states)
+        journal_workflow_state = workflow_state
+        closed_complete = _closed_terminal_projection(route, path, gates, node_states, claims)
         derived = WS.derive_workflow_state(
             node_states, terminal_nodes,
             terminal_gates_passed=bool(gates) and proven is True,
             pending_claims=len(claims))
+        if closed_complete:
+            workflow_state, derived, running, next_stage = "COMPLETE", "COMPLETE", [], []
     else:
         workflow_state, derived, running, next_stage = "unknown", "unknown", [], []
+        journal_workflow_state = None
 
     open_gate = ledger_known and workflow_state == "BLOCKED_HUMAN_GATE"
 
@@ -2368,6 +2399,7 @@ def _survey_route_row(route_row, stale_after_seconds, now):
         "location": route_row.get("location"), "read_only": route_row.get("read_only"),
         "closed": route_row.get("closed"), "route_read": {"status": "ok", "reason": None},
         "workflow_state": workflow_state, "derived_workflow_state": derived,
+        "journal_workflow_state": journal_workflow_state,
         "current_stage": running, "next_stage": next_stage, "terminal_nodes": terminal_nodes,
         "terminal_gate_proven": proven, "terminal_gates": gates,
         "armed": armed_out, "claims": claims,
