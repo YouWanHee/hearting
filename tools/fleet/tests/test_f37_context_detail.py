@@ -1,4 +1,5 @@
 """Focused F-37 context/NOW subordinate-row and child-association checks."""
+import importlib.util
 import json
 import os
 import re
@@ -799,30 +800,123 @@ class CodexAttemptTelemetryTest(unittest.TestCase):
             }) + "\n")
         return path
 
+    @staticmethod
+    def _producer_usage(wire):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                            "utilities", "codex-app-server-supervisor.py")
+        spec = importlib.util.spec_from_file_location("f37_codex_producer", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.normalize_token_usage(wire)
+
+    def _usage_wire(self):
+        return {
+            "last": {"totalTokens": 100000},
+            "total": {"inputTokens": 120000, "cachedInputTokens": 30000,
+                      "outputTokens": 5000, "reasoningOutputTokens": 1000,
+                      "totalTokens": 156000},
+            "modelContextWindow": 200000,
+        }
+
+    def _write_rows(self, job, rows):
+        with open(job._log_file, "w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row) + "\n")
+
     def test_exact_token_usage_and_open_command_are_projected(self):
         job = self._job()
+        thread_id, turn_id = "thread-exact-preview", "turn-exact-preview"
         rows = [
-            {"type": "dispatch.supervisor.token_usage", "token_usage": {
-                "last": {"total_tokens": 100000},
-                "total": {"input_tokens": 120000, "cached_input_tokens": 30000,
-                          "output_tokens": 5000, "reasoning_output_tokens": 1000,
-                          "total_tokens": 156000},
-                "model_context_window": 200000}},
+            {"type": "dispatch.supervisor.turn.started", "thread_id": thread_id,
+             "turn_id": turn_id},
+            {"type": "dispatch.supervisor.token_usage", "thread_id": thread_id,
+             "turn_id": turn_id, "token_usage": self._producer_usage(self._usage_wire())},
             {"type": "item.started", "item": {
                 "type": "command_execution", "id": "cmd-1",
                 "command": "python3 train.py --secret omitted"}},
         ]
-        with open(job._log_file, "w", encoding="utf-8") as stream:
-            for row in rows:
-                stream.write(json.dumps(row) + "\n")
+        self._write_rows(job, rows)
+        self.assertNotIn("timestamp", rows[1])
+        self.assertEqual(rows[1]["token_usage"]["last"]["total_tokens"], 100000)
+        self.assertEqual(rows[1]["token_usage"]["total"]["total_tokens"], 156000)
         dispatch_collector._enrich_codex_attempt_session(job)
         projection.attach_projections([], [job], now=100.0)
         self.assertEqual(job.context.used_pct, 47)  # Codex 12k reserve formula
+        self.assertEqual(job.active_context_tokens, 100000)
+        self.assertEqual(job.session_total_tokens, 156000)
         self.assertEqual(job.context_window_tokens, 200000)
+        self.assertEqual(job._runtime_session_id, thread_id)
         self.assertEqual(job.exec_tool, {"name": "python3"})
         self.assertNotIn("secret", json.dumps(job.to_dict()))
         visible = text(render._dispatch_summary_detail_row(job, term_width=168))
         self.assertIn("⚙ python3", visible)
+
+    def test_exact_attempt_usage_without_thread_id_keeps_legacy_compatibility(self):
+        job = self._job()
+        self._write_rows(job, [{
+            "type": "dispatch.supervisor.token_usage", "turn_id": "legacy-turn",
+            "token_usage": self._producer_usage(self._usage_wire()),
+        }])
+        dispatch_collector._enrich_codex_attempt_session(job)
+        projection.attach_projections([], [job], now=100.0)
+        self.assertIsNone(job.association_ambiguity)
+        self.assertEqual(job.context.used_pct, 47)
+        self.assertEqual(job.session_total_tokens, 156000)
+
+    def test_mixed_thread_usage_activity_and_exec_are_all_unknown(self):
+        job = self._job()
+        a, b, turn = "thread-a", "thread-b", "turn-a"
+        job.active_context_tokens = 777
+        job.session_total_tokens = 888
+        job.context = ContextProjection(47, "normal", "codex")
+        job._context_evidence = ContextEvidence(
+            used_pct=47, source="old", sequence=(1, 1), source_head_sequence=(1, 1),
+            observed_at=1, fresh_until=1000)
+        self._write_rows(job, [
+            {"type": "dispatch.supervisor.turn.started", "thread_id": a, "turn_id": turn},
+            {"type": "dispatch.supervisor.token_usage", "thread_id": a, "turn_id": turn,
+             "timestamp": "2026-10-03T10:00:00+00:00",
+             "token_usage": self._producer_usage(self._usage_wire())},
+            {"type": "item.started", "item": {"type": "command_execution", "id": "cmd-a",
+                                                  "command": "python train.py --sensitive"}},
+            {"type": "thread.started", "thread_id": b},
+        ])
+        dispatch_collector._enrich_codex_attempt_session(job)
+        projection.attach_projections([], [job], now=100.0)
+        self.assertEqual(job.association_ambiguity, "multiple-attempt-thread-ids")
+        self.assertIsNone(job._runtime_session_id)
+        self.assertIsNone(job._runtime_activity)
+        self.assertIsNone(job.context)
+        self.assertIsNone(job.ctx_pct)
+        self.assertIsNone(job.active_context_tokens)
+        self.assertIsNone(job.context_window_tokens)
+        self.assertIsNone(job.session_total_tokens)
+        self.assertIsNone(job._context_evidence)
+        self.assertIsNone(job.exec_tool)
+        visible = text(render._dispatch_summary_detail_row(job, term_width=168))
+        self.assertIn("—", visible)
+        self.assertNotIn("47%", visible)
+        self.assertNotIn("python", visible)
+
+    def test_head_tail_thread_ambiguity_does_not_reuse_tail_usage(self):
+        job = self._job()
+        head_thread, tail_thread = "head-thread", "tail-thread"
+        filler = "x" * (dispatch_collector._CLAUDE_SUPERVISOR_HEAD_BYTES
+                        + dispatch_collector._CLAUDE_STREAM_TAIL_BYTES + 1024)
+        with open(job._log_file, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "thread.started", "thread_id": head_thread}) + "\n")
+            stream.write(filler + "\n")
+            stream.write(json.dumps({"type": "thread.started", "thread_id": tail_thread}) + "\n")
+            stream.write(json.dumps({"type": "dispatch.supervisor.token_usage",
+                                     "thread_id": tail_thread, "turn_id": "tail-turn",
+                                     "token_usage": self._producer_usage(self._usage_wire())}) + "\n")
+        parsed = dispatch_collector._parse_codex_attempt_tail(job._log_file)
+        self.assertTrue(parsed["thread_ambiguity"])
+        dispatch_collector._enrich_codex_attempt_session(job)
+        projection.attach_projections([], [job], now=100.0)
+        self.assertIsNone(job.context)
+        self.assertIsNone(job._context_evidence)
+        self.assertIsNone(job.exec_tool)
 
     def test_completed_command_is_not_reported_as_running(self):
         job = self._job()
