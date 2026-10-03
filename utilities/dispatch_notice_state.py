@@ -59,20 +59,26 @@ def route_obligation_closed(metadata: dict, jobs: Path) -> bool:
 
 
 def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
-    """Prove that this recipient consumed its exact framed route decision.
+    """Prove that this recipient consumed the exact two-frame decision notice.
 
-    The runtime terminal marker is written only after the route-decision record
-    and both frame gates validate. A closed route or an emitted notice alone
-    does not satisfy this proof.
+    The terminal marker is useful only together with the immutable decision
+    artifact, both current frame markers, and the pending notice's own identity.
+    A route-wide PASS by itself is not a consumption receipt.
     """
     parent_attempt = record.get("parent_attempt_id")
     if (not parent_attempt
             or parent_attempt not in {metadata.get("attempt_id"), metadata.get("parent_attempt_id")}):
         return False
+    parent_sid = metadata.get("parent_sid")
+    if not isinstance(parent_sid, str) or not parent_sid:
+        return False
+    import dispatch_pending_delivery as pending
+    if record.get("recipient_digest") != pending.recipient_digest(parent_sid):
+        return False
     bound = bound_route(metadata, jobs, record.get("route_id", ""))
     if bound is None:
         return False
-    _path, route = bound
+    _route_path, route = bound
     try:
         import route_plan
         if not route_plan.is_framed_route(route):
@@ -87,10 +93,72 @@ def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
         capability_route = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(capability_route)
     gates = capability_route.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)
-    terminal_id = next((node.get("id") for node in route.get("nodes", [])
-                        if node.get("id") == "route-decision" and node.get("terminal") is True), None)
-    row = gates.get(terminal_id) if terminal_id else None
-    return bool(row and row.get("passed"))
+    terminal = gates.get("route-decision")
+    if not terminal or terminal.get("passed") is not True or terminal.get("current") is not True:
+        return False
+
+    # The terminal marker binds the actual route_decision_v1 file bytes. Read
+    # that record through its canonical validator, and reject a changed or
+    # unreadable evidence file instead of treating terminality as receipt.
+    evidence_path = Path(terminal.get("evidence") or "")
+    if not evidence_path.is_absolute():
+        return False
+    import dispatch_contract
+    if dispatch_contract.evidence_digest(evidence_path) != terminal.get("evidence_digest"):
+        return False
+    decision_record = route_plan.read_record(evidence_path)
+    frame_route = decision_record["decision"]["frame_route"]
+    if (frame_route.get("route_id") != route.get("route_id")
+            or frame_route.get("route_hash") != route.get("route_hash")
+            or not frame_route.get("cycle_id")):
+        return False
+    import artifact_producer
+    artifact_root = Path(route.get("artifact_root", "")).resolve()
+    cycle = artifact_producer.read_cycle_record(artifact_root, frame_route["cycle_id"])
+    if (not cycle or cycle.get("cycle_id") != frame_route["cycle_id"]
+            or cycle.get("route_id") != route.get("route_id")
+            or cycle.get("route_hash") != route.get("route_hash")):
+        return False
+    cycle_dir = artifact_producer.cycle_dir(artifact_root, cycle["campaign_id"], cycle["cycle_id"], cycle)
+    expected_record = (cycle_dir / "artifacts" / route_plan.RECORD_RELATIVE).resolve()
+    if evidence_path.resolve() != expected_record:
+        return False
+
+    # The two exact frame markers are the attempt proof the decision record
+    # consumes. Their marker reader checks current evidence and exact registry
+    # readiness; their evidence paths and bytes must also match the briefs that
+    # the decision record sealed.
+    nodes = {node.get("id"): node for node in route.get("nodes", [])}
+    frame_attempts = []
+    briefs = {item.get("node"): item for item in decision_record["decision"].get("briefs", [])
+              if isinstance(item, dict)}
+    for node_id in ("frame", "frame-alternative"):
+        node = nodes.get(node_id)
+        if not node:
+            return False
+        proof = capability_route._marker_identity_row(
+            route, node, node_id, node.get("completion_gate"), jobs=jobs, exact_terminal=True)
+        if proof.get("passed") is not True or not proof.get("attempt_id"):
+            return False
+        brief = briefs.get(node_id)
+        if not brief or not isinstance(brief.get("path"), str) or not isinstance(brief.get("sha256"), str):
+            return False
+        output_dir = evidence_path.parents[2]
+        expected_brief = f"shards/{node_id}/direction-brief.md"
+        if brief["path"] != expected_brief:
+            return False
+        brief_path = output_dir / expected_brief
+        if (Path(proof.get("evidence") or "").resolve() != brief_path.resolve()
+                or route_plan.file_digest(brief_path) != brief["sha256"]):
+            return False
+        frame_attempts.append(proof["attempt_id"])
+
+    attempts = record.get("attempt_ids")
+    if (not isinstance(attempts, list) or len(attempts) != 2
+            or not all(isinstance(attempt, str) and attempt for attempt in attempts)
+            or len(set(attempts)) != 2 or set(attempts) != set(frame_attempts)):
+        return False
+    return True
 
 
 def _gate_resolution(entries: list, gate: str, delivery: str) -> dict:
