@@ -1009,12 +1009,14 @@ def run_one_turn(args: argparse.Namespace) -> int:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise SupervisorError("thread-start-response-invalid")
         thread_id = thread["id"]
-        final_text, _final_item = run_turn(
+        run_turn(
             server, thread_id=thread_id, prompt=prompt, args=args
         )
-        terminal = classify_codex_result(final_text)
         completed_thread = thread_id
-        result_code = 0 if terminal.failure_class == "pass" else 3
+        # A completed model turn has the same process-success boundary as raw
+        # codex exec. The wrapper classifies the final handoff from this log;
+        # FAIL/BLOCKED and invalid handoffs are not transport failures.
+        result_code = 0
     except TurnFailed as exc:
         emit({"type": "dispatch.supervisor.error", "reason": "app-server-turn-failed"})
     except (DispatchContractError, JoinContractError, SupervisorError) as exc:

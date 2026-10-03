@@ -1040,7 +1040,14 @@ class OneTurnStageTransportTest(unittest.TestCase):
         self.assertTrue(any(row.get("reason") == "app-server-eof" for row in rows))
         self.assertFalse(any(row.get("type") == "turn.completed" for row in rows))
 
-    def test_failed_turn_missing_final_and_invalid_handoff_do_not_pass(self):
+    def test_runtime_failures_and_completed_handoffs_keep_classification(self):
+        from codex_dispatch_terminal import inspect_terminal_attempt
+        from dispatch_supervisor_terminal import classify_supervisor_log
+
+        artifact_root = self.root / ".agent_reports"
+        artifact_root.mkdir()
+        artifact = artifact_root / "review.md"
+        artifact.write_text("Fixture review findings\n", encoding="utf-8")
         fake = self.root / "terminal.py"
         fake.write_text(textwrap.dedent("""\
             import json, os, sys
@@ -1060,7 +1067,12 @@ class OneTurnStageTransportTest(unittest.TestCase):
                                     'error':{'message':scenario}}}})
                         continue
                     if scenario != 'missing':
-                        text = 'not a handoff' if scenario == 'invalid' else 'artifact: -\\nverdict: PASS\\nblocker: none'
+                        if scenario == 'invalid':
+                            text = 'not a handoff'
+                        else:
+                            verdict = {'pass':'PASS', 'fail':'FAIL', 'blocked':'BLOCKED'}[scenario]
+                            blocker = 'none' if verdict == 'PASS' else 'fixture'
+                            text = 'artifact: ' + os.environ['STAGE_ARTIFACT'] + '\\nverdict: ' + verdict + '\\nblocker: ' + blocker
                         send({'jsonrpc':'2.0','method':'item/completed','params':{
                             'turnId':'turn-terminal','item':{'type':'agentMessage','id':'final','text':text}}})
                     send({'jsonrpc':'2.0','method':'turn/completed','params':{
@@ -1068,20 +1080,47 @@ class OneTurnStageTransportTest(unittest.TestCase):
         """), encoding="utf-8")
         command = [sys.executable, str(SUPERVISOR), "--one-turn", "--worktree", str(self.root),
                    "--sandbox", "read-only", "--app-server-command", f"{sys.executable} {fake}"]
-        for scenario, expected, terminal_event in (
-                ("failed", 70, False), ("interrupted", 70, False),
-                ("missing", 3, True), ("invalid", 3, True)):
-            result = subprocess.run(command, input="stage assignment", text=True,
-                                    capture_output=True, timeout=10,
-                                    env={**os.environ, "STAGE_SCENARIO": scenario})
-            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-            rows = [json.loads(line) for line in result.stdout.splitlines()]
-            self.assertEqual(any(row.get("type") == "turn.completed" for row in rows),
-                             terminal_event)
-            self.assertFalse(any(row.get("type") == "dispatch.supervisor.resumed" for row in rows))
-            if scenario in {"failed", "interrupted"}:
-                self.assertTrue(any(row.get("type") == "dispatch.supervisor.turn.failed"
-                                     for row in rows), result.stdout)
+        for scenario, expected, terminal_event, semantic_note in (
+                ("failed", 70, False, None), ("interrupted", 70, False, None),
+                ("pass", 0, True, "completed-supervisor"),
+                ("fail", 0, True, "dead-worker-fail"),
+                ("blocked", 0, True, "dead-worker-blocked"),
+                ("missing", 0, True, "dead-contract"),
+                ("invalid", 0, True, "dead-contract")):
+            with self.subTest(scenario=scenario):
+                result = subprocess.run(command, input="stage assignment", text=True,
+                                        capture_output=True, timeout=10,
+                                        env={**os.environ, "STAGE_SCENARIO": scenario,
+                                             "STAGE_ARTIFACT": str(artifact)})
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                rows = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual(any(row.get("type") == "turn.completed" for row in rows),
+                                 terminal_event)
+                self.assertFalse(any(row.get("type") == "dispatch.supervisor.resumed" for row in rows))
+                if scenario in {"failed", "interrupted"}:
+                    self.assertTrue(any(row.get("type") == "dispatch.supervisor.turn.failed"
+                                         for row in rows), result.stdout)
+                    continue
+                log = self.root / f"{scenario}.codex.jsonl"
+                log.write_text(result.stdout, encoding="utf-8")
+                self.assertEqual(classify_supervisor_log(log, "codex").note, semantic_note)
+                with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(artifact_root)}):
+                    inspected = inspect_terminal_attempt(
+                        log, worktree=self.root, artifact_root_metadata=artifact_root,
+                        worker_type="review",
+                    )
+                if scenario in {"pass", "fail", "blocked"}:
+                    self.assertEqual(inspected["state"], "valid")
+                    self.assertEqual(inspected["verdict"], scenario.upper())
+                    self.assertEqual(inspected["artifact_state"], "readable")
+                    final = next(row["item"]["text"] for row in rows
+                                 if row.get("type") == "item.completed"
+                                 and row.get("item", {}).get("type") == "agent_message")
+                    self.assertIn(f"verdict: {scenario.upper()}", final)
+                    if scenario == "fail":
+                        self.assertEqual(inspected["failure_note"], "completed-review-blocking")
+                else:
+                    self.assertNotEqual(inspected["state"], "valid")
 
     def test_named_permission_profile_is_applied_without_turn_sandbox_override(self):
         profile = {"default_permissions": "profile-test",
