@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -185,6 +186,68 @@ class BacklogPerformanceTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "artifact-root-resolution-failed"):
                     with mock.patch.object(GOVERNOR.Path, "cwd", return_value=utilities):
                         GOVERNOR.default_root()
+
+    def test_governor_cli_explicit_root_works_with_relative_artifact_environment(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
+            fixture = Path(temp_dir)
+            explicit_root = fixture / "explicit-governor"
+            env = {
+                "AGENT_ARTIFACT_ROOT": ".agent_reports",
+                "HOME": str(fixture / "home"),
+                "PATH": os.defpath,
+            }
+            result = subprocess.run(
+                [sys.executable, str(GOVERNOR_PATH), "--root", str(explicit_root), "status"],
+                cwd=fixture,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('"leases": {}', result.stdout)
+            self.assertTrue((explicit_root / "state.json").is_file())
+
+    def test_governor_cli_help_works_with_relative_artifact_environment(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
+            fixture = Path(temp_dir)
+            env = {
+                "AGENT_ARTIFACT_ROOT": ".agent_reports",
+                "HOME": str(fixture / "home"),
+                "PATH": os.defpath,
+            }
+            result = subprocess.run(
+                [sys.executable, str(GOVERNOR_PATH), "--help"],
+                cwd=fixture,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage:", result.stdout.lower())
+            self.assertFalse((fixture / ".agent_reports").exists())
+
+    def test_governor_cli_implicit_root_preserves_relative_artifact_refusal(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
+            fixture = Path(temp_dir)
+            env = {
+                "AGENT_ARTIFACT_ROOT": ".agent_reports",
+                "HOME": str(fixture / "home"),
+                "PATH": os.defpath,
+            }
+            result = subprocess.run(
+                [sys.executable, str(GOVERNOR_PATH), "status"],
+                cwd=fixture,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("artifact-root-resolution-failed", result.stderr)
+            self.assertIn("AGENT_ARTIFACT_ROOT must be an absolute path", result.stderr)
+            self.assertFalse((fixture / ".agent_reports").exists())
 
     def test_governor_linked_caller_uses_primary_root_and_legacy_fallback(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:

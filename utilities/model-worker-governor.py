@@ -1614,7 +1614,7 @@ def reclaimable(root: str | Path, data: dict[str, Any]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default=str(default_root()))
+    parser.add_argument("--root", default=None)
     commands = parser.add_subparsers(dest="command", required=True)
     acquire_parser = commands.add_parser("acquire")
     acquire_parser.add_argument("--class", dest="worker_class", required=True)
@@ -1653,6 +1653,8 @@ def main() -> int:
     reclaim_parser = commands.add_parser("reclaim")
     reclaim_parser.add_argument("--token", help="reclaim only this lease; default is every provable one")
     args = parser.parse_args()
+    if args.root is None:
+        args.root = str(default_root())
 
     if args.command == "acquire":
         print(acquire(args.root, args.worker_class, args.pid, label=args.label))
