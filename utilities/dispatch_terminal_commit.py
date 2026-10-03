@@ -800,7 +800,7 @@ def _prove_route_children(request, route, gates):
             if identity in seen_attempts:
                 return _proof_failure("transaction-conflict", "duplicate-related-attempt")
             seen_attempts.add(identity)
-            related.append((fields[1], meta))
+            related.append((fields[1], meta, fields))
     for node in route.get("nodes", []):
         if node.get("terminal") is not True:
             continue
@@ -817,13 +817,14 @@ def _prove_route_children(request, route, gates):
         # proof.
         if not gate.get("passed"):
             return _proof_failure("terminal-attempt-not-pass")
-    for status, meta in related:
+    for status, meta, fields in related:
         if status == "done" and dispatch_contract.completed_marker_verdict_contradicts(meta):
             return _proof_failure("terminal-attempt-not-pass")
-        if (status == "done" and meta.get("launch_claimed") == "0" and meta.get("launch_started") != "1"
-                and not meta.get("pid")):
-            # Registered, never claimed for launch, then closed: no process ever existed to wait for.
-            # (`claim_attempt_row` sets launch_claimed=1 under the jobs lock before any spawn.)
+        if status == "done" and dispatch_contract.attempt_row_never_started(fields):
+            # Registered, never claimed for launch, then closed: no process ever
+            # existed to wait for. This is the same launch-fence judgment used
+            # by runtime-wait partitioning; claimed or ambiguous rows remain
+            # subject to normal process quiescence proof.
             continue
         process = dispatch_contract.attempt_process_quiescence(meta, terminal_receipt=True)
         decision = decide_attempt(status, meta, process_state=process.state, process_reason=process.reason)

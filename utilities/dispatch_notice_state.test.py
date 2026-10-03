@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -71,6 +72,34 @@ class NoticeTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(sweep.ack_delivered(self.root, "parent", records, acked_by="test"), 1)
         self.assertEqual(sweep.sweep_deliver(self.root, "claude-parent-runtime", "parent")[0], [])
+
+    def test_exact_framed_decision_marker_consumes_only_its_bound_notice(self):
+        route = {
+            "route_id": "rt-notice", "capability": "route-frame",
+            "effective_intensity": "standard",
+            "selection": {"shape": "framed"},
+            "nodes": [
+                {"id": "frame"}, {"id": "frame-alternative"},
+                {"id": "route-decision", "kind": "runtime-terminal", "terminal": True},
+            ],
+        }
+        route["route_hash"] = route_hash(route)
+        self.path.write_text(json.dumps(route))
+        self.route = route
+        self.meta.update(route_id=route["route_id"], route_hash=route["route_hash"])
+        self.write_row()
+        record = self.seed("advance-completed")
+        reader = SimpleNamespace(terminal_gate_observation=lambda *a, **k: {
+            "route-decision": {"passed": True},
+        })
+        import sys
+        with mock.patch.dict(sys.modules, {"capability_route": reader}):
+            self.assertTrue(notice.framed_decision_consumed(record, self.meta, self.jobs))
+            self.assertFalse(notice.notice_is_current(record, jobs=self.jobs))
+            child_meta = dict(self.meta, attempt_id="att-child", parent_attempt_id="att-owner")
+            self.assertTrue(notice.framed_decision_consumed(record, child_meta, self.jobs))
+            child_meta["parent_attempt_id"] = "att-another-recipient"
+            self.assertFalse(notice.framed_decision_consumed(record, child_meta, self.jobs))
 
     def test_bad_closure_is_unknown_and_preserves_claim_for_recovery(self):
         self.seed()

@@ -658,6 +658,48 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         )
         self.assertNotIn("RAW_CHILD_SENTINEL", json.dumps(receipt))
 
+    def test_route_snapshot_excludes_same_parent_foreign_route_and_latest_advance(self):
+        parent = "att-parent"
+        route_a = row("open", "att-a", parent, "a", process_metadata={
+            "route_id": "rt-a", "route_hash": "sha256:a",
+        })
+        route_b = row("open", "att-b", parent, "b", process_metadata={
+            "route_id": "rt-b", "route_hash": "sha256:b",
+        })
+        advanced = row("done", "att-a", parent, "a", process_metadata={
+            "route_id": "rt-b", "route_hash": "sha256:b",
+        })
+        self.jobs.write_text(route_a + route_b + advanced, encoding="utf-8")
+        selected = JOIN.current_children(
+            self.jobs, parent, route_id="rt-a", route_hash="sha256:a"
+        )
+        self.assertEqual([child.attempt_id for child in selected], [])
+        selected = JOIN.current_children(
+            self.jobs, parent, route_id="rt-b", route_hash="sha256:b"
+        )
+        self.assertEqual({child.attempt_id for child in selected}, {"att-a", "att-b"})
+
+    def test_partition_uses_launch_fence_for_never_started_terminal_rows(self):
+        parent = "att-parent"
+        never_started = row("done", "att-never", parent, "never").replace(
+            "launch_outcome=never-launched", "launch_claimed=0,launch_outcome="
+        )
+        self.jobs.write_text(never_started, encoding="utf-8")
+        child = JOIN.current_children(self.jobs, parent)[0]
+        partition = JOIN.partition_runtime_wait_children(
+            self.jobs, parent, [child], {child.attempt_id}
+        )
+        self.assertEqual(partition.joinable, frozenset())
+        self.assertEqual(partition.unstarted, frozenset())
+
+        claimed = never_started.replace("launch_claimed=0", "launch_claimed=1")
+        self.jobs.write_text(claimed, encoding="utf-8")
+        child = JOIN.current_children(self.jobs, parent)[0]
+        partition = JOIN.partition_runtime_wait_children(
+            self.jobs, parent, [child], {child.attempt_id}
+        )
+        self.assertEqual(partition.unstarted, frozenset({"att-never"}))
+
     def test_terminal_liveness_resumes_for_typed_harvest(self):
         terminal = self.root / "terminal.sh"
         terminal.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
@@ -2087,6 +2129,58 @@ class FinishedChildClosure(unittest.TestCase):
             order=0, status="open", slug=f"{attempt_id}-slug", attempt_id=attempt_id,
             raw=raw, metadata=meta,
         )
+
+    def test_fail_review_with_drained_residue_is_joined_without_completion_marker(self):
+        child = self.child(verdict="FAIL", artifact="round_1.md")
+        namespace = D.process_namespace_identity()
+        metadata = dict(child.metadata, parent_attempt_id="att-parent", worker_type="review",
+                        launch_lifecycle="detached", launch_outcome="governed-process-group-drained",
+                        pid="99999996", pid_start="1", pgid="99999996",
+                        pid_scope="namespace-local", pid_observer_ns=namespace, pid_ns=namespace,
+                        group_reap_proof=D.GROUP_REAP_PROOF, group_reap_pgid="99999996",
+                        attempt_descendant_proof=D.ATTEMPT_DESCENDANT_RESIDUE_PROOF,
+                        attempt_descendant_residue="99999997:2",
+                        attempt_descendant_residue_count="1",
+                        attempt_descendant_residue_basis="terminal-envelope",
+                        attempt_descendant_residue_at="2026-10-03T00:00:00Z",
+                        attempt_descendant_observer_ns=namespace)
+        fields = child.raw.split("\t")
+        fields[5] = ",".join(f"{key}={value}" for key, value in metadata.items())
+        self.jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+
+        def drain(_jobs, attempt):
+            attempt_id = attempt.attempt_id
+            self.assertEqual(attempt_id, child.attempt_id)
+            current = JOIN.current_attempt_row(self.jobs, attempt_id)
+            updated = dict(current.metadata, attempt_descendant_proof=D.ATTEMPT_DESCENDANT_PROOF)
+            for key in ("attempt_descendant_residue", "attempt_descendant_residue_count",
+                        "attempt_descendant_residue_basis", "attempt_descendant_residue_at"):
+                updated.pop(key, None)
+            row_fields = current.raw.rstrip("\n").split("\t")
+            row_fields[5] = ",".join(f"{key}={value}" for key, value in updated.items())
+            self.jobs.write_text("\t".join(row_fields) + "\n", encoding="utf-8")
+            return {"attempt_id": attempt_id, "closed": False, "changed": True,
+                    "reason": "residue-drain-refreshed"}
+
+        def quiescence(meta, **_kwargs):
+            if D.tagged_residue_receipt(meta):
+                return D.ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
+            return D.ProcessQuiescence("quiescent", "fixture-process-exited")
+
+        completion_calls = []
+        with mock.patch.object(JOIN, "recover_receiptless_attempt", side_effect=drain), \
+             mock.patch.object(JOIN, "attempt_process_quiescence", side_effect=quiescence), \
+             mock.patch.object(JOIN, "run_route_completion", side_effect=completion_calls.append):
+            receipt = JOIN.join_batch(jobs=self.jobs, parent_attempt_id="att-parent",
+                                      timeout=1, interval=0.001, recover_receiptless=True)
+
+        self.assertEqual(receipt["state"], "ready", receipt)
+        self.assertEqual(receipt["children"][0]["required_action"], "inspect-done-failure")
+        self.assertEqual(completion_calls, [])
+        saved = JOIN.current_attempt_row(self.jobs, child.attempt_id)
+        self.assertEqual(saved.status, "done")
+        self.assertEqual(saved.metadata.get("note"), "completed-review-blocking")
+        self.assertFalse((self.base / ".dispatch" / "completion").exists())
 
     def test_runtime_settlement_preserves_a_real_negative_handoff(self):
         child = self.child(verdict="FAIL", quiescent=True)

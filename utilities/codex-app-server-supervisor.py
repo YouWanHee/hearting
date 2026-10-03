@@ -519,7 +519,8 @@ def settle_runtime_wait_children(
     interval = min(max(args.join_interval / 10.0, 0.01), 0.1)
     deadline = time.monotonic() + timeout
     while True:
-        rows = current_children(Path(args.jobs), args.parent_attempt_id)
+        rows = current_children(Path(args.jobs), args.parent_attempt_id,
+                                route_id=args.route_id, route_hash=args.route_hash)
         new_rows = [row for row in rows if row.attempt_id not in delivered]
         if new_rows and not unstarted_child_attempts(new_rows):
             return rows, True
@@ -1113,7 +1114,8 @@ def main(argv: list[str] | None = None) -> int:
                 server, thread_id=thread_id, prompt=next_prompt, args=args
             )
             pending_notice = ""
-            rows = current_children(Path(args.jobs), args.parent_attempt_id)
+            rows = current_children(Path(args.jobs), args.parent_attempt_id,
+                                    route_id=args.route_id, route_hash=args.route_hash)
             current = {row.attempt_id: row for row in rows}
             completed_delivery = False
             if active_outbox is not None:

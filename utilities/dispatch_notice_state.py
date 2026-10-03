@@ -58,6 +58,41 @@ def route_obligation_closed(metadata: dict, jobs: Path) -> bool:
     return bool(outcome and not outcome.get("finish_pending"))
 
 
+def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
+    """Prove that this recipient consumed its exact framed route decision.
+
+    The runtime terminal marker is written only after the route-decision record
+    and both frame gates validate. A closed route or an emitted notice alone
+    does not satisfy this proof.
+    """
+    parent_attempt = record.get("parent_attempt_id")
+    if (not parent_attempt
+            or parent_attempt not in {metadata.get("attempt_id"), metadata.get("parent_attempt_id")}):
+        return False
+    bound = bound_route(metadata, jobs, record.get("route_id", ""))
+    if bound is None:
+        return False
+    _path, route = bound
+    try:
+        import route_plan
+        if not route_plan.is_framed_route(route):
+            return False
+        import capability_route
+    except ImportError:
+        import importlib.util
+        module_path = Path(__file__).with_name("capability-route.py")
+        spec = importlib.util.spec_from_file_location("notice_capability_route", module_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("notice-terminal-gate-reader-unavailable")
+        capability_route = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(capability_route)
+    gates = capability_route.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)
+    terminal_id = next((node.get("id") for node in route.get("nodes", [])
+                        if node.get("id") == "route-decision" and node.get("terminal") is True), None)
+    row = gates.get(terminal_id) if terminal_id else None
+    return bool(row and row.get("passed"))
+
+
 def _gate_resolution(entries: list, gate: str, delivery: str) -> dict:
     """Resolve this delivery's raise, never a previous or future question.
 
@@ -157,7 +192,11 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
         if action.startswith("human-gate:"):
             if not _legacy_gate_current(record, jobs, child, meta):
                 return False
-        elif action != "advance-completed" and route_obligation_closed(meta, jobs):
+        elif action == "advance-completed":
+            if framed_decision_consumed(record, meta, jobs):
+                continue
+            current = True
+        elif route_obligation_closed(meta, jobs):
             if meta.get("workflow_completion") == "runtime-v1":
                 from dispatch_terminal_commit import owner_completion_pending
                 if owner_completion_pending(jobs, status, meta):
