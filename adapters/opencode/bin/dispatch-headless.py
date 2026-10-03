@@ -628,8 +628,9 @@ def resolve_report_bundle_root(route_file: str | None, route_node: str | None) -
     return path
 
 
-def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None) -> dict[str, str]:
-    """Keep OpenCode's mutable state inside the invoking owner's workspace.
+def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
+                           state_root: Path | str | None = None) -> dict[str, str]:
+    """Keep each attempt's OpenCode state beside the canonical dispatch registry.
 
     OpenCode writes dependency state beside its config as well as under XDG
     data/cache/state. User config and the existing auth are linked for reading;
@@ -638,15 +639,20 @@ def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None) -> dic
     env = os.environ if environ is None else environ
     if not re.fullmatch(r"att-[A-Za-z0-9_-]+", attempt_id):
         raise DispatchContractError("nested-opencode-attempt-invalid")
-    worktree = Path(worktree).resolve()
-    runtime = worktree / ".dispatch" / "opencode-runtime" / attempt_id
-    if not runtime.resolve().is_relative_to(worktree):
-        raise DispatchContractError("nested-opencode-runtime-outside-worktree")
+    if state_root is None:
+        jobs = env.get("AGENT_DISPATCH_JOBS")
+        if not jobs:
+            raise DispatchContractError("nested-opencode-state-root-unavailable")
+        state_root = Path(jobs).expanduser().resolve(strict=False).parent
+    state_root = Path(state_root).resolve()
+    runtime = state_root / "opencode-runtime" / attempt_id
+    if not runtime.resolve().is_relative_to(state_root):
+        raise DispatchContractError("nested-opencode-runtime-outside-state-root")
     values = {}
     for kind in ("data", "cache", "state", "config"):
         directory = runtime / kind
-        if not directory.resolve().is_relative_to(worktree):
-            raise DispatchContractError("nested-opencode-runtime-outside-worktree")
+        if not directory.resolve().is_relative_to(state_root):
+            raise DispatchContractError("nested-opencode-runtime-outside-state-root")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
         values[f"XDG_{kind.upper()}_HOME"] = str(directory)
@@ -1908,7 +1914,8 @@ def main(argv: list[str]) -> int:
     args.nested_runtime_env = {}
     if action == "start" and args.dispatch_depth == 2 and args.parent_harness == "codex":
         try:
-            args.nested_runtime_env = prepare_nested_runtime(Path(args.worktree), args.attempt_id)
+            args.nested_runtime_env = prepare_nested_runtime(
+                Path(args.worktree), args.attempt_id, state_root=dispatch_state_root(args.jobs_path))
         except (DispatchContractError, OSError) as exc:
             return fail(getattr(exc, "reason", "nested-opencode-runtime-unavailable"), 73,
                         detail=str(exc), child_spawned="0")
@@ -2194,6 +2201,9 @@ def main(argv: list[str]) -> int:
         launch_metadata = args.launch_lifecycle_resolution.metadata()
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("opencode", dispatch_env))
+        if getattr(args, "nested_runtime_env", None):
+            launch_metadata["opencode_runtime_dir"] = str(
+                Path(args.nested_runtime_env["XDG_DATA_HOME"]).parent)
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         try:

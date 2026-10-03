@@ -1112,6 +1112,8 @@ def session_id_of_process(pid, live_codex=None):
     except (OSError, ValueError):
         return None
     from . import procscan
+    cwd = procscan.codex_effective_cwd(
+        procscan._read_argv(pid), cwd, procscan.read_environ(pid).get("PWD"))
     if procscan.is_shared_codex_daemon(pid):
         return None
     path = _proc_rollout(pid, cwd, _home())

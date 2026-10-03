@@ -73,15 +73,13 @@ def bind_session(log_file: str | Path | None) -> str | None:
 
 
 def _candidate_server_logs(metadata: dict[str, Any]) -> list[Path]:
-    """Nested runtime path first, then the inherited XDG path (plan order).
-
-    A nested dispatch gets its own `XDG_DATA_HOME` under the worktree
-    (`adapters/opencode/bin/dispatch-headless.py:prepare_nested_runtime`); a
-    plain foreground/legacy attempt shares the caller's inherited one.
-    """
+    """Attempt runtime path, legacy project path, then inherited XDG fallback."""
     candidates: list[Path] = []
     worktree = metadata.get("worktree")
     attempt_id = metadata.get("attempt_id")
+    runtime_dir = metadata.get("opencode_runtime_dir")
+    if runtime_dir and attempt_id:
+        candidates.append(Path(runtime_dir) / "data" / "opencode" / "log" / "opencode.log")
     if worktree and attempt_id:
         candidates.append(
             Path(worktree) / ".dispatch" / "opencode-runtime" / str(attempt_id)

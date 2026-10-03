@@ -9,6 +9,7 @@ process holding that cwd; the liveness layer paints it stale/dead — honest obs
 no fragile broker-vs-leaf heuristics).
 """
 import os
+from pathlib import Path
 import re
 import subprocess
 
@@ -96,6 +97,48 @@ def read_environ(pid):
             k, v = kv.split(b"=", 1)
             env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
     return env
+
+
+def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
+    """Resolve Codex's root option from argv tokens, keeping ambiguous relatives observed."""
+    if not isinstance(argv, (list, tuple)):
+        return observed_cwd
+    tokens = list(argv)
+    if not tokens or os.path.basename(str(tokens[0])) != "codex":
+        return observed_cwd
+    target = None
+    i = 1
+    while i < len(tokens):
+        token = str(tokens[i])
+        if token == "--":
+            break
+        if token in {"--cd", "-C"}:
+            if i + 1 < len(tokens) and str(tokens[i + 1]) != "--":
+                target = str(tokens[i + 1])
+            break
+        if token.startswith("--cd="):
+            target = token.partition("=")[2]
+            break
+        i += 1
+    if not target or "\x00" in target:
+        return observed_cwd
+    path = Path(target).expanduser()
+    if not path.is_absolute():
+        if not launch_cwd or not Path(launch_cwd).is_absolute():
+            return observed_cwd
+        path = Path(launch_cwd) / path
+    try:
+        return str(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return observed_cwd
+
+
+def _read_argv(pid):
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as handle:
+            return [part.decode("utf-8", "replace") for part in handle.read().split(b"\0") if part]
+    except (OSError, TypeError, ValueError):
+        return []
 
 
 def read_proc_start(pid):
@@ -629,6 +672,10 @@ def scan(harness_filter=None):
         if is_terminal_state(pid):
             continue
         cwd, orphan = _read_cwd(pid)
+        if comm == "codex":
+            proc_argv = _read_argv(pid)
+            launch_cwd = read_environ(pid).get("PWD")
+            cwd = codex_effective_cwd(proc_argv, cwd, launch_cwd)
         # app-server companion marker: codex-only, literal "app-server" token in args.
         # Interactive `codex`/`codex exec` never carries this token, so the gate cannot
         # false-positive on interactive sessions. COLUMNS is pinned to 100000 for the ps
