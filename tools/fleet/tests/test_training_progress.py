@@ -33,9 +33,21 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         config = self.root / "configs" / "model.json"
         config.write_text(json.dumps({"training": {"attempts": 400000}}))
         # A harmless owned child supplies real PID/start/argv/group evidence.
-        self.child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(60)",
+        ready = self.root / "child-ready"
+        self.child = subprocess.Popen([sys.executable, "-B", "-c",
+                                       "import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)",
+                                       str(ready),
                                        "--config", str(config)], cwd=self.root)
         self.addCleanup(self.stop_child)
+        # Popen may return before exec changes /proc's argv/exe. Observe only
+        # after this fixture's Python payload has started; production keeps
+        # rejecting unstable identities.
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            self.assertIsNone(self.child.poll(), "fixture child exited before startup")
+            if time.monotonic() >= deadline:
+                self.fail("fixture child startup timed out")
+            time.sleep(.01)
         identity = resource_progress.observe_process(self.child.pid)
         self.assertIsNotNone(identity)
         wrapper = resource_run_registry.proc_identity(os.getpid())
