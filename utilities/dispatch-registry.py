@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
 import time
 import uuid
@@ -31,6 +32,7 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                annotate_attempt_row_if,
                                attempt_governed_process_quiescence,
                                attempt_process_quiescence,
+                               attempt_row_never_started,
                                attempt_scan_namespace_authority,
                                attempt_tagged_descendants,
                                authoritative_process_identities,
@@ -66,6 +68,7 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                validate_attempt_metadata)  # noqa: E402
 from dispatch_continuation_budget import resolve_continuation_budget  # noqa: E402
 from owner_route_binding import (  # noqa: E402
+    ROUTE as owner_route_verifier,
     OwnerRouteBinding,
     OwnerRouteBindingError,
     resolve_owner_route_lifecycle,
@@ -1189,6 +1192,109 @@ def repair_stale_row(rows, args):
     return 0
 
 
+# Reuse receiptless cancellation: the common writer already withholds delivery
+# intent and successor readiness for this logical, non-success terminal edge.
+OWNER_ROUTE_CANCEL_NOTE = "cancelled-receipt-unavailable"
+OWNER_ROUTE_CANCEL_CLASSIFIER = "closed-unclaimed-owner-v1"
+
+
+def _empty_owner_log_generation(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size:
+        return False
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _closed_unclaimed_owner(row, jobs):
+    """Verify logical retirement, never infer process death from a missing PID."""
+    meta = row["meta"]
+    if (row["status"] not in OPEN or row.get("attempt_contract_status") != "current"
+            or any(meta.get(key) != value for key, value in {
+                "dispatch_depth": "1", "worker_type": "owner", "unit": "_kernel/owner",
+                "registered_worker": "1", "execution_surface": "registered-headless",
+            }.items())
+            or not attempt_row_never_started(row["raw"].split("\t"))
+            or meta.get("launch_started", "") not in {"", "0"}
+            or any(meta.get(key) for key in (
+                "pid_start", "pid_host", "pid_host_start", "pgid", "teardown_claim",
+                "process_exit", "terminal_event", "group_reap_proof", "group_reap_pgid",
+                "attempt_descendant_proof", "delivery_intent", "delivery_receipt_b64", "note",
+            ))
+            or meta.get("failure_class")
+            or any(meta.get(key) for key in ("route_id", "route_node", "route_file"))
+            or not meta.get("parent_sid")):
+        return None
+    values = tuple(meta.get(key, "") for key in (
+        "owner_route_file", "owner_route_id", "owner_route_hash"))
+    if not all(values) or not Path(values[0]).is_absolute():
+        return None
+    binding = OwnerRouteBinding(str(Path(values[0]).resolve()), *values[1:])
+    try:
+        current_binding, status = resolve_owner_route_lifecycle(
+            jobs, owner_attempt_id=meta["attempt_id"], sealed_binding=binding)
+        # A stale catalog can be closed through the existing closure verifier;
+        # it grants no launch authority. Advances and binding conflicts refuse.
+        if (current_binding != binding or status not in {
+                "owner-route-launch-binding", "owner-route-advance-anchor-unresolvable"}):
+            return None
+        route_file = Path(binding.route_file)
+        route_bytes = route_file.read_bytes()
+        raw_route = json.loads(route_bytes)
+        if (not isinstance(raw_route, dict)
+                or raw_route.get("route_hash") != binding.route_hash
+                or route_hash(raw_route) != binding.route_hash
+                or raw_route.get("route_id") != binding.route_id
+                or binding.route_id != "rt-" + binding.route_hash.removeprefix("sha256:")[:16]
+                or raw_route.get("cwd") != row["worktree"]
+                or raw_route.get("owner_dispatch_depth") != 1
+                or any(not meta.get(key) or meta[key] != raw_route.get(route_key)
+                       for key, route_key in (
+                           ("capability", "capability"), ("capability_mode", "capability_mode"),
+                           ("intensity", "effective_intensity"), ("artifact_root", "artifact_root")))
+                or (meta.get("parent_cwd") and meta["parent_cwd"] != row["worktree"])):
+            return None
+        route = owner_route_verifier.verify_route(
+            raw_route, expected_cwd=row["worktree"], allow_stale_registry=True)
+        if not owner_route_verifier.route_path_is_exact(
+                route_file, route["artifact_root"], binding.route_id):
+            return None
+        outcome_file = owner_route_verifier.outcome_path(route_file)
+        outcome_bytes = outcome_file.read_bytes()
+        outcome = json.loads(outcome_bytes)
+        if (not isinstance(outcome, dict) or outcome.get("schema_version") != 3
+                or outcome.get("terminal_gate_proven") is not False
+                or not isinstance(outcome.get("terminal_gates"), dict)
+                or not isinstance(outcome.get("closed_at"), str)
+                or any(outcome.get(key) != value for key, value in {
+                    "route_id": binding.route_id, "route_hash": binding.route_hash,
+                    "route_file": binding.route_file, "cwd": row["worktree"],
+                    "capability": meta["capability"], "effective_intensity": meta["intensity"],
+                }.items())):
+            return None
+        datetime.fromisoformat(outcome["closed_at"].replace("Z", "+00:00"))
+        log_file = Path(meta.get("log_file", ""))
+        if not meta.get("log_file") or not log_file.is_absolute():
+            return None
+        log_generation = _empty_owner_log_generation(log_file)
+        if log_generation is False:
+            return None
+        tagged = attempt_tagged_descendants(meta)
+        if tagged.state != "empty":
+            return None
+        # The scan is only a contradiction check, not a reap/death receipt.
+        if (route_file.read_bytes() != route_bytes or outcome_file.read_bytes() != outcome_bytes
+                or _empty_owner_log_generation(log_file) != log_generation):
+            return None
+        return {"route_sha256": hashlib.sha256(route_bytes).hexdigest(),
+                "outcome_sha256": hashlib.sha256(outcome_bytes).hexdigest(),
+                "log_generation": log_generation}
+    except (OwnerRouteBindingError, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def reconcile(rows, args):
     only_exact_dead = getattr(args, "only_exact_dead", False)
     selected = [row for row in rows if matches(row, args)]
@@ -1203,6 +1309,47 @@ def reconcile(rows, args):
     decisions = []
     for row in selected:
         meta = row["meta"]
+        exact_owner_scope = (exact_selection and not only_exact_dead
+                             and not any((args.session, args.route, args.node, args.job,
+                                          getattr(args, "all", False)))
+                             and meta.get("worker_type") == "owner")
+        if (exact_owner_scope and row["status"] == "done"
+                and meta.get("classifier_source") == OWNER_ROUTE_CANCEL_CLASSIFIER
+                and meta.get("note") == OWNER_ROUTE_CANCEL_NOTE
+                and meta.get("failure_class") == "cancelled"):
+            exact_repair_only = True
+            decisions.append({"attempt_id": args.attempt, "slug": row["slug"],
+                              "category": "closed-owner-already-cancelled",
+                              "reason": "closed-unclaimed-owner-route", "closed": False,
+                              "proposed_note": None, "revalidated": None,
+                              "cascade": [], "cleanup": None,
+                              "summary_owner": {"state": "not-applied", "reason": "exact-attempt-only"}})
+            continue
+        owner_retirement = _closed_unclaimed_owner(row, args.jobs) if exact_owner_scope else None
+        if owner_retirement is not None:
+            exact_repair_only = True
+            def still_closed_owner(fields):
+                if "\t".join(fields) != row["raw"]:
+                    return False
+                fresh = [item for item in read_rows(args.jobs)
+                         if item["meta"].get("attempt_id") == args.attempt]
+                return (len(fresh) == 1 and fresh[0]["raw"] == row["raw"]
+                        and _closed_unclaimed_owner(fresh[0], args.jobs) == owner_retirement)
+            closed = bool(args.apply and close_attempt_row_if(
+                args.jobs, args.attempt, OWNER_ROUTE_CANCEL_NOTE, still_closed_owner,
+                evidence={"failure_class": "cancelled",
+                          "classifier_source": OWNER_ROUTE_CANCEL_CLASSIFIER,
+                          "reconcile_reason": "closed-unclaimed-owner-route"}))
+            decisions.append({"attempt_id": args.attempt, "slug": row["slug"],
+                              "category": "closed-owner-cancelled" if closed else
+                                          "closed-owner-revalidation-veto" if args.apply else
+                                          "closed-owner-cancellation-ready",
+                              "reason": "closed-unclaimed-owner-route", "closed": closed,
+                              "proposed_note": OWNER_ROUTE_CANCEL_NOTE,
+                              "revalidated": closed if args.apply else None,
+                              "process_identity": "unproven", "cascade": [], "cleanup": None,
+                              "summary_owner": {"state": "not-applied", "reason": "exact-attempt-only"}})
+            continue
         if (exact_selection and row["status"] == "done"
                 and meta.get("classifier_source") == "same-host-foreground-review-failure-v1"):
             exact_repair_only = True

@@ -762,6 +762,18 @@ Admission recovery is bounded: only a global/class-cap refusal from `acquire` or
 
 Each registered dispatch attempt also owns its summary lifecycle. While the governed worker remains behind its launch fence, the selected adapter starts one non-model summary supervisor bound to the exact attempt id, log path, and worker PID/start identity; the same registry transaction publishes that owner identity before releasing the worker. The supervisor requests one early summary, at most one ordinary update per 600 seconds (off the priority lane) while the exact worker lives, and one final update after log quiescence, then exits without completion, signal, retry, or launch authority. Initial and final requests may each use one durable `(harness, session, phase)` admission ticket when the ordinary rolling refresh budget is exhausted, but never bypass the provider kill switch, per-session lock, governor, or global concurrency cap. `dispatch-reconcile --apply` may idempotently restore a missing supervisor only for one open, exact, live attempt. An extinct registered namespace-local row from a pre-receipt runtime may be removed from the active Fleet set only through `dispatch-reconcile --attempt <id> --cancel-receiptless-namespace --apply`: this exact operator action records `failure_class=cancelled`, writes no PASS, marker, or reap receipt, and deliberately leaves successor readiness fail-closed. Fleet's explicit kill path likewise closes only the selected exact attempt as a typed cancellation; its wrapper remains responsible for the genuine post-exit receipt. Fleet is otherwise a pure observer of registry and stored summary sidecars: starting, refreshing, or closing Fleet never creates provider work. Interactive sessions use their runtime lifecycle bridge as the summary producer and follow the same bounded admission rules.
 
+An exact operator `dispatch-reconcile --attempt <id> --apply` may also retire
+a registered depth-1 owner whose launch fence remains unclaimed, with no
+worker identity or log content, when its normalized sealed owner binding
+names a normally closed, terminal-unproven route. The existing registry CAS
+rechecks the row, binding, route and outcome bytes and rejects launch or live
+attempt evidence. This is a logical cancellation only: it preserves the
+original unproven outcome, creates no PASS, process-death or quiescence receipt,
+signals no process, and neither cascades children nor delivers unrelated
+pending attempts. Missing, changed, advanced or still-open route bindings and
+launched owners retain the existing reconciliation rules. Fleet may remove
+the cancelled row from its active set without granting successor readiness.
+
 Progress is observed by the runtime from exact native tool identifiers and
 completion states, scoped file changes, and bounded verification leases.
 A quiet window creates a durable `no-progress` supervision notice, not a signal,

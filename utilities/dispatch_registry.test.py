@@ -2766,4 +2766,153 @@ class ForegroundRegistryContractTest(unittest.TestCase):
   self.assertEqual(tuple(module.ROUTE_IDENTITY_METADATA_KEYS), tuple(D.ROUTE_IDENTITY_METADATA_KEYS))
 
 
+class ClosedUnclaimedOwnerTest(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
+  self.jobs=self.base/"jobs.log";self.jobs.write_text("")
+  self.env=mock.patch.dict(os.environ,{
+   "AGENT_HOME":str(ROOT),"AGENT_DISPATCH_JOBS":str(self.jobs),
+   "AGENT_ARTIFACT_ROOT":str(self.base/".agent_reports"),
+   "XDG_STATE_HOME":str(self.base/"state"),"AGENT_ARTIFACT_CHECKPOINT":"off",
+   "AGENT_DISPATCH_ATTEMPT_ID":"","AGENT_DISPATCH_REGISTERED_WORKER":"0",
+  });self.env.start();self.addCleanup(self.env.stop);self.addCleanup(self.tmp.cleanup)
+  spec=importlib.util.spec_from_file_location("registry_closed_owner",SCRIPT)
+  self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
+  R=self.module.owner_route_verifier
+  tuples=[dict(parent_harness=p,parent_transport="headless",
+   parent_sandbox=R.WRAPPER_PARENT_SANDBOXES[p][0],child_harness=c,
+   launch_authority="conductor",status="supported",probe_source="fixture-probe",
+   probe_time="2026-10-04T00:00:00Z",failure_class="",checked_worktree=str(self.base),
+   failure_scope="none",codex_command="ok" if c=="codex" else "not-applicable",
+   retry_on_isolated_worktree=0) for p in ("codex","claude") for c in ("codex","claude")]
+  gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec",
+   "workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
+  self.route=R.compile_route("autopilot-code","debug","standard",self.base,
+   self.base/".agent_reports",transport="headless",tracking="tracked",
+   tracked_gate_evidence=gate,dispatch_evidence={"tuples":tuples,"native_subagent":[]})
+  self.route_file=R.canonical_route_path(self.route["artifact_root"],self.route["route_id"])
+  self.route_file.parent.mkdir(parents=True)
+  self.route_file.write_text(json.dumps(self.route))
+  self.outcome_file=R.outcome_path(self.route_file)
+  self.outcome={"schema_version":3,"closed_at":"2026-10-04T11:35:22Z",
+   "terminal_gate_proven":False,"terminal_gates":{},"route_file":str(self.route_file),
+   **{k:self.route[k] for k in ("route_id","route_hash","cwd","capability","effective_intensity")}}
+  self.outcome_file.write_text(json.dumps(self.outcome))
+  self.attempt="att-closed-owner-exact";self.log=self.base/"owner.jsonl"
+  self.meta=dict(attempt_schema_version="2",dispatch_depth="1",transport="headless",
+   execution_surface="registered-headless",registered_worker="1",fallback_hop="same-harness-headless",
+   worker_type="owner",unit="_kernel/owner",attempt_id=self.attempt,
+   capability="autopilot-code",capability_mode="debug",intensity="standard",
+   artifact_root=self.route["artifact_root"],owner_harness="codex",harness="codex",
+   parent_sid="fixture-parent",parent_cwd=str(self.base),launch_claimed="0",
+   parent_completion_delivery="codex-native-queue",
+   owner_route_file=str(self.route_file),owner_route_id=self.route["route_id"],
+   owner_route_hash=self.route["route_hash"],log_file=str(self.log))
+  self.write_row()
+ def write_row(self,**changes):
+  metadata={**self.meta,**changes}
+  self.jobs.write_text("\t".join(("2026-10-04T00:00:00Z","open",str(self.base),str(self.base),
+   "closed-owner",",".join(f"{k}={v}" for k,v in metadata.items())))+"\n")
+ def row(self):return self.module.read_rows(self.jobs)[0]
+ def args(self,apply=False,**changes):
+  return types.SimpleNamespace(**{**dict(session=None,route=None,node=None,job=None,
+   attempt=self.attempt,all=False,apply=apply,audit=None,jobs=self.jobs,
+   agent_home=ROOT,integration_ref=None,now=time.time(),cascade_grace=0,cascade_kill_wait=0),**changes})
+ def reconcile(self,apply=False,**changes):
+  stream=io.StringIO()
+  with contextlib.redirect_stdout(stream):
+   self.assertEqual(self.module.reconcile(self.module.read_rows(self.jobs),self.args(apply,**changes)),0)
+  return json.loads(stream.getvalue())
+ def test_normal_exact_cancel_preserves_unproven_route_and_other_attempt(self):
+  original=(self.route_file.read_bytes(),self.outcome_file.read_bytes())
+  sibling=self.row()["raw"].replace(self.attempt,self.attempt+"-other")
+  with self.jobs.open("a") as handle:handle.write(sibling+"\n")
+  before=self.jobs.read_bytes();dry=self.reconcile()
+  self.assertEqual(dry["decisions"][0]["category"],"closed-owner-cancellation-ready")
+  self.assertEqual(self.jobs.read_bytes(),before)
+  with mock.patch.object(self.module,"reconcile_pending_delivery",side_effect=AssertionError("unrelated")), \
+       mock.patch.object(self.module,"materialize_after_terminal_close",side_effect=AssertionError("delivery")), \
+       mock.patch.object(self.module,"ensure_attempt_owner",side_effect=AssertionError("new owner")):
+   result=self.reconcile(True);again=self.reconcile(True)
+  self.assertEqual(result["closed"],1,result);self.assertTrue(result["decisions"][0]["revalidated"])
+  self.assertEqual(result["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(again["decisions"][0]["category"],"closed-owner-already-cancelled")
+  self.assertEqual(again["pending_delivery"],{"skipped":"exact-attempt-only"})
+  row=self.row();self.assertEqual(row["status"],"done")
+  self.assertEqual(row["meta"]["failure_class"],"cancelled")
+  self.assertEqual(row["meta"]["note"],"cancelled-receipt-unavailable")
+  from dispatch_attempt_policy import success_note,committed_outcome
+  self.assertFalse(success_note(row["meta"]));self.assertNotEqual(committed_outcome("done",row["meta"]),"succeeded")
+  self.assertEqual(attempt_process_quiescence(row["meta"]).state,"unverifiable")
+  self.assertNotIn("group_reap_proof",row["meta"]);self.assertNotIn("process_exit",row["meta"])
+  self.assertNotIn("delivery_intent",row["meta"]);self.assertNotIn("delivery_receipt_b64",row["meta"])
+  self.assertIsNone(self.module.materialize_after_terminal_close(self.jobs,self.attempt))
+  self.assertEqual(self.jobs.read_text().splitlines()[1],sibling)
+  self.assertEqual((self.route_file.read_bytes(),self.outcome_file.read_bytes()),original)
+ def test_launch_identity_result_and_binding_contradictions_refuse(self):
+  for key,value in (("launch_claimed","1"),("launch_started","1"),("launch_started","unknown"),
+   ("launch_outcome","governed-process-reaped"),("pid","123"),("pid_start","1"),
+   ("pgid","123"),("pid_host","123"),("terminal_event","turn.completed"),
+   ("group_reap_proof","pgid-empty-v1"),("delivery_intent","1"),
+   ("delivery_receipt_b64","old-receipt"),("worker_type","stage"),
+   ("owner_route_hash","sha256:"+"0"*64),("owner_route_file",""),
+   ("parent_sid",""),("parent_cwd","/other"),("capability","autopilot-spec")):
+   with self.subTest(key=key,value=value):
+    self.write_row(**{key:value});self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+ def test_open_successful_mismatched_or_modified_route_outcome_refuses(self):
+  original=self.outcome_file.read_text()
+  for change in ({"closed_at":""},{"terminal_gate_proven":True},{"route_hash":"sha256:other"},
+                 {"route_file":"/other"},{"cwd":"/other"},{"capability":"autopilot-spec"}):
+   with self.subTest(change=change):
+    self.outcome_file.write_text(json.dumps({**self.outcome,**change}))
+    self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+  self.outcome_file.unlink();self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+  self.outcome_file.write_text(original)
+  self.route_file.write_text(json.dumps({**self.route,"cwd":"/other"}))
+  self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+ def test_empty_log_allowed_native_output_and_symlink_refused(self):
+  self.log.write_text("");self.assertIsNotNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+  self.log.write_text('{"type":"turn.completed"}\n')
+  self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+  self.log.unlink();target=self.base/"target";target.write_text("");self.log.symlink_to(target)
+  self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+ def test_active_incomplete_process_and_advanced_owner_binding_refuse(self):
+  for state in ("populated","unverifiable"):
+   with self.subTest(state=state),mock.patch.object(self.module,"attempt_tagged_descendants",
+    return_value=D.ProcessGroupObservation(state)):
+    self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+  binding=self.module.OwnerRouteBinding(str(self.route_file),self.route["route_id"],self.route["route_hash"])
+  with mock.patch.object(self.module,"resolve_owner_route_lifecycle",return_value=(binding,"owner-route-advance-current")):
+   self.assertIsNone(self.module._closed_unclaimed_owner(self.row(),self.jobs))
+ def test_cas_rechecks_row_outcome_and_new_native_log(self):
+  real_close=self.module.close_attempt_row_if
+  for mutation in (lambda:self.write_row(launch_claimed="1"),
+   lambda:self.outcome_file.write_text(json.dumps({**self.outcome,"terminal_gate_proven":True})),
+   lambda:self.outcome_file.write_text(json.dumps({**self.outcome,"summary":"changed closed outcome"})),
+   lambda:self.route_file.write_text(json.dumps({**self.route,"cwd":"/other"})),
+   lambda:self.log.write_text("native handoff\n")):
+   self.write_row();self.outcome_file.write_text(json.dumps(self.outcome))
+   self.route_file.write_text(json.dumps(self.route))
+   self.log.unlink(missing_ok=True)
+   def mutate_then_close(*args,**kwargs):mutation();return real_close(*args,**kwargs)
+   with mock.patch.object(self.module,"close_attempt_row_if",side_effect=mutate_then_close):
+    record=self.reconcile(True)
+   self.assertEqual(record["closed"],0,record)
+   self.assertEqual(record["decisions"][0]["category"],"closed-owner-revalidation-veto")
+   self.assertEqual(self.row()["status"],"open")
+ def test_new_tagged_process_vetoes_lock_time_cancel(self):
+  with mock.patch.object(self.module,"attempt_tagged_descendants",side_effect=[
+   D.ProcessGroupObservation("empty"),D.ProcessGroupObservation("populated",((123,"1","S"),))]):
+   record=self.reconcile(True)
+  self.assertEqual(record["closed"],0);self.assertEqual(self.row()["status"],"open")
+ def test_broad_duplicate_and_exact_death_modes_do_not_logically_cancel(self):
+  for changes in ({"all":True},{"attempt":None,"job":"closed-owner"},{"only_exact_dead":True}):
+   with self.subTest(changes=changes):
+    result=self.reconcile(False,**changes)
+    self.assertNotEqual(result["decisions"][0]["proposed_note"],"cancelled-receipt-unavailable")
+  self.jobs.write_text(self.jobs.read_text()*2)
+  result=self.reconcile();self.assertEqual(result["closed"],0)
+  self.assertTrue(all(d["proposed_note"]!="cancelled-receipt-unavailable" for d in result["decisions"]))
+
+
 if __name__=="__main__":unittest.main()
