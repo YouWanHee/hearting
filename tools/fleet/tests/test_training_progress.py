@@ -109,6 +109,11 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         output = json.loads(fleet._snapshot_json([], [], self.rows, compute_host_snapshot=self.snapshot))
         training = self.training_in(output["compute_hosts"])
         self.assertEqual(training["attempt_total"], 400000)
+        self.assertEqual(training["successful"], 27342)
+        self.assertEqual(training["skipped"], 4)
+        self.assertEqual(training["loss"], .0048248)
+        self.assertEqual(training["loss_kind"], "last-batch")
+        self.assertEqual(training["arm"], "arm")
         self.assertEqual(output["resource_jobs"][0]["training_progress"]["config_ref"], "config:model.json")
         self.assertGreaterEqual(training["progress_age_s"], 600)
         render.set_compute_hosts(self.snapshot)
@@ -116,9 +121,7 @@ class TrainingProgressPipelineTest(unittest.TestCase):
             render.set_process_view(process_view)
             shown = text(render._build_lines([], [], "both", False, 0, term_width=140,
                                             resources=self.rows, governor=None))
-            for expected in ("training-updates", "arm", "Step(attempt) 27,346/400,000 (6.84%)",
-                             "successful 27,342", "skipped 4", "Loss(last batch) 4.82e-03", "progress 10m ago"):
-                self.assertIn(expected, shown)
+            self.assertIn("training-updates 7% 27346/400000 · loss=4.82e-03 · stalled 10m", shown)
             self.assertNotIn("LAB RESOURCES", shown)
             self.assertNotIn("raw producer heartbeat", shown)
             self.assertNotIn("Epoch", shown)
@@ -134,47 +137,60 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         metadata.write_text(json.dumps(value))
         rows = resource_runs.collect(self.index)
         self.assertEqual(resource_runs.collect.last_diagnostics, [])
-        output = json.loads(fleet._snapshot_json([], [], rows, compute_host_snapshot=self.snapshot))
+        snapshot = copy.deepcopy(self.snapshot)
+        snapshot["hosts"][0]["gpus"].append({
+            "index": 1, "name": "GPU", "memory_used_mib": 128, "memory_total_mib": 1024,
+            "processes": [{"pid": 999999999, "command": "python raw fixture --train",
+                           "progress": {"line": "TRAIN: 38%|###| 7603/20000 [00:00<1:38:19, 2batch/s, L_se=9.18e-03, L_se_aux=4.91e-03]",
+                                        "epoch": {"n": "23", "of": 200}, "age_s": 0}}]})
+        output = json.loads(fleet._snapshot_json([], [], rows, compute_host_snapshot=snapshot))
         training = self.training_in(output["compute_hosts"])
         self.assertEqual(training["schedule_epoch"]["current"], 2)
         self.assertEqual(training["schedule_epoch"]["state"], "partial")
         self.assertEqual(training["loss"], .0048248)
+        self.assertEqual(training["successful"], 27342)
+        self.assertEqual(training["skipped"], 4)
+        self.assertEqual(training["percent"], 6.8365)
         self.assertGreaterEqual(training["progress_age_s"], 600)
-        render.set_compute_hosts(self.snapshot)
+        render.set_compute_hosts(snapshot)
         for process_view in (False, True):
             render.set_process_view(process_view)
             shown = text(render._build_lines([], [], "both", False, 0, term_width=180,
                                             resources=rows, governor=None))
-            for expected in ("Epoch(schedule) 2/20 (partial)", "Step(attempt) 27,346/400,000 (6.84%)",
-                             "Loss(last batch) 4.82e-03", "successful 27,342", "skipped 4", "progress 10m ago"):
-                self.assertIn(expected, shown)
+            self.assertIn("Epoch 2/20 · training-updates 37% 7346/20000 · loss=4.82e-03 · stalled 10m", shown)
+            self.assertIn("Epoch 23/200 · TRAIN 38% 7603/20000 · 1:38:19 left · L_se=9.18e-03 L_se_aux=4.91e-03", shown)
             self.assertNotIn("raw producer heartbeat", shown)
 
     def test_human_schedule_boundaries_colors_and_narrow_step_preserve_source_values(self):
-        cases = ((0, 0, "start"), (1, 1, "partial"), (20000, 1, "done"),
-                 (20001, 2, "partial"), (400000, 20, "done"))
-        for attempt, current, state in cases:
+        # Literal expectations distinguish interval attempts from optimizer success
+        # and overall budget; boundary rows show the interval just completed.
+        cases = (
+            (0, 0, "↳ Epoch 0/20 · training-updates 0% 0/20000 · loss=4.82e-03 · stalled 10m"),
+            (1, 1, "↳ Epoch 1/20 · training-updates 0% 1/20000 · loss=4.82e-03 · stalled 10m"),
+            (20000, 1, "↳ Epoch 1/20 · training-updates 100% 20000/20000 · loss=4.82e-03 · stalled 10m"),
+            (20001, 2, "↳ Epoch 2/20 · training-updates 0% 1/20000 · loss=4.82e-03 · stalled 10m"),
+            (400000, 20, "↳ Epoch 20/20 · training-updates 100% 20000/20000 · loss=4.82e-03 · stalled 10m"),
+        )
+        for attempt, current, expected in cases:
             with self.subTest(attempt=attempt):
                 training = {**self.training, "attempt": attempt, "successful": attempt, "skipped": 0,
                             "schedule_epoch": {"current": current, "total": 20, "attempts_per_epoch": 20000}}
                 before = copy.deepcopy(training)
                 process = {"progress": {"training": training}}
-                rows = render._gpu_training_rows(process, "", 180)
-                shown = text(rows)
-                self.assertIn("Epoch(schedule) %d/20 (%s)" % (current, state), shown)
-                self.assertIn("Step(attempt) %s/400,000" % format(attempt, ","), shown)
-                self.assertIn("Loss(last batch) 4.82e-03", shown)
-                self.assertIn(("4.82e-03", "lvl_y"), rows[1])
-                self.assertIn("progress 10m ago", shown)
+                row = render._gpu_progress_row(process, "", 180)
+                self.assertEqual(render._plain(row).strip(), expected)
+                self.assertIn(("4.82e-03", "resource_active"), row)
                 self.assertEqual(training, before)
         process["progress"]["training"].update(attempt=59415, successful=59397, skipped=18,
                                               schedule_epoch={"current": 3, "total": 20, "attempts_per_epoch": 20000})
-        shown = text(render._gpu_training_rows(process, "", 80))
-        self.assertIn("Step(attempt) 59,415/400,000 (14.85%)", shown)
-        self.assertIn("Loss(last batch) 4.82e-03", shown)
-        self.assertIn("progress 10m ago", shown)
+        shown = render._plain(render._gpu_progress_row(process, "", 80))
+        self.assertIn("Epoch 3/20 · training-updates 97% 19415/20000", shown)
+        self.assertTrue(shown.endswith("stalled 10m"), shown)
+        self.assertLessEqual(render._dw(shown), 80)
         process["progress"]["training"]["schedule_epoch"]["total"] = True
-        self.assertNotIn("Epoch", text(render._gpu_training_rows(process, "", 180)))
+        shown = render._plain(render._gpu_progress_row(process, "", 180))
+        self.assertNotIn("Epoch", shown)
+        self.assertIn("training-updates 15% 59415/400000", shown)
 
     def test_fresh_heartbeat_does_not_refresh_counter_age(self):
         projected = self.projected(now=self.now + 5)

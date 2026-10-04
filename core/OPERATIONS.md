@@ -969,10 +969,17 @@ identity-bound projection. A schedule epoch may be derived only when the same
 verified config explicitly supplies positive integer `training.epochs`,
 `blocks_per_epoch` and `updates_per_block` whose product equals `training.attempts`.
 Its partial, boundary and complete states count attempted-update intervals,
-not dataset passes. Human views label Step as attempt and Loss as last batch;
-scientific notation changes only presentation, preserving JSON precision.
-Absent or ambiguous cadence omits Epoch without losing Step or Loss. Combined
-arm totals and ETA are not inferred from these counters.
+not dataset passes. Structured progress and existing tqdm output share one
+compact human row: Epoch, original phase, percentage and matching count fraction,
+observed ETA, then original metric names. A schedule Epoch pairs with attempts
+inside that interval; zero starts at zero and an exact boundary retains the
+completed interval's full count. Absent or ambiguous cadence omits Epoch and
+uses the overall attempt budget. Structured loss remains last batch, with scientific
+notation only in the human view and full JSON precision preserved. Unit basis,
+state, success/skip breakdown and progress age remain in full JSON; the primary
+row uses the existing stalled-age warning rather than forcing fresh-age or
+basis explanations onto it. Original phase/metric names are preserved, and
+combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
