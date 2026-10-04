@@ -6097,55 +6097,6 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
     return rows
 
 
-def _resource_rows(resources, section):
-    if section not in ("dispatch", "both"):
-        return []
-    visible = [r for r in (resources or [])
-               if _SHOW_ALL or getattr(r, "liveness", None) == "working"]
-    if not visible:
-        return []
-    counts = {
-        state: sum(1 for run in visible if getattr(run, "liveness", None) == state)
-        for state in ("working", "exited", "stale")
-    }
-    rows = [[
-        ("  LAB RESOURCES", "head"),
-        ("  %d visible · " % len(visible), "dim"),
-        ("working %d" % counts["working"], "working"),
-        (" · exited %d" % counts["exited"], "dim"),
-        (" · stale %d" % counts["stale"], "lvl_y" if counts["stale"] else "dim"),
-    ]]
-    state_rank = {"working": 0, "exited": 1, "stale": 2}
-    ordered = sorted(
-        visible,
-        key=lambda run: (
-            state_rank.get(getattr(run, "liveness", None), 3),
-            getattr(run, "project", "(unknown)"),
-            getattr(run, "run_id", ""),
-            getattr(run, "registry_path", ""),
-        ),
-    )
-    summary = [("    ", None)]
-    for index, run in enumerate(ordered[:3]):
-        if index:
-            summary.append(("  ·  ", "dim"))
-        state = getattr(run, "liveness", "stale")
-        key = {"working": "working", "exited": "dim", "stale": "lvl_y"}.get(state, "dim")
-        marker = {"working": "●", "exited": "✓", "stale": "⚠"}.get(state, "?")
-        project = getattr(run, "project", None) or "(unknown)"
-        run_id = getattr(run, "run_id", None) or "—"
-        node = getattr(run, "node", None) or "—"
-        summary.extend([
-            (marker + " ", key),
-            ("%s/%s" % (project, run_id), key),
-            (" · %s · %s" % (node, fmt_min(getattr(run, "elapsed_min", None))), "dim"),
-        ])
-    if len(ordered) > 3:
-        summary.append(("  +%d more" % (len(ordered) - 3), "dim"))
-    rows.append(summary)
-    return rows
-
-
 def _shown_group_sessions(group_sessions):
     return (group_sessions if _SHOW_ALL else
             [s for s in group_sessions if session_parent_visible(s)])
@@ -6547,9 +6498,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         process_lines = _build_process_lines(
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor)
-        resource_lines = _resource_rows(resources, section)
-        return (_top_rows(term_width, narrow) + resource_lines
-                + ([None] if resource_lines else []) + process_lines)
+        return _top_rows(term_width, narrow) + process_lines
     # F-18b: mem-worker (distiller/curator/F-17 refresher) census — computed on the ORIGINAL
     # session list, before is_child/mem filtering, so folded/mem-only groups still surface a
     # total in the legend even when no group header badge fires.
@@ -6615,7 +6564,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     show_jobs = section in ("dispatch", "both")
 
     # F-104: live GPU processes neither a registered run nor a drawn session/job GPU
-    # strip shows land on their cwd's project card (same rule as LAB RESOURCES).
+    # strip shows land on their cwd's project card.
     gpu_work = {}
     if show_jobs:
         strip_keys = set()
@@ -6696,9 +6645,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # Show the row by default; counts skip app-server companions. Extracted into _pulse_segs
     # (F-30, v10) so the process view (§5.1) shares this EXACT row instead of a second copy.
     lines.append(_pulse_segs(sessions, display_jobs))  # Aggregate cost rollup intentionally removed.
-    resource_lines = _resource_rows(resources, section)
-    if resource_lines:
-        lines.extend(resource_lines)
     _governor = _governor_segs(governor)       # F-28c — snapshot-owned in the live loop
     if _governor is not None:                  # counts (I8); None = source absent or quiet.
         lines.append(_governor)

@@ -1021,6 +1021,17 @@ class ProbeProgressTest(unittest.TestCase):
             b'{"phase":"train","epoch":0,"global_step":17}'),
             "train · epoch 0 · global_step 17")
 
+    def test_json_progress_control_only_labels_do_not_break_collection(self):
+        log = self.root / "control-labels.log"
+        log.write_text(json.dumps({"phase": "\x00", "arm": "\u200b",
+                                   "successful": 17808}) + "\n")
+        with log.open("ab") as out:
+            child = self.spawn(out, out)
+        self.assertEqual(self.progress(child)["summary"], "successful 17808")
+        self.assertEqual(self.ns["progress_json_summary"](
+            b'{"phase":"\\u0000","arm":"baseline","step":9}'),
+            "baseline · step 9")
+
     def test_pipe_tty_and_device_outputs_have_no_progress(self):
         piped = self.spawn(subprocess.PIPE, subprocess.DEVNULL)
         self.assertIsNone(self.progress(piped))

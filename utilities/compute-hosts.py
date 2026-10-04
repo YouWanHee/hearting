@@ -940,7 +940,8 @@ def progress_json_summary(raw):
         return None
     labels = [command_text([record[key]], 48) for key in ("phase", "arm")
               if isinstance(record.get(key), str) and record[key].strip()]
-    return command_text([" · ".join(labels + counters)], PROGRESS_CELLS_MAX)
+    return command_text([" · ".join([label for label in labels if label] + counters)],
+                        PROGRESS_CELLS_MAX)
 
 
 # Training epoch, found by shape in the same output file. A per-user, host-local
