@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -202,7 +203,7 @@ class StrictPeerHistory(unittest.TestCase):
 
     def test_actual_schema_empty_text_elements_and_body_mismatch(self):
         for message, count in (("peer", 1), ("other", 0)):
-            turn = {"items": [{"type": "userMessage", "clientId": CLIENT_ID,
+            turn = {"id": "fixture-turn", "items": [{"type": "userMessage", "clientId": CLIENT_ID,
                               "content": [{"type": "text", "text": message, "text_elements": []}]}]}
             with mock.patch.object(QUEUE, "_rpc", return_value={"data": [turn]}) as rpc:
                 if count:
@@ -225,6 +226,134 @@ class StrictPeerHistory(unittest.TestCase):
                     QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
                         client_message_id=CLIENT_ID, message="peer", require_message_match=True)
                 rpc.assert_not_called()
+
+
+class BoundedPeerHistory(unittest.TestCase):
+    def send(self):
+        return QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+            client_message_id=CLIENT_ID, message="peer", timeout=3,
+            allow_restart=False, retry_ambiguous=False, require_message_match=True)
+
+    def test_large_aggregate_pages_complete_before_one_enqueue(self):
+        # A real serialized-size fixture reproduces full-page overflow without
+        # changing the socket cap; each individual turn is well below it.
+        turns = [{"id": f"turn-{i}", "items": [{"type": "commandExecution",
+                  "aggregatedOutput": "x" * (1024 * 1024)}]} for i in range(5)]
+        reads, adds = [], []
+
+        def rpc(path, method, params, *, timeout):
+            if method == "thread/queue/add":
+                adds.append(params)
+                return {"queuedSubmission": ITEM}
+            self.assertEqual(method, "thread/turns/list")
+            self.assertEqual(params["threadId"], THREAD)
+            self.assertEqual((params["itemsView"], params["sortDirection"]), ("full", "desc"))
+            start = int(params.get("cursor", 0))
+            end = min(len(turns), start + params["limit"])
+            response = {"data": turns[start:end], "nextCursor": str(end) if end < len(turns) else None}
+            size = len(json.dumps(response).encode())
+            reads.append((start, params["limit"], size))
+            if size > 4 * 1024 * 1024:
+                raise QUEUE.QueueDeliveryError("queue-websocket-message-oversized")
+            return response
+
+        with mock.patch.object(QUEUE, "_rpc", side_effect=rpc), \
+             mock.patch.object(QUEUE, "list_queue", return_value=[]):
+            result = self.send()
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(len(adds), 1)
+        self.assertEqual([limit for start, limit, _ in reads[:4]], [16, 8, 4, 2])
+        self.assertEqual(sum(start == 2 for start, _, size in reads if size < 4 * 1024 * 1024), 2)
+        self.assertEqual(QUEUE.MAX_FRAME_BYTES, 4 * 1024 * 1024)
+
+    def item_rpc(self, tail, *, error=None):
+        # The matching user item occurs after tools and the first user; summary
+        # would miss it. A second matching item can occupy a later item page.
+        items = [{"type": "userMessage", "clientId": "other", "content": []},
+                 {"type": "commandExecution"},
+                 {"type": "userMessage", "clientId": CLIENT_ID,
+                  "content": [{"type": "text", "text": "peer"}]}] + tail
+        calls = []
+
+        def rpc(path, method, params, *, timeout):
+            calls.append((method, params))
+            self.assertEqual(params["threadId"], THREAD)
+            if method == "thread/turns/list":
+                self.assertEqual(params["sortDirection"], "desc")
+                if params["itemsView"] == "full":
+                    raise QUEUE.QueueDeliveryError("queue-websocket-message-oversized")
+                self.assertEqual((params["itemsView"], params["limit"]), ("notLoaded", 1))
+                return {"data": [{"id": "large-turn", "items": []}], "nextCursor": None}
+            self.assertEqual(method, "thread/items/list")
+            self.assertEqual((params["turnId"], params["sortDirection"]), ("large-turn", "asc"))
+            if error:
+                raise error
+            start = int(params.get("cursor", 0))
+            end = min(len(items), start + 2)
+            return {"data": [{"turnId": "large-turn", "item": item} for item in items[start:end]],
+                    "nextCursor": str(end) if end < len(items) else None}
+        return rpc, calls
+
+    def test_singleton_item_pagination_finds_middle_user_with_exact_body(self):
+        rpc, calls = self.item_rpc([{"type": "agentMessage"}])
+        with mock.patch.object(QUEUE, "_rpc", side_effect=rpc):
+            result = self.send()
+        self.assertEqual(result["status"], "consumed")
+        self.assertEqual([params.get("cursor") for method, params in calls if method == "thread/items/list"], [None, "2"])
+
+    def test_matching_item_requires_rest_of_turn_duplicate_check(self):
+        duplicate = {"type": "userMessage", "clientId": CLIENT_ID,
+                     "content": [{"type": "text", "text": "changed"}]}
+        rpc, calls = self.item_rpc([{"type": "agentMessage"}, duplicate])
+        with mock.patch.object(QUEUE, "_rpc", side_effect=rpc):
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-mismatch"):
+                self.send()
+        self.assertEqual([params.get("cursor") for method, params in calls if method == "thread/items/list"], [None, "2", "4"])
+
+    def test_unsupported_item_api_and_single_item_overflow_never_enqueue(self):
+        for reason in ("queue-rpc-refused:thread/items/list:-32601:unsupported",
+                       "queue-websocket-message-oversized"):
+            rpc, calls = self.item_rpc([], error=QUEUE.QueueDeliveryError(reason))
+            with self.subTest(reason=reason), mock.patch.object(QUEUE, "_rpc", side_effect=rpc):
+                with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-unavailable"):
+                    self.send()
+            self.assertNotIn("thread/queue/add", [method for method, _ in calls])
+
+    def test_foreign_items_and_repeated_cursors_are_unavailable(self):
+        for entries, cursor in (([{"turnId": "foreign", "item": {"type": "agentMessage"}}], None),
+                                ([{"turnId": "large-turn", "item": {"type": "agentMessage"}}], "same"),
+                                ([{"turnId": "large-turn", "item": None}], None)):
+            rpc, calls = self.item_rpc([])
+            def wrong(path, method, params, *, timeout):
+                if method == "thread/items/list":
+                    return {"data": entries, "nextCursor": cursor}
+                return rpc(path, method, params, timeout=timeout)
+            with self.subTest(entries=entries), mock.patch.object(QUEUE, "_rpc", side_effect=wrong):
+                with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-unavailable"):
+                    self.send()
+
+    def test_turn_request_and_time_budgets_never_become_absence(self):
+        def rpc(path, method, params, *, timeout):
+            index = int(params.get("cursor", 0))
+            return {"data": [{"id": f"turn-{index}", "items": []}], "nextCursor": str(index + 1)}
+        for bounds in ({"MAX_QUEUE_PAGES": 1, "MAX_PAGE_SIZE": 2},
+                       {"MAX_PEER_HISTORY_REQUESTS": 2}):
+            with self.subTest(bounds=bounds), mock.patch.multiple(QUEUE, **bounds), \
+                 mock.patch.object(QUEUE, "_rpc", side_effect=rpc) as calls:
+                with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-budget-exhausted"):
+                    self.send()
+                self.assertTrue(all(call.args[1] == "thread/turns/list" for call in calls.call_args_list))
+        with mock.patch.object(QUEUE.time, "monotonic", side_effect=[0, 100]), mock.patch.object(QUEUE, "_rpc") as calls:
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-budget-exhausted"):
+                self.send()
+            calls.assert_not_called()
+
+    def test_item_budget_exhaustion_never_accepts_a_partial_match(self):
+        rpc, _ = self.item_rpc([{"type": "agentMessage"}])
+        with mock.patch.object(QUEUE, "MAX_PEER_HISTORY_ITEMS", 2), \
+             mock.patch.object(QUEUE, "_rpc", side_effect=rpc):
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "item-history-budget-exhausted"):
+                self.send()
 
 
 if __name__ == "__main__":

@@ -18,12 +18,16 @@ import secrets
 import socket
 import stat
 import struct
+import time
 from typing import Any
 
 
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_PAGES = 16
 MAX_PAGE_SIZE = 100
+PEER_HISTORY_PAGE_SIZE = 16
+MAX_PEER_HISTORY_REQUESTS = 256
+MAX_PEER_HISTORY_ITEMS = 160000
 
 
 class QueueDeliveryError(RuntimeError):
@@ -296,6 +300,8 @@ def find_turn_by_client_message_id(
     strict_history: bool = False,
 ) -> dict[str, Any] | None:
     """Find the turn that consumed an exact queued client message id."""
+    if strict_history:
+        return _find_peer_turn(path, thread_id, client_message_id, timeout=timeout)
     cursor = None
     for _ in range(MAX_QUEUE_PAGES):
         params: dict[str, Any] = {
@@ -318,12 +324,125 @@ def find_turn_by_client_message_id(
         cursor = response.get("nextCursor")
         if not cursor:
             return None
-    if strict_history:
-        raise QueueDeliveryError("queue-peer-history-budget-exhausted")
     # A bounded history miss is ambiguous, not a reason to strand a new
     # receipt in a long conversation. At-least-once permits another send;
     # the independent exact pending-queue check still suppresses duplicates.
     return None
+
+
+def _find_peer_turn(path, thread_id, client_message_id, *, timeout):
+    """Read complete peer history in small pages; a summary miss proves nothing.
+
+    v0.160 summary includes only the first user item. Full turn pages are reduced
+    after a read-only frame overflow; a singleton uses thread/items/list instead.
+    Both paths retain the original 1600-turn ceiling and fail closed on gaps.
+    """
+    requests = 0
+    inspected_items = 0
+    deadline = time.monotonic() + timeout * MAX_QUEUE_PAGES
+
+    def read(method, params):
+        nonlocal requests
+        requests += 1
+        remaining = deadline - time.monotonic()
+        if requests > MAX_PEER_HISTORY_REQUESTS or remaining <= 0:
+            raise QueueDeliveryError("queue-peer-history-budget-exhausted")
+        return _rpc(path, method, params, timeout=min(timeout, remaining))
+
+    def page(method, params, limit):
+        while True:
+            try:
+                result = read(method, dict(params, limit=limit))
+                values = result.get("data")
+                cursor = result.get("nextCursor")
+                if (not isinstance(values, list) or len(values) > limit
+                        or (cursor is not None and (not isinstance(cursor, str) or not cursor))
+                        or (not values and cursor is not None)):
+                    raise QueueDeliveryError("queue-peer-history-page-invalid")
+                return values, cursor, limit
+            except QueueDeliveryError as exc:
+                # Only a definite read overflow authorizes a smaller read.
+                if exc.reason != "queue-websocket-message-oversized" or exc.ambiguous or limit == 1:
+                    raise
+                limit = max(1, limit // 2)
+
+    def count_items(items):
+        nonlocal inspected_items
+        inspected_items += len(items)
+        if inspected_items > MAX_PEER_HISTORY_ITEMS:
+            raise QueueDeliveryError("queue-peer-item-history-budget-exhausted")
+
+    def turn_items(turn_id):
+        cursor = None
+        seen = set()
+        matches = []
+        limit = PEER_HISTORY_PAGE_SIZE
+        while True:
+            params = {"threadId": thread_id, "turnId": turn_id, "sortDirection": "asc"}
+            if cursor is not None:
+                params["cursor"] = cursor
+            values, next_cursor, limit = page("thread/items/list", params, limit)
+            count_items(values)
+            for entry in values:
+                item = entry.get("item") if isinstance(entry, dict) else None
+                if (not isinstance(entry, dict) or entry.get("turnId") != turn_id
+                        or not isinstance(item, dict) or not isinstance(item.get("type"), str)):
+                    raise QueueDeliveryError("queue-peer-item-history-invalid")
+                if item.get("clientId") == client_message_id:
+                    matches.append(item)
+            if next_cursor is None:
+                return matches
+            if next_cursor in seen:
+                raise QueueDeliveryError("queue-peer-history-cursor-invalid")
+            seen.add(next_cursor)
+            cursor = next_cursor
+
+    cursor = None
+    seen_cursors = set()
+    seen_turns = set()
+    checked = 0
+    limit = PEER_HISTORY_PAGE_SIZE
+    maximum = MAX_QUEUE_PAGES * MAX_PAGE_SIZE
+    while checked < maximum:
+        items_counted = False
+        params = {"threadId": thread_id, "sortDirection": "desc", "itemsView": "full"}
+        if cursor is not None:
+            params["cursor"] = cursor
+        try:
+            turns, next_cursor, limit = page("thread/turns/list", params, min(limit, maximum - checked))
+        except QueueDeliveryError as exc:
+            if exc.reason != "queue-websocket-message-oversized" or exc.ambiguous:
+                raise
+            # page() has already reduced to one. Read the shell, then every item
+            # of that same turn; a huge individual item still refuses enqueue.
+            turns, next_cursor, limit = page("thread/turns/list", dict(params, itemsView="notLoaded"), 1)
+            if (len(turns) != 1 or not isinstance(turns[0], dict)
+                    or not isinstance(turns[0].get("id"), str) or not turns[0]["id"]
+                    or turns[0].get("items") != []):
+                raise QueueDeliveryError("queue-peer-history-shell-invalid")
+            turns = [dict(turns[0], items=turn_items(turns[0]["id"]))]
+            items_counted = True
+        for turn in turns:
+            if (not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not turn["id"]
+                    or turn["id"] in seen_turns or not isinstance(turn.get("items"), list)
+                    or any(not isinstance(item, dict) or not isinstance(item.get("type"), str)
+                           for item in turn["items"])):
+                raise QueueDeliveryError("queue-peer-turn-history-invalid")
+            seen_turns.add(turn["id"])
+            if not items_counted:
+                count_items(turn["items"])
+        for turn in turns:
+            if any(item.get("clientId") == client_message_id for item in turn["items"]):
+                return turn
+        checked += len(turns)
+        if next_cursor is None:
+            return None
+        if next_cursor in seen_cursors:
+            raise QueueDeliveryError("queue-peer-history-cursor-invalid")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+        limit = min(PEER_HISTORY_PAGE_SIZE, limit * 2)
+    raise QueueDeliveryError("queue-peer-history-budget-exhausted")
 
 
 def _start_interrupted_owned_item(
@@ -366,7 +485,8 @@ def _known_consumed(path, thread_id, client_message_id, *, timeout, strict_histo
     except QueueDeliveryError as exc:
         if strict_history:
             # A read failure permits a later normal read, never an add now.
-            raise QueueDeliveryError("queue-peer-history-unavailable:" + exc.reason) from exc
+            raise QueueDeliveryError("queue-peer-history-unavailable:" + exc.reason,
+                                     ambiguous=exc.ambiguous) from exc
         # History can be unavailable or oversized on a long coding turn.
         # That is an ambiguous result under the accepted at-least-once policy,
         # never evidence of consumption. Exact pending lookup still follows.

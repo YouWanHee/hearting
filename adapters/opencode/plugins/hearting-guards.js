@@ -214,18 +214,67 @@ function spawnCheckpoint(sid) {
 // OpenCode has no user-configurable status line, so the pane header is the only place
 // this session can say which session it is -- and it must say it in the same shape the
 // other two harnesses do. Fire-and-forget: a turn never waits on a display projection.
-async function projectPane(sid, ctx) {
+function sdkResponseData(result) {
+  if (!result || typeof result !== "object" || result.error != null || result.response?.ok === false) return null
+  return Object.hasOwn(result, "data") ? result.data : result
+}
+
+const paneProjectionBusy = new Set()
+const paneProjectionRetryAt = new Map()
+let paneProjectionGeneration = 0
+let paneProjectionSession = ""
+async function projectPane(sid, ctx, retry = false) {
   if (!sid || isWorkerSession() || !process.env.HERDR_PANE_ID) return
+  if (paneProjectionBusy.has(sid) || (retry && Date.now() < (paneProjectionRetryAt.get(sid) || 0))) return
+  paneProjectionBusy.add(sid)
+  paneProjectionRetryAt.set(sid, Date.now() + 10000)
+  if (paneProjectionSession !== sid) {
+    paneProjectionSession = sid
+    paneProjectionGeneration++
+  }
+  const generation = paneProjectionGeneration
   let timer
   let verified = false
+  let reason = "sdk-unavailable"
+  let style = "unobserved"
+  let httpStatus = null
+  const started = Date.now()
+  const controller = new AbortController()
   try {
     if (typeof ctx?.client?.session?.get === "function") {
-      const result = await Promise.race([ctx.client.session.get({ path: { id: sid } }),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("peer-identity-timeout")), 500) })])
-      verified = result?.data?.id === sid && !result.data.parentID
+      // PluginInput in OpenCode 1.18.34 uses SDK v1, including path.id.
+      // Explicit error handling also covers the SDK's supported data response style.
+      const result = await Promise.race([ctx.client.session.get({ path: { id: sid },
+        throwOnError: true, signal: controller.signal }), new Promise((_, reject) => {
+        timer = setTimeout(() => { controller.abort(); reject(new Error("peer-identity-timeout")) }, 500)
+      })])
+      style = result && Object.hasOwn(result, "data") ? "wrapped" : "data"
+      if (Number.isInteger(result?.response?.status)) httpStatus = result.response.status
+      const session = sdkResponseData(result)
+      reason = !session || typeof session.id !== "string" ? "sdk-response-invalid"
+        : session.id !== sid ? "sdk-session-mismatch"
+        : session.parentID !== undefined && session.parentID !== null ? "sdk-child-session" : "verified"
+      verified = reason === "verified"
     }
-  } catch {} finally { clearTimeout(timer) }
+  } catch (error) {
+    reason = controller.signal.aborted ? "sdk-timeout" : "sdk-error"
+  } finally { clearTimeout(timer) }
+  if (generation !== paneProjectionGeneration) {
+    verified = false
+    reason = "sdk-stale-callback"
+  }
+  // Existing host logger, metadata only: the old silent catch hid which normal
+  // SDK stage failed. This is observation, never a publication/receipt substitute.
   try {
+    if (typeof ctx?.client?.app?.log === "function") {
+      Promise.resolve(ctx.client.app.log({ body: { service: "hearting-peer-identity",
+        level: verified ? "debug" : "warn", message: reason,
+        extra: { sessionID: sid, verified, responseStyle: style, httpStatus, elapsedMs: Date.now() - started },
+      }})).catch(() => {})
+    }
+  } catch {}
+  try {
+    if (generation !== paneProjectionGeneration) return
     const args = [herdrProjection, "--harness", "opencode", "--session-id", sid]
     if (!verified) args.push("--no-report-session")
     const child = spawn("python3", args, {
@@ -237,7 +286,7 @@ async function projectPane(sid, ctx) {
     child.unref()
   } catch {
     // best-effort; the pane header is display-only
-  }
+  } finally { paneProjectionBusy.delete(sid) }
 }
 
 function collectPreflight(command, args) {
@@ -395,7 +444,7 @@ async function pendingPeerDelivery(ctx, sid) {
     const rows = pendingPeerCommand(sid)
     if (!Array.isArray(rows) || !rows.length) return
     const response = await bounded(client.messages({ path: { id: sid } }))
-    const messages = response?.data
+    const messages = sdkResponseData(response)
     if (!Array.isArray(messages)) return
     for (const row of rows.slice(0, 3)) {
       const matches = messages.filter((m) => m?.info?.sessionID === sid && m.info.role === "user"
@@ -422,10 +471,11 @@ async function pendingPeerDelivery(ctx, sid) {
       const accepted = await bounded(client.prompt({ path: { id: sid }, body: {
         noReply: true, parts: [{ type: "text", text: claimed.text }],
       }}))
-      if (accepted?.data?.info?.sessionID === sid && accepted.data.info.role === "user"
-          && typeof accepted.data.info.id === "string" && accepted.data.info.id
-          && promptText(accepted.data) === claimed.text) {
-        pendingPeerCommand(sid, ["--queued", claimed.ref, "--message-id", accepted.data.info.id])
+      const message = sdkResponseData(accepted)
+      if (message?.info?.sessionID === sid && message.info.role === "user"
+          && typeof message.info.id === "string" && message.info.id
+          && promptText(message) === claimed.text) {
+        pendingPeerCommand(sid, ["--queued", claimed.ref, "--message-id", message.info.id])
       }
     }
   } catch { /* Inflight/ambiguous payload remains unverified; no resend loop. */ }
@@ -493,6 +543,7 @@ export const AgentHarnessGuards = async (ctx) => {
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
+        paneProjectionRetryAt.delete(sid)
       }
     }
   },
@@ -606,6 +657,7 @@ export const AgentHarnessGuards = async (ctx) => {
     for (const file of files) {
       if (isDesignHtml(file)) runPreflight("design", [file])
     }
+    await projectPane(input.sessionID || "", ctx, true)
     await pendingPeerDelivery(ctx, input.sessionID || "")
     // Record actual spec reads for workflow and display evidence.
     // Non-blocking: a marker failure must never abort a successful read.

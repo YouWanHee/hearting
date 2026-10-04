@@ -1114,6 +1114,16 @@ It is bound to the immutable transfer ref, actual sender/recipient and digest,
 not a public ledger field. Receipt removes the private body and retains the ref
 for replay deduplication; unknown, stale or ambiguous identities keep their binding.
 
+Peer-only native history reads keep the exact client ID and body checks while
+reducing oversized pages. A summary miss is not absence: the checked turn range
+includes complete item inspection, using bounded item pagination for a large turn.
+Unavailable, malformed or incomplete history still permits no enqueue. This does
+not change the completion courier's existing at-least-once defaults or frame cap.
+OpenCode self-publication uses the normal callback SID and an exact top-level
+Session returned by its SDK. Wrapped and data-style SDK responses share that
+validation; timeout/error diagnostics and retries occur only on normal callbacks.
+Neither environment/pane labels nor a queued/persisted message prove receipt.
+
 **v56 runtime table** (herdr-unified; supersedes the v50 native-messaging-expansion plan).
 The user decided 2026-09-02 not to extend native peer messaging to Codex; the common
 control lever across Claude and Codex depth-0 sessions is the herdr agent API (`herdr

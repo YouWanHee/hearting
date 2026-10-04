@@ -333,15 +333,21 @@ class PendingCallbacks(unittest.TestCase):
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
-const start = source.indexOf("async function projectPane(");
+const start = source.indexOf("function sdkResponseData(");
 const end = source.indexOf("\nfunction collectPreflight", start);
 const commands = [];
 const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
   spawn: (exe, args) => {commands.push(args);return {unref() {}}}, herdrProjection: "fixture-projector",
-  root: "fixture-root", setTimeout, clearTimeout};
+  root: "fixture-root", setTimeout, clearTimeout, AbortController};
 vm.runInNewContext(source.slice(start, end), scope);
-for (const data of [{id: "exact"}, {id: "foreign"}, {id: "exact", parentID: "child"}]) {
-  await scope.projectPane("exact", {client: {session: {get: async () => ({data})}}});
+for (const response of [{data: {id: "exact"}}, {id: "exact", parentID: null},
+  {data: {id: "foreign"}}, {data: {id: "exact", parentID: "child"}},
+  {data: {id: "exact", parentID: 0}}, {error: "failed", data: {id: "exact"}},
+  {response: {ok: false}, data: {id: "exact"}}, {}]) {
+  await scope.projectPane("exact", {client: {session: {get: async (options) => {
+    if (options.path.id !== "exact" || options.throwOnError !== true || !options.signal) throw Error("wrong SDK v1 call");
+    return response;
+  }}}});
 }
 console.log(JSON.stringify(commands));
 '''
@@ -350,7 +356,45 @@ console.log(JSON.stringify(commands));
         self.assertEqual(run.returncode, 0, run.stderr)
         commands = json.loads(run.stdout)
         self.assertEqual(commands[0], ["fixture-projector", "--harness", "opencode", "--session-id", "exact"])
-        self.assertTrue(all(command[-1] == "--no-report-session" for command in commands[1:]))
+        self.assertEqual(commands[1], ["fixture-projector", "--harness", "opencode", "--session-id", "exact"])
+        self.assertTrue(all(command[-1] == "--no-report-session" for command in commands[2:]))
+
+    def test_opencode_normal_tool_retry_retains_actual_sdk_identity_and_observes_timeout(self):
+        js = r'''
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
+const commands = [], logs = [];
+let now = 1000, gets = 0, resolveFirst;
+const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "foreign-env"}},
+  isWorkerSession: () => false, root: "fixture-root", herdrProjection: "fixture-projector",
+  Date: {now: () => now}, setTimeout, clearTimeout, AbortController,
+  spawn: (exe, args) => {commands.push(args);return {unref() {}}}};
+vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+const ctx = {client: {app: {log: async ({body}) => logs.push(body)}, session: {get: async ({path}) => {
+  if (path.id !== "actual-callback") throw Error("guessed identity");
+  gets++;
+  if (gets === 1) return await new Promise(resolve => {resolveFirst = resolve});
+  return {id: "actual-callback"};
+}}}};
+await Promise.all([scope.projectPane("actual-callback", ctx, true), scope.projectPane("actual-callback", ctx, true)]);
+resolveFirst({id: "late-foreign"});
+await scope.projectPane("actual-callback", ctx, true); // Within interval: no retry.
+now = 12000;
+await scope.projectPane("actual-callback", ctx, true); // Existing normal callback: exact SDK data.
+console.log(JSON.stringify({gets, commands, logs}));
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result["gets"], 2)
+        self.assertEqual(result["commands"], [
+            ["fixture-projector", "--harness", "opencode", "--session-id", "actual-callback", "--no-report-session"],
+            ["fixture-projector", "--harness", "opencode", "--session-id", "actual-callback"],
+        ])
+        self.assertEqual([row["message"] for row in result["logs"]], ["sdk-timeout", "verified"])
+        self.assertEqual([row["extra"]["verified"] for row in result["logs"]], [False, True])
 
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''
@@ -359,14 +403,15 @@ const root = process.env.AGENT_HOME;
 const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
 const sid = "fixture-oc";
 let messages = [], calls = 0;
+const unwrap = (data) => process.env.FIXTURE_SDK_STYLE === "data" ? data : {data};
 const ctx = { directory: root, worktree: root, client: { session: {
-  messages: async () => ({data: messages}),
+  messages: async () => unwrap(messages),
   prompt: async (args) => {
     calls++;
     if (args.body.noReply !== true || Object.keys(args.body).sort().join() !== "noReply,parts") throw Error("unsafe request");
     const row = {info: {id: "fixture-message-" + calls, role: "user", sessionID: sid}, parts: args.body.parts};
     messages.push(row);
-    return {data: row};
+    return unwrap(row);
   },
 }}};
 const hooks = await AgentHarnessGuards(ctx);
@@ -392,6 +437,38 @@ console.log(JSON.stringify({stage: "received", calls}));
         self.assertEqual(stages[1]["calls"], 1)
         self.assertEqual(pm._read_pending(ref)["state"], "received")
         self.assertEqual(len([r for r in self.rows() if r.get("transfer_ref") == ref]), 1)
+
+    def test_opencode_old_callback_cannot_overwrite_new_fork_publication(self):
+        js = r'''
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
+const commands = [], logs = [];
+let resolveOld;
+const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
+  root: "fixture-root", herdrProjection: "fixture-projector", setTimeout, clearTimeout, AbortController,
+  spawn: (exe, args) => {commands.push(args);return {unref() {}}}};
+vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+const ctx = {client: {app: {log: async ({body}) => logs.push(body)}, session: {get: async ({path}) =>
+  path.id === "old" ? await new Promise(resolve => {resolveOld = resolve}) : {data: {id: "new"}}
+}}};
+const old = scope.projectPane("old", ctx);
+await scope.projectPane("new", ctx);
+resolveOld({data: {id: "old"}});
+await old;
+console.log(JSON.stringify({commands, reasons: logs.map(row => row.message)}));
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {
+            "commands": [["fixture-projector", "--harness", "opencode", "--session-id", "new"]],
+            "reasons": ["verified", "sdk-stale-callback"],
+        })
+
+    def test_opencode_data_style_retains_persisted_vs_completed_parent_boundary(self):
+        with mock.patch.dict(os.environ, {"FIXTURE_SDK_STYLE": "data"}):
+            self.test_opencode_persisted_context_and_completed_turn_ack_once()
 
     def test_opencode_lost_response_foreign_history_never_blindly_resends(self):
         js = r'''
