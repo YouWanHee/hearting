@@ -941,7 +941,7 @@ disappears with an expired sample.
 
 Fleet may enrich a working registered resource's GPU process with read-only
 training progress from its existing `run.json` and exact arm directory's
-`progress.json`. The registered wrapper and producer child must retain their
+`progress.json`. The observation binds the registered wrapper and producer child by their
 PID, start time, command hash and same-EUID process-group connection across the
 bounded reads. The child's actual config argument and cwd go through the normal
 lab config resolver; only bytes matching the arm's recorded config hash can
