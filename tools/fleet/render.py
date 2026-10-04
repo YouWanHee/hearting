@@ -4666,9 +4666,13 @@ def _gpu_process_rows(gpu, indent, width):
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
         row = [(indent + "    ", None), ("↳ ", "dim"), (command, "dim")]
         rows.append(_clip_segs(row, width)[0])
-        progress = _gpu_progress_row(process, indent, width)
-        if progress:
-            rows.append(progress)
+        training_rows = _gpu_training_rows(process, indent, width)
+        if training_rows:
+            rows.extend(training_rows)
+        else:
+            progress = _gpu_progress_row(process, indent, width)
+            if progress:
+                rows.append(progress)
     return rows
 
 
@@ -4786,6 +4790,39 @@ def _clip_progress_segments(segs, width):
     if width > 0:
         out.append(("…", "dim"))
     return out
+
+
+def _gpu_training_rows(process, indent, width):
+    progress = process.get("progress")
+    training = progress.get("training") if isinstance(progress, dict) else None
+    if not isinstance(training, dict):
+        return []
+    attempt, total, successful, skipped = (training.get(key) for key in
+        ("attempt", "attempt_total", "successful", "skipped"))
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in (attempt, total, successful, skipped)) \
+            or total <= 0 or attempt > total or attempt != successful + skipped:
+        return []
+    labels = [_gpu_safe_text(training.get(key)).strip() for key in ("phase", "arm")]
+    counter = "attempt %s/%s (%.2f%%)" % (format(attempt, ","), format(total, ","),
+                                        attempt * 100.0 / total)
+    body = " · ".join([label for label in labels if label] + [counter])
+    metrics = "successful %s · skipped %s" % (format(successful, ","), format(skipped, ","))
+    loss = training.get("loss")
+    if isinstance(loss, (int, float)) and not isinstance(loss, bool) and math.isfinite(loss):
+        metrics += " · loss %.5g (last batch)" % loss
+    age = training.get("progress_age_s")
+    age_text = ""
+    if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age >= 0:
+        age_text = "progress %ds ago" % int(age) if age < 120 else "progress %dm ago" % (age // 60)
+    prefix = [(indent + "      ", None), ("↳ ", "dim")]
+    suffix = [(" · " + age_text, "lvl_y" if age >= _PROGRESS_STALLED_S else "dim")] if age_text else []
+    # Keep current/total and last-batch metrics on separate rows so a normal
+    # terminal can show both. Progress age keeps its space when metrics clip.
+    room = width - sum(_dw(text) for text, _key in prefix + suffix)
+    return [_clip_segs(prefix + [(body, "resource_active")], width)[0],
+            _clip_segs(prefix + _clip_progress_segments([(metrics, "dim")], max(0, room))
+                       + suffix, width)[0]]
 
 
 def _gpu_progress_row(process, indent, width):
@@ -5202,8 +5239,8 @@ def _gpu_token(gpu, available, show_name=False, sessions=None, index_width=1,
     return segs
 
 
-def _compute_host_rows(term_width=None, sessions=None):
-    snapshot = _COMPUTE_HOSTS
+def _compute_host_rows(term_width=None, sessions=None, resources=None):
+    snapshot = _compute_hosts.with_training_progress(_COMPUTE_HOSTS, resources)
     if not isinstance(snapshot, dict):
         return []
     width = max(20, int(term_width or 200))
@@ -5799,7 +5836,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
 
 
 def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, term_width, layout,
-                         node_evidence=None, governor=_IO_UNSET):
+                         node_evidence=None, governor=_IO_UNSET, resources=None):
     """F-30 (prd.md:304-310) — the process view: one card per ACTIVE route (pipeline-centric
     regrouping) instead of the group view's per-project regrouping. Returns the SAME flat
     segment-line contract as `_build_lines` ([[(text,key),...]|None]) — `_draw`/`render_once`/
@@ -5823,7 +5860,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if malformed:
         lines.append([("  +%d malformed jobs.log rows skipped" % malformed, "dim")])
     lines.append([(_HFILL, None)])
-    compute_rows = _compute_host_rows(term_width, sessions)
+    compute_rows = _compute_host_rows(term_width, sessions, resources)
     lines.extend(compute_rows)
     if compute_rows:
         lines.append([(_HFILL, None)])
@@ -6497,7 +6534,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # the same way route resolution itself needed it for defect 1.
         process_lines = _build_process_lines(
             sessions, display_jobs, _route_views_by_id, malformed, memory,
-            term_width, layout, node_evidence=_node_evidence, governor=governor)
+            term_width, layout, node_evidence=_node_evidence, governor=governor, resources=resources)
         return _top_rows(term_width, narrow) + process_lines
     # F-18b: mem-worker (distiller/curator/F-17 refresher) census — computed on the ORIGINAL
     # session list, before is_child/mem filtering, so folded/mem-only groups still surface a
@@ -6661,7 +6698,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # usage/intel zone = PLAIN bg + a full-width dim rule below it (user 2026-07-03: intel
     # Keep tint directory-only so the intelligence zone is not confused with active cards.
     lines.append([(_HFILL, None)])
-    compute_rows = _compute_host_rows(term_width, sessions)
+    compute_rows = _compute_host_rows(term_width, sessions, resources)
     lines.extend(compute_rows)
     if compute_rows:
         lines.append([(_HFILL, None)])
