@@ -501,7 +501,7 @@ def pending_answer_response(interview: dict, response) -> bool:
 
 def pending_question_block(interview: dict) -> str:
     """The registered words and choices the parent leaves in ordinary conversation."""
-    lines = [_text(interview.get("understanding")), "Confirm this understanding or correct it in your reply."]
+    lines = [_text(interview.get("understanding"))]
     for question in interview.get("questions") or []:
         lines.extend(["", _text(question.get("question"))])
         for option in question.get("options") or []:

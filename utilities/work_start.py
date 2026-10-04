@@ -259,6 +259,8 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                               "Keep waiting for the actual answer. If this question has not yet been presented, "
                               "present human_wait.question_block now; registration alone does not prove presentation. "
                               "Do not automatically open another native question. ") +
+                    "Ask the person to confirm or correct the understanding in their language, and present the "
+                    "registered question and choices without changing their words. "
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
                     "Preserve only the person's actual structured or typed reply in answers_template; then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "

@@ -1291,8 +1291,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         question, real_answers = self.routed(approve=1)
         asked = self.step(interview=self.question_file)
         self.assertEqual(asked["required_action"], "ask-registered-question")
-        expected = ("Run the two commands and preserve their actual results.\n"
-                    "Confirm this understanding or correct it in your reply.\n\n"
+        expected = ("Run the two commands and preserve their actual results.\n\n"
                     "이 순서로 진행할까요?\n"
                     "- 예, 이 순서로: 예, 이 순서로\n"
                     "- 아니요, 다르게: 아니요, 다르게\n\n"
@@ -1301,6 +1300,9 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
                     "- 아니요, 나중에: 아니요, 나중에")
         self.assertEqual(asked["human_wait"], {"state": "pending", "fallback": "ordinary-conversation",
                                               "question_block": expected})
+        self.assertNotIn("Confirm this understanding", asked["human_wait"]["question_block"])
+        self.assertIn("confirm or correct the understanding in their language", asked["next_step"])
+        self.assertIn("registered question and choices without changing their words", asked["next_step"])
         registered = Path(asked["interview_file"])
         original = registered.read_bytes()
         answers_path = registered.parent / "answers.json"
