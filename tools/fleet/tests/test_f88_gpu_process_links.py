@@ -599,6 +599,25 @@ class GpuProgressLineRenderTest(unittest.TestCase):
         self.assertTrue(text[3].startswith("\u21b3 Epoch 2 done \u00b7 TRAIN 76%"), text[3])
         self.assertEqual(text[5], "\u21b3 Epoch 1.25/3 \u00b7 Epoch(train) [3][100/1250] loss: 0.5")
 
+    def test_json_summary_replaces_metadata_without_inventing_progress(self):
+        rows = render._gpu_process_rows(self.gpu({
+            "line": '{"utc":"2026-10-04","pid":2280280,"successful":17808}',
+            "summary": "training-updates · baseline · successful 17808",
+            "age_s": 0, "epoch": {"n": "3", "of": 200}}), "", 120)
+        self.assertEqual(render._plain(rows[1]).strip(),
+                         "↳ training-updates · baseline · successful 17808")
+        for width in (60, 40):
+            rows = render._gpu_process_rows(self.gpu({
+                "line": "raw JSON", "summary": "training-updates · baseline · successful 17808",
+                "age_s": 900}), "", width)
+            self.assertLessEqual(render._dw(render._plain(rows[1])), width)
+            self.assertTrue(render._plain(rows[1]).endswith("stalled 15m"))
+
+    def test_empty_json_summary_keeps_existing_raw_line(self):
+        rows = render._gpu_process_rows(self.gpu({
+            "line": "step 9", "summary": "", "age_s": 0}), "", 120)
+        self.assertEqual(render._plain(rows[1]).strip(), "↳ step 9")
+
     def test_malformed_epoch_is_ignored(self):
         for epoch in ({"n": 3}, {"n": "3; rm -rf"}, {"n": ""}, "ep 3", None, {"of": 5},
                       {"n": "\x1b[31m3"}):

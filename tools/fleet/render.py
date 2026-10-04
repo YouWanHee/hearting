@@ -4793,7 +4793,8 @@ def _gpu_progress_row(process, indent, width):
     progress = process.get("progress")
     if not isinstance(progress, dict):
         return None
-    line = _gpu_safe_text(progress.get("line")).strip()
+    summary = _gpu_safe_text(progress.get("summary")).strip()
+    line = summary or _gpu_safe_text(progress.get("line")).strip()
     if not line:
         return None
     key = (process.get("pid"), line)
@@ -4802,7 +4803,7 @@ def _gpu_progress_row(process, indent, width):
         if len(_PROGRESS_BODY_CACHE) >= 256:
             _PROGRESS_BODY_CACHE.clear()
         body = _PROGRESS_BODY_CACHE[key] = _progress_body_segments(line)
-    epoch = _progress_epoch_segments(progress.get("epoch"))
+    epoch = () if summary else _progress_epoch_segments(progress.get("epoch"))
     body = list(body)
     if epoch:
         body = list(epoch) + [(" · ", "dim")] + body

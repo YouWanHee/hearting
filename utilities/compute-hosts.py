@@ -900,6 +900,9 @@ def process_progress(pid, expected_start, epochs=None):
             or line is None):
         return None
     progress = {"line": line, "age_s": max(0, int(time.time() - opened.st_mtime))}
+    summary = progress_json_summary(raw)
+    if summary is not None:
+        progress["summary"] = summary
     if epoch is not None:
         progress["epoch"] = epoch
     return progress
@@ -912,6 +915,32 @@ def progress_last_line(raw):
         if line:
             return line
     return None
+
+
+def progress_json_summary(raw):
+    # Parse before the display truncation, using only the already-read tail.
+    # Unknown shapes keep their raw line; field names label counts, not guesses
+    # about epochs, percentages, or completion of the run.
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    line = next((value.strip() for value in reversed(lines) if value.strip()), "")
+    if not line.startswith("{"):
+        return None
+    try:
+        record = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    counters = []
+    for key in ("epoch", "step", "global_step", "iteration", "update", "successful"):
+        value = record.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**12:
+            counters.append("%s %d" % (key, value))
+    if not counters:
+        return None
+    labels = [command_text([record[key]], 48) for key in ("phase", "arm")
+              if isinstance(record.get(key), str) and record[key].strip()]
+    return command_text([" · ".join(labels + counters)], PROGRESS_CELLS_MAX)
 
 
 # Training epoch, found by shape in the same output file. A per-user, host-local
