@@ -81,6 +81,17 @@ Adapters must preserve the portable invariants relevant to this capability:
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
 - use DB memory paths, not runtime-native memory files.
 
+Lab owner start/resume prepares the existing execution access request with the
+initialized compute-hosts inventory's exact `run_root`, so normal resource work
+can write its run records. This default belongs to the lab owner, not frame
+sessions or ordinary code owners. External data roots still require an explicit
+`execution_access_v1` file through `AGENT_DISPATCH_EXECUTION_ACCESS_FILE` or the
+existing dispatch `--execution-access-file` option. The request is validated and
+delivered through the existing owner/child path; children cannot exceed the
+parent's effective access. Do not infer data paths from prose or widen user
+permissions. [Lab execution access](../docs/lab-execution-access.md) documents
+the request shape and current runtime limits.
+
 ## Mode-Specific Semantics
 
 | Mode | Required coverage |

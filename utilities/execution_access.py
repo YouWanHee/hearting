@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -365,11 +366,36 @@ def _atomic_write(path: Path, data: bytes) -> None:
         ) from exc
 
 
-def prepare_task_request(route: Mapping[str, object], jobs: str | Path) -> Path | None:
-    """Prepare the existing request format for a route's directly named roots."""
+def _lab_run_root(route: Mapping[str, object], node: str) -> Path | None:
+    """Read normal lab run storage from the existing inventory loader only."""
 
-    targets = resolve_task_targets(route)
-    if targets is None:
+    if node != "owner" or route.get("capability") != "autopilot-lab":
+        return None
+    path = Path(__file__).resolve().parent / "compute-hosts.py"
+    spec = importlib.util.spec_from_file_location("_execution_compute_hosts", path)
+    if spec is None or spec.loader is None:
+        raise ExecutionAccessError("execution-access-compute-inventory-invalid", "inventory loader unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.load_config()["run_root"]
+    except module.ConfigError as exc:
+        if exc.status in {"missing", "template"}:
+            return None
+        raise ExecutionAccessError("execution-access-compute-inventory-invalid", str(exc)) from exc
+
+
+def prepare_task_request(
+    route: Mapping[str, object], jobs: str | Path, *, node: str = "owner"
+) -> Path | None:
+    """Prepare named targets and lab run storage with the existing request schema."""
+
+    # The explicit typed request keeps precedence over preview-table input.
+    explicit = request_path(None)
+    lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
+    targets = None if lab_owner and explicit is not None else resolve_task_targets(route)
+    run_root = _lab_run_root(route, node)
+    if targets is None and run_root is None:
         return None
     route_id = route.get("route_id")
     route_hash = route.get("route_hash")
@@ -380,35 +406,49 @@ def prepare_task_request(route: Mapping[str, object], jobs: str | Path) -> Path 
     state_root = Path(jobs).expanduser().resolve(strict=False).parent
     directory = state_root / "execution-access" / "routes" / route_id
     request_path_value = directory / "request.json"
-    roots = [str(path) for path in targets.writable_roots]
+    context = AccessContext.build(
+        worktree=str(route.get("cwd") or ""),
+        artifact_root=str(route.get("artifact_root") or ""),
+        dispatch_state_root=state_root,
+        agent_home=Path(__file__).resolve().parents[1],
+    )
+    supplied = load_request(explicit, context=context) if run_root is not None and explicit is not None else None
+    writable = list(targets.writable_roots if targets else ())
+    if run_root is not None:
+        writable.append(run_root)
+    if supplied is not None:
+        writable.extend(supplied.writable_roots)
+    roots = [str(path) for path in _unique_paths(writable)]
+    justification = {root: "Directly named approved task target" for root in roots}
+    if run_root is not None:
+        justification[str(run_root)] = "Compute-hosts inventory run_root for lab resource work"
+    if supplied is not None:
+        justification.update(dict(supplied.justification))
     request = {
         "schema_version": SCHEMA_VERSION,
         "writable_roots": roots,
-        "read_roots": [],
-        "network": {"required": False, "reason": "", "hosts": []},
-        "enforcement_required": "any",
-        "justification": {root: "Directly named approved task target" for root in roots},
+        "read_roots": [str(path) for path in supplied.read_roots] if supplied else [],
+        "network": {
+            "required": supplied.network_required if supplied else False,
+            "reason": supplied.network_reason if supplied else "",
+            "hosts": list(supplied.network_hosts) if supplied else [],
+        },
+        "enforcement_required": supplied.enforcement_required if supplied else "any",
+        "justification": justification,
     }
+    # Use the same validator as load_request before publishing a prepared file.
+    # Inventory defaults never bypass broad-root, symlink or request limits.
+    validated = _validate_request(request, source=request_path_value, context=context)
     request_bytes = _canonical_json_bytes(request)
-    normalized_request = {
-        "schema_version": SCHEMA_VERSION,
-        "writable_roots": roots,
-        "read_roots": [],
-        "network": {"required": False, "reason": "", "hosts": []},
-        "enforcement_required": "any",
-        "justification": dict(sorted(request["justification"].items())),
-    }
-    request_digest = hashlib.sha256(
-        json.dumps(normalized_request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    request_digest = validated.request_sha256
     binding = {
         "schema_version": 1,
         "route_id": route_id,
         "route_hash": route_hash,
         "artifact_root": str(Path(str(route.get("artifact_root") or "")).resolve(strict=False)),
-        "manifest_path": str(targets.manifest_path),
-        "manifest_sha256": targets.manifest_sha256,
-        "selected_names": list(targets.selected_names),
+        "manifest_path": str(targets.manifest_path) if targets else None,
+        "manifest_sha256": targets.manifest_sha256 if targets else None,
+        "selected_names": list(targets.selected_names) if targets else [],
         "writable_roots": roots,
         "request_sha256": request_digest,
     }
@@ -423,7 +463,7 @@ def prepare_task_request(route: Mapping[str, object], jobs: str | Path) -> Path 
         if existing_request != request_bytes or existing_binding != binding_bytes:
             raise ExecutionAccessError(
                 "execution-access-cache-conflict",
-                "the route binding or ROOTS input changed after request preparation",
+                "the route binding or execution access input changed after request preparation",
             )
         return request_path_value
     _atomic_write(request_path_value, request_bytes)
@@ -730,6 +770,14 @@ def load_request(path: str | Path, *, context: AccessContext) -> ExecutionAccess
 
     source = Path(path)
     data = _read_request(source)
+    return _validate_request(data, source=source, context=context)
+
+
+def _validate_request(
+    data: object, *, source: Path, context: AccessContext
+) -> ExecutionAccessRequest:
+    """Shared validation for explicit files and normally prepared lab requests."""
+
     if not isinstance(data, dict):
         _field_error("request", "top-level JSON must be an object")
 

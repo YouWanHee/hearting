@@ -178,6 +178,55 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("reason=execution-access-target-input-invalid", result["launches"][0]["receipt"])
         self.assertIn("child_spawned=0", result["launches"][0]["receipt"])
 
+    def test_lab_owner_start_and_resume_pass_inventory_and_explicit_data_to_dispatch(self):
+        root = Path(self.tmp.name)
+        inventory = root / "compute-hosts.yaml"
+        run_root = root / "custom-runs"
+        data_root = root / "approved-data"
+        inventory.write_text(
+            f"schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: local\n")
+        explicit = root / "data-access.json"
+        explicit.write_text(json.dumps({
+            "schema_version": 1, "writable_roots": [str(data_root)], "read_roots": [],
+            "network": {"required": False, "reason": "", "hosts": []},
+            "enforcement_required": "os-sandbox", "justification": {str(data_root): "approved output"},
+        }))
+        original = explicit.read_bytes()
+        route = {**self.route, "route_id": "rt-lab-data", "route_hash": "sha256:" + "c" * 64,
+                 "capability": "autopilot-lab", "cwd": str(root / "worktree"),
+                 "artifact_root": str(root / "artifacts")}
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "started=1\n", "")
+
+        with mock.patch.dict(os.environ, {
+            "HOME": str(root / "home"), "COMPUTE_HOSTS_CONFIG": str(inventory),
+            "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(explicit),
+        }, clear=True):
+            W._start(route, self.path, self.jobs, "owner", "codex", run)
+            W._start(route, self.path, self.jobs, "owner", "codex", run)
+        paths = [Path(command[command.index("--execution-access-file") + 1]) for command in calls]
+        self.assertEqual(paths[0], paths[1])
+        request = json.loads(paths[0].read_text())
+        self.assertEqual({str(data_root), str(run_root)}, set(request["writable_roots"]))
+        self.assertEqual("os-sandbox", request["enforcement_required"])
+        self.assertEqual(original, explicit.read_bytes())
+        self.assertFalse(data_root.exists())
+        self.assertFalse(run_root.exists())
+
+        explicit.write_text("{")
+        calls.clear()
+        with mock.patch.dict(os.environ, {
+            "HOME": str(root / "home"), "COMPUTE_HOSTS_CONFIG": str(inventory),
+            "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(explicit),
+        }, clear=True):
+            result = W._start(route, self.path, self.jobs, "owner", "codex", run)
+        self.assertEqual([], calls)
+        self.assertEqual(69, result["exit_code"])
+        self.assertIn("execution-access-invalid-json", result["execution_access_diagnostic"])
+
     def observe(self, **kw):
         return {"state": "ready" if self.ready else "timeout", "children": []}
 

@@ -20,6 +20,7 @@ from execution_access import (
     bind_request,
     build_grant,
     load_request,
+    prepare_task_request,
     receipt_fragment,
 )
 
@@ -194,6 +195,30 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         )
         self.assertIn(f"--writable-root {self.scoped}", command)
         self.assertNotIn("--add-dir", command)
+
+    def test_lab_inventory_and_explicit_data_reach_both_codex_execution_builders(self) -> None:
+        run_root = self.root / "inventory-runs"
+        inventory = self.root / "compute-hosts.yaml"
+        inventory.write_text(
+            f"schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: local\n")
+        route = {"route_id": "rt-lab-builders", "route_hash": "sha256:" + "d" * 64,
+                 "capability": "autopilot-lab", "cwd": str(self.worktree),
+                 "artifact_root": str(self.artifact), "work_request": {"text": "Run lab"}}
+        with mock.patch.dict(os.environ, {
+            **self.env, "COMPUTE_HOSTS_CONFIG": str(inventory),
+            "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(self.request_file),
+        }, clear=True):
+            prepared = prepare_task_request(route, self.state / "jobs.log")
+        for delivery, runtime, flag in (("one-shot", "codex-exec", "--add-dir"),
+                                        ("app-server-supervised", "codex-app-server", "--writable-root")):
+            grant = self.codex.bind_execution_access_request(
+                str(prepared), environ=self.env, context=self.context,
+                is_child=False, parent=None, runtime=runtime)
+            command = self.codex.shell_command(self.codex_args(delivery, grant),
+                                               self.root / "prompt.txt", self.root / "log.jsonl")
+            self.assertIn(f"{flag} {run_root}", command)
+            self.assertIn(f"{flag} {self.scoped}", command)
+        self.assertFalse(run_root.exists())
 
     def test_all_adapter_execution_surfaces_consume_the_same_request(self) -> None:
         expected = str(self.request_file.resolve())

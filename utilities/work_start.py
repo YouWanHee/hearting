@@ -402,12 +402,13 @@ def _start(route, path, jobs, node, harness, run):
     if harness:
         command += ["--adapter", harness]
     access_diagnostic = ""
-    # Existing explicit requests keep precedence. For a task that directly
-    # names its ROOTS data, prepare the same request format used by the
-    # wrapper; start and resume both pass through this function.
-    if not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
+    # Explicit requests keep precedence; lab owners combine that validated
+    # input with their inventory run storage through the same request format.
+    # Frame/code defaults are unchanged, and start/resume share this path.
+    lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
+    if lab_owner or not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
         try:
-            prepared = prepare_task_request(route, jobs)
+            prepared = prepare_task_request(route, jobs, node=node)
         except ExecutionAccessError as exc:
             access_diagnostic = f"{exc.reason}: {exc.detail}"
             # An explicit target input was recognized but could not be safely
