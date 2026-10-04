@@ -401,13 +401,22 @@ class RegistryRegistrationTest(unittest.TestCase):
             self.assertEqual(_frozen_digest(after[key]), digest, key)
         # No global table was added either: the only other keys are the two per-name tables.
         self.assertEqual(set(after) - set(FROZEN_GLOBAL_TABLE_DIGESTS), {"recipes", "completion_gate_contracts"})
-        self.assertEqual(_frozen_digest(after["recipes"][:FROZEN_RECIPE_COUNT]), FROZEN_RECIPES_DIGEST)
+        recipes = copy.deepcopy(after["recipes"][:FROZEN_RECIPE_COUNT])
+        for recipe in recipes:
+            if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
+                self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
+                recipe["promotion_signals"].remove("gpu")
+        self.assertEqual(_frozen_digest(recipes), FROZEN_RECIPES_DIGEST)
         # The route-frame rows are the only additions to the gate contract table.
         rest = {k: v for k, v in after["completion_gate_contracts"].items() if k not in ("route-frame", "route-decision")}
         self.assertEqual(_frozen_digest(rest), FROZEN_GATE_CONTRACT_DIGEST)
 
     def test_other_capabilities_keep_their_registry_digest(self):
-        registry = self.registry()
+        registry = copy.deepcopy(self.registry())
+        for recipe in registry["recipes"]:
+            if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
+                self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
+                recipe["promotion_signals"].remove("gpu")
         self.assertEqual(
             sorted({r["capability"] for r in registry["recipes"]} - {"route-frame"}),
             sorted(FROZEN_CAPABILITY_REGISTRY_DIGESTS),

@@ -1084,14 +1084,14 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
     """Consume the validated route's selection before grants or registration."""
     args.gpu_execution_selection = None
     args.gpu_execution_scope = False
+    owner = args.dispatch_depth == 1 and args.worker_type == "owner"
+    if not owner and args.dispatch_depth != 2:
+        return
     route_file = getattr(args, "route_file", None) or getattr(
         getattr(args, "owner_route_binding", None), "route_file", None)
     if not route_file:
         return
     route = json.loads(Path(route_file).read_text(encoding="utf-8"))
-    owner = args.dispatch_depth == 1 and args.worker_type == "owner"
-    if not owner and args.dispatch_depth != 2:
-        return
     cli_explicit = any(arg == "--sandbox" or arg.startswith("--sandbox=")
                        for arg in getattr(args, "replacement_input_argv", []))
     selection = GPU_SANDBOX.select(

@@ -3561,6 +3561,24 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
     gpu_route = {"capability": capability, "nodes": selected_recipe["standard_plus"]["nodes"],
                  "selection": {"promotion_signals": [{"signal": s} for s in signals]}}
+    if (shape == "staged" and not owner_only and dispatch_evidence is not None
+            and GPU_SANDBOX.gpu_resource_nodes(gpu_route)):
+        dispatch_evidence = _validate_dispatch_evidence(
+            dispatch_evidence, DISPATCH_CONTRACT_VERSION,
+            expected_worktree=cwd, require_scope=True)
+        choice = GPU_SANDBOX.select(gpu_route)
+        codex_rows = [row for row in dispatch_evidence.get("tuples", [])
+                      if row.get("parent_harness") == "codex"]
+        if any(row.get("parent_sandbox") != choice["sandbox"] for row in codex_rows):
+            _fallback_chain(dispatch_evidence, expected_worktree=cwd, require_scope=True)
+            # A planning frame checked its own normal owner. The selected GPU
+            # leg needs a real prospective check of its chosen Codex owner,
+            # before its tuple is sealed; never relabel the frame's evidence.
+            readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), "codex",
+                sorted({row["child_harness"] for row in codex_rows}), gpu_route=gpu_route)
+            dispatch_evidence = {**dispatch_evidence, "tuples": [
+                row for row in dispatch_evidence["tuples"] if row.get("parent_harness") != "codex"
+            ] + readiness["tuples"]}
     if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
                                        children or _compose_default_children(selection_pins),
@@ -3668,10 +3686,6 @@ def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
 
 def _leg_evidence(leg, readiness):
     if leg["shape"] == "direct":
-        return {}
-    if leg.get("capability") == "autopilot-lab":
-        # A lab leg's resource classes differ from its planning frame. Compose
-        # probes the selected recipe with the same sandbox selection it seals.
         return {}
     probe = readiness()
     return {"dispatch_evidence": {"tuples": probe["tuples"], "native_subagent": []},

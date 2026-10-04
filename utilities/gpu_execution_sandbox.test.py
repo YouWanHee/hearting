@@ -129,11 +129,11 @@ class GpuSandboxTest(unittest.TestCase):
             C.apply_gpu_execution_sandbox(readonly_child)
             self.assertEqual(C.effective_runtime_sandbox(readonly_child), "read-only")
 
-    def evidence(self, choice):
+    def evidence(self, choice, owners=("codex",)):
         with mock.patch.object(P.NESTED, "command_check", return_value=("supported", "fixture", "")), \
              mock.patch.object(P.NESTED, "prospective_owner_registry_check", return_value=(True, "")):
             return P.generate(worktree=self.worktree, jobs=self.state / "jobs.log",
-                owner_harnesses=["codex"], child_harnesses=["codex"], codex_execution_selection=choice)
+                owner_harnesses=list(owners), child_harnesses=["codex"], codex_execution_selection=choice)
 
     def test_gpu_readiness_sealed_parent_and_actual_exec_app_server_agree(self):
         # BC's actual shape: scaffold remains normal; full-run declares GPU need.
@@ -196,6 +196,78 @@ class GpuSandboxTest(unittest.TestCase):
         args = self.args()
         C.apply_gpu_execution_sandbox(args)
         self.assertEqual(args.sandbox, "danger-full-access")
+
+    def compose_with_evidence(self, evidence, **changes):
+        values = dict(capability="autopilot-lab", capability_mode="setup", shape="staged",
+            graph=None, slug="gpu-frame-fixture", cwd=str(self.worktree),
+            artifact_root=str(self.artifact), signals=["gpu"], spec_read="fixture",
+            unassigned=True, parent_harness="codex", children=["codex"],
+            jobs=self.state / "jobs.log", dispatch_evidence=evidence)
+        values.update(changes)
+        return R.compose_route(**values)
+
+    def test_gpu_leg_checks_new_codex_choice_without_relabeling_frame_evidence(self):
+        previous = self.evidence({**G.select(self.route), "sandbox": "workspace-write"},
+                                 owners=("codex", "claude"))
+        original = copy.deepcopy(previous)
+        observed = []
+        def readiness(cwd, jobs, parent, children, *, gpu_route=None):
+            self.assertEqual((parent, children), ("codex", ["codex"]))
+            choice = G.select(gpu_route)
+            observed.append(choice)
+            return self.evidence(choice)
+        with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT)}), \
+             mock.patch.object(R, "_compose_readiness", side_effect=readiness):
+            route = self.compose_with_evidence(previous)
+            R.verify_route(route, self.worktree)
+        self.assertEqual(previous, original)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(route["codex_execution_sandbox"], observed[0])
+        rows = route["dispatch_evidence"]["tuples"]
+        self.assertEqual(next(r for r in rows if r["parent_harness"] == "codex")["parent_sandbox"],
+                         "danger-full-access")
+        self.assertEqual(next(r for r in rows if r["parent_harness"] == "claude"),
+                         next(r for r in R._validate_dispatch_evidence(original)["tuples"]
+                              if r["parent_harness"] == "claude"))
+
+    def test_normal_and_other_parent_frame_evidence_is_reused(self):
+        for owners, changes in ((("claude",), {}), (("codex",), {
+                "capability": "autopilot-code", "capability_mode": "dev",
+                "graph": "execute,test,report", "signals": []})):
+            with self.subTest(owners=owners, changes=changes):
+                evidence = self.evidence({**G.select(self.route), "sandbox": "workspace-write"}, owners=owners)
+                original = copy.deepcopy(evidence)
+                probe = {**evidence, "candidates": []}
+                supplied = R._leg_evidence({"shape": "staged", "capability": changes.get("capability", "autopilot-lab")},
+                                           lambda: probe)
+                self.assertEqual(supplied["dispatch_evidence"]["tuples"], original["tuples"])
+                with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT)}), \
+                     mock.patch.object(R, "_compose_readiness") as readiness:
+                    route = self.compose_with_evidence(supplied["dispatch_evidence"], **changes)
+                    R.verify_route(route, self.worktree)
+                readiness.assert_not_called()
+                self.assertEqual(route["dispatch_evidence"]["tuples"],
+                                 R._validate_dispatch_evidence(original)["tuples"])
+                self.assertEqual(evidence, original)
+
+    def test_gpu_choice_does_not_replace_foreign_or_failed_scope_evidence(self):
+        for reason in ("foreign", "exact-worktree"):
+            evidence = self.evidence({**G.select(self.route), "sandbox": "workspace-write"})
+            row = evidence["tuples"][0]
+            if reason == "foreign":
+                row["checked_worktree"] = str(self.data)
+                expected = "dispatch-evidence-worktree-mismatch"
+            else:
+                row.update(status="unsupported", failure_scope="exact-worktree",
+                           retry_on_isolated_worktree=1, codex_command="ok")
+                expected = "dispatch-evidence-exact-worktree-reprobe-required"
+            original = copy.deepcopy(evidence)
+            with self.subTest(reason=reason), mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT)}), \
+                 mock.patch.object(R, "_compose_readiness") as readiness:
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.compose_with_evidence(evidence)
+                readiness.assert_not_called()
+                self.assertEqual(evidence, original)
 
     def test_scoped_any_grant_is_logical_and_canonical_record_is_honest(self):
         request = self.request(network={"required": True, "reason": "approved transfer", "hosts": ["fixture.invalid:22"]})

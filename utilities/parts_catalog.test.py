@@ -34,6 +34,11 @@ R, P, TOPO = T.R, T.P, T.R.TOPO
 import dispatch_stage_advance as ADVANCE  # noqa: E402
 
 GOLDEN = HERE / "fixtures" / "sd165-route-golden.json"
+GPU_EVAL_ADVISORY = (
+    "  Codex GPU lab: danger-full-access (gpu-lab-resource); 대상 owner 및 GPU resource eval-run. "
+    "filesystem/network OS enforcement 없음; 요청 root와 child≤parent는 논리 경계입니다. "
+    "외부 sandbox·관리된 runtime 제약은 유지되며 GPU 조회 성공을 보증하지 않습니다."
+)
 GOLDEN_KEYS = (
     "parallel_groups", "completion_gates", "human_gates", "human_gate_bindings",
     "workflow_contract", "conditional_extensions", "resume_retry_boundaries", "composed_recipe",
@@ -132,6 +137,14 @@ def golden_payload(case):
     scenarios = {}
 
     def _digest(value):
+        # The historical catalog snapshot predates the existing GPU signal's
+        # admission for setup. Compare the catalog's graph bytes while the GPU
+        # policy suite checks that new selection and its warning separately.
+        if isinstance(value, dict) and value.get("capability") == "autopilot-lab" and "setup" in value.get("modes", []):
+            signals = list(value["promotion_signals"])
+            case.assertEqual(signals.count("gpu"), 1)
+            signals.remove("gpu")
+            value = {**value, "promotion_signals": signals}
         text = _normalize(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False), case)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
 
@@ -142,10 +155,16 @@ def golden_payload(case):
             scenarios[name] = {"error": f"{type(exc).__name__}: {exc}"}
             return
         R.verify_route(route, R.ROOT)
+        card = R.compose_card(route).splitlines()
+        typed_gpu_nodes = [n["id"] for n in route["nodes"] if n.get("resource_class") == "gpu"]
+        if route["capability"] == "autopilot-lab" and typed_gpu_nodes:
+            case.assertEqual(typed_gpu_nodes, ["eval-run"])
+            case.assertEqual(card.count(GPU_EVAL_ADVISORY), 1)
+            card.remove(GPU_EVAL_ADVISORY)
         entry = {"node_ids": [n["id"] for n in route["nodes"]],
                  "nodes": {n["id"]: _digest(n) for n in route["nodes"]},
                  "input_sources": {n["id"]: n["input_sources"] for n in route["nodes"] if "input_sources" in n},
-                 "card": R.compose_card(route),
+                 "card": "\n".join(card),
                  # The brief names the prior cycle's dated folder; pin its normalized text, not the raw digest.
                  "briefs": {n["id"]: _digest(ADVANCE.render_stage_brief(route, n)[0]) for n in route["nodes"]
                             if n.get("kind") != "runtime-terminal"}}
@@ -174,6 +193,11 @@ def golden_payload(case):
     # The compiler-internal framed route: its own scenario, never part of the user-preset enumeration.
     record("framed:route-frame", lambda: case.compose_framed())
     registry = TOPO.load_registry()
+    registry = json.loads(json.dumps(registry))
+    for recipe in registry["recipes"]:
+        if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
+            case.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
+            recipe["promotion_signals"].remove("gpu")
     digests = {capability: TOPO.capability_registry_digest(registry, capability)
                for capability in sorted({r["capability"] for r in registry["recipes"]})}
     return _normalize(json.dumps({"scenarios": scenarios, "capability_registry_digest": digests},
