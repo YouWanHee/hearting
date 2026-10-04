@@ -4672,7 +4672,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     if allocation is not None:
         required = {"strategy", "window", "harness_order"}
         optional = {"usage_gate_used_percent", "depth_affinity", "depth_affinity_weight", "usage_headroom_exponent",
-                    "harness_weights"}
+                    "harness_weights", "owner_order"}
         if not isinstance(allocation, dict) or not required <= set(allocation) or set(allocation) - required - optional:
             raise ValueError("invalid dispatch_allocation shape")
         if allocation.get("strategy") not in {
@@ -4696,6 +4696,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             raise ValueError("invalid dispatch_allocation depth affinity")
         if any(value not in DEFAULTS.DISPATCHABLE_HARNESSES for value in affinity.values()):
             raise ValueError("invalid dispatch_allocation depth affinity value")
+        if "owner_order" in allocation and not DEFAULTS.valid_owner_order(allocation["owner_order"]):
+            raise ValueError("invalid dispatch_allocation owner order")
         weight = allocation.get("depth_affinity_weight", 0.5)
         if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0.0 <= weight <= 1.0:
             raise ValueError("invalid dispatch_allocation affinity weight")

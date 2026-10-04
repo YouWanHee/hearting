@@ -97,6 +97,34 @@ class ModelSettingsCliTest(unittest.TestCase):
                 self.assertEqual(consumed[model_field], "arbitrary-vendor/model-r7")
                 self.assertEqual(consumed[budget_field], original[f"CFG_TIER_{tier_key}_{suffix}"])
 
+    def test_declared_opencode_deep_tier_matches_roles_profiles_and_role_edits(self):
+        import json
+        path = self.user_path("opencode")
+        path.parent.mkdir(parents=True)
+        shipped = model_config.parse_config(model_config.shipped_path("opencode"))
+        raw = settings._edit_bytes(model_config.shipped_path("opencode").read_bytes(), {
+            "CFG_TIER_DEEP_MODEL": "arbitrary-provider/deep-r1",
+            "CFG_TIER_DEEP_VARIANT": "xhigh",
+            "CFG_MODEL_PROFILE_DEEP": "deep:xhigh",
+            "CFG_MODEL_PROFILE_GRANULARITY_DEEP": "full",
+        })
+        path.write_bytes(raw)
+        for role in ("deep maker", "deep reviewer", "deep orchestrator"):
+            result = subprocess.run([str(ROOT / "adapters/opencode/bin/role-map.sh"), role],
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("model=arbitrary-provider/deep-r1", result.stdout)
+            self.assertIn("variant=xhigh", result.stdout)
+        code, out = self.run_cli("opencode", "role/deep maker", "arbitrary-provider/deep-r2", "--json")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["target"]["tier"], "DEEP")
+        values = model_config.parse_config(path)
+        profile = model_profile.resolve_profile_values("opencode", values, "deep")
+        self.assertEqual((profile["model"], profile["budget"], profile["granularity"]),
+                         ("arbitrary-provider/deep-r2", "xhigh", "full"))
+        self.assertEqual(values["CFG_TIER_BALANCED_DEEP_MODEL"], shipped["CFG_TIER_BALANCED_DEEP_MODEL"])
+        self.assertEqual(path.with_name("models.conf.bak").read_bytes(), raw)
+
     def test_profile_edit_is_independent_and_omitted_budget_is_preserved(self):
         adapter, home = "codex", self.root / "codex"
         path = self.user_path(adapter, home)

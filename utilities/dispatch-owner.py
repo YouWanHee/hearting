@@ -684,6 +684,8 @@ def _audit(
         affinity = allocation.get("depth_affinity") or {}
         lines.append("depth_affinity=" + (",".join(f"{key}:{affinity[key]}" for key in sorted(affinity)) or "none"))
         lines.append(f"depth_affinity_weight={allocation.get('depth_affinity_weight', 0.5)}")
+        if "owner_order" in allocation:
+            lines.append("owner_order=" + ",".join(allocation["owner_order"]))
         lines.append(f"usage_headroom_exponent={allocation.get('usage_headroom_exponent', 1)}")
     for harness in _allocation.HARNESSES:
         if counts is not None:
@@ -909,6 +911,8 @@ def main(argv):
                 affinity_weight=allocation.get("depth_affinity_weight", 0.5),
                 headroom_exponent=allocation.get("usage_headroom_exponent", 1),
                 harness_weights=allocation.get("harness_weights"),
+                preference_order=(allocation.get("owner_order")
+                                  if values["--worker-type"] == "owner" else None),
             )
             if selected:
                 source = "configured-" + allocation["strategy"]

@@ -362,7 +362,7 @@ def validate(config, capmap):
         else:
             unknown_allocation = sorted(set(allocation) - {
                 "strategy", "window", "usage_gate_used_percent", "depth_affinity",
-                "depth_affinity_weight", "usage_headroom_exponent", "harness_weights",
+                "depth_affinity_weight", "usage_headroom_exponent", "harness_weights", "owner_order",
             })
             for key in unknown_allocation:
                 errors.append(f"unknown allocation key: {key!r}")
@@ -382,6 +382,10 @@ def validate(config, capmap):
                 errors.append("allocation.depth_affinity keys must be a subset of owner and worker")
             elif any(value not in DISPATCHABLE_HARNESSES for value in depth_affinity.values()):
                 errors.append("allocation.depth_affinity values must name known harnesses")
+            if "owner_order" in allocation and not valid_owner_order(allocation["owner_order"]):
+                errors.append("allocation.owner_order must be a list of distinct known harnesses")
+            if version == 2 and "owner_order" in allocation:
+                errors.append("allocation.owner_order requires schema_version 3 or 4")
             weight = allocation.get("depth_affinity_weight", 0.5)
             if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0.0 <= weight <= 1.0:
                 errors.append("allocation.depth_affinity_weight must be a number from 0.0 to 1.0")
@@ -594,6 +598,9 @@ def policy_warnings(config):
                         )
     allocation = config.get("allocation")
     if isinstance(allocation, dict):
+        for name in allocation.get("owner_order", []):
+            if name not in enabled:
+                warnings.append(f"allocation.owner_order names disabled harness {name!r}: ignored")
         depth_affinity = allocation.get("depth_affinity")
         if isinstance(depth_affinity, dict):
             for key, value in depth_affinity.items():
@@ -651,6 +658,8 @@ def normalize_policy(config):
                     del stagemap[stage_name]
     allocation = result.get("allocation")
     if isinstance(allocation, dict):
+        if "owner_order" in allocation:
+            allocation["owner_order"] = [h for h in allocation["owner_order"] if h in enabled]
         depth_affinity = allocation.get("depth_affinity")
         if isinstance(depth_affinity, dict):
             for key in [k for k, v in depth_affinity.items() if v not in enabled]:
@@ -757,6 +766,12 @@ def query_profile_policy(config, profile):
     return result
 
 
+def valid_owner_order(value):
+    return (isinstance(value, list)
+            and all(isinstance(h, str) and h in DISPATCHABLE_HARNESSES for h in value)
+            and len(set(value)) == len(value))
+
+
 def query_allocation(config):
     neutral = {"depth_affinity": {}, "depth_affinity_weight": 0.5, "usage_headroom_exponent": 1}
     allocation = config.get("allocation")
@@ -772,6 +787,8 @@ def query_allocation(config):
         # the same allocation bytes as before this key existed.
         if isinstance(allocation.get("harness_weights"), dict):
             result["harness_weights"] = dict(allocation["harness_weights"])
+        if "owner_order" in allocation:
+            result["owner_order"] = list(allocation["owner_order"])
         return result
     result = {
         "strategy": "config-order",
@@ -962,6 +979,8 @@ def main(argv):
         print(f"depth_affinity_weight={allocation['depth_affinity_weight']}")
         print(f"usage_headroom_exponent={allocation['usage_headroom_exponent']}")
         print("harness_order=" + ",".join(allocation["harness_order"]))
+        if "owner_order" in allocation:
+            print("owner_order=" + ",".join(allocation["owner_order"]))
         if allocation.get("harness_weights"):
             weights = allocation["harness_weights"]
             print("harness_weights=" + ",".join(f"{key}:{weights[key]}" for key in sorted(weights)))

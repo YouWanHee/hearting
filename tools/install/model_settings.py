@@ -77,7 +77,8 @@ def _resolve_target(adapter: str, raw: str, values: dict[str, str], *,
         if mapped.returncode not in (0, 64):
             raise ModelSettingsError(f"cannot resolve OpenCode role: {mapped.stderr.strip()}")
         routing = dict(line.split("=", 1) for line in mapped.stdout.splitlines() if "=" in line)
-        family_tier = {"fast": "MINI", "balanced": "LIGHT", "deep": "BALANCED_DEEP"}
+        family_tier = {"fast": "MINI", "balanced": "LIGHT",
+                       "deep": "DEEP" if "DEEP" in tiers else "BALANCED_DEEP"}
         routed_tier = family_tier.get(routing.get("family")) if mapped.returncode == 0 else None
         # The external family has no editable config tier. Environment overrides
         # remain native inputs of role-map.sh and are never written here.

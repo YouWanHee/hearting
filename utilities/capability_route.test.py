@@ -1336,7 +1336,8 @@ class TestRoute(unittest.TestCase):
    route=self._standard()
   allocation=route["dispatch_allocation"]
   allocation.update({"depth_affinity":{"owner":"claude","worker":"codex"},
-                     "depth_affinity_weight":.65,"usage_headroom_exponent":2})
+                     "depth_affinity_weight":.65,"usage_headroom_exponent":2,
+                     "owner_order":["claude","opencode","codex"]})
   route["route_hash"]=R.route_hash(route); route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
   R.verify_route(route,R.ROOT)
   for keys in (("strategy","window","harness_order"),
@@ -1348,6 +1349,8 @@ class TestRoute(unittest.TestCase):
  def test_verify_rejects_invalid_new_allocation_fields(self):
   with dispatch_defaults_config(DD_CONFIG_A): route=self._standard()
   for key,value in (("depth_affinity_weight",True),("depth_affinity_weight",1.2),
+                    ("owner_order",["claude","claude"]),
+                    ("owner_order",["unknown"]),("owner_order","claude"),
                     ("depth_affinity",{"stage":"codex"}),
                     ("depth_affinity",{"owner":"not-a-harness"}),
                     ("usage_headroom_exponent",0)):

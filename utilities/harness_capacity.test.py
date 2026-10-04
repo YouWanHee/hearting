@@ -38,6 +38,41 @@ def tearDownModule():
     _STATE_TMP.cleanup()
 
 
+class OwnerPreferenceTests(unittest.TestCase):
+    def choose(self, *, states=None, scores=None, policy=None, ordered=True):
+        names = ["claude", "opencode", "codex"]
+        return C.select(
+            policy or {"primary": names, "relief": [], "last_resort": [],
+                       "promote_relief_below": 0},
+            states or {h: "ok" for h in names},
+            {"claude": 20, "opencode": 9, "codex": 0}, names,
+            scores or {h: 80 for h in names}, strategy="balanced",
+            harness_weights={"claude": .5, "opencode": .3},
+            preference_order=names if ordered else None)[0]
+
+    def test_owner_order_and_hard_limit_fallback_ignore_worker_share_deficit(self):
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_BIAS": ""}):
+            self.assertEqual(self.choose(), "claude")
+            self.assertEqual(self.choose(states={"claude": "limited", "opencode": "ok", "codex": "ok"}), "opencode")
+            self.assertEqual(self.choose(states={"claude": "limited", "opencode": "limited", "codex": "ok"}), "codex")
+            self.assertEqual(self.choose(ordered=False), "codex")
+
+    def test_usage_gate_all_gated_recovery_and_unknown_keep_existing_meaning(self):
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_BIAS": ""}):
+            self.assertEqual(self.choose(scores={"claude": 5, "opencode": 80, "codex": 90}), "opencode")
+            self.assertEqual(self.choose(scores={"claude": 5, "opencode": 6, "codex": 9}), "codex")
+            self.assertEqual(self.choose(states={"claude": "limited", "opencode": "unknown", "codex": "ok"},
+                                         scores={"claude": 0, "opencode": None, "codex": 90}), "opencode")
+
+    def test_quality_band_and_explicit_bias_keep_precedence(self):
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_BIAS": ""}):
+            self.assertEqual(self.choose(states={"claude": "limited", "opencode": "ok", "codex": "ok"},
+                policy={"primary": ["claude", "codex"], "relief": [],
+                        "last_resort": ["opencode"], "promote_relief_below": 0}), "codex")
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_BIAS": "codex"}):
+            self.assertEqual(self.choose(), "codex")
+
+
 class SharedCacheFallbackTests(unittest.TestCase):
     """2026-09-16: a codex backend 503 at compose time made the gauge `unknown`
     although Fleet had a true reading minutes earlier. The live probe now

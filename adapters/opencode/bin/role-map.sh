@@ -84,8 +84,8 @@ case "$family" in
     { [ -n "${AGENT_MODEL_BALANCED:-}" ] || [ -n "${AGENT_MODEL_ORCHESTRATOR:-}" ]; } && status=configured || status=default
     ;;
   deep)
-    model=${AGENT_MODEL_DEEP:-$CFG_TIER_BALANCED_DEEP_MODEL}
-    variant=${AGENT_VARIANT_DEEP:-$CFG_TIER_BALANCED_DEEP_VARIANT}
+    model=${AGENT_MODEL_DEEP:-${CFG_TIER_DEEP_MODEL:-$CFG_TIER_BALANCED_DEEP_MODEL}}
+    variant=${AGENT_VARIANT_DEEP:-${CFG_TIER_DEEP_VARIANT:-$CFG_TIER_BALANCED_DEEP_VARIANT}}
     [ -n "${AGENT_MODEL_DEEP:-}" ] && status=configured || status=default
     ;;
   external)

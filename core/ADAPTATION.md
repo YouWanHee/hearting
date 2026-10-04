@@ -154,6 +154,8 @@ Adapter and projection edits are derived core-first: change the portable invaria
 the adapter realization and generated projection. A runtime marker proves the read
 gate only; it does not replace this source-order review.
 
+On OpenCode, non-route deep roles use a deep tier when the selected whole-file model configuration declares one, and otherwise retain the existing balanced-deep fallback. Explicit role edits target that same resolved tier. Registered jobs continue to resolve their sealed model profile independently of role families.
+
 ## 4. Capability Model
 
 A portable capability describes:
