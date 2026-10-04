@@ -76,6 +76,112 @@ class ExecutionAccessTest(unittest.TestCase):
             self.request(**changes)
         self.assertEqual(expected, raised.exception.reason)
 
+    def lab_route(self, **changes: object):
+        route = {
+            "route_id": "rt-lab-access",
+            "route_hash": "sha256:" + "a" * 64,
+            "capability": "autopilot-lab",
+            "cwd": str(self.worktree),
+            "artifact_root": str(self.artifact),
+            "work_request": {"text": "Use /data/unapproved-text for the experiment"},
+        }
+        route.update(changes)
+        return route
+
+    def inventory(self, run_root: Path) -> Path:
+        path = self.root / "compute-hosts.yaml"
+        path.write_text(
+            f"schema_version: 1\nrun_root: {run_root}\nhosts:\n"
+            "  fixture:\n    ssh_host: local\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_lab_owner_uses_exact_inventory_root_without_creating_run_storage(self) -> None:
+        run_root = self.root / "custom-inventory" / "runs"
+        inventory = self.inventory(run_root)
+        with mock.patch.dict(os.environ, {**self.env, "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            prepared = prepare_task_request(self.lab_route(), self.state / "jobs.log")
+            again = prepare_task_request(self.lab_route(), self.state / "jobs.log")
+        self.assertEqual(prepared, again)
+        request = load_request(prepared, context=self.context)
+        self.assertEqual((run_root,), request.writable_roots)
+        self.assertFalse(run_root.exists())
+        self.assertNotIn(Path("/data/unapproved-text"), request.writable_roots)
+
+    def test_inventory_default_is_not_given_to_code_owners_or_frames(self) -> None:
+        inventory = self.inventory(self.root / "runs")
+        with mock.patch.dict(os.environ, {**self.env, "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            self.assertIsNone(prepare_task_request(
+                self.lab_route(capability="autopilot-code"), self.state / "jobs.log"))
+            self.assertIsNone(prepare_task_request(
+                self.lab_route(), self.state / "jobs.log", node="frame"))
+        self.assertFalse((self.state / "execution-access").exists())
+
+    def test_missing_or_template_inventory_does_not_guess_a_lab_root(self) -> None:
+        inventory = self.root / "compute-hosts.yaml"
+        with mock.patch.dict(os.environ, {**self.env, "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            self.assertIsNone(prepare_task_request(self.lab_route(), self.state / "jobs.log"))
+            inventory.write_text("schema_version: 1\nhosts:\n# uninitialized\n", encoding="utf-8")
+            self.assertIsNone(prepare_task_request(self.lab_route(), self.state / "jobs.log"))
+        self.assertFalse((self.state / "execution-access").exists())
+
+    def test_invalid_inventory_and_broad_run_root_refuse_before_publishing(self) -> None:
+        inventory = self.inventory(self.home)
+        with mock.patch.dict(os.environ, {**self.env, "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            with self.assertRaises(ExecutionAccessError) as raised:
+                prepare_task_request(self.lab_route(), self.state / "jobs.log")
+            self.assertTrue(raised.exception.reason.startswith("execution-access-root-too-broad:"))
+            inventory.write_text("schema_version: 2\n", encoding="utf-8")
+            with self.assertRaises(ExecutionAccessError) as raised:
+                prepare_task_request(self.lab_route(), self.state / "jobs.log")
+            self.assertEqual("execution-access-compute-inventory-invalid", raised.exception.reason)
+        self.assertFalse((self.state / "execution-access").exists())
+
+    def test_lab_explicit_data_request_is_validated_preserved_and_delivered(self) -> None:
+        run_root = self.root / "runs"
+        inventory = self.inventory(run_root)
+        supplied = self.request(network={"required": True, "reason": "approved transfer", "hosts": ["fixture.invalid:22"]})
+        original = self.request_file.read_bytes()
+        # Explicit data wins over a malformed old preview-table reference.
+        route = self.lab_route(work_request={"text": "## 입력\n- 루트 목록과 경로: unsupported ROOTS input\n"})
+        with mock.patch.dict(os.environ, {
+            **self.env, "COMPUTE_HOSTS_CONFIG": str(inventory),
+            "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(self.request_file),
+        }, clear=True):
+            prepared = prepare_task_request(route, self.state / "jobs.log")
+        merged = load_request(prepared, context=self.context)
+        self.assertEqual(set((*supplied.writable_roots, run_root)), set(merged.writable_roots))
+        self.assertEqual(supplied.read_roots, merged.read_roots)
+        self.assertEqual(supplied.network_hosts, merged.network_hosts)
+        self.assertEqual(supplied.network_reason, merged.network_reason)
+        self.assertEqual(supplied.enforcement_required, merged.enforcement_required)
+        self.assertEqual(original, self.request_file.read_bytes())
+
+    def test_invalid_explicit_data_does_not_publish_partial_lab_grant(self) -> None:
+        inventory = self.inventory(self.root / "runs")
+        self.request_file.write_text("{", encoding="utf-8")
+        with mock.patch.dict(os.environ, {
+            **self.env, "COMPUTE_HOSTS_CONFIG": str(inventory),
+            "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(self.request_file),
+        }, clear=True):
+            with self.assertRaises(ExecutionAccessError) as raised:
+                prepare_task_request(self.lab_route(), self.state / "jobs.log")
+        self.assertEqual("execution-access-invalid-json", raised.exception.reason)
+        self.assertFalse((self.state / "execution-access").exists())
+
+    def test_lab_resource_request_cannot_expand_the_live_parent_grant(self) -> None:
+        inventory = self.inventory(self.root / "runs")
+        with mock.patch.dict(os.environ, {**self.env, "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            prepared = prepare_task_request(self.lab_route(), self.state / "jobs.log")
+        request = load_request(prepared, context=self.context)
+        parent = ParentGrant(writable_roots=request.writable_roots)
+        assert_within_parent(request, parent, is_child=True)
+        outside = self.request(read_roots=[], writable_roots=[str(self.root / "outside")], justification={})
+        with self.assertRaises(ExecutionAccessError) as raised:
+            assert_within_parent(outside, parent, is_child=True)
+        self.assertTrue(raised.exception.reason.startswith("execution-access-exceeds-parent:"))
+
     def test_valid_request_normalizes_and_hashes_stably(self) -> None:
         first = self.request(
             writable_roots=[str(self.root / "z"), str(self.root / "a"), str(self.root / "z")],
