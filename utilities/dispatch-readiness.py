@@ -60,6 +60,7 @@ def generate(
     owner_harnesses: list[str],
     child_harnesses: list[str],
     disabled_harnesses: set[str] | None = None,
+    codex_execution_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
         raise ReadinessError("dispatch-readiness-inside-dispatch")
@@ -85,6 +86,10 @@ def generate(
     rows: list[dict[str, Any]] = []
     for parent in parents:
         parent_sandbox = NESTED.WRAPPER_PARENT_SANDBOXES[parent][0]
+        gpu_owner = False
+        if parent == "codex" and codex_execution_selection is not None:
+            parent_sandbox = codex_execution_selection["sandbox"]
+            gpu_owner = bool(codex_execution_selection["gpu_scope"])
         for child in children:
             args = argparse.Namespace(
                 parent_harness=parent,
@@ -96,6 +101,7 @@ def generate(
                 jobs=str(jobs),
                 user_disabled=child in disabled,
                 prospective_standard_owner=parent == "codex",
+                gpu_resource_owner=gpu_owner,
             )
             rows.append(NESTED.evaluate(args))
     return {

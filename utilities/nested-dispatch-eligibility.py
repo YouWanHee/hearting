@@ -290,13 +290,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     codex_owner_tuple = (
         args.parent_harness == "codex"
         and args.parent_transport == "headless"
-        and args.parent_sandbox == "workspace-write"
+        and (args.parent_sandbox == "workspace-write"
+             or (getattr(args, "gpu_resource_owner", False)
+                 and args.parent_sandbox == "danger-full-access"))
     )
     prospective_profile_applies = codex_owner_tuple and codex_standard_owner_network_enabled(
         dispatch_depth=1,
         worker_type="owner",
         intensity="standard",
         sandbox=args.parent_sandbox,
+        gpu_resource_owner=getattr(args, "gpu_resource_owner", False),
     )
     owner_marker = os.environ.get("AGENT_NESTED_HEADLESS_NETWORK") == "1"
     current_dispatch_depth = os.environ.get("AGENT_DISPATCH_DEPTH", "0")

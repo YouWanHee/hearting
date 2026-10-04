@@ -34,6 +34,11 @@ R, P, TOPO = T.R, T.P, T.R.TOPO
 import dispatch_stage_advance as ADVANCE  # noqa: E402
 
 GOLDEN = HERE / "fixtures" / "sd165-route-golden.json"
+GPU_EVAL_ADVISORY = (
+    "  Codex GPU lab: danger-full-access (gpu-lab-resource); 대상 owner 및 GPU resource eval-run. "
+    "filesystem/network OS enforcement 없음; 요청 root와 child≤parent는 논리 경계입니다. "
+    "외부 sandbox·관리된 runtime 제약은 유지되며 GPU 조회 성공을 보증하지 않습니다."
+)
 GOLDEN_KEYS = (
     "parallel_groups", "completion_gates", "human_gates", "human_gate_bindings",
     "workflow_contract", "conditional_extensions", "resume_retry_boundaries", "composed_recipe",
@@ -123,6 +128,25 @@ def _recipes():
             for r in TOPO.load_registry()["recipes"] if r["capability"] != R.ROUTE_FRAME_CAPABILITY]
 
 
+def _historical_setup_projection(recipe, case):
+    if recipe.get("capability") != "autopilot-lab" or "setup" not in recipe.get("modes", []):
+        return recipe
+    signals = list(recipe["promotion_signals"])
+    case.assertEqual(signals.count("gpu"), 1)
+    signals.remove("gpu")
+    return {**recipe, "promotion_signals": signals}
+
+
+def _historical_gpu_card(route, card, case):
+    lines = card.splitlines()
+    typed_gpu_nodes = [n["id"] for n in route["nodes"] if n.get("resource_class") == "gpu"]
+    if route["capability"] == "autopilot-lab" and typed_gpu_nodes:
+        case.assertEqual(typed_gpu_nodes, ["eval-run"])
+        case.assertEqual(lines.count(GPU_EVAL_ADVISORY), 1)
+        lines.remove(GPU_EVAL_ADVISORY)
+    return "\n".join(lines)
+
+
 def golden_payload(case):
     """Everything a catalog-free route seals, for every recipe and a few subgraphs.
 
@@ -132,6 +156,11 @@ def golden_payload(case):
     scenarios = {}
 
     def _digest(value):
+        # The historical catalog snapshot predates the existing GPU signal's
+        # admission for setup. Compare the catalog's graph bytes while the GPU
+        # policy suite checks that new selection and its warning separately.
+        if isinstance(value, dict) and value.get("capability") == "autopilot-lab" and "setup" in value.get("modes", []):
+            value = _historical_setup_projection(value, case)
         text = _normalize(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False), case)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
 
@@ -145,7 +174,7 @@ def golden_payload(case):
         entry = {"node_ids": [n["id"] for n in route["nodes"]],
                  "nodes": {n["id"]: _digest(n) for n in route["nodes"]},
                  "input_sources": {n["id"]: n["input_sources"] for n in route["nodes"] if "input_sources" in n},
-                 "card": R.compose_card(route),
+                 "card": _historical_gpu_card(route, R.compose_card(route), case),
                  # The brief names the prior cycle's dated folder; pin its normalized text, not the raw digest.
                  "briefs": {n["id"]: _digest(ADVANCE.render_stage_brief(route, n)[0]) for n in route["nodes"]
                             if n.get("kind") != "runtime-terminal"}}
@@ -174,6 +203,8 @@ def golden_payload(case):
     # The compiler-internal framed route: its own scenario, never part of the user-preset enumeration.
     record("framed:route-frame", lambda: case.compose_framed())
     registry = TOPO.load_registry()
+    registry = json.loads(json.dumps(registry))
+    registry["recipes"] = [_historical_setup_projection(recipe, case) for recipe in registry["recipes"]]
     digests = {capability: TOPO.capability_registry_digest(registry, capability)
                for capability in sorted({r["capability"] for r in registry["recipes"]})}
     return _normalize(json.dumps({"scenarios": scenarios, "capability_registry_digest": digests},
@@ -201,6 +232,78 @@ class GoldenTest(CatalogBase):
             with self.subTest(scenario=name):
                 self.assertEqual(actual["scenarios"][name], expected["scenarios"][name])
         self.assertEqual(actual["capability_registry_digest"], expected["capability_registry_digest"])
+
+
+class HistoricalGpuExceptionTest(unittest.TestCase):
+    """Fixed counterexamples keep the historical comparison exception narrow."""
+
+    OLD_SIGNALS = ["resource-run", "session-independent-lifecycle", "smoke-required",
+                   "human-gate", "stage-resume"]
+    OLD_CARD = "CPU unchanged\napproval required\nunit lab/eval\ngate eval-verify"
+
+    def route(self, target="eval-run", capability="autopilot-lab", resource_class="gpu"):
+        return {"capability": capability, "nodes": [{"id": target, "resource_class": resource_class}]}
+
+    def recipe(self, signals=None, **changes):
+        value = {"capability": "autopilot-lab", "modes": ["setup"],
+                 "promotion_signals": ["resource-run", "gpu", *self.OLD_SIGNALS[1:]],
+                 "approval": "required", "unit": "lab/setup", "gate": "smoke-verify"}
+        if signals is not None:
+            value["promotion_signals"] = signals
+        value.update(changes)
+        return value
+
+    def test_exact_notice_only_and_input_is_unchanged(self):
+        card = self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY
+        self.assertEqual(_historical_gpu_card(self.route(), card, self), self.OLD_CARD)
+        self.assertEqual(card, self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY)
+        for old, new in (("danger-full-access", "workspace-write"),
+                ("gpu-lab-resource", "caller-cli"), ("gpu-lab-resource", "forced-env"),
+                ("resource eval-run", "resource full-run"),
+                ("OS enforcement 없음", "OS enforcement enforced"),
+                ("논리 경계입니다", "OS 경계입니다")):
+            changed = card.replace(old, new)
+            with self.subTest(old=old, new=new), self.assertRaises(AssertionError):
+                _historical_gpu_card(self.route(), changed, self)
+        with self.assertRaises(AssertionError):
+            _historical_gpu_card(self.route("full-run"), card, self)
+        with self.assertRaises(AssertionError):
+            _historical_gpu_card(self.route(), card + "\n" + GPU_EVAL_ADVISORY, self)
+
+    def test_additional_notice_and_cpu_approval_unit_gate_changes_remain_visible(self):
+        card = self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY
+        extra = GPU_EVAL_ADVISORY.replace("gpu-lab-resource", "caller-env")
+        projected = _historical_gpu_card(self.route(), card + "\n" + extra, self)
+        self.assertNotEqual(projected, self.OLD_CARD)
+        self.assertIn(extra, projected)
+        for old, new in (("CPU unchanged", "CPU changed"), ("approval required", "approval skipped"),
+                         ("unit lab/eval", "unit code/test"), ("gate eval-verify", "gate removed")):
+            with self.subTest(old=old):
+                self.assertNotEqual(_historical_gpu_card(self.route(), card.replace(old, new), self), self.OLD_CARD)
+        self.assertEqual(_historical_gpu_card(self.route(capability="autopilot-code"), card, self), card)
+        self.assertEqual(_historical_gpu_card(self.route(resource_class="normal"), card, self), card)
+
+    def test_single_setup_signal_only_and_other_signal_differences_remain_visible(self):
+        recipe = self.recipe()
+        original = json.loads(json.dumps(recipe))
+        expected = self.recipe(signals=list(self.OLD_SIGNALS))
+        self.assertEqual(_historical_setup_projection(recipe, self), expected)
+        self.assertEqual(recipe, original)
+        for signals in ([*recipe["promotion_signals"], "gpu"], list(self.OLD_SIGNALS)):
+            with self.subTest(signals=signals), self.assertRaises(AssertionError):
+                _historical_setup_projection(self.recipe(signals=signals), self)
+        for extra in ("network", "resource-run"):
+            with self.subTest(extra=extra):
+                actual = _historical_setup_projection(self.recipe(signals=[*recipe["promotion_signals"], extra]), self)
+                self.assertNotEqual(actual, expected)
+                self.assertEqual(actual["promotion_signals"], [*self.OLD_SIGNALS, extra])
+        for changes in ({"approval": "skipped"}, {"unit": "code/test"}, {"gate": "removed"},
+                        {"graph": ["execute", "report"]}):
+            with self.subTest(changes=changes):
+                self.assertNotEqual(_historical_setup_projection(self.recipe(**changes), self), expected)
+        for changes in ({"modes": ["eval"]}, {"capability": "autopilot-code"}):
+            unchanged = self.recipe(**changes)
+            self.assertEqual(_historical_setup_projection(unchanged, self), unchanged)
 
 
 RETRIEVAL = "shards/parts/autopilot-research/retrieval/shards/retrieval/**"

@@ -2738,6 +2738,63 @@ class TestContinuation(unittest.TestCase):
   }
   args.update(overrides)
   return R.build_continuation_route(source,**args)
+ def test_continuation_optional_checked_evidence_updates_tuple_without_changing_source(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact)
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   original=R.canonical(source)
+   original_evidence=json.loads(json.dumps(source["dispatch_evidence"]))
+   fresh=self._dispatch()
+   fresh["tuples"][0]["parent_sandbox"]="danger-full-access"
+   fresh["tuples"][0]["probe_time"]="2026-10-04T07:11:57Z"
+   retained=self._build(source)
+   changed=self._build(source,dispatch_evidence=fresh)
+   self.assertEqual(retained["dispatch_evidence"],original_evidence)
+   self.assertNotIn("dispatch_evidence_override",retained)
+   self.assertTrue(changed["dispatch_evidence_override"])
+   self.assertEqual(changed["dispatch_evidence"]["tuples"][0]["parent_sandbox"],"danger-full-access")
+   self.assertNotEqual(retained["continuation_id"],changed["continuation_id"])
+   self.assertEqual(R.canonical(source),original)
+   self.assertNotIn("codex_execution_sandbox",changed)
+   for node in changed["nodes"]:
+    if node.get("dispatch_depth")==2:
+     self.assertEqual(node["fallback_hops"][0]["candidates"][0]["parent_sandbox"],"danger-full-access")
+   R.verify_route(changed,R.ROOT)
+   R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
+   output=R.canonical_route_path(artifact,changed["route_id"])
+   R.publish_continuation_route(changed,source,output)
+   R.review_lineage_routes(changed,"test")
+   import subprocess,sys
+   checked=Path(tmp)/"checked.json"
+   checked.write_text(json.dumps(fresh))
+   cli=subprocess.run([sys.executable,str(P),"continuation","--source-route",
+    str(R.canonical_route_path(artifact,source["route_id"])),"--resume-from-node","test",
+    "--requested-boundary","test","--reason","cli-checked-override","--artifact-root",str(artifact),
+    "--dispatch-evidence",str(checked)],capture_output=True,text=True,
+    env={**os.environ,"AGENT_HOME":str(R.ROOT)},cwd=str(R.ROOT),timeout=30)
+   self.assertEqual(cli.returncode,0,cli.stderr)
+   actual=json.loads(cli.stdout)
+   self.assertEqual(actual["dispatch_evidence"],changed["dispatch_evidence"])
+   self.assertTrue(R.canonical_route_path(artifact,actual["route_id"]).is_file())
+   self.assertEqual(R.canonical(source),original)
+   tampered=json.loads(json.dumps(changed))
+   tampered["nodes"][0]["unit"]="qa/ml-debug"
+   tampered["new_nodes"][0]["realized_contract_hash"]=R._continuation_contract_hash(tampered["nodes"][0])
+   tampered["route_hash"]=R.route_hash(tampered)
+   tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
+   with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch"):
+    R.review_lineage_routes(tampered,"test")
+ def test_continuation_checked_override_reuses_foreign_worktree_refusal(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source=self._source(Path(tmp)/"artifacts")
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   original=R.canonical(source)
+   evidence=self._dispatch()
+   evidence["tuples"][0]["checked_worktree"]=str(Path(tmp)/"foreign")
+   with self.assertRaisesRegex(ValueError,"dispatch-evidence-worktree-mismatch"):
+    self._build(source,dispatch_evidence=evidence)
+   self.assertEqual(R.canonical(source),original)
  def _assert_no_alias_key(self,value):
   if isinstance(value,dict):
    self.assertNotIn("evidence_digest",value)

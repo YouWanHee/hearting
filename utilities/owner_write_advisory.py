@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import gpu_execution_sandbox as GPU_SANDBOX
 
 RECEIPT_KEY = "owner_write_advisory="
 CODE = "codex-owner-write-constraints"
@@ -34,24 +35,30 @@ def git_topology(cwd):
 
 
 def advisories(route, *, owner_harness=None, sandbox=None, git_writable_roots=(),
-               explicit_writable_roots=()):
+               explicit_writable_roots=(), gpu_selection=None):
     """Prospective selection or actual wrapper facts, outside sealed route bytes."""
     if route.get("owner_dispatch_depth") == 0 or route.get("effective_intensity") == "direct":
         return []
+    gpu_rows = GPU_SANDBOX.advisory(route, owner_harness=owner_harness,
+                                   selection=gpu_selection, applied=sandbox is not None)
+    applied = sandbox is not None
+    if gpu_rows and sandbox is None:
+        sandbox = gpu_rows[0]["sandbox"]
     if not explicit_writable_roots and not any(
             worktree_mutating_scope(scope) for node in route.get("nodes", [])
             for scope in (node.get("write_scope") or [])):
-        return []
+        return gpu_rows
     owner = owner_harness or (route.get("work_request") or {}).get("owner_harness") or "auto"
     if owner not in {"auto", "codex"}:
         return []
-    applied = sandbox is not None
     topology = git_topology(route.get("cwd"))
     prefix = "Codex owner: " if owner == "codex" else "자동 선택에서 Codex owner의 workspace-write가 선택되면: "
+    if gpu_rows and owner == "auto":
+        prefix = "자동 선택에서 Codex owner가 선택되면: "
     if sandbox == "read-only":
         message = prefix + "현재 sandbox는 read-only이며 source 쓰기를 허용하지 않습니다."
     elif sandbox == "danger-full-access":
-        message = prefix + "현재 sandbox는 danger-full-access입니다. workspace-write의 경로 제한은 적용되지 않습니다."
+        message = prefix + ("현재" if applied else "선택된") + " sandbox는 danger-full-access입니다. workspace-write의 경로 제한은 적용되지 않습니다."
     else:
         message = prefix + ("현재 workspace-write는" if applied else "workspace-write는")
         message += " source 편집을 허용해도 Git 메타데이터와 workspace 밖 경로는 별도 제약을 받습니다."
@@ -69,7 +76,7 @@ def advisories(route, *, owner_harness=None, sandbox=None, git_writable_roots=()
              "owner_harness": owner, "sandbox": sandbox or "workspace-write-if-selected",
              "git_topology": topology, "git_writable_roots": [str(p) for p in git_writable_roots],
              "explicit_writable_roots": [str(p) for p in explicit_writable_roots],
-             "message": message}]
+             "message": message}] + gpu_rows
 
 
 def receipt_advisories(receipt):
@@ -82,7 +89,8 @@ def receipt_advisories(receipt):
             value = json.loads(line[len(RECEIPT_KEY):])
         except (ValueError, TypeError):
             continue
-        if isinstance(value, dict) and value.get("code") == CODE and isinstance(value.get("message"), str):
+        if (isinstance(value, dict) and value.get("code") in {CODE, GPU_SANDBOX.RECEIPT_CODE}
+                and isinstance(value.get("message"), str)):
             if value not in result:
                 result.append(value)
     return result

@@ -1713,6 +1713,7 @@
       ],
       "promotion_signals": [
         "resource-run",
+        "gpu",
         "session-independent-lifecycle",
         "smoke-required",
         "human-gate",
