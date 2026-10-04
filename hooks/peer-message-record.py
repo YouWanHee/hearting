@@ -191,20 +191,8 @@ def handle_prompt(payload):
     trailer = mod.parse_peer_trailer(prompt, {"harness": "claude", "session_id": str(session_id)}) if mod is not None else None
     if not trailer:
         return
-    args_list = [
-        "--from-harness", trailer.get("harness") or "unknown",
-        "--from-session-id", trailer.get("session_id") or "",
-        "--from-project", _project_of(payload.get("cwd")),
-        "--to-harness", "claude",
-        "--to-session-id", str(session_id),
-        "--kind", "notice",
-        "--surface", "herdr",
-        "--status", "received",
-        "--body-stdin",
-    ]
-    if trailer.get("name"):
-        args_list += ["--from-name", trailer["name"]]
-    _record(args_list, "herdr steer received")
+    mod.receive_peer_message(prompt, {"harness": "claude", "session_id": str(session_id)},
+                             _project_of(payload.get("cwd")), summary_text="herdr steer received")
 
 
 def _record(args_list, body):

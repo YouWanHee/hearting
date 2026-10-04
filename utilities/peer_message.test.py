@@ -655,5 +655,166 @@ class UsableSessionIdTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rec["from"]["name"], "hearting-46")
 
 
+class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
+    sender = {"harness": "codex", "session_id": "sender", "name": "original"}
+    recipient = {"harness": "codex", "session_id": "recipient"}
+
+    def pending(self, body="original peer body", **kwargs):
+        return peer_message.prepare_peer_message(body, self.sender, self.recipient, defer=True, **kwargs)
+
+    def test_private_payload_preserves_body_endpoints_refs_and_digest(self):
+        text, ref = self.pending(refs=["original-proof"])
+        row = peer_message._read_pending(ref)
+        self.assertEqual(row["text"], text)
+        self.assertEqual(row["from"], self.sender)
+        self.assertEqual(row["to"], self.recipient)
+        self.assertEqual(row["refs"], ["original-proof"])
+        self.assertEqual(row["body_sha256"], hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(stat.S_IMODE(peer_message._pending_path(ref).stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(peer_message._pending_dir().stat().st_mode), 0o700)
+        self.assertFalse(self._ledger_file("sender").exists())
+
+    def test_pending_retry_reuses_ref_but_different_body_or_sid_does_not(self):
+        text, ref = self.pending()
+        renamed = dict(self.sender, name="renamed")
+        self.assertEqual(peer_message.prepare_peer_message("original peer body", renamed, self.recipient), (text, ref))
+        self.assertNotEqual(self.pending("different body")[1], ref)
+        for changed in (dict(self.recipient, session_id="fork"), dict(self.recipient, harness="claude")):
+            self.assertNotEqual(peer_message.prepare_peer_message("original peer body", self.sender, changed, defer=True)[1], ref)
+            self.assertNotIn(ref, [r["ref"] for r in peer_message.pending_messages(changed)])
+
+    def test_actual_receive_once_and_replay_does_not_rewrite_notice(self):
+        text, ref = self.pending()
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        original = self._ledger_file("sender").read_bytes()
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        self.assertEqual(self._ledger_file("sender").read_bytes(), original)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        self.assertIsNone(peer_message._read_pending(ref)["text"])
+        row = json.loads(original)
+        self.assertEqual(row["transfer_ref"], ref)
+        self.assertEqual(row["delivery"]["status"], "received")
+        self.assertNotIn("original peer body", original.decode())
+        self.assertNotEqual(self.pending()[1], ref) # A later intentional message is new.
+
+    def test_foreign_sid_or_changed_body_never_ack_pending(self):
+        text, ref = self.pending()
+        for actual, body in ((dict(self.recipient, session_id="fork"), text),
+                             (self.recipient, "changed " + text)):
+            peer_message.receive_peer_message(body, actual)
+            self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+
+    def test_payload_tamper_permissions_symlink_and_oversize_refused(self):
+        text, ref = self.pending()
+        path = peer_message._pending_path(ref)
+        original = path.read_bytes()
+        row = json.loads(original)
+        row["to"]["session_id"] = "other"
+        path.write_text(json.dumps(row))
+        with self.assertRaisesRegex(ValueError, "binding-invalid"):
+            peer_message._read_pending(ref)
+        path.write_bytes(original)
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "file-unsafe"):
+            peer_message._read_pending(ref)
+        path.chmod(0o600)
+        path.unlink()
+        path.symlink_to(self.tmp_root / "outside")
+        with self.assertRaises(OSError):
+            peer_message._read_pending(ref)
+        path.unlink() # Remove this fixture's unsafe link before independent size check.
+        with self.assertRaisesRegex(ValueError, "oversized"):
+            self.pending("x" * 16384)
+
+    def test_concurrent_claim_is_nonblocking_and_never_rebinds(self):
+        with peer_message.pending_lock():
+            with self.assertRaises(BlockingIOError):
+                self.pending()
+        self.assertEqual(peer_message.pending_messages(self.recipient), [])
+
+    def test_acceptance_stays_queued_and_disables_restart_and_ambiguous_retry(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending()
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+            result = peer_message.deliver_pending_codex(ref)
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+        self.assertFalse(self._ledger_file("sender").exists())
+        self.assertEqual(send.call_args.kwargs["client_message_id"], "delivery-peer-" + ref)
+        for field in ("allow_restart", "retry_ambiguous"):
+            self.assertFalse(send.call_args.kwargs[field])
+
+    def test_ambiguous_add_preserves_payload_and_next_attempt_is_observation_only(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending()
+        with mock.patch.object(queue, "send_at_least_once", side_effect=queue.QueueDeliveryError("lost-response", ambiguous=True)):
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "unverified")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+            peer_message.deliver_pending_codex(ref)
+        self.assertFalse(send.call_args.kwargs["allow_add"])
+
+    def test_exact_native_history_ack_once_after_queued_and_replay(self):
+        import codex_queue_delivery as queue
+        _text, ref = self.pending()
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "consumed"}) as send:
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
+            original = self._ledger_file("sender").read_bytes()
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
+            self.assertEqual(send.call_count, 1)
+        self.assertEqual(self._ledger_file("sender").read_bytes(), original)
+
+    def test_stale_or_unsupported_callback_retains_pending(self):
+        _text, ref = self.pending()
+        row = json.loads(peer_message._pending_path(ref).read_text())
+        row["to"]["session_id"] = "stale-old-session"
+        peer_message._pending_path(ref).write_text(json.dumps(row))
+        with self.assertRaisesRegex(ValueError, "binding-invalid"):
+            peer_message.deliver_pending_codex(ref)
+        peer_message._pending_path(ref).unlink()
+        text, other = peer_message.prepare_peer_message("claude pending", self.sender,
+            dict(self.recipient, harness="claude"), defer=True)
+        self.assertEqual(peer_message.deliver_pending_codex(other)["status"], "unsupported")
+        self.assertEqual(peer_message._read_pending(other)["text"], text)
+
+    def test_render_failure_keeps_unverified_claim_and_cannot_claim_twice(self):
+        _text, ref = self.pending()
+        args = peer_message.argparse.Namespace(to_harness="codex", to_session_id="recipient", claim=ref, queued=None)
+        with mock.patch("builtins.print", side_effect=BrokenPipeError):
+            with self.assertRaises(BrokenPipeError):
+                peer_message.cmd_pending(args)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(peer_message.cmd_pending(args), 0)
+        output.assert_called_once_with("null")
+
+    def test_ledger_failure_or_publish_failure_does_not_fabricate_receipt_or_duplicate(self):
+        text, ref = self.pending()
+        with mock.patch.object(peer_message, "cmd_record", return_value=1):
+            self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 1)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+        with mock.patch.object(peer_message, "_save_pending", side_effect=OSError("publish failed")):
+            with self.assertRaises(OSError):
+                peer_message.receive_peer_message(text, self.recipient)
+        original = self._ledger_file("sender").read_bytes()
+        peer_message.receive_peer_message(text, self.recipient)
+        self.assertEqual(self._ledger_file("sender").read_bytes(), original)
+
+    def test_crash_after_native_acceptance_cannot_repeat_add_when_history_is_lost(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending()
+        def accepted(*args, **kwargs):
+            kwargs["before_add"]()
+            # Simulate accepted API response followed by failed state publication.
+            raise OSError("state-publish-after-acceptance")
+        with mock.patch.object(queue, "send_at_least_once", side_effect=accepted):
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "unverified")
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+            peer_message.deliver_pending_codex(ref)
+        self.assertFalse(send.call_args.kwargs["allow_add"])
+
+
 if __name__ == "__main__":
     unittest.main()

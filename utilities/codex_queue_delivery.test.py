@@ -159,5 +159,73 @@ class QueueHistoryBoundTest(unittest.TestCase):
         self.assertTrue(all(c.args[2]["itemsView"] == "full" for c in rpc.call_args_list))
 
 
+class PeerQueuePolicy(unittest.TestCase):
+    def test_peer_ambiguous_add_is_not_retried(self):
+        with mock.patch.object(QUEUE, "_known_consumed", return_value=None), \
+             mock.patch.object(QUEUE, "list_queue", return_value=[]), \
+             mock.patch.object(QUEUE, "_rpc", side_effect=QUEUE.QueueDeliveryError("ambiguous", ambiguous=True)) as rpc:
+            with self.assertRaises(QUEUE.QueueDeliveryError):
+                QUEUE.send_at_least_once(SOCKET, thread_id=THREAD, client_message_id=CLIENT_ID,
+                    message="peer", allow_restart=False, retry_ambiguous=False)
+        self.assertEqual([call.args[1] for call in rpc.call_args_list], ["thread/queue/add"])
+
+    def test_peer_never_forces_interrupted_turn_restart(self):
+        with mock.patch.object(QUEUE, "_known_consumed", return_value=None), \
+             mock.patch.object(QUEUE, "list_queue", return_value=[ITEM]), \
+             mock.patch.object(QUEUE, "_rpc") as rpc:
+            result = QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+                client_message_id=CLIENT_ID, message="peer", allow_restart=False)
+        self.assertFalse(result["started_after_interrupt"])
+        rpc.assert_not_called()
+
+    def test_observation_only_cannot_add_after_lost_ack(self):
+        with mock.patch.object(QUEUE, "_known_consumed", return_value=None), \
+             mock.patch.object(QUEUE, "list_queue", return_value=[]), \
+             mock.patch.object(QUEUE, "_rpc") as rpc:
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "previously-unconfirmed"):
+                QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+                    client_message_id=CLIENT_ID, message="peer", allow_restart=False, allow_add=False)
+        rpc.assert_not_called()
+
+
+class StrictPeerHistory(unittest.TestCase):
+    def test_history_failure_and_page_budget_never_add(self):
+        for rpc_result in (QUEUE.QueueDeliveryError("history-unavailable"),
+                           {"data": [], "nextCursor": "next"}):
+            with self.subTest(rpc_result=rpc_result):
+                kwargs = {"side_effect": rpc_result} if isinstance(rpc_result, Exception) else {"return_value": rpc_result}
+                with mock.patch.object(QUEUE, "_rpc", **kwargs) as rpc:
+                    with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-unavailable"):
+                        QUEUE.send_at_least_once(SOCKET, thread_id=THREAD, client_message_id=CLIENT_ID,
+                            message="peer", allow_restart=False, retry_ambiguous=False, require_message_match=True)
+                self.assertTrue(all(call.args[1] == "thread/turns/list" for call in rpc.call_args_list))
+
+    def test_actual_schema_empty_text_elements_and_body_mismatch(self):
+        for message, count in (("peer", 1), ("other", 0)):
+            turn = {"items": [{"type": "userMessage", "clientId": CLIENT_ID,
+                              "content": [{"type": "text", "text": message, "text_elements": []}]}]}
+            with mock.patch.object(QUEUE, "_rpc", return_value={"data": [turn]}) as rpc:
+                if count:
+                    result = QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+                        client_message_id=CLIENT_ID, message="peer", require_message_match=True)
+                    self.assertEqual(result["status"], "consumed")
+                else:
+                    with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "history-mismatch"):
+                        QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+                            client_message_id=CLIENT_ID, message="peer", require_message_match=True)
+            self.assertEqual([c.args[1] for c in rpc.call_args_list], ["thread/turns/list"])
+
+    def test_duplicate_client_or_changed_pending_content_is_unverified(self):
+        for items in ([dict(ITEM, input=[{"type": "text", "text": "other"}])],
+                      [dict(ITEM, input=[{"type": "text", "text": "peer"}])] * 2):
+            with mock.patch.object(QUEUE, "_known_consumed", return_value=None), \
+                 mock.patch.object(QUEUE, "list_queue", return_value=items), \
+                 mock.patch.object(QUEUE, "_rpc") as rpc:
+                with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "pending-mismatch"):
+                    QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+                        client_message_id=CLIENT_ID, message="peer", require_message_match=True)
+                rpc.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """SD-122 peer-session steward ledger: record | list | status | release | prune-steward-markers.
 
-Body text is never persisted. Callers pass the body via --body-file or
-stdin; only its sha256 and a hard-truncated first-line summary are written.
+The public ledger stores only a digest and truncated summary. Form-blocked
+messages alone retain bounded private runtime payloads until exact receipt.
 """
 import argparse
 import functools
+import contextlib
+import stat
+import math
+import tempfile
 import fcntl
 import hashlib
 import json
@@ -153,7 +157,7 @@ def _valid_transfer_endpoint(endpoint):
             and (name is None or isinstance(name, str)))
 
 
-def prepare_peer_message(body, sender, recipient):
+def _prepare_peer_message(body, sender, recipient):
     """Seal a transmission intent before delivery (the receiver may run immediately).
 
     This immutable record shares the ledger's local write trust boundary; it is
@@ -176,6 +180,181 @@ def prepare_peer_message(body, sender, recipient):
         fh.flush()
         os.fsync(fh.fileno())
     return text, ref
+
+
+_PENDING_BYTES = 16 * 1024
+
+
+def _pending_dir():
+    path = peer_state_root() / "peer-messages" / "pending"
+    if path.parent.is_symlink():
+        raise ValueError("peer-pending-parent-symlink")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError("peer-pending-directory-unsafe")
+    return path
+
+
+@contextlib.contextmanager
+def pending_lock():
+    path = _pending_dir() / ".lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("peer-pending-lock-unsafe")
+        # Never hang a hook behind an RPC writer. The next normal callback retries.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _pending_path(ref):
+    _transfer_path(ref)
+    return _pending_dir() / (ref + ".json")
+
+
+def _pending_endpoint(endpoint, state):
+    if _valid_transfer_endpoint(endpoint):
+        return True
+    return (state == "unverified" and isinstance(endpoint, dict)
+            and endpoint.get("harness") in ("claude", "codex", "opencode", None)
+            and endpoint.get("session_id") is None
+            and (endpoint.get("name") is None or isinstance(endpoint.get("name"), str)))
+
+
+def _read_pending(ref):
+    path = _pending_path(ref)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, encoding="utf-8") as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("peer-pending-file-unsafe")
+        raw = fh.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("peer-pending-oversized")
+    row = json.loads(raw)
+    transfer = _read_transfer_record(ref)
+    if (not isinstance(row, dict) or not isinstance(transfer, dict)
+            or type(row.get("schema_version")) is not int or row["schema_version"] != 1
+            or row.get("ref") != ref or row.get("from") != transfer.get("from")
+            or row.get("to") != transfer.get("to") or row.get("body_sha256") != transfer.get("body_sha256")
+            or not _pending_endpoint(row.get("from"), row.get("state"))
+            or not _pending_endpoint(row.get("to"), row.get("state"))
+            or row.get("state") not in ("pending", "queued", "unverified", "received")
+            or type(row.get("created")) not in (int, float) or not math.isfinite(row["created"])):
+        raise ValueError("peer-pending-binding-invalid")
+    text = row.get("text")
+    if (not isinstance(row.get("refs"), list) or not all(isinstance(v, str) for v in row["refs"])
+            or type(transfer.get("schema_version")) is not int or transfer["schema_version"] != 1
+            or transfer.get("message_id") != ref):
+        raise ValueError("peer-pending-binding-invalid")
+    if row["state"] != "received" and (not isinstance(text, str)
+            or len(text.encode("utf-8")) > _PENDING_BYTES
+            or hashlib.sha256(text.encode("utf-8")).hexdigest() != row["body_sha256"]):
+        raise ValueError("peer-pending-body-invalid")
+    if row["state"] != "received":
+        body, sep, _trailer = text.rpartition("\n\n(peer-from:")
+        if not sep or hashlib.sha256(body.encode("utf-8")).hexdigest() != row.get("source_sha256"):
+            raise ValueError("peer-pending-source-invalid")
+    return row
+
+
+def _save_pending(row):
+    path = _pending_path(row["ref"])
+    if len(json.dumps(row, ensure_ascii=False).encode("utf-8")) > 65536:
+        raise ValueError("peer-pending-oversized")
+    fd, tmp = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(row, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)  # Own temporary payload only.
+
+
+def pending_messages(recipient):
+    """Read exact SID-bound payloads. No alias/pane retargeting or rendering ack."""
+    if not _valid_transfer_endpoint(recipient):
+        return []
+    rows = []
+    for path in sorted(_pending_dir().glob("*.json")):
+        row = _read_pending(path.stem)
+        if (row and row["state"] != "received"
+                and all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id"))):
+            rows.append(row)
+    return rows
+
+
+def prepare_peer_message(body, sender, recipient, *, defer=False, refs=()):
+    """A retry reuses a still-pending intent; ordinary messages keep the old contract."""
+    endpoints_verified = _valid_transfer_endpoint(sender) and _valid_transfer_endpoint(recipient)
+    with pending_lock():
+        body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
+        for row in pending_messages(recipient):
+            if (all(row["from"].get(k) == sender.get(k) for k in ("harness", "session_id"))
+                    and row.get("source_sha256") == body_hash):
+                return row["text"], row["ref"]
+        text, ref = _prepare_peer_message(body, sender, recipient)
+        if defer:
+            if len(text.encode("utf-8")) > _PENDING_BYTES:
+                raise ValueError("peer-pending-body-oversized")
+            _save_pending({"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),
+                "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "source_sha256": body_hash, "refs": list(refs), "created": time.time(),
+                "state": "pending" if endpoints_verified else "unverified", "text": text,
+                "receipt": "target-form-open" if endpoints_verified else "peer-endpoint-unverified"})
+        return text, ref
+
+
+def deliver_pending_codex(ref, *, timeout=1.0):
+    """One normal callback/send, no watcher, keyboard input or ambiguous resend."""
+    from codex_queue_delivery import send_at_least_once, QueueDeliveryError
+    from codex_queue_dispatch import resolve_queue_socket
+    with pending_lock():
+        row = _read_pending(ref)
+        if not row:
+            return {"status": "unsupported", "reason": "peer-pending-missing"}
+        if row["state"] == "received":
+            return {"status": "received", "reason": "exact-peer-ref"}
+        if not _valid_transfer_endpoint(row["from"]) or not _valid_transfer_endpoint(row["to"]):
+            return {"status": "unverified", "reason": "peer-endpoint-unverified"}
+        if row["to"]["harness"] != "codex":
+            return {"status": "unsupported", "reason": "peer-native-queue-unavailable"}
+        try:
+            result = send_at_least_once(resolve_queue_socket(),
+                thread_id=row["to"]["session_id"], client_message_id="delivery-peer-" + ref,
+                message=row["text"], timeout=timeout, allow_restart=False,
+                retry_ambiguous=False, allow_add=row["state"] == "pending", require_message_match=True,
+                before_add=lambda: _save_pending(dict(row, state="unverified", receipt="native-queue-inflight")))
+        except (QueueDeliveryError, OSError, ValueError, RuntimeError) as exc:
+            ambiguous = getattr(exc, "ambiguous", False)
+            if ambiguous:
+                _save_pending(dict(row, state="unverified", receipt="native-queue-ambiguous"))
+            return {"status": "unverified", "reason": str(exc)}
+        if result["status"] == "consumed":
+            # Exact native history is an actual receive observation, unlike acceptance.
+            trailer = parse_peer_trailer(row["text"], row["to"], include_ref=True)
+            rc = 0 if _peer_notice_exists(ref, row["to"]) else cmd_record(argparse.Namespace(from_harness=row["from"]["harness"],
+                from_session_id=row["from"]["session_id"], from_name=row["from"].get("name"), from_project="",
+                to_harness="codex", to_session_id=row["to"]["session_id"], to_name=None,
+                kind="notice", surface="codex-queue", status="received", receipt="exact-native-history",
+                ref=[ref, *row["refs"]], transfer_ref=trailer.get("transfer_ref"),
+                body_file=None, body_stdin=False))
+            if rc:
+                return {"status": "unverified", "reason": "peer-receive-ledger-unavailable"}
+            _save_pending(dict(row, state="received", text=None, receipt="exact-native-history"))
+            return {"status": "received", "reason": "exact-native-history"}
+        _save_pending(dict(row, state="queued", receipt="native-queue-accepted"))
+        return {"status": "queued", "reason": "native-queue-accepted"}
 
 
 def usable_session_id(value):
@@ -204,7 +383,7 @@ def usable_session_id(value):
     return text
 
 
-def parse_peer_trailer(text, recipient=None):
+def parse_peer_trailer(text, recipient=None, *, include_ref=False):
     """→ {harness, session_id, name} for the LAST trailer in ``text``, else ``None``.
 
     New aliases require a sealed transfer and the actual recipient tuple. A
@@ -242,23 +421,71 @@ def parse_peer_trailer(text, recipient=None):
                     or any(target.get(k) != recipient.get(k) for k in ("harness", "session_id"))):
                 return result
             result.update(session_id=sender["session_id"], name=sender.get("name"))
+            if include_ref:
+                result["transfer_ref"] = ref
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
     return result
 
 
-def cmd_receive(args):
-    """Canonical receive boundary for adapters without an in-process parser."""
-    text = sys.stdin.read()
-    trailer = parse_peer_trailer(text, {"harness": args.to_harness, "session_id": args.to_session_id})
-    if not trailer or not usable_session_id(args.to_session_id):
+def _peer_notice_exists(ref, recipient):
+    return any(r.get("transfer_ref") == ref and r.get("kind") == "notice"
+        and (r.get("delivery") or {}).get("status") == "received"
+        and all((r.get("to") or {}).get(k) == recipient.get(k) for k in ("harness", "session_id"))
+        for r in _iter_records())
+
+
+def receive_peer_message(text, recipient, project="", *, summary_text=""):
+    """Actual receiver observation; rendering a callback is never this boundary."""
+    trailer = parse_peer_trailer(text, recipient, include_ref=True)
+    if not trailer or not usable_session_id(recipient.get("session_id")):
         return 0
-    return cmd_record(argparse.Namespace(
-        from_harness=trailer["harness"], from_session_id=trailer["session_id"],
-        from_name=trailer["name"], from_project=args.from_project,
-        to_harness=args.to_harness, to_session_id=args.to_session_id, to_name=None,
-        kind="notice", surface="herdr", status="received", receipt=None, ref=[],
-        body_file=None, body_stdin=False))
+    ref = trailer.get("transfer_ref")
+    with pending_lock():
+        pending = _read_pending(ref) if ref else None
+        if pending and pending["state"] == "received":
+            return 0
+        already_received = ref and _peer_notice_exists(ref, recipient)
+        rc = 0 if already_received else cmd_record(argparse.Namespace(
+            from_harness=trailer["harness"], from_session_id=trailer["session_id"],
+            from_name=trailer["name"], from_project=project,
+            to_harness=recipient["harness"], to_session_id=recipient["session_id"], to_name=None,
+            kind="notice", surface="herdr", status="received", receipt="exact-peer-ref" if ref else None,
+            ref=[ref, *(pending.get("refs", []) if pending else [])] if ref else [], transfer_ref=ref,
+            body_file=None, body_stdin=False, body_text=summary_text))
+        if rc == 0 and pending:
+            _save_pending(dict(pending, state="received", text=None))
+        return rc
+
+
+def cmd_receive(args):
+    return receive_peer_message(sys.stdin.read(),
+        {"harness": args.to_harness, "session_id": args.to_session_id}, args.from_project)
+
+
+def cmd_pending(args):
+    recipient = {"harness": args.to_harness, "session_id": args.to_session_id}
+    with pending_lock():
+        if not args.claim and not args.queued:
+            print(json.dumps(pending_messages(recipient)[:5], ensure_ascii=False))
+            return 0
+        row = _read_pending(args.claim or args.queued)
+        if not row or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id")):
+            return 1
+        if args.queued:
+            if not isinstance(args.message_id, str) or not args.message_id.strip():
+                return 1
+            if row["state"] == "received":
+                return 0
+            _save_pending(dict(row, state="queued", receipt="context-api-accepted", actual_message_id=args.message_id))
+            return 0
+        if row["state"] != "pending":
+            print("null")
+            return 0
+        # A failed/expired callback cannot acknowledge or blindly repeat this claim.
+        _save_pending(dict(row, state="unverified", receipt="context-api-inflight"))
+        print(json.dumps(row, ensure_ascii=False))
+        return 0
 
 
 def claude_session_name(session_id, config_dir=None):
@@ -514,6 +741,8 @@ def _message_id(from_sid, to, ts, summary):
 
 
 def _read_body(args):
+    if getattr(args, "body_text", None) is not None:
+        return args.body_text
     if args.body_file:
         return Path(args.body_file).read_text(encoding="utf-8", errors="replace")
     if args.body_stdin:
@@ -767,6 +996,15 @@ def main(argv=None):
     p_receive.add_argument("--to-session-id", required=True)
     p_receive.add_argument("--from-project", default="")
     p_receive.set_defaults(func=cmd_receive)
+
+    p_pending = sub.add_parser("pending")
+    p_pending.add_argument("--to-harness", required=True)
+    p_pending.add_argument("--to-session-id", required=True)
+    intent = p_pending.add_mutually_exclusive_group()
+    intent.add_argument("--claim")
+    intent.add_argument("--queued")
+    p_pending.add_argument("--message-id")
+    p_pending.set_defaults(func=cmd_pending)
 
     p_record = sub.add_parser("record")
     p_record.add_argument("--from-harness", required=True)

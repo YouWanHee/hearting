@@ -1812,8 +1812,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_prompt_refuses_a_blocked_target_or_an_open_form(self):
         """Measured 2026-09-06 (3/3): text injected into an open AskUserQuestion
-        form is lost and the Enter answers it with the default. `blocked` from
-        herdr, or the form footer in a narrow pane, is a typed refusal."""
+        form is lost and the Enter answers it with the default. It is now
+        private pending; no keystrokes or fictional received notice."""
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
         for status, pane_text in (("blocked", "❯ "), ("idle", form), ("working", form)):
@@ -1824,16 +1824,53 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                                        side_effect=self._verify_run(status, calls=calls, pane_text=pane_text)), \
                      mock.patch("builtins.print") as print_mock:
                     rc = peer_steward.main(["prompt", "child", "[steer] go"])
-                self.assertEqual(rc, 1)
+                self.assertEqual(rc, 3)
                 self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]],
                                  "nothing may be typed into an open form")
-                self.assertIn("prompted=failed", print_mock.call_args[0][0])
+                self.assertIn("prompted=queued", print_mock.call_args[0][0])
                 self.assertIn("reason=target-form-open", print_mock.call_args[0][0])
                 rec = self._all_records()[-1]
-                self.assertEqual(rec["delivery"]["status"], "failed")
+                self.assertEqual(rec["delivery"]["status"], "unknown")
                 self.assertIn("reason=target-form-open", rec["delivery"]["receipt"])
                 self.assertEqual(rec["to"]["pane"], "w1:pX")
 
+
+    def test_form_closed_normal_retry_reuses_ref_and_actual_receiver_ack(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        refs = []
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "recipient", "child")), \
+             mock.patch.object(peer_steward, "_from_name", return_value="sender"), \
+             mock.patch.object(peer_steward, "_agent_state", side_effect=[("blocked", "w1:pX"), ("idle", "w1:pX")]), \
+             mock.patch.object(peer_steward, "_form_open", return_value=False), \
+             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as sent, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "original body", "--no-verify"]), 3)
+            refs.append(self._all_records()[-1]["transfer_ref"])
+            sent.assert_not_called() # Even --no-verify never types into a form.
+            self.assertEqual(peer_steward.main(["prompt", "child", "original body"]), 0)
+            refs.append(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual(refs[0], refs[1])
+        sent.assert_called_once()
+        text = sent.call_args.args[1]
+        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "pending")
+        peer_steward.peer_message.receive_peer_message(text, {"harness": "claude", "session_id": "recipient"})
+        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received")
+
+    def test_form_unknown_target_keeps_private_unverified_without_attaching_sid(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sender"
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("opencode", None, "same-name")), \
+             mock.patch.object(peer_steward, "_agent_state", return_value=("blocked", "w1:pX")), \
+             mock.patch.object(peer_steward, "_herdr_prompt") as sent, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "same-name", "original body"]), 5)
+        sent.assert_not_called()
+        ref = self._all_records()[-1]["transfer_ref"]
+        row = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "unverified")
+        self.assertIsNone(row["to"]["session_id"])
+        self.assertEqual(peer_steward.peer_message.pending_messages({"harness": "opencode", "session_id": "fork"}), [])
     def test_transcript_arrival_accepts_queued_rows_and_survives_a_stale_session_id(self):
         """Measured 2026-09-06 06:25Z: a mid-turn send lands in the target
         transcript as `queue-operation`/`enqueue` first; and herdr reported a

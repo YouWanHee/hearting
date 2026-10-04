@@ -1108,6 +1108,11 @@ JSON object per line, schema `peer_message_v1`: `schema_version=1`, a 16-hex `me
 `to{harness,session_id|name}`, `kind`, `summary` (hard-truncated to 200 chars, never the
 full message), `body_sha256` (sha256 of the complete body, never itself stored),
 `delivery{surface,status,receipt}`, `refs[]`. No field carries the message body.
+Only a form-blocked, undelivered transfer retains its bounded body in the private
+runtime `peer-messages/pending/` directory (0700, payload/lock files 0600).
+It is bound to the immutable transfer ref, actual sender/recipient and digest,
+not a public ledger field. Receipt removes the private body and retains the ref
+for replay deduplication; unknown, stale or ambiguous identities keep their binding.
 
 **v56 runtime table** (herdr-unified; supersedes the v50 native-messaging-expansion plan).
 The user decided 2026-09-02 not to extend native peer messaging to Codex; the common
@@ -1146,7 +1151,19 @@ prints `prompted=true` only after the submission was observed, and every other v
 `failed` (exit 1), `queued` (exit 3, our text still sits in the target's input), `unverified`
 (exit 5, nothing could be observed) — never `true` from herdr's exit code alone. Before any send the
 visible pane is scanned for a selection/permission form (AskUserQuestion, permission prompt) in
-every state, and a `blocked` target or an open form is refused as `failed reason=target-form-open`:
+every state. A `blocked` target or an open form receives no keyboard input. Its
+undelivered message is retained as a bounded private runtime payload tied to the
+existing immutable transfer ref, sender, exact recipient session and body digest;
+the public ledger continues to store only digest/summary. A still-pending retry
+of that same sender/recipient/body reuses the ref. A fork, changed SID or different
+body has a separate transfer. Queue acceptance is `queued`, ambiguous transport is
+`unverified`, and neither is delivery or consumption. Only exact native history
+or the existing receiver's observation of the bound ref acknowledges receipt.
+Normal receiver callbacks may retry supported transports without typing into a
+form or changing its answer; callback stdout/system context alone is not an ack.
+An unavailable transport or callback without an actual ack keeps the payload
+pending and reports that limitation, without a watcher, forced key or new gate.
+The original refusal evidence remains:
 measured 2026-09-06, text typed into an open form is lost and the Enter answers the form with its
 default. A target that is not working is sent with `herdr agent prompt --wait --until working`
 (bound clamped to herdr's 5000 ms stall floor) and must flip state (`agent_prompt_stalled` →

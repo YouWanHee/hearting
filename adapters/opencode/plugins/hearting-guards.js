@@ -354,6 +354,74 @@ function spawnPeerNotice(sid, prompt, cwd) {
   } catch {}
 }
 
+// Pending transport uses the current plugin client and exact callback SID. It
+// never touches the TUI draft or system-transform output. Acceptance is queued;
+// only persisted exact text followed by a completed assistant turn acknowledges.
+function pendingPeerCommand(sid, options = []) {
+  if (!sid) return null
+  const result = spawnSync("python3", [path.join(root, "utilities", "peer-message.py"),
+    "pending", "--to-harness", "opencode", "--to-session-id", sid, ...options], {
+    cwd: root, env: { ...process.env, AGENT_HOME: root }, encoding: "utf8", timeout: 1500,
+  })
+  if (result.error || result.status !== 0) return null
+  try { return JSON.parse(result.stdout || "null") } catch { return null }
+}
+
+const pendingPeerBusy = new Set()
+async function pendingPeerDelivery(ctx, sid) {
+  if (!sid || pendingPeerBusy.has(sid) || isWorkerSession()) return
+  const client = ctx.client?.session
+  if (typeof client?.messages !== "function" || typeof client?.prompt !== "function") return
+  pendingPeerBusy.add(sid)
+  let timer
+  const bounded = async (call) => {
+    try {
+      return await Promise.race([call, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("peer-context-timeout")), 1000)
+      })])
+    } finally { clearTimeout(timer) }
+  }
+  try {
+    const rows = pendingPeerCommand(sid)
+    if (!Array.isArray(rows) || !rows.length) return
+    const response = await bounded(client.messages({ path: { id: sid } }))
+    const messages = response?.data
+    if (!Array.isArray(messages)) return
+    for (const row of rows.slice(0, 3)) {
+      const matches = messages.filter((m) => m?.info?.sessionID === sid && m.info.role === "user"
+        && promptText(m) === row.text)
+      if (matches.length > 1) continue // Ambiguous history is never an exact receipt.
+      if (matches.length === 1) {
+        const mid = matches[0].info.id
+        if (!mid || (row.actual_message_id && row.actual_message_id !== mid)) continue
+        const consumed = messages.some((m) => m?.info?.sessionID === sid && m.info.role === "assistant"
+          && m.info.parentID === mid && typeof m.info.time?.completed === "number" && !m.info.error)
+        if (consumed) {
+          // Ack uses actual persisted history, independent of callback output.
+          spawnSync("python3", [path.join(root, "utilities", "peer-message.py"), "receive",
+            "--to-harness", "opencode", "--to-session-id", sid,
+            "--from-project", path.basename(baseDir(ctx))], {
+            cwd: root, env: { ...process.env, AGENT_HOME: root },
+            input: row.text, encoding: "utf8", timeout: 1500,
+          })
+        }
+        continue // Existing persisted text must never be inserted a second time.
+      }
+      const claimed = pendingPeerCommand(sid, ["--claim", row.ref])
+      if (!claimed) continue
+      const accepted = await bounded(client.prompt({ path: { id: sid }, body: {
+        noReply: true, parts: [{ type: "text", text: claimed.text }],
+      }}))
+      if (accepted?.data?.info?.sessionID === sid && accepted.data.info.role === "user"
+          && typeof accepted.data.info.id === "string" && accepted.data.info.id
+          && promptText(accepted.data) === claimed.text) {
+        pendingPeerCommand(sid, ["--queued", claimed.ref, "--message-id", accepted.data.info.id])
+      }
+    }
+  } catch { /* Inflight/ambiguous payload remains unverified; no resend loop. */ }
+  finally { pendingPeerBusy.delete(sid) }
+}
+
 function promptText(output) {
   if (typeof output?.message?.content === "string") return output.message.content
   if (!Array.isArray(output?.parts)) return ""
@@ -399,6 +467,7 @@ export const AgentHarnessGuards = async (ctx) => {
         projectPane(eventSid)
       }
       spawnCheckpoint(eventSid)
+      await pendingPeerDelivery(ctx, eventSid)
       // Liveness side-channel: touch the heartbeat for the active dispatch slug
       // so dispatch-liveness.py can detect stale/crashed headless sessions even
       // when the OpenCode SQLite session mtime is inconclusive.
@@ -427,7 +496,15 @@ export const AgentHarnessGuards = async (ctx) => {
     const prompt = promptText(output)
     const turn = input.messageID || output?.message?.id || ""
     if (prompt) promptBySession.set(sid, prompt)
-    if (prompt && eventSid) spawnPeerNotice(eventSid, prompt, baseDir(ctx))
+    // Actual peer receipt is observed after persistence, not callback rendering.
+    if (prompt && eventSid && prompt.includes("peer-from:")) {
+      // Ordinary manual sends retain their existing notice path. Pending refs
+      // are acknowledged by the persisted-context observation at normal idle.
+      const rows = pendingPeerCommand(eventSid)
+      if (Array.isArray(rows) && !rows.some((row) => row.text === prompt)) {
+        spawnPeerNotice(eventSid, prompt, baseDir(ctx))
+      }
+    }
     if (turn) turnBySession.set(sid, turn)
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
@@ -519,6 +596,7 @@ export const AgentHarnessGuards = async (ctx) => {
     for (const file of files) {
       if (isDesignHtml(file)) runPreflight("design", [file])
     }
+    await pendingPeerDelivery(ctx, input.sessionID || "")
     // Record actual spec reads for workflow and display evidence.
     // Non-blocking: a marker failure must never abort a successful read.
     const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""

@@ -385,28 +385,26 @@ def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) 
         spec = importlib.util.spec_from_file_location("_peer_message", str(tool))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        trailer = mod.parse_peer_trailer(current_prompt, {"harness": "codex", "session_id": sid})
-        if not trailer:
-            return
-        args = [
-            sys.executable, str(tool), "record",
-            "--from-harness", trailer.get("harness") or "unknown",
-            "--from-session-id", trailer.get("session_id") or "",
-            "--from-project", os.path.basename(current_cwd.rstrip("/")) if current_cwd else "",
-            "--to-harness", "codex",
-            "--to-session-id", sid,
-            "--kind", "notice", "--surface", "herdr", "--status", "received",
-            "--body-stdin",
-        ]
-        if trailer.get("name"):
-            args += ["--from-name", trailer["name"]]
-        env = os.environ.copy()
-        env["AGENT_HOME"] = str(ROOT)
-        subprocess.run(args, input=b"herdr steer received", cwd=str(ROOT), env=env,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=5, check=False)
+        mod.receive_peer_message(current_prompt, {"harness": "codex", "session_id": sid},
+                                 os.path.basename(current_cwd.rstrip("/")) if current_cwd else "",
+                                 summary_text="herdr steer received")
+
     except Exception:
         return
+
+
+def retry_pending_peer(sid: str) -> None:
+    if not sid:
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_pending_peer", ROOT / "utilities" / "peer-message.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for row in mod.pending_messages({"harness": "codex", "session_id": sid})[:3]:
+            mod.deliver_pending_codex(row["ref"], timeout=0.25)
+    except Exception:
+        pass
 
 
 def main() -> int:
@@ -433,6 +431,7 @@ def main() -> int:
     sid = session_id(payload)
     current_prompt = nested_string(payload, "prompt")
     peer_notice(payload, current_prompt, current_cwd)
+    retry_pending_peer(interaction_sid)
     if interaction_sid:
         launch_trigger(
             "codex", interaction_sid, "initial", anchor_text=current_prompt
