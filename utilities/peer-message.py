@@ -197,8 +197,10 @@ def _pending_dir():
 
 
 @contextlib.contextmanager
-def pending_lock():
-    path = _pending_dir() / ".lock"
+def pending_lock(key="prepare"):
+    if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9-]{1,80}", key):
+        raise ValueError("peer-pending-lock-key-invalid")
+    path = _pending_dir() / (".lock-" + key)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
@@ -281,45 +283,80 @@ def _save_pending(row):
             os.unlink(tmp)  # Own temporary payload only.
 
 
+def _pending_rows():
+    diagnosed = 0
+    for path in sorted(_pending_dir().glob("*.json")):
+        try:
+            row = _read_pending(path.stem)
+        except (OSError, ValueError):
+            # Preserve the damaged file without ack; unrelated valid refs proceed.
+            if diagnosed < 3:
+                ref = path.stem if re.fullmatch(r"[0-9a-f]{32}", path.stem) else "invalid-ref"
+                print(f"peer-pending-invalid ref={ref}", file=sys.stderr)
+                diagnosed += 1
+            continue
+        if row and row["state"] != "received":
+            yield row
+
+
 def pending_messages(recipient):
     """Read exact SID-bound payloads. No alias/pane retargeting or rendering ack."""
     if not _valid_transfer_endpoint(recipient):
         return []
     rows = []
-    for path in sorted(_pending_dir().glob("*.json")):
-        row = _read_pending(path.stem)
-        if (row and row["state"] != "received"
-                and all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id"))):
+    for row in _pending_rows():
+        if all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id")):
             rows.append(row)
     return rows
 
 
 def prepare_peer_message(body, sender, recipient, *, defer=False, refs=()):
-    """A retry reuses a still-pending intent; ordinary messages keep the old contract."""
+    """A retry reuses a pending intent; ordinary sends need no preparation lock."""
     endpoints_verified = _valid_transfer_endpoint(sender) and _valid_transfer_endpoint(recipient)
-    with pending_lock():
-        body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
-        for row in pending_messages(recipient):
-            if (all(row["from"].get(k) == sender.get(k) for k in ("harness", "session_id"))
+    body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
+
+    def existing():
+        for row in _pending_rows():
+            if (all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id"))
+                    and all(row["from"].get(k) == sender.get(k) for k in ("harness", "session_id"))
+                    and (recipient.get("session_id") is not None or row["to"].get("name") == recipient.get("name"))
+                    and (sender.get("session_id") is not None or row["from"].get("name") == sender.get("name"))
                     and row.get("source_sha256") == body_hash):
                 return row["text"], row["ref"]
+        return None
+
+    if not defer:
+        # An ordinary send is not gated by an unrelated pending writer.
+        try:
+            found = existing()
+        except (OSError, ValueError):
+            found = None
+        return found or _prepare_peer_message(body, sender, recipient)
+    key = json.dumps([[e.get("harness"), e.get("session_id"),
+                       e.get("name") if e.get("session_id") is None else None]
+                      for e in (sender, recipient)] + [body_hash], ensure_ascii=False)
+    with pending_lock("prepare-" + hashlib.sha256(key.encode()).hexdigest()):
+        found = existing()
+        if found:
+            return found
         text, ref = _prepare_peer_message(body, sender, recipient)
-        if defer:
-            if len(text.encode("utf-8")) > _PENDING_BYTES:
-                raise ValueError("peer-pending-body-oversized")
-            _save_pending({"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),
-                "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                "source_sha256": body_hash, "refs": list(refs), "created": time.time(),
-                "state": "pending" if endpoints_verified else "unverified", "text": text,
-                "receipt": "target-form-open" if endpoints_verified else "peer-endpoint-unverified"})
+        if len(text.encode("utf-8")) > _PENDING_BYTES:
+            raise ValueError("peer-pending-body-oversized")
+        _save_pending({"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),
+            "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "source_sha256": body_hash, "refs": list(refs), "created": time.time(),
+            "state": "pending" if endpoints_verified else "unverified", "text": text,
+            "receipt": "target-form-open" if endpoints_verified else "peer-endpoint-unverified"})
         return text, ref
 
 
 def deliver_pending_codex(ref, *, timeout=1.0):
-    """One normal callback/send, no watcher, keyboard input or ambiguous resend."""
+    """Claim/publish briefly; all external RPC runs outside metadata locks."""
     from codex_queue_delivery import send_at_least_once, QueueDeliveryError
     from codex_queue_dispatch import resolve_queue_socket
-    with pending_lock():
+    from dispatch_contract import process_start_ticks, process_identity_disposition
+    token = secrets.token_hex(16)
+    with pending_lock(ref):
         row = _read_pending(ref)
         if not row:
             return {"status": "unsupported", "reason": "peer-pending-missing"}
@@ -329,31 +366,57 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             return {"status": "unverified", "reason": "peer-endpoint-unverified"}
         if row["to"]["harness"] != "codex":
             return {"status": "unsupported", "reason": "peer-native-queue-unavailable"}
-        try:
-            result = send_at_least_once(resolve_queue_socket(),
-                thread_id=row["to"]["session_id"], client_message_id="delivery-peer-" + ref,
-                message=row["text"], timeout=timeout, allow_restart=False,
-                retry_ambiguous=False, allow_add=row["state"] == "pending", require_message_match=True,
-                before_add=lambda: _save_pending(dict(row, state="unverified", receipt="native-queue-inflight")))
-        except (QueueDeliveryError, OSError, ValueError, RuntimeError) as exc:
-            ambiguous = getattr(exc, "ambiguous", False)
-            if ambiguous:
-                _save_pending(dict(row, state="unverified", receipt="native-queue-ambiguous"))
-            return {"status": "unverified", "reason": str(exc)}
+        claim = row.get("rpc_claim")
+        if claim:
+            if (not isinstance(claim, dict) or type(claim.get("pid")) is not int
+                    or process_identity_disposition(claim["pid"], claim.get("start", "")) != "dead"):
+                return {"status": "unverified", "reason": "peer-native-inflight"}
+        claim = {"token": token, "pid": os.getpid(), "start": process_start_ticks(os.getpid())}
+        _save_pending(dict(row, rpc_claim=claim))
+
+    def before_add():
+        with pending_lock(ref):
+            current = _read_pending(ref)
+            if not current or current["state"] == "received" or (current.get("rpc_claim") or {}).get("token") != token:
+                raise QueueDeliveryError("peer-claim-changed-before-add")
+            _save_pending(dict(current, state="unverified", receipt="native-queue-inflight"))
+
+    error = None
+    try:
+        result = send_at_least_once(resolve_queue_socket(),
+            thread_id=row["to"]["session_id"], client_message_id="delivery-peer-" + ref,
+            message=row["text"], timeout=timeout, allow_restart=False,
+            retry_ambiguous=False, allow_add=row["state"] == "pending", require_message_match=True,
+            before_add=before_add)
+    except (QueueDeliveryError, OSError, ValueError, RuntimeError) as exc:
+        error = exc
+
+    with pending_lock(ref):
+        current = _read_pending(ref)
+        if not current:
+            return {"status": "unverified", "reason": "peer-pending-missing-after-rpc"}
+        if current["state"] == "received":
+            return {"status": "received", "reason": "exact-peer-ref"}
+        if (current.get("rpc_claim") or {}).get("token") != token:
+            return {"status": "unverified", "reason": "peer-claim-changed-after-rpc"}
+        if error is not None:
+            state = "unverified" if getattr(error, "ambiguous", False) else current["state"]
+            _save_pending(dict(current, state=state, rpc_claim=None))
+            return {"status": "unverified", "reason": str(error)}
         if result["status"] == "consumed":
-            # Exact native history is an actual receive observation, unlike acceptance.
-            trailer = parse_peer_trailer(row["text"], row["to"], include_ref=True)
-            rc = 0 if _peer_notice_exists(ref, row["to"]) else cmd_record(argparse.Namespace(from_harness=row["from"]["harness"],
-                from_session_id=row["from"]["session_id"], from_name=row["from"].get("name"), from_project="",
-                to_harness="codex", to_session_id=row["to"]["session_id"], to_name=None,
-                kind="notice", surface="codex-queue", status="received", receipt="exact-native-history",
-                ref=[ref, *row["refs"]], transfer_ref=trailer.get("transfer_ref"),
-                body_file=None, body_stdin=False))
+            # Native input consumption is a transport observation, not semantic understanding.
+            rc = 0 if _peer_notice_exists(ref, row["to"]) else cmd_record(argparse.Namespace(
+                from_harness=row["from"]["harness"], from_session_id=row["from"]["session_id"],
+                from_name=row["from"].get("name"), from_project="", to_harness="codex",
+                to_session_id=row["to"]["session_id"], to_name=None, kind="notice", surface="codex-queue",
+                status="received", receipt="exact-native-history", ref=[ref, *row["refs"]],
+                transfer_ref=ref, body_file=None, body_stdin=False))
             if rc:
+                _save_pending(dict(current, rpc_claim=None))
                 return {"status": "unverified", "reason": "peer-receive-ledger-unavailable"}
-            _save_pending(dict(row, state="received", text=None, receipt="exact-native-history"))
+            _save_pending(dict(current, state="received", text=None, rpc_claim=None, receipt="exact-native-history"))
             return {"status": "received", "reason": "exact-native-history"}
-        _save_pending(dict(row, state="queued", receipt="native-queue-accepted"))
+        _save_pending(dict(current, state="queued", rpc_claim=None, receipt="native-queue-accepted"))
         return {"status": "queued", "reason": "native-queue-accepted"}
 
 
@@ -441,7 +504,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
     if not trailer or not usable_session_id(recipient.get("session_id")):
         return 0
     ref = trailer.get("transfer_ref")
-    with pending_lock():
+    with pending_lock(ref or "legacy-receive"):
         pending = _read_pending(ref) if ref else None
         if pending and pending["state"] == "received":
             return 0
@@ -454,7 +517,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
             ref=[ref, *(pending.get("refs", []) if pending else [])] if ref else [], transfer_ref=ref,
             body_file=None, body_stdin=False, body_text=summary_text))
         if rc == 0 and pending:
-            _save_pending(dict(pending, state="received", text=None))
+            _save_pending(dict(pending, state="received", text=None, rpc_claim=None))
         return rc
 
 
@@ -465,10 +528,10 @@ def cmd_receive(args):
 
 def cmd_pending(args):
     recipient = {"harness": args.to_harness, "session_id": args.to_session_id}
-    with pending_lock():
-        if not args.claim and not args.queued:
-            print(json.dumps(pending_messages(recipient)[:5], ensure_ascii=False))
-            return 0
+    if not args.claim and not args.queued:
+        print(json.dumps(pending_messages(recipient)[:5], ensure_ascii=False))
+        return 0
+    with pending_lock(args.claim or args.queued):
         row = _read_pending(args.claim or args.queued)
         if not row or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id")):
             return 1

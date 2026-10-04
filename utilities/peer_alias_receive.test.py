@@ -328,6 +328,30 @@ class PendingCallbacks(unittest.TestCase):
     setUp = AliasReceive.setUp
     rows = AliasReceive.rows
 
+    def test_opencode_peer_identity_publication_requires_exact_sdk_top_level_session(self):
+        js = r'''
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
+const start = source.indexOf("async function projectPane(");
+const end = source.indexOf("\nfunction collectPreflight", start);
+const commands = [];
+const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
+  spawn: (exe, args) => {commands.push(args);return {unref() {}}}, herdrProjection: "fixture-projector",
+  root: "fixture-root", setTimeout, clearTimeout};
+vm.runInNewContext(source.slice(start, end), scope);
+for (const data of [{id: "exact"}, {id: "foreign"}, {id: "exact", parentID: "child"}]) {
+  await scope.projectPane("exact", {client: {session: {get: async () => ({data})}}});
+}
+console.log(JSON.stringify(commands));
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        commands = json.loads(run.stdout)
+        self.assertEqual(commands[0], ["fixture-projector", "--harness", "opencode", "--session-id", "exact"])
+        self.assertTrue(all(command[-1] == "--no-report-session" for command in commands[1:]))
+
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''
 import { pathToFileURL } from "node:url";

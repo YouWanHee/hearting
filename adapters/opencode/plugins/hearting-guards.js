@@ -214,11 +214,21 @@ function spawnCheckpoint(sid) {
 // OpenCode has no user-configurable status line, so the pane header is the only place
 // this session can say which session it is -- and it must say it in the same shape the
 // other two harnesses do. Fire-and-forget: a turn never waits on a display projection.
-function projectPane(sid) {
+async function projectPane(sid, ctx) {
   if (!sid || isWorkerSession() || !process.env.HERDR_PANE_ID) return
+  let timer
+  let verified = false
   try {
-    const child = spawn("python3", [herdrProjection, "--harness", "opencode",
-      "--session-id", sid], {
+    if (typeof ctx?.client?.session?.get === "function") {
+      const result = await Promise.race([ctx.client.session.get({ path: { id: sid } }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("peer-identity-timeout")), 500) })])
+      verified = result?.data?.id === sid && !result.data.parentID
+    }
+  } catch {} finally { clearTimeout(timer) }
+  try {
+    const args = [herdrProjection, "--harness", "opencode", "--session-id", sid]
+    if (!verified) args.push("--no-report-session")
+    const child = spawn("python3", args, {
       cwd: root,
       env: { ...process.env, AGENT_HOME: root },
       detached: true,
@@ -464,7 +474,7 @@ export const AgentHarnessGuards = async (ctx) => {
       const eventSid = (event.properties && event.properties.sessionID) || ""
       if (!isWorkerSession()) {
         spawnSummary(eventSid, "final")
-        projectPane(eventSid)
+        await projectPane(eventSid, ctx)
       }
       spawnCheckpoint(eventSid)
       await pendingPeerDelivery(ctx, eventSid)
@@ -491,7 +501,7 @@ export const AgentHarnessGuards = async (ctx) => {
     const eventSid = input.sessionID || output?.message?.sessionID || ""
     const sid = eventSid || "opencode-plugin"
     spawnSummary(eventSid, "initial")
-    projectPane(eventSid)
+    await projectPane(eventSid, ctx)
     sd111SessionSweep(sid)
     const prompt = promptText(output)
     const turn = input.messageID || output?.message?.id || ""

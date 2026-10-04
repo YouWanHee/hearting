@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import threading
 from unittest import mock
 from pathlib import Path
 
@@ -726,11 +727,38 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "oversized"):
             self.pending("x" * 16384)
 
-    def test_concurrent_claim_is_nonblocking_and_never_rebinds(self):
-        with peer_message.pending_lock():
+    def test_same_ref_claim_is_nonblocking_without_blocking_other_recipient(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending()
+        other = dict(self.recipient, session_id="other-recipient")
+        with peer_message.pending_lock(ref):
             with self.assertRaises(BlockingIOError):
-                self.pending()
-        self.assertEqual(peer_message.pending_messages(self.recipient), [])
+                peer_message.deliver_pending_codex(ref)
+            ordinary = peer_message.prepare_peer_message("ordinary body", self.sender, other)
+            deferred = peer_message.prepare_peer_message("deferred body", self.sender, other, defer=True)
+            with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}):
+                self.assertEqual(peer_message.deliver_pending_codex(deferred[1])["status"], "queued")
+        self.assertTrue(ordinary[0].startswith("ordinary body"))
+        self.assertEqual(peer_message._read_pending(ref)["text"], text)
+
+    def test_unrelated_damaged_row_does_not_block_healthy_prepare_or_drain(self):
+        text, ref = self.pending()
+        damaged = peer_message._pending_dir() / ("0" * 32 + ".json")
+        damaged.write_text("malformed original")
+        damaged.chmod(0o600)
+        recipient = dict(self.recipient, session_id="other")
+        with mock.patch("builtins.print") as diagnostic:
+            ordinary = peer_message.prepare_peer_message("healthy ordinary", self.sender, recipient)
+            deferred = peer_message.prepare_peer_message("healthy deferred", self.sender, recipient, defer=True)
+        self.assertTrue(any(call.args == ("peer-pending-invalid ref=" + "0" * 32,)
+                            for call in diagnostic.call_args_list))
+        with self.assertRaises(ValueError):
+            peer_message.deliver_pending_codex("0" * 32) # Exact-ref refusal stays strict.
+        self.assertTrue(ordinary[0].startswith("healthy ordinary"))
+        self.assertEqual([r["ref"] for r in peer_message.pending_messages(recipient)], [deferred[1]])
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        self.assertEqual(damaged.read_text(), "malformed original")
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
 
     def test_acceptance_stays_queued_and_disables_restart_and_ambiguous_retry(self):
         import codex_queue_delivery as queue
@@ -814,6 +842,61 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
             peer_message.deliver_pending_codex(ref)
         self.assertFalse(send.call_args.kwargs["allow_add"])
+
+    def test_unknown_pending_retry_reuses_original_ref_without_attaching_new_sid(self):
+        unknown = {"harness": "opencode", "session_id": None, "name": "original-name"}
+        text, ref = peer_message.prepare_peer_message("unknown peer", self.sender, unknown, defer=True)
+        self.assertEqual(peer_message.prepare_peer_message("unknown peer", self.sender, unknown, defer=True), (text, ref))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        self.assertEqual(peer_message.pending_messages(dict(unknown, session_id="new-fork")), [])
+        different = dict(unknown, name="different-name")
+        self.assertNotEqual(peer_message.prepare_peer_message("unknown peer", self.sender, different, defer=True)[1], ref)
+
+    def test_two_recipient_rpc_and_receive_race_do_not_block_or_resurrect_payload(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending()
+        entered, finish = threading.Event(), threading.Event()
+        results = []
+        def rpc(*args, **kwargs):
+            if kwargs["client_message_id"] == "delivery-peer-" + ref:
+                entered.set()
+                self.assertTrue(finish.wait(3))
+            return {"status": "queued"}
+        with mock.patch.object(queue, "send_at_least_once", side_effect=rpc) as send:
+            worker = threading.Thread(target=lambda: results.append(peer_message.deliver_pending_codex(ref)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertEqual(peer_message.deliver_pending_codex(ref)["reason"], "peer-native-inflight")
+                other = dict(self.recipient, session_id="other-live-rpc")
+                ordinary = peer_message.prepare_peer_message("ordinary peer", self.sender, other)
+                deferred = peer_message.prepare_peer_message("deferred peer", self.sender, other, defer=True)
+                self.assertTrue(ordinary[0].startswith("ordinary peer"))
+                self.assertEqual(peer_message.deliver_pending_codex(deferred[1])["status"], "queued")
+                # Actual receiver acknowledgment while the RPC is inflight wins
+                # the compare-and-publish; the later queued result cannot undo it.
+                peer_message.receive_peer_message(text, self.recipient)
+            finally:
+                finish.set(); worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(send.call_count, 2)
+        self.assertEqual(results[0]["status"], "received")
+        self.assertIsNone(peer_message._read_pending(ref)["text"])
+
+    def test_changed_claim_after_rpc_is_not_overwritten(self):
+        import codex_queue_delivery as queue
+        text, ref = self.pending()
+        def changed(*args, **kwargs):
+            with peer_message.pending_lock(ref):
+                row = peer_message._read_pending(ref)
+                peer_message._save_pending(dict(row, rpc_claim=dict(row["rpc_claim"], token="different")))
+            return {"status": "queued"}
+        with mock.patch.object(queue, "send_at_least_once", side_effect=changed):
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["reason"], "peer-claim-changed-after-rpc")
+        row = peer_message._read_pending(ref)
+        self.assertEqual(row["rpc_claim"]["token"], "different")
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["text"], text)
 
 
 if __name__ == "__main__":
