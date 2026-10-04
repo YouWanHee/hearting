@@ -38,6 +38,7 @@ class ResourceRunFleetTest(unittest.TestCase):
 
     def tearDown(self):
         render.set_show_all(False)
+        render.set_process_view(False)
 
     def test_json_uses_separate_type_and_all_restores_terminal_rows(self):
         live, ended = self.row("gpu-0"), self.row("gpu-1", "exited")
@@ -57,40 +58,52 @@ class ResourceRunFleetTest(unittest.TestCase):
         self.assertEqual({row["run_id"] for row in all_rows["resource_jobs"]},
                          {"gpu-0", "gpu-1"})
 
-    def test_tui_is_two_line_summary_and_terminal_toggle(self):
-        rows = [
-            self.row("gpu-0"), self.row("gpu-1"),
-            self.row("old", "exited"), self.row("stale", "stale"),
-        ]
-        compact = render._resource_rows(rows, "dispatch")
-        self.assertEqual(len(compact), 2)
-        text = flatten(compact)
-        for value in ("LAB RESOURCES", "2 visible", "working 2", "exited 0", "stale 0",
-                      "project/gpu-0", "project/gpu-1", "full-run", "12m"):
-            self.assertIn(value, text)
-        self.assertNotIn("old", text)
-        self.assertNotIn("train.log", text)  # detailed provenance remains JSON-only.
-        render.set_show_all(True)
-        all_compact = render._resource_rows(rows, "dispatch")
-        self.assertEqual(len(all_compact), 2)
-        shown = flatten(all_compact)
-        self.assertIn("4 visible", shown)
-        self.assertIn("working 2", shown)
-        self.assertIn("exited 1", shown)
-        self.assertIn("stale 1", shown)
-        self.assertIn("old", shown)
-        self.assertIn("+1 more", shown)
-
-    def test_tui_caps_run_summaries_at_three(self):
+    def test_top_level_lab_summary_is_absent_in_both_views(self):
         rows = [self.row("gpu-%d" % i) for i in range(5)]
-        compact = render._resource_rows(rows, "both")
-        self.assertEqual(len(compact), 2)
-        text = flatten(compact)
-        for run_id in ("gpu-0", "gpu-1", "gpu-2"):
-            self.assertIn("project/" + run_id, text)
-        self.assertNotIn("project/gpu-3", text)
-        self.assertNotIn("project/gpu-4", text)
-        self.assertIn("+2 more", text)
+        rows += [self.row("old", "exited"), self.row("stale", "stale")]
+        with mock.patch.object(render, "_COMPUTE_HOSTS", None):
+            for process in (False, True):
+                render.set_process_view(process)
+                for show_all in (False, True):
+                    render.set_show_all(show_all)
+                    for section in ("fleet", "dispatch", "both"):
+                        for width in (60, 120):
+                            with self.subTest(process=process, show_all=show_all,
+                                              section=section, width=width):
+                                baseline = render._build_lines(
+                                    [], [], section, width < 80, 0, term_width=width)
+                                actual = render._build_lines(
+                                    [], [], section, width < 80, 0,
+                                    term_width=width, resources=rows)
+                                self.assertEqual(actual, baseline)
+                                self.assertNotIn("LAB RESOURCES", flatten(actual))
+        self.assertEqual(len(rows), 7)
+
+    def test_gpu_process_progress_remains_visible_without_lab_summary(self):
+        snapshot = {"configured": True, "hosts": [{
+            "host": "cnn", "reachable": True, "gpus": [{
+                "index": 0, "name": "NVIDIA RTX 4090", "util_pct": 42,
+                "memory_used_mib": 12288, "memory_total_mib": 24576,
+                "processes": [{"pid": 42, "proc_start": "11",
+                    "used_memory_mib": 12288, "command": "python run.py --train",
+                    "progress": {"line": "raw JSON", "age_s": 0,
+                        "summary": "training-updates · baseline · successful 17808"}}],
+            }],
+        }]}
+        before = json.dumps(snapshot)
+        with mock.patch.object(render, "_COMPUTE_HOSTS", snapshot), \
+                mock.patch.object(render, "_COMPUTE_HOSTS_SET_AT", render.time.monotonic()):
+            for process in (False, True):
+                render.set_process_view(process)
+                with self.subTest(process=process):
+                    text = flatten(render._build_lines(
+                        [], [], "both", False, 0, term_width=120,
+                        resources=[self.row("gpu-0")]))
+                    self.assertIn("python run.py --train", text)
+                    self.assertIn("training-updates · baseline · successful 17808", text)
+                    self.assertNotIn("LAB RESOURCES", text)
+                    self.assertNotIn("raw JSON", text)
+        self.assertEqual(json.dumps(snapshot), before)
 
     def test_collector_keeps_multiple_runs_in_one_project(self):
         with tempfile.TemporaryDirectory() as td:

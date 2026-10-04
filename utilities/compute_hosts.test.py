@@ -993,6 +993,45 @@ class ProbeProgressTest(unittest.TestCase):
             child = self.spawn(out, out)
         self.assertEqual(self.progress(child)["line"], "a" * 200)
 
+    def test_json_progress_is_parsed_before_display_clipping_without_more_io(self):
+        record = {"utc": "2026-10-04T04:46:16Z", "metadata": "x" * 400,
+                  "phase": "training-updates", "arm": "baseline",
+                  "pid": 123, "attempt": 17808, "successful": 17808}
+        raw = json.dumps(record)
+        log = self.root / "json.log"
+        log.write_text(raw + "\n")
+        with log.open("ab") as out:
+            child = self.spawn(out, out)
+        with mock.patch.object(os, "pread", wraps=os.pread) as pread:
+            progress = self.progress(child)
+        pread.assert_called_once()
+        self.assertEqual(progress["line"], raw[:200])
+        self.assertEqual(progress["summary"],
+                         "training-updates · baseline · successful 17808")
+        self.assertNotIn("epoch", progress)
+
+    def test_json_progress_unknown_and_partial_records_keep_raw_fallback(self):
+        for raw in (b'{"phase":"train","step":', b'{"step":true}',
+                    b'{"step":-1}', b'{"step":1.5}', b'{"step":"3"}',
+                    b'{"step":1000000000000}', b'{"loss":0.4}',
+                    b'{"successful":1}\nnot a progress record', b'[]'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.ns["progress_json_summary"](raw))
+        self.assertEqual(self.ns["progress_json_summary"](
+            b'{"phase":"train","epoch":0,"global_step":17}'),
+            "train · epoch 0 · global_step 17")
+
+    def test_json_progress_control_only_labels_do_not_break_collection(self):
+        log = self.root / "control-labels.log"
+        log.write_text(json.dumps({"phase": "\x00", "arm": "\u200b",
+                                   "successful": 17808}) + "\n")
+        with log.open("ab") as out:
+            child = self.spawn(out, out)
+        self.assertEqual(self.progress(child)["summary"], "successful 17808")
+        self.assertEqual(self.ns["progress_json_summary"](
+            b'{"phase":"\\u0000","arm":"baseline","step":9}'),
+            "baseline · step 9")
+
     def test_pipe_tty_and_device_outputs_have_no_progress(self):
         piped = self.spawn(subprocess.PIPE, subprocess.DEVNULL)
         self.assertIsNone(self.progress(piped))
