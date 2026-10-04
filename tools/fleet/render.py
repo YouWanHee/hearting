@@ -4666,13 +4666,9 @@ def _gpu_process_rows(gpu, indent, width):
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
         row = [(indent + "    ", None), ("↳ ", "dim"), (command, "dim")]
         rows.append(_clip_segs(row, width)[0])
-        training_rows = _gpu_training_rows(process, indent, width)
-        if training_rows:
-            rows.extend(training_rows)
-        else:
-            progress = _gpu_progress_row(process, indent, width)
-            if progress:
-                rows.append(progress)
+        progress = _gpu_progress_row(process, indent, width)
+        if progress:
+            rows.append(progress)
     return rows
 
 
@@ -4688,6 +4684,33 @@ _PROGRESS_STALLED_S = 300
 _PROGRESS_BODY_CACHE = {}   # {(pid, line): immutable compact segments}; bounded below
 
 
+def _progress_fields_segments(phase, percent, count, left=None, metrics=()):
+    """One body grammar for observed tqdm fields and verified structured facts."""
+    parts = []
+    fields = [(phase, "resource_active") if phase else None,
+              ("%.0f%%" % percent, "lvl_g"), (count, "dim")]
+    for field in fields:
+        if field is not None:
+            if parts:
+                parts.append((" ", "dim"))
+            parts.append(field)
+    if left:
+        parts.extend(((" · ", "dim"), (left + " left", "dim")))
+    for index, (label, value) in enumerate(metrics):
+        value = str(value)
+        # Format loss presentation, leaving model names and non-loss metrics intact.
+        if label.lower() == "loss" or label.startswith("L_"):
+            try:
+                number = float(value)
+                if math.isfinite(number):
+                    value = "%.2e" % number
+            except (ValueError, OverflowError):
+                pass
+        parts.extend(((" · " if index == 0 else " ", "dim"),
+                      (label + "=", "dim"), (value, "resource_active")))
+    return tuple(parts)
+
+
 def _progress_body_segments(line):
     match = _PROGRESS_TQDM_RE.match(line)
     if not match:
@@ -4700,26 +4723,11 @@ def _progress_body_segments(line):
             return tuple(parts)
         return ((line, "dim"),)
     desc = match.group("desc").strip().rstrip(":").strip()[:24]
-    parts = []
-
-    fields = [(desc, "resource_active") if desc else None,
-              (match.group("pct") + "%", "lvl_g"), (match.group("count"), "dim")]
-    for field in fields:
-        if field is not None:
-            if parts:
-                parts.append((" ", "dim"))
-            parts.append(field)
     rest = match.group("rest")
     left = _PROGRESS_LEFT_RE.match(rest)
-    if left:
-        parts.extend(((" · ", "dim"), (left.group("left") + " left", "dim")))
-    metrics = _PROGRESS_METRIC_RE.findall(rest)[:2]
-    for index, metric in enumerate(metrics):
-        label, value = metric.split("=", 1)
-        if parts:
-            parts.append((" · " if index == 0 else " ", "dim"))
-        parts.extend(((label + "=", "dim"), (value, "resource_active")))
-    return tuple(parts) or ((line, "dim"),)
+    metrics = [metric.split("=", 1) for metric in _PROGRESS_METRIC_RE.findall(rest)[:2]]
+    return _progress_fields_segments(desc, float(match.group("pct")), match.group("count"),
+                                     left.group("left") if left else None, metrics)
 
 
 def _progress_body(line):
@@ -4748,12 +4756,17 @@ def _progress_epoch_segments(epoch):
     text = _progress_epoch(epoch)
     if text is None:
         return ()
-    number = epoch["n"]
-    parts = [("Epoch ", "dim"), (number, "resource_active")]
     total = epoch.get("of")
-    if isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7:
+    if not (isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7):
+        total = None
+    return _progress_epoch_fields(epoch["n"], total, epoch.get("done") is True)
+
+
+def _progress_epoch_fields(number, total=None, done=False):
+    parts = [("Epoch ", "dim"), (str(number), "resource_active")]
+    if total is not None:
         parts.extend((("/", "dim"), (str(total), "dim")))
-    if epoch.get("done") is True:
+    if done:
         parts.extend(((" ", "dim"), ("done", "lvl_g")))
     return tuple(parts)
 
@@ -4761,7 +4774,8 @@ def _progress_epoch_segments(epoch):
 def _progress_age(age_s):
     # Only a stall is worth a suffix: a live run rewrites its log every few seconds,
     # so a fresh age read "0s ago" on every frame and said nothing.
-    if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) or age_s < 0:
+    if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) \
+            or not math.isfinite(age_s) or age_s < 0:
         return None, None
     age_s = int(age_s)
     if age_s > _PROGRESS_STALLED_S:
@@ -4792,21 +4806,17 @@ def _clip_progress_segments(segs, width):
     return out
 
 
-def _gpu_training_rows(process, indent, width):
-    progress = process.get("progress")
-    training = progress.get("training") if isinstance(progress, dict) else None
+def _structured_progress_segments(training):
+    """Project only display facts; the full training observation stays unchanged."""
     if not isinstance(training, dict):
-        return []
+        return None
     attempt, total, successful, skipped = (training.get(key) for key in
         ("attempt", "attempt_total", "successful", "skipped"))
     if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
                for value in (attempt, total, successful, skipped)) \
             or total <= 0 or attempt > total or attempt != successful + skipped:
-        return []
-    labels = [_gpu_safe_text(training.get(key)).strip() for key in ("phase", "arm")]
-    step = [("Step(attempt) ", "dim"),
-            ("%s/%s" % (format(attempt, ","), format(total, ",")), "resource_active"),
-            (" (%.2f%%)" % (attempt * 100.0 / total), "lvl_g")]
+        return None
+    count, denominator = attempt, total
     epoch = training.get("schedule_epoch")
     epoch_segs = []
     if isinstance(epoch, dict):
@@ -4815,32 +4825,18 @@ def _gpu_training_rows(process, indent, width):
         if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
                for value in (current, epochs, span)) and epochs > 0 and span > 0 \
                 and epochs * span == total and current == (attempt + span - 1) // span:
-            state = "start" if attempt == 0 else "done" if attempt % span == 0 else "partial"
-            epoch_segs = [("Epoch(schedule) ", "dim"), ("%d/%d" % (current, epochs), "resource_active"),
-                          (" (%s)" % state, "lvl_g" if state == "done" else "dim")]
-    prefix = [(indent + "      ", None), ("↳ ", "dim")]
-    room = width - sum(_dw(text) for text, _key in prefix)
-    body = epoch_segs + [(" · ", "dim")] + step if epoch_segs else step
-    if epoch_segs and sum(_dw(text) for text, _key in body) > room:
-        body = step + [(" · ", "dim")] + epoch_segs
-    if any(labels):
-        body += [(" · " + " · ".join(label for label in labels if label), "dim")]
+            epoch_segs = _progress_epoch_fields(current, epochs)
+            # At a boundary, show the interval just completed, not the next zero.
+            count = (attempt - 1) % span + 1 if attempt else 0
+            denominator = span
     metrics = []
     loss = training.get("loss")
     if isinstance(loss, (int, float)) and not isinstance(loss, bool) and math.isfinite(loss):
-        metrics = [("Loss(last batch) ", "dim"), ("%.2e" % loss, "lvl_y"), (" · ", "dim")]
-    metrics += [("successful %s · skipped %s" % (format(successful, ","), format(skipped, ",")), "dim")]
-    age = training.get("progress_age_s")
-    age_text = ""
-    if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age >= 0:
-        age_text = "progress %ds ago" % int(age) if age < 120 else "progress %dm ago" % (age // 60)
-    suffix = [(" · " + age_text, "lvl_y" if age >= _PROGRESS_STALLED_S else "dim")] if age_text else []
-    # Keep current/total and last-batch metrics on separate rows so a normal
-    # terminal can show both. Progress age keeps its space when metrics clip.
-    room = width - sum(_dw(text) for text, _key in prefix + suffix)
-    return [_clip_segs(prefix + body, width)[0],
-            _clip_segs(prefix + _clip_progress_segments(metrics, max(0, room))
-                       + suffix, width)[0]]
+        metrics = [("loss", loss)]
+    phase = _gpu_safe_text(training.get("phase")).strip()[:24]
+    body = _progress_fields_segments(phase, count * 100.0 / denominator,
+                                     "%d/%d" % (count, denominator), metrics=metrics)
+    return body, epoch_segs
 
 
 def _gpu_progress_row(process, indent, width):
@@ -4848,22 +4844,33 @@ def _gpu_progress_row(process, indent, width):
     progress = process.get("progress")
     if not isinstance(progress, dict):
         return None
-    summary = _gpu_safe_text(progress.get("summary")).strip()
-    line = summary or _gpu_safe_text(progress.get("line")).strip()
-    if not line:
-        return None
-    key = (process.get("pid"), line)
-    body = _PROGRESS_BODY_CACHE.get(key)
-    if body is None:
-        if len(_PROGRESS_BODY_CACHE) >= 256:
-            _PROGRESS_BODY_CACHE.clear()
-        body = _PROGRESS_BODY_CACHE[key] = _progress_body_segments(line)
-    epoch = () if summary else _progress_epoch_segments(progress.get("epoch"))
+    structured = _structured_progress_segments(progress.get("training"))
+    if structured is not None:
+        body, epoch = structured
+        age = progress["training"].get("progress_age_s")
+    else:
+        summary = _gpu_safe_text(progress.get("summary")).strip()
+        line = summary or _gpu_safe_text(progress.get("line")).strip()
+        if not line:
+            return None
+        key = (process.get("pid"), line)
+        body = _PROGRESS_BODY_CACHE.get(key)
+        if body is None:
+            if len(_PROGRESS_BODY_CACHE) >= 256:
+                _PROGRESS_BODY_CACHE.clear()
+            body = _PROGRESS_BODY_CACHE[key] = _progress_body_segments(line)
+        epoch = () if summary else _progress_epoch_segments(progress.get("epoch"))
+        age = progress.get("age_s")
+    return _render_progress_row(body, epoch, age, indent, width)
+
+
+def _render_progress_row(body, epoch, age, indent, width):
+    """Shared row layout, color roles, age reservation and clipping in both views."""
     body = list(body)
     if epoch:
         body = list(epoch) + [(" · ", "dim")] + body
     prefix = [(indent + "      ", None), ("↳ ", "dim")]
-    age_text, age_key = _progress_age(progress.get("age_s"))
+    age_text, age_key = _progress_age(age)
     suffix = [(" · ", "dim"), (age_text, age_key)] if age_text else []
     # The age is the stall signal, so the body yields width before it does.
     room = width - sum(_dw(text) for text, _key in prefix + suffix)
