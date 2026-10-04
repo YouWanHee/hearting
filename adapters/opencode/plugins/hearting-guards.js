@@ -219,6 +219,88 @@ function sdkResponseData(result) {
   return Object.hasOwn(result, "data") ? result.data : result
 }
 
+function peerIdentityLog(ctx, stage, reason, extra = {}) {
+  try {
+    if (typeof ctx?.client?.app?.log === "function") {
+      const metadata = { ...extra }
+      if (Object.hasOwn(metadata, "sessionID") && (typeof metadata.sessionID !== "string"
+          || metadata.sessionID.length > 256 || /[\x00-\x1f\x7f]/.test(metadata.sessionID))) {
+        delete metadata.sessionID
+        metadata.sessionIDInvalid = true
+      }
+      Promise.resolve(ctx.client.app.log({ body: { service: "hearting-peer-identity",
+        level: "info", message: "hearting-peer-identity",
+        // OpenCode's host logger drops service; retain a fixed source in extra.
+        extra: { module: "hearting-peer-identity", stage, reason, ...metadata },
+      }})).catch(() => {})
+    }
+  } catch { /* Observation never gates an existing callback or publication. */ }
+}
+
+const paneCallbackObservedAt = new Map()
+function observePaneCallback(ctx, callback, sid) {
+  const key = callback + ":" + (typeof sid === "string" ? sid.slice(0, 256) : "invalid")
+  const now = Date.now()
+  if (now < (paneCallbackObservedAt.get(key) || 0)) return
+  if (paneCallbackObservedAt.size >= 128) paneCallbackObservedAt.delete(paneCallbackObservedAt.keys().next().value)
+  paneCallbackObservedAt.set(key, now + 10000)
+  const reason = !sid ? "callback-no-session" : isWorkerSession() ? "callback-worker"
+    : !process.env.HERDR_PANE_ID ? "callback-no-pane" : "callback-entry"
+  peerIdentityLog(ctx, "callback", reason, { callback, sessionID: sid })
+}
+
+function observePanePublisher(child, ctx, sid, generation) {
+  let output = "", bytes = 0, finished = false
+  const finish = (reason, extra = {}) => {
+    if (finished) return
+    finished = true
+    clearTimeout(timer)
+    child.stdout?.destroy()
+    if (generation !== paneProjectionGeneration) {
+      peerIdentityLog(ctx, "publisher", "publisher-stale-observation", { sessionID: sid })
+    } else {
+      peerIdentityLog(ctx, "publisher", reason, { sessionID: sid, ...extra })
+    }
+  }
+  // Bound the observation, not the existing helper's execution. No kill or retry.
+  const timer = setTimeout(() => finish("publisher-observation-timeout"), 5000)
+  timer.unref?.()
+  child.stdout?.setEncoding("utf8")
+  child.stdout?.on("error", () => finish("publisher-observation-read-error"))
+  child.stdout?.on("data", chunk => {
+    if (finished) return
+    bytes += Buffer.byteLength(chunk, "utf8")
+    if (bytes > 1024) { output = ""; finish("publisher-observation-overflow"); return }
+    output += chunk
+  })
+  child.on("error", () => finish("publisher-spawn-error"))
+  child.on("close", code => {
+    if (finished) return
+    const extra = { sessionID: sid, publisherRc: Number.isInteger(code) ? code : null }
+    if (code !== 0) {
+      finish("publisher-exit-error", extra)
+      return
+    }
+    try {
+      const row = JSON.parse(output)
+      const reasons = ["herdr-unavailable", "pane-unavailable", "guard-refused", "report-attempts-finished"]
+      const statuses = ["not-attempted", "skipped", "exit0", "nonzero", "timeout", "spawn-error"]
+      const keys = ["schema", "reason", "session_report", "metadata_report", "session_report_rc", "metadata_report_rc"]
+      if (!row || row.schema !== "hearting-pane-observation-v1" || !reasons.includes(row.reason)
+          || !statuses.includes(row.session_report) || !statuses.includes(row.metadata_report)
+          || Object.keys(row).some(key => !keys.includes(key))) throw new Error("invalid observation")
+      for (const key of ["session_report_rc", "metadata_report_rc"]) {
+        if (Object.hasOwn(row, key)) {
+          if (!Number.isInteger(row[key]) || row[key] < -128 || row[key] > 255) throw new Error("invalid rc")
+          extra[key] = row[key]
+        }
+      }
+      finish(row.reason, { ...extra,
+        sessionReport: row.session_report, metadataReport: row.metadata_report })
+    } catch { finish("publisher-observation-invalid", extra) }
+  })
+}
+
 const paneProjectionBusy = new Set()
 const paneProjectionRetryAt = new Map()
 let paneProjectionGeneration = 0
@@ -263,16 +345,8 @@ async function projectPane(sid, ctx, retry = false) {
     verified = false
     reason = "sdk-stale-callback"
   }
-  // Existing host logger, metadata only: the old silent catch hid which normal
-  // SDK stage failed. This is observation, never a publication/receipt substitute.
-  try {
-    if (typeof ctx?.client?.app?.log === "function") {
-      Promise.resolve(ctx.client.app.log({ body: { service: "hearting-peer-identity",
-        level: verified ? "debug" : "warn", message: reason,
-        extra: { sessionID: sid, verified, responseStyle: style, httpStatus, elapsedMs: Date.now() - started },
-      }})).catch(() => {})
-    }
-  } catch {}
+  peerIdentityLog(ctx, "sdk", reason, { sessionID: sid, verified,
+    responseStyle: style, httpStatus, elapsedMs: Date.now() - started })
   try {
     if (generation !== paneProjectionGeneration) return
     const args = [herdrProjection, "--harness", "opencode", "--session-id", sid]
@@ -281,11 +355,13 @@ async function projectPane(sid, ctx, retry = false) {
       cwd: root,
       env: { ...process.env, AGENT_HOME: root },
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "ignore"],
     })
+    observePanePublisher(child, ctx, sid, generation)
+    peerIdentityLog(ctx, "publisher", "publisher-spawned", { sessionID: sid })
     child.unref()
   } catch {
-    // best-effort; the pane header is display-only
+    peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid })
   } finally { paneProjectionBusy.delete(sid) }
 }
 
@@ -508,6 +584,7 @@ export const AgentHarnessGuards = async (ctx) => {
   // runtime child inherits OPENCODE_DISPATCH_SLUG, so this proves the plugin
   // was loaded by the headless runtime (dispatch-liveness.py inspects it).
   markPluginLoaded(dispatchSlug())
+  peerIdentityLog(ctx, "plugin", "plugin-registered")
 
   return ({
   event: async ({ event }) => {
@@ -522,6 +599,7 @@ export const AgentHarnessGuards = async (ctx) => {
     // idle or session-end step (it exchanges after writes and reads, D-82/D-83).
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
+      observePaneCallback(ctx, "session.idle", eventSid)
       if (!isWorkerSession()) {
         spawnSummary(eventSid, "final")
         await projectPane(eventSid, ctx)
@@ -548,6 +626,7 @@ export const AgentHarnessGuards = async (ctx) => {
     }
   },
   "chat.message": async (input, output) => {
+    observePaneCallback(ctx, "chat.message", input.sessionID || output?.message?.sessionID || "")
     if (isWorkerSession()) return
     const eventSid = input.sessionID || output?.message?.sessionID || ""
     const sid = eventSid || "opencode-plugin"
@@ -652,6 +731,7 @@ export const AgentHarnessGuards = async (ctx) => {
     }
   },
   "tool.execute.after": async (input, output) => {
+    observePaneCallback(ctx, "tool.execute.after", input.sessionID || "")
     const args = input.args || output.args || {}
     const files = targetFiles(ctx, input.tool || {}, args)
     for (const file of files) {

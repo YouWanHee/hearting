@@ -328,6 +328,91 @@ class PendingCallbacks(unittest.TestCase):
     setUp = AliasReceive.setUp
     rows = AliasReceive.rows
 
+    def test_opencode_normal_registration_and_callback_observation_is_bounded_and_fail_soft(self):
+        js = r'''
+import { pathToFileURL } from "node:url";
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
+const logs = [];
+process.env.HERDR_PANE_ID = "";
+const hooks = await AgentHarnessGuards({client: {app: {log: async ({body}) => logs.push(body)}}});
+await hooks["tool.execute.after"]({sessionID: "actual-callback", tool: "fixture-noop", args: {secret: "private-tool-body"}}, {});
+await hooks["tool.execute.after"]({sessionID: "actual-callback", tool: "fixture-noop", args: {}}, {});
+const failing = await AgentHarnessGuards({client: {app: {log: () => {throw Error("private-error")}}}});
+await failing["tool.execute.after"]({sessionID: "another-callback", tool: "fixture-noop", args: {}}, {});
+console.log(JSON.stringify(logs));
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        logs = json.loads(run.stdout)
+        self.assertEqual([row["extra"]["reason"] for row in logs], ["plugin-registered", "callback-no-pane"])
+        self.assertEqual([row["extra"]["stage"] for row in logs], ["plugin", "callback"])
+        self.assertTrue(all(row["level"] == "info" and row["extra"]["module"] == "hearting-peer-identity" for row in logs))
+        self.assertEqual(logs[1]["extra"]["sessionID"], "actual-callback")
+        self.assertNotIn("private-tool-body", run.stdout)
+        self.assertNotIn("private-error", run.stdout)
+
+    def test_opencode_publisher_observation_preserves_attempt_receipt_and_failure_boundaries(self):
+        js = r'''
+import { readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import vm from "node:vm";
+const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
+const logs = [], timers = [];
+const scope = {process: {env: {}}, isWorkerSession: () => false, Buffer,
+  setTimeout: cb => {const t = {cb, unref() {}}; timers.push(t); return t}, clearTimeout: () => {}};
+vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+const ctx = {client: {app: {log: async ({body}) => logs.push(body)}}};
+const observation = {schema: "hearting-pane-observation-v1", reason: "report-attempts-finished",
+  session_report: "exit0", metadata_report: "timeout", session_report_rc: 0};
+async function emit(text, code = 0, action = "close") {
+  const child = new EventEmitter(); child.stdout = new PassThrough(); child.kill = () => {throw Error("no helper signal")};
+  scope.observePanePublisher(child, ctx, "exact", 0);
+  if (text) child.stdout.write(text);
+  await new Promise(resolve => setImmediate(resolve));
+  if (action === "timeout") timers.at(-1).cb();
+  if (action === "error") child.emit("error", Error("private-exception"));
+  if (action === "read-error") child.stdout.emit("error", Error("private-read-error"));
+  child.emit("close", code);
+  return child;
+}
+await emit(JSON.stringify(observation));
+await emit(JSON.stringify({schema: "hearting-pane-observation-v1", reason: "guard-refused",
+  session_report: "not-attempted", metadata_report: "not-attempted"}));
+await emit("private raw text");
+await emit(JSON.stringify(observation) + "\n" + JSON.stringify(observation));
+await emit("가".repeat(400)); // 1200 UTF-8 bytes, below 1024 characters.
+await emit("", 7);
+await emit("", 0, "error");
+await emit("", 0, "read-error");
+const late = await emit("", 0, "timeout");
+late.emit("close", 0); // Timeout result cannot later become an attempt success.
+await emit(JSON.stringify({...observation, sessionID: "foreign", body: "private-body"}));
+const stale = new EventEmitter(); stale.stdout = new PassThrough();
+scope.observePanePublisher(stale, ctx, "old", -1);
+stale.stdout.write(JSON.stringify(observation));
+await new Promise(resolve => setImmediate(resolve)); stale.emit("close", 0);
+scope.peerIdentityLog(ctx, "callback", "callback-entry", {sessionID: "x".repeat(10000)});
+console.log(JSON.stringify(logs));
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        logs = json.loads(run.stdout)
+        self.assertEqual([row["extra"]["reason"] for row in logs], [
+            "report-attempts-finished", "guard-refused", "publisher-observation-invalid",
+            "publisher-observation-invalid", "publisher-observation-overflow", "publisher-exit-error",
+            "publisher-spawn-error", "publisher-observation-read-error", "publisher-observation-timeout", "publisher-observation-invalid",
+            "publisher-stale-observation", "callback-entry"])
+        self.assertEqual(logs[0]["extra"]["sessionReport"], "exit0")
+        self.assertEqual(logs[0]["extra"]["metadataReport"], "timeout")
+        self.assertNotIn("sessionReport", logs[-2]["extra"])
+        self.assertNotIn("sessionID", logs[-1]["extra"])
+        self.assertTrue(logs[-1]["extra"]["sessionIDInvalid"])
+        self.assertNotIn("private", run.stdout)
+        self.assertNotIn("received", run.stdout)
+
     def test_opencode_peer_identity_publication_requires_exact_sdk_top_level_session(self):
         js = r'''
 import { readFileSync } from "node:fs";
@@ -337,7 +422,7 @@ const start = source.indexOf("function sdkResponseData(");
 const end = source.indexOf("\nfunction collectPreflight", start);
 const commands = [];
 const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
-  spawn: (exe, args) => {commands.push(args);return {unref() {}}}, herdrProjection: "fixture-projector",
+  spawn: (exe, args) => {commands.push(args);return {on() {}, unref() {}}}, herdrProjection: "fixture-projector",
   root: "fixture-root", setTimeout, clearTimeout, AbortController};
 vm.runInNewContext(source.slice(start, end), scope);
 for (const response of [{data: {id: "exact"}}, {id: "exact", parentID: null},
@@ -369,7 +454,7 @@ let now = 1000, gets = 0, resolveFirst;
 const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "foreign-env"}},
   isWorkerSession: () => false, root: "fixture-root", herdrProjection: "fixture-projector",
   Date: {now: () => now}, setTimeout, clearTimeout, AbortController,
-  spawn: (exe, args) => {commands.push(args);return {unref() {}}}};
+  spawn: (exe, args) => {commands.push(args);return {on() {}, unref() {}}}};
 vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
 const ctx = {client: {app: {log: async ({body}) => logs.push(body)}, session: {get: async ({path}) => {
   if (path.id !== "actual-callback") throw Error("guessed identity");
@@ -393,8 +478,8 @@ console.log(JSON.stringify({gets, commands, logs}));
             ["fixture-projector", "--harness", "opencode", "--session-id", "actual-callback", "--no-report-session"],
             ["fixture-projector", "--harness", "opencode", "--session-id", "actual-callback"],
         ])
-        self.assertEqual([row["message"] for row in result["logs"]], ["sdk-timeout", "verified"])
-        self.assertEqual([row["extra"]["verified"] for row in result["logs"]], [False, True])
+        self.assertEqual([row["extra"]["reason"] for row in result["logs"] if row["extra"]["stage"] == "sdk"], ["sdk-timeout", "verified"])
+        self.assertEqual([row["extra"]["verified"] for row in result["logs"] if row["extra"]["stage"] == "sdk"], [False, True])
 
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''
@@ -447,7 +532,7 @@ const commands = [], logs = [];
 let resolveOld;
 const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
   root: "fixture-root", herdrProjection: "fixture-projector", setTimeout, clearTimeout, AbortController,
-  spawn: (exe, args) => {commands.push(args);return {unref() {}}}};
+  spawn: (exe, args) => {commands.push(args);return {on() {}, unref() {}}}};
 vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
 const ctx = {client: {app: {log: async ({body}) => logs.push(body)}, session: {get: async ({path}) =>
   path.id === "old" ? await new Promise(resolve => {resolveOld = resolve}) : {data: {id: "new"}}
@@ -456,7 +541,7 @@ const old = scope.projectPane("old", ctx);
 await scope.projectPane("new", ctx);
 resolveOld({data: {id: "old"}});
 await old;
-console.log(JSON.stringify({commands, reasons: logs.map(row => row.message)}));
+console.log(JSON.stringify({commands, reasons: logs.filter(row => row.extra.stage === "sdk").map(row => row.extra.reason)}));
 '''
         run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
                              capture_output=True, text=True, timeout=5)

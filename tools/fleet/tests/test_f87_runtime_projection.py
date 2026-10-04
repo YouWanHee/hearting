@@ -1002,6 +1002,94 @@ class PaneHeaderIdentityTest(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
 
 
+class ProjectionObservationTest(unittest.TestCase):
+    def test_public_bool_guard_and_quiet_other_cli_contracts(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+             unittest.mock.patch.object(hp, "may_report", return_value=False), \
+             unittest.mock.patch.object(hp, "runtime_identity", return_value=(None, None)), \
+             unittest.mock.patch.object(hp, "_report") as report:
+            observation = {}
+            self.assertIs(hp.project("opencode", "callback", pane_id="fixture", observation=observation), True)
+            self.assertEqual(observation, {"schema": "hearting-pane-observation-v1", "reason": "guard-refused",
+                                          "session_report": "not-attempted", "metadata_report": "not-attempted"})
+            for harness in ("opencode", "claude", "codex"):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(hp.main(["--harness", harness, "--session-id", "callback", "--pane", "fixture"]), 0)
+                if harness == "opencode":
+                    self.assertEqual(json.loads(output.getvalue()), observation)
+                    self.assertEqual(len(output.getvalue().splitlines()), 1)
+                    self.assertLess(len(output.getvalue().encode()), 512)
+                else:
+                    self.assertEqual(output.getvalue(), "")
+            report.assert_not_called()
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(hp.main(["--harness", "opencode", "--session-id", "callback", "--may-report"]), 1)
+            self.assertEqual(output.getvalue(), "")
+        with unittest.mock.patch.object(hp, "compose", return_value=("shown", "title")):
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(hp.main(["--harness", "opencode", "--session-id", "callback", "--print"]), 0)
+            self.assertEqual(json.loads(output.getvalue()), {"display_agent": "shown", "title": "title"})
+
+    def test_report_observation_preserves_command_timeout_error_and_no_retry(self):
+        from tools.fleet import herdr_projection as hp
+        cases = [(SimpleNamespace(returncode=0), "exit0", 0),
+                 (SimpleNamespace(returncode=7), "nonzero", 7),
+                 (subprocess.TimeoutExpired("private-command", .5), "timeout", None),
+                 (PermissionError("private-error"), "spawn-error", None)]
+        for outcome, status, rc in cases:
+            with self.subTest(status=status), \
+                 unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+                 unittest.mock.patch.object(hp, "session_title", return_value="private-title"), \
+                 unittest.mock.patch.object(hp, "_formatter_overrides", return_value=(None, None)), \
+                 unittest.mock.patch.object(hp, "compose", return_value=("opencode", "private-title")), \
+                 unittest.mock.patch.object(hp.subprocess, "run", side_effect=[outcome, outcome]) as run:
+                observation = {}
+                hp._report("opencode", "exact", "fixture-pane", True, observation=observation)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(observation["reason"], "report-attempts-finished")
+                self.assertEqual(observation["session_report"], status)
+                self.assertEqual(observation["metadata_report"], status)
+                self.assertEqual(observation.get("session_report_rc"), rc)
+                self.assertEqual(observation.get("metadata_report_rc"), rc)
+                self.assertNotIn("private", json.dumps(observation))
+                self.assertNotIn("received", observation)
+                self.assertTrue(all(call.kwargs["stdout"] == subprocess.DEVNULL and
+                                    call.kwargs["stderr"] == subprocess.DEVNULL for call in run.call_args_list))
+
+    def test_unavailable_and_no_report_session_observation_never_promote_identity(self):
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp.shutil, "which", return_value=None), \
+             unittest.mock.patch.object(hp, "_report") as report:
+            observation = {}
+            self.assertIs(hp.project("opencode", "exact", observation=observation), True)
+            self.assertEqual(observation["reason"], "herdr-unavailable")
+            report.assert_not_called()
+        with unittest.mock.patch.dict(os.environ, {"HERDR_PANE_ID": ""}), \
+             unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+             unittest.mock.patch.object(hp, "_report") as report:
+            observation = {}
+            self.assertIs(hp.project("opencode", "exact", observation=observation), True)
+            self.assertEqual(observation["reason"], "pane-unavailable")
+            report.assert_not_called()
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+             unittest.mock.patch.object(hp, "session_title", return_value=""), \
+             unittest.mock.patch.object(hp, "_formatter_overrides", return_value=(None, None)), \
+             unittest.mock.patch.object(hp, "compose", return_value=("opencode", "")), \
+             unittest.mock.patch.object(hp.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            observation = {}
+            hp._report("opencode", "exact", "fixture", False, observation=observation)
+            self.assertEqual(observation["session_report"], "skipped")
+            self.assertEqual(observation["metadata_report"], "exit0")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][2], "report-metadata")
+
+
 class PaneTitleLadderTest(unittest.TestCase):
     """The pane header and the board must climb ONE ladder for the same session.
 
