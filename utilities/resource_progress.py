@@ -137,6 +137,23 @@ def _hash(value):
     return value.removeprefix("sha256:") if isinstance(value, str) else None
 
 
+def _schedule_epoch(training, attempt, total):
+    """Optional schedule intervals, derived only from an explicit exact cadence."""
+    epochs, blocks, updates = (training.get(key) for key in
+                               ("epochs", "blocks_per_epoch", "updates_per_block"))
+    if not all(_count(value) and value > 0 for value in (epochs, blocks, updates)):
+        return None
+    width = blocks * updates
+    if epochs * width != total:
+        return None
+    completed, position = divmod(attempt, width)
+    state = ("start" if attempt == 0 else "complete" if attempt == total
+             else "boundary" if position == 0 else "partial")
+    return {"current": completed + int(position > 0), "total": epochs,
+            "attempts_per_epoch": width, "completed": completed,
+            "attempt_in_epoch": position, "state": state}
+
+
 def collect(run, registry, now, process_reader=observe_process, config_resolver=resolve_config):
     """Return one optional active-arm observation; unknown or ambiguous shapes fail soft."""
     try:
@@ -193,6 +210,7 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
         total = training.get("attempts") if isinstance(training, dict) else None
         if not _count(total) or total <= 0 or attempt > total:
             return None
+        epoch = _schedule_epoch(training, attempt, total)
         last = progress.get("last")
         loss = None
         if isinstance(last, dict) and _count(last.get("attempt")) and last["attempt"] == attempt:
@@ -218,6 +236,7 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
             "progress_path": str(progress_path), "progress_sha256": hashlib.sha256(data).hexdigest(),
             "config_path": str(config_path), "config_ref": resolved["config_ref"],
             "config_sha256": digest,
+            **({"schedule_epoch": epoch} if epoch is not None else {}),
         }
     except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError,
             OverflowError, subprocess.SubprocessError):

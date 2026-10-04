@@ -4804,24 +4804,42 @@ def _gpu_training_rows(process, indent, width):
             or total <= 0 or attempt > total or attempt != successful + skipped:
         return []
     labels = [_gpu_safe_text(training.get(key)).strip() for key in ("phase", "arm")]
-    counter = "attempt %s/%s (%.2f%%)" % (format(attempt, ","), format(total, ","),
-                                        attempt * 100.0 / total)
-    body = " · ".join([label for label in labels if label] + [counter])
-    metrics = "successful %s · skipped %s" % (format(successful, ","), format(skipped, ","))
+    step = [("Step(attempt) ", "dim"),
+            ("%s/%s" % (format(attempt, ","), format(total, ",")), "resource_active"),
+            (" (%.2f%%)" % (attempt * 100.0 / total), "lvl_g")]
+    epoch = training.get("schedule_epoch")
+    epoch_segs = []
+    if isinstance(epoch, dict):
+        current, epochs, span = (epoch.get(key) for key in
+                                 ("current", "total", "attempts_per_epoch"))
+        if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in (current, epochs, span)) and epochs > 0 and span > 0 \
+                and epochs * span == total and current == (attempt + span - 1) // span:
+            state = "start" if attempt == 0 else "done" if attempt % span == 0 else "partial"
+            epoch_segs = [("Epoch(schedule) ", "dim"), ("%d/%d" % (current, epochs), "resource_active"),
+                          (" (%s)" % state, "lvl_g" if state == "done" else "dim")]
+    prefix = [(indent + "      ", None), ("↳ ", "dim")]
+    room = width - sum(_dw(text) for text, _key in prefix)
+    body = epoch_segs + [(" · ", "dim")] + step if epoch_segs else step
+    if epoch_segs and sum(_dw(text) for text, _key in body) > room:
+        body = step + [(" · ", "dim")] + epoch_segs
+    if any(labels):
+        body += [(" · " + " · ".join(label for label in labels if label), "dim")]
+    metrics = []
     loss = training.get("loss")
     if isinstance(loss, (int, float)) and not isinstance(loss, bool) and math.isfinite(loss):
-        metrics += " · loss %.5g (last batch)" % loss
+        metrics = [("Loss(last batch) ", "dim"), ("%.2e" % loss, "lvl_y"), (" · ", "dim")]
+    metrics += [("successful %s · skipped %s" % (format(successful, ","), format(skipped, ",")), "dim")]
     age = training.get("progress_age_s")
     age_text = ""
     if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age >= 0:
         age_text = "progress %ds ago" % int(age) if age < 120 else "progress %dm ago" % (age // 60)
-    prefix = [(indent + "      ", None), ("↳ ", "dim")]
     suffix = [(" · " + age_text, "lvl_y" if age >= _PROGRESS_STALLED_S else "dim")] if age_text else []
     # Keep current/total and last-batch metrics on separate rows so a normal
     # terminal can show both. Progress age keeps its space when metrics clip.
     room = width - sum(_dw(text) for text, _key in prefix + suffix)
-    return [_clip_segs(prefix + [(body, "resource_active")], width)[0],
-            _clip_segs(prefix + _clip_progress_segments([(metrics, "dim")], max(0, room))
+    return [_clip_segs(prefix + body, width)[0],
+            _clip_segs(prefix + _clip_progress_segments(metrics, max(0, room))
                        + suffix, width)[0]]
 
 

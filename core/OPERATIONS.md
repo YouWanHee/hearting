@@ -965,8 +965,14 @@ separate from log heartbeat age, including while validation pauses updates.
 Unknown provenance, units or shapes retain the existing raw progress; no
 registry repair, producer output requirement, project-specific exception or
 training restart is involved. JSON and both Fleet views consume the same
-identity-bound projection. Schedule epochs, combined arm totals and ETA are not
-inferred from these counters.
+identity-bound projection. A schedule epoch may be derived only when the same
+verified config explicitly supplies positive integer `training.epochs`,
+`blocks_per_epoch` and `updates_per_block` whose product equals `training.attempts`.
+Its partial, boundary and complete states count attempted-update intervals,
+not dataset passes. Human views label Step as attempt and Loss as last batch;
+scientific notation changes only presentation, preserving JSON precision.
+Absent or ambiguous cadence omits Epoch without losing Step or Loss. Combined
+arm totals and ETA are not inferred from these counters.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work

@@ -31,6 +31,7 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / "configs").mkdir()
         config = self.root / "configs" / "model.json"
+        self.config = config
         config.write_text(json.dumps({"training": {"attempts": 400000}}))
         # A harmless owned child supplies real PID/start/argv/group evidence.
         ready = self.root / "child-ready"
@@ -68,6 +69,7 @@ class TrainingProgressPipelineTest(unittest.TestCase):
             **wrapper, "process_group": os.getpgrp(), "cwd": str(self.root), "status": "running",
             "config_ref": "config:model.json", "config_sha256": "baseline-will-not-supply-total"}}}))
         index = self.root / "index.json"
+        self.index = index
         resource_run_registry.register_registry(registry, index)
         self.rows = resource_runs.collect(index)
         self.assertEqual(resource_runs.collect.last_diagnostics, [])
@@ -114,14 +116,65 @@ class TrainingProgressPipelineTest(unittest.TestCase):
             render.set_process_view(process_view)
             shown = text(render._build_lines([], [], "both", False, 0, term_width=140,
                                             resources=self.rows, governor=None))
-            for expected in ("training-updates", "arm", "attempt 27,346/400,000 (6.84%)",
-                             "successful 27,342", "skipped 4", "loss 0.0048248 (last batch)", "progress 10m ago"):
+            for expected in ("training-updates", "arm", "Step(attempt) 27,346/400,000 (6.84%)",
+                             "successful 27,342", "skipped 4", "Loss(last batch) 4.82e-03", "progress 10m ago"):
                 self.assertIn(expected, shown)
             self.assertNotIn("LAB RESOURCES", shown)
             self.assertNotIn("raw producer heartbeat", shown)
             self.assertNotIn("Epoch", shown)
             self.assertNotIn("800,000", shown)
         self.assertEqual(self.snapshot, before)
+
+    def test_verified_cadence_projects_schedule_to_json_and_both_human_views(self):
+        self.config.write_text(json.dumps({"training": {"attempts": 400000, "epochs": 20,
+                                                       "blocks_per_epoch": 1000, "updates_per_block": 20}}))
+        metadata = self.root / "run.json"
+        value = json.loads(metadata.read_text())
+        value["arms"][0]["config_sha256"] = hashlib.sha256(self.config.read_bytes()).hexdigest()
+        metadata.write_text(json.dumps(value))
+        rows = resource_runs.collect(self.index)
+        self.assertEqual(resource_runs.collect.last_diagnostics, [])
+        output = json.loads(fleet._snapshot_json([], [], rows, compute_host_snapshot=self.snapshot))
+        training = self.training_in(output["compute_hosts"])
+        self.assertEqual(training["schedule_epoch"]["current"], 2)
+        self.assertEqual(training["schedule_epoch"]["state"], "partial")
+        self.assertEqual(training["loss"], .0048248)
+        self.assertGreaterEqual(training["progress_age_s"], 600)
+        render.set_compute_hosts(self.snapshot)
+        for process_view in (False, True):
+            render.set_process_view(process_view)
+            shown = text(render._build_lines([], [], "both", False, 0, term_width=180,
+                                            resources=rows, governor=None))
+            for expected in ("Epoch(schedule) 2/20 (partial)", "Step(attempt) 27,346/400,000 (6.84%)",
+                             "Loss(last batch) 4.82e-03", "successful 27,342", "skipped 4", "progress 10m ago"):
+                self.assertIn(expected, shown)
+            self.assertNotIn("raw producer heartbeat", shown)
+
+    def test_human_schedule_boundaries_colors_and_narrow_step_preserve_source_values(self):
+        cases = ((0, 0, "start"), (1, 1, "partial"), (20000, 1, "done"),
+                 (20001, 2, "partial"), (400000, 20, "done"))
+        for attempt, current, state in cases:
+            with self.subTest(attempt=attempt):
+                training = {**self.training, "attempt": attempt, "successful": attempt, "skipped": 0,
+                            "schedule_epoch": {"current": current, "total": 20, "attempts_per_epoch": 20000}}
+                before = copy.deepcopy(training)
+                process = {"progress": {"training": training}}
+                rows = render._gpu_training_rows(process, "", 180)
+                shown = text(rows)
+                self.assertIn("Epoch(schedule) %d/20 (%s)" % (current, state), shown)
+                self.assertIn("Step(attempt) %s/400,000" % format(attempt, ","), shown)
+                self.assertIn("Loss(last batch) 4.82e-03", shown)
+                self.assertIn(("4.82e-03", "lvl_y"), rows[1])
+                self.assertIn("progress 10m ago", shown)
+                self.assertEqual(training, before)
+        process["progress"]["training"].update(attempt=59415, successful=59397, skipped=18,
+                                              schedule_epoch={"current": 3, "total": 20, "attempts_per_epoch": 20000})
+        shown = text(render._gpu_training_rows(process, "", 80))
+        self.assertIn("Step(attempt) 59,415/400,000 (14.85%)", shown)
+        self.assertIn("Loss(last batch) 4.82e-03", shown)
+        self.assertIn("progress 10m ago", shown)
+        process["progress"]["training"]["schedule_epoch"]["total"] = True
+        self.assertNotIn("Epoch", text(render._gpu_training_rows(process, "", 180)))
 
     def test_fresh_heartbeat_does_not_refresh_counter_age(self):
         projected = self.projected(now=self.now + 5)
