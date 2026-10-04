@@ -538,6 +538,21 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(len(self.calls), 3)
 
+    def test_pending_conversation_receipt_returns_without_starting_an_owner(self):
+        self.start(); self.ready = True
+        pending = {"state": "needs-question", "required_action": "wait-for-user-answer",
+                   "human_wait": {"state": "pending", "fallback": "ordinary-conversation",
+                                  "question_block": "이 순서로 진행할까요?\n- 예\n- 아니요"},
+                   "parent_next": "end-turn"}
+        with mock.patch.object(W, "frame_interview_step", return_value=pending):
+            result = self.start(answers="expired-empty-response.json")
+        self.assertEqual(result["state"], "needs-question")
+        self.assertEqual(result["required_action"], "wait-for-user-answer")
+        self.assertEqual(result["parent_next"], "end-turn")
+        self.assertEqual(result["human_wait"]["question_block"], "이 순서로 진행할까요?\n- 예\n- 아니요")
+        self.assertFalse(result["owner_started"])
+        self.assertEqual(len(self.calls), 2)  # only the existing frame pair
+
     def test_question_failure_after_frame_completion_does_not_promise_another_wake(self):
         self.start(); self.ready = True
         self.jobs.write_text(self.jobs.read_text().replace("\topen\t", "\tdone\t"))
@@ -1270,6 +1285,112 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.calls, ["gate", "release"])
         self.assertEqual(Path(result["intent_file"]).read_bytes(), intent)
 
+    def test_expired_empty_response_and_async_ack_keep_same_question_until_actual_reply(self):
+        import frame_interview as FI
+        import tidy_decisions
+        question, real_answers = self.routed(approve=1)
+        asked = self.step(interview=self.question_file)
+        self.assertEqual(asked["required_action"], "ask-registered-question")
+        expected = ("Run the two commands and preserve their actual results.\n"
+                    "Confirm this understanding or correct it in your reply.\n\n"
+                    "이 순서로 진행할까요?\n"
+                    "- 예, 이 순서로: 예, 이 순서로\n"
+                    "- 아니요, 다르게: 아니요, 다르게\n\n"
+                    "긴 실험을 지금 시작해도 될까요?\n"
+                    "- 예, 시작: 예, 시작\n"
+                    "- 아니요, 나중에: 아니요, 나중에")
+        self.assertEqual(asked["human_wait"], {"state": "pending", "fallback": "ordinary-conversation",
+                                              "question_block": expected})
+        registered = Path(asked["interview_file"])
+        original = registered.read_bytes()
+        answers_path = registered.parent / "answers.json"
+        pending_file = self.base / "native-response.json"
+        with mock.patch.object(tidy_decisions, "record_interview_answers") as record:
+            for payload in ({"answers": {}}, {"timeout": True, "answers": {}}, {"accepted": True},
+                            FI.answers_template(json.loads(original)),
+                            {"answers": {"go": {"answers": []}, "run-ok": {"answers": []}}}):
+                with self.subTest(payload=payload):
+                    pending_file.write_text(json.dumps(payload))
+                    result = self.step(answers=pending_file)
+                    self.assertEqual(result["state"], "needs-question")
+                    self.assertEqual(result["required_action"], "wait-for-user-answer")
+                    self.assertEqual(result["parent_next"], "end-turn")
+                    self.assertEqual(result["human_wait"]["question_block"], expected)
+                    self.assertEqual(result["interview_file"], str(registered))
+                    self.assertEqual(registered.read_bytes(), original)
+                    self.assertFalse(answers_path.exists())
+                    self.assertFalse((registered.parent.parent / "intent.md").exists())
+                    self.assertEqual((self.resolution()["status"], self.resolution()["epoch"]), ("blocked", 1))
+                    self.assertIsNone(self.resolution()["answers"])
+                    self.assertEqual(self.calls, ["gate"])
+                    self.assertEqual(record.call_count, 0)
+            resumed = self.step()
+            self.assertEqual(resumed["required_action"], "wait-for-user-answer")
+            self.assertEqual(resumed["human_wait"]["question_block"], expected)
+            released = self.step(answers=real_answers)
+            self.assertEqual(released["state"], "released")
+            self.assertEqual(self.calls, ["gate", "release"])
+            self.assertEqual(record.call_count, 1)
+            given = self.resolution()["answers"]
+            self.assertEqual(given["answers"]["run-ok"]["choice"], 1)
+            self.assertEqual(FI.approvals_given(json.loads(original), given,
+                question["route_proposals"]["by_option"]["예, 이 순서로"])[0]["accepted"], False)
+            intent = Path(released["intent_file"]).read_bytes()
+            self.assertIn("question `run-ok`: declined".encode(), intent)
+            self.assertEqual(self.step(answers=real_answers)["state"], "released")
+            self.assertEqual(self.calls, ["gate", "release"])
+            self.assertEqual(record.call_count, 1)
+            self.assertEqual(Path(released["intent_file"]).read_bytes(), intent)
+
+    def test_invalid_or_mixed_native_responses_do_not_disappear_into_humanwait(self):
+        self.routed()
+        asked = self.step(interview=self.question_file)
+        registered = Path(asked["interview_file"])
+        original = registered.read_bytes()
+        bad = self.base / "bad-response.json"
+        valid = json.loads(self.base.joinpath("routed-answers.json").read_text())
+        for response in ({"route_id": "rt-foreign", "answers": {}},
+                         {"round": 2, "answers": {}}, {"schema": "foreign/v1", "answers": {}},
+                         {"answers": []}, {"accepted": "yes"},
+                         {"answers": {"unknown": {"answers": []}}},
+                         {"answers": {"go": {"choice": 50}}}, {**valid, "accepted": True}):
+            with self.subTest(response=response):
+                bad.write_text(json.dumps(response))
+                with self.assertRaisesRegex(ValueError, "frame-input-invalid"):
+                    self.step(answers=bad)
+                self.assertEqual(registered.read_bytes(), original)
+                self.assertFalse((registered.parent / "answers.json").exists())
+                self.assertEqual((self.resolution()["status"], self.resolution()["epoch"]), ("blocked", 1))
+                self.assertEqual(self.calls, ["gate"])
+
+    def test_explicit_stop_after_unanswered_question_keeps_its_original_meaning(self):
+        self.routed()
+        asked = self.step(interview=self.question_file)
+        self.assertEqual(self.step()["required_action"], "wait-for-user-answer")
+        stopped = self.step(decision="stop")
+        self.assertEqual(stopped["state"], "cancelled")
+        self.assertEqual(self.resolution()["status"], "stop")
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertFalse((Path(asked["interview_file"]).parent / "answers.json").exists())
+        self.assertEqual(self.step()["state"], "cancelled")
+        self.assertEqual(self.calls, ["gate", "release"])
+
+    def test_actual_approval_after_async_accepted_releases_once(self):
+        self.routed()
+        self.step(interview=self.question_file)
+        ack = self.base / "accepted.json"
+        ack.write_text('{"accepted": true}')
+        self.assertEqual(self.step(answers=ack)["state"], "needs-question")
+        self.assertEqual(self.resolution()["status"], "blocked")
+        self.assertEqual(self.calls, ["gate"])
+        real = self.base / "routed-answers.json"
+        result = self.step(answers=real)
+        self.assertEqual(result["state"], "released")
+        self.assertIn("question `run-ok`: approved", Path(result["intent_file"]).read_text())
+        self.assertEqual(self.resolution()["answers"]["answers"]["run-ok"]["choice"], 0)
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertEqual(self.step(answers=real)["state"], "released")
+        self.assertEqual(self.calls, ["gate", "release"])
     def routed(self, *, approve=0, route_choice=0):
         """An interview that maps its one route question to a proposal with a start approval."""
         import frame_interview as FI

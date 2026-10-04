@@ -40,7 +40,8 @@ ANSWERS_SHAPE = ('answers file: {"understanding_confirmed": true, "answers": {"<
 # A decision question stays open until the person answers (roles/response-policy.md).
 PENDING_ANSWER_RULE = ("Until the person answers, do not proceed and do not ask again; if the turn "
                        "ends first, end it with the question and its options restated, and use the "
-                       "person's next reply, structured or typed, as the answer.")
+                       "person's next reply, structured or typed, as the answer. Timeout, empty "
+                       "answers, and async accepted are not decisions; keep the same question pending.")
 
 # Questions per raise, by intensity. `quick` now carries the `frame-review`
 # gate too (entry-bound at its `one-shot` node), so its cap is machine-checked
@@ -450,6 +451,64 @@ def answers_template(interview: dict) -> dict:
     }
 
 
+def pending_answer_response(interview: dict, response) -> bool:
+    """Recognize only an unreceived answer, never a malformed or foreign decision.
+
+    Native Default may return an empty answer map or an async acknowledgement.
+    These do not belong in answers.json and cannot release a gate. The caller
+    retains the existing interview and awaits a real answer in conversation.
+    """
+    if response is None:
+        return True
+    if not isinstance(response, dict):
+        return False
+    allowed = {"schema", "route_id", "round", "understanding_confirmed", "correction",
+               "answers", "accepted", "timeout", "timed_out"}
+    if set(response) - allowed:
+        return False
+    for key, expected in (("schema", ANSWERS_SCHEMA), ("route_id", interview.get("route_id")),
+                          ("round", interview.get("round", 1))):
+        if key in response and (response[key] != expected or
+                                (key == "round" and isinstance(response[key], bool))):
+            return False
+    try:
+        if len(json.dumps(response, ensure_ascii=False).encode("utf-8")) > MAX_ANSWERS_BYTES:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if response.get("understanding_confirmed") is not None or response.get("correction", "") != "":
+        return False
+    if any(key in response and response[key] is not True
+           for key in ("accepted", "timeout", "timed_out")):
+        return False
+    given = response.get("answers", {})
+    if not isinstance(given, dict):
+        return False
+    questions = _question_table(interview.get("questions") or [])
+    if set(given) - set(questions):
+        return False
+    for entry in given.values():
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or set(entry) - {"choice", "note", "answers"}:
+            return False
+        if entry.get("choice") is not None or entry.get("note", "") != "":
+            return False
+        if "answers" in entry and entry["answers"] != []:
+            return False
+    return True
+
+
+def pending_question_block(interview: dict) -> str:
+    """The registered words and choices the parent leaves in ordinary conversation."""
+    lines = [_text(interview.get("understanding")), "Confirm this understanding or correct it in your reply."]
+    for question in interview.get("questions") or []:
+        lines.extend(["", _text(question.get("question"))])
+        for option in question.get("options") or []:
+            lines.append(f"- {_text(option.get('label'))}: {_text(option.get('means'))}")
+    return "\n".join(lines)
+
+
 def validate_answers(interview: dict, answers: dict) -> list[str]:
     errors: list[str] = []
     if not is_interview(interview):
@@ -460,6 +519,8 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
                 f"{(interview or {}).get('schema') if isinstance(interview, dict) else None!r}"]
     if not isinstance(answers, dict):
         return [f"answers: expected a JSON object; {ANSWERS_SHAPE}"]
+    if any(key in answers for key in ("accepted", "timeout", "timed_out")):
+        errors.append("response: acknowledgement or timeout is not the person's answer")
     if answers.get("schema", ANSWERS_SCHEMA) != ANSWERS_SCHEMA:
         return [f"schema: expected {ANSWERS_SCHEMA!r} or no schema field; {ANSWERS_SHAPE}"]
     if answers.get("route_id", interview.get("route_id")) != interview.get("route_id"):
@@ -475,7 +536,7 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
         # gate-release sidecar, and re-parsed on every await/fence read.
         errors.append(f"answers: {size} bytes > {MAX_ANSWERS_BYTES}")
     confirmed = answers.get("understanding_confirmed")
-    if confirmed not in (True, False):
+    if not isinstance(confirmed, bool):
         errors.append("understanding_confirmed: must be true or false -- the user confirms the restatement")
     elif confirmed is False and not _text(answers.get("correction")).strip():
         errors.append("correction: say in the user's words what the owner got wrong")

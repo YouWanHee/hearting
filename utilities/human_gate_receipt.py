@@ -507,6 +507,7 @@ def render_context(
     *,
     agent_home: Path,
 ) -> dict[str, Any]:
+    from frame_interview import PENDING_ANSWER_RULE
     normalized = _validate_shape(receipt)
     if delivery_id != gateway_delivery_id(normalized):
         raise HumanGateReceiptError("gateway-delivery-id-mismatch")
@@ -528,11 +529,13 @@ def render_context(
         + "\nA human decision is required; the owner is waiting at the gate or has paused there, "
         + "and the release continues the work either way.\n"
         + f"Artifact: {normalized['artifact_path']}\n"
-        + "Run only these checked forms after presenting the gate to the person:\n"
+        + "Run only these checked forms after presenting the gate and receiving the person's actual decision; "
+        + "registration or delivery alone is not an answer:\n"
         + inspect
         + "\n"
         + "\n".join(release_commands)
         + "\nFor interview gates, answers are required only on proceed; revise/stop omit answers."
+        + "\n" + PENDING_ANSWER_RULE
         + "\nDo not auto-approve, mark-done, harvest, or start any polling/wait loop."
     )
     if len(text.encode("utf-8")) > MAX_CONTEXT_BYTES:

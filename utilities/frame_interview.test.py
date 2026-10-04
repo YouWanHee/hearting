@@ -60,6 +60,33 @@ def good_answers(interview, **overrides):
 
 
 class ValidateTest(unittest.TestCase):
+    def test_only_clear_no_answer_responses_remain_pending(self):
+        interview = good_interview()
+        for response in (None, {}, {"answers": {}}, {"accepted": True},
+                         {"timeout": True, "answers": {}}, {"timed_out": True},
+                         {"answers": {"q-scope": {"answers": []}}},
+                         FI.answers_template(interview)):
+            with self.subTest(response=response):
+                self.assertTrue(FI.pending_answer_response(interview, response))
+        for response in ({"route_id": "rt-other", "answers": {}},
+                         {"round": 2, "accepted": True}, {"round": True},
+                         {"schema": "other/v1", "answers": {}}, {"accepted": "true"},
+                         {"answers": {"unknown": {"answers": []}}},
+                         {"answers": {"q-scope": {"answers": ["Both (recommended)"]}}},
+                         {"answers": {"q-scope": {"choice": 9}}},
+                         {"answers": {"q-scope": {"choice": None, "note": "not decided yet"}}},
+                         {"answer": ""}, [], "", good_answers(interview)):
+            with self.subTest(response=response):
+                self.assertFalse(FI.pending_answer_response(interview, response))
+
+    def test_a_mixed_acknowledgement_cannot_be_validated_as_a_persons_answer(self):
+        interview = good_interview()
+        for marker in ("accepted", "timeout", "timed_out"):
+            response = good_answers(interview, **{marker: True})
+            self.assertFalse(FI.pending_answer_response(interview, response))
+            self.assertIn("response: acknowledgement or timeout is not the person's answer",
+                          FI.validate_answers(interview, response))
+
     def test_a_plain_interview_is_valid(self):
         self.assertEqual(FI.validate(good_interview(), intensity="standard"), [])
 
@@ -266,6 +293,9 @@ class AnswersTest(unittest.TestCase):
 
     def test_the_user_must_confirm_or_correct_the_restatement(self):
         interview = good_interview()
+        for value in (0, 1):
+            self.assertTrue(any("understanding_confirmed" in e for e in
+                                FI.validate_answers(interview, good_answers(interview, understanding_confirmed=value))))
         answers = good_answers(interview, understanding_confirmed=None)
         self.assertTrue(any("understanding_confirmed" in e for e in FI.validate_answers(interview, answers)))
         answers = good_answers(interview, understanding_confirmed=False, correction="")

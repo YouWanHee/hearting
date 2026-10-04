@@ -96,7 +96,12 @@ answer arrives as an ordinary typed message. The blocking tool (feature
 `default_mode_request_user_input`, under development) auto-resolves with empty
 answers outside Plan mode and is therefore not enabled. Empty answers never
 satisfy a human decision gate; the session restates an open decision question
-at turn end and uses the next reply as its answer. Fleet question display uses
+at turn end and uses the next reply as its answer. The normal frame start
+receipt keeps `human_wait.question_block` and the existing interview artifact;
+empty/timeout/accepted responses return the same pending question without
+saving answers or releasing approval. A plain resume waits for the answer
+instead of opening another native box. The parent records the actual reply
+with the existing answers template. Fleet question display uses
 rollout/panel evidence.
 
 The dispatch wrapper still validates the capability catalog, validates an
