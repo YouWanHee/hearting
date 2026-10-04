@@ -83,7 +83,7 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
 
     def test_declared_wrapper_tiers_cover_every_literal_key_the_wrappers_read(self):
-        """Drift guard for WRAPPER_REQUIRED_TIERS.
+        """Drift guard for required tiers and declared optional fallbacks.
 
         Scope (deliberately narrow, review R4-M1): it reads `.sh` and `.py` files
         directly under each adapter's `bin/` and matches fully written key names.
@@ -96,12 +96,23 @@ class ModelConfigTest(unittest.TestCase):
         for adapter, declared in config.WRAPPER_REQUIRED_TIERS.items():
             with self.subTest(adapter=adapter):
                 found = set()
+                fallbacks = config.WRAPPER_FALLBACK_TIERS.get(adapter, {})
+                self.assertFalse(declared & fallbacks.keys())
                 bin_dir = ROOT / "adapters" / adapter / "bin"
                 self.assertTrue(bin_dir.is_dir(), bin_dir)
                 for path in sorted(bin_dir.iterdir()):
                     if path.is_file() and path.suffix in (".sh", ".py"):
-                        found.update(literal.findall(path.read_text(encoding="utf-8", errors="replace")))
-                self.assertEqual(found - declared, set(), f"{adapter} wrappers read an undeclared tier")
+                        contents = path.read_text(encoding="utf-8", errors="replace")
+                        found.update(literal.findall(contents))
+                        for tier, fallback in fallbacks.items():
+                            self.assertIn(fallback, declared)
+                            for suffix in ("MODEL", "EFFORT", "VARIANT"):
+                                key = f"CFG_TIER_{tier}_{suffix}"
+                                guarded = "${" + key + ":-$CFG_TIER_" + fallback + "_" + suffix + "}"
+                                self.assertNotRegex(contents.replace(guarded, ""), rf"\b{key}\b",
+                                                    f"{path.name} reads optional {key} without its required fallback")
+                self.assertEqual(found - declared - fallbacks.keys(), set(),
+                                 f"{adapter} wrappers read an undeclared tier")
                 # Each declared tier must ship the exact keys a wrapper reads —
                 # a failover/cascade-only mention is not enough.
                 shipped = config.parse_config(config.shipped_path(adapter, source_root=ROOT))
