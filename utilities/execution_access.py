@@ -949,6 +949,7 @@ def build_grant(
     default_writable_roots: Iterable[str | Path] = (),
     network_available: bool = False,
     effective_sandbox: str = "workspace-write",
+    gpu_resource_scope: bool = False,
 ) -> ExecutionAccessGrant:
     """Compute the effective explicit grant; never create runtime argv."""
 
@@ -971,7 +972,11 @@ def build_grant(
         file_grade = network_grade = "none"
 
     unmet: list[str] = []
-    if request.writable_roots and runtime.startswith("codex") and file_grade == "none":
+    gpu_logical = (gpu_resource_scope and runtime.startswith("codex")
+                   and effective_sandbox == "danger-full-access"
+                   and request.enforcement_required == "any")
+    if (request.writable_roots and runtime.startswith("codex") and file_grade == "none"
+            and not gpu_logical):
         sandbox_subject = (
             "codex-read-only"
             if effective_sandbox == "read-only"
@@ -983,17 +988,24 @@ def build_grant(
         )
     if request.read_roots:
         unmet.append("read-roots-unprojected")
-    if request.writable_roots and file_grade == "none":
+    if (request.writable_roots or gpu_logical) and file_grade == "none":
         unmet.append("file-enforcement-none")
+    if gpu_logical:
+        unmet.append("network-enforcement-none")
 
     if request.network_required:
         if runtime.startswith("codex"):
-            if not network_available or network_grade != "os-sandbox":
+            if not network_available or (network_grade != "os-sandbox" and not gpu_logical):
                 raise ExecutionAccessError(
                     "execution-access-enforcement-unavailable:codex-network-role-gated",
                     "network is outside the current Codex launch policy; change the top-level launch request/role",
                 )
-            if request.network_hosts:
+            if gpu_logical:
+                network = "granted-unenforced"
+                unmet.append("network-unenforced-codex")
+                if request.network_hosts:
+                    unmet.append("network-hosts-unenforced")
+            elif request.network_hosts:
                 if request.enforcement_required == "os-sandbox":
                     raise ExecutionAccessError(
                         "execution-access-enforcement-unavailable:codex-network-hosts",
@@ -1046,6 +1058,7 @@ def bind_request(
     default_writable_roots: Iterable[str | Path] = (),
     network_available: bool = False,
     effective_sandbox: str = "workspace-write",
+    gpu_resource_scope: bool = False,
 ) -> ExecutionAccessGrant | None:
     """Resolve, validate, constrain, and grade an explicit request.
 
@@ -1064,6 +1077,7 @@ def bind_request(
         default_writable_roots=default_writable_roots,
         network_available=network_available,
         effective_sandbox=effective_sandbox,
+        gpu_resource_scope=gpu_resource_scope,
     )
 
 
@@ -1082,6 +1096,7 @@ def publish_effective_grant(
     grant: ExecutionAccessGrant | None,
     default_writable_roots: Iterable[str | Path],
     network_allowed: bool,
+    execution_selection: Mapping[str, object] | None = None,
 ) -> tuple[Path, str]:
     """Publish the exact filesystem/network effect used by one attempt."""
 
@@ -1115,6 +1130,16 @@ def publish_effective_grant(
             "os-sandbox" if runtime.startswith("codex") and sandbox == "workspace-write" else "none"
         ),
     }
+    if (grant is not None and runtime.startswith("codex")
+            and sandbox == "danger-full-access" and grant.file_enforcement == "none"):
+        record.update({"boundary": "logical-request", "unmet": list(grant.unmet),
+                       "os_filesystem_enforced": False, "os_network_enforced": False})
+        record["network_allowed"] = bool(network_allowed or grant.network == "granted-unenforced")
+    if execution_selection is not None and execution_selection.get("gpu_scope") is True:
+        record["execution_sandbox_selection"] = dict(execution_selection)
+        if runtime.startswith("codex") and sandbox == "danger-full-access":
+            record.update({"boundary": "logical-request" if grant else "logical-defaults",
+                           "os_filesystem_enforced": False, "os_network_enforced": False})
     raw = _canonical_json_bytes(record)
     digest = hashlib.sha256(raw).hexdigest()
     path = state_root / "execution-access" / "attempts" / attempt_id / "effective.json"

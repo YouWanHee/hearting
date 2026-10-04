@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
 from codex_permission_profile import commit_profile_config, config_arguments
+import gpu_execution_sandbox as GPU_SANDBOX
 from dispatch_contract import (
     _atomic_registry_replace,
     workflow_completion_receipt,  # noqa: E402
@@ -859,7 +860,8 @@ def _worktree_git_dirs(worktree) -> tuple[Path, Path] | None:
 
 def owner_write_advisories(args):
     """Observe the applied owner sandbox/grant without changing launch inputs."""
-    if getattr(args, "worker_type", None) != "owner":
+    gpu_choice = getattr(args, "gpu_execution_selection", None)
+    if getattr(args, "worker_type", None) != "owner" and gpu_choice is None:
         return []
     route_file = getattr(args, "route_file", None) or getattr(
         getattr(args, "owner_route_binding", None), "route_file", None)
@@ -872,13 +874,16 @@ def owner_write_advisories(args):
     if not isinstance(route, dict):
         route = {"cwd": str(args.worktree), "nodes": [
             {"write_scope": (getattr(args, "write_scope", None) or "").split(";")}]}
+    if getattr(args, "worker_type", None) != "owner":
+        return GPU_SANDBOX.advisory(route, owner_harness="codex", selection=gpu_choice, applied=True)
     grant = getattr(args, "execution_access_grant", None)
     # build_grant preserves request.writable_roots, including roots absorbed
     # by existing defaults; it never adds adapter default roots to this field.
     return OWNER_WRITE_ADVISORY.advisories(
         route, owner_harness="codex", sandbox=effective_runtime_sandbox(args),
         git_writable_roots=linked_worktree_git_writable_dirs(args),
-        explicit_writable_roots=getattr(grant, "writable_roots", ()))
+        explicit_writable_roots=getattr(grant, "writable_roots", ()),
+        gpu_selection=getattr(args, "gpu_execution_selection", None))
 
 
 def _is_linked_worktree(worktree, agent_home) -> bool:
@@ -1075,9 +1080,40 @@ def dispatch_prompt(
     )
 
 
+def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
+    """Consume the validated route's selection before grants or registration."""
+    args.gpu_execution_selection = None
+    args.gpu_execution_scope = False
+    route_file = getattr(args, "route_file", None) or getattr(
+        getattr(args, "owner_route_binding", None), "route_file", None)
+    if not route_file:
+        return
+    route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    owner = args.dispatch_depth == 1 and args.worker_type == "owner"
+    if not owner and args.dispatch_depth != 2:
+        return
+    cli_explicit = any(arg == "--sandbox" or arg.startswith("--sandbox=")
+                       for arg in getattr(args, "replacement_input_argv", []))
+    selection = GPU_SANDBOX.select(
+        route, owner=owner, node=getattr(args, "route_node", None),
+        requested=args.sandbox if cli_explicit else None)
+    if not selection["gpu_scope"]:
+        return
+    if owner:
+        for row in (route.get("dispatch_evidence") or {}).get("tuples", []):
+            if row.get("parent_harness") == "codex" and row.get("parent_sandbox") != selection["sandbox"]:
+                raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
+                                            "selected GPU owner sandbox differs from its checked tuple")
+    args.gpu_execution_selection = selection
+    args.gpu_execution_scope = True
+    args.sandbox = selection["sandbox"]
+
+
 def effective_runtime_sandbox(args: argparse.Namespace) -> str:
     """Avoid nesting Codex's mount sandbox inside an already checked Codex sandbox."""
 
+    if getattr(args, "gpu_execution_scope", False):
+        return args.sandbox  # The shared GPU selection already includes caller constraints.
     if (
         getattr(args, "launch_lifecycle", DETACHED) == FOREGROUND_SCOPED
         and os.environ.get("AGENT_DISPATCH_CHILD") == "1"
@@ -1874,6 +1910,7 @@ def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
         worker_type=args.worker_type,
         intensity=args.intensity,
         sandbox=args.sandbox,
+        gpu_resource_owner=getattr(args, "gpu_execution_scope", False),
     )
 
 
@@ -2461,6 +2498,11 @@ def main(argv: list[str]) -> int:
     rc = validate_route_record(args)
     if rc != 0:
         return rc
+    try:
+        apply_gpu_execution_sandbox(args)
+    except (DispatchContractError, OSError, ValueError) as exc:
+        return fail(getattr(exc, "reason", "gpu-execution-selection-invalid"), 65,
+                    detail=str(exc), child_spawned="0")
     args.replica_batch_expectation = None
     if action in {"register", "start"}:
         try:
@@ -2749,8 +2791,12 @@ def main(argv: list[str]) -> int:
                 else "codex-exec"
             ),
             default_writable_roots=default_roots,
-            network_available=args.nested_headless_network,
+            network_available=(args.nested_headless_network or
+                               (args.gpu_execution_scope and access_parent is not None
+                                and access_parent.network_allowed)),
             effective_sandbox=effective_runtime_sandbox(args),
+            gpu_resource_scope=(args.gpu_execution_scope
+                                and effective_runtime_sandbox(args) == "danger-full-access"),
         )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
@@ -3073,6 +3119,7 @@ def main(argv: list[str]) -> int:
                 sandbox=effective_runtime_sandbox(args), grant=args.execution_access_grant,
                 default_writable_roots=default_roots,
                 network_allowed=args.nested_headless_network,
+                execution_selection=args.gpu_execution_selection,
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256

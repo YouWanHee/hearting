@@ -23,6 +23,7 @@ import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 import owner_write_advisory as OWNER_WRITE_ADVISORY
+import gpu_execution_sandbox as GPU_SANDBOX
 from dispatch_continuation_budget import (COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT,
                                           derive_workload_ordinary)
 from dispatch_contract import (
@@ -1233,7 +1234,7 @@ def build_continuation_route(
     source_route,*,resume_from_node,requested_boundary,reason,
     artifact_root,lineage_operation="resume",thread_id=None,new_thread_id=None,
     forked_from_id=None,last_turn_id=None,ephemeral=False,
-    partial_group=None,
+    partial_group=None,dispatch_evidence=None,
 ):
     """Generate one official route suffix without invoking the generic compiler."""
     source_nodes=source_route.get("nodes") or []
@@ -1289,6 +1290,12 @@ def build_continuation_route(
         "source_evidence_digest":evidence_digest,
         "lineage":lineage,
     }
+    if dispatch_evidence is not None:
+        dispatch_evidence=_validate_dispatch_evidence(
+            dispatch_evidence,source_route.get("dispatch_contract_version") or DISPATCH_CONTRACT_VERSION,
+            _evidence_parent_dispatch_depth(source_nodes,source_route.get("owner_dispatch_depth",1)),
+            expected_worktree=source_route.get("cwd"),require_scope=True)
+        identity.update({"dispatch_evidence_override":True,"dispatch_evidence":dispatch_evidence})
     if inherited_refresh is not None:
         identity["ancestor_revision_digest"]=_sha256_record(inherited_refresh)
     continuation_id=_continuation_id(identity)
@@ -1340,6 +1347,10 @@ def build_continuation_route(
     for offset,source_node in enumerate(source_nodes[resume_index:]):
         source_contract_hash=_continuation_contract_hash(source_node)
         node=_continuation_node_projection(source_node,reused)
+        if dispatch_evidence is not None and node.get("dispatch_depth")==2:
+            node["fallback_hops"]=_fallback_chain(
+                dispatch_evidence,source_route.get("dispatch_contract_version") or DISPATCH_CONTRACT_VERSION,
+                expected_worktree=source_route.get("cwd"),require_scope=True)
         if (inherited_refresh is not None
                 and source_route["route_id"]==inherited_refresh["source_route_id"]
                 and node["id"]=="plan-check"):
@@ -1373,7 +1384,7 @@ def build_continuation_route(
         "owner_dispatch_depth","max_dispatch_depth","tracking",
         "tracked_gate_evidence","spec_touch","cwd","source_commit",
         "registry_digest","capability_registry_digest","dispatch_defaults_digest","dispatch_allocation",
-        "owner_harness_policy","selection","human_gates","human_gate_bindings",
+        "owner_harness_policy","selection","codex_execution_sandbox","human_gates","human_gate_bindings",
         "confirmation_mode","small_work_confirmation",
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
@@ -1511,6 +1522,8 @@ def _verify_continuation_route(route):
         "reason":route.get("reason"),
         "source_evidence_digest":route.get("source_evidence_digest"),
         "lineage":route.get("runtime_lineage"),
+        **({"dispatch_evidence_override":True,"dispatch_evidence":route.get("dispatch_evidence")}
+           if route.get("dispatch_evidence_override") is True else {}),
         **({"ancestor_revision_digest":route.get("ancestor_revision_digest")}
            if route.get("ancestor_plan_refresh") is not None else {}),
     })
@@ -3189,7 +3202,7 @@ def _compose_default_jobs():
     return stable_state_root(os.environ) / "jobs.log"
 
 
-def _compose_readiness(cwd, jobs, parent_harness, children):
+def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None):
     spec = importlib.util.spec_from_file_location(
         "hearting_dispatch_readiness", ROOT / "utilities" / "dispatch-readiness.py")
     module = importlib.util.module_from_spec(spec)
@@ -3198,6 +3211,8 @@ def _compose_readiness(cwd, jobs, parent_harness, children):
         return module.generate(
             worktree=Path(cwd), jobs=Path(jobs),
             owner_harnesses=[parent_harness], child_harnesses=list(children),
+            **({"codex_execution_selection": GPU_SANDBOX.select(gpu_route)}
+               if gpu_route and GPU_SANDBOX.gpu_resource_nodes(gpu_route) else {}),
         )
     except module.ReadinessError as exc:
         raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
@@ -3544,9 +3559,12 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             if node.get("model_profile") and node["id"] not in explicit_profiles:
                 explicit_profiles[node["id"]] = node["model_profile"]
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
+    gpu_route = {"capability": capability, "nodes": selected_recipe["standard_plus"]["nodes"],
+                 "selection": {"promotion_signals": [{"signal": s} for s in signals]}}
     if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
-                                       children or _compose_default_children(selection_pins))
+                                       children or _compose_default_children(selection_pins),
+                                       gpu_route=gpu_route if shape == "staged" else None)
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
     if (shape == "solo" or owner_only) and registered_headless_evidence is None:
         readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
@@ -3650,6 +3668,10 @@ def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
 
 def _leg_evidence(leg, readiness):
     if leg["shape"] == "direct":
+        return {}
+    if leg.get("capability") == "autopilot-lab":
+        # A lab leg's resource classes differ from its planning frame. Compose
+        # probes the selected recipe with the same sandbox selection it seals.
         return {}
     probe = readiness()
     return {"dispatch_evidence": {"tuples": probe["tuples"], "native_subagent": []},
@@ -4278,6 +4300,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          "terminal_commit_contract":RUNTIME_SUPPORT.TERMINAL_COMMIT_CONTRACT,
                          "terminal_handoff_contract":RUNTIME_SUPPORT.TERMINAL_HANDOFF_CONTRACT,
                          "producer_binding_contract":RUNTIME_SUPPORT.PRODUCER_BINDING_CONTRACT}}
+    if GPU_SANDBOX.gpu_resource_nodes(payload):
+        payload["codex_execution_sandbox"] = GPU_SANDBOX.select(payload)
     payload.update(slug_fields)
     for key, value in (("campaign_key", campaign_key), ("parent_cycle_id", parent_cycle_id)):
         if value is not None:
@@ -8018,6 +8042,10 @@ def review_lineage_routes(route, node_id):
         # reused prefix; all other assignment, assurance, gate and scope fields
         # remain byte-for-byte equal to the source node.
         expected_node = _continuation_node_projection(parent_node, reused)
+        if current.get("dispatch_evidence_override") is True and expected_node.get("dispatch_depth")==2:
+            expected_node["fallback_hops"]=_fallback_chain(
+                current.get("dispatch_evidence"),current.get("dispatch_contract_version") or DISPATCH_CONTRACT_VERSION,
+                expected_worktree=current.get("cwd"),require_scope=True)
         if (refresh is not None
                 and parent["route_id"]==refresh["source_route_id"]
                 and current.get("resume_from_node")=="plan-check"
@@ -9458,6 +9486,7 @@ def main():
     co.add_argument("--reason",required=True)
     co.add_argument("--artifact-root",required=True)
     co.add_argument("--output")
+    co.add_argument("--dispatch-evidence",help="optional checked nested evidence for this continuation; source evidence stays unchanged")
     co.add_argument("--lineage-operation",choices=("resume","fork"),default="resume")
     co.add_argument("--thread-id")
     co.add_argument("--new-thread-id")
@@ -9726,6 +9755,8 @@ def main():
                 thread_id=a.thread_id,new_thread_id=a.new_thread_id,
                 forked_from_id=a.forked_from_id,last_turn_id=a.last_turn_id,
                 ephemeral=a.ephemeral,partial_group=partial,
+                dispatch_evidence=(json.loads(Path(a.dispatch_evidence).read_text(encoding="utf-8"))
+                                   if a.dispatch_evidence else None),
             )
         except ValueError:
             # Every other refusal on this command prints the zeroed receipt line

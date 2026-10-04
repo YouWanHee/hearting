@@ -477,7 +477,8 @@ _CAPACITY_TERMINAL_RE = re.compile(
 
 
 def codex_standard_owner_network_enabled(
-    *, dispatch_depth: int, worker_type: str, intensity: str, sandbox: str
+    *, dispatch_depth: int, worker_type: str, intensity: str, sandbox: str,
+    gpu_resource_owner: bool = False,
 ) -> bool:
     """Return whether the Codex wrapper grants its scoped nested network profile."""
 
@@ -485,7 +486,8 @@ def codex_standard_owner_network_enabled(
         dispatch_depth == 1
         and worker_type == "owner"
         and intensity in STANDARD_PLUS_INTENSITIES
-        and sandbox == "workspace-write"
+        and (sandbox == "workspace-write"
+             or (gpu_resource_owner and sandbox == "danger-full-access"))
     )
 
 

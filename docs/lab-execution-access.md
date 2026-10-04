@@ -50,6 +50,36 @@ Child 요청이 부모의 실제 파일 또는 네트워크 범위를 넘으면 
 
 ## 적용 수준과 현재 한계
 
+### GPU lab의 실행 sandbox
+
+GPU resource를 선언한 lab route는 Codex owner와 그 GPU resource에 기존
+`danger-full-access`를 선택한다. 기준은 `resource_class=gpu`, 또는 기존
+compose `--signal gpu`와 resource runner이며 작업 설명의 자연어는 해석하지 않는다.
+기존 signal은 정상 route 선택에서 재사용한다. 일반 code·frame과 다른 lab child의
+기본값은 그대로다. Caller의 기존 `--sandbox`·`CODEX_DISPATCH_SANDBOX`와
+`CODEX_DISPATCH_SANDBOX_FORCE`가 우선하며 사용자 전역 설정은 수정하지 않는다.
+같은 선택을 prospective readiness, sealed parent sandbox tuple, exec/App Server
+실행이 소비한다. Owner 내부에서 env를 붙이고 다시 probe/compile할 필요가 없다.
+
+Codex 0.160.0의 Linux sandbox에서 NVIDIA 장치가 숨겨지는 것을 실제 조회로
+확인했다. `/dev` read로 해결되지 않았고 장치 write profile은 bwrap panic으로
+종료됐다. 같은 설치의 full access에서는 `nvidia-smi -L` 조회가 성공했다.
+이는 학습 성공이나 다른 외부 sandbox의 장치 지원을 보증하지 않는다.
+
+이 선택에는 filesystem/network OS enforcement가 **없다**. 이 범위에서
+`enforcement_required=any`인 요청만 논리적 root/child≤parent 경계로 수용하고
+grade `none`, `file-enforcement-none`, `network-enforcement-none`을 기록한다.
+Network 요청은 부모의 논리적 허용 범위 안에서 `granted-unenforced`로 남는다.
+`os-sandbox` 필수 요청, read-only에서 쓰기 요청, 부모 밖 요청은 기존대로 거부한다.
+Strict OS enforcement가 필요하면 기존 workspace 실행이나 compute-hosts resource
+경로를 이용한다. Compose/explain/start와 launch receipt에는 실제 선택·적용 수준이
+표시되며, 외부 sandbox와 관리된 runtime 제약은 계속 적용된다.
+
+공식 문서도 full access가 파일·네트워크 경계를 제거한다고 설명한다.
+[Codex sandbox](https://learn.chatgpt.com/docs/sandboxing),
+[Codex permissions](https://learn.chatgpt.com/docs/permissions),
+[Codex App Server](https://learn.chatgpt.com/docs/app-server)
+
 Codex의 `workspace-write`에서는 writable root를 OS sandbox에 적용한다. 로컬
 `codex-cli 0.160.0`의 exec는 `--add-dir`, Hearting App Server runner는
 `--writable-root`로 같은 검증 결과를 전달한다. 일반 code 실행의 기존 기본 경로와
@@ -69,3 +99,13 @@ Codex 공식 문서 역시 호스트별 네트워크 규칙을 적용하려면 p
 Claude·OpenCode에서는 같은 요청을 기존 tool-permission 수준으로 적용하며 OS sandbox와
 동등하다고 보고하지 않는다. Claude의 additional directory 권한과 sandbox는 별도
 설정이다. [Claude permissions](https://code.claude.com/docs/en/permissions)
+
+## Continuation의 checked evidence 갱신
+
+이미 실행 중인 부모의 sandbox가 원 tuple과 다르면 기존 continuation 명령에
+선택적으로 `--dispatch-evidence /absolute/path/checked-evidence.json`을 전달할 수 있다.
+Compile/compose와 같은 exact-worktree·parent identity 검증으로 evidence를 확인하고,
+새 continuation의 tuple과 해당 fallback 선택에만 반영한다. 원 route와 완료 증거,
+단위·승인 범위·cycle lineage는 보존한다. Override가 없으면 원 evidence를 그대로 쓴다.
+이 입력은 sandbox를 바꾸거나 자동 probe·권한 승격을 수행하지 않는다. 새 정상 GPU
+compose/start는 실행 선택과 probe/tuple을 함께 준비하므로 이 복구 입력이 필요 없다.

@@ -45,6 +45,7 @@ shared-utility-deferred	interactive-main-recovery.py
 shared-utility-deferred	memory-store.sh
 shared-utility-deferred	opencode_session_runtime.py
 shared-utility-deferred	owner_write_advisory.py
+shared-utility-deferred	gpu_execution_sandbox.py
 shared-utility-deferred	prd_readability.py
 shared-utility-deferred	review_input.py
 shared-utility-deferred	review_watchdog.py
