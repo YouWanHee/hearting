@@ -218,6 +218,11 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                 "created": original.get("created") or datetime.now(timezone.utc).strftime("%Y-%m-%d")}
     errors = FI.validate(question, intensity=route["effective_intensity"])
     response = json.loads(Path(answers).read_text()) if answers else None
+    # A native timeout/acknowledgement is not an answer file. Keep the same
+    # registered question available for a later ordinary conversation reply.
+    unanswered = FI.pending_answer_response(question, response)
+    if unanswered:
+        response = None
     if response is not None:
         errors += FI.validate_answers(question, response)
     if errors:
@@ -239,14 +244,25 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         if completed.returncode:
             raise ValueError(f"frame-{operation}-pending: {completed.stderr.strip()} {completed.stdout.strip()}")
 
+    ask_now = (resolution["status"] == "not-raised" or next_round) and not answers
     if resolution["status"] == "not-raised" or next_round:
         command("gate", "--block", "--artifact", str(question_path))
         resolution = WS.human_gate_resolution(ledger.journal(), "frame-review")
     if response is None and decision == "proceed":
-        return {"state": "needs-question", "required_action": "ask-registered-question",
+        return {"state": "needs-question", "required_action": "ask-registered-question" if ask_now else "wait-for-user-answer",
                 "interview_file": str(question_path), "interview": question,
                 "answers_template": FI.answers_template(question),
-                "next_step": "Display the native question and preserve the actual response; then rerun "
+                "human_wait": {"state": "pending", "fallback": "ordinary-conversation",
+                               "question_block": FI.pending_question_block(question)},
+                "parent_next": "end-turn",
+                "next_step": ("Present the registered question once. " if ask_now else
+                              "Keep waiting for the actual answer. If this question has not yet been presented, "
+                              "present human_wait.question_block now; registration alone does not prove presentation. "
+                              "Do not automatically open another native question. ") +
+                    "Ask the person to confirm or correct the understanding in their language, and present the "
+                    "registered question and choices without changing their words. "
+                    "Leave human_wait.question_block in the final conversation reply if the native box closes. "
+                    "Preserve only the person's actual structured or typed reply in answers_template; then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "
                     "For a revise/stop decision also pass --decision revise|stop. " + FI.PENDING_ANSWER_RULE}
     if resolution["status"] in {"proceed", "revise", "stop"}:

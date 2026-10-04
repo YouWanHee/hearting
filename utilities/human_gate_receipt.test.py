@@ -335,6 +335,9 @@ class HumanGateReceiptTest(unittest.TestCase):
         self.assertIn("--jobs", value)
         self.assertIn("human decision is required", value)
         self.assertIn("paused there", value)
+        self.assertIn("receiving the person's actual decision", value)
+        self.assertIn("Timeout, empty answers, and async accepted are not decisions", value)
+        self.assertIn("person's next reply, structured or typed, as the answer", value)
         self.assertNotIn("preflight.sh harvest", value)
 
 

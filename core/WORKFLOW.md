@@ -302,7 +302,12 @@ execution/cleanup responsibility and the deadline grants no retry authority.
 `needs-interview` means both frames have been checked: compare their results,
 fill the returned semantic template, and use `start --route <file> --interview
 <question.json>`. It registers the gate before returning `needs-question`.
-After the native answer, use the same command with `--answers <answers.json>`;
+Native acknowledgement, timeout, or empty answers keep this question pending;
+they carry no approval. The `needs-question` receipt retains the registered
+question and choices for ordinary conversation when the native box closes.
+Restate that block at turn end and wait for the person's actual reply; a plain
+resume reuses the pending question rather than opening another native box.
+After the actual structured or typed answer, use the same command with `--answers <answers.json>`;
 it records intent, releases the gate, and starts the owner. Already answered
 questions can supply both files without asking again. `--decision revise|stop`
 records those choices; repeated answers reuse the recorded decision.

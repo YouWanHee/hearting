@@ -108,7 +108,7 @@ Each clause is one contract line plus the signal that it was violated.
   confirmation above is a separate pre-execution contract. *Violation signal:*
   a pause flag added because the task merely feels important.
 - **No answer is not a decision** — an empty answer, no response, or elapsed
-  time from a structured question (`AskUserQuestion`, Codex
+  time or an async acknowledgement (`accepted`) from a structured question (`AskUserQuestion`, Codex
   `request_user_input[_async]`, OpenCode `question`, or equivalent) never counts
   as the user's decision. For a simple, reversible confirmation of your own,
   proceed with the recommended option and report it briefly. A question that
