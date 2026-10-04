@@ -28,6 +28,100 @@ def load_module():
     return module
 
 
+class SSHNamespacePrefixTest(unittest.TestCase):
+    HOST = {"ssh_host": "example.invalid", "ssh_port": 1689, "ssh_user": "operator"}
+    NORMAL = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+              "-p", "1689", "operator@example.invalid"]
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        (self.home / ".ssh").mkdir()
+        self.config = self.home / ".ssh" / "config"
+        self.config.write_text("Host example.invalid\n  User operator\n")
+        self.module = load_module()
+        self.paths = {
+            "/etc/ssh/ssh_config": mock.Mock(),
+            "/proc/sys/kernel/overflowuid": mock.Mock(),
+            "/proc/self/uid_map": mock.Mock(),
+        }
+        self.paths["/etc/ssh/ssh_config"].stat.return_value.st_uid = 65534
+        self.paths["/proc/sys/kernel/overflowuid"].read_text.return_value = "65534\n"
+        self.paths["/proc/self/uid_map"].read_text.return_value = "1002 0 1\n"
+        patch = mock.patch.object(self.module, "Path", side_effect=self.paths.__getitem__)
+        self.path = patch.start()
+        self.addCleanup(patch.stop)
+        self.path.home.return_value = self.home
+        uid = mock.patch.object(self.module.os, "getuid", return_value=1002)
+        uid.start()
+        self.addCleanup(uid.stop)
+
+    def test_normal_root_owned_config_keeps_identical_argv_bytes(self):
+        self.paths["/etc/ssh/ssh_config"].stat.return_value.st_uid = 0
+        actual = self.module.ssh_prefix(self.HOST)
+        self.assertEqual(b"\0".join(word.encode() for word in actual),
+                         b"\0".join(word.encode() for word in self.NORMAL))
+        self.paths["/proc/sys/kernel/overflowuid"].read_text.assert_not_called()
+
+    def test_unmapped_system_owner_uses_user_config_and_disables_key_updates(self):
+        for uid_map in ("1002 0 1\n", "0 1002 1\n"):
+            with self.subTest(uid_map=uid_map):
+                self.paths["/proc/self/uid_map"].read_text.return_value = uid_map
+                actual = self.module.ssh_prefix(self.HOST)
+                self.assertEqual(actual, self.NORMAL[:5] + [
+                    "-F", str(self.config), "-o", "UpdateHostKeys=no"] + self.NORMAL[5:])
+                self.assertNotIn("StrictHostKeyChecking=no", actual)
+        self.assertEqual(self.config.read_text(), "Host example.invalid\n  User operator\n")
+
+    def test_missing_user_config_uses_dev_null_without_creating_files(self):
+        home = self.home / "absent"
+        self.path.home.return_value = home
+        self.assertEqual(self.module.ssh_prefix(self.HOST), self.NORMAL[:5] + [
+            "-F", "/dev/null", "-o", "UpdateHostKeys=no"] + self.NORMAL[5:])
+        self.assertFalse(home.exists())
+
+    def test_real_mapped_overflow_owner_keeps_normal_ownership_checks(self):
+        for uid_map in ("0 0 4294967295\n", "1002 0 1\n65534 65534 1\n"):
+            with self.subTest(uid_map=uid_map):
+                self.paths["/proc/self/uid_map"].read_text.return_value = uid_map
+                self.assertEqual(self.module.ssh_prefix(self.HOST), self.NORMAL)
+
+    def test_other_or_current_owner_does_not_trigger_namespace_options(self):
+        for owner in (1002, 123, 65535):
+            with self.subTest(owner=owner):
+                self.paths["/etc/ssh/ssh_config"].stat.return_value.st_uid = owner
+                self.assertEqual(self.module.ssh_prefix(self.HOST), self.NORMAL)
+
+    def test_kernel_overflow_uid_is_read_instead_of_hardcoded(self):
+        self.paths["/etc/ssh/ssh_config"].stat.return_value.st_uid = 65535
+        self.paths["/proc/sys/kernel/overflowuid"].read_text.return_value = "65535\n"
+        actual = self.module.ssh_prefix(self.HOST)
+        self.assertIn("-F", actual)
+        self.assertIn("UpdateHostKeys=no", actual)
+
+    def test_unreadable_or_malformed_namespace_evidence_preserves_argv(self):
+        for path in self.paths.values():
+            with self.subTest(path=path):
+                method = path.stat if path is self.paths["/etc/ssh/ssh_config"] else path.read_text
+                method.side_effect = OSError("fixture denied")
+                self.assertEqual(self.module.ssh_prefix(self.HOST), self.NORMAL)
+                method.side_effect = None
+        for overflow in ("invalid", "0", "-1"):
+            with self.subTest(overflow=overflow):
+                self.paths["/proc/sys/kernel/overflowuid"].read_text.return_value = overflow
+                self.assertEqual(self.module.ssh_prefix(self.HOST), self.NORMAL)
+        self.paths["/proc/sys/kernel/overflowuid"].read_text.return_value = "65534\n"
+        for mapping in ("", "invalid", "0 0", "0 0 0", "-1 0 1", "0 -1 1"):
+            with self.subTest(mapping=mapping):
+                self.paths["/proc/self/uid_map"].read_text.return_value = mapping
+                self.assertEqual(self.module.ssh_prefix(self.HOST), self.NORMAL)
+
+    def test_local_host_never_probes_ssh_configuration(self):
+        self.assertEqual(self.module.ssh_prefix({"ssh_host": "local"}), [])
+        self.path.assert_not_called()
+
+
 class ComputeHostsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir="/var/tmp")

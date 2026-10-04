@@ -196,6 +196,33 @@ def is_self(host):
     return False
 
 
+def _ssh_namespace_config_options():
+    """Skip system SSH defaults only when their owner is an unmapped UID."""
+    try:
+        owner = Path("/etc/ssh/ssh_config").stat().st_uid
+        if owner in (0, os.getuid()):
+            return []
+        overflow = int(Path("/proc/sys/kernel/overflowuid").read_text().strip())
+        if overflow <= 0 or owner != overflow:
+            return []
+        mappings = []
+        for row in Path("/proc/self/uid_map").read_text().splitlines():
+            inside, outside, count = map(int, row.split())
+            if inside < 0 or outside < 0 or count <= 0:
+                return []
+            mappings.append((inside, count))
+        # A genuinely mapped owner (including nobody on a normal host) must
+        # retain OpenSSH's normal ownership checks, not trigger this workaround.
+        if not mappings or any(start <= overflow < start + count
+                               for start, count in mappings):
+            return []
+        config = Path.home() / ".ssh" / "config"
+        return ["-F", str(config) if config.is_file() else "/dev/null",
+                "-o", "UpdateHostKeys=no"]
+    except (OSError, ValueError, RuntimeError):
+        return []
+
+
 def ssh_prefix(host):
     """Argv prefix that runs a command on this host, locally or over SSH."""
     if is_self(host):
@@ -204,6 +231,7 @@ def ssh_prefix(host):
     user = host.get("ssh_user")
     argv = ["ssh", "-o", "BatchMode=yes",
             "-o", f"ConnectTimeout={CONNECT_TIMEOUT}"]
+    argv += _ssh_namespace_config_options()
     if host.get("ssh_port"):
         argv += ["-p", str(host["ssh_port"])]
     argv.append(f"{user}@{target}" if user else target)
