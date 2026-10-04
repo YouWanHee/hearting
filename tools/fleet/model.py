@@ -609,6 +609,7 @@ class ResourceJob:
     source_dirty: Optional[bool] = None
     source_git_state: Optional[str] = None
     started_at: Optional[float] = None
+    training_progress: Optional[dict] = None
     # Tracked-workflow projection (OPERATIONS §5.12): a resource row exposes why it
     # ended, which registered attempt owns it, and what the workflow thinks it is.
     workflow_state: Optional[str] = None

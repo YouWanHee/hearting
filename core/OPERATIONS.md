@@ -940,6 +940,22 @@ evidence), with its GPU, VRAM, and running time; a process whose cwd cannot be r
 row uses the same probe sample, is read-only, adds no registry entry, and
 disappears with an expired sample.
 
+Fleet may enrich a working registered resource's GPU process with read-only
+training progress from its existing `run.json` and exact arm directory's
+`progress.json`. The observation binds the registered wrapper and producer child by their
+PID, start time, command hash and same-EUID process-group connection across the
+bounded reads. The child's actual config argument and cwd go through the normal
+lab config resolver; only bytes matching the arm's recorded config hash can
+supply an explicit `training.attempts` denominator. Attempt, successful and
+skipped counters remain separate units. A finite loss is labelled last batch
+only when its attempt matches the current counter. Progress-file age remains
+separate from log heartbeat age, including while validation pauses updates.
+Unknown provenance, units or shapes retain the existing raw progress; no
+registry repair, producer output requirement, project-specific exception or
+training restart is involved. JSON and both Fleet views consume the same
+identity-bound projection. Schedule epochs, combined arm totals and ETA are not
+inferred from these counters.
+
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
 may end long before it finishes and any later session on any host that mounts
