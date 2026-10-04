@@ -242,7 +242,12 @@ function nativePaneSelector(argv) {
     const key = equal < 0 ? arg : arg.slice(0, equal)
     let value = equal < 0 ? undefined : arg.slice(equal + 1)
     if (key === "--session" || key === "-s" || values.has(key)) {
-      if (value === undefined) value = argv[++i]
+      if (value === undefined) {
+        value = argv[++i]
+        // yargs leaves a following option in the option stream. Treat that
+        // ambiguous separated value as unavailable; explicit = values remain literal.
+        if (typeof value !== "string" || value.startsWith("-")) return null
+      }
       if (typeof value !== "string" || /[\x00-\x1f\x7f]/.test(value)) return null
       if (key === "--session" || key === "-s") {
         if (sid !== null || !/^ses_[A-Za-z0-9]+$/.test(value) || value.length > 256) return null

@@ -460,7 +460,7 @@ function fixture(options = {}) {
 const f = fixture();
 const cases = [
  ["opencode", "--session", "ses_A"], ["/native/opencode", "-s", "ses_A", "--model", "provider/model"],
- ["opencode", "--session=ses_A", "--prompt", "--continue"],
+ ["opencode", "--session=ses_A", "--prompt=--continue"],
  ["opencode", "--session", "ses_A", "--continue=false", "--fork=false"],
  ["opencode", "--no-continue", "--session", "ses_A"],
  ["opencode", "--session", "ses_A", "--", "/fixture/project"],
@@ -475,9 +475,12 @@ const cases = [
  ["opencode", "--session", "ses_A\0foreign"], ["opencode", "--session", "ses_A", "--mini"],
  ["opencode"], ["opencode", "--session", "ses_A", "--continue=0"],
 ];
+for (const key of ["--prompt", "--model", "-m", "--agent", "--port", "--hostname", "--mdns-domain", "--cors", "--log-level"]) {
+ for (const flag of ["--continue", "-c", "--fork"]) cases.push(["opencode", "--session=ses_A", key, flag]);
+}
 console.log(JSON.stringify(cases.map(argv => f.scope.nativePaneSelector(argv))));
 ''')
-        self.assertEqual(result, ["ses_A"] * 6 + [None] * 19)
+        self.assertEqual(result, ["ses_A"] * 6 + [None] * 46)
 
     def test_opencode_native_origin_invalid_or_bounded_proc_data_has_no_sdk_fallback(self):
         result = self.run_pane_projection_fixture(r'''
@@ -485,7 +488,8 @@ const results = [];
 const cases = [{stat: "999 (opencode) S " + "0 ".repeat(18) + "77 0"}, {stat: "123 (opencode) S 0"},
  {command: Buffer.from("opencode\0--session\0ses_A")},
  {argv: ["opencode", "--session", "ses_A", "--prompt", "x".repeat(33000)]},
- {argv: ["opencode", "--session", "ses_A", "--continue"]}, {worker: true}];
+ {argv: ["opencode", "--session", "ses_A", "--continue"]},
+ {argv: ["opencode", "--session=ses_A", "--prompt", "--continue"]}, {worker: true}];
 for (const options of cases) {
  const f = fixture(options);let gets = 0;
  await f.scope.projectPane("ses_A", f.ctx(async () => {gets++;return {id: "ses_A"}}));
@@ -493,7 +497,7 @@ for (const options of cases) {
 }
 console.log(JSON.stringify(results));
 ''')
-        self.assertEqual(result, [[0, 0]] * 6)
+        self.assertEqual(result, [[0, 0]] * 7)
 
     def test_opencode_foreign_first_directory_and_unknown_origin_consume_nothing(self):
         result = self.run_pane_projection_fixture(r'''
