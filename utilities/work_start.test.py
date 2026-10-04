@@ -1353,7 +1353,11 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
                          {"round": 2, "answers": {}}, {"schema": "foreign/v1", "answers": {}},
                          {"answers": []}, {"accepted": "yes"},
                          {"answers": {"unknown": {"answers": []}}},
-                         {"answers": {"go": {"choice": 50}}}, {**valid, "accepted": True}):
+                         {"answers": {"go": {"choice": 50}}},
+                         {"understanding_confirmed": True, "answers": {"go": {"choice": 0}}},
+                         {**valid, "understanding_confirmed": 1},
+                         {**valid, "answers": {"go": {"choice": False}, "run-ok": {"choice": 0}}},
+                         {**valid, "accepted": True}):
             with self.subTest(response=response):
                 bad.write_text(json.dumps(response))
                 with self.assertRaisesRegex(ValueError, "frame-input-invalid"):
