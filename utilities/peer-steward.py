@@ -161,7 +161,7 @@ def _resolve_target(target):
 
 def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
             receipt=None, status="sent", from_identity=None, to_session_id=None,
-            to_pane=None, transfer_ref=None, from_name=_UNSET_NAME):
+            to_pane=None, transfer_ref=None, from_name=_UNSET_NAME, surface="herdr"):
     """Write one peer_message_v1 row.
 
     `from_identity` exists for the detached watcher: `_current_session_identity`
@@ -193,7 +193,7 @@ def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
         to_name=to_name,
         to_pane=to_pane,
         kind=kind,
-        surface="herdr",
+        surface=surface,
         status=status,
         receipt=receipt,
         ref=list(ref or []),
@@ -1807,10 +1807,10 @@ def cmd_prompt(args):
     SD-122 (11) v67/v70 — `prompted=true` is printed only after the submission was
     observed, never from herdr's exit code alone:
 
-    * target `blocked`, or its visible pane shows a selection/permission form
-      (checked for every state): refused as `prompted=failed
-      reason=target-form-open` -- typed text would be lost and the Enter would
-      answer the form with its default (measured 3/3).
+    * target `blocked` or an open form: no keyboard input. A bounded private
+      payload retains the exact transfer/SID. Native queue acceptance is queued;
+      unavailable/ambiguous delivery stays pending. Only actual receipt is true.
+      Original typing-loss/default-Enter evidence (3/3) remains applicable.
     * target not working (idle/done/unknown): `herdr agent prompt --wait --until
       working` must see the state change; herdr's `agent_prompt_stalled` is
       `prompted=failed reason=agent-prompt-stalled`; a herdr `timeout` falls
@@ -1845,14 +1845,20 @@ def cmd_prompt(args):
     from_name = _from_name(from_harness, from_sid)
     t_harness, t_sid, _t_name = _resolve_target(args.target)
     transfer_ref = None
+    state_before, target_pane = _agent_state(args.target)
+    if not args.no_verify and state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
+        _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
+        state_before, target_pane = _agent_state(args.target)
+    form_open = state_before == "blocked" or _form_open(args.target)
     if not args.no_trailer:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
                 body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
-                {"harness": t_harness, "session_id": t_sid, "name": _t_name})
+                {"harness": t_harness, "session_id": t_sid, "name": _t_name},
+                defer=form_open, refs=args.ref)
         except (OSError, ValueError):
-            print("prompted=false reason=peer-transfer-record-unavailable")
-            return 1
+            print("prompted=unverified reason=peer-pending-or-transfer-unavailable")
+            return 5
     first = body.strip().splitlines()[0] if body.strip() else ""
     kind = "steer"
     for prefix, k in (("[steer]", "steer"), ("[handoff]", "handoff"), ("[gate]", "gate-relay")):
@@ -1865,8 +1871,27 @@ def cmd_prompt(args):
     reason = None
     rc = None
     verify_timeout_ms = max(_PROMPT_STALL_FLOOR_MS, int(args.verify_timeout_ms))
-    state_before, target_pane = _agent_state(args.target)
-    if args.no_verify:
+    try:
+        pending = peer_message._read_pending(transfer_ref) if transfer_ref else None
+    except (OSError, ValueError):
+        print("prompted=unverified reason=peer-pending-unavailable")
+        return 5
+    surface = "herdr"
+    if pending and t_harness == "codex":
+        surface = "codex-queue"
+        try:
+            result = peer_message.deliver_pending_codex(transfer_ref)
+        except (OSError, ValueError) as exc:
+            result = {"status": "unverified", "reason": "peer-pending-unavailable:" + str(exc)}
+        outcome = "true" if result["status"] == "received" else (
+            "queued" if result["status"] == "queued" else "unverified")
+        verify, reason = "native-queue-" + result["status"], result["reason"]
+    elif form_open:
+        outcome = ("unverified" if pending and pending["state"] == "unverified" else
+                   "queued" if pending else "failed")
+        verify = "private-pending" if pending else "none"
+        reason = pending["receipt"] if pending and pending["state"] == "unverified" else "target-form-open"
+    elif args.no_verify:
         state_before = "-"
         rc, _payload = _herdr_prompt(args.target, text, wait=False,
                                      timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
@@ -1875,12 +1900,7 @@ def cmd_prompt(args):
         outcome = "true" if rc == 0 else "failed"
         reason = None if rc == 0 else f"herdr-exit-{rc}"
     else:
-        if state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
-            _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
-            state_before, target_pane = _agent_state(args.target)
-        if state_before == "blocked" or _form_open(args.target):
-            outcome, reason = "failed", "target-form-open"
-        elif state_before == "working":
+        if state_before == "working":
             rc, payload = _herdr_prompt(args.target, text, wait=False,
                                         timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
             if rc is None:
@@ -1919,7 +1939,7 @@ def cmd_prompt(args):
     _record(to_harness=t_harness or "unknown", to_name=args.target, kind=kind,
             summary_text=text, to_session_id=t_sid, to_pane=target_pane,
             ref=args.ref, status=ledger_status, receipt=receipt,
-            from_identity=from_identity, from_name=from_name, transfer_ref=transfer_ref)
+            from_identity=from_identity, from_name=from_name, transfer_ref=transfer_ref, surface=surface)
     line = (f"prompted={outcome} target={args.target} "
             f"to_harness={t_harness or '-'} to_alias={peer_message.peer_alias(t_harness, t_sid)} kind={kind} "
             f"state_before={state_before} verify={verify} ms={elapsed_ms}")

@@ -293,6 +293,7 @@ def _latest_turn_status(path: Path, thread_id: str, *, timeout: float) -> str | 
 
 def find_turn_by_client_message_id(
     path: Path, thread_id: str, client_message_id: str, *, timeout: float = 5.0,
+    strict_history: bool = False,
 ) -> dict[str, Any] | None:
     """Find the turn that consumed an exact queued client message id."""
     cursor = None
@@ -317,6 +318,8 @@ def find_turn_by_client_message_id(
         cursor = response.get("nextCursor")
         if not cursor:
             return None
+    if strict_history:
+        raise QueueDeliveryError("queue-peer-history-budget-exhausted")
     # A bounded history miss is ambiguous, not a reason to strand a new
     # receipt in a long conversation. At-least-once permits another send;
     # the independent exact pending-queue check still suppresses duplicates.
@@ -354,19 +357,44 @@ def _pending_item(items, client_message_id):
     return True, item_id if isinstance(item_id, str) and item_id else None
 
 
-def _known_consumed(path, thread_id, client_message_id, *, timeout):
+def _known_consumed(path, thread_id, client_message_id, *, timeout, strict_history=False):
     try:
+        if strict_history:
+            return find_turn_by_client_message_id(path, thread_id, client_message_id,
+                                                 timeout=timeout, strict_history=True)
         return find_turn_by_client_message_id(path, thread_id, client_message_id, timeout=timeout)
-    except QueueDeliveryError:
+    except QueueDeliveryError as exc:
+        if strict_history:
+            # A read failure permits a later normal read, never an add now.
+            raise QueueDeliveryError("queue-peer-history-unavailable:" + exc.reason) from exc
         # History can be unavailable or oversized on a long coding turn.
         # That is an ambiguous result under the accepted at-least-once policy,
         # never evidence of consumption. Exact pending lookup still follows.
         return None
 
 
+def _peer_text_input(content, message):
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        return False
+    item = content[0]
+    return (item.get("type") == "text" and item.get("text") == message
+            and set(item) <= {"type", "text", "text_elements"}
+            and item.get("text_elements", []) == [])
+
+
+def _exact_peer_content(turn, client_message_id, message):
+    items = turn.get("items") if isinstance(turn, dict) else None
+    matches = [item for item in items if isinstance(item, dict)
+               and item.get("clientId") == client_message_id] if isinstance(items, list) else []
+    return (len(matches) == 1 and matches[0].get("type") == "userMessage"
+            and _peer_text_input(matches[0].get("content"), message))
+
+
 def send_at_least_once(
     path: Path, *, thread_id: str, client_message_id: str, message: str,
-    timeout: float = 5.0,
+    timeout: float = 5.0, allow_restart: bool = True,
+    retry_ambiguous: bool = True, allow_add: bool = True,
+    require_message_match: bool = False, before_add=None,
 ) -> dict[str, Any]:
     """Inspect exact history and pending input before every at-least-once send."""
     if not thread_id or not client_message_id.startswith("delivery-"):
@@ -374,30 +402,47 @@ def send_at_least_once(
     if not isinstance(message, str) or not message.strip() or len(message.encode("utf-8")) > 16 * 1024:
         raise QueueDeliveryError("queue-message-invalid")
     for retry in range(2):
-        consumed = _known_consumed(path, thread_id, client_message_id, timeout=timeout)
+        consumed = _known_consumed(path, thread_id, client_message_id, timeout=timeout,
+                                   strict_history=require_message_match)
         if consumed is not None:
+            if require_message_match and not _exact_peer_content(consumed, client_message_id, message):
+                raise QueueDeliveryError("queue-peer-history-mismatch", ambiguous=True)
             return {"status": "consumed", "queued_submission_id": None,
                     "already_pending": False, "started_after_interrupt": False}
-        pending, item_id = _pending_item(list_queue(path, thread_id, timeout=timeout), client_message_id)
+        queued = list_queue(path, thread_id, timeout=timeout)
+        pending, item_id = _pending_item(queued, client_message_id)
         if pending:
-            started = bool(item_id) and _start_interrupted_owned_item(
+            if require_message_match:
+                matches = [item for item in queued if isinstance(item, dict)
+                           and item.get("clientUserMessageId") == client_message_id]
+                if len(matches) != 1 or not _peer_text_input(matches[0].get("input"), message):
+                    raise QueueDeliveryError("queue-peer-pending-mismatch", ambiguous=True)
+            started = allow_restart and bool(item_id) and _start_interrupted_owned_item(
                 path, thread_id=thread_id, client_message_id=client_message_id,
                 item_id=item_id, timeout=timeout)
             return {"status": "queued", "queued_submission_id": item_id,
                     "already_pending": True, "started_after_interrupt": started}
         # Close the common consume-between-history-and-list race. Another
         # writer may still win after this read; accepted duplicates are benign.
-        if _known_consumed(path, thread_id, client_message_id, timeout=timeout) is not None:
+        consumed = _known_consumed(path, thread_id, client_message_id, timeout=timeout,
+                                   strict_history=require_message_match)
+        if consumed is not None:
+            if require_message_match and not _exact_peer_content(consumed, client_message_id, message):
+                raise QueueDeliveryError("queue-peer-history-mismatch", ambiguous=True)
             return {"status": "consumed", "queued_submission_id": None,
                     "already_pending": False, "started_after_interrupt": False}
-        interrupted = _latest_turn_status(path, thread_id, timeout=timeout) == "interrupted"
+        if not allow_add:
+            raise QueueDeliveryError("queue-add-previously-unconfirmed", ambiguous=True)
+        interrupted = allow_restart and _latest_turn_status(path, thread_id, timeout=timeout) == "interrupted"
         try:
+            if before_add is not None:
+                before_add()
             result = _rpc(path, "thread/queue/add", {
                 "threadId": thread_id, "clientUserMessageId": client_message_id,
                 "input": [{"type": "text", "text": message}],
             }, timeout=timeout)
         except QueueDeliveryError as exc:
-            if not exc.ambiguous or retry:
+            if not exc.ambiguous or retry or not retry_ambiguous:
                 raise
             continue
         submission = result.get("queuedSubmission")

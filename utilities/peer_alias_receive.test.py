@@ -324,5 +324,121 @@ process.stdout.write(JSON.stringify(result));
             self.assertEqual(row["from"]["session_id"], self.sender["session_id"] if row["to"]["session_id"] == "recipient-a" else "")
 
 
+class PendingCallbacks(unittest.TestCase):
+    setUp = AliasReceive.setUp
+    rows = AliasReceive.rows
+
+    def test_opencode_peer_identity_publication_requires_exact_sdk_top_level_session(self):
+        js = r'''
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
+const start = source.indexOf("async function projectPane(");
+const end = source.indexOf("\nfunction collectPreflight", start);
+const commands = [];
+const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
+  spawn: (exe, args) => {commands.push(args);return {unref() {}}}, herdrProjection: "fixture-projector",
+  root: "fixture-root", setTimeout, clearTimeout};
+vm.runInNewContext(source.slice(start, end), scope);
+for (const data of [{id: "exact"}, {id: "foreign"}, {id: "exact", parentID: "child"}]) {
+  await scope.projectPane("exact", {client: {session: {get: async () => ({data})}}});
+}
+console.log(JSON.stringify(commands));
+'''
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        commands = json.loads(run.stdout)
+        self.assertEqual(commands[0], ["fixture-projector", "--harness", "opencode", "--session-id", "exact"])
+        self.assertTrue(all(command[-1] == "--no-report-session" for command in commands[1:]))
+
+    def test_opencode_persisted_context_and_completed_turn_ack_once(self):
+        js = r'''
+import { pathToFileURL } from "node:url";
+const root = process.env.AGENT_HOME;
+const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
+const sid = "fixture-oc";
+let messages = [], calls = 0;
+const ctx = { directory: root, worktree: root, client: { session: {
+  messages: async () => ({data: messages}),
+  prompt: async (args) => {
+    calls++;
+    if (args.body.noReply !== true || Object.keys(args.body).sort().join() !== "noReply,parts") throw Error("unsafe request");
+    const row = {info: {id: "fixture-message-" + calls, role: "user", sessionID: sid}, parts: args.body.parts};
+    messages.push(row);
+    return {data: row};
+  },
+}}};
+const hooks = await AgentHarnessGuards(ctx);
+const tool = () => hooks["tool.execute.after"]({sessionID: sid, tool: "fixture-noop", args: {}}, {});
+await Promise.all([tool(), tool()]);
+await tool();
+console.log(JSON.stringify({stage: "queued", calls, messages}));
+messages.push({info: {id: "assistant", sessionID: sid, role: "assistant", parentID: messages[0]?.info.id,
+  time: {completed: 100}}, parts: []});
+await tool();
+await new Promise(resolve => setTimeout(resolve, 300));
+await tool();
+console.log(JSON.stringify({stage: "received", calls}));
+'''
+        recipient = {"harness": "opencode", "session_id": "fixture-oc"}
+        text, ref = pm.prepare_peer_message("original pending\u3000peer body", self.sender, recipient, defer=True)
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        stages = [json.loads(line) for line in run.stdout.splitlines()]
+        self.assertEqual(stages[0]["calls"], 1)
+        self.assertEqual(stages[0]["messages"][0]["parts"], [{"type": "text", "text": text}])
+        self.assertEqual(stages[1]["calls"], 1)
+        self.assertEqual(pm._read_pending(ref)["state"], "received")
+        self.assertEqual(len([r for r in self.rows() if r.get("transfer_ref") == ref]), 1)
+
+    def test_opencode_lost_response_foreign_history_never_blindly_resends(self):
+        js = r'''
+import { pathToFileURL } from "node:url";
+const root = process.env.AGENT_HOME;
+const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
+const sid = "fixture-oc";
+let messages = [], calls = 0;
+const hooks = await AgentHarnessGuards({directory: root, worktree: root, client: {session: {
+  messages: async () => ({data: messages}),
+  prompt: async (args) => {
+    calls++;
+    messages.push({info: {id: "persisted", role: "user", sessionID: "foreign-fork"}, parts: args.body.parts});
+    throw Error("response-lost-after-persist");
+  },
+}}});
+const tool = () => hooks["tool.execute.after"]({sessionID: sid, tool: "fixture-noop", args: {}}, {});
+await tool(); await tool(); await tool();
+console.log(JSON.stringify({calls}));
+'''
+        recipient = {"harness": "opencode", "session_id": "fixture-oc"}
+        text, ref = pm.prepare_peer_message("original body", self.sender, recipient, defer=True)
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["calls"], 1)
+        self.assertEqual(pm._read_pending(ref)["state"], "unverified")
+        self.assertEqual(pm._read_pending(ref)["text"], text)
+        self.assertEqual(self.rows(), [])
+
+    def test_claude_actual_prompt_observes_ref_once_without_output_ack(self):
+        recipient = {"harness": "claude", "session_id": "recipient-a"}
+        text, ref = pm.prepare_peer_message("original peer body", self.sender, recipient, defer=True)
+        AliasReceive._receive_actual(self, "claude", text)
+        original = self.rows()
+        AliasReceive._receive_actual(self, "claude", text)
+        self.assertEqual(self.rows(), original)
+        self.assertEqual(pm._read_pending(ref)["state"], "received")
+
+    def test_codex_actual_prompt_observes_ref_once_without_queue_acceptance_ack(self):
+        text, ref = pm.prepare_peer_message("original peer body", self.sender, self.recipient, defer=True)
+        AliasReceive._receive_actual(self, "codex", text)
+        original = self.rows()
+        AliasReceive._receive_actual(self, "codex", text)
+        self.assertEqual(self.rows(), original)
+        self.assertEqual(pm._read_pending(ref)["state"], "received")
+
+
 if __name__ == "__main__":
     unittest.main()
