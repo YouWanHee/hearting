@@ -1191,7 +1191,14 @@ def load_parent_effective_grant(
         raise ExecutionAccessError("execution-access-parent-record-invalid", "effective record is invalid JSON") from exc
     if not isinstance(record, dict) or record.get("schema_version") != 1:
         raise ExecutionAccessError("execution-access-parent-record-invalid", "effective record schema is unsupported")
-    for key, row_key in (("attempt_id", "attempt_id"), ("route_id", "route_id"), ("route_hash", "route_hash")):
+    route_prefix = ""
+    if (not row.get("route_id") and not row.get("route_hash")
+            and row.get("dispatch_depth") == "1" and row.get("worker_type") == "owner"
+            and row.get("unit") == "_kernel/owner" and row.get("owner_route_file")):
+        route_prefix = "owner_"
+    for key, row_key in (("attempt_id", "attempt_id"),
+                         ("route_id", route_prefix + "route_id"),
+                         ("route_hash", route_prefix + "route_hash")):
         if not isinstance(record.get(key), str) or not record.get(key) or record[key] != row.get(row_key):
             raise ExecutionAccessError("execution-access-parent-record-identity-mismatch", key)
     if record.get("runtime") not in _RUNTIMES or record.get("sandbox") != row.get("runtime_sandbox"):

@@ -2220,10 +2220,14 @@ def main(argv: list[str]) -> int:
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("opencode", dispatch_env))
-        if args.route_id and args.route_hash:
+        grant_route_id, grant_route_hash = args.route_id, args.route_hash
+        if not grant_route_id and not grant_route_hash and args.owner_route_binding:
+            grant_route_id = args.owner_route_binding.route_id
+            grant_route_hash = args.owner_route_binding.route_hash
+        if grant_route_id and grant_route_hash:
             effective_path, effective_sha256 = publish_effective_grant(
-                jobs=jobs, attempt_id=args.attempt_id, route_id=args.route_id,
-                route_hash=args.route_hash, runtime="opencode", sandbox="adapter-default",
+                jobs=jobs, attempt_id=args.attempt_id, route_id=grant_route_id,
+                route_hash=grant_route_hash, runtime="opencode", sandbox="adapter-default",
                 grant=args.execution_access_grant, default_writable_roots=default_roots,
                 network_allowed=False,
             )
