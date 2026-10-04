@@ -335,6 +335,7 @@ const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME
 const logs = [];
 process.env.HERDR_PANE_ID = "";
 const hooks = await AgentHarnessGuards({client: {app: {log: async ({body}) => logs.push(body)}}});
+if (typeof hooks.dispose !== "function") throw Error("normal host disposal missing");
 await hooks["tool.execute.after"]({sessionID: "actual-callback", tool: "fixture-noop", args: {secret: "private-tool-body"}}, {});
 await hooks["tool.execute.after"]({sessionID: "actual-callback", tool: "fixture-noop", args: {}}, {});
 const failing = await AgentHarnessGuards({client: {app: {log: () => {throw Error("private-error")}}}});
@@ -413,73 +414,205 @@ console.log(JSON.stringify(logs));
         self.assertNotIn("private", run.stdout)
         self.assertNotIn("received", run.stdout)
 
-    def test_opencode_peer_identity_publication_requires_exact_sdk_top_level_session(self):
+    def run_pane_projection_fixture(self, body, timeout=5):
+        # Fixed native invocation/SDK/child fixtures; expected results below are literals.
         js = r'''
 import { readFileSync } from "node:fs";
+import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import vm from "node:vm";
 const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
-const start = source.indexOf("function sdkResponseData(");
-const end = source.indexOf("\nfunction collectPreflight", start);
+function fixture(options = {}) {
+  const commands = [], children = [], logs = [], reads = [], timers = [];
+  let now = 1000;
+  const native = options.command || Buffer.from((options.argv || ["/native/opencode", "--session", "ses_A"]).join("\0") + "\0");
+  const files = {"/proc/self/cmdline": native,
+    "/proc/self/stat": Buffer.from(options.stat || "123 (opencode) S " + "0 ".repeat(18) + "77 0")};
+  const scope = {path, Buffer, process: {pid: 123, env: {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "ses_foreign"}},
+    isWorkerSession: () => !!options.worker, root: "fixture-root", herdrProjection: "fixture-projector",
+    Date: {now: () => now}, AbortController,
+    openSync: file => {reads.push(file);if (!files[file]) throw Error("foreign proc read");return file},
+    readSync: (fd, buffer, offset, size) => files[fd].copy(buffer, offset, 0, size), closeSync: () => {},
+    realpathSync: file => file === "/proc/self/cwd" ? "/fixture/project" : file,
+    setTimeout: (cb, ms) => {const timer = setTimeout(cb, ms);timers.push({cb, ms, timer});return timer}, clearTimeout,
+    spawn: (exe, args) => {
+      commands.push(args);
+      if (options.spawnThrows) {options.spawnThrows = false;throw Error("private spawn failure")}
+      const child = new EventEmitter();child.pid = options.spawnNoPid ? undefined : children.length + 100;
+      child.stdout = new PassThrough();child.unref = () => {};child.kill = () => {throw Error("no signals")};
+      children.push(child);return child;
+    }};
+  vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
+  return {scope, commands, children, logs, reads, timers, setNow: value => {now = value},
+    ctx: get => ({directory: "/fixture/project", client: {app: {log: async ({body}) => logs.push(body)},
+      session: {get: get || (async () => ({data: {id: "ses_A"}}))}}}),
+    exit: index => {children[index].emit("exit", 0);children[index].emit("close", 0)}};
+}
+''' + body
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
+                             capture_output=True, text=True, timeout=timeout)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(run.stdout)
+
+    def test_opencode_native_selector_keeps_pure_invocation_and_rejects_mixed_continue(self):
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture();
+const cases = [
+ ["opencode", "--session", "ses_A"], ["/native/opencode", "-s", "ses_A", "--model", "provider/model"],
+ ["opencode", "--session=ses_A", "--prompt", "--continue"],
+ ["opencode", "--session", "ses_A", "--continue=false", "--fork=false"],
+ ["opencode", "--no-continue", "--session", "ses_A"],
+ ["opencode", "--session", "ses_A", "--", "/fixture/project"],
+ ["opencode", "-s", "ses_A", "-c"], ["opencode", "--session", "ses_A", "--continue"],
+ ["opencode", "--continue=true", "--session", "ses_A"], ["opencode", "--session", "ses_A", "--fork"],
+ ["opencode", "--session", "ses_A", "--fork", "--continue=false"],
+ ["opencode", "--continue"], ["opencode", "run", "--session", "ses_A"],
+ ["opencode", "serve", "--session", "ses_A"], ["opencode", "attach", "--session", "ses_A"],
+ ["opencode", "--", "--session", "ses_A"], ["opencode", "--prompt", "--session", "ses_A"],
+ ["opencode", "--session", "ses_A", "--session", "ses_A"], ["opencode", "-sA"],
+ ["opencode", "--unknown", "--session", "ses_A"], ["node", "--session", "ses_A"],
+ ["opencode", "--session", "ses_A\0foreign"], ["opencode", "--session", "ses_A", "--mini"],
+ ["opencode"], ["opencode", "--session", "ses_A", "--continue=0"],
+];
+console.log(JSON.stringify(cases.map(argv => f.scope.nativePaneSelector(argv))));
+''')
+        self.assertEqual(result, ["ses_A"] * 6 + [None] * 19)
+
+    def test_opencode_native_origin_invalid_or_bounded_proc_data_has_no_sdk_fallback(self):
+        result = self.run_pane_projection_fixture(r'''
+const results = [];
+const cases = [{stat: "999 (opencode) S " + "0 ".repeat(18) + "77 0"}, {stat: "123 (opencode) S 0"},
+ {command: Buffer.from("opencode\0--session\0ses_A")},
+ {argv: ["opencode", "--session", "ses_A", "--prompt", "x".repeat(33000)]},
+ {argv: ["opencode", "--session", "ses_A", "--continue"]}, {worker: true}];
+for (const options of cases) {
+ const f = fixture(options);let gets = 0;
+ await f.scope.projectPane("ses_A", f.ctx(async () => {gets++;return {id: "ses_A"}}));
+ results.push([gets, f.commands.length]);
+}
+console.log(JSON.stringify(results));
+''')
+        self.assertEqual(result, [[0, 0]] * 6)
+
+    def test_opencode_foreign_first_directory_and_unknown_origin_consume_nothing(self):
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture();let gets = 0;
+const ctx = f.ctx(async ({path}) => {gets++;return {data: {id: path.id}}});
+await f.scope.projectPane("ses_B", ctx); // Another parentless root in the same directory arrives first.
+const foreignDirectory = f.ctx();foreignDirectory.directory = "/another/project";
+await f.scope.projectPane("ses_A", foreignDirectory);
+const before = [gets, f.commands.length];
+await f.scope.projectPane("ses_A", ctx);
+const unavailable = fixture({argv: ["opencode", "--session", "ses_A", "--continue"]});
+await unavailable.scope.projectPane("ses_A", unavailable.ctx());
+console.log(JSON.stringify({before, gets, commands: f.commands, unavailable: unavailable.commands, reads: f.reads}));
+''')
+        self.assertEqual(result["before"], [0, 0])
+        self.assertEqual(result["gets"], 1)
+        self.assertEqual(result["commands"], [["fixture-projector", "--harness", "opencode", "--session-id", "ses_A",
+                                              "--seq", "1000001", "--session-start-source", "startup"]])
+        self.assertEqual(result["unavailable"], [])
+        self.assertEqual(result["reads"], ["/proc/self/cmdline", "/proc/self/stat"])
+
+    def test_opencode_peer_identity_publication_requires_exact_sdk_top_level_session(self):
+        result = self.run_pane_projection_fixture(r'''
 const commands = [];
-const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
-  spawn: (exe, args) => {commands.push(args);return {on() {}, unref() {}}}, herdrProjection: "fixture-projector",
-  root: "fixture-root", setTimeout, clearTimeout, AbortController};
-vm.runInNewContext(source.slice(start, end), scope);
-for (const response of [{data: {id: "exact"}}, {id: "exact", parentID: null},
-  {data: {id: "foreign"}}, {data: {id: "exact", parentID: "child"}},
-  {data: {id: "exact", parentID: 0}}, {error: "failed", data: {id: "exact"}},
-  {response: {ok: false}, data: {id: "exact"}}, {}]) {
-  await scope.projectPane("exact", {client: {session: {get: async (options) => {
-    if (options.path.id !== "exact" || options.throwOnError !== true || !options.signal) throw Error("wrong SDK v1 call");
-    return response;
-  }}}});
+for (const response of [{data: {id: "ses_A"}}, {id: "ses_A", parentID: null},
+ {data: {id: "ses_foreign"}}, {data: {id: "ses_A", parentID: "child"}},
+ {data: {id: "ses_A", parentID: 0}}, {error: "failed", data: {id: "ses_A"}},
+ {response: {ok: false}, data: {id: "ses_A"}}, {}]) {
+ const f = fixture();await f.scope.projectPane("ses_A", f.ctx(async options => {
+  if (options.path.id !== "ses_A" || options.throwOnError !== true || !options.signal) throw Error("wrong SDK v1 call");
+  return response;
+ }));commands.push(f.commands[0]);f.exit(0);
 }
 console.log(JSON.stringify(commands));
-'''
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
-                             capture_output=True, text=True, timeout=5)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        commands = json.loads(run.stdout)
-        self.assertEqual(commands[0], ["fixture-projector", "--harness", "opencode", "--session-id", "exact"])
-        self.assertEqual(commands[1], ["fixture-projector", "--harness", "opencode", "--session-id", "exact"])
-        self.assertTrue(all(command[-1] == "--no-report-session" for command in commands[2:]))
+''')
+        startup = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A",
+                   "--seq", "1000001", "--session-start-source", "startup"]
+        metadata = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
+        self.assertEqual(result, [startup, startup] + [metadata] * 6)
 
     def test_opencode_normal_tool_retry_retains_actual_sdk_identity_and_observes_timeout(self):
-        js = r'''
-import { readFileSync } from "node:fs";
-import vm from "node:vm";
-const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
-const commands = [], logs = [];
-let now = 1000, gets = 0, resolveFirst;
-const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "foreign-env"}},
-  isWorkerSession: () => false, root: "fixture-root", herdrProjection: "fixture-projector",
-  Date: {now: () => now}, setTimeout, clearTimeout, AbortController,
-  spawn: (exe, args) => {commands.push(args);return {on() {}, unref() {}}}};
-vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
-const ctx = {client: {app: {log: async ({body}) => logs.push(body)}, session: {get: async ({path}) => {
-  if (path.id !== "actual-callback") throw Error("guessed identity");
-  gets++;
-  if (gets === 1) return await new Promise(resolve => {resolveFirst = resolve});
-  return {id: "actual-callback"};
-}}}};
-await Promise.all([scope.projectPane("actual-callback", ctx, true), scope.projectPane("actual-callback", ctx, true)]);
-resolveFirst({id: "late-foreign"});
-await scope.projectPane("actual-callback", ctx, true); // Within interval: no retry.
-now = 12000;
-await scope.projectPane("actual-callback", ctx, true); // Existing normal callback: exact SDK data.
-console.log(JSON.stringify({gets, commands, logs}));
-'''
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
-                             capture_output=True, text=True, timeout=5)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        result = json.loads(run.stdout)
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture();let gets = 0, resolveFirst;
+const ctx = f.ctx(async ({path}) => {
+ if (path.id !== "ses_A") throw Error("guessed identity");gets++;
+ if (gets === 1) return await new Promise(resolve => {resolveFirst = resolve});
+ return {id: "ses_A"};
+});
+await Promise.all([f.scope.projectPane("ses_A", ctx, true), f.scope.projectPane("ses_A", ctx, true)]);
+resolveFirst({id: "late-foreign"});f.exit(0);
+await f.scope.projectPane("ses_A", ctx, true);
+f.setNow(12000);await f.scope.projectPane("ses_A", ctx, true);
+const sdk = f.logs.filter(row => row.extra.stage === "sdk").map(row => [row.extra.reason, row.extra.verified]);
+console.log(JSON.stringify({gets, commands: f.commands, sdk}));
+''')
         self.assertEqual(result["gets"], 2)
         self.assertEqual(result["commands"], [
-            ["fixture-projector", "--harness", "opencode", "--session-id", "actual-callback", "--no-report-session"],
-            ["fixture-projector", "--harness", "opencode", "--session-id", "actual-callback"],
-        ])
-        self.assertEqual([row["extra"]["reason"] for row in result["logs"] if row["extra"]["stage"] == "sdk"], ["sdk-timeout", "verified"])
-        self.assertEqual([row["extra"]["verified"] for row in result["logs"] if row["extra"]["stage"] == "sdk"], [False, True])
+            ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"],
+            ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A",
+             "--seq", "1000001", "--session-start-source", "startup"]])
+        self.assertEqual(result["sdk"], [["sdk-timeout", False], ["verified", True]])
+
+    def test_opencode_spent_startup_and_child_slot_survive_reload_and_observer_timeout(self):
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture();const first = f.ctx();
+f.scope.registerPaneContext(first);await f.scope.projectPane("ses_A", first);
+f.scope.retirePaneContext(first);const next = f.ctx();f.scope.registerPaneContext(next);
+f.timers.find(t => t.ms === 5000).cb(); // Observation ends, actual child remains alive.
+await Promise.all([f.scope.projectPane("ses_A", next), f.scope.projectPane("ses_A", next)]);
+const whileAlive = f.commands.length;
+f.exit(0);await f.scope.projectPane("ses_A", next);f.exit(1);
+f.scope.retirePaneContext(next);const third = f.ctx();f.scope.registerPaneContext(third);
+await f.scope.projectPane("ses_A", third);f.exit(2);
+f.scope.invalidatePaneOrigin("ses_A");await f.scope.projectPane("ses_A", third);f.exit(3);
+console.log(JSON.stringify({whileAlive, commands: f.commands,
+ timeout: f.logs.some(row => row.extra.reason === "publisher-stale-observation")}));
+''')
+        self.assertEqual(result["whileAlive"], 1)
+        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
+            prefix + ["--seq", "1000002"], prefix + ["--seq", "1000003"], prefix + ["--no-report-session"]])
+        self.assertTrue(result["timeout"])
+
+    def test_opencode_disposed_pending_origin_never_rearms_or_spawns_from_late_sdk(self):
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture();let resolveOld;
+const old = f.ctx(async () => await new Promise(resolve => {resolveOld = resolve}));
+f.scope.registerPaneContext(old);const waiting = f.scope.projectPane("ses_A", old);
+f.scope.retirePaneContext(old);const next = f.ctx();f.scope.registerPaneContext(next);
+await f.scope.projectPane("ses_A", next);f.exit(0);
+resolveOld({data: {id: "ses_A"}});await waiting;
+f.scope.retirePaneContext(next);const third = f.ctx();f.scope.registerPaneContext(third);
+await f.scope.projectPane("ses_A", third);f.exit(1);
+await f.scope.projectPane("ses_B", third); // A later fork is not the native launch selection.
+console.log(JSON.stringify({commands: f.commands,
+ sdk: f.logs.filter(row => row.extra.stage === "sdk").map(row => row.extra.reason)}));
+''')
+        metadata = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
+        self.assertEqual(result["commands"], [metadata, metadata])
+        self.assertEqual(result["sdk"], ["verified", "sdk-stale-callback", "verified"])
+
+    def test_opencode_spawn_failure_report_zero_can_retry_but_created_attempt_never_replays(self):
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture({spawnThrows: true});const ctx = f.ctx();
+await f.scope.projectPane("ses_A", ctx);await f.scope.projectPane("ses_A", ctx);
+f.children[0].stdout.write(JSON.stringify({schema: "hearting-pane-observation-v1", reason: "guard-refused",
+ session_report: "not-attempted", metadata_report: "not-attempted"}));
+await new Promise(resolve => setImmediate(resolve));f.exit(0);
+await f.scope.projectPane("ses_A", ctx);f.exit(1);
+const noPid = fixture({spawnNoPid: true});const other = noPid.ctx();
+await noPid.scope.projectPane("ses_A", other);noPid.children[0].emit("error", Error("no process"));
+await noPid.scope.projectPane("ses_A", other);
+console.log(JSON.stringify({commands: f.commands, noPid: noPid.commands}));
+''')
+        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
+            prefix + ["--seq", "1000002", "--session-start-source", "startup"], prefix + ["--seq", "1000003"]])
+        self.assertEqual(result["noPid"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
+            prefix + ["--seq", "1000002", "--session-start-source", "startup"]])
 
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''
@@ -522,34 +655,6 @@ console.log(JSON.stringify({stage: "received", calls}));
         self.assertEqual(stages[1]["calls"], 1)
         self.assertEqual(pm._read_pending(ref)["state"], "received")
         self.assertEqual(len([r for r in self.rows() if r.get("transfer_ref") == ref]), 1)
-
-    def test_opencode_old_callback_cannot_overwrite_new_fork_publication(self):
-        js = r'''
-import { readFileSync } from "node:fs";
-import vm from "node:vm";
-const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
-const commands = [], logs = [];
-let resolveOld;
-const scope = {process: {env: {HERDR_PANE_ID: "fixture-pane"}}, isWorkerSession: () => false,
-  root: "fixture-root", herdrProjection: "fixture-projector", setTimeout, clearTimeout, AbortController,
-  spawn: (exe, args) => {commands.push(args);return {on() {}, unref() {}}}};
-vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
-const ctx = {client: {app: {log: async ({body}) => logs.push(body)}, session: {get: async ({path}) =>
-  path.id === "old" ? await new Promise(resolve => {resolveOld = resolve}) : {data: {id: "new"}}
-}}};
-const old = scope.projectPane("old", ctx);
-await scope.projectPane("new", ctx);
-resolveOld({data: {id: "old"}});
-await old;
-console.log(JSON.stringify({commands, reasons: logs.filter(row => row.extra.stage === "sdk").map(row => row.extra.reason)}));
-'''
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
-                             capture_output=True, text=True, timeout=5)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(json.loads(run.stdout), {
-            "commands": [["fixture-projector", "--harness", "opencode", "--session-id", "new"]],
-            "reasons": ["verified", "sdk-stale-callback"],
-        })
 
     def test_opencode_data_style_retains_persisted_vs_completed_parent_boundary(self):
         with mock.patch.dict(os.environ, {"FIXTURE_SDK_STYLE": "data"}):

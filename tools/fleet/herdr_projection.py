@@ -429,8 +429,20 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
         time.sleep(2)
 
 
+def _opencode_lifecycle(harness, session_seq, session_start_source):
+    """Optional native bootstrap fields; never infer a source or widen a guard."""
+    if session_seq is None and session_start_source is None:
+        return {}
+    if (harness != "opencode" or type(session_seq) is not int
+            or not 0 < session_seq <= 9007199254740991
+            or session_start_source not in (None, "startup")):
+        return None
+    return dict(session_seq=session_seq, session_start_source=session_start_source)
+
+
 def project(harness: str, session_id: str, *, pane_id=None, worker=None,
-            report_session=True, observation=None) -> bool:
+            report_session=True, observation=None, session_seq=None,
+            session_start_source=None) -> bool:
     """Report this session's pane metadata to herdr. Always returns True (fail-soft)."""
     harness = str(harness or "").lower()
     pane = pane_id or os.environ.get("HERDR_PANE_ID", "")
@@ -457,15 +469,17 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         if codex_main and runtime_identity() == ("codex", None):
             _defer_until_proven(session_id, report_session)
         return True
-    if observation is None:
-        _report(harness, session_id, pane, report_session)
-    else:
-        _report(harness, session_id, pane, report_session, observation=observation)
+    lifecycle = _opencode_lifecycle(harness, session_seq, session_start_source)
+    if lifecycle is None:
+        report_session, lifecycle = False, {}
+    if observation is not None:
+        lifecycle["observation"] = observation
+    _report(harness, session_id, pane, report_session, **lifecycle)
     return True
 
 
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
-            observation=None) -> None:
+            observation=None, session_seq=None, session_start_source=None) -> None:
     herdr = shutil.which("herdr")
     if not herdr:
         if observation is not None:
@@ -477,9 +491,17 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
                                  label=label)
     source = "herdr:%s" % harness
     commands = []
+    lifecycle = _opencode_lifecycle(harness, session_seq, session_start_source)
+    if lifecycle is None:
+        report_session = False
     if report_session:
-        commands.append([herdr, "pane", "report-agent-session", pane, "--source", source,
-                         "--agent", harness, "--agent-session-id", session_id])
+        session_command = [herdr, "pane", "report-agent-session", pane, "--source", source,
+                           "--agent", harness, "--agent-session-id", session_id]
+        if session_seq is not None:
+            session_command += ["--seq", str(session_seq)]
+        if session_start_source is not None:
+            session_command += ["--session-start-source", session_start_source]
+        commands.append(session_command)
     # Both fields go in the SAME report: herdr's metadata record is per-source and a
     # report replaces it whole, so sending one alone clears the other (measured).
     metadata = [herdr, "pane", "report-metadata", pane, "--source", source,
@@ -516,6 +538,10 @@ def main(argv=None) -> int:
     parser.add_argument("--pane")
     parser.add_argument("--no-report-session", action="store_true",
                         help="skip report-agent-session (the runtime's own hook owns it)")
+    parser.add_argument("--seq", type=int,
+                        help="optional OpenCode native publisher sequence")
+    parser.add_argument("--session-start-source", choices=["startup"],
+                        help="one real OpenCode native bootstrap attempt, never a new session")
     parser.add_argument("--print", action="store_true",
                         help="print the composed metadata instead of reporting it")
     parser.add_argument("--await-codex-tui", action="store_true",
@@ -535,8 +561,11 @@ def main(argv=None) -> int:
     # Only the existing OpenCode callback consumes this bounded observation.
     # Keep project()'s fail-soft bool and the other harnesses' quiet CLI contract.
     observation = {} if args.harness == "opencode" else None
+    lifecycle = {}
+    if args.seq is not None or args.session_start_source is not None:
+        lifecycle = dict(session_seq=args.seq, session_start_source=args.session_start_source)
     project(args.harness, args.session_id, pane_id=args.pane,
-            report_session=not args.no_report_session, observation=observation)
+            report_session=not args.no_report_session, observation=observation, **lifecycle)
     if observation is not None:
         print(json.dumps(observation, separators=(",", ":")))
     return 0

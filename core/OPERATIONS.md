@@ -1122,6 +1122,18 @@ not change the completion courier's existing at-least-once defaults or frame cap
 OpenCode self-publication uses the normal callback SID and an exact top-level
 Session returned by its SDK. Wrapped and data-style SDK responses share that
 validation; timeout/error diagnostics and retries occur only on normal callbacks.
+OpenCode cold bootstrap binds this native process's pure explicit-session TUI
+invocation to the same SDK-verified root in its directory. Continue (including
+mixed explicit-session/continue), fork, ambiguous selectors and foreign roots are
+ineligible origins. One real startup event allows one created publisher child;
+all later refreshes use ordinary increasing sequences, with startup replay and
+synthetic new-session events excluded. Origin state, shared sequence and the
+actual-child slot survive constructor recreation; disposal retires old SDK results
+and preserves spent/invalidated origins. Normal callbacks coalesce without waiting
+for a live publisher; actual exit frees its slot, observation timeout/pipe closure
+does not. Initial selection proves neither continuous UI selection nor a peer
+recipient. Unsupported origins and unknown publication remain unverified without
+a manual report or another user step.
 Existing host logs separate plugin/callback entry, SDK validation and the publisher's
 guard/CLI outcomes with bounded metadata only. A returned publisher command, including
 exit 0, is an attempt observation; it does not prove identity publication or receipt.

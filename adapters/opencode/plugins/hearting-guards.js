@@ -1,7 +1,7 @@
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync, spawn } from "node:child_process"
-import { existsSync, mkdirSync, writeFileSync, utimesSync } from "node:fs"
+import { existsSync, mkdirSync, writeFileSync, utimesSync, openSync, readSync, closeSync, realpathSync } from "node:fs"
 
 const pluginDir = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.resolve(pluginDir, "../../..")
@@ -219,6 +219,119 @@ function sdkResponseData(result) {
   return Object.hasOwn(result, "data") ? result.data : result
 }
 
+// One native launch event and one publisher belong to this module/process, not
+// to a directory-scoped plugin constructor. worker.reload recreates those contexts.
+function nativePaneSelector(argv) {
+  if (!Array.isArray(argv) || !argv.length || path.basename(argv[0]) !== "opencode") return null
+  const values = new Set(["--model", "-m", "--prompt", "--agent", "--port", "--hostname",
+    "--mdns-domain", "--cors", "--log-level"])
+  const booleans = new Set(["--continue", "-c", "--fork", "--auto", "--yolo",
+    "--dangerously-skip-permissions", "--mdns", "--print-logs"])
+  const commands = new Set(["run", "serve", "attach", "web", "auth", "agent", "models",
+    "stats", "export", "import", "session", "upgrade", "uninstall", "mcp", "acp", "debug", "completion"])
+  let sid = null, positional = 0, ended = false
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]
+    if (typeof arg !== "string" || /[\x00-\x1f\x7f]/.test(arg)) return null
+    if (arg === "--" && !ended) { ended = true; continue }
+    if (ended || !arg.startsWith("-")) {
+      if (++positional > 1 || (!ended && commands.has(arg))) return null
+      continue
+    }
+    const equal = arg.indexOf("=")
+    const key = equal < 0 ? arg : arg.slice(0, equal)
+    let value = equal < 0 ? undefined : arg.slice(equal + 1)
+    if (key === "--session" || key === "-s" || values.has(key)) {
+      if (value === undefined) value = argv[++i]
+      if (typeof value !== "string" || /[\x00-\x1f\x7f]/.test(value)) return null
+      if (key === "--session" || key === "-s") {
+        if (sid !== null || !/^ses_[A-Za-z0-9]+$/.test(value) || value.length > 256) return null
+        sid = value
+      }
+      continue
+    }
+    if (key === "--no-continue" || key === "--no-fork" || key === "--no-mdns") {
+      if (value !== undefined) return null
+      continue
+    }
+    if (!booleans.has(key)) return null // Unknown/mini/command grammar has no selector fallback.
+    if (value === undefined && ["true", "false"].includes(argv[i + 1])) value = argv[++i]
+    if (value !== undefined && !["true", "false"].includes(value)) return null
+    if (["--continue", "-c", "--fork"].includes(key) && value !== "false") return null
+  }
+  return sid
+}
+
+function readPaneProc(file, limit) {
+  const fd = openSync(file, "r")
+  try {
+    const data = Buffer.alloc(limit + 1)
+    const bytes = readSync(fd, data, 0, data.length, null)
+    if (bytes > limit) throw new Error("native origin unavailable")
+    return data.subarray(0, bytes)
+  } finally { closeSync(fd) }
+}
+
+function ownNativePaneOrigin() {
+  try {
+    const command = readPaneProc("/proc/self/cmdline", 32768)
+    if (!command.length || command.at(-1) !== 0) return null
+    const argv = command.toString("utf8").slice(0, -1).split("\0")
+    const sid = nativePaneSelector(argv)
+    if (!sid) return null
+    const stat = readPaneProc("/proc/self/stat", 4096).toString("utf8")
+    const split = stat.lastIndexOf(") ")
+    const start = stat.slice(split + 2).trim().split(/\s+/)[19]
+    if (split < 0 || Number(stat.slice(0, stat.indexOf(" ("))) !== process.pid || !/^\d+$/.test(start)) return null
+    return { pid: process.pid, start, sid, directory: realpathSync("/proc/self/cwd"), state: "pending" }
+  } catch { return null }
+}
+
+let paneNativeOrigin // undefined means not yet read; null is unsupported, never SDK-filled.
+const paneContexts = new WeakMap()
+let paneOwningContext = null
+let panePublisherSlot = null
+let paneReportSequence = Date.now() * 1000
+
+function registerPaneContext(ctx) {
+  if (paneContexts.has(ctx)) return paneContexts.get(ctx)
+  if (paneNativeOrigin === undefined) paneNativeOrigin = ownNativePaneOrigin()
+  let ownsOrigin = false
+  try { ownsOrigin = !!paneNativeOrigin && realpathSync(ctx.directory) === paneNativeOrigin.directory } catch {}
+  const binding = { active: true, ownsOrigin, refreshPending: false, originObserved: false }
+  paneContexts.set(ctx, binding)
+  if (ownsOrigin) {
+    if (paneOwningContext) retirePaneContext(paneOwningContext)
+    paneOwningContext = ctx
+    paneProjectionGeneration++
+    paneProjectionRetryAt.delete(paneNativeOrigin.sid)
+  }
+  return binding
+}
+
+function retirePaneContext(ctx) {
+  const binding = paneContexts.get(ctx)
+  if (!binding) return
+  binding.active = false
+  if (paneOwningContext === ctx) {
+    paneProjectionGeneration++
+    paneOwningContext = null
+    if (paneNativeOrigin?.state === "pending") paneNativeOrigin.state = "invalidated"
+  }
+  // A live publisher survives disposal. Closing its observer is not child exit.
+}
+
+function invalidatePaneOrigin(sid) {
+  if (paneNativeOrigin?.sid === sid) {
+    paneNativeOrigin.state = "invalidated"
+    paneProjectionGeneration++
+  }
+}
+
+function releasePanePublisher(slot) {
+  if (panePublisherSlot === slot) panePublisherSlot = null
+}
+
 function peerIdentityLog(ctx, stage, reason, extra = {}) {
   try {
     if (typeof ctx?.client?.app?.log === "function") {
@@ -301,19 +414,31 @@ function observePanePublisher(child, ctx, sid, generation) {
   })
 }
 
-const paneProjectionBusy = new Set()
+const paneProjectionBusy = new Map()
 const paneProjectionRetryAt = new Map()
 let paneProjectionGeneration = 0
-let paneProjectionSession = ""
 async function projectPane(sid, ctx, retry = false) {
   if (!sid || isWorkerSession() || !process.env.HERDR_PANE_ID) return
-  if (paneProjectionBusy.has(sid) || (retry && Date.now() < (paneProjectionRetryAt.get(sid) || 0))) return
-  paneProjectionBusy.add(sid)
-  paneProjectionRetryAt.set(sid, Date.now() + 10000)
-  if (paneProjectionSession !== sid) {
-    paneProjectionSession = sid
-    paneProjectionGeneration++
+  const binding = registerPaneContext(ctx)
+  if (!binding.active) return
+  const ownsSession = binding.ownsOrigin && paneNativeOrigin?.sid === sid
+  // Directory events may contain another parentless root. Neither SDK root
+  // verification nor first arrival selects the native owner or a peer recipient.
+  if (!ownsSession) {
+    if (!binding.originObserved) {
+      binding.originObserved = true
+      peerIdentityLog(ctx, "origin", "native-origin-unavailable", { sessionID: sid })
+    }
+    return
   }
+  // Retain only one refresh intent. After actual exit, the next normal callback
+  // validates it again; no timer, autonomous SDK retry or publisher loop is armed.
+  if (panePublisherSlot) { binding.refreshPending = true; return }
+  const busy = paneProjectionBusy.get(sid)
+  if ((busy && busy.active) || (retry && Date.now() < (paneProjectionRetryAt.get(sid) || 0))) return
+  paneProjectionBusy.set(sid, binding)
+  paneProjectionRetryAt.set(sid, Date.now() + 10000)
+  binding.refreshPending = false
   const generation = paneProjectionGeneration
   let timer
   let verified = false
@@ -324,8 +449,6 @@ async function projectPane(sid, ctx, retry = false) {
   const controller = new AbortController()
   try {
     if (typeof ctx?.client?.session?.get === "function") {
-      // PluginInput in OpenCode 1.18.34 uses SDK v1, including path.id.
-      // Explicit error handling also covers the SDK's supported data response style.
       const result = await Promise.race([ctx.client.session.get({ path: { id: sid },
         throwOnError: true, signal: controller.signal }), new Promise((_, reject) => {
         timer = setTimeout(() => { controller.abort(); reject(new Error("peer-identity-timeout")) }, 500)
@@ -338,31 +461,47 @@ async function projectPane(sid, ctx, retry = false) {
         : session.parentID !== undefined && session.parentID !== null ? "sdk-child-session" : "verified"
       verified = reason === "verified"
     }
-  } catch (error) {
+  } catch {
     reason = controller.signal.aborted ? "sdk-timeout" : "sdk-error"
   } finally { clearTimeout(timer) }
-  if (generation !== paneProjectionGeneration) {
+  if (!binding.active || generation !== paneProjectionGeneration) {
     verified = false
     reason = "sdk-stale-callback"
   }
   peerIdentityLog(ctx, "sdk", reason, { sessionID: sid, verified,
     responseStyle: style, httpStatus, elapsedMs: Date.now() - started })
   try {
-    if (generation !== paneProjectionGeneration) return
+    if (!binding.active || generation !== paneProjectionGeneration) return
+    if (panePublisherSlot) { binding.refreshPending = true; return }
+    const reportSession = verified && paneNativeOrigin.state !== "invalidated"
+    const startup = reportSession && paneNativeOrigin.state === "pending"
     const args = [herdrProjection, "--harness", "opencode", "--session-id", sid]
-    if (!verified) args.push("--no-report-session")
-    const child = spawn("python3", args, {
-      cwd: root,
-      env: { ...process.env, AGENT_HOME: root },
-      detached: true,
-      stdio: ["ignore", "pipe", "ignore"],
-    })
+    if (reportSession) {
+      args.push("--seq", String(++paneReportSequence))
+      if (startup) args.push("--session-start-source", "startup")
+    } else args.push("--no-report-session")
+    const slot = { child: null }
+    panePublisherSlot = slot // Reserve before spawn, including synchronous reentrancy.
+    let child
+    try {
+      child = spawn("python3", args, {
+        cwd: root, env: { ...process.env, AGENT_HOME: root },
+        detached: true, stdio: ["ignore", "pipe", "ignore"],
+      })
+    } catch (error) { releasePanePublisher(slot); throw error }
+    slot.child = child
+    const created = Number.isInteger(child.pid) && child.pid > 0
+    if (startup && created) paneNativeOrigin.state = "spent"
+    child.on("exit", () => releasePanePublisher(slot))
+    child.on("close", () => releasePanePublisher(slot))
+    child.on("error", () => { if (!created) releasePanePublisher(slot) })
     observePanePublisher(child, ctx, sid, generation)
-    peerIdentityLog(ctx, "publisher", "publisher-spawned", { sessionID: sid })
+    peerIdentityLog(ctx, "publisher", "publisher-spawned", { sessionID: sid,
+      nativeStartupAttempt: startup && created })
     child.unref()
   } catch {
     peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid })
-  } finally { paneProjectionBusy.delete(sid) }
+  } finally { if (paneProjectionBusy.get(sid) === binding) paneProjectionBusy.delete(sid) }
 }
 
 function collectPreflight(command, args) {
@@ -585,8 +724,10 @@ export const AgentHarnessGuards = async (ctx) => {
   // was loaded by the headless runtime (dispatch-liveness.py inspects it).
   markPluginLoaded(dispatchSlug())
   peerIdentityLog(ctx, "plugin", "plugin-registered")
+  registerPaneContext(ctx)
 
   return ({
+  dispose: () => retirePaneContext(ctx),
   event: async ({ event }) => {
     if (event && event.type === "session.compacted") {
       collectCard("compact", (event.properties && event.properties.sessionID) || "", baseDir(ctx))
@@ -622,6 +763,7 @@ export const AgentHarnessGuards = async (ctx) => {
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
+        invalidatePaneOrigin(sid)
       }
     }
   },
