@@ -8,6 +8,7 @@ result unchanged enough for diagnostics; it never edits config or chooses a host
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -139,6 +140,71 @@ def _registered_run_marks(resource_jobs):
         if _pos_int(group):
             groups.add(group)
     return exact, groups
+
+
+def with_training_progress(snapshot, resource_jobs=(), now=None):
+    """Pure exact-process join shared by JSON and both Fleet views.
+
+    The resource collector has already bound config/progress bytes to a stable
+    wrapper and child. A fresh self-host GPU sample must still name that exact
+    child. Heartbeat freshness never resets the progress file's age.
+    """
+    if not isinstance(snapshot, dict) or snapshot.get("error"):
+        return snapshot
+    now = time.time() if now is None else now
+    matches = {}
+    for job in resource_jobs or ():
+        training = getattr(job, "training_progress", None)
+        if getattr(job, "liveness", None) != "working" or not isinstance(training, dict):
+            continue
+        observed = training.get("observed_at")
+        updated = training.get("progress_updated_at")
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   and math.isfinite(value) for value in (observed, updated)) \
+                or not 0 <= now - observed <= 30:
+            continue
+        key = (training.get("pid"), str(training.get("starttime")), training.get("process_group"))
+        if not _pos_int(key[0]) or not _pos_int(key[2]) \
+                or key[2] != getattr(job, "process_group", None):
+            continue
+        # Multiple registrations with different observations are ambiguous.
+        if key in matches and matches[key] != training:
+            matches[key] = None
+        else:
+            matches.setdefault(key, training)
+    hosts = []
+    for host in snapshot.get("hosts") or ():
+        if not isinstance(host, dict):
+            hosts.append(host)
+            continue
+        observed = host.get("observed_at", snapshot.get("observed_at"))
+        if host.get("self") is not True or host.get("reachable") is not True \
+                or not isinstance(observed, (int, float)) or isinstance(observed, bool) \
+                or not math.isfinite(observed) or not 0 <= now - observed <= 30:
+            hosts.append(host)
+            continue
+        gpus = []
+        for gpu in host.get("gpus") or ():
+            if not isinstance(gpu, dict):
+                gpus.append(gpu)
+                continue
+            processes = []
+            for process in gpu.get("processes") or ():
+                training = None
+                if isinstance(process, dict) and _pos_int(process.get("pid")) \
+                        and _pos_int(process.get("pgid")):
+                    training = matches.get((process["pid"], str(process.get("proc_start")), process["pgid"]))
+                if training is not None:
+                    training = dict(training)
+                    training["progress_age_s"] = max(0.0, now - training["progress_updated_at"])
+                    raw_progress = process.get("progress")
+                    progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+                    progress["training"] = training
+                    process = {**process, "progress": progress}
+                processes.append(process)
+            gpus.append({**gpu, "processes": processes})
+        hosts.append({**host, "gpus": gpus})
+    return {**snapshot, "hosts": hosts}
 
 
 def unregistered_gpu(snapshot, resource_jobs=(), shown_sessions=frozenset(), age_s=0.0):
