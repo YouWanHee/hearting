@@ -2792,6 +2792,11 @@ def main(argv: list[str]) -> int:
         ensure_owner_writable_dirs(args)
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
+    # Preparation may create existing bootstrap roots used by the builders.
+    # Publish the same defaults that the command below actually applies.
+    default_roots = adapter_default_roots(
+        args, default_roots, nested_owner_writable_dirs(args), route_bound_worker_writable_dirs(args),
+    )
     command = shell_command(args, prompt_path, log_path)
 
     governor = ROOT / "utilities" / "model-worker-governor.py"
@@ -3056,10 +3061,14 @@ def main(argv: list[str]) -> int:
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("codex", dispatch_env))
-        if args.route_id and args.route_hash:
+        grant_route_id, grant_route_hash = args.route_id, args.route_hash
+        if not grant_route_id and not grant_route_hash and args.owner_route_binding:
+            grant_route_id = args.owner_route_binding.route_id
+            grant_route_hash = args.owner_route_binding.route_hash
+        if grant_route_id and grant_route_hash:
             effective_path, effective_sha256 = publish_effective_grant(
-                jobs=jobs, attempt_id=args.attempt_id, route_id=args.route_id,
-                route_hash=args.route_hash,
+                jobs=jobs, attempt_id=args.attempt_id, route_id=grant_route_id,
+                route_hash=grant_route_hash,
                 runtime=("codex-app-server" if args.resolved_completion_delivery == "app-server-supervised" else "codex-exec"),
                 sandbox=effective_runtime_sandbox(args), grant=args.execution_access_grant,
                 default_writable_roots=default_roots,
