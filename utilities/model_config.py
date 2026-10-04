@@ -64,6 +64,12 @@ WRAPPER_REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "codex": frozenset({"DEEP", "LIGHT", "MINI"}),
     "opencode": frozenset({"BALANCED_DEEP", "LIGHT", "MINI"}),
 }
+# Optional wrapper tiers must name a required fallback. Absence never makes a
+# legacy user copy incomplete; the literal-read drift guard verifies that every
+# optional read uses that fallback rather than an unguarded shell variable.
+WRAPPER_FALLBACK_TIERS: dict[str, dict[str, str]] = {
+    "opencode": {"DEEP": "BALANCED_DEEP"},
+}
 
 
 TIER_REFERENCE_KEYS = ("CFG_TIER_DEEP_FAILOVER", "CFG_NATIVE_SUBAGENT", "CFG_LIFECYCLE_NUDGE", "CFG_LIFECYCLE_CURATE")

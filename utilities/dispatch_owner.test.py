@@ -160,6 +160,7 @@ class FrameTopDeclarationTest(unittest.TestCase):
             policy = {"primary": list(self.HARNESSES), "relief": [], "last_resort": [],
                       "promote_relief_below": 0}
             allocation = {"strategy": "capacity-aware", "window": 30, "harness_order": list(self.HARNESSES)}
+            allocation["owner_order"] = ["claude", "opencode", "codex"]
             values = {"--model-profile": profile, "--worker-type": "frame", "--route-node": "frame",
                       "--worktree": str(base), "--capability": "autopilot-code",
                       "--capability-mode": "dev", "--intensity": "standard"}
@@ -1820,7 +1821,7 @@ class RouteOwnerPinTest(unittest.TestCase):
         path.write_text(json.dumps(doc), encoding="utf-8")
         return path
 
-    def _launch(self, path, adapter, usage=None, extra=()):
+    def _launch(self, path, adapter, usage=None, extra=(), scores=None):
         jobs = path.parent / "jobs.log"
         jobs.touch()
         calls = []
@@ -1830,7 +1831,7 @@ class RouteOwnerPinTest(unittest.TestCase):
                                side_effect=lambda cmd, **kw: (calls.append(cmd), SimpleNamespace(returncode=0))[1]), \
              mock.patch.object(OWNER, "_usage", return_value=usage or {"claude": "ok", "codex": "ok", "opencode": "ok"}), \
              mock.patch.object(OWNER._capacity, "capacity_scores",
-                               return_value={"claude": 3.0, "codex": 80.0, "opencode": 80.0}), \
+                               return_value=scores or {"claude": 3.0, "codex": 80.0, "opencode": 80.0}), \
              mock.patch.object(OWNER, "validate_owner_route_binding", return_value=binding), \
              mock.patch.object(OWNER, "export_owner_route_env", return_value=None), \
              mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \
@@ -1845,6 +1846,30 @@ class RouteOwnerPinTest(unittest.TestCase):
         wrapper = Path(cmd[0]).parts[-3] if cmd else None
         flag = cmd[cmd.index("--explicit-adapter") + 1] if "--explicit-adapter" in cmd else None
         return SimpleNamespace(rc=rc, out=out, wrapper=wrapper, flag=flag, calls=calls)
+
+    def test_owner_order_uses_sealed_policy_and_keeps_hard_limits_pins_and_candidates(self):
+        scores = {"claude": 80, "opencode": 80, "codex": 90}
+        for limited, expected in (((), "claude"), (("claude",), "opencode"),
+                                  (("claude", "opencode"), "codex")):
+            with self.subTest(limited=limited):
+                path = self._route(sealed=("claude", "codex", "opencode"))
+                doc = json.loads(path.read_text())
+                doc["dispatch_allocation"]["owner_order"] = ["claude", "opencode", "codex"]
+                doc["owner_harness_policy"].update(primary=["claude", "opencode", "codex"], relief=[])
+                path.write_text(json.dumps(doc))
+                got = self._launch(path, None, usage={h: "limited" if h in limited else "ok" for h in scores}, scores=scores)
+                self.assertEqual((got.rc, got.wrapper), (0, expected), got.out)
+                doc["selection_pins"] = {"contract_version": 1, "owner": {"harness": "codex"}}
+                path.write_text(json.dumps(doc))
+                pinned = self._launch(path, None, scores=scores)
+                self.assertEqual((pinned.rc, pinned.wrapper), (0, "codex"), pinned.out)
+
+        path = self._route()
+        doc = json.loads(path.read_text())
+        doc["dispatch_allocation"]["owner_order"] = ["opencode", "codex", "claude"]
+        path.write_text(json.dumps(doc))
+        got = self._launch(path, None, scores=scores)
+        self.assertEqual((got.rc, got.wrapper), (0, "codex"), got.out)
 
     def test_owner_pin_beats_an_explicit_adapter_and_records_it(self):
         # claude's headroom is 3 here: an automatic choice would have been codex

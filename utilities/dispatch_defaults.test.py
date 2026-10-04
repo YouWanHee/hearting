@@ -100,6 +100,10 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
     def test_allocation_validation_rejects_invalid_affinity_weight_and_exponent(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())
         cases = [
+            ("owner_order", "claude", "owner_order"),
+            ("owner_order", ["claude", "claude"], "owner_order"),
+            ("owner_order", ["gemini"], "owner_order"),
+            ("owner_order", [["claude"]], "owner_order"),
             ("depth_affinity_weight", 1.2, "depth_affinity_weight"),
             ("usage_headroom_exponent", 0, "usage_headroom_exponent"),
             ("depth_affinity", {"stage": "codex"}, "depth_affinity keys"),
@@ -259,6 +263,7 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
     def test_recommendation_findings_are_normalized_not_rejected(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())
         config = self.config()
+        config["allocation"]["owner_order"] = ["claude", "opencode", "codex"]
         config["harnesses"]["enabled"] = ["claude", "opencode"]
         # W1: a band naming a disabled harness; W2: a harness in two bands.
         config["profiles"]["deep"]["primary"] = ["claude", "codex"]
@@ -288,6 +293,8 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
         self.assertEqual(normalized["capabilities"]["autopilot-code"], {})
         self.assertEqual(normalized["allocation"]["depth_affinity"], {"worker": "claude"})
         self.assertEqual(normalized["allocation"]["harness_weights"], {"opencode": 0.3})
+        self.assertEqual(normalized["allocation"]["owner_order"], ["claude", "opencode"])
+        self.assertEqual(D.query_allocation(normalized)["owner_order"], ["claude", "opencode"])
         # The input is never mutated; normalizing is idempotent.
         self.assertEqual(config["profiles"]["deep"]["primary"], ["claude", "codex"])
         self.assertEqual(D.normalize_policy(normalized), normalized)

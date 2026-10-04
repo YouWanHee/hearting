@@ -25,6 +25,7 @@
 #     usage_gate_used_percent: 85
 #     depth_affinity: {owner: claude, worker: codex}
 #     depth_affinity_weight: 0.65
+#     owner_order: [claude, opencode, codex] # v3/v4; owners only, within eligibility/band
 #     usage_headroom_exponent: 2
 #     harness_weights:                 # optional; block mapping only (an inline
 #       opencode: 0.3                  # {a: 1} map is not parsed); 0 < w <= 1,

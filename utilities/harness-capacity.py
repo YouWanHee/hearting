@@ -617,7 +617,8 @@ def ordered_candidates(ranks, band_order, scores, *, strategy="capacity-aware", 
 
 
 def select(policy, states, counts, declared_order, scores, *, strategy="capacity-aware", usage_gate_used_percent=90,
-           preferred=None, affinity_weight=0.5, headroom_exponent=1, harness_weights=None):
+           preferred=None, affinity_weight=0.5, headroom_exponent=1, harness_weights=None,
+           preference_order=None):
     """Select one harness without allowing capacity to erase quality boundaries."""
     ranks = {
         band: rank_band(
@@ -628,6 +629,13 @@ def select(policy, states, counts, declared_order, scores, *, strategy="capacity
         )
         for band in ("primary", "relief", "last_resort")
     }
+    # A caller may supply an owner-only order. Eligibility was already checked
+    # above; the existing cross-band ordering below still owns usage gates,
+    # quality bands and all-gated recovery. An explicit env bias retains priority.
+    if preference_order and os.environ.get("HARNESS_CAPACITY_BIAS", "").strip().lower() not in HARNESSES:
+        order = {name: i for i, name in enumerate(preference_order)}
+        for band, rows in ranks.items():
+            ranks[band] = sorted(rows, key=lambda name: order.get(name, len(order)))
     threshold = int(policy.get("promote_relief_below", 0))
     primary_headroom = [scores.get(name) for name in ranks["primary"]]
     primary_headroom = [value for value in primary_headroom if value is not None]
