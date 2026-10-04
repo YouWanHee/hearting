@@ -430,31 +430,46 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
 
 
 def project(harness: str, session_id: str, *, pane_id=None, worker=None,
-            report_session=True) -> bool:
+            report_session=True, observation=None) -> bool:
     """Report this session's pane metadata to herdr. Always returns True (fail-soft)."""
     harness = str(harness or "").lower()
     pane = pane_id or os.environ.get("HERDR_PANE_ID", "")
+    if observation is not None:
+        observation.update(schema="hearting-pane-observation-v1", reason="not-attempted",
+                           session_report="not-attempted", metadata_report="not-attempted")
     if not shutil.which("herdr"):
+        if observation is not None:
+            observation["reason"] = "herdr-unavailable"
         return True
     codex_main = harness == "codex" and not (
         worker if worker is not None else is_worker())
     if codex_main and not pane_id and _in_shared_codex_service():
         pane = ""
     if not pane:
+        if observation is not None:
+            observation["reason"] = "pane-unavailable"
         if codex_main:
             _defer_until_proven(session_id, report_session)
         return True
     if not may_report(harness, session_id, worker=worker):
+        if observation is not None:
+            observation["reason"] = "guard-refused"
         if codex_main and runtime_identity() == ("codex", None):
             _defer_until_proven(session_id, report_session)
         return True
-    _report(harness, session_id, pane, report_session)
+    if observation is None:
+        _report(harness, session_id, pane, report_session)
+    else:
+        _report(harness, session_id, pane, report_session, observation=observation)
     return True
 
 
-def _report(harness: str, session_id: str, pane: str, report_session: bool) -> None:
+def _report(harness: str, session_id: str, pane: str, report_session: bool,
+            observation=None) -> None:
     herdr = shutil.which("herdr")
     if not herdr:
+        if observation is not None:
+            observation["reason"] = "herdr-unavailable"
         return
     title = session_title(harness, session_id)
     label, custom_title = _formatter_overrides(harness, session_id, title)
@@ -473,12 +488,24 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool) -> N
     if header:
         metadata += ["--title", header]
     commands.append(metadata)
+    if observation is not None and not report_session:
+        observation["session_report"] = "skipped"
     for command in commands:
+        field = "session_report" if command[2] == "report-agent-session" else "metadata_report"
         try:
-            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=_HERDR_TIMEOUT, check=False)
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=_HERDR_TIMEOUT, check=False)
+            if observation is not None:
+                observation[field] = "exit0" if result.returncode == 0 else "nonzero"
+                observation[field + "_rc"] = result.returncode
+        except subprocess.TimeoutExpired:
+            if observation is not None:
+                observation[field] = "timeout"
         except Exception:
-            pass
+            if observation is not None:
+                observation[field] = "spawn-error"
+    if observation is not None:
+        observation["reason"] = "report-attempts-finished"
 
 
 def main(argv=None) -> int:
@@ -505,8 +532,13 @@ def main(argv=None) -> int:
         agent, title = compose(args.harness, args.session_id)
         print(json.dumps({"display_agent": agent, "title": title}, ensure_ascii=False))
         return 0
+    # Only the existing OpenCode callback consumes this bounded observation.
+    # Keep project()'s fail-soft bool and the other harnesses' quiet CLI contract.
+    observation = {} if args.harness == "opencode" else None
     project(args.harness, args.session_id, pane_id=args.pane,
-            report_session=not args.no_report_session)
+            report_session=not args.no_report_session, observation=observation)
+    if observation is not None:
+        print(json.dumps(observation, separators=(",", ":")))
     return 0
 
 

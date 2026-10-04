@@ -1122,6 +1122,9 @@ not change the completion courier's existing at-least-once defaults or frame cap
 OpenCode self-publication uses the normal callback SID and an exact top-level
 Session returned by its SDK. Wrapped and data-style SDK responses share that
 validation; timeout/error diagnostics and retries occur only on normal callbacks.
+Existing host logs separate plugin/callback entry, SDK validation and the publisher's
+guard/CLI outcomes with bounded metadata only. A returned publisher command, including
+exit 0, is an attempt observation; it does not prove identity publication or receipt.
 Neither environment/pane labels nor a queued/persisted message prove receipt.
 
 **v56 runtime table** (herdr-unified; supersedes the v50 native-messaging-expansion plan).
