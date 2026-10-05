@@ -277,6 +277,95 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             timeout=10,
         )
 
+
+    def test_mixed_model_resource_outboxes_restart_after_model_interruption(self):
+        self._assert_mixed_resource_outbox_delivery("model")
+
+    def test_mixed_model_resource_outboxes_restart_after_resource_interruption(self):
+        self._assert_mixed_resource_outbox_delivery("resource")
+
+    def _assert_mixed_resource_outbox_delivery(self, interrupt_on):
+        import dispatch_resource_wait as RESOURCE
+        from types import SimpleNamespace
+        module = supervisor
+        join = RESOURCE.JOIN
+        self.jobs.write_text(owner_row(self.lease) + (child_row(status="done").rstrip("\n") + ",failure_class=pass,launch_outcome=never-launched\n"))
+        route = seal_route({"schema_version":2,"cwd":str(self.base),
+            "nodes":[{"id":"full-run","kind":"resource-runner","continuation":{"kind":"supervised"}},
+                     {"id":"verify"}]})
+        route_path = self.base / "mixed-route.json"
+        route_path.write_text(json.dumps(route))
+        route_args = ["--route-file",str(route_path),"--route-id",route["route_id"],"--route-hash",route["route_hash"]]
+        run = {"run_id":"finished-resource","pid":555,"starttime":"201","command":["approved"],
+               "node":"full-run","status":"succeeded","sentinel":"/fixture-exit"}
+        stage = {"state":"STAGE_SUCCEEDED","evidence":{"resource_sha256":RESOURCE.RESUME.row_digest(run)}}
+        sup = SimpleNamespace(poll_once=mock.Mock(),resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+            artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
+        ctx = (sup,route,SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}}),
+               [({"node":"full-run","successors":["verify"]},run)])
+        args = SimpleNamespace(parent_attempt_id=PARENT,route_id=route["route_id"],route_hash=route["route_hash"],jobs=str(self.jobs))
+        native = "mixed-native-session"
+        turns = []
+        interrupted = False
+        acknowledgements = []
+        original_acknowledge = RESOURCE.acknowledge
+        def acknowledge(*args):
+            accepted = original_acknowledge(*args)
+            acknowledgements.append((args[2],accepted))
+            return accepted
+        def turn(*a,**k):
+            nonlocal interrupted
+            prompt,session = a[2],a[1]
+            kind = "resource" if "Runtime resource receipt" in prompt else "model"
+            state = join.read_supervisor_phase_state(self.state,PARENT)
+            self.assertIsNotNone(state.resource["outbox"])
+            self.assertEqual(state.resource["delivered"],[])
+            self.assertEqual(state.resource["outbox"]["receipt_id"],resource_id)
+            self.assertEqual(session,native)
+            turns.append(kind)
+            if kind == "model":
+                self.assertIsNotNone(state.outbox)
+                self.assertNotIn("Runtime resource receipt",prompt)
+            else:
+                self.assertIsNone(state.outbox)
+                self.assertIn('"verification_pass":false',prompt)
+            if kind == interrupt_on and not interrupted:
+                interrupted = True
+                raise module.SupervisorError("fixture-receiving-turn-interrupted")
+            text = "runtime_wait: registered-children" if kind=="model" else "artifact: -\nverdict: PASS\nblocker: none"
+            return {"type":"result","subtype":"success","is_error":False,"result":text},0
+        with mock.patch.object(RESOURCE,"context",return_value=ctx), \
+             mock.patch.object(RESOURCE,"acknowledge",side_effect=acknowledge), \
+             mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=True), \
+             mock.patch.object(module,"run_turn",side_effect=turn), \
+             mock.patch.object(module,"reconcile",return_value=True), \
+             mock.patch.object(module,"emit"), mock.patch.object(module,"resolved_turn_transport",return_value="resume-process"):
+            join.write_supervisor_state(self.state,PARENT,set(),phase="running-turn")
+            RESOURCE.wait(args,self.state,SimpleNamespace(thread_id=native,pending=lambda:False),set(),lambda _:None)
+            original = join.read_supervisor_phase_state(self.state,PARENT).resource["outbox"]
+            resource_id = original["receipt_id"]
+            receipt = {"schema_version":2,"state":"ready","parent_attempt_id":PARENT,
+                "children":[{"attempt_id":"att-child","status":"done","readiness":"ready",
+                             "reason":"registry-closed","required_action":"advance-completed"}],
+                "delivery_timing":{"delivery_timing_schema_version":1,**{point:None for point in DELIVERY_TIMING_POINTS}}}
+            join.prepare_supervisor_outbox(self.state,PARENT,set(),receipt,join.current_children(self.jobs,PARENT,{"att-child"}))
+            self.assertEqual(join.read_supervisor_phase_state(self.state,PARENT).resource["session_id"],native)
+            with mock.patch.object(sys,"stdin",io.StringIO("assignment")):
+                self.assertEqual(module.main(self.command()[2:]+route_args),70)
+            held = join.read_supervisor_phase_state(self.state,PARENT)
+            self.assertEqual(held.resource["outbox"],original)
+            self.assertEqual(held.resource["delivered"],[])
+            self.assertEqual(held.outbox is not None,interrupt_on=="model")
+            self.assertEqual(acknowledgements,[])
+            with mock.patch.object(sys,"stdin",io.StringIO("assignment")):
+                self.assertEqual(module.main(self.command()[2:]+route_args),0)
+            self.assertEqual(acknowledgements,[(resource_id,True)])
+            self.assertFalse(RESOURCE.acknowledge(self.state,PARENT,resource_id))
+            self.assertEqual(acknowledgements,[(resource_id,True),(resource_id,False)])
+        self.assertEqual(turns,["model","model","resource"] if interrupt_on=="model" else ["model","resource","resource"])
+        self.assertEqual(sum(kind=="resource" for kind in turns),1 if interrupt_on=="model" else 2)
+        self.assertEqual(sup.poll_once.call_count,1)
+
     def test_resource_only_park_resumes_same_owner_after_runtime_poll_not_a_bash_wait(self):
         import dispatch_resource_wait as RESOURCE
         from types import SimpleNamespace

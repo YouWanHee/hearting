@@ -1451,9 +1451,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             resource_state = read_supervisor_phase_state(state_path, args.parent_attempt_id)
             resource_box = (resource_state.resource or {}).get("outbox") if resource_state else None
-            resource_receipt_id = resource_box["receipt_id"] if resource_box else ""
+            resource_receipt_id = ""
             if resource_box and active_outbox is None:
                 next_prompt = RESOURCE_WAIT.pending_prompt(state_path, args.parent_attempt_id, args, control)
+                resource_receipt_id = resource_box["receipt_id"]
             begin_supervisor_turn(
                 state_path, args.parent_attempt_id, delivered,
                 receipt_id=active_outbox.receipt_id if active_outbox is not None else None,
