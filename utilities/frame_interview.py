@@ -34,9 +34,11 @@ from pathlib import Path
 
 SCHEMA = "frame_interview_v1"
 ANSWERS_SCHEMA = "frame_interview_answers_v1"
+ANSWER_ACTOR_KINDS = ("user", "supervisor", "automatic", "headless-owner", "unknown")
 ANSWERS_SHAPE = ('answers file: {"understanding_confirmed": true, "answers": {"<question id>": {"choice": 0}}} '
                  '-- choice is an option index or label ("none" plus a "note" when no option fits); '
-                 'add "correction" when understanding_confirmed is false')
+                 'add "correction" when understanding_confirmed is false; the acting parent sets '
+                 '"actor_kind": "user" only for the actual user reply (unmarked source is unknown)')
 # A decision question stays open until the person answers (roles/response-policy.md).
 PENDING_ANSWER_RULE = ("Until the person answers, do not proceed and do not ask again; if the turn "
                        "ends first, end it with the question and its options restated, and use the "
@@ -414,6 +416,32 @@ def _approves(question, index) -> bool:
     return marked == [index]
 
 
+def answer_actor_kind(answers: dict, *, registered_worker=False) -> str:
+    """Declared answer provenance; an unmarked file never implies a person.
+
+    The caller supplies its known worker identity separately. A worker cannot
+    claim a user reply, and an unmarked worker answer retains that known source.
+    This is not authentication of an interactive caller's declaration.
+    """
+    kind = answers.get("actor_kind", "unknown")
+    if not isinstance(kind, str) or kind not in ANSWER_ACTOR_KINDS:
+        raise ValueError("actor_kind: expected one of " + ", ".join(ANSWER_ACTOR_KINDS))
+    if registered_worker and kind == "user":
+        raise ValueError("gate-release-actor-refused: a registered worker cannot claim user answers")
+    return "headless-owner" if registered_worker and kind == "unknown" else kind
+
+
+def recorded_answer_context(answers, actor_kind):
+    """Read an old unmarked release with its existing journal provenance.
+
+    No file or historical release is rewritten. Explicit answer provenance wins;
+    a missing/unsupported journal source remains unknown.
+    """
+    if isinstance(answers, dict) and "actor_kind" not in answers:
+        return {**answers, "actor_kind": actor_kind if actor_kind in ANSWER_ACTOR_KINDS else "unknown"}
+    return answers
+
+
 def approvals_given(interview: dict, answers: dict, proposal) -> list:
     """Each `entry_approvals` row of the selected proposal with the answer to its question:
     `{key, leg, question, label, accepted}`. Only the option marked `approves: true` accepts."""
@@ -427,8 +455,9 @@ def approvals_given(interview: dict, answers: dict, proposal) -> list:
         chosen = resolve_answer(question, given.get(approval.get("question"))) if question else {"state": "unanswered", "label": None, "index": None}
         same_route_question = (isinstance(interview.get("route_proposals"), dict)
                                and approval.get("question") == interview["route_proposals"].get("question"))
-        accepted = (chosen["state"] == "chosen" if same_route_question else
-                    chosen["state"] == "chosen" and _approves(question, chosen["index"]))
+        accepted = answer_actor_kind(answers) == "user" and (
+            chosen["state"] == "chosen" if same_route_question else
+            chosen["state"] == "chosen" and _approves(question, chosen["index"]))
         rows.append({"key": approval.get("key"), "leg": approval.get("leg"), "question": approval.get("question"),
                      "label": chosen["label"], "accepted": accepted})
     return rows
@@ -442,6 +471,7 @@ def answers_template(interview: dict) -> dict:
         "schema": ANSWERS_SCHEMA,
         "route_id": interview.get("route_id"),
         "round": interview.get("round", 1),
+        "actor_kind": "unknown",
         "understanding_confirmed": None,
         "correction": "",
         "answers": {
@@ -463,8 +493,12 @@ def pending_answer_response(interview: dict, response) -> bool:
     if not isinstance(response, dict):
         return False
     allowed = {"schema", "route_id", "round", "understanding_confirmed", "correction",
-               "answers", "accepted", "timeout", "timed_out"}
+               "answers", "accepted", "timeout", "timed_out", "actor_kind"}
     if set(response) - allowed:
+        return False
+    try:
+        answer_actor_kind(response)
+    except ValueError:
         return False
     for key, expected in (("schema", ANSWERS_SCHEMA), ("route_id", interview.get("route_id")),
                           ("round", interview.get("round", 1))):
@@ -527,6 +561,10 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
         errors.append("route_id: answers do not belong to this interview (omit route_id to answer this one)")
     if answers.get("round", interview.get("round", 1)) != interview.get("round", 1):
         errors.append("round: answers belong to a different round (omit round to answer this one)")
+    try:
+        answer_actor_kind(answers)
+    except ValueError as exc:
+        errors.append(str(exc))
     try:
         size = len(json.dumps(answers, ensure_ascii=False).encode("utf-8"))
     except (TypeError, ValueError):
@@ -605,9 +643,13 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None, app
     brief = interview.get("brief") if isinstance(interview.get("brief"), dict) else {}
     given = answers.get("answers") if isinstance(answers.get("answers"), dict) else {}
     confirmed = answers.get("understanding_confirmed") is True
+    actor_kind = answer_actor_kind(answers)
+    human = actor_kind == "user"
+    speaker = "User" if human else actor_kind.capitalize()
     lines = [
         "---",
-        "status: agreed" if confirmed else "status: agreed-with-correction",
+        ("status: agreed" if confirmed else "status: agreed-with-correction") if human else "status: recorded",
+        f"actor_kind: {actor_kind}",
         f"created: {stamp}",
         f"route_id: {interview.get('route_id', '-')}",
         f"round: {interview.get('round', 1)}",
@@ -616,12 +658,12 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None, app
         "",
         "# Intent",
         "",
-        "## Confirmed understanding",
+        "## Confirmed understanding" if human else "## Recorded understanding",
         "",
         _inline(interview.get("understanding")) or "-",
     ]
     if not confirmed:
-        lines += ["", "**User's correction:** " + (_inline(answers.get("correction")) or "-")]
+        lines += ["", f"**{speaker}'s correction:** " + (_inline(answers.get("correction")) or "-")]
     section = {
         "problem": "Problem", "outcome": "Proposed Outcome",
         "affected": "Affected Users / Systems", "constraints": "Constraints",
@@ -631,7 +673,8 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None, app
     lines += ["", "## Decisions", ""]
     questions = [q for q in interview.get("questions", []) if isinstance(q, dict)]
     if not questions:
-        lines.append("No question needed a decision from the user; the direction above stands as proposed.")
+        lines.append("No question needed a decision from the user; the direction above stands as proposed." if human else
+                     f"No question recorded a decision from {actor_kind}; the direction above stands as proposed.")
     for question in questions:
         qid = _text(question.get("id"))
         entry = given.get(qid) if isinstance(given.get(qid), dict) else {}
@@ -649,13 +692,13 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None, app
             # user never picked. The note below carries the actual decision.
             lines.append("  - Decision: **제시된 선택지 없음** (off-menu)")
         elif chosen is not None:
-            tag = "recommended" if followed else "user's own choice"
+            tag = "recommended" if followed else ("user's own choice" if human else f"{actor_kind} choice")
             lines.append(f"  - Decision: **{_text(chosen.get('label'))}** ({tag}) — {_text(chosen.get('means')).strip()}")
         else:
             lines.append("  - Decision: unanswered")
         note = _inline(entry.get("note"))
         if note:
-            lines.append(f"  - User's note: {note}")
+            lines.append(f"  - {speaker}'s note: {note}")
     if "route_proposals" in interview:
         lines += _route_lines(interview, answers, approval_scope or {})
     lines += ["", "## Open Questions", "", _inline(brief.get("open")) or "None recorded."]

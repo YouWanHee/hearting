@@ -407,7 +407,7 @@ def released_task_prompt(args) -> str:
         value = json.loads(source.read_text(encoding="utf-8"))
         if value.get("route_id") != route_id:
             raise ValueError("recorded interview belongs to a different route")
-        answers = resolution.get("answers")
+        answers = interview.recorded_answer_context(resolution.get("answers"), resolution.get("actor_kind"))
         errors = interview.validate_answers(value, answers)
         if errors:
             raise ValueError("; ".join(errors[:3]))

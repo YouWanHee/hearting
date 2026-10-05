@@ -1229,10 +1229,10 @@ def resolved_released_by(actor_kind, requested):
     indistinguishability contract (d) exists to prevent. A registered worker now
     may not name the releaser at all; its label is derived.
     """
-    if actor_kind == "headless-owner" and requested:
+    if actor_kind != "user" and requested and (actor_kind == "headless-owner" or requested != actor_kind):
         raise SupervisorError(
-            "gate-release-actor-refused: a registered headless owner may not name "
-            "the releaser; released_by is derived as headless-owner"
+            "gate-release-actor-refused: a non-user answer may not name a person; "
+            "released_by is derived from its source"
         )
     return requested or actor_kind
 
@@ -1309,7 +1309,7 @@ def assert_release_authority(actor_kind, resolution, binding, gate):
     no authority keep the `any` allowance; a binding that declares `depth-0`
     is honoured even when the raise predates this field.
     """
-    if actor_kind != "headless-owner":
+    if actor_kind == "user":
         return
     if gate == "preview-disposition":
         raise SupervisorError("gate-release-authority-refused: preview-disposition requires the person's decision")
@@ -1325,7 +1325,7 @@ def assert_release_authority(actor_kind, resolution, binding, gate):
         raise SupervisorError(
             f"gate-release-authority-refused: {gate!r} is released by the depth-0 "
             "session (release_authority=depth-0), not by the registered owner that "
-            "raised it; keep waiting with `await-release` -- the person records the "
+            "raised it or another non-user source; keep waiting with `await-release` -- the person records the "
             "decision with `release --decision proceed|revise|stop`")
 
 
@@ -1395,18 +1395,20 @@ def retire_gate_delivery(route, gate, jobs):
     return None
 
 
-def release_actor_kind():
-    """`headless-owner` when the process recording the release is a registered
-    worker, `user` otherwise.
+def release_actor_kind(answers=None):
+    """File releases use declared answer provenance plus known worker identity.
 
-    Contract (d) does not forbid a headless owner from releasing its own gate --
-    forbidding it just makes the 53-minute death the only ending. It forbids that
-    release from being *indistinguishable* from a person's, which is what
-    actually happened on 2026-09-03: both cycles were honest in prose and the
-    data could not tell. The discriminator is deliberately harness-neutral, so
-    Codex/OpenCode parity (SD-OPEN-33) needs no new predicate here.
+    Calls without an answer file retain the existing interactive/worker contract
+    for stop/revise, plain gates and transport helpers. That caller identity must
+    also be checked before a file's kind so it cannot relax registered guards.
     """
-    if os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1":
+    registered_worker = os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1"
+    if answers is not None:
+        try:
+            return INTERVIEW.answer_actor_kind(answers, registered_worker=registered_worker)
+        except ValueError as exc:
+            raise SupervisorError(str(exc)) from exc
+    if registered_worker:
         return "headless-owner"
     return "user"
 
@@ -1561,6 +1563,12 @@ def cmd_release(args):
         if inline_gate and args.decision == "proceed":
             WS.require_gate_artifact_current(WS.human_gate_resolution(ledger.journal(), args.gate))
         answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
+        if answers is not None:
+            actor_kind = release_actor_kind(answers)
+            actor = resolved_released_by(actor_kind, args.actor)
+            assert_release_authority(actor_kind, WS.human_gate_resolution(ledger.journal(), args.gate),
+                                     gates[args.gate], args.gate)
+            answers = {**answers, "actor_kind": actor_kind}
         answered_interview = interview_of_gate(ledger, args.gate) if answers else None
         if args.decision == "proceed":
             ledger.set_workflow_state(
@@ -1634,7 +1642,7 @@ def cmd_release(args):
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
                             released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
-    record_answered_decisions(route, answered_interview, answers)
+    record_answered_decisions(route, answered_interview, answers, actor_kind=actor_kind)
     if args.decision == "proceed" and actor_kind == "user":
         jobs = args.jobs or (None if payload.get("ledger_root_source") == "AGENT_WORKFLOW_ROOT"
                              else default_jobs_path())
@@ -1657,8 +1665,8 @@ def interview_of_gate(ledger, gate):
         return None
 
 
-def record_answered_decisions(route, interview, answers):
-    """D-87: the answers this release just accepted become decision records.
+def record_answered_decisions(route, interview, answers, *, actor_kind="unknown"):
+    """D-87: only actual user answers accepted by this release become user memories.
 
     `cmd_release` is the one place a frame-review answer is accepted (both
     `release --answers` and `capability-route.py start --answers` reach it), so
@@ -1666,13 +1674,13 @@ def record_answered_decisions(route, interview, answers):
     records; any failure leaves the original text in the waiting folder and one
     stderr line. The release result, exit code and stdout are never affected.
     """
-    if not answers or not interview:
+    if not answers or not interview or actor_kind != "user":
         return
     try:
         import tidy_decisions
         tidy_decisions.record_interview_answers(
             interview, answers, route_id=route.get("route_id", ""),
-            cwd=route.get("cwd") or os.getcwd())
+            cwd=route.get("cwd") or os.getcwd(), actor_kind=actor_kind)
     except BaseException as exc:  # noqa: BLE001 - never change the accepted release
         if isinstance(exc, KeyboardInterrupt):
             raise

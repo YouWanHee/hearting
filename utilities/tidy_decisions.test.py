@@ -83,17 +83,36 @@ class KeyTest(unittest.TestCase):
                          {"id": "q1", "question": "Which?", "options": [{"label": "One", "means": "first"},
                                                                           {"label": "Two", "means": "second"}]},
                          {"id": "q2", "question": "Else?", "options": [{"label": "Yes", "means": "y"}]}]}
-        answers = {"understanding_confirmed": False, "correction": "no, the other thing",
+        answers = {"actor_kind": "user", "understanding_confirmed": False, "correction": "no, the other thing",
                    "answers": {"q1": {"choice": 1, "note": "because"},
                                "q2": {"choice": "none", "note": "my own words"}}}
-        payloads = td.interview_payloads(interview, answers, cwd="/p")
+        payloads = td.interview_payloads(interview, answers, cwd="/p", actor_kind="user")
         self.assertEqual([p["answers"] for p in payloads],
                          [["Two"], ["my own words"], ["수정 요청: no, the other thing"]])
         self.assertEqual(payloads[0]["note"], "because")
         self.assertEqual(payloads[1]["note"], "")
         self.assertEqual(payloads[0]["correction"], "no, the other thing")
-        confirmed = td.interview_payloads(interview, {**answers, "understanding_confirmed": True}, cwd="/p")
+        confirmed = td.interview_payloads(interview, {**answers, "understanding_confirmed": True}, cwd="/p", actor_kind="user")
         self.assertEqual(len(confirmed), 2)
+
+    def test_interview_memory_requires_effective_user_source_not_a_file_claim(self):
+        interview = {"route_id": "rt-x", "questions": [{"id": "q", "question": "Which?",
+                                                              "options": [{"label": "One"}]}]}
+        answers = {"actor_kind": "user", "understanding_confirmed": True, "answers": {"q": {"choice": 0}}}
+        for kind in ("unknown", "supervisor", "automatic", "headless-owner", None):
+            with self.subTest(kind=kind), mock.patch.object(td, "save_pending") as save, \
+                 mock.patch.object(td.subprocess, "run") as run:
+                self.assertEqual(td.interview_payloads(interview, answers, actor_kind=kind), [])
+                self.assertEqual(td.record_interview_answers(interview, answers, actor_kind=kind), "none")
+                save.assert_not_called()
+                run.assert_not_called()
+        self.assertEqual(td.record_interview_answers(interview, answers), "none")
+        for kind in ("supervisor", "automatic", "unknown", None):
+            mismatch = {**answers, "actor_kind": kind}
+            self.assertEqual(td.interview_payloads(interview, mismatch, actor_kind="user"), [])
+        payloads = td.interview_payloads(interview, answers, actor_kind="user")
+        self.assertEqual(payloads[0]["origin"]["actor_kind"], "user")
+        self.assertEqual(payloads[0]["answers"], ["One"])
 
 
 class TwoPathsTest(unittest.TestCase):
@@ -123,8 +142,8 @@ class TwoPathsTest(unittest.TestCase):
                                     "options": [{"label": "파일로 저장 (권장)", "means": "다른 설명"},
                                                 {"label": "그 밖의 선택지", "means": "x"}]}]}
         from_interview = td.interview_payloads(
-            interview, {"understanding_confirmed": True, "answers": {"q1": {"choice": 0, "note": "메모"}}},
-            cwd=str(self.proj))[0]
+            interview, {"actor_kind": "user", "understanding_confirmed": True, "answers": {"q1": {"choice": 0, "note": "메모"}}},
+            cwd=str(self.proj), actor_kind="user")[0]
         self.assertEqual(from_transcript["source"], from_interview["source"])
         self.assertTrue(from_transcript["source"].startswith("user-choice:"))
         with self.iso.patched_environ():
@@ -272,7 +291,7 @@ class ReleaseDecisionTest(WF.TestGateSubjectNotCaller):
         before = self.records()
         # the same answer reaching the recorder again (a replay) is skipped by its source
         payloads = td.interview_payloads(self.value, self.answers, route_id="rt-fixture0000000",
-                                         cwd=str(self.base))
+                                         cwd=str(self.base), actor_kind="user")
         for payload in payloads:
             td.save_pending(payload)
         completed = subprocess.run([sys.executable, str(HERE / "tidy_decisions.py"), "drain", "--cwd", str(self.base)],

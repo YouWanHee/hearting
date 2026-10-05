@@ -2324,6 +2324,7 @@ class TestGateSubjectNotCaller(WorkflowFixture):
     def _answers(self, interview, **overrides):
         import frame_interview as FI
         answers = FI.answers_template(interview)
+        answers["actor_kind"] = "user"
         answers["understanding_confirmed"] = True
         for qid in answers["answers"]:
             answers["answers"][qid]["choice"] = 1
@@ -2332,6 +2333,66 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         path = self.base / "answers.json"
         path.write_text(json.dumps(answers, ensure_ascii=False), encoding="utf-8")
         return path, answers
+
+    def test_answer_source_is_preserved_on_any_gate_without_human_approval_or_memory(self):
+        import frame_interview as FI
+        import tidy_decisions
+        for index, kind in enumerate(("supervisor", "automatic", "unknown", "headless-owner", None)):
+            with self.subTest(kind=kind):
+                route_id = f"rt-actor-{index}"
+                route, path = self.two_stage_route(human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"}, route_id=route_id)
+                route["human_gate_bindings"][0]["release_authority"] = "any"
+                path.write_text(json.dumps(route))
+                jobs, _, _ = self.owner_registry(route_id=route_id)
+                interview_path, interview = self._interview(route_id=route_id)
+                self._block_with(path, jobs, interview_path)
+                answer_path, answers = self._answers(interview, actor_kind=kind)
+                if kind is None:
+                    del answers["actor_kind"]
+                    answer_path.write_text(json.dumps(answers))
+                before = answer_path.read_bytes()
+                out = io.StringIO()
+                with mock.patch.object(tidy_decisions, "record_interview_answers") as memory, \
+                     mock.patch.object(SUP, "owner_continuation") as continuation, contextlib.redirect_stdout(out):
+                    self.assertEqual(SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                        "--decision", "proceed", "--answers", str(answer_path), "--jobs", str(jobs)]), 0)
+                effective = kind or "unknown"
+                self.assertEqual(answer_path.read_bytes(), before)
+                memory.assert_not_called()
+                continuation.assert_not_called()
+                payload = json.loads(out.getvalue())
+                resolution = WS.human_gate_resolution(SUP.ledger_for(route, jobs).journal(), "frame-review")
+                sidecar = json.loads(SUP.gate_release_sidecar_path(path).read_text())["gate_releases"][0]
+                self.assertEqual((payload["actor_kind"], resolution["actor_kind"], sidecar["actor_kind"]),
+                                 (effective, effective, effective))
+                self.assertEqual(resolution["answers"]["actor_kind"], effective)
+                self.assertEqual(sidecar["answers"]["actor_kind"], effective)
+                text = FI.render_intent(interview, resolution["answers"])
+                self.assertIn("actor_kind: " + effective, text)
+                self.assertNotIn("User's note", text)
+
+    def test_registered_caller_restrictions_are_independent_of_file_kind(self):
+        route, path = self.two_stage_route(human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        route["human_gate_bindings"][0]["release_authority"] = "any"
+        path.write_text(json.dumps(route))
+        jobs, _, _ = self.owner_registry()
+        interview_path, interview = self._interview()
+        self._block_with(path, jobs, interview_path)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            for kind in ("user", "supervisor", "automatic", "unknown"):
+                answer, _ = self._answers(interview, actor_kind=kind)
+                for label in ("user", "shinuh", "supervisor", "automatic"):
+                    with self.subTest(kind=kind, label=label):
+                        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-actor-refused"):
+                            SUP.main(["release", "--route", str(path), "--gate", "frame-review", "--decision", "proceed",
+                                      "--answers", str(answer), "--actor", label, "--jobs", str(jobs)])
+                if kind == "user":
+                    with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-actor-refused"):
+                        SUP.main(["release", "--route", str(path), "--gate", "frame-review", "--decision", "proceed",
+                                  "--answers", str(answer), "--jobs", str(jobs)])
+        self.assertEqual(WS.human_gate_resolution(SUP.ledger_for(route, jobs).journal(), "frame-review")["status"], "blocked")
 
     def _block_with(self, path, jobs, artifact):
         buf = io.StringIO()

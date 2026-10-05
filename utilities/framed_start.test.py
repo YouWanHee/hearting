@@ -114,7 +114,7 @@ class StartBase(F.EndingBase):
         for extra in extra_questions:
             given[extra["id"]] = {"choice": 0 if approval_choice is None else approval_choice, "note": ""}
         self.answers = {"schema": FI.ANSWERS_SCHEMA, "route_id": self.route["route_id"], "round": 1,
-                        "understanding_confirmed": True, "correction": "", "answers": given}
+                        "actor_kind": "user", "understanding_confirmed": True, "correction": "", "answers": given}
 
     def fake_run(self, command, **kwargs):
         """The selector admits the first leg's owner: one registered row."""
