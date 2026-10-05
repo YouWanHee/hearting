@@ -809,5 +809,89 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
         self.assertTrue(reason.startswith("route-record-unparsable:"), reason)
         self.assertEqual(results, [])
 
+
+class InlineRouteReleasesPinTest(unittest.TestCase):
+    """An unclosed inline route never had a registry attempt to wait for.
+
+    Measured 2026-10-05: 24 of 35 unclosed routes pinning releases were inline
+    (depth 0) with no rows, and one pre-launch-tuple inline record without a
+    `launch_home` made the whole scan undecidable, so no release was pruned.
+    """
+
+    ROUTE_ID = "rt-d14cb2ca1f171cc5"
+    _routes_dir = RouteStaleOpenMirrorTest._routes_dir
+    _registry = RouteStaleOpenMirrorTest._registry
+    _scan = RouteStaleOpenMirrorTest._scan
+
+    def _inline(self, routes: Path, *, launch_home=None, jobs=None, **extra) -> Path:
+        body = {
+            "route_id": self.ROUTE_ID, "schema_version": 2,
+            "execution_topology": "inline", "owner_dispatch_depth": 0,
+            "nodes": [{"id": "inline", "dispatch_depth": 0}],
+        }
+        tuple_: dict = {}
+        if launch_home is not None:
+            tuple_["launch_home"] = {"kind": "launch_home", "path": launch_home}
+        if jobs is not None:
+            tuple_["jobs_path"] = {"kind": "jobs_path", "path": jobs}
+        if tuple_:
+            body["launch_compatibility_tuple"] = tuple_
+        body.update(extra)
+        path = routes / f"{self.ROUTE_ID}.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    def _scan_inline(self, *, rows=None, **kwargs):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        jobs_path = base / "state" / "jobs.log"
+        kwargs.setdefault("launch_home", str(base / "release"))
+        kwargs.setdefault("jobs", str(jobs_path))
+        self._inline(self._routes_dir(base), **kwargs)
+        if rows is not None:
+            self._registry(jobs_path, rows)
+        return self._scan(base)
+
+    def test_an_inline_route_with_no_rows_stops_pinning(self):
+        self.assertEqual(self._scan_inline(rows=[]), ([], ""))
+        self.assertEqual(self._scan_inline(), ([], ""))
+
+    def test_an_inline_record_from_before_the_launch_tuple_stops_pinning(self):
+        self.assertEqual(self._scan_inline(launch_home=None, jobs=None), ([], ""))
+
+    def test_an_inline_route_shown_live_in_a_registry_keeps_the_pin(self):
+        results, reason = self._scan_inline(rows=[
+            ("open", f"route_id={self.ROUTE_ID},attempt_id=att-1"),
+        ])
+        self.assertEqual(reason, "")
+        self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
+
+    def test_an_inline_route_with_a_malformed_registry_keeps_the_pin(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        jobs_path = base / "state" / "jobs.log"
+        self._inline(self._routes_dir(base), launch_home=str(base / "release"), jobs=str(jobs_path))
+        jobs_path.parent.mkdir(parents=True)
+        jobs_path.write_text("not\ta\tregistry\trow\n", encoding="utf-8")
+        results, reason = self._scan(base)
+        self.assertEqual(reason, "")
+        self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
+
+    def test_what_is_not_plainly_inline_keeps_the_old_rule(self):
+        for extra in (
+            {"owner_dispatch_depth": 1},
+            {"execution_topology": "staged"},
+            {"nodes": [{"id": "inline", "dispatch_depth": 0}, {"id": "w", "dispatch_depth": 1}]},
+            {"route_id": "rt-0000000000000000"},
+        ):
+            with self.subTest(extra=extra):
+                results, reason = self._scan_inline(rows=[], **extra)
+                self.assertEqual(reason, "")
+                self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
+        # Without a launch_home the old rule still fails the scan closed.
+        _results, reason = self._scan_inline(launch_home=None, jobs=None, owner_dispatch_depth=1)
+        self.assertTrue(reason.startswith("route-record-unparsable:"), reason)
+
+
 if __name__ == "__main__":
     unittest.main()
