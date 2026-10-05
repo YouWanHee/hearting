@@ -970,7 +970,7 @@ verified config explicitly supplies positive integer `training.epochs`,
 `blocks_per_epoch` and `updates_per_block` whose product equals `training.attempts`.
 Its partial, boundary and complete states count attempted-update intervals,
 not dataset passes. Structured progress and existing tqdm output share one
-compact human row: Epoch, original phase, percentage and matching count fraction,
+compact human row: Epoch, phase caption (`training-updates` as `TRAIN`), percentage and matching count fraction,
 observed ETA, then original metric names. A schedule Epoch pairs with attempts
 inside that interval; zero starts at zero and an exact boundary retains the
 completed interval's full count. Absent or ambiguous cadence omits Epoch and

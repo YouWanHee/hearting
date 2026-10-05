@@ -4686,6 +4686,8 @@ _PROGRESS_BODY_CACHE = {}   # {(pid, line): immutable compact segments}; bounded
 
 def _progress_fields_segments(phase, percent, count, left=None, metrics=()):
     """One body grammar for observed tqdm fields and verified structured facts."""
+    if phase == "training-updates":
+        phase = "TRAIN"
     parts = []
     fields = [(phase, "resource_active") if phase else None,
               ("%.0f%%" % percent, "lvl_g"), (count, "dim")]
