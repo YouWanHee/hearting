@@ -296,7 +296,8 @@ parent. The runtime seals it, prepares its cycle, starts the frame pair when
 declared, and returns one receipt. Reuse that receipt's `resume_command` after
 wakes or input corrections. It reuses exact attempts, carries partial admission
 obligations, and never retries a failed attempt merely because it was called
-again. Follow its `parent_next` while work is running. An expired bounded wait
+again. Follow this receipt's top-level `parent_next`/`parent_next_command` while
+work is running; nested launch receipts are evidence, not extra child waits. An expired bounded wait
 returns `needs-attention`: report the pending work; runtime watchers retain
 execution/cleanup responsibility and the deadline grants no retry authority.
 `needs-interview` means both frames have been checked: compare their results,
@@ -364,7 +365,9 @@ completion gate are unchanged, and a preset-free route is still a route the
 the dispatch-depth-0 session in the final worktree; inside a registered owner
 (`AGENT_DISPATCH_DEPTH` ≠ 0) it needs `--dispatch-evidence` or
 `--registered-headless-evidence` from the parent, exactly like `compile`.
-The `[경로]` line it prints on stderr is the notice §0.4 uses for small work.
+The stderr `[경로]` notice (§0.4) keeps the campaign choice observed before
+compose starts, and accompanies an admitted first leg. A no-wait snapshot is
+pending; only an elapsed bounded wait is a timeout.
 
 ### 0.3. Pre-Execution Gate for Long-Running Work
 
