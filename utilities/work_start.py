@@ -234,7 +234,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         actor_kind = FI.answer_actor_kind(response, registered_worker=registered_worker)
         binding = next((row for row in route.get("human_gate_bindings", [])
                         if row.get("gate") == "frame-review"), {})
-        authority = (resolution.get("release_authority") or binding.get("release_authority") or "depth-0")
+        authority = (resolution.get("release_authority") or
+                     ("depth-0" if resolution.get("interview") else None) or
+                     binding.get("release_authority") or "depth-0")
         if authority == "depth-0" and (registered_worker or actor_kind != "user"):
             raise ValueError("gate-release-authority-refused: frame-review requires the person's actual answer")
         response = {**response, "actor_kind": actor_kind}

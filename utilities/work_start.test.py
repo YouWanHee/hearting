@@ -1312,6 +1312,26 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.calls, [])
         self.assertFalse((self.output / "shards/frame/round-1/answers.json").exists())
 
+    def test_old_interview_person_authority_precedes_any_binding_before_save(self):
+        self.route["human_gate_bindings"][0]["release_authority"] = "any"
+        self.path.write_text(json.dumps(self.route))
+        asked = self.step(interview=self.question_file)
+        question = Path(asked["interview_file"])
+        before = question.read_bytes()
+        legacy = {**self.resolution(), "release_authority": None}
+        answer = self.answers()
+        response = json.loads(answer.read_text())
+        response["actor_kind"] = "supervisor"
+        answer.write_text(json.dumps(response))
+        with mock.patch.object(WF.WS, "human_gate_resolution", return_value=legacy):
+            with self.assertRaisesRegex(ValueError, "gate-release-authority-refused"):
+                self.step(answers=answer)
+        self.assertFalse((question.parent / "answers.json").exists())
+        self.assertFalse((self.output / "shards/frame/intent.md").exists())
+        self.assertEqual(question.read_bytes(), before)
+        self.assertEqual(self.calls, ["gate"])
+        self.assertEqual(self.resolution()["status"], "blocked")
+
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
         asked = self.step(interview=self.question_file)
