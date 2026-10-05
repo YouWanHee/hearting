@@ -1543,7 +1543,11 @@ def _validate_optional_part(registry, recipe, part_id, optional, owner_profile):
     stage = part_id.partition(":")[2]
     if not isinstance(node, dict) or node.get("id") != stage:
         raise TopologyError(f"part {part_id}: optional node id must equal the stage id")
-    if node.get("kind") not in ("pipeline-stage", "review-worker", "map-worker"):
+    resume = (part_id == "autopilot-lab:resume-run" and node.get("kind") == "resource-runner"
+              and node.get("resource_policy") == "verified-resume"
+              and node.get("resource_transport") == "detached-process"
+              and node.get("continuation") == {"kind": "supervised"})
+    if node.get("kind") not in ("pipeline-stage", "review-worker", "map-worker") and not resume:
         raise TopologyError(f"part {part_id}: optional part must be a pipeline, review, or map worker")
     known = {n["id"] for n in recipe["standard_plus"]["nodes"]} | {
         other for other, _row in recipe_optional_parts(registry, recipe)}
@@ -1555,14 +1559,24 @@ def _validate_optional_part(registry, recipe, part_id, optional, owner_profile):
     alone.update(depends_on=[], terminal=True, terminal_gate=alone.get("completion_gate"),
                  advance_class="model-required", model_required_reason="terminal-report")
     alone.pop("continuation", None)
+    probe_nodes = [alone]
+    if resume:
+        alone = json.loads(json.dumps(node))
+        verification = json.loads(json.dumps(next(n for n in recipe["standard_plus"]["nodes"]
+                                                 if n["id"] == "run-verify")))
+        verification.update(depends_on=[stage], terminal=True,
+                            terminal_gate=verification["completion_gate"])
+        verification.pop("continuation", None)
+        probe_nodes = [alone, verification]
     probe = {key: json.loads(json.dumps(recipe[key])) for key in (
         "capability", "modes", "topology_class", "direct_predicates", "promotion_signals",
         "artifact_scope", "quick")}
     probe.update({
         "standard_plus": {"topology": recipe["standard_plus"].get("topology", recipe["topology_class"]),
                           "owner_dispatch_depth": recipe["standard_plus"]["owner_dispatch_depth"],
-                          "max_dispatch_depth": alone.get("dispatch_depth", 0), "nodes": [alone]},
-        "completion_gates": [alone.get("completion_gate")], "human_gates": [],
+                          "max_dispatch_depth": max(n.get("dispatch_depth", 0) for n in probe_nodes),
+                          "nodes": probe_nodes},
+        "completion_gates": [n.get("completion_gate") for n in probe_nodes], "human_gates": [],
         "human_gate_bindings": [], "resume_retry_boundaries": [stage],
     })
     _validate_recipe(probe, registry, owner_profile)

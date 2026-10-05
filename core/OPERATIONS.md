@@ -711,6 +711,17 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+For the explicit `resume-run,run-verify` graph, `resource-runner start` also
+arms the shared supervisor and starts its watch, without a model waiting on the
+payload. The same route's normal `start` is the claimed successor: before the
+resource succeeds it reports resource readiness/liveness, and afterwards it
+starts only the independent verifier. The receipt distinguishes the resource,
+watch and verification identities. A repeated exact launch returns the existing
+run; a changed launch or another run for that route/node cannot duplicate it.
+Exit failure, a missing sentinel or unverifiable identity starts no verifier.
+Verification completion retains the existing parent-delivery receipt and its
+supported fallback; watch startup or queue acceptance alone is not receipt.
+
 **Managed completion resumes a parent thread once per batch.** A registered
 batch's parent thread is resumed exactly one time when the whole batch is
 semantically terminal and execution-quiescent, under the existing

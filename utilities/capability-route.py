@@ -24,6 +24,7 @@ import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import gpu_execution_sandbox as GPU_SANDBOX
+import resource_resume as RESOURCE_RESUME
 from dispatch_continuation_budget import (COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT,
                                           derive_workload_ordinary)
 from dispatch_contract import (
@@ -3472,7 +3473,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         capability, capability_mode, graph, profile = ROUTE_FRAME_CAPABILITY, "default", None, None
         if intensity not in (None, "standard"):
             raise ValueError("compose-shape-intensity-mismatch:framed")
-    if shape != "staged" and graph:
+    resume_graph = (shape in ("direct", "solo") and RESOURCE_RESUME.selected(
+        capability, capability_mode or "setup", graph.split(",") if graph else None))
+    if shape != "staged" and graph and not resume_graph:
         raise ValueError(f"compose-graph-only-staged:{shape}")
     registry = TOPO.load_registry()
     # A capability may own several recipes (autopilot-lab: setup, eval); the
@@ -3510,7 +3513,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if campaign_key is None and parent_cycle_id is None and not unassigned:
         raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root))
     if tracking is None:
-        tracking = "tracked" if shape in ("staged", "framed") else "untracked"
+        tracking = "tracked" if shape in ("staged", "framed") or resume_graph else "untracked"
     gate = {
         "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
         "drift_verdict": drift_verdict or DEFAULT_DRIFT_VERDICT,
@@ -3518,6 +3521,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         "artifact_guard": {"satisfied": True, "source": artifact_guard or DEFAULT_ARTIFACT_GUARD},
     }
     predicates = list(base["direct_predicates"]) if shape == "direct" else []
+    if resume_graph:
+        predicates = [p for p in predicates if p not in ("no-resource-run", "no-independent-verifier")]
     signals = sorted(set(signals or ()))
     if shape == "direct" and signals:
         raise ValueError("compose-direct-signals-conflict")
@@ -3541,7 +3546,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         # No graph: the recipe's own order, minus the frame nodes the plan already ran.
         graph_spec = [(n["id"], None) for n in base["standard_plus"]["nodes"] if not _frame_node(n)]
     else:
-        graph_spec = parse_graph_spec(graph, capabilities) if shape == "staged" and graph else None
+        graph_spec = parse_graph_spec(graph, capabilities) if (shape == "staged" or resume_graph) and graph else None
     if shape == "staged" and execution_scope == "report":
         source_graph = ([f"{node}" + (f":{unit}" if unit else "") for node, unit in graph_spec]
                         if graph_spec is not None else None)
@@ -3584,7 +3589,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                                        children or _compose_default_children(selection_pins),
                                        gpu_route=gpu_route if shape == "staged" else None)
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
-    if (shape == "solo" or owner_only) and registered_headless_evidence is None:
+    if (shape == "solo" or owner_only or resume_graph) and registered_headless_evidence is None:
         readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
                                                     parent_harness, children or _compose_default_children(selection_pins))
         registered_headless_evidence = {"candidates": readiness["candidates"]}
@@ -3827,6 +3832,8 @@ def declared_start_approvals(leg, registry=None):
     base = (next((r for r in recipes if "dev" in r["modes"]), recipes[0]) if mode is None
             else next((r for r in recipes if mode in r["modes"]), None))
     if base is None:
+        return []
+    if RESOURCE_RESUME.selected(capability, mode or "setup", leg.get("graph")):
         return []
     if leg.get("shape") != "staged":
         # A one-shot recipe still contains these internal approval-scoped parts.
@@ -4076,7 +4083,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         raise ValueError(f"invalid transport: {transport!r}")
     inferred="standard" if signals else ("direct" if set(predicates)==known_pred else "quick")
     effective=max((requested,inferred),key=ORDER.get)
-    if composed and effective in ("direct","quick"):
+    resume_recipe = composed and RESOURCE_RESUME.recipe_selected(recipe) and effective == "quick"
+    if composed and effective in ("direct","quick") and not resume_recipe:
         raise ValueError("composed routes require a standard+ effective intensity")
     registered_headless_candidates=None
     if effective=="direct":
@@ -4161,6 +4169,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
             nodes = [nodes[-1]]
             nodes[0]["depends_on"] = []
             gates = ["quick-complete"]
+        if resume_recipe:
+            nodes = RESOURCE_RESUME.nodes(recipe, owner_model_profile)
+            gates = ["resource-exit", "quick-complete"]
         selection_basis=[{"axis":"direct-predicate-gap","signal":p,"source":"compiler"} for p in sorted(known_pred-set(predicates))]
     else:
         if transport not in (None, "headless"):
@@ -4264,7 +4275,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "persona_independence_contract_version":1,
       "profile_demands":profile_demands,"explicit_profiles":explicit_profiles,
       "owner_profile_demand":owner_demand,"owner_profile_selection":owner_profile_selection,
-      "execution_topology":("inline" if effective=="direct" else recipe["quick"]["topology"] if effective=="quick" else recipe["topology_class"]),
+      "execution_topology":("resource+verification" if resume_recipe else "inline" if effective=="direct" else recipe["quick"]["topology"] if effective=="quick" else recipe["topology_class"]),
       "owner_dispatch_depth":0 if effective=="direct" else (recipe["quick"]["owner_dispatch_depth"] if effective=="quick" else recipe["standard_plus"]["owner_dispatch_depth"]),
       "max_dispatch_depth":recipe["quick"]["max_dispatch_depth"] if effective=="quick" else (0 if effective=="direct" else recipe["standard_plus"]["max_dispatch_depth"]),
       "tracking":tracking,"tracked_gate_evidence":evidence,"spec_touch":spec_touch,
@@ -4593,7 +4604,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             if k not in ("fallback_hops", "harness_affinity", "harness_policy")
         }
     if route.get("composed"):
-        if route.get("effective_intensity") in ("direct","quick"):
+        resume_recipe = RESOURCE_RESUME.route_selected(route)
+        if route.get("effective_intensity") in ("direct","quick") and not resume_recipe:
             raise ValueError("composed routes require a standard+ effective intensity")
         composed_recipe=route.get("composed_recipe")
         if not isinstance(composed_recipe, dict):
@@ -4602,7 +4614,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             composed_recipe, registry,
             registry["owner_profile_by_intensity"]["standard"],
         )
-        expected_nodes=json.loads(json.dumps(composed_recipe["standard_plus"]["nodes"]))
+        if resume_recipe and not _versioned_subgraph(registry, composed_recipe):
+            raise ValueError("resume recipe differs from the declared catalog")
+        expected_nodes=(RESOURCE_RESUME.nodes(composed_recipe, registry["owner_profile_by_intensity"]["quick"])
+                        if resume_recipe else json.loads(json.dumps(composed_recipe["standard_plus"]["nodes"])))
         expected_nodes=_expand_parallel_groups(
             expected_nodes, composed_recipe["standard_plus"].get("parallel_groups"),
             route.get("effective_intensity"), route.get("capability"),
@@ -4919,6 +4934,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         ):
             raise ValueError("direct node axes mismatch")
     elif effective=="quick":
+        resume_recipe = RESOURCE_RESUME.route_selected(route)
         if (
             route.get("owner_dispatch_depth") != 1
             or route.get("max_dispatch_depth") != 1
@@ -4928,7 +4944,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             # so it stays true unchanged with three nodes. `max_dispatch_depth`
             # stays 1 because the frame legs are depth 1 as well.
             or route.get("registered_headless_policy") != "serial-attempt"
-            or len(route.get("nodes",[])) != (3 if _recipe_has_frame(route_recipe) else 1)
+            or len(route.get("nodes",[])) != (2 if resume_recipe else 3 if _recipe_has_frame(route_recipe) else 1)
         ):
             raise ValueError("quick route shape mismatch")
         candidates=_validate_registered_headless_evidence({
@@ -4948,7 +4964,9 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_inline_gates = [gate for gate in expected_inline_gates if gate != "preview-disposition"]
         if node.get("inline_human_gates", []) != expected_inline_gates:
             raise ValueError("quick-inline-human-gates-mismatch")
-        if node.get("write_scope") != route_recipe["quick"]["write_scope"]:
+        expected_scope = (route_recipe["standard_plus"]["nodes"][1]["write_scope"] if resume_recipe
+                          else route_recipe["quick"]["write_scope"])
+        if node.get("write_scope") != expected_scope:
             raise ValueError("quick-write-scope-mismatch")
         if (
             node.get("dispatch_depth") != 1
@@ -4958,7 +4976,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             or node.get("registered_worker") is not True
             or node.get("fallback_hops")
             or sorted(node.get("depends_on") or []) !=
-               (["frame","frame-alternative"] if _recipe_has_frame(route_recipe) else [])
+               (["resume-run"] if resume_recipe else ["frame","frame-alternative"] if _recipe_has_frame(route_recipe) else [])
         ):
             raise ValueError("quick node axes mismatch")
         frame_legs=[n for n in route["nodes"] if _frame_node(n)]

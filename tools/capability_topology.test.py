@@ -807,7 +807,8 @@ class PartCatalogTest(unittest.TestCase):
                   if r["capability"] != "route-frame"}  # compiler-internal: never composable, no catalog parts
         optional = {part for part, row in self.parts.items() if "optional" in row}
         self.assertEqual(set(self.parts), stages | optional)
-        self.assertEqual(optional, {"autopilot-lab:diagnose", "autopilot-lab:eval-spec", "autopilot-lab:eval-smoke"})
+        self.assertEqual(optional, {"autopilot-lab:diagnose", "autopilot-lab:eval-spec", "autopilot-lab:eval-smoke",
+                                    "autopilot-lab:resume-run"})
         self.invalid(lambda c, r: c["parts"].pop("audit:inspect"), "lacks a row for recipe stages")
         self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(summary=""), "one-line summary")
         self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(gate="x"), "unknown catalog fields")
@@ -847,7 +848,14 @@ class PartCatalogTest(unittest.TestCase):
         self.invalid(renamed, "node id must equal the stage id")
         self.assertEqual([stage for stage, _row in T.recipe_optional_parts(
             self.r, T.resolve_recipe(self.r, "autopilot-lab", "eval"))], ["diagnose", "eval-spec", "eval-smoke"])
-        self.assertEqual(T.recipe_optional_parts(self.r, T.resolve_recipe(self.r, "autopilot-lab", "setup")), [])
+        self.assertEqual([stage for stage, _row in T.recipe_optional_parts(
+            self.r, T.resolve_recipe(self.r, "autopilot-lab", "setup"))], ["resume-run"])
+        def unsafe_resource(c, r):
+            c["parts"]["autopilot-lab:resume-run"]["optional"]["node"]["continuation"] = {"kind": "inline-next"}
+        self.invalid(unsafe_resource, "optional part must be")
+        def unverified_resource(c, r):
+            c["parts"]["autopilot-lab:resume-run"]["optional"]["node"]["resource_policy"] = "new-code"
+        self.invalid(unverified_resource, "optional part must be")
     def test_unit_io_gate_accepts_a_declared_choice_only(self):
         r = copy.deepcopy(self.r)
         lab = T.resolve_recipe(r, "autopilot-lab", "setup")

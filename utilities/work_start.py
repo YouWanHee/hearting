@@ -32,6 +32,7 @@ from parent_next_directive import parent_next
 from execution_access import ExecutionAccessError, prepare_task_request
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import route_plan as RP
+import resource_resume as RESOURCE_RESUME
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROUTE_MODULE = None
@@ -425,7 +426,10 @@ def _start(route, path, jobs, node, harness, run):
                "--attempt-id", attempt_id(route, node)]
     if node == "owner" or not route.get("artifact_root"):
         # A route with no artifact root has no runtime home for a prompt file; every sealed route has one.
-        command += ["--prompt-text", route["work_request"]["text"]]
+        task = route["work_request"]["text"]
+        if RESOURCE_RESUME.route_selected(route):
+            task += RESOURCE_RESUME.verification_prompt(route, jobs)
+        command += ["--prompt-text", task]
     else:
         command += ["--prompt-file", str(_frame_prompt_file(route))]
     if node != "owner":
@@ -1325,6 +1329,27 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                             "required_action": "inspect-recovery", "outcome": closed}
         return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
                                       "outcome": closed})
+    if RESOURCE_RESUME.route_selected(route):
+        resource = RESOURCE_RESUME.observation(route, jobs)
+        if resource["state"] != "resource-succeeded":
+            from artifact_producer import prepare_route_artifact_env
+            supervised = RESOURCE_RESUME.supervisor_alive(resource.get("supervision"))
+            artifacts = prepare_route_artifact_env(path, start=True, jobs=jobs)
+            output = Path(artifacts["AGENT_ARTIFACT_OUTPUT_DIR"])
+            runner_command = shlex.join([sys.executable, str(ROOT / "utilities/resource-runner.py"),
+                "--registry", str(output / "resource-runs.json"), "start", "--run-id", route["route_id"],
+                "--cwd", route["cwd"], "--log", str(output / "logs/resume-run.log"),
+                "--route", str(path), "--node", "resume-run", "--jobs", str(jobs), "--"])
+            if resource["state"] == "resource-running" and not supervised:
+                resource = {**resource, "state": "needs-attention", "reason": "resource-watch-unavailable"}
+            return {**result, **resource, "required_action": "start-resource" if resource["state"] == "resource-ready"
+                    else "wait-for-resource" if supervised else "inspect-resource-continuation",
+                    "artifact_env": artifacts, "resource_runner_command": runner_command,
+                    "parent_next": "end-turn" if supervised else "inspect-receipt",
+                    "parent_next_command": "",
+                    "next_step": "Run the already approved payload once through resource-runner start with this "
+                        "route and node resume-run. It owns the shared exit watch and post-run verifier. "
+                        "No payload rerun is authorized by a missing supervisor or exit proof."}
     if route["effective_intensity"] == "direct":
         from artifact_producer import prepare_route_artifact_env
         return {**result, "state": "inline", "required_action": "execute-inline",
@@ -1577,6 +1602,8 @@ def _compose_again(route) -> str:
             "--slug", str(route.get("slug") or route["route_id"]), *named, "--shape", shape,
             "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
             "--prompt-file", str(task), "--start"]
+    if RESOURCE_RESUME.route_selected(route):
+        argv += ["--graph", "resume-run,run-verify"]
     if route.get("campaign_key"):
         argv += ["--campaign-key", route["campaign_key"]]
     elif route.get("parent_cycle_id"):

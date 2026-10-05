@@ -4391,7 +4391,7 @@
     },
     "lab-setup-handoff": {
       "kind": "custom",
-      "doc": "owner records the successor tracked workflow for a finished run — a registered follow-up route/attempt or an explicit human gate; a prose 'evaluate later' note is not completion"
+      "doc": "owner records the successor tracked workflow for a finished run \u2014 a registered follow-up route/attempt or an explicit human gate; a prose 'evaluate later' note is not completion"
     },
     "ship-deploy": {
       "kind": "custom",
@@ -4456,6 +4456,10 @@
     "route-decision": {
       "kind": "custom",
       "doc": "capabilities/route-frame.md: runtime terminal record route_decision_v1, fixed by the runtime after the single frame interview; no model attempt"
+    },
+    "resource-exit": {
+      "kind": "custom",
+      "doc": "Exact detached resource exit sentinel and identity, observed by the shared supervisor."
     }
   },
   "model_profiles": {
@@ -5116,6 +5120,47 @@
             },
             "advance_class": "runtime-eligible",
             "commit_expected": false
+          }
+        }
+      },
+      "autopilot-lab:resume-run": {
+        "summary": "Run one explicitly approved already-verified same-code/config resume, epoch extension or repeat.",
+        "optional": {
+          "modes": [
+            "setup"
+          ],
+          "after": [],
+          "before": [
+            "run-verify"
+          ],
+          "node": {
+            "id": "resume-run",
+            "kind": "resource-runner",
+            "depends_on": [],
+            "role": "orchestrator",
+            "inputs": [
+              "verified-run"
+            ],
+            "outputs": [
+              "run.json",
+              "logs/**",
+              "experiment-artifact"
+            ],
+            "write_scope": [
+              "run.json",
+              "logs/**",
+              "checkpoints/**"
+            ],
+            "resource_class": "long-running",
+            "completion_gate": "resource-exit",
+            "resource_transport": "detached-process",
+            "unit": "_kernel/resource",
+            "continuation": {
+              "kind": "supervised"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false,
+            "resource_policy": "verified-resume"
           }
         }
       }
