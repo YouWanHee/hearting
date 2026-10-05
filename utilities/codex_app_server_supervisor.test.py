@@ -383,7 +383,13 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             turns.append((session,prompt))
             text = "runtime_wait: registered-children" if len(turns)==1 else "artifact: -\nverdict: PASS\nblocker: none"
             return text,{}
-        with mock.patch.object(RESOURCE,"context",return_value=ctx), \
+        owned_payload,owned_watch=mock.Mock(),mock.Mock()
+        owned_payload.poll.side_effect=lambda:events.append("reap-owned-payload")
+        owned_watch.poll.side_effect=lambda:events.append("reap-owned-watch")
+        def context(args,control):
+            args.resource_children={RESOURCE.resource_key(row):(owned_payload,owned_watch)}
+            return ctx
+        with mock.patch.object(RESOURCE,"context",side_effect=context), \
              mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=True), \
              mock.patch.object(module,"run_turn",side_effect=turn), \
              mock.patch.object(module,"reconcile",return_value=True), \
@@ -391,7 +397,9 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
              mock.patch.object(module,"emit"), mock.patch.object(module,"AppServer") as app:
             app.return_value.request.return_value={"thread":{"id":"same-native"}}
             self.assertEqual(module.main(self.command()[2:]+route_args),0)
-        self.assertEqual(events,["model-turn","runtime-poll","model-turn"])
+        self.assertEqual(events,["model-turn","reap-owned-payload","reap-owned-watch","runtime-poll","model-turn"])
+        owned_payload.poll.assert_called_once()
+        owned_watch.poll.assert_called_once()
         self.assertEqual(len(turns),2)
         self.assertEqual(turns[0][0],turns[1][0])
         self.assertIn("Runtime resource receipt",turns[1][1])
@@ -400,6 +408,109 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertNotIn("registration-required",turns[1][1])
         creation = next(c for c in app.return_value.request.call_args_list if c.args[0]=="thread/start")
         self.assertIs(creation.args[1]["ephemeral"],False)
+
+    def test_resource_payload_reuses_selected_native_sandbox_without_global_or_inherit_changes(self):
+        module=load_supervisor_module()
+        args=SimpleNamespace(sandbox="workspace-write",network_access=False,worktree=str(self.base),
+            writable_root=[str(self.base/"output")],native_permission_profile=None)
+        row={"cwd":str(self.base/"payload"),"command":["python3","producer.py","--epochs","1"]}
+        command,selection=module.resource_sandbox_command(args,row)
+        self.assertEqual(command[:2],["codex","sandbox"])
+        self.assertIn("--include-managed-config",command)
+        self.assertEqual(command[command.index("-C")+1],str(self.base))
+        self.assertEqual(command[-6:],["resource-payload",row["cwd"],"python3","producer.py","--epochs","1"])
+        self.assertIn('"extends"=":workspace"',command[5])
+        self.assertIn('"enabled"=false',command[5])
+        self.assertIn(str(self.base/"output"),command[5])
+        self.assertEqual(selection,{"mode":"workspace-write","enforcement":"os-sandbox","network_access":False})
+        self.assertNotIn("--inherit-pid-namespace",command)
+        profile={"default_permissions":"hearting_linked_commit","permissions":{"hearting_linked_commit":{
+            "extends":":workspace","filesystem":{str(self.base/".git/config"):"read"},"network":{"enabled":False}}}}
+        args.native_permission_profile=profile
+        command,_=module.resource_sandbox_command(args,row)
+        self.assertIn('"'+str(self.base/".git/config")+'"="read"',command[5])
+        args.native_permission_profile=None
+        args.sandbox="read-only"
+        command,selection=module.resource_sandbox_command(args,row)
+        self.assertIn('"extends"=":read-only"',command[5])
+        self.assertIn('"filesystem"={}',command[5])
+        self.assertEqual(selection["enforcement"],"os-sandbox")
+        args.sandbox="danger-full-access"
+        command,selection=module.resource_sandbox_command(args,row)
+        self.assertEqual(command[2:4],["-P",":danger-full-access"])
+        self.assertEqual(selection["enforcement"],"none")
+        args.sandbox="unsupported"
+        with self.assertRaisesRegex(module.SupervisorError,"resource-sandbox-selection-unsupported"):
+            module.resource_sandbox_command(args,row)
+
+    def test_controller_intent_correction_scope_claim_and_exact_argv_boundaries(self):
+        import dispatch_resource_wait as RESOURCE
+        import dispatch_owner_input as INPUT
+        runner=RESOURCE.supervisor().runner()
+        args=SimpleNamespace(jobs=str(self.jobs),parent_attempt_id=PARENT,
+            resource_launch_command=lambda row: (["codex","sandbox","--",*row["command"]],{"mode":"workspace-write"}))
+        row={"run_id":"queued","cwd":str(self.base),"log":str(self.base/"output.log"),"route":str(self.base/"route.json"),
+            "jobs":str(self.jobs),"node":"full-run","command":["python3","producer.py"],"parent_attempt_id":PARENT,
+            "resource_policy":"supervised-owner","status":"launching","launch_state":"queued",
+            "owner_wait":{"launch_scope":"codex-owner-controller","owner_pid":os.getpid(),"session_id":"same-native",
+                "owner_start":runner.proc_identity(os.getpid())["starttime"],"parent_attempt_id":PARENT,"jobs":str(self.jobs)},
+            "launch_request":{"smoke_attestation":"/exact-smoke.json","config_manifest":None}}
+        self.jobs.write_text("")
+        registry=self.base/"resource-registry.json"
+        registry.write_text(json.dumps({"schema_version":1,"runs":{"queued":row}}))
+        armed={"resource_registry":str(registry)}
+        control=SimpleNamespace(thread_id="same-native")
+        state={"target":"exact","thread_id":"same-native","requests":[]}
+        import contextlib
+        @contextlib.contextmanager
+        def locked(*_):
+            yield None,state
+        def validate_call(argv,*,controller):
+            self.assertEqual(argv,["--registry",str(registry),"start","--run-id","queued","--cwd",str(self.base),
+                "--log",str(self.base/"output.log"),"--route",str(self.base/"route.json"),"--node","full-run",
+                "--parent-attempt-id",PARENT,"--jobs",str(self.jobs),"--smoke-attestation","/exact-smoke.json",
+                "--","python3","producer.py"])
+            self.assertEqual(controller.expected,row)
+            self.assertEqual(controller.command,["codex","sandbox","--","python3","producer.py"])
+            with controller.guard():
+                pass
+        parent=SimpleNamespace(status="open",metadata={"harness":"codex","pid":str(os.getpid()),"pid_start":row["owner_wait"]["owner_start"]})
+        with mock.patch.object(INPUT,"_locked",side_effect=locked),mock.patch.object(INPUT,"_target",return_value=(parent,"exact")), \
+             mock.patch.object(runner,"main",side_effect=validate_call) as launch:
+            RESOURCE.admit_controller_launch(args,control,armed,row)
+            self.assertEqual(launch.call_count,1)
+            state["requests"]=[{"state":"queued"}]
+            with self.assertRaises(runner.LaunchDeferred):
+                RESOURCE.admit_controller_launch(args,control,armed,row)
+            state["requests"]=[]
+            self.jobs.write_text(child_row())
+            with self.assertRaisesRegex(runner.LaunchDeferred,"resource-model-child-pending"):
+                RESOURCE.admit_controller_launch(args,control,armed,row)
+            self.jobs.write_text(child_row().replace("launch_started=1","launch_started=0"))
+            with self.assertRaisesRegex(runner.LaunchDeferred,"resource-model-child-pending"):
+                RESOURCE.admit_controller_launch(args,control,armed,row)
+            self.jobs.write_text("")
+            parent.metadata["pid_start"]="foreign-start"
+            with self.assertRaisesRegex(RESOURCE.JOIN.JoinContractError,"resource-owner-input-binding-changed"):
+                RESOURCE.admit_controller_launch(args,control,armed,row)
+            parent.metadata["pid_start"]=row["owner_wait"]["owner_start"]
+            state["thread_id"]="foreign"
+            with self.assertRaisesRegex(RESOURCE.JOIN.JoinContractError,"resource-owner-input-binding-changed"):
+                RESOURCE.admit_controller_launch(args,control,armed,row)
+            state["thread_id"]="same-native"
+            with mock.patch.object(RESOURCE.os,"readlink",side_effect=["pid:[host]","pid:[foreign]"]):
+                before=launch.call_count
+                with self.assertRaisesRegex(RESOURCE.JOIN.JoinContractError,"resource-controller-scope-unavailable"):
+                    RESOURCE.admit_controller_launch(args,control,armed,row)
+                self.assertEqual(launch.call_count,before)
+            claimed={**row,"launch_state":"claimed"}
+            registry.write_text(json.dumps({"schema_version":1,"runs":{"queued":claimed}}))
+            before=launch.call_count
+            RESOURCE.admit_controller_launch(args,control,armed,claimed)
+            self.assertEqual(launch.call_count,before)
+            failed=json.loads(registry.read_text())["runs"]["queued"]
+            self.assertEqual(failed["failure_class"],"resource-launch-incomplete")
+            self.assertNotIn("pid",failed)
 
     def test_resource_phase_restart_resumes_exact_native_thread_without_new_start(self):
         module = load_supervisor_module()

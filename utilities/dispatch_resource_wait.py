@@ -4,10 +4,14 @@ The workflow watch records evidence; it does not launch model successors for
 this leg. Delivery lives in the existing private supervisor phase/outbox file.
 """
 from __future__ import annotations
+import contextlib
 import importlib.util
+import io
+import os
 from functools import lru_cache
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import time
 
 import dispatch_completion_join as JOIN
@@ -68,14 +72,25 @@ def start_binding(route, route_file, args, environ):
     args.jobs, args.parent_attempt_id = str(jobs), attempt
     return {"parent_attempt_id": attempt, "session_id": session, "route_id": route["route_id"],
         "route_hash": route["route_hash"], "jobs": str(jobs),
-        "owner_pid": parent.pid, "owner_start": parent.pid_start}
+        "owner_pid": parent.pid, "owner_start": parent.pid_start,
+        **({"launch_scope": "codex-owner-controller"} if row.metadata.get("harness") == "codex" else {})}
 
 
 def resource_body_digest(row):
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
             "resource_policy", "owner_wait")
-    return RESUME.row_digest({key: row.get(key) for key in keys})
+    body = {key: row.get(key) for key in keys}
+    if "launch_request" in row:
+        body["launch_request"] = row["launch_request"]
+    return RESUME.row_digest(body)
+
+
+def controller_intent(row):
+    return ((row.get("owner_wait") or {}).get("launch_scope") == "codex-owner-controller"
+            and row.get("launch_state") in {"queued", "claimed"}
+            and row.get("resource_policy") == "supervised-owner"
+            and isinstance(row.get("launch_request"), dict))
 
 
 def resource_key(row):
@@ -125,7 +140,10 @@ def context(args, control):
                 or row.get("parent_attempt_id") != args.parent_attempt_id
                 or row.get("route") != binding.route_file or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")
-                or type(row.get("pid")) is not int or row["pid"] <= 0 or not row.get("starttime")
+                or not (controller_intent(row) or
+                        (type(row.get("pid")) is int and row["pid"] > 0 and row.get("starttime")))
+                or (row.get("pid_namespace") is not None and
+                    row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
                 or armed.get("route_id") != args.route_id or armed.get("route_hash") != args.route_hash
                 or armed.get("route_file") != binding.route_file or armed.get("jobs") != str(jobs)
                 or armed.get("resource_binding") != resource_body_digest(row)
@@ -133,6 +151,73 @@ def context(args, control):
             raise JOIN.JoinContractError("resource-owner-binding-invalid")
         result.append((armed, row))
     return sup, route, ledger, result
+
+
+def model_legs_pending(args, delivered):
+    rows = JOIN.current_children(Path(args.jobs), args.parent_attempt_id,
+        route_id=getattr(args, "route_id", None), route_hash=getattr(args, "route_hash", None))
+    candidates = {row.attempt_id for row in rows}.difference(delivered)
+    partition = JOIN.partition_runtime_wait_children(Path(args.jobs), args.parent_attempt_id, rows, candidates)
+    return bool(partition.joinable or partition.unstarted or partition.chain_pending)
+
+
+def admit_controller_launch(args, control, armed, row, delivered=()):
+    """The existing leased controller, not the native tool, owns the real launch."""
+    if not controller_intent(row) or row.get("status") != "launching":
+        return
+    from resource_run_registry import proc_identity
+    runner = supervisor().runner()
+    command_builder = getattr(args, "resource_launch_command", None)
+    owner = row["owner_wait"]
+    identity = proc_identity(os.getpid())
+    try:
+        namespace = os.readlink("/proc/self/ns/pid")
+        same_scope = namespace == os.readlink(f'/proc/{owner["owner_pid"]}/ns/pid')
+    except (OSError, KeyError):
+        same_scope = False
+    if command_builder is None or not identity or not same_scope:
+        raise JOIN.JoinContractError("resource-controller-scope-unavailable")
+    identity["pid_namespace"] = namespace
+    import dispatch_owner_input as INPUT
+    @contextlib.contextmanager
+    def guard():
+        with INPUT._locked(args.jobs, args.parent_attempt_id) as (_, value):
+            parent, target = INPUT._target(args.jobs, args.parent_attempt_id)
+            live = proc_identity(owner["owner_pid"])
+            if (value is None or value.get("target") != target or
+                    value.get("thread_id") != control.thread_id or parent.status not in {"open", "running"}
+                    or parent.metadata.get("harness") != "codex"
+                    or parent.metadata.get("pid") != str(owner["owner_pid"])
+                    or parent.metadata.get("pid_start") != owner.get("owner_start")
+                    or not live or live["starttime"] != owner.get("owner_start")):
+                raise JOIN.JoinContractError("resource-owner-input-binding-changed")
+            if (args.parent_attempt_id != owner.get("parent_attempt_id") or
+                    str(Path(args.jobs).resolve()) != owner.get("jobs")):
+                raise JOIN.JoinContractError("resource-owner-input-binding-changed")
+            if any(item.get("state") == "queued" for item in value["requests"]):
+                raise runner.LaunchDeferred("resource-owner-correction-pending")
+            if model_legs_pending(args, delivered):
+                raise runner.LaunchDeferred("resource-model-child-pending")
+            yield
+    if row["launch_state"] == "claimed":
+        # A crash after claim is not a known-never-started request. The private
+        # fence prevents payload release, but observation never authorizes retry.
+        failed = {**row, "status": "failed", "workflow_state": "FAILED_RETRYABLE",
+                  "failure_class": "resource-launch-incomplete"}
+        runner.publish_verified_run(armed["resource_registry"], row["run_id"], row, failed)
+        return
+    command, sandbox = command_builder(row)
+    controller = SimpleNamespace(expected=row, identity=identity, command=command,
+                                 sandbox=sandbox, guard=guard)
+    # Tool receipts stay in the native tool response; the outer stream contains
+    # only its existing typed controller events, not a second raw CLI receipt.
+    with contextlib.redirect_stdout(io.StringIO()):
+        runner.main(runner.controller_argv(armed["resource_registry"], row), controller=controller)
+    if hasattr(controller, "children"):
+        owned = getattr(args, "resource_children", None)
+        if owned is None:
+            args.resource_children = owned = {}
+        owned[resource_key(controller.row)] = controller.children
 
 
 def _write(path, parent, delivered, resource, phase):
@@ -184,7 +269,7 @@ def acknowledge(path, parent, receipt_id):
 
 
 def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
-    """No model calls, continuation spend, replacement or payload launch in this loop."""
+    """Admit queued owner intent once, then wait outside model turns/budgets."""
     pending = pending_prompt(path, args.parent_attempt_id, args, control)
     if pending:
         return pending
@@ -192,6 +277,23 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
     if found is None:
         return None
     sup, route, ledger, candidates = found
+    if control.pending():
+        return "Continue the same work using the pending user correction; preserve the resource request."
+    for armed, row in candidates:
+        if controller_intent(row) and row.get("status") == "launching":
+            try:
+                admit_controller_launch(args, control, armed, row, delivered)
+            except sup.runner().LaunchDeferred as error:
+                if str(error) == "resource-model-child-pending":
+                    return None
+                return "Continue the same work using the pending user correction; preserve the resource request."
+            found = context(args, control)
+            sup, route, ledger, candidates = found
+            actual = next((r for _, r in candidates if r["run_id"] == row["run_id"]), None)
+            emit({"type": "dispatch.supervisor.resource-admitted", "node": armed["node"],
+                  "run_id": row["run_id"], "payload_spawned": bool(actual and actual.get("launch_state") == "started"),
+                  "verification_pass": False, "workflow_complete": False})
+            break
     state = JOIN.read_supervisor_phase_state(path, args.parent_attempt_id)
     resource = dict(state.resource or {}) if state else {}
     if resource and resource["session_id"] != control.thread_id:
@@ -221,6 +323,8 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
         # record/claim evidence, but cannot spawn the owner's next model leg.
         if control.pending():
             continue
+        for child in getattr(args, "resource_children", {}).get(key, ()):
+            child.poll()  # Only actual unreaped Popen children, never rediscovered PIDs.
         sup.poll_once(route, ledger)
         evidence = sup.resource_evidence(armed)
         stage = ledger.state().get("nodes", {}).get(armed["node"], {})

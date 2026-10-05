@@ -63,6 +63,12 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
         pid = int(run["pid"])
     except (TypeError, ValueError):
         return "stale", None, "recorded-pid-invalid"
+    if run.get("pid_namespace") is not None:
+        try:
+            if run["pid_namespace"] != os.readlink("/proc/self/ns/pid"):
+                return "stale", None, "process-namespace-mismatch"
+        except OSError:
+            return "stale", None, "process-namespace-unreadable"
     current = identity_reader(pid)
     if current is None:
         if Path(f"/proc/{pid}").exists():

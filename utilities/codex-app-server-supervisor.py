@@ -697,6 +697,32 @@ def sandbox_policy(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def resource_sandbox_command(args, row):
+    """Apply this owner's selected native policy; no tool namespace inheritance."""
+    from codex_permission_profile import PROFILE_NAME
+    if args.sandbox == "danger-full-access":
+        options = ["-P", ":danger-full-access"]
+        enforcement = "none"
+    elif args.sandbox in {"workspace-write", "read-only"}:
+        profile = getattr(args, "native_permission_profile", None)
+        if profile is None:
+            profile = {"default_permissions": PROFILE_NAME, "permissions": {PROFILE_NAME: {
+                "extends": ":workspace" if args.sandbox == "workspace-write" else ":read-only",
+                "filesystem": ({str(Path(root).resolve()): "write"
+                    for root in [args.worktree, *args.writable_root]} if args.sandbox == "workspace-write" else {}),
+                "network": {"enabled": bool(args.network_access)},
+            }}}
+        options = [*config_arguments(profile), "-P", PROFILE_NAME]
+        enforcement = "os-sandbox"
+    else:
+        raise SupervisorError("resource-sandbox-selection-unsupported")
+    command = ["codex", "sandbox", *options, "--include-managed-config", "-C", args.worktree,
+               "--", "/bin/sh", "-c", 'cd -- "$1" || exit; shift; exec "$@"',
+               "resource-payload", row["cwd"], *row["command"]]
+    return command, {"mode": args.sandbox, "enforcement": enforcement,
+                     "network_access": bool(args.network_access)}
+
+
 def run_turn(
     server: AppServer,
     *,
@@ -1086,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
         args.worktree, args.writable_root, args.sandbox, args.network_access,
         primary_commit=args.primary_git_commit,
     )
+    args.resource_launch_command = lambda row: resource_sandbox_command(args, row)
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)
     state_path = Path(args.state_file) if args.state_file else None
