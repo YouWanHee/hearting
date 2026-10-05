@@ -298,6 +298,8 @@ class ReleasedTaskPromptTest(unittest.TestCase):
                 before = self.ledger.journal_path.read_bytes()
                 context = WB.released_task_prompt(self.args())
                 self.assertIn("actor_kind: " + (kind or "unknown"), context)
+                self.assertIn("The recorded scope and decisions below govern this work.", context)
+                self.assertNotIn("The recorded user scope", context)
                 self.assertEqual(self.ledger.journal_path.read_bytes(), before)
                 self.assertNotIn("actor_kind", legacy)
                 if kind != "user":

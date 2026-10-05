@@ -423,7 +423,7 @@ def released_task_prompt(args) -> str:
         ) from exc
     return (
         "Released task context (frame-review):\n"
-        "The recorded user scope and decisions below govern this work. Apply the "
+        "The recorded scope and decisions below govern this work. Apply the "
         "assigned stage within that scope; role defaults do not expand it. Cite "
         "applicable decision ids in the output.\n\n"
         f"{intent}\n"
