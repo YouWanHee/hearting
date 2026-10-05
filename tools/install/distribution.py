@@ -2672,6 +2672,12 @@ def _route_record_launch_home(
         return _UNDECIDABLE
     if not isinstance(raw, dict):
         return _UNDECIDABLE
+    cache = registry_cache if registry_cache is not None else {}
+    environ = environ if environ is not None else os.environ
+    # A parsed inline record is trustworthy enough to answer from even when it
+    # predates the launch tuple; see `_inline_route_released`.
+    if _inline_route_released(path.stem, raw, cache, environ):
+        return None
     launch_home = (raw.get("launch_compatibility_tuple") or {}).get("launch_home")
     value = launch_home.get("path") if isinstance(launch_home, dict) else None
     if not isinstance(value, str) or not value:
@@ -2679,13 +2685,54 @@ def _route_record_launch_home(
     # Checked only after the record parses and names a launch_home: an
     # undecidable record must stay undecidable, never be released by a
     # terminality answer derived from a body we could not trust.
-    if _route_attempts_finished(
-        path.stem, raw,
-        registry_cache if registry_cache is not None else {},
-        environ if environ is not None else os.environ,
-    ) is True:
+    if _route_attempts_finished(path.stem, raw, cache, environ) is True:
         return None
     return value
+
+
+def _inline_route_released(route_id: str, raw: dict, cache: dict, environ: dict) -> bool:
+    """Does an unclosed inline route stop pinning its release?
+
+    An inline route (topology `inline`, every node at dispatch depth 0) is run
+    by the interactive session itself and never writes a registry attempt, so
+    "no rows" cannot mean "compiled but not yet launched" the way it does for
+    an owner route (`_route_attempts_finished`). While that session lives,
+    `_release_held_by_live_process` already holds the release it runs from;
+    after it ends nothing resumes from the recorded launch home, and nobody
+    closes a direct route once its work is done. Measured 2026-10-05 on one
+    machine: 24 of the 35 unclosed routes pinning releases were inline with no
+    rows, and one inline record from before the launch tuple had no
+    `launch_home` at all, which made the whole scan undecidable and kept every
+    release.
+
+    Still pinned: a body whose `route_id` disagrees with the file name, any
+    node above depth 0, a registry row that shows the route live, or a
+    registry too malformed to tell.
+    """
+
+    if raw.get("execution_topology") != "inline" or raw.get("owner_dispatch_depth") != 0:
+        return False
+    body_id = raw.get("route_id")
+    if isinstance(body_id, str) and body_id and body_id != route_id:
+        return False
+    nodes = raw.get("nodes")
+    if isinstance(nodes, list) and any(
+        not isinstance(node, dict) or node.get("dispatch_depth", 0) != 0 for node in nodes
+    ):
+        return False
+    registries = _veto_registry_paths(environ)
+    tuple_ = raw.get("launch_compatibility_tuple")
+    jobs = (tuple_ or {}).get("jobs_path") if isinstance(tuple_, dict) else None
+    sealed = jobs.get("path") if isinstance(jobs, dict) else None
+    if isinstance(sealed, str) and sealed:
+        registries.append(sealed)
+    for registry in registries:
+        index = _read_route_registry_index(registry, cache)
+        if index is None:
+            continue
+        if index["malformed"] or route_id in index["live"]:
+            return False
+    return True
 
 
 # `capability-route.py` names every route record exactly `{route_id}.json`, and
