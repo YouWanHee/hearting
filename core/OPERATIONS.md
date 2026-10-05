@@ -1065,7 +1065,9 @@ is the only record of them (SD-122 §13.37.2-(1)). Six invariants govern the rol
 Starting a peer honors the requested project in the launched runtime: Codex receives
 `--cd`, interactive OpenCode receives its positional project, and Claude changes the
 idle pane shell's cwd before the agent starts. Any cwd or PATH bootstrap waits for an
-observed shell prompt within the existing bound. Unknown, occupied, form, and native
+observed final visible shell prompt, including Powerline, within the existing bound
+(seconds converted to native milliseconds). Readiness includes the native foreground
+shell; past screen prompts are not readiness. Unknown, busy, occupied, form, and native
 trust screens receive no typed input; native trust remains a human decision and is
 reported as a wait reason, separate from whether the process was started.
 

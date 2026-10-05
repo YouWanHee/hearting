@@ -394,24 +394,53 @@ def _pane_has_agent(pane):
         payload = json.loads(proc.stdout or "")
     except Exception:
         return "pane-unknown"  # unreadable pane: type nothing
-    block = (payload.get("result") or {}).get("pane") if isinstance(payload, dict) else None
-    if not isinstance(block, dict):
+    result = payload.get("result") if isinstance(payload, dict) else None
+    block = result.get("pane") if isinstance(result, dict) else None
+    if (proc.returncode != 0 or not isinstance(payload, dict) or payload.get("error")
+            or not isinstance(block, dict)):
         return "pane-unknown"
     return "pane-occupied" if block.get("agent") else None
 
 
 def _wait_for_shell_prompt(pane, timeout_ms=None):
     """Observe an idle shell prompt before sending cwd/PATH bootstrap text."""
-    timeout_ms = int(timeout_ms or _herdr_get_timeout())
+    timeout_ms = int(_herdr_get_timeout() * 1000 if timeout_ms is None else timeout_ms)
     try:
         proc = subprocess.run(
-            ["herdr", "pane", "wait-output", "--regex",
-             r"(?m)(?:^|[ ])(?:[$#%❯])\s*$", pane,
+            ["herdr", "pane", "wait-output", pane, "--regex",
+             r"(?m)(?:^|[ ])(?:[$#%❯])\s*(?-m:$)",
              "--source", "visible", "--timeout", str(timeout_ms)],
             capture_output=True, text=True, timeout=max(1, timeout_ms / 1000 + 1))
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0
+
+
+def _pane_foreground_shell(pane):
+    """Observe the actual shell, not an old prompt left by a foreground job."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+        result = payload.get("result") if isinstance(payload, dict) else None
+        info = result.get("process_info") if isinstance(result, dict) else None
+        if (proc.returncode != 0 or not isinstance(payload, dict) or payload.get("error")
+                or not isinstance(info, dict) or info.get("pane_id") != pane):
+            return "pane-unknown"
+        shell = info.get("shell_pid")
+        group = info.get("foreground_process_group_id")
+        processes = info.get("foreground_processes")
+        if (type(shell) is not int or shell <= 0 or type(group) is not int or group <= 0
+                or not isinstance(processes, list)):
+            return "pane-unknown"
+        if group != shell:
+            return "pane-busy"
+        if not processes or any(not isinstance(item, dict) or type(item.get("pid")) is not int
+                                or item["pid"] <= 0 for item in processes):
+            return "pane-unknown"
+        return None if all(item["pid"] == shell for item in processes) else "pane-busy"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "pane-unknown"
 
 
 def _ensure_pane_ingress(pane, kind, cwd=None):
@@ -429,6 +458,11 @@ def _ensure_pane_ingress(pane, kind, cwd=None):
         return pane_state
     if not _wait_for_shell_prompt(pane):
         return _native_trust_reason(kind, _read_screen(pane)) or "shell-readiness-timeout"
+    # The wait searches existing screen output too. Recheck occupancy and the native
+    # foreground identity after it, before typing into what may now be a job or form.
+    pane_state = _pane_has_agent(pane) or _pane_foreground_shell(pane)
+    if pane_state:
+        return _native_trust_reason(kind, _read_screen(pane)) or pane_state
     commands = []
     if bootstrap_cwd:
         commands.append("cd -- %s" % shlex.quote(bootstrap_cwd))

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -72,6 +73,15 @@ def _herdr_json(payload):
     if isinstance(payload, dict) and "error" in payload:
         return subprocess.CompletedProcess(["herdr"], 1, stdout="", stderr=json.dumps(payload))
     return subprocess.CompletedProcess(["herdr"], 0, stdout=json.dumps(payload), stderr="")
+
+
+def _idle_shell_run(argv, **kwargs):
+    if argv[:3] == ["herdr", "pane", "process-info"]:
+        return _herdr_json({"result": {"process_info": {
+            "pane_id": "w1:pM", "shell_pid": 101, "foreground_process_group_id": 101,
+            "foreground_processes": [{"pid": 101, "argv": ["zsh"]}],
+        }}})
+    return _herdr_json({"result": {"pane": {}}})
 
 
 class WaitTest(_TmpRootMixin, unittest.TestCase):
@@ -297,7 +307,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         bindir = self._ingress()
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json({"result": {"pane": {}}})) as run_mock:
+                                side_effect=_idle_shell_run) as run_mock:
             peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
         argvs = [c[0][0] for c in run_mock.call_args_list]
         sends = [a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]]
@@ -323,7 +333,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         # Claude and OpenCode have no launcher wrapper; there is no PATH to fix.
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json({"result": {"pane": {}}})) as run_mock:
+                                side_effect=_idle_shell_run) as run_mock:
             peer_steward.main(["start", "peer-c", "--kind", "claude", "--pane", "w1:pM"])
         argvs = [c[0][0] for c in run_mock.call_args_list]
         self.assertEqual([a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]], [])
@@ -340,7 +350,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self._ingress()
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json({"result": {"pane": {}}})), \
+                                side_effect=_idle_shell_run), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -353,7 +363,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self._ingress()
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json({"result": {"pane": {}}})), \
+                                side_effect=_idle_shell_run), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=True):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -406,8 +416,12 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
             if argv[:3] == ["herdr", "pane", "get"]:
                 return _herdr_json({"result": {"pane": {}}})
             if argv[:3] == ["herdr", "pane", "wait-output"]:
-                time.sleep(0.01)  # delayed shell prompt is observed before bootstrap
+                self.assertEqual(argv[argv.index("--timeout") + 1], "15000")
+                self.assertEqual(kwargs["timeout"], 16)
+                time.sleep(0.025)  # later than the old erroneous 15 ms budget
                 return _herdr_json({"result": {"pane": {}}})
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                return _idle_shell_run(argv, **kwargs)
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
@@ -421,6 +435,111 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         ready = next(argv for argv in argvs if argv[:3] == ["herdr", "pane", "wait-output"])
         self.assertLess(argvs.index(ready), argvs.index(send))
         self.assertLess(argvs.index(send), argvs.index(_agent_start_cmd(run_mock)))
+
+    def test_shell_prompt_glyphs_and_past_prompt_are_distinct(self):
+        screens = [
+            (" Uihyeop@moving4  /home/nas/user/Uihyeop/NN_Zoo/BC_ResNet  ↱ main ± ", True),
+            ("host ~/project $ ", True), ("#\n\n", True), ("% ", True), ("❯ ", True),
+            ("host $\nrunning command\n", False),
+            ("host \nDownloading 42%\n", False),
+            ("host $ echo hi", False),
+            ("host $\nTrust this folder?\n1. Yes\n2. No", False),
+        ]
+        for screen, expected in screens:
+            with self.subTest(screen=screen):
+                def wait(argv, **kwargs):
+                    self.assertEqual(argv[:5], ["herdr", "pane", "wait-output", "w1:pM", "--regex"])
+                    matched = re.search(argv[5], screen) is not None
+                    return subprocess.CompletedProcess(argv, 0 if matched else 1, "", "")
+                with mock.patch.object(peer_steward.subprocess, "run", side_effect=wait):
+                    self.assertEqual(peer_steward._wait_for_shell_prompt("w1:pM"), expected)
+
+    def test_shell_wait_keeps_explicit_milliseconds_and_default_seconds(self):
+        for milliseconds, expected_ms, expected_seconds in [(None, "15000", 16), (2750, "2750", 3.75), (0, "0", 1)]:
+            with self.subTest(milliseconds=milliseconds), \
+                 mock.patch.object(peer_steward, "_herdr_get_timeout", return_value=15), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                self.assertTrue(peer_steward._wait_for_shell_prompt("w1:pM", milliseconds))
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[argv.index("--timeout") + 1], expected_ms)
+                self.assertEqual(run.call_args.kwargs["timeout"], expected_seconds)
+
+    def test_old_prompt_busy_form_and_trust_receive_no_bootstrap_or_start(self):
+        for screen, reason in [
+            ("host $\ncommand still running", "pane-busy"),
+            ("host \nSelect an option\n1. Continue\n2. Cancel", "pane-busy"),
+            ("host $\nDo you trust the contents of this folder?", "native-trust-wait"),
+        ]:
+            with self.subTest(screen=screen):
+                calls = []
+                def busy(argv, **kwargs):
+                    calls.append(argv)
+                    if argv[:3] == ["herdr", "pane", "process-info"]:
+                        return _herdr_json({"result": {"process_info": {
+                            "pane_id": "w1:pM", "shell_pid": 101,
+                            "foreground_process_group_id": 202,
+                            "foreground_processes": [{"pid": 202, "argv": ["busy"]}],
+                        }}})
+                    if argv[:3] == ["herdr", "agent", "read"]:
+                        return subprocess.CompletedProcess(argv, 0, screen, "")
+                    # Even a stale successful wait receipt must not authorize input.
+                    return _herdr_json({"result": {"pane": {}}})
+                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=busy), \
+                     mock.patch("builtins.print") as output:
+                    rc = peer_steward.main(["start", "peer-c", "--kind", "claude", "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+                self.assertEqual(rc, 1)
+                self.assertIn("reason=" + reason, output.call_args.args[0])
+                self.assertFalse(any(a[:3] in (["herdr", "pane", "send-text"], ["herdr", "pane", "send-keys"], ["herdr", "agent", "start"]) for a in calls))
+
+    def test_occupancy_changed_during_wait_does_not_receive_bootstrap(self):
+        gets = 0
+        calls = []
+        def changed(argv, **kwargs):
+            nonlocal gets
+            calls.append(argv)
+            if argv[:3] == ["herdr", "pane", "get"]:
+                gets += 1
+                return _herdr_json({"result": {"pane": {} if gets == 1 else {"agent": "claude"}}})
+            return _idle_shell_run(argv, **kwargs)
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=changed):
+            self.assertEqual(peer_steward._ensure_pane_ingress("w1:pM", "claude", str(self.tmp_root)), "pane-occupied")
+        self.assertEqual(gets, 2)
+        self.assertFalse(any(a[:3] in (["herdr", "pane", "send-text"], ["herdr", "pane", "send-keys"]) for a in calls))
+
+    def test_unreadable_or_error_pane_never_reaches_wait_or_input(self):
+        payloads = [[], {"result": "invalid"}, {"result": {"pane": None}},
+                    {"error": {"code": "unavailable"}, "result": {"pane": {}}}]
+        for payload in payloads:
+            with self.subTest(payload=payload), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json(payload)) as run:
+                self.assertEqual(peer_steward._ensure_pane_ingress("w1:pM", "claude", str(self.tmp_root)), "pane-unknown")
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_args.args[0][:3], ["herdr", "pane", "get"])
+
+    def test_unknown_or_foreign_foreground_receives_no_bootstrap(self):
+        infos = [None, {},
+            {"pane_id": "w1:pOther", "shell_pid": 101, "foreground_process_group_id": 101, "foreground_processes": [{"pid": 101}]},
+            {"pane_id": "w1:pM", "shell_pid": 101, "foreground_process_group_id": None, "foreground_processes": []},
+            {"pane_id": "w1:pM", "shell_pid": True, "foreground_process_group_id": 101, "foreground_processes": [{"pid": 101}]},
+            {"pane_id": "w1:pM", "shell_pid": 101, "foreground_process_group_id": 101, "foreground_processes": []},
+            {"pane_id": "w1:pM", "shell_pid": 101, "foreground_process_group_id": 101, "foreground_processes": [{"pid": False}]},
+        ]
+        for info in infos:
+            with self.subTest(info=info):
+                calls = []
+                def unknown(argv, **kwargs):
+                    calls.append(argv)
+                    if argv[:3] == ["herdr", "pane", "process-info"]:
+                        return _herdr_json({"result": {"process_info": info}})
+                    return _herdr_json({"result": {"pane": {}}})
+                with mock.patch.object(peer_steward.subprocess, "run", side_effect=unknown):
+                    self.assertEqual(peer_steward._ensure_pane_ingress("w1:pM", "claude", str(self.tmp_root)), "pane-unknown")
+                self.assertFalse(any(a[:3] in (["herdr", "pane", "send-text"], ["herdr", "pane", "send-keys"]) for a in calls))
+        for failure in (OSError("unavailable"), subprocess.TimeoutExpired(["herdr"], 5)):
+            with self.subTest(failure=type(failure).__name__), \
+                 mock.patch.object(peer_steward.subprocess, "run", side_effect=failure):
+                self.assertEqual(peer_steward._pane_foreground_shell("w1:pM"), "pane-unknown")
 
     def test_opencode_uses_the_interactive_positional_project_argument(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
@@ -438,7 +557,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         calls = []
         def fake_run(argv, **kwargs):
             calls.append(list(argv))
-            if argv[:4] == ["herdr", "pane", "wait-output", "--regex"]:
+            if argv[:3] == ["herdr", "pane", "wait-output"]:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="timeout")
             return _herdr_json({"result": {"pane": {}}})
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
