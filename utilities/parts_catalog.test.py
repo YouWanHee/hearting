@@ -599,7 +599,8 @@ class StagesTest(unittest.TestCase):
             "autopilot-lab:diagnose", "autopilot-lab:full-run", "autopilot-lab:smoke",
             "autopilot-research:retrieval", "autopilot-research:synthesis"])
         self.assertEqual(sorted(part for part, node in parts.items() if node["optional"]), [
-            "autopilot-lab:diagnose", "autopilot-lab:eval-smoke", "autopilot-lab:eval-spec"])
+            "autopilot-lab:diagnose", "autopilot-lab:eval-smoke", "autopilot-lab:eval-spec",
+            "autopilot-lab:resume-run"])
         self.assertFalse(parts["autopilot-code:execute"]["shareable"])
         self.assertEqual(parts["autopilot-lab:metrics"]["unit_choices"], ["material/data-script", "qa/ml-debug"])
         self.assertEqual(parts["audit:report"]["unit_choices"], ["editorial/polish", "research/research-survey"])

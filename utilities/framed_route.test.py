@@ -46,7 +46,8 @@ NODE_IDS = FRAME_IDS + ["route-decision"]
 # recipe). They are literals, not a comparison with HEAD, so they mean the same in CI and after any
 # commit. Report-format bootstrap intentionally refreshes only the four reader-facing recipes
 # and their capability digests. Entry approvals refresh only refine's preview approval mark,
-# review output, and the corresponding catalog/recipe digests; gate contracts stay unchanged.
+# review output, and the corresponding catalog/recipe digests. Verified resume refreshes only
+# the optional resume-run catalog and dedicated resource-exit gate contract digests.
 # Each global table is hashed as sha256 of its JSON (sorted keys, compact separators).
 FROZEN_GLOBAL_TABLE_DIGESTS = {
     "schema_version": "4a44dc15364204a80fe80e9039455cc1608281820fe2b24f1e5233ade6af1dd5",
@@ -85,9 +86,9 @@ FROZEN_GLOBAL_TABLE_DIGESTS = {
     "human_gate_positions": "fc45768a57481792e0643d4bec1faae15743411bc06096fdb1740f632f0707b0",
     "artifact_buckets": "ccbd32ef24b84897147e3d1a0862a824d9c6f893a12aed07f53c9f77724cb835",
     "producer_lifecycle": "a9f26a373d2e3af19f55be8c37b8cd0126f30165cdfa0407ef0242aa7c2f9816",
-    "part_catalog": "140a47c84be0fd96a60a52747010a06e7dded5fcb77725a22ca450fdb233ce23",
+    "part_catalog": "4a90cec3f0df00c09bb16f4c4e44f1f2f7372f88f75bde6b8c84f51cb2ba4a03",
 }
-FROZEN_GATE_CONTRACT_DIGEST = "53db72bbbcb6228d395819d147eb3a12eeba17161dbc06fe63cefa9389f469fb"
+FROZEN_GATE_CONTRACT_DIGEST = "4b243bd3f897ea98d1ba93283f8297c10c88155c2c2ee80146322023902adb58"
 FROZEN_RECIPE_COUNT = 14
 FROZEN_RECIPES_DIGEST = "be19089591319912719893b9d2a2f14aca38f900a76b54bfb1c310b060dcf674"
 FROZEN_CAPABILITY_REGISTRY_DIGESTS = {
@@ -407,7 +408,7 @@ class RegistryRegistrationTest(unittest.TestCase):
                 self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
                 recipe["promotion_signals"].remove("gpu")
         self.assertEqual(_frozen_digest(recipes), FROZEN_RECIPES_DIGEST)
-        # The route-frame rows are the only additions to the gate contract table.
+        # The frozen digest includes resource-exit; only route-frame rows are projected out.
         rest = {k: v for k, v in after["completion_gate_contracts"].items() if k not in ("route-frame", "route-decision")}
         self.assertEqual(_frozen_digest(rest), FROZEN_GATE_CONTRACT_DIGEST)
 
