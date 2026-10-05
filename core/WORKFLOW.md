@@ -814,8 +814,9 @@ watch is ready before the once-only payload release. The owner yields the model
 turn with `runtime_wait: registered-children`; the existing controller waits for
 the exact resource outside that turn and resumes the same native owner from a
 bounded receipt. Resource receipts are separate from registered model children.
-The watch preserves evidence; the owner admits its next work after pending user
-corrections. Exit alone is neither verification PASS nor workflow completion.
+After pending user corrections, the watch writes the resource completion marker
+from the original producer artifact before recording stage success and claiming
+next work. Exit and this marker are neither verification PASS nor workflow completion.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
