@@ -729,7 +729,19 @@ def scoped_external_directory_config(
     else:
         permission = dict(permission)
 
-    external = permission.get("external_directory")
+    def effective_tool(subject, tool, default=None):
+        # fromConfig preserves outer property order, and native findLast lets
+        # a later '*' override every earlier tool/path rule. Materialize that
+        # effective original rule before moving this narrow overlay last.
+        value = default
+        for key, candidate in subject.items():
+            if key in ("*", tool):
+                value = candidate
+        return value
+
+    original_permission = dict(permission)
+    external = (effective_tool(original_permission, "external_directory")
+                if agent_home is not None else permission.get("external_directory"))
     if external is None:
         # SD-15/1(b): headless has no human to answer an "ask" prompt, so the
         # runtime auto-rejects it -- and that auto-reject truncates the
@@ -761,9 +773,11 @@ def scoped_external_directory_config(
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
             rules[pattern] = "allow"
+    if contract_roots:
+        permission.pop("external_directory", None)
     permission["external_directory"] = rules
     if contract_roots:
-        edit = permission.get("edit", permission.get("*", "allow"))
+        edit = effective_tool(original_permission, "edit", "allow")
         if isinstance(edit, str):
             edit_rules = {"*": edit}
         elif isinstance(edit, dict):
@@ -780,6 +794,7 @@ def scoped_external_directory_config(
                             for pattern in (directory, f"{directory}/**")):
                 edit_rules.pop(pattern, None)
                 edit_rules[pattern] = "deny"
+        permission.pop("edit", None)
         permission["edit"] = edit_rules
     config["permission"] = permission
     if contract_roots and selected_agent:
@@ -800,8 +815,9 @@ def scoped_external_directory_config(
             local = dict(local)
         else:
             raise ValueError("OpenCode agent permission must be a string or object")
+        original_local = dict(local)
         for tool, action in (("external_directory", "allow"), ("edit", "deny")):
-            old = local.get(tool, local.get("*"))
+            old = effective_tool(original_local, tool)
             if old is None:
                 overlay = {}
             elif isinstance(old, str):
@@ -818,6 +834,7 @@ def scoped_external_directory_config(
                     for pattern in (directory, f"{directory}/**"):
                         overlay.pop(pattern, None)
                         overlay[pattern] = action
+            local.pop(tool, None)
             local[tool] = overlay
         selected["permission"] = local
         agents[selected_agent] = selected

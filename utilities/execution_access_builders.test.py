@@ -386,6 +386,31 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
                 selected_agent="build",
             ))
         self.assertNotIn("*", inherited["agent"]["build"]["permission"]["edit"])
+        # Fixed original-order counterexamples: a later outer wildcard wins
+        # outside capabilities, while the narrow new exception always wins there.
+        for original, expected_edit, expected_external in (
+            ({"edit": "allow", "*": "allow"}, "allow", "allow"),
+            ({"external_directory": "deny", "*": "deny"}, "deny", "deny"),
+            ({"edit": "deny", "*": "allow"}, "allow", "allow"),
+            ({"external_directory": "allow", "*": "deny"}, "deny", "deny"),
+            ({"*": "allow", "edit": "deny"}, "deny", "allow"),
+            ({"*": "deny", "external_directory": "allow"}, "deny", "allow"),
+        ):
+            before = {"permission": original,
+                      "agent": {"build": {"permission": original}}}
+            with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(before)}):
+                after = json.loads(self.opencode.scoped_external_directory_config(
+                    str(self.artifact), agent_home=alias, worktree=str(self.worktree),
+                    selected_agent="build",
+                ))
+            for permission in (after["permission"], after["agent"]["build"]["permission"]):
+                keys = list(permission)
+                self.assertGreater(keys.index("edit"), keys.index("*"))
+                self.assertGreater(keys.index("external_directory"), keys.index("*"))
+                self.assertEqual(expected_edit, permission["edit"]["*"])
+                self.assertEqual(expected_external, permission["external_directory"]["*"])
+                self.assertEqual("deny", permission["edit"][f"{alias / 'capabilities'}/**"])
+                self.assertEqual("allow", permission["external_directory"][f"{alias / 'capabilities'}/**"])
         self.assertEqual("tool-permission", grant.file_enforcement)
         self.assertEqual("none", grant.network_enforcement)
 
