@@ -330,6 +330,25 @@ class TestStateMachine(WorkflowFixture):
 # B. supervisor advance semantics
 # ---------------------------------------------------------------------------
 class TestSupervisorAdvance(WorkflowFixture):
+    def test_legacy_launching_without_identity_or_sentinel_settles_failure(self):
+        route, path = self.two_stage_route()
+        registry = self.resource_registry(exit_code=None, sentinel=False, status="launching")
+        data = json.loads(registry.read_text())
+        for key in ("pid", "starttime", "command_hash"):
+            data["runs"]["fixture-run"].pop(key)
+        registry.write_text(json.dumps(data))
+        self.arm(path, registry)
+        ledger = SUP.ledger_for(route)
+        with mock.patch.object(SUP, "_start_successor") as launch:
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "halt-failed")
+        self.assertTrue(result[0]["evidence"]["terminal"])
+        self.assertFalse(result[0]["evidence"]["succeeded"])
+        self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
+        self.assertEqual(json.loads(registry.read_text())["runs"]["fixture-run"]["status"], "failed")
+        self.assertEqual(launch.call_count, 0)
+        self.assertEqual(ledger.claims(), {})
+
     def _resume_fixture(self):
         router = SUP.route_module()
         candidates = {"candidates": [{"harness": "codex", "transport": "headless",

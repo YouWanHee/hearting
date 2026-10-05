@@ -58,7 +58,8 @@ def settle(registry, run_id, run):
     recorded by whoever notices it first and is idempotent afterwards.
     """
     liveness,_current,reason=classify_identity(run)
-    if liveness=="working" or run.get("status") == "launching":
+    if liveness=="working" or (run.get("resource_policy") == "verified-resume"
+                              and run.get("status") == "launching"):
         return run, False
     exit_code=read_sentinel(run.get("sentinel"))
     if run.get("resource_policy") == "verified-resume" and run.get("cancel_requested") is True:
@@ -184,7 +185,7 @@ def start_verified(registry, args, route, route_file, placeholder):
             raise ValueError("resource-launch-identity-unconfirmed")
         row = {**placeholder, **ident, "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
                "status": "running", "workflow_state": "RUNNING", "supervision": supervision}
-        locked_update(registry, lambda data: data["runs"].update({args.run_id: row}))
+        publish_verified_run(registry, args.run_id, placeholder, row)
         os.write(release, b"start\n")
         payload_released = True
         os.close(release)
@@ -200,9 +201,29 @@ def start_verified(registry, args, route, route_file, placeholder):
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=2)
         if not payload_released:
-            locked_update(registry, lambda data: data["runs"][args.run_id].update(
-                status="failed", workflow_state="FAILED_RETRYABLE", failure_class="resource-launch-incomplete"))
+            if watch is not None and watch.poll() is None:
+                # This is our unreaped child, not a PID rediscovered in a registry.
+                with contextlib.suppress(ProcessLookupError):
+                    watch.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    watch.wait(timeout=2)
+            def mark_failed(data):
+                current = data["runs"].get(args.run_id)
+                if current != placeholder and current != row:
+                    raise ValueError("resource-reservation-changed")
+                current.update(status="failed", workflow_state="FAILED_RETRYABLE",
+                               failure_class="resource-launch-incomplete")
+            locked_update(registry, mark_failed)
         raise
+
+
+def publish_verified_run(registry, run_id, expected, published):
+    """Only the exact reserved row can release this payload; a foreign row survives."""
+    def apply(data):
+        if data["runs"].get(run_id) != expected:
+            raise ValueError("resource-reservation-changed")
+        data["runs"][run_id] = published
+    locked_update(registry, apply)
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--registry"); s=p.add_subparsers(dest="cmd",required=True)
     a=s.add_parser("start"); a.add_argument("--run-id",required=True); a.add_argument("--cwd",required=True); a.add_argument("--log",required=True); a.add_argument("--route",required=True); a.add_argument("--node",required=True); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")

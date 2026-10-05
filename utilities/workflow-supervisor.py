@@ -164,12 +164,12 @@ def resource_evidence(armed):
         return {"terminal": False, "reason": f"resource-registry-unreadable:{exc}"}
     if not isinstance(row, dict):
         return {"terminal": False, "reason": "resource-run-absent"}
-    if row.get("status") == "launching":
-        return {"terminal": False, "reason": "resource-launching"}
     resume = row.get("resource_policy") == "verified-resume"
     if resume and (row.get("route") != armed.get("route_file") or row.get("node") != armed.get("node")
                    or row.get("jobs") != armed.get("jobs")):
         return {"terminal": False, "reason": "resource-binding-mismatch"}
+    if resume and row.get("status") == "launching":
+        return {"terminal": False, "reason": "resource-launching"}
     row, _settled = runner().settle(registry, run_id, row)
     liveness, _current, reason = RR.classify_identity(row)
     identity = f"{run_id}:{row.get('pid')}:{row.get('starttime')}:{row.get('exit_code')}"

@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not (
@@ -31,6 +32,41 @@ spec.loader.exec_module(R)
 
 
 class TestRunner(unittest.TestCase):
+    def test_verified_publication_cas_preserves_changed_or_missing_reservation(self):
+        expected = {"run_id":"resume", "status":"launching", "command":["approved"], "token":"one"}
+        for current in ({**expected,"command":["foreign"]}, {**expected,"token":"two"}, None):
+            with self.subTest(current=current):
+                data = {"schema_version":1,"runs":{} if current is None else {"resume":current}}
+                self.registry.write_text(json.dumps(data))
+                before = self.registry.read_bytes()
+                with self.assertRaisesRegex(ValueError,"resource-reservation-changed"):
+                    R.publish_verified_run(self.registry,"resume",expected,{**expected,"status":"running"})
+                self.assertEqual(self.registry.read_bytes(),before)
+        self.registry.write_text(json.dumps({"schema_version":1,"runs":{"resume":expected}}))
+        published = {**expected,"status":"running"}
+        R.publish_verified_run(self.registry,"resume",expected,published)
+        self.assertEqual(json.loads(self.registry.read_text())["runs"]["resume"],published)
+
+        jobs = self.base / "cas-jobs.log"
+        jobs.write_text("")
+        args = SimpleNamespace(jobs=str(jobs), run_id="resume", node="resume-run")
+        route_file = self.base / "cas-route.json"
+        for changed in ({**expected,"command":["foreign"]}, None):
+            with self.subTest(exception_row=changed):
+                self.registry.write_text(json.dumps({"schema_version":1,"runs":{}}))
+                preserved = []
+                def interrupt(_registry):
+                    self.registry.write_text(json.dumps({"schema_version":1,
+                        "runs":{} if changed is None else {"resume":changed}}))
+                    preserved.append(self.registry.read_bytes())
+                    raise RuntimeError("launch-interrupted")
+                with mock.patch.object(R,"register_registry",side_effect=interrupt), \
+                     mock.patch.object(R.subprocess,"Popen") as launch:
+                    with self.assertRaisesRegex(ValueError,"resource-reservation-changed"):
+                        R.start_verified(self.registry,args,{},route_file,dict(expected))
+                self.assertEqual(self.registry.read_bytes(),preserved[0])
+                self.assertEqual(launch.call_count,0)
+
     def _resume_route(self):
         evidence = self.base / "headless.json"
         evidence.write_text(json.dumps({"candidates": [{"harness": "codex", "transport": "headless",
