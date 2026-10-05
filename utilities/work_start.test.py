@@ -1135,6 +1135,50 @@ class WorkStartTest(unittest.TestCase):
         prepare.assert_called_once_with(self.path, start=True, jobs=self.jobs)
         self.assertEqual(self.calls, [])
 
+    def test_verified_resume_start_defers_owner_and_preserves_checked_fallback(self):
+        import artifact_producer
+        self.route.update(capability="autopilot-lab", capability_mode="setup", effective_intensity="quick",
+            cwd=self.tmp.name, artifact_root=self.tmp.name,
+            composed_recipe={"capability":"autopilot-lab","modes":["setup"],
+                "compose":{"graph":["resume-run","run-verify"]},
+                "standard_plus":{"nodes":[{"id":"resume-run"},{"id":"run-verify"}]}},
+            nodes=[{"id":"resume-run"},{"id":"one-shot","worker_type":"owner","dispatch_depth":1}])
+        with mock.patch.object(artifact_producer,"prepare_route_artifact_env",
+                               return_value={"AGENT_ARTIFACT_OUTPUT_DIR":str(Path(self.tmp.name)/"artifacts")}), \
+             mock.patch.object(W.RESOURCE_RESUME,"observation",return_value={"state":"resource-ready"}):
+            ready=self.start()
+        self.assertEqual(ready["state"],"resource-ready",ready)
+        self.assertEqual(ready["required_action"],"start-resource")
+        self.assertIn("--node resume-run",ready["resource_runner_command"])
+        self.assertNotEqual(ready["parent_next"],"end-turn")
+        for live in (True,False):
+            with mock.patch.object(artifact_producer,"prepare_route_artifact_env",
+                                   return_value={"AGENT_ARTIFACT_OUTPUT_DIR":str(Path(self.tmp.name)/"artifacts")}), \
+                 mock.patch.object(W.RESOURCE_RESUME,"observation",return_value={"state":"resource-running"}), \
+                 mock.patch.object(W.RESOURCE_RESUME,"supervisor_alive",return_value=live):
+                waiting=self.start()
+            self.assertEqual(waiting["state"],"resource-running" if live else "needs-attention")
+            self.assertEqual(waiting["parent_next"],"end-turn" if live else "inspect-receipt")
+        self.assertEqual(self.calls,[])
+        self.assertFalse(self.jobs.exists())
+
+    def test_verified_resume_confirmed_exit_enters_existing_once_only_owner_path(self):
+        self.route.update(capability="autopilot-lab", capability_mode="setup", effective_intensity="quick",
+            composed_recipe={"capability":"autopilot-lab","modes":["setup"],
+                "compose":{"graph":["resume-run","run-verify"]},
+                "standard_plus":{"nodes":[{"id":"resume-run"},{"id":"run-verify"}]}},
+            nodes=[{"id":"resume-run"},{"id":"one-shot","worker_type":"owner","dispatch_depth":1}])
+        with mock.patch.object(W.RESOURCE_RESUME,"observation",return_value={"state":"resource-succeeded"}), \
+             mock.patch.object(W.RESOURCE_RESUME,"verification_prompt",return_value="\nONLY independent post-run verification"):
+            first=self.start()
+            again=self.start()
+        self.assertEqual(first["state"],"running")
+        self.assertEqual(again["state"],"running")
+        self.assertEqual(len(self.calls),1)
+        task=self.calls[0][self.calls[0].index("--prompt-text")+1]
+        self.assertIn("ONLY independent post-run verification",task)
+        self.assertNotIn("frame",self.calls[0])
+
     def test_closed_request_replay_never_launches_or_prepares_artifacts(self):
         import artifact_producer
         outcome = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],

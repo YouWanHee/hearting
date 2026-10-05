@@ -46,6 +46,7 @@ from hearting_gates import gates_on, same_work_or_refuse
 from dispatch_contract import success_note, verdict_pass  # noqa: E402
 import workflow_state as WS  # noqa: E402
 import resource_run_registry as RR  # noqa: E402
+import resource_resume as RESOURCE_RESUME  # noqa: E402
 import dispatch_pending_delivery as PENDING  # noqa: E402
 import frame_interview as INTERVIEW  # noqa: E402
 import human_gate_receipt as HUMAN_GATE  # noqa: E402
@@ -163,6 +164,12 @@ def resource_evidence(armed):
         return {"terminal": False, "reason": f"resource-registry-unreadable:{exc}"}
     if not isinstance(row, dict):
         return {"terminal": False, "reason": "resource-run-absent"}
+    if row.get("status") == "launching":
+        return {"terminal": False, "reason": "resource-launching"}
+    resume = row.get("resource_policy") == "verified-resume"
+    if resume and (row.get("route") != armed.get("route_file") or row.get("node") != armed.get("node")
+                   or row.get("jobs") != armed.get("jobs")):
+        return {"terminal": False, "reason": "resource-binding-mismatch"}
     row, _settled = runner().settle(registry, run_id, row)
     liveness, _current, reason = RR.classify_identity(row)
     identity = f"{run_id}:{row.get('pid')}:{row.get('starttime')}:{row.get('exit_code')}"
@@ -187,6 +194,7 @@ def resource_evidence(armed):
         "reason": reason,
         "log": row.get("log"),
         "parent_attempt_id": row.get("parent_attempt_id"),
+        **({"resource_sha256": RESOURCE_RESUME.row_digest(row)} if resume else {}),
     }
 
 
@@ -365,6 +373,13 @@ def cmd_arm(args):
     with ledger.lock():
         armed_dir(ledger).mkdir(parents=True, exist_ok=True)
         target = armed_dir(ledger) / f"{args.node}.json"
+        if RESOURCE_RESUME.route_selected(route) and target.exists():
+            prior = json.loads(target.read_text())
+            if any(prior.get(k) != record.get(k) for k in record if k != "armed_at"):
+                raise SupervisorError("resource-watch-binding-conflict")
+            print(json.dumps({"armed": args.node, "replayed": True,
+                              **ledger_metadata(getattr(args, "jobs", None), ledger)}, sort_keys=True))
+            return 0
         target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         state = ledger.state()
         if state["workflow_state"] == "CREATED":
@@ -444,6 +459,22 @@ def _evaluate(route, ledger, armed, results):
         evidence = resource_evidence(armed)
     else:
         evidence = registered_evidence(armed)
+    if (RESOURCE_RESUME.route_selected(route) and evidence.get("terminal")
+            and evidence.get("succeeded") and evidence.get("liveness") == "exited"):
+        # The small run record is the resource artifact, not a verification verdict.
+        row_data = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
+        if (RESOURCE_RESUME.row_digest(row_data) != evidence.get("resource_sha256")
+                or runner().read_sentinel(row_data.get("sentinel")) != 0
+                or RR.classify_identity(row_data)[0] != "exited"):
+            row_data = None
+        if row_data is None:
+            results.append({"node": node_id, "action": "wait", "reason": "resource-evidence-changed"})
+            return
+        record = Path(armed["artifact_base"]) / "run.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        temporary = record.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(row_data, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, record)
     artifacts = artifact_evidence(armed)
     evidence["artifacts"] = artifacts
     row = {"node": node_id, "evidence": evidence}
@@ -481,6 +512,11 @@ def _evaluate(route, ledger, armed, results):
             return
         evidence["monitor"] = "matched"
 
+    if RESOURCE_RESUME.route_selected(route):
+        # Reuse the ordinary resource marker writer, so the normal owner launch
+        # consumes the same dependency contract as every other route.
+        route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
+                                              Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
     ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
     started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
     row["action"] = "advanced"
@@ -537,6 +573,12 @@ def cmd_poll(args):
 def cmd_watch(args):
     route = load_route(args.route)
     ledger = ledger_for(route, getattr(args, "jobs", None))
+    ready_fd = getattr(args, "ready_fd", None)
+    if ready_fd is not None:
+        if not read_armed(ledger):
+            raise SupervisorError("resource-watch-not-armed")
+        os.write(ready_fd, b"ready\n")
+        os.close(ready_fd)
     interval = max(1.0, float(args.interval))
     deadline = time.monotonic() + min(max(1.0, float(args.max)), MAX_WATCH_SECONDS)
     last = []
@@ -2485,6 +2527,7 @@ def build_parser():
     watch = sub.add_parser("watch", help="poll until terminal or the bounded deadline")
     watch.add_argument("--route", required=True)
     watch.add_argument("--jobs")
+    watch.add_argument("--ready-fd", type=int, help=argparse.SUPPRESS)
     watch.add_argument("--max", type=float, default=3600.0)
     watch.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL)
 

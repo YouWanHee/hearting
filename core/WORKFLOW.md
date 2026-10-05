@@ -790,6 +790,16 @@ any of these is rejected at route compile, and a launch bound to such a graph is
 rejected before the process starts** — the refusal is the point, because the
 alternative is silent abandonment.
 
+An already verified run's same-code/config resume, epoch extension or repeat is
+the smaller `autopilot-lab` graph `resume-run,run-verify`, including from a
+`direct` or `solo` request. It has no pre-run frame, owner, scaffold, smoke or
+new human decision. The resource starts once under the existing sentinel and
+supervisor; only after its successful, evidenced exit does the existing
+depth-1 one-shot execute the independent verification. This is the verification
+surface of the small graph, not a fresh training recipe. New code, data or model
+structure still uses the setup recipe. The graph records only the caller's
+explicit approved verified-run scope; prose and command paths are not scope evidence.
+
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
 keeps the exact question and gate available for a later real answer; independent

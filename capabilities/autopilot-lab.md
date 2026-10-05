@@ -131,6 +131,19 @@ advances `metrics`, and `sync` is the terminal node.
 
 ### Parts (SD-165)
 
+For an already verified run's same-code/config resume, epoch extension or repeat,
+select `--shape direct|solo --graph resume-run,run-verify`. This starts no frame,
+scaffold, smoke, pre-run owner or new approval. Use the route's `resource-runner
+start` instruction once with the approved command; the runtime connects its
+sentinel and supervisor to the independent verification after exit. The small
+graph realizes only that verifier as a depth-1 one-shot and preserves the
+requested shape separately. It does not authorize new code/data/model work.
+`full-run` retains its smoke requirements; `resume-run` records the explicitly
+approved verified-run scope and preserves any supplied config provenance.
+Parent completion uses the existing registered delivery surface, with queued,
+received and unsupported results kept distinct. A bare process exit is not
+verification or workflow completion.
+
 Every stage above is a part `autopilot-lab:<stage>`; `capabilities/topologies.json`
 (recipes plus `part_catalog`) is the one stage list and
 `capability-route.py stages --capability autopilot-lab` prints it. The presets

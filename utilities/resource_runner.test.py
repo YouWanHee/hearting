@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,86 @@ spec.loader.exec_module(R)
 
 
 class TestRunner(unittest.TestCase):
+    def _resume_route(self):
+        evidence = self.base / "headless.json"
+        evidence.write_text(json.dumps({"candidates": [{"harness": "codex", "transport": "headless",
+            "surface": "registered-headless", "status": "supported", "probe_source": "fixture",
+            "probe_time": "2026-10-05T00:00:00Z"}]}))
+        prompt = self.base / "request.txt"
+        prompt.write_text("Verify the already approved same-code/config resume after it exits.\n")
+        result = subprocess.run([sys.executable, str(ROUTER), "compose", "--capability", "autopilot-lab",
+            "--capability-mode", "setup", "--shape", "direct", "--graph", "resume-run,run-verify",
+            "--slug", "resume-fixture", "--cwd", str(self.repo), "--artifact-root", str(self.artifacts),
+            "--registered-headless-evidence", str(evidence), "--unassigned", "--prompt-file", str(prompt)],
+            env=CLEAN_ENV, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        route = json.loads(result.stdout)
+        self.resume_path = self.artifacts / ".runtime/routes" / (route["route_id"] + ".json")
+        self.assertTrue(self.resume_path.is_file())
+        self.jobs = self.base / "state/jobs.log"
+        self.jobs.parent.mkdir()
+        self.jobs.write_text("")
+        return json.loads(self.resume_path.read_text())
+
+    def test_verified_resume_concurrent_exact_body_starts_once_and_fast_exit_has_identity(self):
+        self._resume_route()
+        # Failed payload deliberately ends before any verifier can be admitted.
+        # This tests real reserve/fence/watch behavior without a model invocation.
+        args = ["start", "--run-id", "resume", "--cwd", str(self.repo), "--log", str(self.log),
+                "--route", str(self.resume_path), "--node", "resume-run", "--jobs", str(self.jobs),
+                "--", sys.executable, "-c", f"from pathlib import Path; p=Path({str(self.launch)!r}); "
+                "p.open('a').write('x'); raise SystemExit(7)"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(lambda _: self.cli(*args), range(2)))
+        for outcome in outcomes:
+            self.assertEqual(outcome.returncode, 0, outcome.stderr)
+        receipts = [json.loads(o.stdout) for o in outcomes]
+        self.assertEqual(sum(r["payload_spawned"] for r in receipts), 1)
+        self.assertEqual(sum(r["replayed"] for r in receipts), 1)
+        started = next(r for r in receipts if r["payload_spawned"])
+        self.assertTrue(started["supervision"]["starttime"])
+        self.assertFalse(started["verification_admitted"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            row = json.loads(self.registry.read_text())["runs"]["resume"]
+            if row["status"] == "failed": break
+            time.sleep(.05)
+        self.assertEqual(self.launch.read_text(), "x")
+        self.assertEqual(row["exit_code"], 7)
+        self.assertEqual(row["failure_class"], "exit-7")
+        self.assertTrue(row["starttime"])
+        replay = self.cli(*args)
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertFalse(json.loads(replay.stdout)["payload_spawned"])
+        changed = self.cli(*args[:-1], "raise SystemExit(9)")
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("resource-route-body-conflict", changed.stderr)
+        different_run = list(args)
+        different_run[different_run.index("--run-id")+1] = "another"
+        self.assertIn("resource-route-body-conflict", self.cli(*different_run).stderr)
+        self.assertEqual(self.launch.read_text(), "x")
+        self.assertEqual(self.jobs.read_text(), "")
+
+    def test_verified_resume_watch_spawn_failure_releases_no_payload(self):
+        route = self._resume_route()
+        args = type("Args", (), {"jobs": str(self.jobs), "node": "resume-run", "run_id": "resume"})()
+        placeholder = {"run_id": "resume", "route": str(self.resume_path), "node": "resume-run",
+            "cwd": str(self.repo), "log": str(self.log), "sentinel": str(self.log)+".exit",
+            "command": [sys.executable, "-c", f"open({str(self.launch)!r},'w').write('wrong')"],
+            "status": "launching", "workflow_state": "READY"}
+        original = subprocess.Popen
+        def spawn(argv, **kwargs):
+            if "watch" in argv: raise OSError("synthetic watch spawn failure")
+            return original(argv, **kwargs)
+        with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT), "AGENT_WORKFLOW_ROOT": str(self.base/"workflow"),
+                                         "AGENT_RESOURCE_RUN_INDEX": str(self.index)}), \
+             mock.patch.object(R.subprocess, "Popen", side_effect=spawn):
+            with self.assertRaisesRegex(OSError, "synthetic watch"):
+                R.start_verified(self.registry, args, route, self.resume_path, placeholder)
+        self.assertFalse(self.launch.exists())
+        self.assertEqual(json.loads(self.registry.read_text())["runs"]["resume"]["status"], "failed")
+        self.assertEqual(self.jobs.read_text(), "")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

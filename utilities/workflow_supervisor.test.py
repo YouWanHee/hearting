@@ -330,6 +330,71 @@ class TestStateMachine(WorkflowFixture):
 # B. supervisor advance semantics
 # ---------------------------------------------------------------------------
 class TestSupervisorAdvance(WorkflowFixture):
+    def _resume_fixture(self):
+        router = SUP.route_module()
+        candidates = {"candidates": [{"harness": "codex", "transport": "headless",
+            "surface": "registered-headless", "status": "supported", "probe_source": "fixture",
+            "probe_time": "2026-10-05T00:00:00Z"}]}
+        route = router.compose_route(capability="autopilot-lab", capability_mode="setup", shape="direct",
+            graph="resume-run,run-verify", slug="resume-fixture", cwd=self.base, artifact_root=self.base,
+            registered_headless_evidence=candidates, unassigned=True)
+        path = self.base / "resume-route.json"
+        path.write_text(json.dumps(route))
+        jobs = self.base / "jobs.log"
+        jobs.write_text("")
+        registry = self.resource_registry()
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        row.update(route=str(path), node="resume-run", jobs=str(jobs), resource_policy="verified-resume")
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
+        output = self.base / "artifacts"
+        output.mkdir()
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        self.arm(path, registry, node="resume-run", extra=("--jobs", str(jobs), "--artifact-base", str(output)))
+        return route, path, jobs, registry, output
+
+    def test_verified_resume_exit_marker_claim_and_replay_are_not_workflow_complete(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        ledger = SUP.ledger_for(route, jobs)
+        with mock.patch.object(SUP, "_start_successor", return_value={"started": True, "surface": "fixture-CLI"}) as launch:
+            result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]["action"], "advanced")
+            self.assertEqual(result[0]["successors"][0]["successor"], "one-shot")
+            self.assertEqual(launch.call_count, 1)
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "settled")
+            self.assertEqual(launch.call_count, 1)
+        self.assertNotEqual(ledger.state()["workflow_state"], "COMPLETE")
+        marker = jobs.parent / "completion" / route["route_id"] / "resume-run.json"
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads(marker.read_text())["node_id"], "resume-run")
+        import resource_resume
+        self.assertEqual(resource_resume.observation(route, jobs)["state"], "resource-succeeded")
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        Path(row["sentinel"]).write_text("7")
+        self.assertEqual(resource_resume.observation(route, jobs)["state"], "needs-attention")
+        self.assertEqual(jobs.read_text(), "")
+
+    def test_verified_resume_launching_pid_reuse_missing_sentinel_and_foreign_bindings_never_verify(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        ledger = SUP.ledger_for(route, jobs)
+        original = json.loads(registry.read_text())["runs"]["fixture-run"]
+        armed = SUP.read_armed(ledger)["resume-run"]
+        cases = [({"status": "launching"}, "resource-launching"),
+                 ({"route": str(self.base / "foreign.json")}, "resource-binding-mismatch"),
+                 ({"pid": os.getpid(), "starttime": "0"}, "process-identity-mismatch"),
+                 ({"pid": None}, "recorded-identity-incomplete"),
+                 ({"cancel_requested": True}, "cancelled"),
+                 ({"sentinel": str(self.base / "missing.exit")}, "no-exit-sentinel")]
+        with mock.patch.object(SUP, "_start_successor") as launch:
+            for change, reason in cases:
+                with self.subTest(change=change):
+                    registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": {**original, **change}}}))
+                    evidence = SUP.resource_evidence(armed)
+                    self.assertFalse(evidence.get("succeeded", False))
+                    self.assertEqual(evidence["reason"] if reason.startswith("resource-") else
+                                     evidence.get("failure_class"), reason)
+            self.assertEqual(launch.call_count, 0)
+        self.assertEqual(ledger.claims(), {})
+
     def test_successful_stage_registers_the_next_stage_exactly_once(self):
         route, path = self.two_stage_route()
         registry = self.resource_registry(exit_code=0)

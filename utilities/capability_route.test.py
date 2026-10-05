@@ -6934,6 +6934,32 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_verified_resume_graph_keeps_payload_inline_and_verifies_after_exit(self):
+  for shape in ("direct", "solo"):
+   route=self.compose(capability="autopilot-lab",capability_mode="setup",shape=shape,
+                      graph="resume-run,run-verify",dispatch_evidence=None,
+                      registered_headless_evidence=self.registered_headless())
+   self.assertEqual(route["selection"]["shape"],shape)
+   self.assertEqual(route["effective_intensity"],"quick")
+   self.assertEqual(route["tracking"],"tracked")
+   self.assertEqual([n["id"] for n in route["nodes"]],["resume-run","one-shot"])
+   self.assertNotIn("dispatch_depth",route["nodes"][0])
+   self.assertEqual(route["nodes"][0]["continuation"],{"kind":"supervised"})
+   self.assertEqual(route["nodes"][1]["dispatch_depth"],1)
+   self.assertEqual(route["nodes"][1]["depends_on"],["resume-run"])
+   self.assertTrue(route["nodes"][1]["verification_only"])
+   self.assertEqual(route["human_gates"],[])
+   self.assertNotIn("no-resource-run",route["selection"]["direct_predicates"])
+   self.assertEqual(R.declared_start_approvals({"capability":"autopilot-lab","mode":"setup",
+                                               "shape":shape,"graph":["resume-run","run-verify"]}),[])
+   R.verify_route(route,R.ROOT)
+   forged=json.loads(json.dumps(route))
+   forged["composed_recipe"]["standard_plus"]["nodes"][0]["resource_policy"]="new-code"
+   forged["route_hash"]=R.route_hash(forged)
+   forged["route_id"]=R.ROUTE_IDENTITY.route_id_from_hash(forged["route_hash"])
+   with self.assertRaises(ValueError): R.verify_route(forged,R.ROOT)
+  with self.assertRaisesRegex(ValueError,"compose-graph-only-staged"):
+   self.compose(capability="autopilot-lab",capability_mode="setup",shape="direct",graph="full-run,run-verify")
  def test_old_refine_route_uses_exact_git_show_catalog_and_unrelated_digest_drift_stays_stale(self):
   import subprocess
   current = R.TOPO.load_registry()
