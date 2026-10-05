@@ -58,7 +58,7 @@ def settle(registry, run_id, run):
     recorded by whoever notices it first and is idempotent afterwards.
     """
     liveness,_current,reason=classify_identity(run)
-    if liveness=="working" or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
+    if liveness in {"working", "reaping"} or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
                               and run.get("status") == "launching"):
         return run, False
     exit_code=read_sentinel(run.get("sentinel"))
@@ -465,7 +465,7 @@ def main(argv=None, *, controller=None):
             locked_update(registry, cancel)
         os.killpg(group,signal.SIGTERM)
     status=run.get("status") if run.get("status") in TERMINAL_STATUSES else \
-        {"working":"running","exited":"exited","stale":"stale"}[liveness]
+        {"working":"running","reaping":"reaping","exited":"exited","stale":"stale"}[liveness]
     print(json.dumps({**run,"status":status,"liveness":liveness},sort_keys=True))
 if __name__=="__main__":
  try: main()

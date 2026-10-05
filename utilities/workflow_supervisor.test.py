@@ -420,6 +420,90 @@ class TestSupervisorAdvance(WorkflowFixture):
             self.assertEqual(spawn.call_count,0)
         self.assertEqual((output/"run.json").read_bytes(),b'{\n "payload": "fixture-resume", "count": 1, "sum": 10\n}\n')
 
+    def test_independent_watch_before_owned_reap_preserves_success_and_once_marker(self):
+        import dispatch_owner_input as INPUT
+        import dispatch_resource_wait as OWNER_RESOURCE
+        route, path, jobs, registry, output = self._resume_fixture()
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        sentinel = Path(row["sentinel"])
+        sentinel.unlink()
+        proc = subprocess.Popen(["/bin/sh", "-c",
+            'cat >/dev/null; printf 0 > "$1"', "wrapper", str(sentinel)],
+            stdin=subprocess.PIPE, start_new_session=True)
+        try:
+            identity = SUP.RR.proc_identity(proc.pid)
+            identity_deadline = time.monotonic() + 5
+            while identity is None:
+                self.assertLess(time.monotonic(), identity_deadline, "wrapper identity unavailable")
+                time.sleep(0.005)
+                identity = SUP.RR.proc_identity(proc.pid)
+            self.assertIsNotNone(identity)
+            namespace = os.readlink("/proc/self/ns/pid")
+            row.update(**identity, process_group=proc.pid, pid_namespace=namespace,
+                resource_policy="supervised-owner", launch_state="started",
+                owner_wait={"parent_attempt_id": "att-parent", "session_id": "same-native",
+                            "launch_scope": "codex-owner-controller"},
+                launch_controller={**SUP.RR.proc_identity(os.getpid()), "pid_namespace": namespace})
+            registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
+            ledger = SUP.ledger_for(route, jobs)
+            arm_path = ledger.root / "armed/resume-run.json"
+            armed = json.loads(arm_path.read_text())
+            armed.update(successor_command=None, successor_external=True,
+                         resource_binding=OWNER_RESOURCE.resource_body_digest(row))
+            arm_path.write_text(json.dumps(armed))
+            producer = output / "run.json"
+            original = producer.read_bytes(), producer.stat().st_ino, producer.stat().st_mtime_ns
+            original_registry = registry.read_bytes()
+            proc.stdin.close(); proc.stdin = None
+            # Observe the actual unreaped kernel state, never poll/wait the child
+            # before the independent observer. This fixes ordering deterministically.
+            deadline = time.monotonic() + 5
+            while Path(f"/proc/{proc.pid}/stat").read_text().rsplit(") ", 1)[1].split()[0] != "Z":
+                self.assertLess(time.monotonic(), deadline, "wrapper did not complete")
+                time.sleep(0.005)
+            self.assertIsNone(proc.returncode)
+            self.assertEqual(sentinel.read_text(), "0")
+            self.assertEqual(Path(f"/proc/{proc.pid}/cmdline").read_bytes(), b"")
+            # A real sibling watch cannot reap our owned wrapper. Keep the
+            # wrapper unreaped for its entire finite observation window.
+            observed = subprocess.run([sys.executable, str(HERE / "workflow-supervisor.py"),
+                "watch", "--route", str(path), "--jobs", str(jobs), "--max", "1", "--interval", "1"],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(observed.returncode, 3, observed.stderr)
+            observed_json = json.loads(observed.stdout)
+            self.assertTrue(observed_json["timeout"])
+            first = observed_json["results"][0]
+            self.assertEqual(first["action"], "wait")
+            self.assertEqual(first["evidence"]["reason"], "owned-wrapper-awaiting-reap")
+            self.assertFalse(first["evidence"]["terminal"])
+            self.assertEqual(registry.read_bytes(), original_registry)
+            self.assertEqual(ledger.claims(), {})
+            marker = jobs.parent / "completion" / route["route_id"] / "resume-run.json"
+            self.assertFalse(marker.exists())
+            self.assertEqual(proc.poll(), 0)  # Only the actual owning handle reaps.
+            self.assertEqual(SUP.RR.classify_identity(row)[0], "exited")
+            value = {"target": "exact-target", "thread_id": "same-native", "requests": []}
+            @contextlib.contextmanager
+            def input_lock(*_):
+                yield None, value
+            with mock.patch.object(INPUT, "_locked", side_effect=input_lock), \
+                 mock.patch.object(INPUT, "_target", return_value=(None, "exact-target")), \
+                 mock.patch.object(SUP, "_start_successor", wraps=SUP._start_successor) as successor:
+                self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "advanced")
+                self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "settled")
+                self.assertEqual(successor.call_count, 1)
+            self.assertEqual(json.loads(registry.read_text())["runs"]["fixture-run"]["status"], "succeeded")
+            self.assertEqual(len(ledger.claims()), 1)
+            self.assertNotEqual(ledger.state()["workflow_state"], "COMPLETE")
+            self.assertEqual(json.loads(marker.read_text())["evidence"],
+                             {"path": str(producer), "sha256": hashlib.sha256(original[0]).hexdigest()})
+            self.assertEqual((producer.read_bytes(), producer.stat().st_ino, producer.stat().st_mtime_ns), original)
+            self.assertEqual(jobs.read_text(), "")
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=5)
+
     def test_verified_resume_exit_marker_claim_and_replay_are_not_workflow_complete(self):
         route, path, jobs, registry, output = self._resume_fixture()
         ledger = SUP.ledger_for(route, jobs)
