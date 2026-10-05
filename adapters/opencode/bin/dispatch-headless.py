@@ -752,6 +752,11 @@ def scoped_external_directory_config(
                 raise ValueError(f"OpenCode {tool} permission must be a string or object")
         return value
 
+    # Keep the existing headless projection before normalizing native order:
+    # no explicit external rule means deny outside the scoped launch roots,
+    # even when a global catchall allows/asks for other tools (SD-15).
+    if agent_home is not None and "external_directory" not in permission:
+        permission["external_directory"] = "deny"
     original_permission = dict(permission)
     external = (effective_tool(original_permission, "external_directory")
                 if agent_home is not None else permission.get("external_directory"))
