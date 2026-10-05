@@ -67,7 +67,7 @@ class OrphanWatchTest(unittest.TestCase):
     def write_rows(self, completed_owner=False, child=None, supervised=True):
         status = "done" if completed_owner else "open"
         child_pid = child.pid if child is not None else 99999999
-        child_start = self.proc_start(child.pid) if child is not None else "1"
+        child_start = self.proc_start(child.pid) if child is not None else self.owner_start
         child_group = f",pgid={child_pid},pid_observer_ns={self.observer_namespace},pid_ns={self.observer_namespace}"
         current = (
             "attempt_schema_version=2,transport=headless,"
