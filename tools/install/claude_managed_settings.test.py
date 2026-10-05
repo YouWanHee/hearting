@@ -264,6 +264,28 @@ class RetiredHookMigrationTests(unittest.TestCase):
                 runtime_activation._merge_claude_settings(source, None)
             self.assertEqual(helper._read_user_settings(home)["hooks"]["PreToolUse"][0]["hooks"], [user_hook])
 
+    def test_retired_guard_called_through_the_harness_root_is_pruned(self):
+        # Settings that reached a guard through the runtime-home `hearting`
+        # projection, the managed `current` pointer, or a release directory
+        # still name an owned file after the guard is retired; a missing script
+        # there exits 2, which Claude reads as a block on every Edit/Write.
+        import claude_settings_config as settings
+        owned = [
+            'sh "$HOME/.claude/hearting/hooks/core-first-guard.sh"',
+            'sh "$HOME/.claude/hearting/hooks/core-read-marker.sh"',
+            'sh "$HOME/hearting/hooks/git-state-guard.sh"',
+            'sh "$HOME/.local/share/hearting/current/hooks/artifact-guard.sh"',
+            'sh "/home/u/.local/share/hearting/releases/v2.150.0/hooks/spec-skill-gate.sh"',
+        ]
+        user = [
+            {"type": "command", "command": 'sh "$HOME/scripts/core-first-guard.sh"'},
+            {"type": "command", "command": 'sh "$HOME/.claude/hearting/hooks/herdr-agent-state.sh" idle'},
+        ]
+        data = {"hooks": {"PreToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [
+            *({"type": "command", "command": c} for c in owned), *user]}]}}
+        self.assertTrue(settings.remove_retired_hooks(data))
+        self.assertEqual(data["hooks"]["PreToolUse"][0]["hooks"], user)
+
 OLD_MEM_SYNC = (
     "sh -c 'if [ \"${AGENT_SESSION_ROLE:-}\" = worker ] || [ \"${AGENT_DISPATCH_CHILD:-}\" = 1 ] "
     "|| [ -n \"${AGENT_DISPATCH_DEPTH:-}\" ] || [ -n \"${OPENCODE_DISPATCH_SLUG:-}\" ] "
