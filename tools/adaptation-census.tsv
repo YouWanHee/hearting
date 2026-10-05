@@ -33,6 +33,7 @@ shared-utility-deferred	dispatch_owner_input.py
 shared-utility-deferred	dispatch_parent_completion.py
 shared-utility-deferred	dispatch_receipt_identity.py
 shared-utility-deferred	dispatch_replacement.py
+shared-utility-deferred	dispatch_resource_wait.py
 shared-utility-deferred	dispatch_replacement_batch.py
 shared-utility-deferred	dispatch_replacement_subsession.py
 shared-utility-deferred	dispatch_supervision.py

@@ -978,6 +978,49 @@ class SupervisorState:
     phase: str
     delivered_attempt_ids: frozenset[str]
     outbox: SupervisorOutbox | None = None
+    resource: dict[str, object] | None = None
+
+
+def valid_resource_state(value: object) -> bool:
+    """Separate bounded resource delivery; never manufacture model attempts."""
+    if not isinstance(value, dict) or set(value) != {"session_id", "delivered", "outbox"}:
+        return False
+    delivered = value["delivered"]
+    if (not isinstance(value["session_id"], str) or not _safe_identity(value["session_id"])
+            or not isinstance(delivered, list) or len(delivered) > 64
+            or any(not re_fullmatch_digest(key) for key in delivered)
+            or len(set(delivered)) != len(delivered)):
+        return False
+    box = value["outbox"]
+    if box is None:
+        return True
+    if (not isinstance(box, dict) or set(box) != {"receipt_id", "digest", "key", "receipt"}
+            or not isinstance(box["receipt_id"], str) or not _safe_identity(box["receipt_id"])
+            or not re_fullmatch_digest(box["digest"]) or not re_fullmatch_digest(box["key"])
+            or box["receipt_id"] != "resource-" + box["digest"][:32]
+            or box["key"] in delivered or not isinstance(box["receipt"], dict)
+            or box["receipt"].get("type") != "resource-completion"):
+        return False
+    receipt = box["receipt"]
+    if (set(receipt) != {"type", "parent_attempt_id", "session_id", "route_id", "route_hash",
+            "jobs", "node", "run_id", "resource_key", "resource_sha256", "state", "exit_code",
+            "reason", "verification_pass", "workflow_complete", "successors"}
+            or any(not isinstance(receipt[k], str) or not _safe_identity(receipt[k])
+                   for k in ("parent_attempt_id", "session_id", "route_id", "route_hash", "node", "run_id", "jobs"))
+            or not Path(receipt["jobs"]).is_absolute() or receipt["session_id"] != value["session_id"]
+            or receipt["resource_key"] != box["key"] or not re_fullmatch_digest(receipt["resource_sha256"])
+            or not isinstance(receipt["state"], str) or receipt["state"] not in {"succeeded", "cancelled", "needs-attention"}
+            or (receipt["exit_code"] is not None and type(receipt["exit_code"]) is not int)
+            or receipt["verification_pass"] is not False or receipt["workflow_complete"] is not False
+            or (receipt["reason"] is not None and
+                (not isinstance(receipt["reason"], str) or not _safe_identity(receipt["reason"])))
+            or not isinstance(receipt["successors"], list) or len(receipt["successors"]) > MAX_BATCH_ATTEMPTS
+            or any(not isinstance(n, str) or not _safe_identity(n) for n in receipt["successors"])
+            or (receipt["state"] != "succeeded" and receipt["successors"])
+            or (receipt["state"] == "succeeded" and receipt["exit_code"] != 0)):
+        return False
+    return hashlib.sha256(json.dumps(box["receipt"], sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest() == box["digest"]
 
 
 @dataclass(frozen=True)
@@ -1122,6 +1165,7 @@ def _write_supervisor_state_unlocked(
     *,
     phase: str = "parked",
     outbox: SupervisorOutbox | None = None,
+    resource: dict[str, object] | None = None,
 ) -> None:
     if path is None:
         return
@@ -1148,6 +1192,16 @@ def _write_supervisor_state_unlocked(
         "delivered_attempt_ids": sorted(delivered_attempt_ids),
         "phase": phase,
     }
+    # A model-child phase update cannot erase an unacknowledged resource result.
+    if resource is None:
+        previous = read_supervisor_phase_state(path, parent_attempt_id)
+        resource = previous.resource if previous is not None else None
+    if resource is not None:
+        if (not valid_resource_state(resource) or
+                (resource["outbox"] is not None and
+                 resource["outbox"]["receipt"]["parent_attempt_id"] != parent_attempt_id)):
+            raise JoinContractError("supervisor-resource-state-invalid")
+        value["resource"] = resource
     if outbox is not None:
         if (
             not _safe_identity(outbox.receipt_id)
@@ -1412,9 +1466,12 @@ def read_supervisor_phase_state(
             receipt,
             frozenset(consumed),
         )
-    return SupervisorState(
-        str(value["phase"]), frozenset(delivered), outbox
-    )
+    resource = value.get("resource")
+    if resource is not None and (not valid_resource_state(resource) or
+            (resource["outbox"] is not None and
+             resource["outbox"]["receipt"]["parent_attempt_id"] != parent_attempt_id)):
+        return None
+    return SupervisorState(str(value["phase"]), frozenset(delivered), outbox, resource)
 
 
 def read_supervisor_state(

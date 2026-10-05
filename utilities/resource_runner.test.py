@@ -67,6 +67,92 @@ class TestRunner(unittest.TestCase):
                 self.assertEqual(self.registry.read_bytes(),preserved[0])
                 self.assertEqual(launch.call_count,0)
 
+    def test_owner_resource_external_watch_once_fence_and_fast_exit(self):
+        import artifact_producer
+        jobs = self.base / "owner-jobs.log"
+        jobs.write_text("")
+        route_file = self.base / "owner-route.json"
+        args = SimpleNamespace(jobs=str(jobs), run_id="owner-run", node="full-run")
+        placeholder = {"run_id":"owner-run", "cwd":str(self.repo), "log":str(self.log),
+            "command":[sys.executable,"-c",f"from pathlib import Path; Path({str(self.launch)!r}).write_text('once')"],
+            "route":str(route_file), "node":"full-run", "status":"launching", "sentinel":str(self.log)+".exit",
+            "parent_attempt_id":"att-parent", "owner_wait":{"session_id":"same-native"}}
+        real_popen = subprocess.Popen
+        watch = mock.Mock(pid=os.getpid())
+        watch.poll.return_value = None
+        payloads = []
+        def launch(argv, **kwargs):
+            if "watch" in argv:
+                os.write(kwargs["pass_fds"][0],b"ready\n")
+                return watch
+            proc = real_popen(argv, **kwargs)
+            payloads.append(proc)
+            return proc
+        route = {"route_id":"rt-owner", "route_hash":"sha256:owner"}
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}), \
+             mock.patch.object(artifact_producer,"prepare_route_artifact_env",return_value={"AGENT_ARTIFACT_OUTPUT_DIR":str(self.base)}), \
+             mock.patch.object(R,"register_registry"), \
+             mock.patch.object(R.subprocess,"run") as arm, \
+             mock.patch.object(R.subprocess,"Popen",side_effect=launch), \
+             mock.patch("sys.stdout"):
+            R.start_verified(self.registry,args,route,route_file,dict(placeholder))
+            payloads[0].wait(timeout=5)
+            R.start_verified(self.registry,args,route,route_file,dict(placeholder))
+        self.assertEqual(len(payloads),1)
+        self.assertEqual(self.launch.read_text(),"once")
+        self.assertEqual(arm.call_count,1)
+        self.assertIn("--successor-external",arm.call_args.args[0])
+        self.assertNotIn("--successor-command",arm.call_args.args[0])
+        row = json.loads(self.registry.read_text())["runs"]["owner-run"]
+        self.assertEqual(row["resource_policy"],"supervised-owner")
+        self.assertEqual(row["owner_wait"],placeholder["owner_wait"])
+        self.assertEqual(R.read_sentinel(row["sentinel"]),0)
+
+    def test_owner_start_derives_existing_native_tuple_and_refuses_foreign_or_unknown_before_spawn(self):
+        import dispatch_resource_wait as OWNER_RESOURCE
+        import owner_route_binding as OWNER
+        import dispatch_contract as CONTRACT
+        import dispatch_owner_input as INPUT
+        join = OWNER_RESOURCE.JOIN
+        jobs = self.base / "binding-state/jobs.log"
+        jobs.parent.mkdir()
+        jobs.write_text("time\topen\t/repo\t/wt\towner\tattempt_id=att-parent,attempt_schema_version=2,worker_type=owner,dispatch_depth=1\n")
+        state = CONTRACT.dispatch_state_root(jobs) / "supervisor-state/att-parent.json"
+        join.write_supervisor_state(state,"att-parent",set(),phase="running-turn")
+        args = SimpleNamespace(jobs=None,parent_attempt_id=None)
+        route_file = self.base / "bound-route.json"
+        route = {"route_id":"rt-bound","route_hash":"sha256:bound"}
+        binding = SimpleNamespace(route_file=str(route_file),route_id="rt-bound",route_hash="sha256:bound")
+        native = {"thread_id":"same-native","supervisor_live":True}
+        env = {"AGENT_DISPATCH_COMPLETION_MODE":"supervised", "AGENT_DISPATCH_ATTEMPT_ID":"att-parent",
+               "AGENT_OWNER_ROUTE_FILE":str(route_file),"AGENT_DISPATCH_JOBS":str(jobs),
+               "AGENT_DISPATCH_COMPLETION_STATE_FILE":str(state)}
+        with mock.patch.object(OWNER,"resolve_owner_route_lifecycle",return_value=(binding,"bound")), \
+             mock.patch.object(CONTRACT,"resolve_live_parent_attempt",return_value=SimpleNamespace(pid=444,pid_start="200")) as live, \
+             mock.patch.object(INPUT,"inspect",return_value=native), \
+             mock.patch.object(R.subprocess,"Popen") as spawn:
+            actual = OWNER_RESOURCE.start_binding(route,route_file,args,env)
+            self.assertEqual(actual,{"parent_attempt_id":"att-parent","session_id":"same-native",
+                "route_id":"rt-bound","route_hash":"sha256:bound","jobs":str(jobs),"owner_pid":444,"owner_start":"200"})
+            self.assertEqual(args.parent_attempt_id,"att-parent")
+            self.assertEqual(live.call_args.kwargs["repo"],"/repo")
+            self.assertEqual(live.call_args.kwargs["worktree"],"/wt")
+            self.assertEqual(join.read_supervisor_phase_state(state,"att-parent").resource["session_id"],"same-native")
+            before = state.read_bytes()
+            args.parent_attempt_id="att-foreign"
+            with self.assertRaisesRegex(ValueError,"resource-owner-attempt-conflict"):
+                OWNER_RESOURCE.start_binding(route,route_file,args,env)
+            args.parent_attempt_id="att-parent"
+            native["supervisor_live"]=False
+            with self.assertRaisesRegex(ValueError,"resource-owner-session-unavailable"):
+                OWNER_RESOURCE.start_binding(route,route_file,args,env)
+            native.update(supervisor_live=True,thread_id="different-native")
+            with self.assertRaisesRegex(ValueError,"resource-owner-session-conflict"):
+                OWNER_RESOURCE.start_binding(route,route_file,args,env)
+            self.assertEqual(state.read_bytes(),before)
+            self.assertEqual(spawn.call_count,0)
+            self.assertIsNone(OWNER_RESOURCE.start_binding(route,route_file,args,{}))
+
     def _resume_route(self):
         evidence = self.base / "headless.json"
         evidence.write_text(json.dumps({"candidates": [{"harness": "codex", "transport": "headless",

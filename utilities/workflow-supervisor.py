@@ -164,10 +164,14 @@ def resource_evidence(armed):
         return {"terminal": False, "reason": f"resource-registry-unreadable:{exc}"}
     if not isinstance(row, dict):
         return {"terminal": False, "reason": "resource-run-absent"}
-    resume = row.get("resource_policy") == "verified-resume"
+    resume = row.get("resource_policy") in {"verified-resume", "supervised-owner"}
     if resume and (row.get("route") != armed.get("route_file") or row.get("node") != armed.get("node")
                    or row.get("jobs") != armed.get("jobs")):
         return {"terminal": False, "reason": "resource-binding-mismatch"}
+    if row.get("resource_policy") == "supervised-owner":
+        import dispatch_resource_wait as OWNER_RESOURCE
+        if armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row):
+            return {"terminal": False, "reason": "resource-body-binding-mismatch"}
     if resume and row.get("status") == "launching":
         return {"terminal": False, "reason": "resource-launching"}
     row, _settled = runner().settle(registry, run_id, row)
@@ -369,11 +373,19 @@ def cmd_arm(args):
         "declared_outputs": list(node.get("outputs") or []),
         "armed_at": WS.now_iso(),
     }
+    if args.predecessor_kind == "resource":
+        resource = json.loads(Path(args.resource_registry).read_text())["runs"][args.predecessor_id]
+        if resource.get("resource_policy") == "supervised-owner":
+            import dispatch_resource_wait as OWNER_RESOURCE
+            if (resource.get("route") != record["route_file"] or resource.get("node") != args.node
+                    or resource.get("jobs") != record["jobs"]):
+                raise SupervisorError("resource-watch-binding-mismatch")
+            record["resource_binding"] = OWNER_RESOURCE.resource_body_digest(resource)
     ledger = ledger_for(route, getattr(args, "jobs", None))
     with ledger.lock():
         armed_dir(ledger).mkdir(parents=True, exist_ok=True)
         target = armed_dir(ledger) / f"{args.node}.json"
-        if RESOURCE_RESUME.route_selected(route) and target.exists():
+        if args.predecessor_kind == "resource" and target.exists():
             prior = json.loads(target.read_text())
             if any(prior.get(k) != record.get(k) for k in record if k != "armed_at"):
                 raise SupervisorError("resource-watch-binding-conflict")
@@ -459,7 +471,7 @@ def _evaluate(route, ledger, armed, results):
         evidence = resource_evidence(armed)
     else:
         evidence = registered_evidence(armed)
-    if (RESOURCE_RESUME.route_selected(route) and evidence.get("terminal")
+    if (evidence.get("resource_sha256") and evidence.get("terminal")
             and evidence.get("succeeded") and evidence.get("liveness") == "exited"):
         # Revalidate runtime evidence without writing the producer's declared output.
         row_data = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
@@ -512,8 +524,31 @@ def _evaluate(route, ledger, armed, results):
         # runtime identity remains in the resource registry and ledger evidence.
         route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
                                               Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
-    ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
-    started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
+    owner_row = (json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
+                 if armed["predecessor_kind"] == "resource" else {})
+    if owner_row.get("resource_policy") == "supervised-owner":
+        # The same input lock serializes correction admission and the external
+        # successor claim. No model child is started by this watcher.
+        import dispatch_owner_input as INPUT
+        owner = owner_row.get("owner_wait") or {}
+        try:
+            with INPUT._locked(armed["jobs"], owner["parent_attempt_id"]) as (_, value):
+                _, target = INPUT._target(armed["jobs"], owner["parent_attempt_id"])
+                if (value is None or value.get("target") != target
+                        or value.get("thread_id") != owner.get("session_id")
+                        or any(item.get("state") == "queued" for item in value["requests"])):
+                    results.append({"node": node_id, "action": "wait-owner-input"})
+                    return
+                if armed.get("successor_command") is not None or not armed.get("successor_external"):
+                    raise SupervisorError("resource-owner-successor-not-external")
+                ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
+                started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
+        except (INPUT.InputError, KeyError):
+            results.append({"node": node_id, "action": "wait-owner-input-unavailable"})
+            return
+    else:
+        ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
+        started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
     row["action"] = "advanced"
     row["successors"] = started
     if any(entry.get("created") for entry in started):

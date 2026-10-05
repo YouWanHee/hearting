@@ -12,6 +12,7 @@ import selectors
 import shlex
 import subprocess
 from dispatch_owner_input import OwnerInput
+import dispatch_resource_wait as RESOURCE_WAIT
 import sys
 import time
 from typing import Any, NamedTuple
@@ -933,7 +934,7 @@ def claude_command(
     else:
         command = ["claude"]
     command += ["-p"]
-    command += ["--session-id" if stream or not resume else "--resume", session_id]
+    command += ["--resume" if resume else "--session-id", session_id]
     hook_command = " ".join(
         shlex.quote(value)
         for value in (
@@ -1001,10 +1002,10 @@ def result_answers_turn(result: dict[str, Any], turn_uuid: str | None = None) ->
 class ClaudeStreamSession:
     """One long-lived realtime-input Claude process for every owner boundary."""
 
-    def __init__(self, args: argparse.Namespace, session_id: str) -> None:
+    def __init__(self, args: argparse.Namespace, session_id: str, *, resume: bool = False) -> None:
         try:
             self.process = subprocess.Popen(
-                claude_command(args, session_id, False, stream=True),
+                claude_command(args, session_id, resume, stream=True),
                 cwd=args.worktree,
                 env={
                     **os.environ,
@@ -1314,7 +1315,9 @@ def main(argv: list[str] | None = None) -> int:
             return 70
         emit({"type": "dispatch.supervisor.error", "reason": "initial-prompt-empty"})
         return 64
-    session_id = "" if args.runtime_harness == "opencode" else str(uuid.uuid4())
+    prior_resource = read_supervisor_phase_state(Path(args.state_file), args.parent_attempt_id) if args.state_file else None
+    saved_session = (prior_resource.resource or {}).get("session_id") if prior_resource else None
+    session_id = "" if args.runtime_harness == "opencode" else saved_session or str(uuid.uuid4())
     # This attempt log is a receipt log, never a transcript: it carries control rows
     # plus exactly one final `result`, and deliberately never echoes model text. A
     # summary producer reading only this file therefore has no conversational input
@@ -1359,7 +1362,7 @@ def main(argv: list[str] | None = None) -> int:
     next_prompt = initial_prompt
     pending_notice = ""
     continuations = 0
-    resume = False
+    resume = bool(saved_session)
     turn_ordinal = 0
     turn_transport = resolved_turn_transport(args)
     stream_session: ClaudeStreamSession | None = None
@@ -1384,7 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
         control = OwnerInput(args.jobs, args.parent_attempt_id, input_thread,
                              args.runtime_harness + "-next-turn", emit)
         if turn_transport == "stream-json":
-            stream_session = ClaudeStreamSession(args, session_id)
+            stream_session = ClaudeStreamSession(args, session_id, resume=bool(saved_session))
         recovered = read_supervisor_phase_state(
             state_path, args.parent_attempt_id
         )
@@ -1428,6 +1431,11 @@ def main(argv: list[str] | None = None) -> int:
                 delivery_timing = validate_delivery_timing(
                     (active_outbox.receipt or {})["delivery_timing"]
                 )
+        if recovered is not None and recovered.resource is not None and active_outbox is None:
+            resource_prompt = RESOURCE_WAIT.wait(args, state_path, control, delivered, emit)
+            if resource_prompt is not None:
+                next_prompt = resource_prompt
+                resume = True
         while True:
             if pending_handoff_intent is None and active_outbox is not None and active_outbox.receipt is not None:
                 if delivery_timing["same_thread_resume_ns"] is None:
@@ -1441,6 +1449,12 @@ def main(argv: list[str] | None = None) -> int:
                     resumed_receipt, active_outbox, jobs=args.jobs,
                     notice=pending_notice,
                 )
+            resource_state = read_supervisor_phase_state(state_path, args.parent_attempt_id)
+            resource_box = (resource_state.resource or {}).get("outbox") if resource_state else None
+            resource_receipt_id = ""
+            if resource_box and active_outbox is None:
+                next_prompt = RESOURCE_WAIT.pending_prompt(state_path, args.parent_attempt_id, args, control)
+                resource_receipt_id = resource_box["receipt_id"]
             begin_supervisor_turn(
                 state_path, args.parent_attempt_id, delivered,
                 receipt_id=active_outbox.receipt_id if active_outbox is not None else None,
@@ -1545,6 +1559,8 @@ def main(argv: list[str] | None = None) -> int:
             rows = current_children(Path(args.jobs), args.parent_attempt_id,
                                     route_id=args.route_id, route_hash=args.route_hash)
             current = {row.attempt_id: row for row in rows}
+            if resource_receipt_id:
+                RESOURCE_WAIT.acknowledge(state_path, args.parent_attempt_id, resource_receipt_id)
             completed_delivery = False
             if active_outbox is not None:
                 acknowledge_supervisor_delivery(
@@ -1609,6 +1625,25 @@ def main(argv: list[str] | None = None) -> int:
                     "ordinal": 1,
                     **delivery_timing,
                 })
+            # A resource never makes an unstarted model leg joinable. Collect
+            # actual model children first, and preserve their refusal semantics.
+            if not park_attempts and not unstarted and not partition.chain_pending:
+                resource_prompt = RESOURCE_WAIT.wait(args, state_path, control, delivered, emit)
+                if resource_prompt is not None:
+                    resource_state = read_supervisor_phase_state(state_path, args.parent_attempt_id)
+                    if resource_state is not None and (resource_state.resource or {}).get("outbox"):
+                        verdict, notice = _admit_continuation(
+                            ledger, budget_state_root, parent_attempt_id=args.parent_attempt_id,
+                            route_id=args.route_id, route_hash=args.route_hash,
+                            ordinal=continuations, purpose="ordinary", stalled=False,
+                            warning_threshold=args.continuation_warning_threshold)
+                        if not verdict.admitted:
+                            raise SupervisorError("continuation-limit-exceeded")
+                        continuations += 1
+                        resource_prompt = _apply_notice(resource_prompt, notice)
+                    next_prompt = resource_prompt
+                    resume = True
+                    continue
             empty_wait = (not current and runtime_wait_requested(result.get("result"))) or (
                 runtime_wait_requested(result.get("result")) and not partition.joinable
                 and not partition.chain_pending and bool(partition.refusal_settled)
@@ -2050,8 +2085,9 @@ def main(argv: list[str] | None = None) -> int:
             }
         except Exception:
             open_children = set()
+        resource_recovery = RESOURCE_WAIT.needs_recovery(state_path, args.parent_attempt_id, lease_exit[0] is not None)
         try:
-            if open_children:
+            if open_children or resource_recovery:
                 write_supervisor_state(
                     state_path,
                     args.parent_attempt_id,
@@ -2075,7 +2111,7 @@ def main(argv: list[str] | None = None) -> int:
             if lease_acquired:
                 try:
                     lease.__exit__(
-                        *(lease_exit if open_children else (None, None, None))
+                        *(lease_exit if open_children or resource_recovery else (None, None, None))
                     )
                 except Exception as exc:
                     emit(

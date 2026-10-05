@@ -58,13 +58,13 @@ def settle(registry, run_id, run):
     recorded by whoever notices it first and is idempotent afterwards.
     """
     liveness,_current,reason=classify_identity(run)
-    if liveness=="working" or (run.get("resource_policy") == "verified-resume"
+    if liveness=="working" or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
                               and run.get("status") == "launching"):
         return run, False
     exit_code=read_sentinel(run.get("sentinel"))
-    if run.get("resource_policy") == "verified-resume" and run.get("cancel_requested") is True:
+    if run.get("resource_policy") in {"verified-resume", "supervised-owner"} and run.get("cancel_requested") is True:
         status,state,failure="failed","CANCELLED","cancelled"
-    elif run.get("resource_policy") == "verified-resume" and liveness != "exited":
+    elif run.get("resource_policy") in {"verified-resume", "supervised-owner"} and liveness != "exited":
         status,state,failure="failed","FAILED_RETRYABLE",reason
     elif exit_code==0:
         status,state,failure="succeeded","STAGE_SUCCEEDED",None
@@ -98,9 +98,12 @@ def start_verified(registry, args, route, route_file, placeholder):
     inherited_jobs = os.environ.get("AGENT_DISPATCH_JOBS")
     if inherited_jobs and Path(inherited_jobs).resolve(strict=True) != jobs:
         raise ValueError("resource-dispatch-jobs-conflict")
-    placeholder.update(resource_policy="verified-resume", route=str(route_file), jobs=str(jobs))
+    owner_wait = placeholder.get("owner_wait")
+    placeholder.update(resource_policy="supervised-owner" if owner_wait else "verified-resume",
+                       route=str(route_file), jobs=str(jobs))
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
-            "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout")
+            "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
+            "resource_policy", "owner_wait")
     def reserve(data):
         matches = [row for row in data["runs"].values() if row.get("route") == str(route_file)
                    and row.get("node") == args.node]
@@ -131,11 +134,13 @@ def start_verified(registry, args, route, route_file, placeholder):
                      "start", "--route", str(route_file), "--jobs", str(jobs)]
         supervisor = str(Path(__file__).with_name("workflow-supervisor.py"))
         environment = {**os.environ, "AGENT_DISPATCH_JOBS": str(jobs)}
+        continuation = (["--successor-external"] if owner_wait else
+                        ["--successor-command", json.dumps(successor)])
         subprocess.run([sys.executable, supervisor, "arm", "--route", str(route_file),
             "--node", args.node, "--predecessor-kind", "resource", "--predecessor-id", args.run_id,
             "--resource-registry", str(registry), "--jobs", str(jobs),
             "--artifact-base", artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
-            "--successor-command", json.dumps(successor), "--successor-cwd", str(placeholder["cwd"]),
+            *continuation, "--successor-cwd", str(placeholder["cwd"]),
             "--successor-log", str(runtime / "verification-start.log")],
             check=True, env=environment, stdout=subprocess.DEVNULL, timeout=30)
         ready_read, ready_write = os.pipe()
@@ -309,7 +314,13 @@ def main():
                      "sentinel":str(sentinel),
                      "parent_attempt_id":args.parent_attempt_id,
                      "workflow_state":"READY","started_at":time.time()}
-        if resume:
+        owner_wait = None
+        if not resume and (node.get("continuation") or {}).get("kind") == "supervised":
+            import dispatch_resource_wait as OWNER_RESOURCE
+            owner_wait = OWNER_RESOURCE.start_binding(route, route_file, args, os.environ)
+            if owner_wait:
+                placeholder.update(parent_attempt_id=args.parent_attempt_id, owner_wait=owner_wait)
+        if resume or owner_wait:
             start_verified(registry, args, route, route_file, placeholder)
             return
         def reserve(data):
@@ -384,7 +395,7 @@ def main():
             if os.getpgid(pid)!=group: fail("process group changed before signal")
         except OSError:
             fail("process group changed before signal")
-        if run.get("resource_policy") == "verified-resume":
+        if run.get("resource_policy") in {"verified-resume", "supervised-owner"}:
             def cancel(data):
                 row = data["runs"][args.run_id]
                 if any(row.get(k) != run.get(k) for k in ("pid", "starttime", "command_hash")):
