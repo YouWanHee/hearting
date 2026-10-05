@@ -803,6 +803,14 @@ Runtime identity stays in the resource registry and ledger. The supervisor reads
 producer artifacts without replacing or synthesizing them; missing declared output
 blocks verification.
 
+A supervised route owner starts its ordinary detached resource through the same
+runner, which arms the watch before releasing the payload. It yields the model
+turn with `runtime_wait: registered-children`; the existing controller waits for
+the exact resource outside that turn and resumes the same native owner from a
+bounded receipt. Resource receipts are separate from registered model children.
+The watch preserves evidence; the owner admits its next work after pending user
+corrections. Exit alone is neither verification PASS nor workflow completion.
+
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
 keeps the exact question and gate available for a later real answer; independent

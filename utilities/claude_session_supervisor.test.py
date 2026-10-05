@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import hashlib
 import importlib.util
 import os
@@ -275,6 +276,66 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             env=self.child_env(FAKE_TRACE=str(self.trace), **extra_env),
             timeout=10,
         )
+
+    def test_resource_only_park_resumes_same_owner_after_runtime_poll_not_a_bash_wait(self):
+        import dispatch_resource_wait as RESOURCE
+        from types import SimpleNamespace
+        module = supervisor
+        self.jobs.write_text(owner_row(self.lease))
+        route_value = seal_route({"schema_version":2,"cwd":str(self.base),
+            "nodes":[{"id":"full-run","kind":"resource-runner","continuation":{"kind":"supervised"}},
+                     {"id":"verify"}]})
+        route_path = self.base / "resource-route.json"
+        route_path.write_text(json.dumps(route_value))
+        route_args = ["--route-file",str(route_path),"--route-id",route_value["route_id"],"--route-hash",route_value["route_hash"]]
+        row = {"run_id":"approved","pid":555,"starttime":"201","command":["approved"],
+               "node":"full-run","status":"running","sentinel":"/fixture-exit"}
+        stage = {"state":"RUNNING"}
+        events,turns = [],[]
+        def poll(*_):
+            events.append("runtime-poll")
+            row.update(status="succeeded",exit_code=0)
+            stage.update(state="STAGE_SUCCEEDED",evidence={"resource_sha256":RESOURCE.RESUME.row_digest(row)})
+        sup = SimpleNamespace(poll_once=poll,resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+            artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
+        ledger = SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}})
+        ctx = (sup,route_value,ledger,[({"node":"full-run","successors":["verify"]},row)])
+        def turn(*a,**k):
+            events.append("model-turn")
+            prompt,session = a[2],a[1]
+            turns.append((session,prompt))
+            text = "runtime_wait: registered-children" if len(turns)==1 else "artifact: -\nverdict: PASS\nblocker: none"
+            return {"type":"result","subtype":"success","is_error":False,"result":text},0
+        with mock.patch.object(RESOURCE,"context",return_value=ctx), \
+             mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=True), \
+             mock.patch.object(module,"run_turn",side_effect=turn), \
+             mock.patch.object(module,"reconcile",return_value=True), \
+             mock.patch.object(sys,"stdin",io.StringIO("initial assignment")), \
+             mock.patch.object(module,"emit"), mock.patch.object(module,"resolved_turn_transport",return_value="resume-process"):
+            self.assertEqual(module.main(self.command()[2:]+route_args),0)
+        self.assertEqual(events,["model-turn","runtime-poll","model-turn"])
+        self.assertEqual(len(turns),2)
+        self.assertEqual(turns[0][0],turns[1][0])
+        self.assertIn("Runtime resource receipt",turns[1][1])
+        self.assertIn('"verification_pass":false',turns[1][1])
+        self.assertIn("not a model child",turns[1][1])
+        self.assertNotIn("registration-required",turns[1][1])
+    def test_resource_phase_restart_resumes_exact_native_session(self):
+        self.jobs.write_text(owner_row(self.lease))
+        join = supervisor.RESOURCE_WAIT.JOIN
+        join.write_supervisor_state(self.state,PARENT,set(),phase="recovery")
+        with join._supervisor_state_lock(self.state):
+            join._write_supervisor_state_unlocked(self.state,PARENT,set(),phase="recovery",
+                resource={"session_id":"fixture-original-native","delivered":["a"*64],"outbox":None})
+        result = self.run_supervisor()
+        self.assertEqual(result.returncode,0,result.stderr+result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(len(trace),1)
+        self.assertEqual(trace[0]["session"],"fixture-original-native")
+        self.assertTrue(trace[0]["resume"])
+        self.assertIn("--resume",trace[0]["args"])
+        self.assertNotIn("--session-id",trace[0]["args"])
+        self.assertNotIn("registration-required",result.stdout)
 
     def test_resume_uses_same_session_once_after_join(self):
         self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")

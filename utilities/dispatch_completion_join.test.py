@@ -1111,6 +1111,181 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                 liveness_command=[str(self.live)],
             )
 
+    def test_resource_wait_long_silent_runtime_receipt_and_exact_returning_turn_ack(self):
+        import dispatch_resource_wait as RESOURCE
+        from types import SimpleNamespace
+        path = self.root / "state.json"
+        args = SimpleNamespace(parent_attempt_id="att-parent", route_id="rt-resource",
+                               route_hash="sha256:route", jobs=str(self.jobs))
+        control = SimpleNamespace(thread_id="same-native", pending=lambda: False)
+        run = {"run_id":"long", "pid":123, "starttime":"100", "command":["approved"],
+               "route":"/exact", "node":"full-run", "jobs":str(self.jobs),
+               "owner_wait":{"parent_attempt_id":"att-parent"}, "status":"running", "sentinel":"/exit"}
+        armed = {"node":"full-run", "successors":["run-verify"]}
+        stage = {"state":"RUNNING"}
+        polls, virtual_seconds, events = [], [], []
+        def poll(*_):
+            polls.append(1)
+            if len(polls) == 3:
+                run.update(status="succeeded", exit_code=0)
+                stage.update(state="STAGE_SUCCEEDED", evidence={"resource_sha256":RESOURCE.RESUME.row_digest(run)})
+        sup = SimpleNamespace(poll_once=poll,
+            resource_evidence=lambda _: {"terminal":run["status"]=="succeeded", "succeeded":run["status"]=="succeeded",
+                                         "liveness":"exited", "exit_code":0},
+            artifact_evidence=lambda _: {"checked":True,"missing":[]},
+            runner=lambda: SimpleNamespace(read_sentinel=lambda _:0))
+        ledger = SimpleNamespace(state=lambda: {"nodes":{"full-run":stage}})
+        ctx = (sup, {}, ledger, [(armed,run)])
+        JOIN.write_supervisor_state(path,"att-parent",set(),phase="running-turn")
+        with mock.patch.object(RESOURCE,"context",return_value=ctx), \
+             mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=True):
+            prompt = RESOURCE.wait(args,path,control,set(),events.append,sleep=lambda _:virtual_seconds.append(4000))
+            self.assertEqual(sum(virtual_seconds),8000)
+            self.assertEqual(len(polls),3)
+            self.assertEqual(len(events),1)
+            self.assertIn('"verification_pass":false',prompt)
+            state = JOIN.read_supervisor_phase_state(path,"att-parent")
+            self.assertEqual(state.delivered_attempt_ids,frozenset())
+            self.assertIsNone(state.outbox)
+            self.assertEqual(state.resource["session_id"],"same-native")
+            receipt = state.resource["outbox"]["receipt_id"]
+            original = path.read_bytes()
+            self.assertEqual(RESOURCE.wait(args,path,control,set(),events.append),prompt)
+            self.assertEqual(path.read_bytes(),original)
+            self.assertEqual(len(polls),3)
+            JOIN.begin_supervisor_turn(path,"att-parent",set())
+            self.assertEqual(RESOURCE.pending_prompt(path,"att-parent"),prompt)
+            self.assertFalse(RESOURCE.acknowledge(path,"att-parent","resource-stale"))
+            self.assertIsNotNone(JOIN.read_supervisor_phase_state(path,"att-parent").resource["outbox"])
+            self.assertTrue(RESOURCE.acknowledge(path,"att-parent",receipt))
+            self.assertFalse(RESOURCE.acknowledge(path,"att-parent",receipt))
+            self.assertIsNone(RESOURCE.wait(args,path,control,set(),events.append))
+            self.assertEqual(len(polls),3)
+
+    def test_resource_correction_and_attention_never_become_model_child_success(self):
+        import dispatch_resource_wait as RESOURCE
+        from types import SimpleNamespace
+        args = SimpleNamespace(parent_attempt_id="att-parent", route_id="rt-resource", route_hash="hash", jobs=str(self.jobs))
+        for reason in ("cancelled","failed","unknown","lostwatch"):
+            with self.subTest(reason=reason):
+                path = self.root / (reason + ".json")
+                row = {"run_id":"run", "pid":123, "starttime":"100", "command":["approved"],
+                       "node":"full-run", "owner_wait":{}, "status":"failed", "cancel_requested":reason=="cancelled"}
+                stage = {"state":"RUNNING" if reason=="lostwatch" else "FAILED_RETRYABLE"}
+                sup = SimpleNamespace(poll_once=mock.Mock(), resource_evidence=lambda _: {"terminal":False},
+                    artifact_evidence=lambda _: {"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:None))
+                ledger = SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}})
+                ctx = (sup,{},ledger,[({"node":"full-run","successors":["verify"]},row)])
+                control = SimpleNamespace(thread_id="same-native", pending=lambda:True)
+                with mock.patch.object(RESOURCE,"context",return_value=ctx), \
+                     mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=reason!="lostwatch"):
+                    prompt = RESOURCE.wait(args,path,control,set(),lambda _:None)
+                    self.assertIn("pending user correction",prompt)
+                    self.assertEqual(sup.poll_once.call_count,0)
+                    self.assertIsNone(JOIN.read_supervisor_phase_state(path,"att-parent").resource["outbox"])
+                    control.pending = lambda:False
+                    prompt = RESOURCE.wait(args,path,control,set(),lambda _:None)
+                    state = JOIN.read_supervisor_phase_state(path,"att-parent")
+                    self.assertEqual(state.resource["outbox"]["receipt"]["successors"],[])
+                    self.assertFalse(state.resource["outbox"]["receipt"]["verification_pass"])
+                    self.assertEqual(state.delivered_attempt_ids,frozenset())
+                    self.assertIn('"state":"cancelled"' if reason=="cancelled" else '"state":"needs-attention"',prompt)
+                    control.thread_id="foreign-native"
+                    with self.assertRaisesRegex(JOIN.JoinContractError,"resource-outbox-binding-changed"):
+                        RESOURCE.wait(args,path,control,set(),lambda _:None)
+
+    def test_resource_context_keeps_owner_session_route_jobs_and_original_body_together(self):
+        import copy
+        import dispatch_resource_wait as RESOURCE
+        import owner_route_binding as OWNER
+        from types import SimpleNamespace
+        jobs = self.jobs
+        jobs.write_text("")
+        path = self.root / "route.json"
+        path.write_text("{}")
+        registry = self.root / "resources.json"
+        args = SimpleNamespace(jobs=str(jobs),route_file=str(path),route_id="rt-resource",
+                               route_hash="sha256:route",parent_attempt_id="att-parent")
+        control = SimpleNamespace(thread_id="same-native")
+        owner = {"parent_attempt_id":"att-parent","session_id":"same-native","route_id":"rt-resource",
+                 "route_hash":"sha256:route","jobs":str(jobs),"owner_pid":444,"owner_start":"200"}
+        row = {"run_id":"approved","pid":555,"starttime":"201","command":["approved-command"],
+               "command_hash":"a"*64,"launch_argv":["wrapper","approved-command"],"process_group":555,
+               "route":str(path),"node":"full-run","jobs":str(jobs),"parent_attempt_id":"att-parent",
+               "resource_policy":"supervised-owner","owner_wait":owner}
+        armed = {"predecessor_kind":"resource","predecessor_id":"approved","resource_registry":str(registry),
+                 "node":"full-run","route_id":"rt-resource","route_hash":"sha256:route",
+                 "route_file":str(path),"jobs":str(jobs),"successor_external":True,"successor_command":None,
+                 "resource_binding":RESOURCE.resource_body_digest(row)}
+        parent = SimpleNamespace(status="open",raw="time\topen\t/repo\t/wt\towner\tmeta",
+                                 metadata={"pid":"444","pid_start":"200"})
+        sup = SimpleNamespace(load_route=lambda _: {"route_id":"rt-resource","route_hash":"sha256:route"},
+                              ledger_for=lambda *_:None,read_armed=lambda _:{"full-run":armed})
+        binding = SimpleNamespace(route_file=str(path),route_id="rt-resource",route_hash="sha256:route")
+        def write(value): registry.write_text(json.dumps({"runs":{"approved":value}}))
+        write(row)
+        with mock.patch.object(RESOURCE,"supervisor",return_value=sup), \
+             mock.patch.object(OWNER,"resolve_owner_route_lifecycle",return_value=(binding,"bound")), \
+             mock.patch.object(OWNER,"_owner_row_proof"), \
+             mock.patch.object(RESOURCE.JOIN,"exact_attempt_row",return_value=parent):
+            self.assertEqual(len(RESOURCE.context(args,control)[3]),1)
+            for field,value in (("session_id","foreign-native"),("route_hash","foreign-hash"),
+                                ("jobs",str(self.root/"foreign-jobs")),("owner_start","201")):
+                bad = copy.deepcopy(row)
+                bad["owner_wait"][field]=value
+                write(bad)
+                with self.assertRaisesRegex(JOIN.JoinContractError,"resource-owner-binding-invalid"):
+                    RESOURCE.context(args,control)
+            for field,value in (("command",["foreign-command"]),("pid",True),("node","foreign-node")):
+                bad = copy.deepcopy(row)
+                bad[field]=value
+                write(bad)
+                with self.assertRaisesRegex(JOIN.JoinContractError,"resource-owner-binding-invalid"):
+                    RESOURCE.context(args,control)
+            write(row)
+            armed["successor_command"]=["would-spawn-model"]
+            with self.assertRaisesRegex(JOIN.JoinContractError,"resource-owner-binding-invalid"):
+                RESOURCE.context(args,control)
+
+    def test_resource_state_reader_rejects_malformed_foreign_and_false_pass(self):
+        import copy
+        import dispatch_resource_wait as RESOURCE
+        from types import SimpleNamespace
+        path = self.root / "resource-state.json"
+        JOIN.write_supervisor_state(path,"att-parent",set())
+        resource = {"session_id":"same-native","delivered":[],"outbox":None}
+        with JOIN._supervisor_state_lock(path):
+            JOIN._write_supervisor_state_unlocked(path,"att-parent",set(),resource=resource)
+        baseline = json.loads(path.read_text())
+        for mutated in ([{}], [True], ["not-a-digest"], ["a"*64,"a"*64]):
+            bad = copy.deepcopy(baseline)
+            bad["resource"]["delivered"] = mutated
+            path.write_text(json.dumps(bad))
+            self.assertIsNone(JOIN.read_supervisor_phase_state(path,"att-parent"))
+        path.write_text(json.dumps(baseline))
+        JOIN.begin_supervisor_turn(path,"att-parent",set())
+        self.assertEqual(JOIN.read_supervisor_phase_state(path,"att-parent").resource,resource)
+        self.assertTrue(RESOURCE.needs_recovery(path,"att-parent",failed=True))
+        self.assertFalse(RESOURCE.needs_recovery(path,"att-parent"))
+        receipt = {"type":"resource-completion","parent_attempt_id":"att-parent","session_id":"same-native",
+            "route_id":"rt-resource","route_hash":"sha256:route","jobs":str(self.jobs),"node":"full-run",
+            "run_id":"approved","resource_key":"a"*64,"resource_sha256":"b"*64,"state":"succeeded",
+            "exit_code":0,"reason":"STAGE_SUCCEEDED","verification_pass":False,"workflow_complete":False,
+            "successors":["verify"]}
+        resource["outbox"]={"receipt_id":"resource-"+RESOURCE.RESUME.row_digest(receipt)[:32],"digest":RESOURCE.RESUME.row_digest(receipt),
+                            "key":"a"*64,"receipt":receipt}
+        with JOIN._supervisor_state_lock(path):
+            JOIN._write_supervisor_state_unlocked(path,"att-parent",set(),phase="deliverable",resource=resource)
+        baseline = json.loads(path.read_text())
+        for field,value in (("verification_pass",True),("workflow_complete",True),("exit_code",False),
+                            ("state",[]),("parent_attempt_id","att-foreign"),("unrecognized","transport-ack")):
+            bad = copy.deepcopy(baseline)
+            box = bad["resource"]["outbox"]
+            box["receipt"][field]=value
+            box["digest"]=RESOURCE.RESUME.row_digest(box["receipt"])
+            path.write_text(json.dumps(bad))
+            self.assertIsNone(JOIN.read_supervisor_phase_state(path,"att-parent"))
+
     def test_supervisor_phase_state_is_atomic_bounded_and_parent_scoped(self):
         state = self.root / "runtime" / "parent.json"
         JOIN.write_supervisor_state(state, "att-parent", {"att-b", "att-a"})

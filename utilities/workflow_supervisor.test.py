@@ -373,6 +373,53 @@ class TestSupervisorAdvance(WorkflowFixture):
         self.arm(path, registry, node="resume-run", extra=("--jobs", str(jobs), "--artifact-base", str(output)))
         return route, path, jobs, registry, output
 
+    def test_owner_resource_correction_is_checked_under_input_lock_before_once_external_claim(self):
+        import contextlib
+        import dispatch_owner_input as INPUT
+        route, path, jobs, registry, output = self._resume_fixture()
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        row.update(resource_policy="supervised-owner", owner_wait={"parent_attempt_id":"att-parent","session_id":"same-native"})
+        registry.write_text(json.dumps({"runs":{"fixture-run":row}}))
+        ledger = SUP.ledger_for(route,jobs)
+        arm_path = ledger.root / "armed/resume-run.json"
+        armed = json.loads(arm_path.read_text())
+        import dispatch_resource_wait as OWNER_RESOURCE
+        armed.update(successor_command=None,successor_external=True,
+                     resource_binding=OWNER_RESOURCE.resource_body_digest(row))
+        arm_path.write_text(json.dumps(armed))
+        value = {"target":"exact-target","thread_id":"same-native","requests":[{"state":"queued"}]}
+        locked = []
+        @contextlib.contextmanager
+        def input_lock(*_):
+            locked.append(True)
+            try: yield None,value
+            finally: locked.pop()
+        original_claim = SUP._claim_successors
+        claims = []
+        def checked_claim(*a,**k):
+            self.assertEqual(locked,[True])
+            self.assertFalse(any(i["state"]=="queued" for i in value["requests"]))
+            claims.append(1)
+            return original_claim(*a,**k)
+        with mock.patch.object(INPUT,"_locked",side_effect=input_lock), \
+             mock.patch.object(INPUT,"_target",return_value=(None,"exact-target")), \
+             mock.patch.object(SUP.RESOURCE_RESUME,"route_selected",return_value=False), \
+             mock.patch.object(SUP,"_claim_successors",side_effect=checked_claim), \
+             mock.patch.object(SUP.subprocess,"Popen") as spawn:
+            result = SUP.poll_once(route,ledger)
+            self.assertEqual(result[0]["action"],"wait-owner-input")
+            self.assertEqual(ledger.claims(),{})
+            self.assertNotEqual(ledger.state()["nodes"]["resume-run"]["state"],"STAGE_SUCCEEDED")
+            value["requests"][0]["state"]="delivered"
+            result = SUP.poll_once(route,ledger)
+            self.assertEqual(result[0]["action"],"advanced")
+            self.assertEqual(len(ledger.claims()),1)
+            self.assertEqual(result[0]["successors"][0]["started"],False)
+            self.assertEqual(SUP.poll_once(route,ledger)[0]["action"],"settled")
+            self.assertEqual(len(claims),1)
+            self.assertEqual(spawn.call_count,0)
+        self.assertEqual((output/"run.json").read_bytes(),b'{\n "payload": "fixture-resume", "count": 1, "sum": 10\n}\n')
+
     def test_verified_resume_exit_marker_claim_and_replay_are_not_workflow_complete(self):
         route, path, jobs, registry, output = self._resume_fixture()
         ledger = SUP.ledger_for(route, jobs)

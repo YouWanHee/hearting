@@ -6,8 +6,12 @@ separable `standard+` work, dispatch registered dispatch-depth-2 stages through
 the shared `dispatch-chain` entry against the inherited registry. Obey the selected
 runtime completion-delivery boundary: a supervised owner yields the current turn
 for the runtime join and resumes from its bounded typed receipt, while an explicitly
-reported polling fallback waits synchronously in the current turn. The runtime
-acknowledges notifications and reconciles exact worker outcomes; inspect the
+reported polling fallback waits synchronously in the current turn. It also joins a route-bound resource whose runner receipt confirms payload release
+and a ready supervisor. Yield the same wait sentinel after that receipt rather
+than waiting for training inside a Bash/model turn. This registered resource is
+not a model child and needs no model-child launch tuple. Its typed result resumes
+this owner; apply pending corrections before admitting the declared next work.
+The runtime acknowledges notifications and reconciles exact worker outcomes; inspect the
 reported evidence and decide the authorized next work. Synthesize one owner artifact. Do not
 merge, push, clean worktrees, or create dispatch depth 3.
 
