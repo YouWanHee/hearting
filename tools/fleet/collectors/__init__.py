@@ -337,6 +337,18 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
             share_registry_state(sessions)
     except Exception:
         pass
+    # Issue #158: one opencode session id → one row. A session leader plus its
+    # helper child (or any two processes that created nothing themselves) share
+    # the one directory-fallback guess and would otherwise render as identical
+    # rows. Runs here, after every binding is known and before the exact
+    # herdr/steward/peer joins below, which all key on session_id.
+    try:
+        collapse = getattr(modules.get("opencode"), "collapse_duplicate_sids", None)
+        if collapse and any(s.harness == "opencode" and getattr(s, "session_id", None)
+                            for s in sessions):
+            collapse(sessions)
+    except Exception:
+        pass
 
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.

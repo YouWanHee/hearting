@@ -304,5 +304,75 @@ class SessionBindingTest(unittest.TestCase):
         self.assertEqual(until, {2: 200, 3: 300, 1: None, 4: None})
 
 
+class DuplicateSidCollapseTest(unittest.TestCase):
+    """Issue #158 — a session leader plus its arg-less helper child bound the
+    same sid through the directory fallback and rendered as two identical
+    working rows. One session id must keep exactly one row; the loser returns
+    to anonymous-process state but its row stays (existence is the backbone's
+    decision, PRD §1)."""
+
+    def _row(self, pid, sid, kind=None, started=None, harness="opencode",
+             cwd="/repo", title="T", tag="[83]"):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            pid=pid, harness=harness, cwd=cwd, session_id=sid,
+            _opencode_bind_kind=kind,
+            proc_start=str(started) if started is not None else None,
+            session_tag=tag, slug="db-slug", title=title, summary="S",
+            summary_ts=1.0, subagents=[], model="m", effort="high",
+            effort_default=False, cost=1.0, tokens=10,
+            session_input_tokens=1, session_output_tokens=2,
+            session_reasoning_output_tokens=3, session_total_tokens=6,
+            active_context_tokens=5, context_window_tokens=100, ctx_pct=5,
+            _context_evidence="e", _refresh_source={"session_id": sid},
+            mtime=999.0)
+
+    def test_leader_keeps_sid_and_helper_is_unbound(self):
+        leader = self._row(100, "ses_1", kind="window", started=1000)
+        helper = self._row(200, "ses_1", kind="fallback", started=2000)
+        opencode.collapse_duplicate_sids([leader, helper])
+        self.assertEqual(leader.session_id, "ses_1")
+        self.assertEqual(leader.title, "T")
+        self.assertIsNone(helper.session_id)
+        self.assertIsNone(helper.session_tag)
+        self.assertIsNone(helper.title)
+        self.assertIsNone(helper.summary)
+        self.assertIsNone(helper.model)
+        self.assertIsNone(helper.ctx_pct)
+        self.assertIsNone(helper._refresh_source)
+        # the process row itself stays, with process-owned fields intact
+        self.assertEqual(helper.pid, 200)
+        self.assertEqual(helper.cwd, "/repo")
+        self.assertEqual(helper.slug, "repo")
+        self.assertEqual(helper.mtime, 999.0)
+
+    def test_window_beats_fallback_despite_pid_order(self):
+        # The fallback row enriches first (lower pid) but must not steal the
+        # session from the process that created it through its window.
+        fallback = self._row(50, "ses_1", kind="fallback", started=1000)
+        owner = self._row(200, "ses_1", kind="window", started=2000)
+        opencode.collapse_duplicate_sids([fallback, owner])
+        self.assertEqual(owner.session_id, "ses_1")
+        self.assertIsNone(fallback.session_id)
+
+    def test_two_fallbacks_keep_the_earliest_start(self):
+        old = self._row(300, "ses_1", kind="fallback", started=1000)
+        new = self._row(100, "ses_1", kind="fallback", started=2000)
+        opencode.collapse_duplicate_sids([old, new])
+        self.assertEqual(old.session_id, "ses_1")
+        self.assertIsNone(new.session_id)
+
+    def test_distinct_sids_and_other_harnesses_untouched(self):
+        a = self._row(100, "ses_1", kind="window", started=1000)
+        b = self._row(200, "ses_2", kind="fallback", started=2000)
+        c = self._row(300, "ses_1", kind="fallback", started=3000,
+                      harness="codex")
+        d = self._row(400, None, kind="fallback", started=4000)
+        opencode.collapse_duplicate_sids([a, b, c, d])
+        self.assertEqual((a.session_id, b.session_id, c.session_id, d.session_id),
+                         ("ses_1", "ses_2", "ses_1", None))
+        self.assertEqual(c.title, "T")
+
+
 if __name__ == "__main__":
     unittest.main()

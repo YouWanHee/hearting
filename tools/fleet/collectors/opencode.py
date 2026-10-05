@@ -184,24 +184,111 @@ def prepare_tick(sessions):
     return until
 
 
-def _query(cur, cwd, proc_start_ms=None, until_ms=None):
-    # N opencode processes can share one directory, and one process can open several
-    # sessions over its life (/new). Bind to the most recently updated top-level session
-    # created inside this process's window [own start, next same-directory start): the
-    # window keeps panes apart, and "most recently updated" follows the session the pane
-    # is on now instead of the first one it ever created. A process that attached to a
-    # pre-existing session has no candidate here and keeps the older binding below.
-    if proc_start_ms is not None:
-        bound = "AND time_created<? " if until_ms is not None else ""
-        args = (cwd, proc_start_ms) + ((until_ms,) if until_ms is not None else ())
-        row = cur.execute(
-            "SELECT %s FROM session WHERE directory=? AND parent_id IS NULL "
-            "AND time_created>=? %sORDER BY time_updated DESC LIMIT 1" % (_COLS, bound),
-            args,
-        ).fetchone()
-        if row:
-            return row
-    # prefer a top-level session; fall back to any session in the directory
+def _keeper_key(sess):
+    """Sort key for one member of a shared session id: window-bound rows created
+    the session (exact ownership), then earliest process start (the creator
+    started before any attacher or helper), then lowest pid. Missing evidence
+    sorts last — never used as a fact."""
+    kind = getattr(sess, "_opencode_bind_kind", None)
+    try:
+        started = int(getattr(sess, "proc_start", None))
+    except (TypeError, ValueError):
+        started = None
+    try:
+        pid = int(getattr(sess, "pid", None))
+    except (TypeError, ValueError):
+        pid = None
+    return (
+        0 if kind == "window" else 1,
+        started if started is not None and started >= 0 else float("inf"),
+        pid if pid is not None else float("inf"),
+    )
+
+
+def _unbind_shadow(sess):
+    """Return a duplicate-bound row to anonymous-process state.
+
+    The process row stays (existence is the backbone's decision, PRD §1) but
+    carries no session identity, so the exact herdr/steward/peer joins and the
+    tag mint — all keyed on session_id — answer on the keeper only. mtime is
+    kept: the transcript really is updating, and liveness must stay truthful
+    about the live process. slug is restored to the scan-time cwd basename.
+    """
+    sess.session_id = None
+    sess.session_tag = None
+    cwd = getattr(sess, "cwd", None)
+    sess.slug = os.path.basename(cwd.rstrip("/")) if cwd else None
+    sess.title = None
+    sess.summary = None
+    sess.summary_ts = None
+    sess.subagents = None
+    sess.model = None
+    sess.effort = None
+    sess.effort_default = False
+    sess.cost = None
+    sess.tokens = None
+    sess.session_input_tokens = None
+    sess.session_output_tokens = None
+    sess.session_reasoning_output_tokens = None
+    sess.session_total_tokens = None
+    sess.active_context_tokens = None
+    sess.context_window_tokens = None
+    sess.ctx_pct = None
+    sess._context_evidence = None
+    sess._refresh_source = None
+    sess._opencode_bind_kind = None
+
+
+def collapse_duplicate_sids(sessions):
+    """One session id → one row.
+
+    Measured 2026-10-05: a session leader plus its arg-less helper child bound
+    the same sid through the directory fallback and rendered as two identical
+    working rows (issue #158). The 2026-09-29 window binding only separates
+    processes that each created a session; every other process in the directory
+    shares the one fallback guess, so the losers must be unbound here, after
+    all bindings are known — a per-row claim inside enrich cannot do this,
+    because a lower-pid fallback row enriches before the higher-pid process
+    that actually owns the session through its window.
+    """
+    groups = {}
+    for sess in sessions:
+        if getattr(sess, "harness", None) != "opencode":
+            continue
+        sid = getattr(sess, "session_id", None)
+        if not sid:
+            continue
+        groups.setdefault(sid, []).append(sess)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=_keeper_key)
+        for loser in members[1:]:
+            _unbind_shadow(loser)
+
+
+def _query_window(cur, cwd, proc_start_ms, until_ms=None):
+    """The exact branch: the top-level session this process created.
+
+    Most recently updated among the sessions created inside this process's
+    window [own start, next same-directory start). Returns None when this
+    process created nothing (attached to a pre-existing session, or its own
+    session row does not exist yet) — the caller then falls back.
+    """
+    bound = "AND time_created<? " if until_ms is not None else ""
+    args = (cwd, proc_start_ms) + ((until_ms,) if until_ms is not None else ())
+    return cur.execute(
+        "SELECT %s FROM session WHERE directory=? AND parent_id IS NULL "
+        "AND time_created>=? %sORDER BY time_updated DESC LIMIT 1" % (_COLS, bound),
+        args,
+    ).fetchone()
+
+
+def _query_fallback(cur, cwd):
+    """The guess branch: most recently updated top-level session in the
+    directory, else any session there. Shared by every process that created
+    nothing itself — which is exactly why two such processes can land on one
+    session id (see collapse_duplicate_sids)."""
     for extra in ("AND parent_id IS NULL ", ""):
         row = cur.execute(
             "SELECT %s FROM session WHERE directory=? %s"
@@ -211,6 +298,21 @@ def _query(cur, cwd, proc_start_ms=None, until_ms=None):
         if row:
             return row
     return None
+
+
+def _query(cur, cwd, proc_start_ms=None, until_ms=None):
+    # N opencode processes can share one directory, and one process can open several
+    # sessions over its life (/new). Bind to the most recently updated top-level session
+    # created inside this process's window [own start, next same-directory start): the
+    # window keeps panes apart, and "most recently updated" follows the session the pane
+    # is on now instead of the first one it ever created. A process that attached to a
+    # pre-existing session has no candidate here and keeps the older binding below.
+    if proc_start_ms is not None:
+        row = _query_window(cur, cwd, proc_start_ms, until_ms)
+        if row:
+            return row
+    # prefer a top-level session; fall back to any session in the directory
+    return _query_fallback(cur, cwd)
 
 
 def _context_tokens_from_payload(payload):
@@ -291,8 +393,17 @@ def enrich(sess, tick=None):
     subagents = None
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1.0)
-        row = _query(con.cursor(), sess.cwd, _process_started_ms(sess),
-                     (tick or {}).get(sess.pid))
+        cur = con.cursor()
+        start_ms = _process_started_ms(sess)
+        row, sess._opencode_bind_kind = None, None
+        if start_ms is not None:
+            row = _query_window(cur, sess.cwd, start_ms, (tick or {}).get(sess.pid))
+            if row:
+                sess._opencode_bind_kind = "window"
+        if row is None:
+            row = _query_fallback(cur, sess.cwd)
+            if row:
+                sess._opencode_bind_kind = "fallback"
         if row and row[0]:
             table = _message_table(con)
             cursor = _observed_cursor(con, table, row[0])
