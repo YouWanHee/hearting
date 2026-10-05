@@ -12,6 +12,7 @@ import contextlib
 import copy
 import importlib.util
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -367,6 +368,7 @@ class TestSupervisorAdvance(WorkflowFixture):
         registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
         output = self.base / "artifacts"
         output.mkdir()
+        (output / "run.json").write_bytes(b'{\n "payload": "fixture-resume", "count": 1, "sum": 10\n}\n')
         os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
         self.arm(path, registry, node="resume-run", extra=("--jobs", str(jobs), "--artifact-base", str(output)))
         return route, path, jobs, registry, output
@@ -374,6 +376,9 @@ class TestSupervisorAdvance(WorkflowFixture):
     def test_verified_resume_exit_marker_claim_and_replay_are_not_workflow_complete(self):
         route, path, jobs, registry, output = self._resume_fixture()
         ledger = SUP.ledger_for(route, jobs)
+        producer = output / "run.json"
+        original_bytes = producer.read_bytes()
+        original_stat = producer.stat()
         with mock.patch.object(SUP, "_start_successor", return_value={"started": True, "surface": "fixture-CLI"}) as launch:
             result = SUP.poll_once(route, ledger)
             self.assertEqual(result[0]["action"], "advanced")
@@ -385,12 +390,63 @@ class TestSupervisorAdvance(WorkflowFixture):
         marker = jobs.parent / "completion" / route["route_id"] / "resume-run.json"
         self.assertTrue(marker.is_file())
         self.assertEqual(json.loads(marker.read_text())["node_id"], "resume-run")
+        self.assertEqual(json.loads(marker.read_text())["evidence"],
+                         {"path": str(producer), "sha256": hashlib.sha256(original_bytes).hexdigest()})
+        self.assertEqual(producer.read_bytes(), original_bytes)
+        self.assertEqual((producer.stat().st_ino, producer.stat().st_mtime_ns),
+                         (original_stat.st_ino, original_stat.st_mtime_ns))
         import resource_resume
         self.assertEqual(resource_resume.observation(route, jobs)["state"], "resource-succeeded")
         row = json.loads(registry.read_text())["runs"]["fixture-run"]
         Path(row["sentinel"]).write_text("7")
         self.assertEqual(resource_resume.observation(route, jobs)["state"], "needs-attention")
         self.assertEqual(jobs.read_text(), "")
+
+    def test_verified_resume_missing_producer_artifact_never_synthesizes_or_verifies(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        producer = output / "run.json"
+        producer.unlink()
+        ledger = SUP.ledger_for(route, jobs)
+        with mock.patch.object(SUP, "_start_successor") as launch:
+            result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]["action"], "halt-missing-artifact")
+            self.assertEqual(result[0]["evidence"]["artifacts"]["missing"], ["run.json"])
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halted")
+            self.assertEqual(launch.call_count, 0)
+        self.assertFalse(producer.exists())
+        self.assertFalse(producer.with_suffix(".json.tmp").exists())
+        self.assertFalse((jobs.parent / "completion" / route["route_id"] / "resume-run.json").exists())
+        self.assertEqual(ledger.claims(), {})
+        self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
+        self.assertEqual(jobs.read_text(), "")
+
+    def test_verified_resume_changed_runtime_evidence_preserves_producer_and_refuses_marker(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        ledger = SUP.ledger_for(route, jobs)
+        armed = SUP.read_armed(ledger)["resume-run"]
+        evidence = SUP.resource_evidence(armed)
+        original_registry = registry.read_bytes()
+        original_producer = (output / "run.json").read_bytes()
+        row = json.loads(original_registry)["runs"]["fixture-run"]
+        with mock.patch.object(SUP, "_start_successor") as launch:
+            for change in ("row-digest", "sentinel", "identity"):
+                with self.subTest(change=change):
+                    registry.write_bytes(original_registry)
+                    Path(row["sentinel"]).write_text("0")
+                    if change == "row-digest":
+                        changed = {**row, "exit_code": 7}
+                        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": changed}}))
+                    elif change == "sentinel":
+                        Path(row["sentinel"]).write_text("7")
+                    identity = "working" if change == "identity" else "exited"
+                    with mock.patch.object(SUP, "resource_evidence", return_value=dict(evidence)), \
+                         mock.patch.object(SUP.RR, "classify_identity", return_value=(identity, None, "fixture")):
+                        result = SUP.poll_once(route, ledger)
+                    self.assertEqual(result[0]["reason"], "resource-evidence-changed")
+                    self.assertEqual((output / "run.json").read_bytes(), original_producer)
+                    self.assertEqual(ledger.claims(), {})
+                    self.assertFalse((jobs.parent / "completion" / route["route_id"] / "resume-run.json").exists())
+            self.assertEqual(launch.call_count, 0)
 
     def test_verified_resume_launching_pid_reuse_missing_sentinel_and_foreign_bindings_never_verify(self):
         route, path, jobs, registry, output = self._resume_fixture()

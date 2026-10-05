@@ -461,7 +461,7 @@ def _evaluate(route, ledger, armed, results):
         evidence = registered_evidence(armed)
     if (RESOURCE_RESUME.route_selected(route) and evidence.get("terminal")
             and evidence.get("succeeded") and evidence.get("liveness") == "exited"):
-        # The small run record is the resource artifact, not a verification verdict.
+        # Revalidate runtime evidence without writing the producer's declared output.
         row_data = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
         if (RESOURCE_RESUME.row_digest(row_data) != evidence.get("resource_sha256")
                 or runner().read_sentinel(row_data.get("sentinel")) != 0
@@ -470,11 +470,6 @@ def _evaluate(route, ledger, armed, results):
         if row_data is None:
             results.append({"node": node_id, "action": "wait", "reason": "resource-evidence-changed"})
             return
-        record = Path(armed["artifact_base"]) / "run.json"
-        record.parent.mkdir(parents=True, exist_ok=True)
-        temporary = record.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(row_data, indent=2, sort_keys=True) + "\n")
-        os.replace(temporary, record)
     artifacts = artifact_evidence(armed)
     evidence["artifacts"] = artifacts
     row = {"node": node_id, "evidence": evidence}
@@ -513,8 +508,8 @@ def _evaluate(route, ledger, armed, results):
         evidence["monitor"] = "matched"
 
     if RESOURCE_RESUME.route_selected(route):
-        # Reuse the ordinary resource marker writer, so the normal owner launch
-        # consumes the same dependency contract as every other route.
+        # The ordinary marker binds the existing producer artifact's bytes;
+        # runtime identity remains in the resource registry and ledger evidence.
         route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
                                               Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
     ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")

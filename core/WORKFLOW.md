@@ -799,6 +799,9 @@ depth-1 one-shot execute the independent verification. This is the verification
 surface of the small graph, not a fresh training recipe. New code, data or model
 structure still uses the setup recipe. The graph records only the caller's
 explicit approved verified-run scope; prose and command paths are not scope evidence.
+Runtime identity stays in the resource registry and ledger. The supervisor reads
+producer artifacts without replacing or synthesizing them; missing declared output
+blocks verification.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
