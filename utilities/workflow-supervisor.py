@@ -467,6 +467,16 @@ def _claim_successors(route, ledger, armed, node_id, successors, evidence=None):
     return started
 
 
+def _checked_resource_row(armed, evidence):
+    """Recheck the existing exit tuple at the resource admission boundary."""
+    row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
+    if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
+            or runner().read_sentinel(row.get("sentinel")) != 0
+            or RR.classify_identity(row)[0] != "exited"):
+        return None
+    return row
+
+
 def _evaluate(route, ledger, armed, results):
     node_id = armed["node"]
     kind = armed["continuation_kind"]
@@ -477,11 +487,7 @@ def _evaluate(route, ledger, armed, results):
     if (evidence.get("resource_sha256") and evidence.get("terminal")
             and evidence.get("succeeded") and evidence.get("liveness") == "exited"):
         # Revalidate runtime evidence without writing the producer's declared output.
-        row_data = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
-        if (RESOURCE_RESUME.row_digest(row_data) != evidence.get("resource_sha256")
-                or runner().read_sentinel(row_data.get("sentinel")) != 0
-                or RR.classify_identity(row_data)[0] != "exited"):
-            row_data = None
+        row_data = _checked_resource_row(armed, evidence)
         if row_data is None:
             results.append({"node": node_id, "action": "wait", "reason": "resource-evidence-changed"})
             return
@@ -522,11 +528,6 @@ def _evaluate(route, ledger, armed, results):
             return
         evidence["monitor"] = "matched"
 
-    if RESOURCE_RESUME.route_selected(route):
-        # The ordinary marker binds the existing producer artifact's bytes;
-        # runtime identity remains in the resource registry and ledger evidence.
-        route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
-                                              Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
     owner_row = (json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
                  if armed["predecessor_kind"] == "resource" else {})
     if owner_row.get("resource_policy") == "supervised-owner":
@@ -544,12 +545,22 @@ def _evaluate(route, ledger, armed, results):
                     return
                 if armed.get("successor_command") is not None or not armed.get("successor_external"):
                     raise SupervisorError("resource-owner-successor-not-external")
+                if _checked_resource_row(armed, evidence) is None:
+                    results.append({"node": node_id, "action": "wait", "reason": "resource-evidence-changed"})
+                    return
+                # Bind the original producer bytes before ordinary owner admission;
+                # this resource marker is not an independent verifier verdict.
+                route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
+                    Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
                 ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
                 started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
         except (INPUT.InputError, KeyError):
             results.append({"node": node_id, "action": "wait-owner-input-unavailable"})
             return
     else:
+        if RESOURCE_RESUME.route_selected(route):
+            route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
+                Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
         ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
         started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
     row["action"] = "advanced"

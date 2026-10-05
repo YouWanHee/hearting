@@ -350,75 +350,119 @@ class TestSupervisorAdvance(WorkflowFixture):
         self.assertEqual(launch.call_count, 0)
         self.assertEqual(ledger.claims(), {})
 
-    def _resume_fixture(self):
+    def _resume_fixture(self, *, ordinary=False):
         router = SUP.route_module()
         candidates = {"candidates": [{"harness": "codex", "transport": "headless",
             "surface": "registered-headless", "status": "supported", "probe_source": "fixture",
             "probe_time": "2026-10-05T00:00:00Z"}]}
-        route = router.compose_route(capability="autopilot-lab", capability_mode="setup", shape="direct",
-            graph="resume-run,run-verify", slug="resume-fixture", cwd=self.base, artifact_root=self.base,
-            registered_headless_evidence=candidates, unassigned=True)
+        if ordinary:
+            route = compile_fixture("autopilot-lab", "setup", str(self.base), ["resource-run"])
+            node = "full-run"
+        else:
+            route = router.compose_route(capability="autopilot-lab", capability_mode="setup", shape="direct",
+                graph="resume-run,run-verify", slug="resume-fixture", cwd=self.base, artifact_root=self.base,
+                registered_headless_evidence=candidates, unassigned=True)
+            node = "resume-run"
         path = self.base / "resume-route.json"
         path.write_text(json.dumps(route))
         jobs = self.base / "jobs.log"
         jobs.write_text("")
         registry = self.resource_registry()
         row = json.loads(registry.read_text())["runs"]["fixture-run"]
-        row.update(route=str(path), node="resume-run", jobs=str(jobs), resource_policy="verified-resume")
+        row.update(route=str(path), node=node, jobs=str(jobs),
+                   resource_policy="supervised-owner" if ordinary else "verified-resume")
+        if ordinary:
+            row["owner_wait"] = {"parent_attempt_id": "att-parent", "session_id": "same-native"}
         registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
         output = self.base / "artifacts"
-        output.mkdir()
+        output.mkdir(exist_ok=True)
         (output / "run.json").write_bytes(b'{\n "payload": "fixture-resume", "count": 1, "sum": 10\n}\n')
         os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
-        self.arm(path, registry, node="resume-run", extra=("--jobs", str(jobs), "--artifact-base", str(output)))
+        self.arm(path, registry, node=node, extra=("--jobs", str(jobs), "--artifact-base", str(output)))
+        if ordinary:
+            import dispatch_resource_wait as OWNER_RESOURCE
+            ledger = SUP.ledger_for(route, jobs)
+            arm_path = ledger.root / "armed/full-run.json"
+            armed = json.loads(arm_path.read_bytes())
+            armed.update(successor_command=None, successor_external=True,
+                         resource_binding=OWNER_RESOURCE.resource_body_digest(row))
+            arm_path.write_text(json.dumps(armed))
         return route, path, jobs, registry, output
 
     def test_owner_resource_correction_is_checked_under_input_lock_before_once_external_claim(self):
         import contextlib
         import dispatch_owner_input as INPUT
-        route, path, jobs, registry, output = self._resume_fixture()
+        route, path, jobs, registry, output = self._resume_fixture(ordinary=True)
         row = json.loads(registry.read_text())["runs"]["fixture-run"]
         row.update(resource_policy="supervised-owner", owner_wait={"parent_attempt_id":"att-parent","session_id":"same-native"})
         registry.write_text(json.dumps({"runs":{"fixture-run":row}}))
         ledger = SUP.ledger_for(route,jobs)
-        arm_path = ledger.root / "armed/resume-run.json"
+        arm_path = ledger.root / "armed/full-run.json"
         armed = json.loads(arm_path.read_text())
         import dispatch_resource_wait as OWNER_RESOURCE
         armed.update(successor_command=None,successor_external=True,
                      resource_binding=OWNER_RESOURCE.resource_body_digest(row))
         arm_path.write_text(json.dumps(armed))
+        producer = output / "run.json"
+        original = producer.read_bytes(), producer.stat().st_ino, producer.stat().st_mtime_ns
+        marker_path = jobs.parent / "completion" / route["route_id"] / "full-run.json"
+        self.assertFalse(SUP.RESOURCE_RESUME.route_selected(route))
         value = {"target":"exact-target","thread_id":"same-native","requests":[{"state":"queued"}]}
         locked = []
+        drift_at_lock = []
         @contextlib.contextmanager
         def input_lock(*_):
             locked.append(True)
-            try: yield None,value
+            try:
+                if drift_at_lock:
+                    data = json.loads(registry.read_bytes())
+                    data["runs"]["fixture-run"]["command_hash"] = "1" * 64
+                    registry.write_text(json.dumps(data))
+                yield None,value
             finally: locked.pop()
         original_claim = SUP._claim_successors
         claims = []
         def checked_claim(*a,**k):
             self.assertEqual(locked,[True])
             self.assertFalse(any(i["state"]=="queued" for i in value["requests"]))
+            marker = json.loads(marker_path.read_bytes())
+            self.assertEqual(marker["node_id"], "full-run")
+            self.assertEqual(marker["completion_gate"], "authorized-full-run")
+            self.assertEqual(marker["evidence"], {"path": str(producer),
+                             "sha256": hashlib.sha256(original[0]).hexdigest()})
             claims.append(1)
             return original_claim(*a,**k)
         with mock.patch.object(INPUT,"_locked",side_effect=input_lock), \
              mock.patch.object(INPUT,"_target",return_value=(None,"exact-target")), \
-             mock.patch.object(SUP.RESOURCE_RESUME,"route_selected",return_value=False), \
              mock.patch.object(SUP,"_claim_successors",side_effect=checked_claim), \
              mock.patch.object(SUP.subprocess,"Popen") as spawn:
             result = SUP.poll_once(route,ledger)
             self.assertEqual(result[0]["action"],"wait-owner-input")
             self.assertEqual(ledger.claims(),{})
-            self.assertNotEqual(ledger.state()["nodes"]["resume-run"]["state"],"STAGE_SUCCEEDED")
+            self.assertFalse(marker_path.exists())
+            self.assertNotEqual(ledger.state()["nodes"]["full-run"]["state"],"STAGE_SUCCEEDED")
             value["requests"][0]["state"]="delivered"
+            settled_registry = registry.read_bytes()
+            drift_at_lock.append(True)
+            result = SUP.poll_once(route,ledger)
+            self.assertEqual(result[0]["reason"], "resource-evidence-changed")
+            self.assertFalse(marker_path.exists())
+            self.assertEqual(ledger.claims(), {})
+            self.assertEqual(claims, [])
+            registry.write_bytes(settled_registry)
+            drift_at_lock.clear()
             result = SUP.poll_once(route,ledger)
             self.assertEqual(result[0]["action"],"advanced")
             self.assertEqual(len(ledger.claims()),1)
             self.assertEqual(result[0]["successors"][0]["started"],False)
+            marker_bytes = marker_path.read_bytes()
             self.assertEqual(SUP.poll_once(route,ledger)[0]["action"],"settled")
+            self.assertEqual(marker_path.read_bytes(), marker_bytes)
+            self.assertEqual(len(list(marker_path.parent.glob("full-run.*.json"))), 1)
             self.assertEqual(len(claims),1)
             self.assertEqual(spawn.call_count,0)
-        self.assertEqual((output/"run.json").read_bytes(),b'{\n "payload": "fixture-resume", "count": 1, "sum": 10\n}\n')
+        self.assertEqual((producer.read_bytes(), producer.stat().st_ino, producer.stat().st_mtime_ns), original)
+        self.assertNotEqual(ledger.state()["workflow_state"], "COMPLETE")
 
     def test_independent_watch_before_owned_reap_preserves_success_and_once_marker(self):
         import dispatch_owner_input as INPUT
@@ -534,50 +578,56 @@ class TestSupervisorAdvance(WorkflowFixture):
         self.assertEqual(jobs.read_text(), "")
 
     def test_verified_resume_missing_producer_artifact_never_synthesizes_or_verifies(self):
-        route, path, jobs, registry, output = self._resume_fixture()
-        producer = output / "run.json"
-        producer.unlink()
-        ledger = SUP.ledger_for(route, jobs)
-        with mock.patch.object(SUP, "_start_successor") as launch:
-            result = SUP.poll_once(route, ledger)
-            self.assertEqual(result[0]["action"], "halt-missing-artifact")
-            self.assertEqual(result[0]["evidence"]["artifacts"]["missing"], ["run.json"])
-            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halted")
-            self.assertEqual(launch.call_count, 0)
-        self.assertFalse(producer.exists())
-        self.assertFalse(producer.with_suffix(".json.tmp").exists())
-        self.assertFalse((jobs.parent / "completion" / route["route_id"] / "resume-run.json").exists())
-        self.assertEqual(ledger.claims(), {})
-        self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
-        self.assertEqual(jobs.read_text(), "")
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                node = "full-run" if ordinary else "resume-run"
+                route, path, jobs, registry, output = self._resume_fixture(ordinary=ordinary)
+                producer = output / "run.json"
+                producer.unlink()
+                ledger = SUP.ledger_for(route, jobs)
+                with mock.patch.object(SUP, "_start_successor") as launch:
+                    result = SUP.poll_once(route, ledger)
+                    self.assertEqual(result[0]["action"], "halt-missing-artifact")
+                    self.assertEqual(result[0]["evidence"]["artifacts"]["missing"], ["run.json"])
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halted")
+                    self.assertEqual(launch.call_count, 0)
+                self.assertFalse(producer.exists())
+                self.assertFalse(producer.with_suffix(".json.tmp").exists())
+                self.assertFalse((jobs.parent / "completion" / route["route_id"] / f"{node}.json").exists())
+                self.assertEqual(ledger.claims(), {})
+                self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
+                self.assertEqual(jobs.read_text(), "")
 
     def test_verified_resume_changed_runtime_evidence_preserves_producer_and_refuses_marker(self):
-        route, path, jobs, registry, output = self._resume_fixture()
-        ledger = SUP.ledger_for(route, jobs)
-        armed = SUP.read_armed(ledger)["resume-run"]
-        evidence = SUP.resource_evidence(armed)
-        original_registry = registry.read_bytes()
-        original_producer = (output / "run.json").read_bytes()
-        row = json.loads(original_registry)["runs"]["fixture-run"]
-        with mock.patch.object(SUP, "_start_successor") as launch:
-            for change in ("row-digest", "sentinel", "identity"):
-                with self.subTest(change=change):
-                    registry.write_bytes(original_registry)
-                    Path(row["sentinel"]).write_text("0")
-                    if change == "row-digest":
-                        changed = {**row, "exit_code": 7}
-                        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": changed}}))
-                    elif change == "sentinel":
-                        Path(row["sentinel"]).write_text("7")
-                    identity = "working" if change == "identity" else "exited"
-                    with mock.patch.object(SUP, "resource_evidence", return_value=dict(evidence)), \
-                         mock.patch.object(SUP.RR, "classify_identity", return_value=(identity, None, "fixture")):
-                        result = SUP.poll_once(route, ledger)
-                    self.assertEqual(result[0]["reason"], "resource-evidence-changed")
-                    self.assertEqual((output / "run.json").read_bytes(), original_producer)
-                    self.assertEqual(ledger.claims(), {})
-                    self.assertFalse((jobs.parent / "completion" / route["route_id"] / "resume-run.json").exists())
-            self.assertEqual(launch.call_count, 0)
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                node = "full-run" if ordinary else "resume-run"
+                route, path, jobs, registry, output = self._resume_fixture(ordinary=ordinary)
+                ledger = SUP.ledger_for(route, jobs)
+                armed = SUP.read_armed(ledger)[node]
+                evidence = SUP.resource_evidence(armed)
+                original_registry = registry.read_bytes()
+                original_producer = (output / "run.json").read_bytes()
+                row = json.loads(original_registry)["runs"]["fixture-run"]
+                with mock.patch.object(SUP, "_start_successor") as launch:
+                    for change in ("row-digest", "sentinel", "identity"):
+                        with self.subTest(change=change):
+                            registry.write_bytes(original_registry)
+                            Path(row["sentinel"]).write_text("0")
+                            if change == "row-digest":
+                                changed = {**row, "exit_code": 7}
+                                registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": changed}}))
+                            elif change == "sentinel":
+                                Path(row["sentinel"]).write_text("7")
+                            identity = "working" if change == "identity" else "exited"
+                            with mock.patch.object(SUP, "resource_evidence", return_value=dict(evidence)), \
+                                 mock.patch.object(SUP.RR, "classify_identity", return_value=(identity, None, "fixture")):
+                                result = SUP.poll_once(route, ledger)
+                            self.assertEqual(result[0]["reason"], "resource-evidence-changed")
+                            self.assertEqual((output / "run.json").read_bytes(), original_producer)
+                            self.assertEqual(ledger.claims(), {})
+                            self.assertFalse((jobs.parent / "completion" / route["route_id"] / f"{node}.json").exists())
+                    self.assertEqual(launch.call_count, 0)
 
     def test_verified_resume_launching_pid_reuse_missing_sentinel_and_foreign_bindings_never_verify(self):
         route, path, jobs, registry, output = self._resume_fixture()
