@@ -158,6 +158,13 @@ On OpenCode, non-route deep roles use a deep tier when the selected whole-file m
 
 ## 4. Capability Model
 
+Registered workers must be able to read their assigned portable contract from
+the sealed agent home's `capabilities/` directory. Invocation-local external
+path permissions may expose that directory and its canonical target for reads;
+they must not expose the whole agent home or grant contract edits. Existing
+worker write guards remain in force. A spec-read marker records an observed
+read and does not deliver file contents or prove that a contract was read.
+
 A portable capability describes:
 
 - trigger semantics;

@@ -706,6 +706,10 @@ def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
     execution_access_roots: tuple[Path, ...] = (),
+    *,
+    agent_home: Path | None = None,
+    worktree: str | None = None,
+    selected_agent: str | None = None,
 ) -> str:
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
@@ -725,7 +729,37 @@ def scoped_external_directory_config(
     else:
         permission = dict(permission)
 
-    external = permission.get("external_directory")
+    def effective_tool(subject, tool, default=None):
+        # Native fromConfig flattens every matching outer wildcard in order.
+        # A scalar replaces all paths, whereas an object replaces only its
+        # matching patterns. Preserve those rules before moving the tool last.
+        value = None if default is None else {"*": default}
+        for key, candidate in subject.items():
+            wildcard = re.escape(key.replace("\\", "/")).replace(r"\ ", " ").replace(r"\*", ".*").replace(r"\?", ".")
+            if wildcard.endswith(" .*"):
+                wildcard = wildcard[:-3] + "( .*)?"
+            if not re.fullmatch(wildcard, tool, re.DOTALL):
+                continue
+            if isinstance(candidate, str):
+                value = {"*": candidate}
+            elif isinstance(candidate, dict):
+                if value is None:
+                    value = {}
+                for pattern, action in candidate.items():
+                    value.pop(pattern, None)
+                    value[pattern] = action
+            else:
+                raise ValueError(f"OpenCode {tool} permission must be a string or object")
+        return value
+
+    # Keep the existing headless projection before normalizing native order:
+    # no explicit external rule means deny outside the scoped launch roots,
+    # even when a global catchall allows/asks for other tools (SD-15).
+    if agent_home is not None and "external_directory" not in permission:
+        permission["external_directory"] = "deny"
+    original_permission = dict(permission)
+    external = (effective_tool(original_permission, "external_directory")
+                if agent_home is not None else permission.get("external_directory"))
     if external is None:
         # SD-15/1(b): headless has no human to answer an "ask" prompt, so the
         # runtime auto-rejects it -- and that auto-reject truncates the
@@ -743,15 +777,86 @@ def scoped_external_directory_config(
     else:
         raise ValueError("OpenCode external_directory permission must be a string or object")
 
-    for root in (artifact_root, report_bundle_root, *execution_access_roots):
+    # The launch environment and this permission projection use the same
+    # resolved agent home. Keep its lexical alias as well as the canonical
+    # directory: native tools can check either form of a symlinked install.
+    contract_roots = () if agent_home is None else tuple(dict.fromkeys((
+        str(agent_home / "capabilities"),
+        str((agent_home / "capabilities").resolve()),
+    )))
+    for root in (artifact_root, report_bundle_root, *execution_access_roots, *contract_roots):
         if not root:
             continue
         root = str(root)
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
             rules[pattern] = "allow"
+    if contract_roots:
+        permission.pop("external_directory", None)
     permission["external_directory"] = rules
+    if contract_roots:
+        edit = effective_tool(original_permission, "edit", "allow")
+        if isinstance(edit, str):
+            edit_rules = {"*": edit}
+        elif isinstance(edit, dict):
+            edit_rules = dict(edit)
+        else:
+            raise ValueError("OpenCode edit permission must be a string or object")
+        for root in contract_roots:
+            # v1 native edit/write/patch ask against paths relative to the
+            # worktree, unlike external_directory's absolute directory glob.
+            edit_paths = (root,) if worktree is None else (
+                root, os.path.relpath(root, worktree),
+            )
+            for pattern in (pattern for directory in edit_paths
+                            for pattern in (directory, f"{directory}/**")):
+                edit_rules.pop(pattern, None)
+                edit_rules[pattern] = "deny"
+        permission.pop("edit", None)
+        permission["edit"] = edit_rules
     config["permission"] = permission
+    if contract_roots and selected_agent:
+        # Native agent permissions merge after global permissions. Overlay only
+        # the selected agent, without giving its other tools a new default.
+        agents = config.get("agent", {})
+        if not isinstance(agents, dict):
+            raise ValueError("OpenCode agent config must be an object")
+        agents = dict(agents)
+        selected = agents.get(selected_agent, {})
+        if not isinstance(selected, dict):
+            raise ValueError("OpenCode selected agent config must be an object")
+        selected = dict(selected)
+        local = selected.get("permission", {})
+        if isinstance(local, str):
+            local = {"*": local}
+        elif isinstance(local, dict):
+            local = dict(local)
+        else:
+            raise ValueError("OpenCode agent permission must be a string or object")
+        original_local = dict(local)
+        for tool, action in (("external_directory", "allow"), ("edit", "deny")):
+            old = effective_tool(original_local, tool)
+            if old is None:
+                overlay = {}
+            elif isinstance(old, str):
+                overlay = {"*": old}
+            elif isinstance(old, dict):
+                overlay = dict(old)
+            else:
+                raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
+            for root in contract_roots:
+                directories = (root,)
+                if tool == "edit" and worktree is not None:
+                    directories += (os.path.relpath(root, worktree),)
+                for directory in directories:
+                    for pattern in (directory, f"{directory}/**"):
+                        overlay.pop(pattern, None)
+                        overlay[pattern] = action
+            local.pop(tool, None)
+            local[tool] = overlay
+        selected["permission"] = local
+        agents[selected_agent] = selected
+        config["agent"] = agents
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1668,6 +1773,9 @@ def main(argv: list[str]) -> int:
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
+            agent_home=args.agent_home,
+            worktree=args.worktree,
+            selected_agent=args.agent,
         )
     except ValueError as e:
         return fail("artifact-root-access-config-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1915,6 +2023,9 @@ def main(argv: list[str]) -> int:
                 if args.report_bundle_root is not None
                 else None,
                 args.execution_access_grant.additional_writable_roots,
+                agent_home=args.agent_home,
+                worktree=args.worktree,
+                selected_agent=args.agent,
             )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")

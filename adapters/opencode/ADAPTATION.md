@@ -182,6 +182,14 @@ invariants Claude enforces through `settings.json` hooks are enforced here
 through the plugin and throw to abort, and the prompt/session lifecycle
 injections are auto-applied. The table records the current state.
 
+Registered headless launches allow native reads of the sealed agent home's
+`capabilities/` directory (including its canonical symlink target), while
+denying native edits there and retaining the existing worker write guards.
+This is tool permission, not an OS filesystem sandbox. `preflight.sh read`
+only records an already completed PRD read; it prints no document body and is
+a no-op for capability files. Read the assigned portable contract with the
+native `read` tool; a successful marker command is not evidence of its contents.
+
 | Claude `settings.json` hook | OpenCode realization | Parity |
 |---|---|---|
 | `PreToolUse[Skill]` spec-skill gate (deny) | plugin `command.execute.before` → `preflight capability` (throws) | full — auto enforced (command path) |
