@@ -1089,6 +1089,69 @@ class ProjectionObservationTest(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.args[0][2], "report-metadata")
 
+    def test_native_opencode_lifecycle_fields_keep_exact_argv_and_metadata(self):
+        from tools.fleet import herdr_projection as hp
+        prefix = ["/fixture/herdr", "pane", "report-agent-session", "fixture-pane", "--source", "herdr:opencode",
+                  "--agent", "opencode", "--agent-session-id", "ses_A"]
+        cases = [(1000001, "startup", True, prefix + ["--seq", "1000001", "--session-start-source", "startup"]),
+                 (1000002, None, True, prefix + ["--seq", "1000002"]),
+                 (None, None, True, prefix), (1000003, "startup", False, None)]
+        for seq, start, report_session, expected in cases:
+            with self.subTest(seq=seq, start=start, report=report_session), \
+                 unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+                 unittest.mock.patch.object(hp, "session_title", return_value="title"), \
+                 unittest.mock.patch.object(hp, "_formatter_overrides", return_value=(None, None)), \
+                 unittest.mock.patch.object(hp, "compose", return_value=("opencode", "title")), \
+                 unittest.mock.patch.object(hp.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+                observation = {}
+                hp._report("opencode", "ses_A", "fixture-pane", report_session, observation=observation,
+                           session_seq=seq, session_start_source=start)
+                commands = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(commands[:-1], [expected] if expected else [])
+                self.assertEqual(commands[-1], ["/fixture/herdr", "pane", "report-metadata", "fixture-pane",
+                    "--source", "herdr:opencode", "--display-agent", "opencode", "--title", "opencode title"])
+                self.assertEqual(observation["session_report"], "exit0" if report_session else "skipped")
+
+    def test_invalid_bootstrap_fields_never_promote_or_bypass_original_guard(self):
+        from tools.fleet import herdr_projection as hp
+        cases = [(True, "startup"), (0, "startup"), (-1, None), (9007199254740992, None),
+                 ("100", "startup"), (100, "new"), (None, "startup")]
+        for seq, start in cases:
+            with self.subTest(seq=seq, start=start), \
+                 unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+                 unittest.mock.patch.object(hp, "may_report", return_value=True), \
+                 unittest.mock.patch.object(hp, "_report") as report:
+                self.assertIs(hp.project("opencode", "ses_A", pane_id="fixture-pane",
+                                        session_seq=seq, session_start_source=start), True)
+                report.assert_called_once_with("opencode", "ses_A", "fixture-pane", False)
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="/fixture/herdr"), \
+             unittest.mock.patch.object(hp, "may_report", return_value=False), \
+             unittest.mock.patch.object(hp, "_report") as report:
+            self.assertIs(hp.project("opencode", "ses_A", pane_id="fixture-pane",
+                                    session_seq=100, session_start_source="startup"), True)
+            report.assert_not_called()
+
+    def test_normal_opencode_cli_transports_lifecycle_without_changing_other_harnesses(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp, "project") as project:
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(hp.main(["--harness", "opencode", "--session-id", "ses_A", "--pane", "fixture-pane",
+                                          "--seq", "1000001", "--session-start-source", "startup"]), 0)
+            project.assert_called_once_with("opencode", "ses_A", pane_id="fixture-pane", report_session=True,
+                                            observation={}, session_seq=1000001, session_start_source="startup")
+            self.assertEqual(output.getvalue(), "{}\n")
+        for harness in ("codex", "claude"):
+            with self.subTest(harness=harness), unittest.mock.patch.object(hp, "project") as project:
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(hp.main(["--harness", harness, "--session-id", "actual"]), 0)
+                project.assert_called_once_with(harness, "actual", pane_id=None, report_session=True, observation=None)
+                self.assertEqual(output.getvalue(), "")
+
+
 
 class PaneTitleLadderTest(unittest.TestCase):
     """The pane header and the board must climb ONE ladder for the same session.
