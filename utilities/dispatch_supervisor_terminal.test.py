@@ -282,6 +282,30 @@ class RuntimeFailureClassifierTest(unittest.TestCase):
         self.assertEqual(auth.note, "dead-auth")
         self.assertEqual(auth.failure_class, "auth")
 
+    def test_transient_overload_text_is_not_read_as_account_capacity(self):
+        # The real `serverOverloaded` envelope carries diagnostic text
+        # "Selected model is at capacity" -- transient congestion, not an
+        # account quota. A structured non-account code is authoritative, so
+        # the text must not reach `_CAPACITY_RE`'s `model.{0,80}at capacity`
+        # alternative and seal the row `dead-capacity`, which a consumer then
+        # blocks for an hour.
+        overloaded = SUPERVISOR.classify_runtime_failure(
+            "codex", event="turn.failed", process_exit=70,
+            structured_code="serverOverloaded",
+            text="Selected model is at capacity",
+        )
+        self.assertEqual(overloaded.note, "dead-runtime-error")
+        self.assertEqual(overloaded.failure_class, "runtime")
+        # An account structured code still wins on its own, independently of
+        # the same text (structured-first, unchanged).
+        account = SUPERVISOR.classify_runtime_failure(
+            "codex", event="turn.failed", process_exit=70,
+            structured_code="usageLimitExceeded",
+            text="Selected model is at capacity",
+        )
+        self.assertEqual(account.note, "dead-capacity")
+        self.assertEqual(account.failure_class, "capacity")
+
     def test_session_result_behaviour_unchanged(self):
         # Pinning guard: classify_session_result's claude/opencode behaviour
         # must not move a single case after the failure branch was factored

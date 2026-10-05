@@ -211,7 +211,14 @@ def classify_runtime_failure(
             str(process_exit),
             status,
         )
-    if _CAPACITY_RE.search(text):
+    # A surviving `structured_code` here is a non-account code (the capacity
+    # codes returned above), so it is authoritative about the envelope's class
+    # and its free text must not be read as account evidence. Without this
+    # guard, `serverOverloaded` (transient congestion) carries diagnostic text
+    # like "Selected model is at capacity"; `_CAPACITY_RE`'s
+    # `model.{0,80}at capacity` alternative flips it to `dead-capacity`, and a
+    # consumer blocks that verdict for an hour.
+    if not structured_code and _CAPACITY_RE.search(text):
         return SupervisorTerminal(
             "dead-capacity",
             "capacity",
