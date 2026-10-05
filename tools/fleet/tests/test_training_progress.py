@@ -121,7 +121,7 @@ class TrainingProgressPipelineTest(unittest.TestCase):
             render.set_process_view(process_view)
             shown = text(render._build_lines([], [], "both", False, 0, term_width=140,
                                             resources=self.rows, governor=None))
-            self.assertIn("training-updates 7% 27346/400000 · loss=4.82e-03 · stalled 10m", shown)
+            self.assertIn("TRAIN 7% 27346/400000 · loss=4.82e-03 · stalled 10m", shown)
             self.assertNotIn("LAB RESOURCES", shown)
             self.assertNotIn("raw producer heartbeat", shown)
             self.assertNotIn("Epoch", shown)
@@ -157,7 +157,7 @@ class TrainingProgressPipelineTest(unittest.TestCase):
             render.set_process_view(process_view)
             shown = text(render._build_lines([], [], "both", False, 0, term_width=180,
                                             resources=rows, governor=None))
-            self.assertIn("Epoch 2/20 · training-updates 37% 7346/20000 · loss=4.82e-03 · stalled 10m", shown)
+            self.assertIn("Epoch 2/20 · TRAIN 37% 7346/20000 · loss=4.82e-03 · stalled 10m", shown)
             self.assertIn("Epoch 23/200 · TRAIN 38% 7603/20000 · 1:38:19 left · L_se=9.18e-03 L_se_aux=4.91e-03", shown)
             self.assertNotIn("raw producer heartbeat", shown)
 
@@ -165,11 +165,11 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         # Literal expectations distinguish interval attempts from optimizer success
         # and overall budget; boundary rows show the interval just completed.
         cases = (
-            (0, 0, "↳ Epoch 0/20 · training-updates 0% 0/20000 · loss=4.82e-03 · stalled 10m"),
-            (1, 1, "↳ Epoch 1/20 · training-updates 0% 1/20000 · loss=4.82e-03 · stalled 10m"),
-            (20000, 1, "↳ Epoch 1/20 · training-updates 100% 20000/20000 · loss=4.82e-03 · stalled 10m"),
-            (20001, 2, "↳ Epoch 2/20 · training-updates 0% 1/20000 · loss=4.82e-03 · stalled 10m"),
-            (400000, 20, "↳ Epoch 20/20 · training-updates 100% 20000/20000 · loss=4.82e-03 · stalled 10m"),
+            (0, 0, "↳ Epoch 0/20 · TRAIN 0% 0/20000 · loss=4.82e-03 · stalled 10m"),
+            (1, 1, "↳ Epoch 1/20 · TRAIN 0% 1/20000 · loss=4.82e-03 · stalled 10m"),
+            (20000, 1, "↳ Epoch 1/20 · TRAIN 100% 20000/20000 · loss=4.82e-03 · stalled 10m"),
+            (20001, 2, "↳ Epoch 2/20 · TRAIN 0% 1/20000 · loss=4.82e-03 · stalled 10m"),
+            (400000, 20, "↳ Epoch 20/20 · TRAIN 100% 20000/20000 · loss=4.82e-03 · stalled 10m"),
         )
         for attempt, current, expected in cases:
             with self.subTest(attempt=attempt):
@@ -184,13 +184,13 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         process["progress"]["training"].update(attempt=59415, successful=59397, skipped=18,
                                               schedule_epoch={"current": 3, "total": 20, "attempts_per_epoch": 20000})
         shown = render._plain(render._gpu_progress_row(process, "", 80))
-        self.assertIn("Epoch 3/20 · training-updates 97% 19415/20000", shown)
+        self.assertIn("Epoch 3/20 · TRAIN 97% 19415/20000", shown)
         self.assertTrue(shown.endswith("stalled 10m"), shown)
         self.assertLessEqual(render._dw(shown), 80)
         process["progress"]["training"]["schedule_epoch"]["total"] = True
         shown = render._plain(render._gpu_progress_row(process, "", 180))
         self.assertNotIn("Epoch", shown)
-        self.assertIn("training-updates 15% 59415/400000", shown)
+        self.assertIn("TRAIN 15% 59415/400000", shown)
 
     def test_fresh_heartbeat_does_not_refresh_counter_age(self):
         projected = self.projected(now=self.now + 5)
