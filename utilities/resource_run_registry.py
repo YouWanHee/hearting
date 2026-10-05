@@ -55,16 +55,65 @@ def proc_identity(pid) -> dict | None:
         return None
 
 
+def _owned_wrapper_awaiting_reap(run, pid, identity_reader):
+    """Recognize only this controller's exact unreaped child, never exit success.
+
+    A zombie has no cmdline. Its stable kernel PID/start/parent/group tuple plus
+    the still-exact controller distinguishes it from an unreadable live PID.
+    The parent retains the actual Popen handle and owns the wait; observers do
+    not reconstruct a handle or signal this PID.
+    """
+    owner = run.get("owner_wait")
+    controller = run.get("launch_controller")
+    if (run.get("resource_policy") != "supervised-owner"
+            or not isinstance(owner, dict) or owner.get("launch_scope") != "codex-owner-controller"
+            or run.get("launch_state") != "started" or not isinstance(controller, dict)
+            or run.get("pid_namespace") != controller.get("pid_namespace")
+            or not run.get("pid_namespace")):
+        return False
+    try:
+        parent = int(controller["pid"])
+        if (isinstance(controller["pid"], bool) or parent <= 0 or pid <= 0
+                or int(run["process_group"]) != pid
+                or os.readlink(f"/proc/{parent}/ns/pid") != run["pid_namespace"]):
+            return False
+        current_parent = identity_reader(parent)
+        if not current_parent or any(str(current_parent[key]) != str(controller[key]) for key in IDENTITY_KEYS):
+            return False
+        path = Path(f"/proc/{pid}/stat")
+        before = path.read_text(encoding="utf-8")
+        fields = before.rsplit(") ", 1)[1].split()
+        if (int(before.split(" ", 1)[0]) != pid or fields[0] != "Z"
+                or int(fields[1]) != parent or int(fields[2]) != pid
+                or fields[19] != str(run["starttime"])
+                or Path(f"/proc/{pid}/cmdline").read_bytes() != b""):
+            return False
+        # A concurrent reap or PID reuse cannot turn this observation into a
+        # terminal result. Recheck both kernel child and recorded parent.
+        after = path.read_text(encoding="utf-8")
+        return (after == before and identity_reader(parent) == current_parent)
+    except (OSError, KeyError, TypeError, ValueError, IndexError):
+        return False
+
+
 def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, dict | None, str]:
-    """Return working/exited/stale without trusting the registry status word."""
+    """Return working/reaping/exited/stale without trusting registry status."""
     if not isinstance(run, dict) or any(run.get(key) in (None, "") for key in IDENTITY_KEYS):
         return "stale", None, "recorded-identity-incomplete"
     try:
         pid = int(run["pid"])
     except (TypeError, ValueError):
         return "stale", None, "recorded-pid-invalid"
+    if run.get("pid_namespace") is not None:
+        try:
+            if run["pid_namespace"] != os.readlink("/proc/self/ns/pid"):
+                return "stale", None, "process-namespace-mismatch"
+        except OSError:
+            return "stale", None, "process-namespace-unreadable"
     current = identity_reader(pid)
     if current is None:
+        if _owned_wrapper_awaiting_reap(run, pid, identity_reader):
+            return "reaping", None, "owned-wrapper-awaiting-reap"
         if Path(f"/proc/{pid}").exists():
             return "stale", None, "process-identity-unreadable"
         return "exited", None, "process-absent"

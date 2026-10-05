@@ -804,7 +804,13 @@ producer artifacts without replacing or synthesizing them; missing declared outp
 blocks verification.
 
 A supervised route owner starts its ordinary detached resource through the same
-runner, which arms the watch before releasing the payload. It yields the model
+runner. A sandboxed Codex owner tool records only the exact launch intent;
+its outer controller owns the observable watch and exit wrapper, and runs the
+payload with the owner's selected native sandbox. Intent admission is not a
+payload start. An exact controller-owned wrapper awaiting its parent's reap is
+nonterminal; an independent watch cannot settle it from empty cmdline or sentinel
+alone. Other runner paths retain their existing launch boundary. The
+watch is ready before the once-only payload release. The owner yields the model
 turn with `runtime_wait: registered-children`; the existing controller waits for
 the exact resource outside that turn and resumes the same native owner from a
 bounded receipt. Resource receipts are separate from registered model children.

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import resource_run_registry as registry
 
@@ -64,6 +65,47 @@ class ResourceRegistryTest(unittest.TestCase):
         unreadable = {**row, "pid": os.getpid()}
         self.assertEqual(registry.classify_identity(
             unreadable, lambda _pid: None)[0], "stale")
+
+    def test_owned_zombie_requires_exact_kernel_and_controller_identity(self):
+        pid = 999999999
+        parent = registry.proc_identity(os.getpid())
+        namespace = os.readlink("/proc/self/ns/pid")
+        row = {"pid": pid, "starttime": "42", "command_hash": "a" * 64,
+               "process_group": pid, "pid_namespace": namespace,
+               "resource_policy": "supervised-owner", "launch_state": "started",
+               "owner_wait": {"launch_scope": "codex-owner-controller"},
+               "launch_controller": {**parent, "pid_namespace": namespace}}
+        # Linux fields 3/4/5/22: state, parent PID, group, kernel start tick.
+        fields = ["Z", str(os.getpid()), str(pid)] + ["0"] * 16 + ["42"]
+        raw = f"{pid} (wrapper) " + " ".join(fields)
+        reader = lambda candidate: parent if candidate == os.getpid() else None
+        with mock.patch.object(Path, "read_text", return_value=raw), \
+             mock.patch.object(Path, "read_bytes", return_value=b""), \
+             mock.patch.object(Path, "exists", return_value=True):
+            self.assertEqual(registry.classify_identity(row, reader),
+                             ("reaping", None, "owned-wrapper-awaiting-reap"))
+            self.assertFalse(registry.is_alive(row, reader))
+            for change in ({"starttime": "43"}, {"process_group": pid + 1},
+                           {"pid_namespace": "pid:[foreign]"}, {"launch_state": "claimed"},
+                           {"resource_policy": "verified-resume"}, {"owner_wait": {}},
+                           {"launch_controller": {**parent, "starttime": "0", "pid_namespace": namespace}},
+                           {"launch_controller": {**parent, "command_hash": "foreign", "pid_namespace": namespace}}):
+                with self.subTest(change=change):
+                    self.assertEqual(registry.classify_identity({**row, **change}, reader)[0], "stale")
+            for index, value in ((0, "S"), (1, str(os.getpid() + 1)), (2, str(pid + 1)), (19, "43")):
+                altered = list(fields); altered[index] = value
+                with self.subTest(field=index), mock.patch.object(Path, "read_text",
+                        return_value=f"{pid} (wrapper) " + " ".join(altered)):
+                    self.assertEqual(registry.classify_identity(row, reader)[0], "stale")
+            for method in ("read_text", "read_bytes"):
+                with self.subTest(error=method), mock.patch.object(Path, method, side_effect=PermissionError()):
+                    self.assertEqual(registry.classify_identity(row, reader)[0], "stale")
+            with mock.patch.object(Path, "read_text", side_effect=[raw, raw.replace("42", "43")]):
+                self.assertEqual(registry.classify_identity(row, reader)[0], "stale")
+            with mock.patch.object(Path, "read_text", return_value="malformed"):
+                self.assertEqual(registry.classify_identity(row, reader)[0], "stale")
+            with mock.patch.object(Path, "read_bytes", return_value=b"live-command\0"):
+                self.assertEqual(registry.classify_identity(row, reader)[0], "stale")
 
     def test_multi_project_index_and_malformed_registry_isolation(self):
         with tempfile.TemporaryDirectory() as td:

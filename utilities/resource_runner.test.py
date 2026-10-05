@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """CLI regression tests for the detached resource authorization boundary."""
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -108,6 +109,108 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(row["owner_wait"],placeholder["owner_wait"])
         self.assertEqual(R.read_sentinel(row["sentinel"]),0)
 
+    def test_codex_tool_intent_has_no_process_until_controller_admission_once(self):
+        import artifact_producer
+        jobs = self.base / "codex-owner-jobs.log"
+        jobs.write_text("")
+        route_file = self.base / "codex-owner-route.json"
+        args = SimpleNamespace(jobs=str(jobs),run_id="codex-owner-run",node="full-run")
+        body = {"run_id":args.run_id,"cwd":str(self.repo),"log":str(self.log),
+            "command":[sys.executable,"-c",f"from pathlib import Path; import time; time.sleep(.2); Path({str(self.launch)!r}).write_text('once')"],
+            "route":str(route_file),"node":"full-run","status":"launching","sentinel":str(self.log)+".exit",
+            "parent_attempt_id":"att-parent","owner_wait":{"session_id":"same-native","launch_scope":"codex-owner-controller"},
+            "launch_request":{"smoke_attestation":None,"smoke_attestation_sha256":None,"config_manifest":None,"config_manifest_sha256":None}}
+        real_popen = subprocess.Popen
+        watch = mock.Mock(pid=os.getpid())
+        watch.poll.return_value=None
+        payloads=[]
+        def launch(argv,**kwargs):
+            if "watch" in argv:
+                os.write(kwargs["pass_fds"][0],b"ready\n")
+                return watch
+            proc=real_popen(argv,**kwargs)
+            payloads.append(proc)
+            return proc
+        route={"route_id":"rt-codex-owner","route_hash":"sha256:owner"}
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}), \
+             mock.patch.object(artifact_producer,"prepare_route_artifact_env",return_value={"AGENT_ARTIFACT_OUTPUT_DIR":str(self.base)}), \
+             mock.patch.object(R,"register_registry"), mock.patch.object(R.subprocess,"run"), \
+             mock.patch("sys.stdout") as stdout, mock.patch.object(R.subprocess,"Popen",side_effect=launch) as spawn:
+            R.start_verified(self.registry,args,route,route_file,dict(body))
+            queued=json.loads(self.registry.read_text())["runs"][args.run_id]
+            receipt=json.loads(stdout.write.call_args_list[-2].args[0])
+            self.assertEqual(queued["launch_state"],"queued")
+            self.assertNotIn("pid",queued)
+            self.assertIs(receipt["payload_spawned"],False)
+            self.assertIs(receipt["supervisor_alive"],False)
+            self.assertEqual(spawn.call_count,0)
+            self.assertFalse(self.launch.exists())
+            R.start_verified(self.registry,args,route,route_file,dict(body))
+            self.assertEqual(spawn.call_count,0)
+            identity={**R.proc_identity(os.getpid()),"pid_namespace":os.readlink("/proc/self/ns/pid")}
+            admission=SimpleNamespace(expected=queued,identity=identity,command=body["command"],
+                sandbox={"mode":"workspace-write","enforcement":"os-sandbox"},guard=contextlib.nullcontext)
+            R.start_verified(self.registry,args,route,route_file,dict(body),controller=admission)
+            running=json.loads(self.registry.read_text())["runs"][args.run_id]
+            self.assertEqual(running["pid_namespace"],os.readlink("/proc/self/ns/pid"))
+            self.assertEqual(R.classify_identity(running)[0],"working")
+            self.assertEqual(running["launch_controller"],identity)
+            self.assertEqual(running["launch_state"],"started")
+            self.assertFalse(self.launch.exists())
+            self.assertIs(admission.children[0],payloads[0])
+            self.assertIs(admission.children[1],watch)
+            self.assertEqual(admission.row,running)
+            payloads[0].wait(timeout=5)
+            self.assertEqual(R.classify_identity(running)[0],"exited")
+            self.assertEqual(self.launch.read_text(),"once")
+            self.assertEqual(R.read_sentinel(running["sentinel"]),0)
+            before=self.registry.read_bytes()
+            with self.assertRaisesRegex(ValueError,"resource-reservation-changed"):
+                R.start_verified(self.registry,args,route,route_file,dict(body),controller=admission)
+            self.assertEqual(self.registry.read_bytes(),before)
+            self.assertEqual(len(payloads),1)
+            foreign={**running,"pid_namespace":"pid:[foreign]"}
+            self.assertEqual(R.classify_identity(foreign)[0],"stale")
+            self.assertEqual(R.classify_identity(foreign)[2],"process-namespace-mismatch")
+
+    def test_controller_correction_before_release_preserves_queued_body_and_payload_zero(self):
+        import artifact_producer
+        jobs=self.base/"correction-jobs.log"; jobs.write_text("")
+        route_file=self.base/"correction-route.json"
+        args=SimpleNamespace(jobs=str(jobs),run_id="correction-run",node="full-run")
+        row={"run_id":args.run_id,"cwd":str(self.repo),"log":str(self.log),"command":[sys.executable,"-c",f"open({str(self.launch)!r},'w').write('wrong')"],
+             "route":str(route_file),"jobs":str(jobs),"node":"full-run","status":"launching","sentinel":str(self.log)+".exit",
+             "parent_attempt_id":"att-parent","resource_policy":"supervised-owner","launch_state":"queued",
+             "owner_wait":{"session_id":"same-native","launch_scope":"codex-owner-controller"},"launch_request":{}}
+        self.registry.write_text(json.dumps({"schema_version":1,"runs":{args.run_id:row}}))
+        checks=[]
+        @contextlib.contextmanager
+        def guard():
+            checks.append("check")
+            if len(checks)==2:
+                raise R.LaunchDeferred("correction-pending")
+            yield
+        watch=mock.Mock(pid=os.getpid()); watch.poll.return_value=None
+        real_popen=subprocess.Popen
+        payloads=[]
+        def launch(argv,**kwargs):
+            if "watch" in argv:
+                os.write(kwargs["pass_fds"][0],b"ready\n"); return watch
+            proc=real_popen(argv,**kwargs); payloads.append(proc); return proc
+        admission=SimpleNamespace(expected=row,identity={"pid_namespace":os.readlink("/proc/self/ns/pid")},
+            command=row["command"],sandbox={"mode":"workspace-write"},guard=guard)
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}), \
+             mock.patch.object(artifact_producer,"prepare_route_artifact_env",return_value={"AGENT_ARTIFACT_OUTPUT_DIR":str(self.base)}), \
+             mock.patch.object(R,"register_registry"),mock.patch.object(R.subprocess,"run"), \
+             mock.patch.object(R.subprocess,"Popen",side_effect=launch):
+            with self.assertRaises(R.LaunchDeferred):
+                R.start_verified(self.registry,args,{"route_id":"rt-correction","route_hash":"sha256:c"},route_file,dict(row),controller=admission)
+        self.assertEqual(json.loads(self.registry.read_text())["runs"][args.run_id],row)
+        self.assertEqual(payloads[0].returncode,125)
+        self.assertFalse(self.launch.exists())
+        self.assertFalse(Path(row["sentinel"]).exists())
+        watch.terminate.assert_called_once()
+
     def test_owner_start_derives_existing_native_tuple_and_refuses_foreign_or_unknown_before_spawn(self):
         import dispatch_resource_wait as OWNER_RESOURCE
         import owner_route_binding as OWNER
@@ -135,6 +238,10 @@ class TestRunner(unittest.TestCase):
             self.assertEqual(actual,{"parent_attempt_id":"att-parent","session_id":"same-native",
                 "route_id":"rt-bound","route_hash":"sha256:bound","jobs":str(jobs),"owner_pid":444,"owner_start":"200"})
             self.assertEqual(args.parent_attempt_id,"att-parent")
+            old_jobs=jobs.read_text()
+            jobs.write_text(old_jobs.rstrip("\n")+",harness=codex\n")
+            self.assertEqual(OWNER_RESOURCE.start_binding(route,route_file,args,env)["launch_scope"],"codex-owner-controller")
+            jobs.write_text(old_jobs)
             self.assertEqual(live.call_args.kwargs["repo"],"/repo")
             self.assertEqual(live.call_args.kwargs["worktree"],"/wt")
             self.assertEqual(join.read_supervisor_phase_state(state,"att-parent").resource["session_id"],"same-native")

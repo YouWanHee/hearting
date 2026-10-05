@@ -1177,11 +1177,20 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                 ledger = SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}})
                 ctx = (sup,{},ledger,[({"node":"full-run","successors":["verify"]},row)])
                 control = SimpleNamespace(thread_id="same-native", pending=lambda:True)
+                # Normal begin-turn/start_binding precede the resource request.
+                # A pending correction must preserve that already-bound state.
+                with JOIN._supervisor_state_lock(path):
+                    JOIN._write_supervisor_state_unlocked(path,"att-parent",set(),phase="running-turn",
+                        resource={"session_id":"same-native","delivered":[],"outbox":None})
+                original_state = path.read_bytes()
                 with mock.patch.object(RESOURCE,"context",return_value=ctx), \
-                     mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=reason!="lostwatch"):
+                     mock.patch.object(RESOURCE.RESUME,"supervisor_alive",return_value=reason!="lostwatch"), \
+                     mock.patch.object(RESOURCE,"admit_controller_launch") as admit:
                     prompt = RESOURCE.wait(args,path,control,set(),lambda _:None)
                     self.assertIn("pending user correction",prompt)
                     self.assertEqual(sup.poll_once.call_count,0)
+                    admit.assert_not_called()
+                    self.assertEqual(path.read_bytes(),original_state)
                     self.assertIsNone(JOIN.read_supervisor_phase_state(path,"att-parent").resource["outbox"])
                     control.pending = lambda:False
                     prompt = RESOURCE.wait(args,path,control,set(),lambda _:None)

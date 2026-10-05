@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Detached process runner with PID reuse-safe reattachment."""
-import argparse, contextlib, fcntl, json, os, re, select, signal, subprocess, sys, time
+import argparse, contextlib, fcntl, hashlib, json, os, re, select, signal, subprocess, sys, time
 from pathlib import Path
 import resource_resume as RESOURCE_RESUME
 from resource_run_registry import (
@@ -58,7 +58,7 @@ def settle(registry, run_id, run):
     recorded by whoever notices it first and is idempotent afterwards.
     """
     liveness,_current,reason=classify_identity(run)
-    if liveness=="working" or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
+    if liveness in {"working", "reaping"} or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
                               and run.get("status") == "launching"):
         return run, False
     exit_code=read_sentinel(run.get("sentinel"))
@@ -88,7 +88,32 @@ def settle(registry, run_id, run):
     return locked_update(registry,apply)
 
 
-def start_verified(registry, args, route, route_file, placeholder):
+class LaunchDeferred(Exception):
+    """An actual queued correction takes precedence over unreleased payloads."""
+
+
+def launch_request(args):
+    request = {}
+    for name in ("smoke_attestation", "config_manifest"):
+        value = getattr(args, name, None)
+        request[name] = str(Path(value).resolve(strict=True)) if value else None
+        request[name + "_sha256"] = hashlib.sha256(Path(value).read_bytes()).hexdigest() if value else None
+    return request
+
+
+def controller_argv(registry, row):
+    request = row["launch_request"]
+    argv = ["--registry", str(registry), "start", "--run-id", row["run_id"],
+            "--cwd", row["cwd"], "--log", row["log"], "--route", row["route"],
+            "--node", row["node"], "--parent-attempt-id", row["parent_attempt_id"],
+            "--jobs", row["jobs"]]
+    for name in ("smoke_attestation", "config_manifest"):
+        if request[name]:
+            argv += ["--" + name.replace("_", "-"), request[name]]
+    return argv + ["--", *row["command"]]
+
+
+def start_verified(registry, args, route, route_file, placeholder, *, controller=None):
     """Own the existing watch before releasing an exact, once-only payload."""
     from artifact_producer import prepare_route_artifact_env
     from dispatch_contract import resolve_agent_home, resolve_dispatch_state_root
@@ -103,8 +128,16 @@ def start_verified(registry, args, route, route_file, placeholder):
                        route=str(route_file), jobs=str(jobs))
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
-            "resource_policy", "owner_wait")
+            "resource_policy", "owner_wait", "launch_request")
     def reserve(data):
+        if controller is not None:
+            current = data["runs"].get(args.run_id)
+            if (current != controller.expected or current.get("launch_state") != "queued"
+                    or any(current.get(k) != placeholder.get(k) for k in keys)):
+                raise ValueError("resource-reservation-changed")
+            claimed = {**current, "launch_state": "claimed", "launch_controller": controller.identity}
+            data["runs"][args.run_id] = claimed
+            return True, claimed
         matches = [row for row in data["runs"].values() if row.get("route") == str(route_file)
                    and row.get("node") == args.node]
         if matches:
@@ -115,11 +148,13 @@ def start_verified(registry, args, route, route_file, placeholder):
             raise ValueError("run id already exists")
         data["runs"][args.run_id] = placeholder
         return True, placeholder
-    created, row = locked_update(registry, reserve)
+    with controller.guard() if controller else contextlib.nullcontext():
+        created, row = locked_update(registry, reserve)
     if not created:
         print(json.dumps({**row, "replayed": True, "payload_spawned": False,
                           "supervisor_alive": RESOURCE_RESUME.supervisor_alive(row.get("supervision"))}))
         return
+    placeholder = row
     proc = None
     release = None
     watch = None
@@ -143,6 +178,13 @@ def start_verified(registry, args, route, route_file, placeholder):
             *continuation, "--successor-cwd", str(placeholder["cwd"]),
             "--successor-log", str(runtime / "verification-start.log")],
             check=True, env=environment, stdout=subprocess.DEVNULL, timeout=30)
+        if owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller" and controller is None:
+            queued = {**placeholder, "launch_state": "queued"}
+            publish_verified_run(registry, args.run_id, placeholder, queued)
+            print(json.dumps({**queued, "payload_spawned": False, "supervisor_alive": False,
+                              "required_action": "yield-owner-turn", "verification_admitted": False,
+                              "workflow_complete": False}))
+            return
         ready_read, ready_write = os.pipe()
         try:
             with open(runtime / "watch.log", "ab", buffering=0) as output:
@@ -170,7 +212,7 @@ def start_verified(registry, args, route, route_file, placeholder):
                 path.unlink()
         wait_read, release = os.pipe()
         launch_argv = ["/bin/sh", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
-                       + SENTINEL_SCRIPT, "resource-runner", *placeholder["command"]]
+                       + SENTINEL_SCRIPT, "resource-runner", *(controller.command if controller else placeholder["command"])]
         environment.update(AGENT_RESOURCE_SENTINEL=str(sentinel), AGENT_RESOURCE_LAUNCH_FD=str(wait_read))
         try:
             with open(log, "ab", buffering=0) as output:
@@ -190,15 +232,24 @@ def start_verified(registry, args, route, route_file, placeholder):
             raise ValueError("resource-launch-identity-unconfirmed")
         row = {**placeholder, **ident, "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
                "status": "running", "workflow_state": "RUNNING", "supervision": supervision}
-        publish_verified_run(registry, args.run_id, placeholder, row)
-        os.write(release, b"start\n")
-        payload_released = True
+        if controller is not None:
+            row.update(launch_state="started", pid_namespace=controller.identity["pid_namespace"],
+                       payload_sandbox=controller.sandbox)
+        with controller.guard() if controller else contextlib.nullcontext():
+            publish_verified_run(registry, args.run_id, placeholder, row)
+            os.write(release, b"start\n")
+            payload_released = True
+        if controller is not None:
+            # The outer controller keeps the actual Popen handles so it can
+            # reap its children before observing /proc, without PID guessing.
+            controller.children = (proc, watch)
+            controller.row = row
         os.close(release)
         release = None
         print(json.dumps({**row, "replayed": False, "payload_spawned": True,
                           "supervisor_alive": True, "watch_seconds": 86400,
                           "verification_admitted": False, "workflow_complete": False}))
-    except Exception:
+    except Exception as error:
         # Closing the private fence cannot run the payload. Do not signal a foreign PID.
         if release is not None:
             os.close(release)
@@ -216,8 +267,11 @@ def start_verified(registry, args, route, route_file, placeholder):
                 current = data["runs"].get(args.run_id)
                 if current != placeholder and current != row:
                     raise ValueError("resource-reservation-changed")
-                current.update(status="failed", workflow_state="FAILED_RETRYABLE",
-                               failure_class="resource-launch-incomplete")
+                if isinstance(error, LaunchDeferred) and controller is not None:
+                    data["runs"][args.run_id] = controller.expected
+                else:
+                    current.update(status="failed", workflow_state="FAILED_RETRYABLE",
+                                   failure_class="resource-launch-incomplete")
             locked_update(registry, mark_failed)
         raise
 
@@ -229,7 +283,7 @@ def publish_verified_run(registry, run_id, expected, published):
             raise ValueError("resource-reservation-changed")
         data["runs"][run_id] = published
     locked_update(registry, apply)
-def main():
+def main(argv=None, *, controller=None):
     p=argparse.ArgumentParser(); p.add_argument("--registry"); s=p.add_subparsers(dest="cmd",required=True)
     a=s.add_parser("start"); a.add_argument("--run-id",required=True); a.add_argument("--cwd",required=True); a.add_argument("--log",required=True); a.add_argument("--route",required=True); a.add_argument("--node",required=True); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")
     a.add_argument("--parent-attempt-id",help="registered headless attempt that owns this resource child")
@@ -239,7 +293,7 @@ def main():
         x=s.add_parser(name); x.add_argument("--run-id",required=True)
     s.add_parser("list")
     index_cmd=s.add_parser("index"); index_cmd.add_argument("--registry",required=True)
-    args=p.parse_args()
+    args=p.parse_args(argv)
     if args.cmd=="index":
         registry=Path(args.registry).resolve(strict=True)
         indexed=register_registry(registry)
@@ -317,11 +371,18 @@ def main():
         owner_wait = None
         if not resume and (node.get("continuation") or {}).get("kind") == "supervised":
             import dispatch_resource_wait as OWNER_RESOURCE
-            owner_wait = OWNER_RESOURCE.start_binding(route, route_file, args, os.environ)
+            owner_wait = (controller.expected.get("owner_wait") if controller is not None else
+                          OWNER_RESOURCE.start_binding(route, route_file, args, os.environ))
             if owner_wait:
                 placeholder.update(parent_attempt_id=args.parent_attempt_id, owner_wait=owner_wait)
+                if owner_wait.get("launch_scope") == "codex-owner-controller":
+                    placeholder["launch_request"] = launch_request(args)
+                    if controller is not None and placeholder["launch_request"] != controller.expected.get("launch_request"):
+                        fail("resource-launch-request-changed")
+        if controller is not None and (not owner_wait or owner_wait.get("launch_scope") != "codex-owner-controller"):
+            fail("resource-controller-scope-invalid")
         if resume or owner_wait:
-            start_verified(registry, args, route, route_file, placeholder)
+            start_verified(registry, args, route, route_file, placeholder, controller=controller)
             return
         def reserve(data):
             if args.run_id in data["runs"]: raise ValueError("run id already exists")
@@ -404,7 +465,7 @@ def main():
             locked_update(registry, cancel)
         os.killpg(group,signal.SIGTERM)
     status=run.get("status") if run.get("status") in TERMINAL_STATUSES else \
-        {"working":"running","exited":"exited","stale":"stale"}[liveness]
+        {"working":"running","reaping":"reaping","exited":"exited","stale":"stale"}[liveness]
     print(json.dumps({**run,"status":status,"liveness":liveness},sort_keys=True))
 if __name__=="__main__":
  try: main()

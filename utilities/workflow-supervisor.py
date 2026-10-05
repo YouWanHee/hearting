@@ -180,6 +180,9 @@ def resource_evidence(armed):
     if liveness == "working":
         return {"terminal": False, "reason": "resource-still-running", "liveness": liveness,
                 "identity": identity}
+    if liveness == "reaping":
+        return {"terminal": False, "reason": reason, "liveness": liveness,
+                "identity": identity}
     status = row.get("status")
     if status not in ("succeeded", "failed"):
         # Gone but unsettled means the observation could not be persisted; refuse.
