@@ -588,10 +588,14 @@ def _wait_budget(result):
                - result.get("join_waited_seconds", 0))
 
 
-def _timed_join(result, clock, **kwargs):
+def _timed_join(result, clock, *, observe_only=False, **kwargs):
     began = clock()
     joined = join_selected_attempts(**kwargs)
     result["join_waited_seconds"] = round(result.get("join_waited_seconds", 0) + max(0, clock() - began), 1)
+    if observe_only and kwargs.get("timeout") == 0 and joined["state"] == "timeout":
+        # The shared join calls a zero-time snapshot a timeout. No wait expired
+        # in this start receipt; preserve the exact children and diagnostics.
+        joined = {**joined, "state": "pending"}
     return joined
 
 
@@ -997,6 +1001,8 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
     leg_result = start_work(leg_route, leg_path, jobs, wait=wait, run=run, sleep=sleep, clock=clock)
     if not _first_leg_started(leg_result, jobs, leg_route):
         return None, leg_result
+    print(module.compose_card(leg_route, RP.display_plan(decision["proposal"]["legs"]),
+                              owner_harness=context.get("owner")), file=sys.stderr)
     _checkpoint("after-first-start")
     encoded = json.dumps(leg_result, sort_keys=True, ensure_ascii=False)
     decision_record = _bind(record_path, start_receipt=json.loads(encoded),
@@ -1384,7 +1390,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             result.update(_wait_fields(attempts, rows, resume))
         joined = _timed_join(
             result, clock, jobs=jobs, expected_attempts=attempts,
-            timeout=_wait_budget(result) if wait else 0, recover=True)
+            timeout=_wait_budget(result) if wait else 0, recover=True, observe_only=not wait)
         result["observation"] = joined
         from dispatch_replacement import advance_batch
         effective, lineage, attention = advance_batch(jobs, attempts, run=run)
@@ -1491,7 +1497,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                         "cannot execute them. No automatic retry or replacement is authorized by this observation."}
     joined = _timed_join(
         result, clock, jobs=jobs, expected_attempts={aid},
-        timeout=_wait_budget(result) if wait else 0, recover=True)
+        timeout=_wait_budget(result) if wait else 0, recover=True, observe_only=not wait)
     if status != "done" and _rows(jobs).get(aid, (status,))[0] == "done":
         # The owner exited while this call waited: its receipt asks the same question the next start would.
         gate_response = _owner_gate_response(route, path, jobs, aid, _rows(jobs)[aid][1], result)

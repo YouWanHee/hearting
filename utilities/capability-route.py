@@ -3965,7 +3965,8 @@ def route_start_approvals(route, registry=None):
     return rows
 
 
-def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False):
+def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
+                 campaign_selection=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
@@ -3976,7 +3977,8 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
         f" · route {route['route_id']} · origin compose · 사람 게이트 {gates}\n"
         f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
-        + _compose_campaign_line(compose_campaign_selection(route))
+        + _compose_campaign_line(campaign_selection if campaign_selection is not None
+                                 else compose_campaign_selection(route))
     )
     if framed:
         card += ("\n  frame이 방향과 경로를 조립해 제안합니다"
@@ -9641,9 +9643,13 @@ def main():
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
+        # Starting this route may create its campaign. Keep this invocation's
+        # original choice instead of calling the newly-created stream a join.
+        _campaign_for_card = compose_campaign_selection(route)
         if a.explain:
             print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
-                               route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
+                               route_plan_unreadable=route_plan_unreadable,
+                               campaign_selection=_campaign_for_card),file=sys.stderr)
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
                               "effective_intensity":route["effective_intensity"],"shape":shape,
@@ -9652,7 +9658,7 @@ def main():
                                         "completion_gate":n.get("completion_gate"),"terminal":n.get("terminal") is True}
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
-                              "campaign":compose_campaign_selection(route),
+                              "campaign":_campaign_for_card,
                               "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_pin),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
@@ -9664,7 +9670,8 @@ def main():
         # never closes this route, and a cycle it seals is never the one this route begins or continues).
         _route_autoclose(artifact_root,"compose",route)
         print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
-                           route_plan_unreadable=route_plan_unreadable),file=sys.stderr)
+                           route_plan_unreadable=route_plan_unreadable,
+                           campaign_selection=_campaign_for_card),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError

@@ -9,6 +9,7 @@ that registers one row like the selector does), and the readiness probe (fixed e
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import re
@@ -206,7 +207,9 @@ class EntryExecutionScopeTest(StartBase):
 
 class SelectedLegTest(StartBase):
     def test_a164_2_a_direct_proposal_starts_one_first_leg_and_closes_the_frame_route(self):
-        result = self.settle()
+        notice = io.StringIO()
+        with contextlib.redirect_stderr(notice):
+            result = self.settle()
         self.assertEqual((result["state"], result["required_action"]), ("inline", "execute-inline"), result)
         self.assertEqual(result["route_decision"]["selected"], ROUTE_LABELS[0])
         record = self.record()
@@ -216,6 +219,14 @@ class SelectedLegTest(StartBase):
         self.assertEqual(len(self.leg_routes()), 1)
         leg = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
         self.assertEqual(first["route"]["route_id"], leg["route_id"])
+        self.assertEqual(notice.getvalue().count("[경로]"), 1)
+        self.assertIn("[경로] autopilot-code · direct(direct) inline", notice.getvalue())
+        self.assertIn("route " + leg["route_id"], notice.getvalue())
+        replay_notice = io.StringIO()
+        with contextlib.redirect_stderr(replay_notice):
+            replay = self.settle()
+        self.assertEqual((replay["state"], replay["route_id"]), ("inline", leg["route_id"]))
+        self.assertNotIn("[경로]", replay_notice.getvalue())
         self.assertEqual(leg["selection"]["shape"], "direct")
         self.assertEqual(leg["parent_cycle_id"], decision["frame_route"]["cycle_id"])
         self.assertEqual(leg["campaign_key"], "framed-key")
@@ -235,7 +246,9 @@ class SelectedLegTest(StartBase):
     def test_a_staged_proposal_starts_one_registered_owner_and_returns_its_receipt(self):
         self.set_briefs(CODE_STAGED, CODE_STAGED)
         self.set_interview({"legs": [CODE_STAGED]})
-        result = self.settle()
+        notice = io.StringIO()
+        with contextlib.redirect_stderr(notice):
+            result = self.settle()
         self.assertEqual(result["state"], "running", result)
         self.assertEqual(result["parent_next"], "end-turn")          # the owner's own directive, unchanged
         self.assertTrue(result["owner_started"])
@@ -256,6 +269,9 @@ class SelectedLegTest(StartBase):
         self.assertIn("direction-brief.md", task)
         record = self.record()
         self.assertEqual(record["first_leg"]["route"]["route_id"], leg["route_id"])
+        self.assertEqual(notice.getvalue().count("[경로]"), 1)
+        self.assertIn("[경로] autopilot-code · staged(standard)", notice.getvalue())
+        self.assertIn("route " + leg["route_id"], notice.getvalue())
         self.assertEqual(record["first_leg"]["start_receipt"]["owner_attempt_id"], result["owner_attempt_id"])
         self.assertEqual(self.cli_calls, ["complete", "close"])
         self.assertTrue(R.outcome_path(self.path).exists())
@@ -533,7 +549,10 @@ class FailureTableTest(StartBase):
     def test_a_launch_that_is_not_admitted_is_the_first_legs_own_needs_attention(self):
         self.set_briefs(CODE_STAGED, CODE_STAGED)
         self.set_interview({"legs": [CODE_STAGED]})
-        result = self.settle(run=lambda command, **kw: subprocess.CompletedProcess(command, 65, "check=failed\nreason=x\n", ""))
+        notice = io.StringIO()
+        with contextlib.redirect_stderr(notice):
+            result = self.settle(run=lambda command, **kw: subprocess.CompletedProcess(command, 65, "check=failed\nreason=x\n", ""))
+        self.assertNotIn("[경로]", notice.getvalue())
         self.assertEqual(result["state"], "needs-attention", result)
         self.assertEqual(result["reason"], "owner-launch-not-admitted")
         self.assertFalse(R.outcome_path(self.path).exists())

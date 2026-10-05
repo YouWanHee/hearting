@@ -7064,6 +7064,32 @@ class ComposeRouteTest(TestRoute):
     path=R._emit_compiled_route(types.SimpleNamespace(command="compose",start=True),route,tmp)
    self.assertEqual(out.getvalue(),"")
    self.assertEqual(json.loads(path.read_text()),route)
+ def test_compose_start_keeps_new_campaign_notice_before_its_own_cycle_creation(self):
+  import artifact_producer, work_start
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp); artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("One approved inline edit")
+   route=self.compose(shape="direct",graph=None,artifact_root=str(artifacts),campaign_key="new-start",
+                      work_request={"text":prompt.read_text(),"owner_harness":None})
+   def start(route,path,jobs,**kwargs):
+    artifact_producer.prepare_route_artifact_env(path,start=True,jobs=jobs)
+    return {"state":"inline","required_action":"execute-inline","route_id":route["route_id"]}
+   argv=[str(P),"compose","--shape","direct","--campaign-key","new-start","--slug","notice",
+         "--cwd",str(R.ROOT),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),"--jobs",str(root/"jobs.log")]
+   notices=[]
+   for _ in range(2):
+    out,err=io.StringIO(),io.StringIO()
+    with mock.patch.object(sys,"argv",argv), mock.patch.object(R,"compose_route",return_value=route), \
+         mock.patch.object(R,"_record_route_chain"), mock.patch.object(R,"_route_autoclose"), \
+         mock.patch.object(work_start,"start_work",side_effect=start), \
+         contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+     self.assertEqual(R.main(),0)
+    self.assertEqual(json.loads(out.getvalue())["state"],"inline")
+    self.assertEqual(json.loads(Path(R.canonical_route_path(str(artifacts),route["route_id"])).read_text()),route)
+    self.assertEqual(err.getvalue().count("[경로]"),1)
+    notices.append(err.getvalue())
+   self.assertIn("캠페인 new-start (신규 생성)",notices[0])
+   self.assertNotIn("기존 합류",notices[0])
+   self.assertIn("캠페인 new-start (기존 합류)",notices[1])
  def test_compose_receipt_keeps_choices_and_full_canonical_record(self):
   import contextlib, io, types
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT)}):

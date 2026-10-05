@@ -297,6 +297,7 @@ class WorkStartTest(unittest.TestCase):
         for _ in range(3):
             result = self.start()
             self.assertEqual(result["state"], "preparing", result)
+            self.assertEqual(result["observation"]["state"], "pending")
             self.assertEqual(result["parent_next"], "end-turn")
         self.assertEqual(len(self.calls), 2)
         self.assertTrue(all("--adapter" not in c for c in self.calls))
@@ -388,6 +389,8 @@ class WorkStartTest(unittest.TestCase):
                 mock.patch("dispatch_replacement.advance_batch", side_effect=batch):
             result = self.start(wait=True, sleep=lambda seconds: None, clock=lambda: now[0])
         self.assertEqual(timeouts, [600, 10])
+        self.assertEqual(result["observation"]["state"], "timeout")
+        self.assertEqual((result["state"], result["reason"]), ("needs-attention", "parent-wait-deadline"))
         self.assertEqual(result["join_waited_seconds"], 1180)
         self.assertEqual(W._wait_budget(result), 0)
         self.assertEqual(W._wait_budget({"capacity_waited_seconds": 7, "join_waited_seconds": 3}), 590)

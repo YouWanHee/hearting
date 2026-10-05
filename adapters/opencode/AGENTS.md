@@ -129,10 +129,14 @@ call, never a subset, or both briefs land in an unrelated, possibly closed,
 campaign/cycle directory.
 
 **OpenCode has no automatic wake carrier, and this is not carrier parity with
-Claude.** An OpenCode depth-0 parent joins its frame legs by an *explicit
-bounded wait*: each leg's receipt reads `parent_next=bounded-wait`, and you run
-that leg's printed `parent_next_command` exactly once — once per leg, two legs,
-two waits. Nothing wakes this session on its own. Do not describe or rely on a
+Claude.** For `compose --start` / `start`, follow the top-level receipt's
+`parent_next` and run its `parent_next_command` once only when it says
+`bounded-wait`; reuse its `resume_command` after a wake or correction. Nested
+leg receipts remain evidence and do not add child waits. `end-turn` requires
+no wait, and `needs-attention` after an expired wait grants no repeat wait.
+For independent low-level leg launches only, follow each actual leg receipt;
+two legs do not by themselves require two waits. Nothing wakes this session
+on its own. Do not describe or rely on a
 Claude-style carrier here; that gap is a deliberate scope boundary, not a
 defect to work around.
 
