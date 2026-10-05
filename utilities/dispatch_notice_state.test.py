@@ -2,6 +2,7 @@
 """H6/H7: stale obligations are retired, real completion and gates survive."""
 import json
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -205,6 +206,10 @@ class NoticeTest(unittest.TestCase):
 
     def test_materialized_single_frame_notice_stops_after_exact_decision(self):
         import dispatch_completion_join as join
+        from dispatch_contract import process_start_ticks
+        # The synthetic gone workers use this host's actual birth clock.
+        fixture_start = process_start_ticks(os.getpid())
+        self.assertIsNotNone(fixture_start)
         source = Path(__file__).with_name("framed_route.test.py")
         spec = importlib.util.spec_from_file_location("notice_production_frame_fixture", source)
         framed = importlib.util.module_from_spec(spec)
@@ -224,7 +229,7 @@ class NoticeTest(unittest.TestCase):
                     route_hash=case.route["route_hash"], route_file=str(case.path),
                     route_node=node["id"], parent_sid="parent", harness="claude",
                     parent_completion_delivery="claude-parent-runtime",
-                    launch_claimed="1", launch_started="1", pid="99999999", pid_start="1",
+                    launch_claimed="1", launch_started="1", pid="99999999", pid_start=fixture_start,
                     pgid="99999999", pid_scope="host-visible", process_exit="0",
                     launch_lifecycle="foreground-scoped", launch_outcome="governed-process-reaped",
                     group_reap_proof="pgid-empty-v1", group_reap_pgid="99999999",

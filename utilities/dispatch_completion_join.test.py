@@ -172,7 +172,7 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         namespace = D.process_namespace_identity()
         metadata = {
             "harness": "claude", "fallback_hop": "same-harness-headless", "worker_type": "stage",
-            "pid": "99999996", "pid_start": "1", "pgid": "99999996",
+            "pid": "99999996", "pid_start": D.process_start_ticks(os.getpid()), "pgid": "99999996",
             "pid_scope": "namespace-local", "pid_observer_ns": namespace, "pid_ns": namespace,
             "launch_lifecycle": "detached", "launch_outcome": "governed-process-group-drained",
             "group_reap_proof": D.GROUP_REAP_PROOF, "group_reap_pgid": "99999996",
@@ -263,7 +263,7 @@ class DispatchCompletionJoinTest(unittest.TestCase):
     def extinct_foreign_namespace_metadata(self):
         if not D._current_observer_is_host_like():
             self.skipTest("requires a host procfs observer")
-        metadata={"pid":"99999999","pgid":"99999999","pid_start":"1",
+        metadata={"pid":"99999999","pgid":"99999999","pid_start":D.process_start_ticks(os.getpid()),
                   "pid_scope":"namespace-local","pid_observer_ns":"pid:[999999999]",
                   "pid_ns":"pid:[999999999]",
                   "fallback_hop":"same-harness-headless","worker_type":"stage"}
@@ -875,7 +875,7 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         parent = "att-parent"
         metadata = {
             "pid": "999999",
-            "pid_start": "42",
+            "pid_start": D.process_start_ticks(os.getpid()),
             "pgid": "999999",
             "pid_scope": "namespace-local",
             "pid_ns": os.readlink("/proc/self/ns/pid"),
@@ -933,7 +933,7 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         namespace = os.readlink("/proc/self/ns/pid")
         metadata = {
             "pid": "999999",
-            "pid_start": "42",
+            "pid_start": D.process_start_ticks(os.getpid()),
             "pgid": "999999",
             "pid_scope": "namespace-local",
             "pid_ns": namespace,
@@ -1776,7 +1776,7 @@ def sealed_cancellation_metadata() -> dict[str, str]:
     observer = os.readlink("/proc/self/ns/pid")
     return {
         "pid_scope": "namespace-local",
-        "pid": "99999996", "pid_start": "1", "pgid": "99999996",
+        "pid": "99999996", "pid_start": D.process_start_ticks(os.getpid()), "pgid": "99999996",
         "pid_observer_ns": observer, "pid_ns": observer,
         "cancellation_quiescence_receipt": D.ATTEMPT_CANCELLATION_QUIESCENCE_RECEIPT,
         "cancellation_receipt_digest": "sha256:" + "c" * 64,
@@ -1789,7 +1789,7 @@ def sealed_cancellation_metadata_without_receipt() -> dict[str, str]:
     observer = os.readlink("/proc/self/ns/pid")
     return {
         "pid_scope": "namespace-local",
-        "pid": "99999996", "pid_start": "1", "pgid": "99999996",
+        "pid": "99999996", "pid_start": D.process_start_ticks(os.getpid()), "pgid": "99999996",
         "pid_observer_ns": observer, "pid_ns": observer,
     }
 
@@ -2144,7 +2144,7 @@ class FinishedChildClosure(unittest.TestCase):
         namespace = D.process_namespace_identity()
         metadata = dict(child.metadata, parent_attempt_id="att-parent", worker_type="review",
                         launch_lifecycle="detached", launch_outcome="governed-process-group-drained",
-                        pid="99999996", pid_start="1", pgid="99999996",
+                        pid="99999996", pid_start=D.process_start_ticks(os.getpid()), pgid="99999996",
                         pid_scope="namespace-local", pid_observer_ns=namespace, pid_ns=namespace,
                         group_reap_proof=D.GROUP_REAP_PROOF, group_reap_pgid="99999996",
                         attempt_descendant_proof=D.ATTEMPT_DESCENDANT_RESIDUE_PROOF,

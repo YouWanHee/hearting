@@ -2880,6 +2880,7 @@ class ProcessTableScan:
     incomplete_reason: str = ""
     group_errors: tuple[tuple[int, int | None, str], ...] = ()
     error: str = ""
+    tag_access_errors: tuple[tuple[int, str, str], ...] = ()
 
 
 _PROCESS_TABLE_SCAN: contextvars.ContextVar = contextvars.ContextVar(
@@ -2893,7 +2894,7 @@ def scan_process_table() -> ProcessTableScan:
     Per-process reads, skips, and incomplete reasons are exactly those of the
     two single-shot probes, evaluated independently on the same raw ``stat``
     line: the tag index needs ``tail[0]``/``tail[19]`` and then ``environ``
-    (a permission failure is another uid's process and is skipped); the group
+    (permission failures retain UID and adjacent birth observations); the group
     index needs ``int(tail[2])`` first (a failure there is a group-wide
     incomplete walk, like an unreadable ``stat``) and ``tail[19]`` only for the
     group that pgid names. The tag value is recorded for every process instead
@@ -2906,6 +2907,7 @@ def scan_process_table() -> ProcessTableScan:
     by_pgid: dict[int, list[tuple[int, str, str]]] = {}
     incomplete_reason = ""
     group_errors: list[tuple[int, int | None, str]] = []
+    tag_access_errors: list[tuple[int, str, str]] = []
     try:
         entries = tuple(Path("/proc").iterdir())
     except OSError as exc:
@@ -2921,7 +2923,11 @@ def scan_process_table() -> ProcessTableScan:
             if exc.errno in {errno.ENOENT, errno.ESRCH}:
                 continue
             group_errors.append((order, None, f"procfs-member:{entry.name}:{exc.errno or 'error'}"))
-            if exc.errno not in {errno.EACCES, errno.EPERM}:
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                _start, reason = _tag_access_observation(entry)
+                if reason:
+                    tag_access_errors.append((int(entry.name), "", reason))
+            else:
                 incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
         except ValueError:
@@ -2956,10 +2962,15 @@ def scan_process_table() -> ProcessTableScan:
             continue
         try:
             environ = (entry / "environ").read_bytes()
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError:
             continue
         except OSError as exc:
-            if exc.errno in {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                stable_start, reason = _tag_access_observation(entry, start)
+                if reason:
+                    tag_access_errors.append((pid, stable_start, reason))
                 continue
             incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
@@ -2975,6 +2986,7 @@ def scan_process_table() -> ProcessTableScan:
         {pgid: tuple(sorted(rows, key=lambda member: member[0])) for pgid, rows in by_pgid.items()},
         incomplete_reason,
         tuple(group_errors),
+        tag_access_errors=tuple(tag_access_errors),
     )
 
 
@@ -3037,6 +3049,11 @@ def _tagged_descendants_from_scan(
         return ProcessGroupObservation(
             "unverifiable", (), "observer-namespace-mismatch"
         )
+    access_reason = next((reason for pid, start, reason in scan.tag_access_errors
+                          if pid not in excluded_pids and not _denied_process_outside_attempt(
+                              start, metadata, host_complete=host_complete)), "")
+    if access_reason:
+        return ProcessGroupObservation("unverifiable", (), access_reason)
     return ProcessGroupObservation("empty")
 
 
@@ -3055,6 +3072,45 @@ def _process_group_from_scan(scan: ProcessTableScan, pgid: int) -> ProcessGroupO
     return ProcessGroupObservation("empty", ordered)
 
 
+def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
+    """Only another UID or an adjacent stable birth observation may exclude denial."""
+    try:
+        if entry.stat().st_uid != os.getuid():
+            return "", ""
+    except FileNotFoundError:
+        return "", ""
+    except OSError:
+        return "", f"procfs-environ:{entry.name}:uid-unobservable"
+    try:
+        raw = (entry / "stat").read_text(encoding="utf-8")
+        current = raw[raw.rfind(")") + 2:].split()[19]
+        stable = start if start.isdigit() and current == start else ""
+    except FileNotFoundError:
+        return "", ""
+    except (OSError, IndexError, ValueError):
+        stable = ""
+    return stable, f"procfs-environ:{entry.name}:same-uid-unobservable"
+
+
+def _denied_process_outside_attempt(start: str, metadata: dict[str, str], *, host_complete=False) -> bool:
+    """A denied process born before this exact local child is not its descendant."""
+    if not metadata.get('pid') and metadata.get('launch_outcome') in {'never-launched', 'reaped-before-publish'}:
+        return True  # atomic fenced outcome: no payload could create a descendant
+    if (metadata.get("launch_claimed") == "0"
+            and metadata.get("launch_started", "") in {"", "0"}
+            and metadata.get("registered_worker") == "1"
+            and metadata.get("execution_surface") == "registered-headless"
+            and not any(metadata.get(key) for key in (
+                "pid", "pid_start", "pid_host", "pid_host_start", "pgid"))):
+        return True  # atomic register-only row: no runner has claimed execution
+    origin = metadata.get("pid_start", "")
+    authority = attempt_scan_namespace_authority(metadata) or (
+        host_complete and _current_observer_is_host_like() and namespace_gone(metadata) == 'extinct')
+    return bool(isinstance(start, str) and isinstance(origin, str)
+                and start.isdigit() and origin.isdigit() and int(start) < int(origin)
+                and authority)
+
+
 def attempt_tagged_descendants(
     metadata: dict[str, str], *, host_complete: bool = False
 ) -> ProcessGroupObservation:
@@ -3068,9 +3124,9 @@ def attempt_tagged_descendants(
 
     Emptiness is evidence only from the namespace that recorded the identities;
     from anywhere else the tagged processes may simply be invisible, so that
-    case is ``unverifiable`` rather than a false death. Another uid's process is
-    never one of this harness's workers, so an unreadable ``environ`` is skipped
-    instead of poisoning the scan. ``host_complete`` is used only once the
+    case is ``unverifiable`` rather than a false death. Only a verified different
+    UID, or an adjacent stable birth earlier than this exact local child, excludes
+    a denied environment. Readable positive tags always win. ``host_complete`` is used only once the
     recorded namespaces are extinct (`attempt_process_quiescence`): then a
     complete walk by a host-like observer, which sees every namespace, is the
     one that may answer ``empty``.
@@ -3096,6 +3152,7 @@ def attempt_tagged_descendants(
     excluded_pids = _parent_leader_pids(metadata)
     members: list[tuple[int, str, str]] = []
     incomplete_reason = ""
+    access_errors = []
     try:
         entries = tuple(Path("/proc").iterdir())
     except OSError as exc:
@@ -3105,6 +3162,7 @@ def attempt_tagged_descendants(
     for entry in entries:
         if not entry.name.isdigit():
             continue
+        start = ""
         try:
             raw = (entry / "stat").read_text(encoding="utf-8")
             tail = raw[raw.rfind(")") + 2 :].split()
@@ -3112,10 +3170,17 @@ def attempt_tagged_descendants(
             if state == "Z":
                 continue
             environ = (entry / "environ").read_bytes()
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError:
             continue
         except OSError as exc:
-            if exc.errno in {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                if int(entry.name) in excluded_pids:
+                    continue
+                stable_start, reason = _tag_access_observation(entry, start)
+                if reason:
+                    access_errors.append((stable_start, reason))
                 continue
             incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
@@ -3135,6 +3200,10 @@ def attempt_tagged_descendants(
         return ProcessGroupObservation(
             "unverifiable", (), "observer-namespace-mismatch"
         )
+    access_reason = next((reason for start, reason in access_errors if not _denied_process_outside_attempt(
+        start, metadata, host_complete=host_complete)), '')
+    if access_reason:
+        return ProcessGroupObservation('unverifiable', (), access_reason)
     return ProcessGroupObservation("empty")
 
 

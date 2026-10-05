@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, unittest
+import contextlib, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, types, unittest
 from unittest import mock
 from pathlib import Path
 
@@ -4311,7 +4311,7 @@ def residue_sealed_metadata(attempt="att-residue-drain"):
  namespace=D.process_namespace_identity()
  metadata=cancellation_metadata(attempt)
  metadata.update({
-  "pid":"99999996","pgid":"99999996","pid_start":"1",
+  "pid":"99999996","pgid":"99999996","pid_start":D.process_start_ticks(os.getpid()),
   "pid_observer_ns":namespace,"pid_ns":namespace,
   "launch_outcome":"governed-process-group-drained",
   "group_reap_proof":D.GROUP_REAP_PROOF,"group_reap_pgid":"99999996",
@@ -6061,7 +6061,7 @@ def namespace_row_metadata(attempt="att-namespace-extinct"):
  # The 5th Codex run's plan row: a receiptless namespace-local worker whose
  # recorded (kernel-shaped) PID namespace is not this observer's.
  return {"attempt_id":attempt,"route_id":"rt-namespace","route_hash":"sha256:"+"5"*64,
-         "route_node":"plan","pid":"464","pid_start":"537327887","pgid":"464",
+         "route_node":"plan","pid":"464","pid_start":D.process_start_ticks(os.getpid()),"pgid":"464",
          "pid_scope":"namespace-local","pid_observer_ns":"pid:[4026534323]",
          "pid_ns":"pid:[4026534323]","registered_worker":"1",
          "launch_lifecycle":"foreground-scoped"}
@@ -6324,5 +6324,66 @@ class ForegroundInterruptedOutcomeTest(unittest.TestCase):
         self.assertRaises(D.DispatchContractError):
     D._foreground_outcome_values(exit_code=exit_code,failure=failure,group_empty=True)
 
+
+class TagScanPermissionScopeTest(unittest.TestCase):
+ def check_scan(self, start, expected, *, uid=None, stable=None, positive=False, authority=True, origin='100', extra=None):
+  with tempfile.TemporaryDirectory() as home:
+   entry=Path(home)/'123';entry.mkdir()
+   def raw(value):
+    tail=['S','1','123']+['0']*16+[value]
+    return '123 (fixture) '+' '.join(tail)
+   (entry/'stat').write_text(raw(start));(entry/'environ').write_bytes(b'AGENT_DISPATCH_ATTEMPT_ID=att-scope\0')
+   original_bytes=Path.read_bytes;original_stat=Path.stat;original_text=Path.read_text
+   def read_bytes(path):
+    if path==entry/'environ' and not positive:raise PermissionError(13,'denied')
+    return original_bytes(path)
+   def stat(path,*args,**kw):
+    if path==entry:
+     if uid=='unknown':raise PermissionError(13,'denied')
+     return types.SimpleNamespace(st_uid=os.getuid() if uid is None else uid)
+    return original_stat(path,*args,**kw)
+   reads=[0]
+   def read_text(path,*args,**kw):
+    if path==entry/'stat':
+     reads[0]+=1
+     return raw(start if reads[0]%2==1 or stable is None else stable)
+    return original_text(path,*args,**kw)
+   metadata={'attempt_id':'att-scope','pid_start':origin,**(extra or {})}
+   with mock.patch.object(Path,'iterdir',return_value=iter([entry])), \
+        mock.patch.object(Path,'read_bytes',read_bytes),mock.patch.object(Path,'stat',stat), \
+        mock.patch.object(Path,'read_text',read_text), \
+        mock.patch.object(D,'_parent_leader_pids',return_value=set()), \
+        mock.patch.object(D,'attempt_scan_namespace_authority',return_value=authority):
+    self.assertEqual(D.attempt_tagged_descendants(metadata).state,expected)
+   reads[0]=0
+   with mock.patch.object(Path,'iterdir',return_value=iter([entry])), \
+        mock.patch.object(Path,'read_bytes',read_bytes),mock.patch.object(Path,'stat',stat), \
+        mock.patch.object(Path,'read_text',read_text), \
+        mock.patch.object(D,'_parent_leader_pids',return_value=set()), \
+        mock.patch.object(D,'attempt_scan_namespace_authority',return_value=authority):
+    scan=D.scan_process_table()
+    self.assertEqual(D._tagged_descendants_from_scan(scan,metadata,'att-scope').state,expected)
+
+ def test_denied_same_uid_older_is_outside_child_but_equal_new_unknown_are_not(self):
+  self.check_scan('99','empty')
+  for start in ('100','101','bad'):
+   with self.subTest(start=start):self.check_scan(start,'unverifiable')
+  self.check_scan('99','unverifiable',stable='101')
+  self.check_scan('99','unverifiable',uid='unknown')
+  self.check_scan('99','unverifiable',authority=False)
+
+ def test_different_uid_skip_and_positive_exact_tag_live_priority(self):
+  self.check_scan('101','empty',uid=os.getuid()+1)
+  self.check_scan('99','populated',positive=True)
+
+ def test_atomic_register_only_excludes_denial_but_claim_or_identity_does_not(self):
+  metadata=dict(launch_claimed='0',registered_worker='1',
+                execution_surface='registered-headless')
+  self.check_scan('101','empty',origin='',extra=metadata)
+  self.check_scan('101','populated',origin='',extra=metadata,positive=True)
+  for changes in ({'launch_claimed':'1'},{'launch_started':'1'},
+                  {'pid':'123'},{'pid_host_start':'100'},{'registered_worker':'0'}):
+   with self.subTest(changes=changes):
+    self.check_scan('101','unverifiable',origin='',extra={**metadata,**changes})
 
 if __name__=="__main__": unittest.main()

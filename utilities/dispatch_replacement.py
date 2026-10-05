@@ -11,6 +11,7 @@ import fcntl
 import dataclasses
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1259,15 +1260,84 @@ def _capacity_wait(jobs, aid, source, hold=None):
         hold = _capacity_hold(jobs, source)
     if hold:
         result['usage_state'] = hold['label']
+        for key in ('headroom', 'usage_gate_used_percent', 'capacity_source'):
+            if key in hold:
+                result[key] = hold[key]
         if hold.get('until_epoch'):
             result['retry_at'] = datetime.fromtimestamp(hold['until_epoch'], timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     return result
 
 
+def _capacity_reader():
+    spec = importlib.util.spec_from_file_location('replacement_harness_capacity', ROOT/'utilities/harness-capacity.py')
+    capacity = importlib.util.module_from_spec(spec); spec.loader.exec_module(capacity)
+    return capacity
+
+
 def _capacity_hold(jobs, source, model=None):
-    from dispatch_capacity_evidence import harness_hold
+    from dispatch_capacity_evidence import harness_hold, usage_states
     harness = source.get('harness') or source.get('owner_harness')
-    return harness_hold(jobs, harness, model=model or source.get('model')) if harness else None
+    if not harness:
+        return None
+    hold = harness_hold(jobs, harness, model=model or source.get('model'))
+    if hold:
+        return hold
+    _, route = _route(jobs, source.get('attempt_id'), source)
+    allocation = route.get('dispatch_allocation') or {}
+    if allocation.get('strategy') not in {'balanced', 'capacity-aware'}:
+        return None  # legacy routes keep their existing hard-quota contract
+    policy = route.get('owner_harness_policy') if source.get('worker_type') == 'owner' else next(
+        (node.get('harness_policy') for node in route.get('nodes', [])
+         if node.get('id') == source.get('route_node')), None)
+    if not isinstance(policy, dict):
+        return None
+    capacity = _capacity_reader()
+    report = capacity.capacity_report()
+    scores = report['scores']; score = scores.get(harness)
+    gate = allocation.get('usage_gate_used_percent', 90)
+    if (allocation['strategy'] == 'balanced' and not capacity.is_gated(
+            scores, harness, usage_gate_used_percent=gate)):
+        return None  # balanced unknown remains optimistic, as in the normal selector
+    if allocation['strategy'] == 'capacity-aware' and score is not None and score > 0 and not capacity.is_gated(
+            scores, harness, usage_gate_used_percent=gate):
+        return None
+    states = usage_states(jobs, models={harness: model or source.get('model')})
+    from dispatch_allocation import attempt_counts
+    counts = attempt_counts(jobs, window=allocation.get('window', 30))
+    selected, _, _, _ = capacity.select(
+        policy, states, counts, allocation.get('harness_order', []), scores,
+        strategy=allocation['strategy'], usage_gate_used_percent=gate,
+        preferred=capacity.preferred_for_depth(allocation, int(source.get('dispatch_depth', '1'))),
+        affinity_weight=allocation.get('depth_affinity_weight', .5),
+        headroom_exponent=allocation.get('usage_headroom_exponent', 1),
+        harness_weights=allocation.get('harness_weights'),
+        preference_order=allocation.get('owner_order') if source.get('worker_type') == 'owner' else None,
+    )
+    if selected == harness:
+        return None  # original all-gated recovery, quality bands and relief remain intact
+    return {'label': 'allocation-usage-gate', 'until_epoch': None,
+            'headroom': score, 'usage_gate_used_percent': gate,
+            'capacity_source': report['sources'].get(harness)}
+
+
+def _launcher_budget(command, source):
+    from dispatch_lifecycle import (FOREGROUND_SCOPED, FOREGROUND_TIMEOUT_DEFAULT,
+                                    FORWARDED_TERMINATION_GRACE, bounded_foreground_timeout,
+                                    reconcile_launch_lifecycle)
+    def option(name, default):
+        value = default
+        for index, token in enumerate(command):
+            if token.startswith(name+'='):
+                value = token.split('=', 1)[1]
+            elif token == name and index+1 < len(command):
+                value = command[index+1]
+        return value
+    requested = option('--launch-lifecycle', source.get('launch_lifecycle', 'detached'))
+    foreground = reconcile_launch_lifecycle(requested).effective == FOREGROUND_SCOPED
+    if not foreground:
+        return False, LAUNCHER_TIMEOUT_SECONDS
+    timeout = bounded_foreground_timeout(float(option('--foreground-timeout', FOREGROUND_TIMEOUT_DEFAULT)))
+    return True, LAUNCHER_TIMEOUT_SECONDS + timeout + FORWARDED_TERMINATION_GRACE
 
 
 def _retry_model(source, kind):
@@ -1363,8 +1433,13 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             except (ProducerError, OSError, ValueError):
                 pass
         try:
-            completed = run(command,env=env,text=True,capture_output=True,check=False,
-                            timeout=LAUNCHER_TIMEOUT_SECONDS)
+            foreground, timeout = _launcher_budget(command, source)
+            if foreground and run is subprocess.run:
+                from dispatch_lifecycle import run_forwarding_termination
+                completed = run_forwarding_termination(command, env=env, capture=True,
+                                                      timeout=timeout, terminate_on_timeout=True)
+            else:
+                completed = run(command,env=env,text=True,capture_output=True,check=False,timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             # A slow disk after a usage-limit reset can hold the launcher past its budget.
             # The unclaimed successor row stays; the next `start` relaunches that same attempt.
@@ -1375,6 +1450,11 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                     'launcher_diagnostic':'\n'.join(output.splitlines()[-20:]),
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         current = _rows(Path(jobs).read_text().splitlines()).get(replacement)
+        if getattr(completed, 'received_signal', None) or getattr(completed, 'cleanup_incomplete', False):
+            return {'state':'needs-attention','reason':'replacement-launch-timeout' if getattr(completed, 'timed_out', False)
+                    else 'replacement-launch-interrupted', 'attempt_id':replacement,'record':record,
+                    'cleanup_incomplete':bool(getattr(completed, 'cleanup_incomplete', False)),
+                    'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}
         output = ''.join(str(getattr(completed, name, '') or '') for name in ('stdout', 'stderr'))

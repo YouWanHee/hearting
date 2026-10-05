@@ -19,6 +19,7 @@ GOVERNOR = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(GOVERNOR)
 import replica_batch_contract as CONTRACT
+from dispatch_contract import process_start_ticks
 from replica_batch_contract import build_manifest
 
 
@@ -612,7 +613,7 @@ class GovernorTest(unittest.TestCase):
             # current marker on disk.
             failed_peer_metadata = metadata(peer, note="completed-marker") + (
                 ",failure_class=blocked,"
-                f"pid={dead_pid},pid_start=1,pgid={dead_pid},"
+                f"pid={dead_pid},pid_start={process_start_ticks(os.getpid())},pgid={dead_pid},"
                 f"pid_observer_ns={os.readlink('/proc/self/ns/pid')}"
             )
             jobs.write_text(
@@ -630,7 +631,7 @@ class GovernorTest(unittest.TestCase):
             # (live registry 45:1), so an ABSENT class must defer to the marker-verified
             # proof and be accepted as immutable terminal success.
             terminal_peer_metadata = metadata(peer, note="completed-marker") + (
-                f",pid={dead_pid},pid_start=1,pgid={dead_pid},"
+                f",pid={dead_pid},pid_start={process_start_ticks(os.getpid())},pgid={dead_pid},"
                 f"pid_observer_ns={os.readlink('/proc/self/ns/pid')}"
             )
             jobs.write_text(
@@ -794,7 +795,7 @@ class GovernorTest(unittest.TestCase):
                 "completed-marker", "infrastructure,"
                 "classifier_source=registered-wrapper-completion-transient-v1,"
                 f"completion_marker={marker_path},"
-                f"pid={dead_pid},pid_start=1,pgid={dead_pid},"
+                f"pid={dead_pid},pid_start={process_start_ticks(os.getpid())},pgid={dead_pid},"
                 f"pid_observer_ns={os.readlink('/proc/self/ns/pid')}"
             ), encoding="utf-8")
             GOVERNOR._validate_batch_peer(

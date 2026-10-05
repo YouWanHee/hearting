@@ -664,6 +664,34 @@ class ClaudeAccountAggregationTests(unittest.TestCase):
                 score = C._claude_score(now, stale_after=3600)
         self.assertEqual(score, 90.0)
 
+    def test_same_reset_keeps_high_usage_despite_fresher_lower_rewrite(self):
+        with tempfile.TemporaryDirectory() as home:
+            statusline=Path(home)/'.statusline';statusline.mkdir();now=1_000_000.
+            self._write(statusline,'high.json',{'seven_day':{'used_percentage':99,'resets_at':now+3600}},now-20)
+            self._write(statusline,'rewrite.json',{'seven_day':{'used_percentage':69,'resets_at':now+3600}},now-1)
+            with mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':home}):
+                self.assertEqual(C._claude_score(now,3600),1.)
+
+    def test_expired_window_does_not_block_real_reset_or_merge_other_window(self):
+        with tempfile.TemporaryDirectory() as home:
+            statusline=Path(home)/'.statusline';statusline.mkdir();now=1_000_000.
+            self._write(statusline,'expired.json',{'five_hour':{'used_percentage':99,'resets_at':now-1}},now-1)
+            self._write(statusline,'new.json',{'five_hour':{'used_percentage':2,'resets_at':now+18000},
+                                             'seven_day':{'used_percentage':73,'resets_at':now+86400}},now-2)
+            with mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':home}):
+                self.assertEqual(C._claude_score(now,3600),27.)
+
+    def test_explicit_foreign_account_and_malformed_reset_are_not_current_usage(self):
+        with tempfile.TemporaryDirectory() as home:
+            statusline=Path(home)/'.statusline';statusline.mkdir();now=1_000_000.
+            self._write(statusline,'bad.json',{'seven_day':{'used_percentage':99,'resets_at':'invalid'}},now-1)
+            p=self._write(statusline,'foreign.json',{'seven_day':{'used_percentage':99,'resets_at':now+3600}},now-2)
+            d=json.loads(p.read_text());d.update(quota_scope='foreign',quota_scope_kind='account');p.write_text(json.dumps(d));os.utime(p,(now-2,now-2))
+            self._write(statusline,'current.json',{'seven_day':{'used_percentage':20,'resets_at':now+3600}},now-3)
+            with mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':home}), \
+                 mock.patch('dispatch_capacity_evidence._scope_candidates',return_value={'account':'current'}):
+                self.assertEqual(C._claude_score(now,3600),80.)
+
     def test_equal_mtime_tie_is_deterministic(self):
         with tempfile.TemporaryDirectory() as home:
             statusline = Path(home) / ".statusline"

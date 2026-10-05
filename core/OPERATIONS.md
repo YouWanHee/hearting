@@ -580,6 +580,18 @@ values remain unknown. The App Server owner keeps its existing supervised
 live ephemeral thread across turns. This policy does not change owner
 supervision or interactive sessions.
 
+Same-host foreground recovery uses the exact harness-native terminal handoff and
+the existing process receipt and completion writer. A complete Claude success
+result includes the finished turn; a PASS string, a missing leader, or an
+unreadable same-UID descendant is insufficient. A process born before the
+recorded child cannot be its descendant, but a readable positive attempt tag
+takes priority. Recovery preserves the live owner, successful siblings and original
+execution evidence. Replacement launchers retain the selected foreground
+watchdog and cleanup grace rather than applying the detached admission timeout;
+automatic replacements also retain the route's allocation usage gate. A tap's
+write time is not a new usage observation: one reset window cannot gain headroom
+from a lower stale value being written again.
+
 ### §5.10a. Completion Delivery (model-visible contract)
 
 The parent carries one field, not the carrier taxonomy: every launch receipt that

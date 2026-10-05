@@ -374,6 +374,65 @@ class ReplacementTest(unittest.TestCase):
             R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
 
+    def test_foreground_601_seconds_is_not_killed_by_detached_admission_budget(self):
+        import dispatch_lifecycle as L
+        seen=[]
+        command=['wrapper','--launch-lifecycle','foreground-scoped','--foreground-timeout','3600']
+        def finished(argv,**kw):
+            seen.append(kw['timeout']);self.assertGreater(kw['timeout'],601)
+            return SimpleNamespace(returncode=0,stdout='',stderr='')
+        with mock.patch.object(R,'_command',return_value=command),mock.patch.object(R,'_authorized'), \
+             mock.patch('dispatch_replacement_batch.command',return_value=None):
+            R.advance(self.jobs,'att-source',run=finished)
+        self.assertEqual(seen,[600+3600+L.FORWARDED_TERMINATION_GRACE])
+        with mock.patch.object(L,'reconcile_launch_lifecycle',return_value=SimpleNamespace(effective='detached')):
+            self.assertEqual(R._launcher_budget(['wrapper','--launch-lifecycle=detached'],self.meta),(False,600))
+
+    def test_foreground_launch_uses_existing_forwarder_and_claimed_timeout_never_relaunches(self):
+        import dispatch_lifecycle as L
+        record=self.claim();aid=record['replacement_attempt_id']
+        command=['wrapper','--launch-lifecycle','foreground-scoped','--foreground-timeout','3600']
+        def interrupted(*args,**kw):
+            self.assertTrue(kw['terminate_on_timeout'])
+            self._successor(record,self.meta,'open')
+            return L.ForwardedRun(0,'','',15,True,True)
+        with mock.patch.object(R,'_command',return_value=command),mock.patch.object(R,'_authorized'), \
+             mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch.object(L,'run_forwarding_termination',side_effect=interrupted) as forward:
+            result=R.advance(self.jobs,'att-source')
+            self.assertEqual(result['reason'],'replacement-launch-timeout')
+            self.assertTrue(result['cleanup_incomplete'])
+            replay=R.advance(self.jobs,'att-source')
+            self.assertEqual((replay['state'],replay['attempt_id']),('running',aid))
+            self.assertEqual(forward.call_count,1)
+
+    def test_soft_gate_uses_sealed_profile_policy_and_preserves_unknown_all_gated(self):
+        capacity=R._capacity_reader()
+        self.route['dispatch_allocation']={'strategy':'balanced','window':30,'usage_gate_used_percent':85,
+                                          'harness_order':['claude','codex','opencode']}
+        self.route['nodes']=[{'id':'frame','harness_policy':{'primary':['claude','codex'],
+                             'relief':[],'last_resort':[],'promote_relief_below':0}}]
+        source={**self.meta,'harness':'claude'}
+        def report(claude,codex):return {'scores':{'claude':claude,'codex':codex,'opencode':None},
+                                        'sources':{'claude':'taps','codex':'fixture','opencode':'unknown'}}
+        with mock.patch.object(R,'_capacity_reader',return_value=capacity), \
+             mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
+             mock.patch('dispatch_capacity_evidence.usage_states',return_value=dict.fromkeys(['claude','codex','opencode'],'ok')), \
+             mock.patch.object(capacity,'capacity_report',return_value=report(1,80)):
+            hold=R._capacity_hold(self.jobs,source)
+            self.assertEqual((hold['label'],hold['headroom'],hold['usage_gate_used_percent']),('allocation-usage-gate',1,85))
+            self.write(source);before=self.jobs.read_bytes()
+            with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim') as claim:
+                result=R.advance(self.jobs,'att-source',run=mock.Mock(side_effect=AssertionError('spawn')))
+            self.assertEqual(result['reason'],'replacement-capacity-wait');claim.assert_not_called()
+            self.assertEqual(self.jobs.read_bytes(),before)
+            for scores in (report(None,80),report(10,1)):
+                with mock.patch.object(capacity,'capacity_report',return_value=scores):
+                    self.assertIsNone(R._capacity_hold(self.jobs,source))
+            self.route['nodes'][0]['harness_policy']['primary']=['claude']
+            with mock.patch.object(capacity,'capacity_report',return_value=report(1,80)):
+                self.assertIsNone(R._capacity_hold(self.jobs,source))
+
     def test_an_io_failure_keeps_its_cause(self):
         with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
             result=R.advance(self.jobs,'att-source',run=mock.Mock())

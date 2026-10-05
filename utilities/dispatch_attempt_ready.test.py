@@ -34,7 +34,7 @@ def sealed_cancellation_metadata(attempt: str) -> dict[str, str]:
         "fallback_hop": "same-harness-headless",
         "attempt_id": attempt,
         "pid_scope": "namespace-local",
-        "pid": "99999996", "pid_start": "1", "pgid": "99999996",
+        "pid": "99999996", "pid_start": D.process_start_ticks(os.getpid()), "pgid": "99999996",
         "pid_observer_ns": observer, "pid_ns": observer,
         "cancellation_quiescence_receipt": D.ATTEMPT_CANCELLATION_QUIESCENCE_RECEIPT,
         "cancellation_receipt_digest": "sha256:" + "e" * 64,

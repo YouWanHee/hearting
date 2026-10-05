@@ -199,6 +199,29 @@ def _codex_final_agent_message(
     return None
 
 
+def _claude_completion_tail(lines: list[str], session_id: object) -> bool:
+    """Only the published native prompt-suggestion event may follow a result.
+
+    SDKPromptSuggestionMessage (Agent SDK 0.3.289) is informational: it does
+    not start another turn. Raw lines still have to parse, so an ignored partial
+    record cannot disappear through the general inspector's stderr filtering.
+    """
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(row, dict)
+                or set(row) != {"type", "suggestion", "uuid", "session_id"}
+                or row.get("type") != "prompt_suggestion"
+                or not isinstance(row.get("suggestion"), str)
+                or not isinstance(row.get("uuid"), str) or not row["uuid"]
+                or not isinstance(session_id, str) or not session_id
+                or row.get("session_id") != session_id):
+            return False
+    return True
+
+
 def _read_terminal(path: str | Path | None) -> dict[str, object]:
     if not path:
         return _result(
@@ -219,7 +242,8 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
         )
 
     rows: list[dict] = []
-    for line in lines:
+    row_line_indices: list[int] = []
+    for line_index, line in enumerate(lines):
         try:
             value = json.loads(line)
         except (TypeError, ValueError):
@@ -228,6 +252,7 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
             continue
         if isinstance(value, dict):
             rows.append(value)
+            row_line_indices.append(line_index)
 
     terminal_index = next(
         (
@@ -373,6 +398,17 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
         failure_note=failure_note,
         failure_class="sandbox-init" if sandbox_init else verdict.lower(),
         terminal_event=terminal_event,
+        native_completed=(
+            terminal_source == "exact-claude-result"
+            and terminal_row.get("subtype") in (None, "success")
+            and (terminal_row.get("is_error") is False or terminal_row.get("is_error") is None)
+            and terminal_row.get("terminal_reason") in (None, "completed")
+            and terminal_row.get("stop_reason") in (None, "end_turn")
+            and sum(row.get("type") == "result" for row in rows) == 1
+            and _claude_completion_tail(
+                lines[row_line_indices[terminal_index] + 1:], terminal_row.get("session_id")
+            )
+        ),
         log_file=str(log_path),
     )
 

@@ -5136,7 +5136,7 @@ class RevisedAncestorSuccessorTest(unittest.TestCase):
    "registered_worker":"1","owner_route_file":str(R.canonical_route_path(
       Path(route["artifact_root"]),route["route_id"])),
    "owner_route_id":route["route_id"],"owner_route_hash":route["route_hash"],
-   "pid":"99999999","pid_start":"1","pid_scope":"host-visible",
+   "pid":"99999999","pid_start":D.process_start_ticks(os.getpid()),"pid_scope":"host-visible",
    "pgid":"99999999","terminal_event":"turn.completed",
    "failure_class":"blocked","note":"dead-worker-blocked",
    "log_file":str(log),
@@ -5235,7 +5235,7 @@ class RevisedAncestorSuccessorTest(unittest.TestCase):
                  +",attempt_schema_version=2,dispatch_depth=2,transport=headless"
                  +",execution_surface=registered-headless,fallback_hop=same-harness-headless"
                  +",registered_worker=1,worker_type=review,unit=qa/plan-review"
-                 +",note=completed-marker,pid=99999999,pid_start=1,pid_scope=host-visible"
+                 +f",note=completed-marker,pid=99999999,pid_start={D.process_start_ticks(os.getpid())},pid_scope=host-visible"
                  +",pgid=99999999"
                  if "attempt_id=att-continuation-plan-check" in line else "") for line in lines]
     self._jobs.write_text("\n".join(lines)+"\n")

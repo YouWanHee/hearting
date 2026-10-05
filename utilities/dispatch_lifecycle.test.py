@@ -410,10 +410,25 @@ class ForwardingTerminationTest(unittest.TestCase):
         self.assertIn("worker_failure=interrupted", run.stdout)
         self.assertIn("cleanup-said-to-stderr", run.stderr)
         self.assertEqual(self.marker.read_text(), str(int(signal.SIGINT)))
-        # The launcher waited for the wrapper's whole 1s cleanup.
         self.assertGreaterEqual(ended - sent[0], 1.0)
-        # The launcher's own handler is gone again.
         self.assertIs(signal.getsignal(signal.SIGINT), before)
+
+    def test_foreground_outer_timeout_forwards_TERM_and_waits_for_receipt_cleanup(self):
+        run = L.run_forwarding_termination(self.command(.2), capture=True, timeout=.3,
+                                          grace=2, terminate_on_timeout=True)
+        self.assertTrue(run.timed_out)
+        self.assertEqual(run.received_signal, signal.SIGTERM)
+        self.assertFalse(run.cleanup_incomplete)
+        self.assertTrue(self.marker.is_file())
+        self.assertIn('worker_failure=interrupted', run.stdout)
+
+    def test_foreground_outer_timeout_reports_incomplete_without_reexecution(self):
+        run = L.run_forwarding_termination(self.command(2), capture=True, timeout=.3,
+                                          grace=.1, terminate_on_timeout=True)
+        self.assertTrue(run.timed_out)
+        self.assertTrue(run.cleanup_incomplete)
+        self.assertEqual(run.returncode, -signal.SIGKILL)
+        self.assertFalse(self.marker.exists())
 
     def test_repeated_signals_are_forwarded_without_restarting_the_deadline(self):
         # Wrapper cleanup takes 3s; the grace is 1.5s. Stop requests arrive at

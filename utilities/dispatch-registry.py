@@ -653,6 +653,34 @@ def _support_binding(row):
         return None
 
 
+def _foreground_stage_terminal(row):
+    """One exact native handoff for receipt recovery and interrupted writer reentry."""
+    meta = row["meta"]
+    attempt = meta.get("attempt_id", "")
+    log = Path(meta.get("log_file") or "")
+    runtime = next((name for name in ("codex", "claude")
+                    if attempt and log.name.endswith(f".{attempt}.{name}.jsonl")), None)
+    if (runtime is None or not log.is_absolute() or log.is_symlink()
+            or meta.get("harness", runtime) != runtime):
+        return False
+    terminal = inspect_terminal_attempt(
+        log, worktree=row.get("worktree"), artifact_root_metadata=meta.get("artifact_root"),
+    )
+    boundary = (
+        terminal.get("source") == "exact-turn-completed"
+        and terminal.get("terminal_event") == "turn.completed"
+    ) if runtime == "codex" else (
+        terminal.get("source") == "exact-claude-result"
+        and terminal.get("terminal_event") == "result"
+        and terminal.get("native_completed") is True
+    )
+    return bool(boundary and terminal.get("state") == "valid"
+                and terminal.get("verdict") == "PASS"
+                and terminal.get("failure_class") == "pass"
+                and terminal.get("artifact_state") == "readable"
+                and terminal.get("artifact_shape") == "file")
+
+
 def _same_host_foreground_stage_receipt(row):
     """Recover only a finished stage whose exact local process and output are proved.
 
@@ -685,20 +713,7 @@ def _same_host_foreground_stage_receipt(row):
             or identities[0].pid != int(pid)
             or identities[0].expected_start != meta["pid_start"]):
         return None
-    log_file = meta.get("log_file", "")
-    if not log_file or not Path(log_file).name.endswith(f".{attempt}.codex.jsonl"):
-        return None
-    terminal = inspect_terminal_attempt(
-        log_file, worktree=row.get("worktree"),
-        artifact_root_metadata=meta.get("artifact_root"),
-    )
-    if not (terminal.get("state") == "valid"
-            and terminal.get("source") == "exact-turn-completed"
-            and terminal.get("terminal_event") == "turn.completed"
-            and terminal.get("verdict") == "PASS"
-            and terminal.get("failure_class") == "pass"
-            and terminal.get("artifact_state") == "readable"
-            and terminal.get("artifact_shape") == "file"):
+    if not _foreground_stage_terminal(row):
         return None
     governed = attempt_governed_process_quiescence(meta)
     if governed.state != "quiescent" or governed.reason != "local-pid-gone":
@@ -948,10 +963,7 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
                     and meta.get("dispatch_depth") == "2"
                     and meta.get("launch_lifecycle") == "foreground-scoped"
                     and post_exit_receipt_reason(meta)
-                    and attempt_view.get("state") == "valid"
-                    and attempt_view.get("source") == "exact-turn-completed"
-                    and attempt_view.get("verdict") == "PASS"
-                    and attempt_view.get("artifact_state") == "readable"):
+                    and _foreground_stage_terminal(row)):
                 # The group receipt is process evidence, not a completion
                 # marker. A parked owner's existing terminal writer must still
                 # commit the marker; another reconcile must not turn its
@@ -1559,8 +1571,7 @@ def reconcile(rows, args):
             and meta.get("dispatch_depth") == "2"
             and meta.get("launch_lifecycle") == "foreground-scoped"
             and meta.get("route_id") and meta.get("route_node")
-            and meta.get("log_file", "").endswith(
-                f".{meta.get('attempt_id', '')}.codex.jsonl")
+            and _foreground_stage_terminal(row)
             and post_exit_receipt_reason(meta) == "governed-process-group-reaped"
             and meta.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
             and meta.get("attempt_descendant_observer_ns") == process_namespace_identity()
