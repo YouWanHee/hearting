@@ -154,6 +154,11 @@ Adapter and projection edits are derived core-first: change the portable invaria
 the adapter realization and generated projection. A runtime marker proves the read
 gate only; it does not replace this source-order review.
 
+Identity publishers retain bounded launch errors and may use one bounded fallback
+with the same invocation after a failed launch. A live launched helper must not
+be duplicated. Helper exit success records an attempt, not authoritative identity
+publication or peer receipt.
+
 On OpenCode, non-route deep roles use a deep tier when the selected whole-file model configuration declares one, and otherwise retain the existing balanced-deep fallback. Explicit role edits target that same resolved tier. Registered jobs continue to resolve their sealed model profile independently of role families.
 
 ## 4. Capability Model
