@@ -706,6 +706,9 @@ def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
     execution_access_roots: tuple[Path, ...] = (),
+    *,
+    agent_home: Path | None = None,
+    worktree: str | None = None,
 ) -> str:
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
@@ -743,7 +746,14 @@ def scoped_external_directory_config(
     else:
         raise ValueError("OpenCode external_directory permission must be a string or object")
 
-    for root in (artifact_root, report_bundle_root, *execution_access_roots):
+    # The launch environment and this permission projection use the same
+    # resolved agent home. Keep its lexical alias as well as the canonical
+    # directory: native tools can check either form of a symlinked install.
+    contract_roots = () if agent_home is None else tuple(dict.fromkeys((
+        str(agent_home / "capabilities"),
+        str((agent_home / "capabilities").resolve()),
+    )))
+    for root in (artifact_root, report_bundle_root, *execution_access_roots, *contract_roots):
         if not root:
             continue
         root = str(root)
@@ -751,6 +761,25 @@ def scoped_external_directory_config(
             rules.pop(pattern, None)
             rules[pattern] = "allow"
     permission["external_directory"] = rules
+    if contract_roots:
+        edit = permission.get("edit", permission.get("*", "allow"))
+        if isinstance(edit, str):
+            edit_rules = {"*": edit}
+        elif isinstance(edit, dict):
+            edit_rules = dict(edit)
+        else:
+            raise ValueError("OpenCode edit permission must be a string or object")
+        for root in contract_roots:
+            # v1 native edit/write/patch ask against paths relative to the
+            # worktree, unlike external_directory's absolute directory glob.
+            edit_paths = (root,) if worktree is None else (
+                root, os.path.relpath(root, worktree),
+            )
+            for pattern in (pattern for directory in edit_paths
+                            for pattern in (directory, f"{directory}/**")):
+                edit_rules.pop(pattern, None)
+                edit_rules[pattern] = "deny"
+        permission["edit"] = edit_rules
     config["permission"] = permission
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
@@ -1668,6 +1697,8 @@ def main(argv: list[str]) -> int:
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
+            agent_home=args.agent_home,
+            worktree=args.worktree,
         )
     except ValueError as e:
         return fail("artifact-root-access-config-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1915,6 +1946,8 @@ def main(argv: list[str]) -> int:
                 if args.report_bundle_root is not None
                 else None,
                 args.execution_access_grant.additional_writable_roots,
+                agent_home=args.agent_home,
+                worktree=args.worktree,
             )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")

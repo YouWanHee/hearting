@@ -309,14 +309,49 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             self.assertNotIn("dangerously-bypass", command)
 
         grant = build_grant(self.request, runtime="opencode")
-        config = json.loads(
-            self.opencode.scoped_external_directory_config(
-                str(self.artifact), None, grant.additional_writable_roots
-            )
-        )
+        install = self.root / "installed-contract"
+        (install / "capabilities").mkdir(parents=True)
+        alias = self.root / "agent-home"
+        alias.symlink_to(install, target_is_directory=True)
+        existing = {
+            "theme": "system",
+            "permission": {
+                "bash": "deny", "read": {"*.env": "deny"},
+                "edit": {"*": "ask", "/keep/**": "deny"},
+                "external_directory": {"*": "deny", "/keep/**": "deny"},
+            },
+        }
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(existing)}):
+            config = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), None, grant.additional_writable_roots,
+                agent_home=alias, worktree=str(self.worktree),
+            ))
         rules = config["permission"]["external_directory"]
         self.assertEqual("allow", rules[str(self.scoped)])
         self.assertEqual("allow", rules[f"{self.scoped}/**"])
+        self.assertEqual("system", config["theme"])
+        self.assertEqual("deny", config["permission"]["bash"])
+        self.assertEqual({"*.env": "deny"}, config["permission"]["read"])
+        self.assertEqual("deny", rules["*"])
+        self.assertEqual("deny", rules["/keep/**"])
+        for directory in (alias / "capabilities", install / "capabilities"):
+            for pattern in (str(directory), f"{directory}/**"):
+                self.assertEqual("allow", rules[pattern])
+                self.assertEqual("deny", config["permission"]["edit"][pattern])
+            relative = os.path.relpath(directory, self.worktree)
+            self.assertEqual("deny", config["permission"]["edit"][f"{relative}/**"])
+        self.assertEqual("ask", config["permission"]["edit"]["*"])
+        self.assertEqual("deny", config["permission"]["edit"]["/keep/**"])
+        for directory in (alias, install, install / "core", install / "roles", install / "skills"):
+            self.assertNotIn(str(directory), rules)
+            self.assertNotIn(f"{directory}/**", rules)
+        # A string/global deny remains the default for every other edit.
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": '{"permission":"deny"}'}):
+            denied = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), agent_home=alias, worktree=str(self.worktree),
+            ))
+        self.assertEqual("deny", denied["permission"]["edit"]["*"])
+        self.assertEqual("deny", denied["permission"]["*"])
         self.assertEqual("tool-permission", grant.file_enforcement)
         self.assertEqual("none", grant.network_enforcement)
 
