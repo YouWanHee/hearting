@@ -1745,6 +1745,7 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.log=self.base/f"plan.{self.attempt}.claude.jsonl"
   result={"type":"result","subtype":"success","is_error":False,
           "terminal_reason":"completed","stop_reason":"end_turn",
+          "session_id":"claude-fixture-session",
           "result":f"artifact: {self.artifact}\nverdict: PASS\nblocker: none"}
   result.update(changes)
   self.log.write_text(json.dumps(result, separators=(',',':'))+'\n')
@@ -1761,6 +1762,51 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
   self.assertEqual(self.jobs.read_bytes(),sealed)
   self.assertNotIn('failure_class=pass',self.jobs.read_text())
+
+ def test_claude_prompt_suggestion_preserves_recovery_and_writer_reentry(self):
+  self.claude_log()
+  suggestion={'type':'prompt_suggestion','suggestion':'Review the result',
+              'uuid':'123e4567-e89b-12d3-a456-426614174000',
+              'session_id':'claude-fixture-session'}
+  self.log.write_text(self.log.read_text()+json.dumps(suggestion)+'\n')
+  before=self.jobs.read_bytes()
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.jobs.read_bytes(),before)
+  self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
+  sealed=self.jobs.read_bytes()
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
+  self.assertEqual(self.jobs.read_bytes(),sealed)
+
+ def test_claude_unrecognized_tail_never_recovers_or_reenters_completion_writer(self):
+  suggestion={'type':'prompt_suggestion','suggestion':'Review the result',
+              'uuid':'123e4567-e89b-12d3-a456-426614174000',
+              'session_id':'claude-fixture-session'}
+  self.claude_log();result=json.loads(self.log.read_text())
+  tails=['{"type":"prompt_suggestion"',json.dumps({'type':'assistant'}),
+         json.dumps({'type':'user'}),json.dumps({'type':'turn.completed'}),
+         json.dumps({'type':'system','subtype':'unknown'}),
+         json.dumps({**suggestion,'suggestion':False}),
+         json.dumps({**suggestion,'session_id':'foreign-session'}),
+         json.dumps({**suggestion,'is_error':True}),
+         json.dumps(result),json.dumps({**result,'is_error':True})]
+  spec=importlib.util.spec_from_file_location('registry_claude_tail_fixture',SCRIPT)
+  module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  for tail in tails:
+   with self.subTest(tail=tail):
+    self.claude_log();body=self.log.read_text()
+    self.log.write_text(body+tail+'\n');self.assert_receipt_refused()
+    self.claude_log();self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
+    sealed=self.jobs.read_bytes();self.log.write_text(body+tail+'\n')
+    self.assertFalse(self.decision()['category'].startswith('terminal-receipt-'))
+    self.assertEqual(self.jobs.read_bytes(),sealed)
+    row=module.read_rows(self.jobs)[0]
+    args=types.SimpleNamespace(jobs=self.jobs,attempt=self.attempt,session=None,route=None,
+       node=None,job=None,all=False,apply=True,agent_home=self.base,only_exact_dead=False,audit=None)
+    with mock.patch.object(module,'close_finished_child') as writer,contextlib.redirect_stdout(io.StringIO()):
+     module.reconcile([row],args)
+    writer.assert_not_called()
+    self.assertNotIn('note=completed-marker',self.jobs.read_text())
 
  def test_claude_errors_unfinished_or_truncated_never_seal(self):
   for change in ({'is_error':True},{'terminal_reason':'api_error'},
