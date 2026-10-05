@@ -730,13 +730,26 @@ def scoped_external_directory_config(
         permission = dict(permission)
 
     def effective_tool(subject, tool, default=None):
-        # fromConfig preserves outer property order, and native findLast lets
-        # a later '*' override every earlier tool/path rule. Materialize that
-        # effective original rule before moving this narrow overlay last.
-        value = default
+        # Native fromConfig flattens every matching outer wildcard in order.
+        # A scalar replaces all paths, whereas an object replaces only its
+        # matching patterns. Preserve those rules before moving the tool last.
+        value = None if default is None else {"*": default}
         for key, candidate in subject.items():
-            if key in ("*", tool):
-                value = candidate
+            wildcard = re.escape(key.replace("\\", "/")).replace(r"\ ", " ").replace(r"\*", ".*").replace(r"\?", ".")
+            if wildcard.endswith(" .*"):
+                wildcard = wildcard[:-3] + "( .*)?"
+            if not re.fullmatch(wildcard, tool, re.DOTALL):
+                continue
+            if isinstance(candidate, str):
+                value = {"*": candidate}
+            elif isinstance(candidate, dict):
+                if value is None:
+                    value = {}
+                for pattern, action in candidate.items():
+                    value.pop(pattern, None)
+                    value[pattern] = action
+            else:
+                raise ValueError(f"OpenCode {tool} permission must be a string or object")
         return value
 
     original_permission = dict(permission)

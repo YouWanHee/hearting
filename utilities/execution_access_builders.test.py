@@ -411,6 +411,40 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
                 self.assertEqual(expected_external, permission["external_directory"]["*"])
                 self.assertEqual("deny", permission["edit"][f"{alias / 'capabilities'}/**"])
                 self.assertEqual("allow", permission["external_directory"][f"{alias / 'capabilities'}/**"])
+        # Partial wildcard objects leave non-overlapping earlier rules valid.
+        # Outer wildcard tool names use the native '*'/'?' matching grammar.
+        for original in (
+            {"edit": {"private/**": "deny"}, "*": {"public/**": "allow"}},
+            {"ed?t": {"private/**": "deny"}, "e*": {"public/**": "allow"}},
+            {"*": {"public/**": "allow"}, "edit": {"private/**": "deny"}},
+        ):
+            before = {"permission": original,
+                      "agent": {"build": {"permission": original}}}
+            with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(before)}):
+                after = json.loads(self.opencode.scoped_external_directory_config(
+                    str(self.artifact), agent_home=alias, worktree=str(self.worktree),
+                    selected_agent="build",
+                ))
+            for permission in (after["permission"], after["agent"]["build"]["permission"]):
+                self.assertEqual("deny", permission["edit"]["private/**"])
+                self.assertEqual("allow", permission["edit"]["public/**"])
+                self.assertEqual("deny", permission["edit"][f"{alias / 'capabilities'}/**"])
+                self.assertEqual("allow", permission["external_directory"][f"{alias / 'capabilities'}/**"])
+        # A later scalar wildcard does supersede every earlier private rule;
+        # duplicate patterns move to their last native position within objects.
+        before = {"permission": {"edit": {"private/**": "deny"}, "*": "allow"},
+                  "agent": {"build": {"permission": {
+                      "edit": {"private/**": "deny", "private/safe/**": "deny"},
+                      "*": {"private/**": "allow"},
+                  }}}}
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(before)}):
+            after = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), agent_home=alias, worktree=str(self.worktree), selected_agent="build",
+            ))
+        self.assertNotIn("private/**", after["permission"]["edit"])
+        ordered = after["agent"]["build"]["permission"]["edit"]
+        self.assertEqual("allow", ordered["private/**"])
+        self.assertGreater(list(ordered).index("private/**"), list(ordered).index("private/safe/**"))
         self.assertEqual("tool-permission", grant.file_enforcement)
         self.assertEqual("none", grant.network_enforcement)
 
