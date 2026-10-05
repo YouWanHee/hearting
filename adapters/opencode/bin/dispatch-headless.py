@@ -709,6 +709,7 @@ def scoped_external_directory_config(
     *,
     agent_home: Path | None = None,
     worktree: str | None = None,
+    selected_agent: str | None = None,
 ) -> str:
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
@@ -781,6 +782,46 @@ def scoped_external_directory_config(
                 edit_rules[pattern] = "deny"
         permission["edit"] = edit_rules
     config["permission"] = permission
+    if contract_roots and selected_agent:
+        # Native agent permissions merge after global permissions. Overlay only
+        # the selected agent, without giving its other tools a new default.
+        agents = config.get("agent", {})
+        if not isinstance(agents, dict):
+            raise ValueError("OpenCode agent config must be an object")
+        agents = dict(agents)
+        selected = agents.get(selected_agent, {})
+        if not isinstance(selected, dict):
+            raise ValueError("OpenCode selected agent config must be an object")
+        selected = dict(selected)
+        local = selected.get("permission", {})
+        if isinstance(local, str):
+            local = {"*": local}
+        elif isinstance(local, dict):
+            local = dict(local)
+        else:
+            raise ValueError("OpenCode agent permission must be a string or object")
+        for tool, action in (("external_directory", "allow"), ("edit", "deny")):
+            old = local.get(tool, local.get("*"))
+            if old is None:
+                overlay = {}
+            elif isinstance(old, str):
+                overlay = {"*": old}
+            elif isinstance(old, dict):
+                overlay = dict(old)
+            else:
+                raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
+            for root in contract_roots:
+                directories = (root,)
+                if tool == "edit" and worktree is not None:
+                    directories += (os.path.relpath(root, worktree),)
+                for directory in directories:
+                    for pattern in (directory, f"{directory}/**"):
+                        overlay.pop(pattern, None)
+                        overlay[pattern] = action
+            local[tool] = overlay
+        selected["permission"] = local
+        agents[selected_agent] = selected
+        config["agent"] = agents
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1699,6 +1740,7 @@ def main(argv: list[str]) -> int:
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
             agent_home=args.agent_home,
             worktree=args.worktree,
+            selected_agent=args.agent,
         )
     except ValueError as e:
         return fail("artifact-root-access-config-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1948,6 +1990,7 @@ def main(argv: list[str]) -> int:
                 args.execution_access_grant.additional_writable_roots,
                 agent_home=args.agent_home,
                 worktree=args.worktree,
+                selected_agent=args.agent,
             )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
