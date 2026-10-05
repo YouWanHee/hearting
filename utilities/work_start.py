@@ -227,6 +227,19 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         errors += FI.validate_answers(question, response)
     if errors:
         raise ValueError("frame-input-invalid: " + "; ".join(errors[:8]))
+    if response is not None:
+        # Check provenance before write-once answers/intent can occupy the
+        # question. A refused machine reply must leave room for the real reply.
+        registered_worker = os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1"
+        actor_kind = FI.answer_actor_kind(response, registered_worker=registered_worker)
+        binding = next((row for row in route.get("human_gate_bindings", [])
+                        if row.get("gate") == "frame-review"), {})
+        authority = (resolution.get("release_authority") or
+                     ("depth-0" if resolution.get("interview") else None) or
+                     binding.get("release_authority") or "depth-0")
+        if authority == "depth-0" and (registered_worker or actor_kind != "user"):
+            raise ValueError("gate-release-authority-refused: frame-review requires the person's actual answer")
+        response = {**response, "actor_kind": actor_kind}
     if not next_round and resolution["status"] != "not-raised" and resolution.get("artifact") != str(question_path):
         raise ValueError("frame-interview-binding-conflict: use the currently registered interview")
     _store_once(question_path, question)
@@ -262,7 +275,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                     "Ask the person to confirm or correct the understanding in their language, and present the "
                     "registered question and choices without changing their words. "
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
-                    "Preserve only the person's actual structured or typed reply in answers_template; then rerun "
+                    "Preserve only the person's actual structured or typed reply in answers_template and set "
+                    "actor_kind=user for that reply. Keep supervisor/automatic/unknown sources as such; "
+                    "an acknowledgement or template is never a user decision. Then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "
                     "For a revise/stop decision also pass --decision revise|stop. " + FI.PENDING_ANSWER_RULE}
     if resolution["status"] in {"proceed", "revise", "stop"}:
@@ -802,7 +817,10 @@ def _recorded_interview(route, jobs):
     artifact = resolution.get("artifact")
     if not artifact or not Path(artifact).is_file():
         return None, None
-    return json.loads(Path(artifact).read_text()), resolution.get("answers")
+    import frame_interview as FI
+    answers = FI.recorded_answer_context(resolution.get("answers"),
+                                         resolution.get("actor_kind") if resolution.get("status") == "proceed" else None)
+    return json.loads(Path(artifact).read_text()), answers
 
 
 def _leg_task_text(route, root, output, briefs, intent, approvals):

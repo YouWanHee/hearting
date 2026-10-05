@@ -327,12 +327,13 @@ def drain_pending(mem=None, project_origin_filter: Optional[str] = None, cwd=Non
 # D-87: frame-review answers
 # ---------------------------------------------------------------------------
 
-def interview_payloads(interview: dict, answers: dict, *, route_id="", cwd=None) -> list:
+def interview_payloads(interview: dict, answers: dict, *, route_id="", cwd=None, actor_kind="unknown") -> list:
     """One payload per answered question (plus the understanding correction when given)."""
-    if not isinstance(interview, dict) or not isinstance(answers, dict):
+    if (actor_kind != "user" or not isinstance(interview, dict) or not isinstance(answers, dict)
+            or answers.get("actor_kind") != "user"):
         return []
     origin = {"kind": "frame-interview", "route_id": _text(route_id or interview.get("route_id")),
-              "round": interview.get("round") or 1}
+              "round": interview.get("round") or 1, "actor_kind": actor_kind}
     given = answers.get("answers") if isinstance(answers.get("answers"), dict) else {}
     correction = _text(answers.get("correction"))
     out = []
@@ -370,7 +371,7 @@ def interview_payloads(interview: dict, answers: dict, *, route_id="", cwd=None)
 
 
 def record_interview_answers(interview, answers, *, route_id="", cwd=None,
-                             timeout: float = RECORD_TIMEOUT_SEC, stderr=None) -> str:
+                             timeout: float = RECORD_TIMEOUT_SEC, stderr=None, actor_kind="unknown") -> str:
     """Record the answers just accepted at the frame-review gate. Never raises.
 
     The original text is saved to the waiting folder first; then one short
@@ -380,7 +381,7 @@ def record_interview_answers(interview, answers, *, route_id="", cwd=None,
     """
     stderr = stderr or sys.stderr
     try:
-        payloads = interview_payloads(interview, answers, route_id=route_id, cwd=cwd)
+        payloads = interview_payloads(interview, answers, route_id=route_id, cwd=cwd, actor_kind=actor_kind)
         if not payloads:
             return "none"
         saved = [p for p in (save_pending(item) for item in payloads) if p is not None]

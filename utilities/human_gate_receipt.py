@@ -535,6 +535,9 @@ def render_context(
         + "\n"
         + "\n".join(release_commands)
         + "\nFor interview gates, answers are required only on proceed; revise/stop omit answers."
+        + "\nIn the existing answers JSON, set actor_kind=user only for the person's actual reply; "
+        + "keep supervisor/automatic/unknown sources distinct. An unmarked file is unknown. "
+        + "This is the acting parent's provenance record, not another question for the person."
         + "\n" + PENDING_ANSWER_RULE
         + "\nDo not auto-approve, mark-done, harvest, or start any polling/wait loop."
     )

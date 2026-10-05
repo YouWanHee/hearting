@@ -1258,6 +1258,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
     def answers(self):
         import frame_interview as FI
         a = FI.answers_template({**self.question, "route_id": self.route["route_id"]})
+        a["actor_kind"] = "user"
         a["understanding_confirmed"] = True
         path = self.base / "answers.json"
         path.write_text(json.dumps(a))
@@ -1266,6 +1267,70 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
     def resolution(self):
         ledger = WF.WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
         return WF.WS.human_gate_resolution(ledger.journal(), "frame-review")
+
+    def test_nonuser_complete_answer_does_not_occupy_the_pending_human_answer(self):
+        import frame_interview as FI
+        import tidy_decisions
+        question, answer = self.routed()
+        asked = self.step(interview=self.question_file)
+        registered = Path(asked["interview_file"])
+        question_bytes = registered.read_bytes()
+        original = json.loads(answer.read_text())
+        with mock.patch.object(tidy_decisions, "record_interview_answers", return_value="recorded") as record:
+            for kind in (None, "unknown", "supervisor", "automatic", "headless-owner"):
+                with self.subTest(kind=kind):
+                    supplied = {**original, "actor_kind": kind}
+                    if kind is None:
+                        del supplied["actor_kind"]
+                    answer.write_text(json.dumps(supplied))
+                    with self.assertRaisesRegex(ValueError, "gate-release-authority-refused"):
+                        self.step(answers=answer)
+                    self.assertEqual(registered.read_bytes(), question_bytes)
+                    self.assertEqual((self.resolution()["status"], self.resolution()["epoch"]), ("blocked", 1))
+                    self.assertIsNone(self.resolution()["answers"])
+                    self.assertFalse((registered.parent / "answers.json").exists())
+                    self.assertFalse((self.output / "shards/frame/intent.md").exists())
+                    self.assertEqual((self.calls, record.call_count), (["gate"], 0))
+            for payload in ({"accepted": True, "actor_kind": "user"},
+                            {**FI.answers_template(json.loads(question_bytes)), "actor_kind": "user"}):
+                answer.write_text(json.dumps(payload))
+                self.assertEqual(self.step(answers=answer)["state"], "needs-question")
+                self.assertFalse((registered.parent / "answers.json").exists())
+            answer.write_text(json.dumps(original))
+            released = self.step(answers=answer)
+            self.assertEqual(released["state"], "released")
+            self.assertEqual(self.resolution()["actor_kind"], "user")
+            self.assertEqual(self.resolution()["answers"]["answers"]["go"]["choice"], 0)
+            self.assertEqual(self.step(answers=answer), released)
+            self.assertEqual((self.calls, record.call_count), (["gate", "release"], 1))
+
+    def test_registered_caller_cannot_claim_a_user_before_immutable_save(self):
+        answer = self.answers()
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
+                self.step(interview=self.question_file, answers=answer)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.output / "shards/frame/round-1/answers.json").exists())
+
+    def test_old_interview_person_authority_precedes_any_binding_before_save(self):
+        self.route["human_gate_bindings"][0]["release_authority"] = "any"
+        self.path.write_text(json.dumps(self.route))
+        asked = self.step(interview=self.question_file)
+        question = Path(asked["interview_file"])
+        before = question.read_bytes()
+        legacy = {**self.resolution(), "release_authority": None}
+        answer = self.answers()
+        response = json.loads(answer.read_text())
+        response["actor_kind"] = "supervisor"
+        answer.write_text(json.dumps(response))
+        with mock.patch.object(WF.WS, "human_gate_resolution", return_value=legacy):
+            with self.assertRaisesRegex(ValueError, "gate-release-authority-refused"):
+                self.step(answers=answer)
+        self.assertFalse((question.parent / "answers.json").exists())
+        self.assertFalse((self.output / "shards/frame/intent.md").exists())
+        self.assertEqual(question.read_bytes(), before)
+        self.assertEqual(self.calls, ["gate"])
+        self.assertEqual(self.resolution()["status"], "blocked")
 
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
@@ -1414,6 +1479,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             "route_proposals": {"question": "go", "by_option": {"예, 이 순서로": proposal}}}
         self.question_file.write_text(json.dumps(question))
         response = FI.answers_template({**question, "route_id": self.route["route_id"]})
+        response["actor_kind"] = "user"
         response["understanding_confirmed"] = True
         response["answers"] = {"go": {"choice": route_choice, "note": ""}, "run-ok": {"choice": approve, "note": ""}}
         answer = self.base / "routed-answers.json"
@@ -1512,6 +1578,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             "recommended": 0, "why": "Only you can weigh the wording against the schedule."}]}
         self.question_file.write_text(json.dumps(question))
         template = FI.answers_template({**question, "route_id": self.route["route_id"]})
+        template["actor_kind"] = "user"
         template["understanding_confirmed"] = True
         template["answers"]["q-scope"].update(choice=0, note="go on")
         answers = self.base / "answers.json"
@@ -1524,6 +1591,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             self.assertEqual(self.step(interview=self.question_file, answers=answers)["state"], "released")
         self.assertEqual(self.calls, ["gate", "release"])
         self.assertEqual(record.call_count, 1)
+        self.assertEqual(record.call_args.kwargs["actor_kind"], "user")
         interview, given = record.call_args.args
         self.assertEqual(interview["questions"][0]["id"], "q-scope")
         self.assertEqual(given["answers"]["q-scope"]["note"], "go on")
@@ -1541,6 +1609,30 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
              mock.patch.object(W, "_store_once", side_effect=AssertionError("sealed write")):
             self.assertEqual(self.step(answers=answer), result)
             self.assertEqual(self.step(interview=self.question_file), result)
+        self.assertEqual(self.calls, ["gate", "release"])
+
+    def test_legacy_untyped_committed_reply_replays_without_writing_or_new_memory(self):
+        import artifact_producer
+        import tidy_decisions
+        answer = self.answers()
+        result = self.step(interview=self.question_file, answers=answer)
+        current = self.resolution()
+        legacy = {**current, "answers": dict(current["answers"])}
+        del legacy["answers"]["actor_kind"]
+        original = json.loads(Path(result["interview_file"]).read_text())
+        legacy_file = self.base / "legacy-answers.json"
+        legacy_file.write_text(json.dumps(legacy["answers"]))
+        with mock.patch.object(WF.WS, "human_gate_resolution", return_value=legacy), \
+             mock.patch.object(artifact_producer, "prepare_route_artifact_env", side_effect=AssertionError("sealed cycle")), \
+             mock.patch.object(W, "_store_once", side_effect=AssertionError("history rewrite")), \
+             mock.patch.object(tidy_decisions, "record_interview_answers") as memory:
+            self.assertEqual(self.step(answers=legacy_file), result)
+            recorded, context = W._recorded_interview(self.route, self.jobs)
+            self.assertEqual(recorded, original)
+            self.assertEqual(context["actor_kind"], "user")
+            self.assertNotIn("actor_kind", legacy["answers"])
+            memory.assert_not_called()
+        self.assertEqual(self.resolution(), current)
         self.assertEqual(self.calls, ["gate", "release"])
 
     def test_lost_release_response_replays_exact_committed_answer(self):
@@ -1589,7 +1681,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
 
     def answers_for_scope(self):
         path = self.base / "scope-answers.json"
-        path.write_text(json.dumps({"understanding_confirmed": True, "correction": "",
+        path.write_text(json.dumps({"actor_kind": "user", "understanding_confirmed": True, "correction": "",
                                     "answers": {"q-scope": {"choice": 0, "note": ""}},
                                     "schema": "frame_interview_answers_v1", "route_id": self.route["route_id"], "round": 1}))
         return path
@@ -1603,7 +1695,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertIn('"understanding_confirmed"', needs["next_step"])
         self.assertIn('"choice"', needs["next_step"])
         bare = self.base / "bare.json"
-        bare.write_text(json.dumps({"understanding_confirmed": True, "answers": {"q-scope": {"choice": 1}}}))
+        bare.write_text(json.dumps({"actor_kind": "user", "understanding_confirmed": True, "answers": {"q-scope": {"choice": 1}}}))
         result = self.step(interview=self.question_file, answers=bare)
         self.assertEqual(result["state"], "released")
         self.assertEqual(self.calls, ["gate", "release"])
@@ -1636,7 +1728,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         answer.write_text(json.dumps({"round": 1, "understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
         with self.assertRaisesRegex(ValueError, "frame-input-invalid: round:"):
             self.step(answers=answer)
-        answer.write_text(json.dumps({"understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
+        answer.write_text(json.dumps({"actor_kind": "user", "understanding_confirmed": True, "answers": {"q-scope": {"choice": 0}}}))
         self.assertEqual(self.step(answers=answer)["state"], "released")
         self.assertEqual(self.calls, ["gate", "release", "gate", "release"])
 
@@ -1665,7 +1757,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         second=self.step(interview=self.question_file)
         self.assertEqual(second["state"], "needs-question")
         self.assertEqual(self.resolution()["epoch"],2)
-        response=second["answers_template"];response["understanding_confirmed"]=True
+        response=second["answers_template"];response["actor_kind"]="user";response["understanding_confirmed"]=True
         answer.write_text(json.dumps(response))
         self.assertEqual(self.step(answers=answer)["state"],"released")
         self.assertEqual(Path(result["interview_file"]).read_bytes(),before)
@@ -1677,6 +1769,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         for number in range(1,FI.MAX_ROUNDS+1):
             self.question_file.write_text(json.dumps(question))
             response=FI.answers_template({**question,"route_id":self.route["route_id"]})
+            response["actor_kind"]="user"
             response["understanding_confirmed"]=True
             answer=self.base/"received-answer.json";answer.write_text(json.dumps(response))
             result=self.step(interview=self.question_file,answers=answer,decision="revise")

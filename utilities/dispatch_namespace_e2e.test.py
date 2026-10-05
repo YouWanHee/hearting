@@ -806,6 +806,7 @@ class NamespaceE2E(unittest.TestCase):
             }
             gate_artifact.write_text(json.dumps(interview), encoding="utf-8")
             answers = frame_interview.answers_template(interview)
+            answers["actor_kind"] = "user"
             answers["understanding_confirmed"] = True
             answers_path = artifact_root / "frame-answers.json"
             answers_path.write_text(json.dumps(answers), encoding="utf-8")

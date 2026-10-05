@@ -267,6 +267,7 @@ class ReleasedTaskPromptTest(unittest.TestCase):
         }
         self.interview.write_text(json.dumps(self.value))
         self.answers = FI.answers_template(self.value)
+        self.answers["actor_kind"] = "user"
         self.answers["understanding_confirmed"] = True
         self.answers["answers"]["record-failure"] = {"choice": 0, "note": "Keep the failure."}
         self.ledger = WS.WorkflowLedger(self.route_id, jobs=self.jobs)
@@ -285,6 +286,24 @@ class ReleasedTaskPromptTest(unittest.TestCase):
     def args(self, **overrides):
         return SimpleNamespace(**{"worker_type": "stage", "route_id": self.route_id,
                                   "jobs": self.jobs, **overrides})
+
+    def test_legacy_context_uses_only_recorded_actor_and_does_not_rewrite_history(self):
+        legacy = dict(self.answers)
+        del legacy["actor_kind"]
+        for kind in ("user", "supervisor", None):
+            with self.subTest(kind=kind):
+                released = {**self.released, "evidence": {**self.released["evidence"], "answers": legacy,
+                                                         "actor_kind": kind}}
+                self.write_journal(self.raised, released)
+                before = self.ledger.journal_path.read_bytes()
+                context = WB.released_task_prompt(self.args())
+                self.assertIn("actor_kind: " + (kind or "unknown"), context)
+                self.assertIn("The recorded scope and decisions below govern this work.", context)
+                self.assertNotIn("The recorded user scope", context)
+                self.assertEqual(self.ledger.journal_path.read_bytes(), before)
+                self.assertNotIn("actor_kind", legacy)
+                if kind != "user":
+                    self.assertNotIn("User's note", context)
 
     def test_no_plan_stage_or_intent_copy_needed_in_all_three_adapters(self):
         for harness, (wrapper, model, _suffix) in ADAPTERS.items():

@@ -52,6 +52,7 @@ def good_interview(**overrides):
 
 def good_answers(interview, **overrides):
     answers = FI.answers_template(interview)
+    answers["actor_kind"] = "user"
     answers["understanding_confirmed"] = True
     for qid in answers["answers"]:
         answers["answers"][qid]["choice"] = 0
@@ -60,6 +61,28 @@ def good_answers(interview, **overrides):
 
 
 class ValidateTest(unittest.TestCase):
+    def test_answer_sources_and_no_answer_metadata_are_typed(self):
+        interview = good_interview()
+        self.assertEqual(FI.answers_template(interview)["actor_kind"], "unknown")
+        for kind in ("user", "supervisor", "automatic", "headless-owner", "unknown"):
+            with self.subTest(kind=kind):
+                answers = good_answers(interview, actor_kind=kind)
+                self.assertEqual(FI.validate_answers(interview, answers), [])
+                self.assertEqual(FI.answer_actor_kind(answers), kind)
+                self.assertTrue(FI.pending_answer_response(interview, {"accepted": True, "actor_kind": kind}))
+                self.assertFalse(FI.pending_answer_response(interview, {**answers, "accepted": True}))
+        for kind in (None, [], {}, True, 1, "USER", ""):
+            with self.subTest(kind=kind):
+                self.assertFalse(FI.pending_answer_response(interview, {"accepted": True, "actor_kind": kind}))
+                self.assertTrue(any("actor_kind:" in e for e in FI.validate_answers(
+                    interview, good_answers(interview, actor_kind=kind))))
+        unmarked = good_answers(interview)
+        del unmarked["actor_kind"]
+        self.assertEqual(FI.answer_actor_kind(unmarked), "unknown")
+        self.assertEqual(FI.answer_actor_kind(unmarked, registered_worker=True), "headless-owner")
+        with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
+            FI.answer_actor_kind(good_answers(interview), registered_worker=True)
+
     def test_only_clear_no_answer_responses_remain_pending(self):
         interview = good_interview()
         for response in (None, {}, {"answers": {}}, {"accepted": True},
@@ -174,7 +197,7 @@ class ValidateTest(unittest.TestCase):
         text = FI.render_intent(interview, answers, now="2026-09-06")
         self.assertEqual(sum(1 for line in text.splitlines() if line.startswith("## Decisions")), 1)
         self.assertFalse(any(line.startswith("## Fake heading") for line in text.splitlines()))
-        self.assertFalse(any(line.strip() == "---" for line in text.splitlines()[7:]))
+        self.assertFalse(any(line.strip() == "---" for line in text.splitlines()[8:]))
         self.assertIn("아니, 승인만 고쳐. --- ## Decisions - **fake**", text)
 
     def test_ordinary_words_that_contain_a_harness_word_pass(self):
@@ -330,6 +353,35 @@ class AnswersTest(unittest.TestCase):
 
 
 class IntentTest(unittest.TestCase):
+    def test_nonuser_intent_and_approvals_keep_the_declared_source(self):
+        interview = good_interview()
+        interview["questions"][0]["options"][0]["approves"] = True
+        proposal = {"entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-scope"}]}
+        for kind in ("supervisor", "automatic", "headless-owner", "unknown"):
+            with self.subTest(kind=kind):
+                answers = good_answers(interview, actor_kind=kind, understanding_confirmed=False, correction="Limit scope.")
+                answers["answers"]["q-cap"].update(choice=1, note="Three is enough.")
+                text = FI.render_intent(interview, answers, now="2026-10-05")
+                self.assertIn("status: recorded\nactor_kind: " + kind, text)
+                self.assertIn(f"**{kind.capitalize()}'s correction:** Limit scope.", text)
+                self.assertIn(kind.capitalize() + "'s note: Three is enough.", text)
+                self.assertIn("(" + kind + " choice)", text)
+                self.assertNotIn("User's", text)
+                self.assertNotIn("user's own choice", text)
+                self.assertFalse(FI.approvals_given(interview, answers, proposal)[0]["accepted"])
+        self.assertTrue(FI.approvals_given(interview, good_answers(interview), proposal)[0]["accepted"])
+
+    def test_legacy_recorded_actor_is_read_context_only(self):
+        answers = good_answers(good_interview())
+        del answers["actor_kind"]
+        original = copy.deepcopy(answers)
+        context = FI.recorded_answer_context(answers, "user")
+        self.assertEqual(context["actor_kind"], "user")
+        self.assertEqual(answers, original)
+        self.assertEqual(FI.recorded_answer_context(answers, None)["actor_kind"], "unknown")
+        explicit = {**answers, "actor_kind": "supervisor"}
+        self.assertIs(FI.recorded_answer_context(explicit, "user"), explicit)
+
     def test_intent_carries_every_decision_and_the_brief(self):
         interview = good_interview()
         answers = good_answers(interview)
