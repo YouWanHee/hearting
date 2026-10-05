@@ -367,7 +367,51 @@ function observePaneCallback(ctx, callback, sid) {
   peerIdentityLog(ctx, "callback", reason, { callback, sessionID: sid })
 }
 
-function observePanePublisher(child, ctx, sid, generation) {
+function publisherErrorFields(error) {
+  const text = (value, limit) => {
+    if (typeof value !== "string") return undefined
+    let result = "", bytes = 0
+    for (const char of value.replace(/[\x00-\x1f\x7f]/g, " ")) {
+      const size = Buffer.byteLength(char, "utf8")
+      if (bytes + size > limit) break
+      result += char; bytes += size
+    }
+    return result
+  }
+  try {
+    const fields = {}
+    const code = Number.isInteger(error?.code) && error.code >= -2147483648 && error.code <= 2147483647
+      ? error.code : text(error?.code, 64)
+    const message = text(error?.message, 256)
+    if (code !== undefined) fields.errorCode = code
+    if (message !== undefined) fields.errorMessage = message
+    if (Number.isInteger(error?.errno) && error.errno >= -2147483648 && error.errno <= 2147483647) {
+      fields.errorErrno = error.errno
+    }
+    return fields
+  } catch { return {} }
+}
+
+function publisherObservation(output) {
+  if (typeof output !== "string" || Buffer.byteLength(output, "utf8") > 1024) throw new Error("invalid observation")
+  const row = JSON.parse(output)
+  const reasons = ["herdr-unavailable", "pane-unavailable", "guard-refused", "report-attempts-finished"]
+  const statuses = ["not-attempted", "skipped", "exit0", "nonzero", "timeout", "spawn-error"]
+  const keys = ["schema", "reason", "session_report", "metadata_report", "session_report_rc", "metadata_report_rc"]
+  if (!row || row.schema !== "hearting-pane-observation-v1" || !reasons.includes(row.reason)
+      || !statuses.includes(row.session_report) || !statuses.includes(row.metadata_report)
+      || Object.keys(row).some(key => !keys.includes(key))) throw new Error("invalid observation")
+  const extra = { sessionReport: row.session_report, metadataReport: row.metadata_report }
+  for (const key of ["session_report_rc", "metadata_report_rc"]) {
+    if (Object.hasOwn(row, key)) {
+      if (!Number.isInteger(row[key]) || row[key] < -128 || row[key] > 255) throw new Error("invalid rc")
+      extra[key] = row[key]
+    }
+  }
+  return { reason: row.reason, extra }
+}
+
+function observePanePublisher(child, ctx, sid, generation, onSpawnError = () => {}) {
   let output = "", bytes = 0, finished = false
   const finish = (reason, extra = {}) => {
     if (finished) return
@@ -380,7 +424,7 @@ function observePanePublisher(child, ctx, sid, generation) {
       peerIdentityLog(ctx, "publisher", reason, { sessionID: sid, ...extra })
     }
   }
-  // Bound the observation, not the existing helper's execution. No kill or retry.
+  // Bound the observation, not the existing helper's execution.
   const timer = setTimeout(() => finish("publisher-observation-timeout"), 5000)
   timer.unref?.()
   child.stdout?.setEncoding("utf8")
@@ -391,7 +435,12 @@ function observePanePublisher(child, ctx, sid, generation) {
     if (bytes > 1024) { output = ""; finish("publisher-observation-overflow"); return }
     output += chunk
   })
-  child.on("error", () => finish("publisher-spawn-error"))
+  child.on("error", error => {
+    const extra = publisherErrorFields(error)
+    if (finished) peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid, ...extra })
+    else finish("publisher-spawn-error", extra)
+    onSpawnError()
+  })
   child.on("close", code => {
     if (finished) return
     const extra = { sessionID: sid, publisherRc: Number.isInteger(code) ? code : null }
@@ -400,21 +449,8 @@ function observePanePublisher(child, ctx, sid, generation) {
       return
     }
     try {
-      const row = JSON.parse(output)
-      const reasons = ["herdr-unavailable", "pane-unavailable", "guard-refused", "report-attempts-finished"]
-      const statuses = ["not-attempted", "skipped", "exit0", "nonzero", "timeout", "spawn-error"]
-      const keys = ["schema", "reason", "session_report", "metadata_report", "session_report_rc", "metadata_report_rc"]
-      if (!row || row.schema !== "hearting-pane-observation-v1" || !reasons.includes(row.reason)
-          || !statuses.includes(row.session_report) || !statuses.includes(row.metadata_report)
-          || Object.keys(row).some(key => !keys.includes(key))) throw new Error("invalid observation")
-      for (const key of ["session_report_rc", "metadata_report_rc"]) {
-        if (Object.hasOwn(row, key)) {
-          if (!Number.isInteger(row[key]) || row[key] < -128 || row[key] > 255) throw new Error("invalid rc")
-          extra[key] = row[key]
-        }
-      }
-      finish(row.reason, { ...extra,
-        sessionReport: row.session_report, metadataReport: row.metadata_report })
+      const observation = publisherObservation(output)
+      finish(observation.reason, { ...extra, ...observation.extra })
     } catch { finish("publisher-observation-invalid", extra) }
   })
 }
@@ -487,25 +523,73 @@ async function projectPane(sid, ctx, retry = false) {
     } else args.push("--no-report-session")
     const slot = { child: null }
     panePublisherSlot = slot // Reserve before spawn, including synchronous reentrancy.
+    const options = { cwd: root, env: { ...process.env, AGENT_HOME: root },
+      detached: true, stdio: ["ignore", "pipe", "ignore"] }
+    let fallbackTried = false, launched = false
+    const fallback = () => {
+      if (fallbackTried) return
+      fallbackTried = true
+      if (launched) {
+        peerIdentityLog(ctx, "publisher", "publisher-sync-fallback-skipped-live", { sessionID: sid })
+        return
+      }
+      if (!binding.active || generation !== paneProjectionGeneration || panePublisherSlot !== slot) {
+        peerIdentityLog(ctx, "publisher", "publisher-sync-fallback-stale", { sessionID: sid })
+        releasePanePublisher(slot)
+        return
+      }
+      try {
+        // Same executable, argv, sequence and environment; no startup replay with
+        // a newer sequence. The synchronous child is bounded and owns this slot.
+        const result = spawnSync("python3", args, { ...options, encoding: "utf8",
+          timeout: 10000, killSignal: "SIGKILL", maxBuffer: 1024 })
+        if (startup && Number.isInteger(result.pid) && result.pid > 0) paneNativeOrigin.state = "spent"
+        if (result.error) {
+          peerIdentityLog(ctx, "publisher", "publisher-sync-fallback-error", {
+            sessionID: sid, ...publisherErrorFields(result.error) })
+        } else if (result.status !== 0) {
+          peerIdentityLog(ctx, "publisher", "publisher-sync-fallback-exit-error", {
+            sessionID: sid, publisherRc: Number.isInteger(result.status) ? result.status : null })
+        } else {
+          peerIdentityLog(ctx, "publisher", "publisher-path-success", {
+            sessionID: sid, publisherPath: "sync-fallback", publisherRc: 0 })
+          try {
+            const observation = publisherObservation(result.stdout)
+            peerIdentityLog(ctx, "publisher", observation.reason, {
+              sessionID: sid, publisherPath: "sync-fallback", ...observation.extra })
+          } catch {
+            peerIdentityLog(ctx, "publisher", "publisher-observation-invalid", {
+              sessionID: sid, publisherPath: "sync-fallback" })
+          }
+        }
+      } catch (error) {
+        peerIdentityLog(ctx, "publisher", "publisher-sync-fallback-error", {
+          sessionID: sid, ...publisherErrorFields(error) })
+      } finally { releasePanePublisher(slot) }
+    }
     let child
     try {
-      child = spawn("python3", args, {
-        cwd: root, env: { ...process.env, AGENT_HOME: root },
-        detached: true, stdio: ["ignore", "pipe", "ignore"],
-      })
-    } catch (error) { releasePanePublisher(slot); throw error }
+      child = spawn("python3", args, options)
+    } catch (error) {
+      peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid, ...publisherErrorFields(error) })
+      fallback()
+      return
+    }
     slot.child = child
     const created = Number.isInteger(child.pid) && child.pid > 0
     if (startup && created) paneNativeOrigin.state = "spent"
+    child.on("spawn", () => {
+      launched = true
+      peerIdentityLog(ctx, "publisher", "publisher-path-success", { sessionID: sid, publisherPath: "async" })
+    })
     child.on("exit", () => releasePanePublisher(slot))
     child.on("close", () => releasePanePublisher(slot))
-    child.on("error", () => { if (!created) releasePanePublisher(slot) })
-    observePanePublisher(child, ctx, sid, generation)
+    observePanePublisher(child, ctx, sid, generation, fallback)
     peerIdentityLog(ctx, "publisher", "publisher-spawned", { sessionID: sid,
       nativeStartupAttempt: startup && created })
     child.unref()
-  } catch {
-    peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid })
+  } catch (error) {
+    peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid, ...publisherErrorFields(error) })
   } finally { if (paneProjectionBusy.get(sid) === binding) paneProjectionBusy.delete(sid) }
 }
 

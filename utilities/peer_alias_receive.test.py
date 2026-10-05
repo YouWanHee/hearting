@@ -373,7 +373,7 @@ async function emit(text, code = 0, action = "close") {
   if (text) child.stdout.write(text);
   await new Promise(resolve => setImmediate(resolve));
   if (action === "timeout") timers.at(-1).cb();
-  if (action === "error") child.emit("error", Error("private-exception"));
+  if (action === "error") child.emit("error", Object.assign(Error("synthetic spawn denied"), {code: "EACCES", errno: -13}));
   if (action === "read-error") child.stdout.emit("error", Error("private-read-error"));
   child.emit("close", code);
   return child;
@@ -408,6 +408,8 @@ console.log(JSON.stringify(logs));
             "publisher-stale-observation", "callback-entry"])
         self.assertEqual(logs[0]["extra"]["sessionReport"], "exit0")
         self.assertEqual(logs[0]["extra"]["metadataReport"], "timeout")
+        self.assertEqual({key: logs[6]["extra"][key] for key in ["errorCode", "errorErrno", "errorMessage"]},
+                         {"errorCode": "EACCES", "errorErrno": -13, "errorMessage": "synthetic spawn denied"})
         self.assertNotIn("sessionReport", logs[-2]["extra"])
         self.assertNotIn("sessionID", logs[-1]["extra"])
         self.assertTrue(logs[-1]["extra"]["sessionIDInvalid"])
@@ -424,7 +426,7 @@ import { PassThrough } from "node:stream";
 import vm from "node:vm";
 const source = readFileSync(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js", "utf8");
 function fixture(options = {}) {
-  const commands = [], children = [], logs = [], reads = [], timers = [];
+  const commands = [], children = [], logs = [], reads = [], timers = [], sync = [];
   let now = 1000;
   const native = options.command || Buffer.from((options.argv || ["/native/opencode", "--session", "ses_A"]).join("\0") + "\0");
   const files = {"/proc/self/cmdline": native,
@@ -438,13 +440,18 @@ function fixture(options = {}) {
     setTimeout: (cb, ms) => {const timer = setTimeout(cb, ms);timers.push({cb, ms, timer});return timer}, clearTimeout,
     spawn: (exe, args) => {
       commands.push(args);
-      if (options.spawnThrows) {options.spawnThrows = false;throw Error("private spawn failure")}
+      if (options.spawnThrows) {options.spawnThrows = false;throw Object.assign(Error("synthetic spawn failure"), {code: "EACCES", errno: -13})}
       const child = new EventEmitter();child.pid = options.spawnNoPid ? undefined : children.length + 100;
       child.stdout = new PassThrough();child.unref = () => {};child.kill = () => {throw Error("no signals")};
       children.push(child);return child;
+    },
+    spawnSync: (exe, args, config) => {
+      sync.push({exe, args, config});
+      if (options.syncThrows) throw Object.assign(Error("synthetic sync failure"), {code: "EFAULT", errno: -14});
+      return options.syncResult || {pid: 0, error: Object.assign(Error("synthetic fallback denied"), {code: "EACCES", errno: -13})};
     }};
   vm.runInNewContext(source.slice(source.indexOf("function sdkResponseData("), source.indexOf("\nfunction collectPreflight")), scope);
-  return {scope, commands, children, logs, reads, timers, setNow: value => {now = value},
+  return {scope, commands, children, logs, reads, timers, sync, setNow: value => {now = value},
     ctx: get => ({directory: "/fixture/project", client: {app: {log: async ({body}) => logs.push(body)},
       session: {get: get || (async () => ({data: {id: "ses_A"}}))}}}),
     exit: index => {children[index].emit("exit", 0);children[index].emit("close", 0)}};
@@ -617,6 +624,83 @@ console.log(JSON.stringify({commands: f.commands, noPid: noPid.commands}));
             prefix + ["--seq", "1000002", "--session-start-source", "startup"], prefix + ["--seq", "1000003"]])
         self.assertEqual(result["noPid"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
             prefix + ["--seq", "1000002", "--session-start-source", "startup"]])
+
+    def test_opencode_spawn_error_fallback_uses_same_invocation_once_and_preserves_errno(self):
+        result = self.run_pane_projection_fixture(r'''
+const observation = JSON.stringify({schema: "hearting-pane-observation-v1", reason: "report-attempts-finished",
+ session_report: "exit0", metadata_report: "exit0", session_report_rc: 0, metadata_report_rc: 0});
+const syncResult = {pid: 901, status: 0, stdout: observation};
+const f = fixture({spawnNoPid: true, syncResult});const ctx = f.ctx();
+await f.scope.projectPane("ses_A", ctx);
+const error = Object.assign(Error("synthetic async failure\n" + "가".repeat(200)), {code: "EFAULT", errno: -14});
+f.children[0].emit("error", error);f.children[0].emit("error", error);f.exit(0);
+await f.scope.projectPane("ses_A", ctx);f.exit(1);
+const thrown = fixture({spawnThrows: true, syncResult});const other = thrown.ctx();
+await thrown.scope.projectPane("ses_A", other);await thrown.scope.projectPane("ses_A", other);thrown.exit(0);
+console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs,
+ thrown: {commands: thrown.commands, sync: thrown.sync, logs: thrown.logs}}));
+''')
+        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        startup = prefix + ["--seq", "1000001", "--session-start-source", "startup"]
+        refresh = prefix + ["--seq", "1000002"]
+        for record in [result, result["thrown"]]:
+            self.assertEqual(record["commands"], [startup, refresh])
+            self.assertEqual(len(record["sync"]), 1)
+            attempt = record["sync"][0]
+            self.assertEqual(attempt["exe"], "python3")
+            self.assertEqual(attempt["args"], startup)
+            self.assertEqual(attempt["config"], {"cwd": "fixture-root",
+                "env": {"HERDR_PANE_ID": "fixture-pane", "OPENCODE_SESSION_ID": "ses_foreign", "AGENT_HOME": "fixture-root"},
+                "detached": True, "stdio": ["ignore", "pipe", "ignore"], "encoding": "utf8",
+                "timeout": 10000, "killSignal": "SIGKILL", "maxBuffer": 1024})
+            success = [row["extra"] for row in record["logs"] if row["extra"]["reason"] == "publisher-path-success"]
+            self.assertEqual(success, [{"module": "hearting-peer-identity", "stage": "publisher",
+                "reason": "publisher-path-success", "sessionID": "ses_A", "publisherPath": "sync-fallback", "publisherRc": 0}])
+            self.assertTrue(any(row["extra"].get("sessionReport") == "exit0" for row in record["logs"]))
+        error = next(row["extra"] for row in result["logs"] if row["extra"]["reason"] == "publisher-spawn-error")
+        self.assertEqual((error["errorCode"], error["errorErrno"]), ("EFAULT", -14))
+        self.assertLessEqual(len(error["errorMessage"].encode("utf-8")), 256)
+        self.assertNotIn("\n", error["errorMessage"])
+        error = next(row["extra"] for row in result["thrown"]["logs"] if row["extra"]["reason"] == "publisher-spawn-error")
+        self.assertEqual((error["errorCode"], error["errorErrno"], error["errorMessage"]),
+                         ("EACCES", -13, "synthetic spawn failure"))
+
+    def test_opencode_spawn_fallback_failure_live_and_stale_boundaries(self):
+        result = self.run_pane_projection_fixture(r'''
+const resultRows = [];
+for (const options of [{syncResult: {pid: 903, status: null, error: Object.assign(Error("synthetic timeout"), {code: "ETIMEDOUT", errno: -110})}},
+ {syncResult: {pid: 904, status: 7, stdout: "private-stdout"}},
+ {syncResult: {pid: 905, status: 0, stdout: "private-invalid-output"}}, {syncThrows: true},
+ {syncResult: {pid: 906, status: null, error: Object.assign(Error("synthetic overflow"), {code: "ENOBUFS", errno: -105})}}]) {
+ const f = fixture({...options, spawnThrows: true});await f.scope.projectPane("ses_A", f.ctx());
+ resultRows.push({sync: f.sync.length, logs: f.logs});
+}
+const live = fixture();const liveCtx = live.ctx();await live.scope.projectPane("ses_A", liveCtx);
+live.children[0].emit("spawn");live.children[0].emit("error", Object.assign(Error("synthetic launched error"), {errno: -14}));
+await live.scope.projectPane("ses_A", liveCtx);const held = live.commands.length;live.exit(0);
+await live.scope.projectPane("ses_A", liveCtx);live.exit(1);
+const stale = fixture();const old = stale.ctx();await stale.scope.projectPane("ses_A", old);
+stale.scope.retirePaneContext(old);stale.children[0].emit("error", Error("synthetic old error"));stale.exit(0);
+console.log(JSON.stringify({numericError: live.scope.publisherErrorFields({code: 14, errno: -14, message: "synthetic numeric code"}),
+ resultRows, live: {sync: live.sync.length, held, commands: live.commands, logs: live.logs},
+ stale: {sync: stale.sync.length, logs: stale.logs}}));
+''')
+        expected = ["publisher-sync-fallback-error", "publisher-sync-fallback-exit-error",
+                    "publisher-observation-invalid", "publisher-sync-fallback-error", "publisher-sync-fallback-error"]
+        for row, reason in zip(result["resultRows"], expected):
+            self.assertEqual(row["sync"], 1)
+            self.assertIn(reason, [log["extra"]["reason"] for log in row["logs"]])
+            self.assertNotIn("private", json.dumps(row["logs"]))
+        self.assertEqual(result["resultRows"][0]["logs"][-1]["extra"]["errorCode"], "ETIMEDOUT")
+        self.assertEqual(result["resultRows"][3]["logs"][-1]["extra"]["errorErrno"], -14)
+        self.assertEqual(result["numericError"], {"errorCode": 14, "errorErrno": -14, "errorMessage": "synthetic numeric code"})
+        self.assertEqual(result["live"]["sync"], 0)
+        self.assertEqual(result["live"]["held"], 1)
+        self.assertEqual(len(result["live"]["commands"]), 2)
+        self.assertIn("publisher-sync-fallback-skipped-live", [row["extra"]["reason"] for row in result["live"]["logs"]])
+        self.assertIn("async", [row["extra"].get("publisherPath") for row in result["live"]["logs"]])
+        self.assertEqual(result["stale"]["sync"], 0)
+        self.assertIn("publisher-sync-fallback-stale", [row["extra"]["reason"] for row in result["stale"]["logs"]])
 
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''
