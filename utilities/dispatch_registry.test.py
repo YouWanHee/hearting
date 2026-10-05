@@ -605,7 +605,7 @@ class RegistryTest(unittest.TestCase):
     "phase":"tool","sequence":3,"updated_at":time.time()}))
   return (f"2026-07-16T00:00:09Z\topen\t/r\t/w\tghost\t"
           f"route_id=r-ghost,route_node=execute,attempt_id={attempt},"
-          f"pid=99999996,pid_start=1,pid_scope=namespace-local,"
+          f"pid=99999996,pid_start={D.process_start_ticks(os.getpid())},pid_scope=namespace-local,"
           f"pid_ns=pid:[inner],pid_observer_ns={observer}{extra}")
 
  # B-P1. A fresh heartbeat no longer keeps a row open once the scan for its own
@@ -1533,7 +1533,10 @@ class RegistryTest(unittest.TestCase):
   (heartbeats/f"{attempt}.json").write_text(json.dumps(
    {"attempt_id":attempt,"route_id":"rt-recovery","route_node":"execute",
     "phase":heartbeat_phase,"kind":"registry","sequence":1,"updated_at":time.time()}))
-  return self.cancellation_row(attempt,extra=",pid_observer_ns=pid:[4026534323],pid_ns=pid:[4026534323]")
+  # This extinct fixture shares the host's clock; its synthetic gone child was
+  # born with this test, rather than at tick 900 before unrelated host services.
+  return self.cancellation_row(attempt,extra=",pid_observer_ns=pid:[4026534323],pid_ns=pid:[4026534323]").replace(
+   "pid_start=900",f"pid_start={D.process_start_ticks(os.getpid())}")
 
  def extinct_namespace(self,gone="extinct"):
   stack=contextlib.ExitStack()
@@ -1661,7 +1664,7 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.attempt="att-same-host-stage"
   self.log=self.base/f"plan.{self.attempt}.codex.jsonl"
   self.namespace=os.readlink("/proc/self/ns/pid")
-  self.pid=99999996;self.pid_start="1"
+  self.pid=99999996;self.pid_start=D.process_start_ticks(os.getpid())
   self.live=None
   self.write_log()
   self.write_row()
@@ -1730,13 +1733,69 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),before_retry)
 
  def test_ambiguous_or_reused_identity_stays_pending(self):
-  self.write_row(extra=(f",pid_host=99999997,pid_host_start=1,pid_host_ns={self.namespace},"
+  self.write_row(extra=(f",pid_host=99999997,pid_host_start={self.pid_start},pid_host_ns={self.namespace},"
                         "pid_host_proof=nspid-procfs-root-v1"))
   self.assert_receipt_refused()
   self.live=subprocess.Popen(["sleep","60"],start_new_session=True)
   actual=Path(f"/proc/{self.live.pid}/stat").read_text().rsplit(") ",1)[1].split()[19]
   self.write_row(pid=self.live.pid,pid_start=str(int(actual)+1))
   self.assert_receipt_refused()
+
+ def claude_log(self, **changes):
+  self.log=self.base/f"plan.{self.attempt}.claude.jsonl"
+  result={"type":"result","subtype":"success","is_error":False,
+          "terminal_reason":"completed","stop_reason":"end_turn",
+          "result":f"artifact: {self.artifact}\nverdict: PASS\nblocker: none"}
+  result.update(changes)
+  self.log.write_text(json.dumps(result, separators=(',',':'))+'\n')
+  self.write_row(extra=",harness=claude")
+
+ def test_claude_complete_recovers_and_receipt_writer_reentry_is_idempotent(self):
+  self.claude_log()
+  original=self.jobs.read_bytes()
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.jobs.read_bytes(),original)
+  first=self.decision('--apply')
+  self.assertEqual(first['category'],'terminal-receipt-sealed')
+  sealed=self.jobs.read_bytes()
+  self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
+  self.assertEqual(self.jobs.read_bytes(),sealed)
+  self.assertNotIn('failure_class=pass',self.jobs.read_text())
+
+ def test_claude_errors_unfinished_or_truncated_never_seal(self):
+  for change in ({'is_error':True},{'terminal_reason':'api_error'},
+                 {'stop_reason':'max_tokens'},{'subtype':'error_max_turns'},
+                 {'is_error':0}):
+   with self.subTest(change=change):
+    self.claude_log(**change);self.assert_receipt_refused()
+  self.claude_log();self.log.write_text(self.log.read_text()+'{"type":"result"')
+  self.assert_receipt_refused()
+
+ def test_legacy_claude_optional_none_contract_and_harness_identity(self):
+  self.claude_log(subtype=None,is_error=None,terminal_reason=None,stop_reason=None)
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
+  self.write_row(extra=',harness=codex');self.assert_receipt_refused()
+
+ def test_claude_receipt_CAS_rechecks_terminal_and_owned_descendants(self):
+  self.claude_log()
+  spec=importlib.util.spec_from_file_location('registry_claude_receipt_fixture',SCRIPT)
+  module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  row=module.read_rows(self.jobs)[0]
+  with mock.patch.object(module,'prove_attempt_quiescence',return_value=types.SimpleNamespace(
+          proven=False,source='exact-teardown',process_group_state='empty',
+          descendant_state='unverifiable',namespace_authority=True)):
+   self.assertIsNone(module._same_host_foreground_stage_receipt(row))
+  before=self.jobs.read_bytes()
+  args=types.SimpleNamespace(jobs=self.jobs,attempt=self.attempt,session=None,route=None,
+       node=None,job=None,all=False,apply=True,agent_home=self.base,only_exact_dead=False,audit=None)
+  def changed(jobs,attempt,receipt,predicate):
+   self.log.write_text(self.log.read_text()+'{"type":"result"')
+   self.assertFalse(predicate(row['raw'].split('\t')))
+   return False
+  with mock.patch.object(module,'annotate_attempt_row_if',side_effect=changed), \
+       mock.patch.object(module,'close_finished_child',side_effect=AssertionError('completion after veto')):
+   with contextlib.redirect_stdout(io.StringIO()):module.reconcile([row],args)
+  self.assertEqual(self.jobs.read_bytes(),before)
 
  def test_live_or_foreign_process_stays_pending(self):
   self.live=subprocess.Popen(["sleep","60"],start_new_session=True)
@@ -1817,7 +1876,7 @@ class SameHostForegroundReviewFailureTest(unittest.TestCase):
   self.parent="att-owner-review-fail"
   self.log=self.base/f"plan-check.{self.attempt}.codex.jsonl"
   self.ns=os.readlink("/proc/self/ns/pid")
-  self.pid=99999996;self.start="1";self.live=None
+  self.pid=99999996;self.start=D.process_start_ticks(os.getpid());self.live=None
   self.write_log();self.write_row()
 
  def tearDown(self):
@@ -2033,7 +2092,7 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.jobs.write_text(
    f"2026-08-19T00:00:00Z\t{status}\t{self.repo}\t{self.repo}\tproof\t"
    f"route_id=r-proof,route_node=execute,route_hash=h-proof,"
-   f"attempt_id={self.attempt},pid={pid},pid_start=1,"
+   f"attempt_id={self.attempt},pid={pid},pid_start={D.process_start_ticks(os.getpid())},"
    f"pid_scope=namespace-local,pid_ns={self.observer},"
    f"pid_observer_ns={self.observer},pgid={pid},launch_lifecycle=detached,"
    f"artifact_root={self.artifact_root},log_file={self.log}{extra}\n")
@@ -2161,7 +2220,8 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
    start=(Path("/proc")/str(live.pid)/"stat").read_text().split()[21]
    self.write_row(status="open",pid=live.pid,
                   extra="")
-   self.jobs.write_text(self.jobs.read_text().replace("pid_start=1",f"pid_start={start}"))
+   self.jobs.write_text(self.jobs.read_text().replace(
+    f"pid_start={D.process_start_ticks(os.getpid())}",f"pid_start={start}"))
    record=self.seal("--apply")
    self.assertEqual(record["sealed"],0)
    self.assertTrue(record["decisions"][0]["reason"].startswith("governed-process-"),
@@ -2221,7 +2281,7 @@ class DetachedResidueDrainReconcileTest(unittest.TestCase):
   self.jobs.write_text(
    f"2026-10-02T04:00:00Z\topen\t{self.repo}\t{self.repo}\tslice\t"
    f"{CURRENT_ATTEMPT_CONTRACT},worker_type=stage,route_id=rt-residue,route_node=execute,"
-   f"route_file={self.base}/route.json,attempt_id={self.attempt},pid=99999996,pid_start=1,"
+   f"route_file={self.base}/route.json,attempt_id={self.attempt},pid=99999996,pid_start={D.process_start_ticks(os.getpid())},"
    f"pgid=99999996,pid_scope=namespace-local,pid_ns={ns},pid_observer_ns={ns},"
    f"launch_lifecycle=detached,log_file={self.log},artifact_root={root},"
    f"launch_outcome=governed-process-group-drained,group_reap_proof={D.GROUP_REAP_PROOF},"

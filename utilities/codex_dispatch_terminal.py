@@ -359,6 +359,10 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
         if verdict == "FAIL"
         else ""
     )
+    try:
+        last_record = json.loads(lines[-1]) if lines else None
+    except (TypeError, ValueError):
+        last_record = None
     return _result(
         0,
         "valid",
@@ -373,6 +377,15 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
         failure_note=failure_note,
         failure_class="sandbox-init" if sandbox_init else verdict.lower(),
         terminal_event=terminal_event,
+        native_completed=(
+            terminal_source == "exact-claude-result"
+            and terminal_row.get("subtype") in (None, "success")
+            and (terminal_row.get("is_error") is False or terminal_row.get("is_error") is None)
+            and terminal_row.get("terminal_reason") in (None, "completed")
+            and terminal_row.get("stop_reason") in (None, "end_turn")
+            and terminal_index == len(rows) - 1
+            and last_record == terminal_row
+        ),
         log_file=str(log_path),
     )
 

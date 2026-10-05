@@ -11,6 +11,8 @@ reading instead of becoming unknown.
 from __future__ import annotations
 
 import json
+import math
+from datetime import datetime
 import os
 from pathlib import Path
 import sys
@@ -55,9 +57,10 @@ def _claude_score(now: float, stale_after: int) -> float | None:
     so picking one "winning" file (the old behaviour) could report a 51%
     headroom window as the account's answer while a different, equally fresh
     session file showed the same window at 1%. Instead, take each window
-    key's most-recently-observed `used_percentage` across all non-stale
-    files, then combine those per-window values into one headroom the same
-    way a single file always did.
+    key's readings across non-stale files. A tap write is not a new usage
+    observation: within one unexpired reset window the highest reading remains
+    authoritative over a lower value written again. Legacy taps without a reset
+    retain their historical mtime ordering; they prove no window transition.
     """
     home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     files = []
@@ -70,27 +73,53 @@ def _claude_score(now: float, stale_after: int) -> float | None:
         return None
     latest_used: dict[str, float] = {}
     latest_mtime: dict[str, float] = {}
+    window_used: dict[tuple[str, float], float] = {}
+    from dispatch_capacity_evidence import _scope_candidates
+    current_scopes = _scope_candidates("claude")
     for path in files[:12]:
         try:
             mtime = path.stat().st_mtime
             if now - mtime > stale_after:
                 break
+            if mtime > now:
+                continue
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(payload, dict):
+            continue
+        bound = payload.get("quota_scope")
+        if bound is not None and bound != current_scopes.get(payload.get("quota_scope_kind")):
+            continue
         limits = payload.get("rate_limits") or {}
+        if not isinstance(limits, dict):
+            continue
         for key, row in limits.items():
             if not isinstance(row, dict):
                 continue
             used = row.get("used_percentage")
-            if not isinstance(used, (int, float)):
+            if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
+                continue
+            reset = row.get("resets_at")
+            if reset is not None:
+                try:
+                    if isinstance(reset, bool):
+                        continue
+                    expires = (float(reset) if isinstance(reset, (int, float)) else
+                               datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp())
+                    if not math.isfinite(expires) or expires <= now:
+                        continue
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    continue
+                window = (key, expires)
+                window_used[window] = max(window_used.get(window, used), used)
                 continue
             if key not in latest_mtime or mtime > latest_mtime[key]:
                 latest_mtime[key] = mtime
                 latest_used[key] = used
-    if not latest_used:
+    if not latest_used and not window_used:
         return None
-    return _headroom(latest_used.values())
+    return _headroom([*latest_used.values(), *window_used.values()])
 
 
 # Why the last live probe produced no reading, per harness; `_codex_probe` /

@@ -941,6 +941,7 @@ class ForwardedRun:
     stderr: str | None
     received_signal: int | None = None
     cleanup_incomplete: bool = False
+    timed_out: bool = False
 
 
 def _forwarded_signals() -> list[int]:
@@ -978,6 +979,7 @@ def run_forwarding_termination(
     timeout: float | None,
     grace: float = FORWARDED_TERMINATION_GRACE,
     poll_interval: float = 0.05,
+    terminate_on_timeout: bool = False,
 ) -> ForwardedRun:
     """Run a wrapper inside this call and hand any stop request to it.
 
@@ -987,8 +989,9 @@ def run_forwarding_termination(
     and is passed to the wrapper; later signals are passed too but never move
     that deadline. A wrapper still running at the deadline is killed (only the
     wrapper: its worker group belongs to the wrapper's own cleanup) and the
-    result says ``cleanup_incomplete``. Without a signal, ``timeout`` keeps the
-    ``subprocess.run`` meaning and raises ``subprocess.TimeoutExpired``.
+    result says ``cleanup_incomplete``. With ``terminate_on_timeout`` the same
+    bounded TERM cleanup applies at the outer deadline and reports ``timed_out``.
+    Otherwise timeout retains its existing ``subprocess.TimeoutExpired`` meaning.
     Handlers are installed only on the main thread and are always restored.
     """
 
@@ -1045,6 +1048,7 @@ def run_forwarding_termination(
                 readers.append(reader)
         outer_deadline = None if timeout is None else time.monotonic() + timeout
         cleanup_incomplete = False
+        timed_out = False
         try:
             while True:
                 try:
@@ -1060,6 +1064,10 @@ def run_forwarding_termination(
                         cleanup_incomplete = True
                         break
                 elif outer_deadline is not None and now >= outer_deadline:
+                    if terminate_on_timeout:
+                        timed_out = True
+                        forward(signal.SIGTERM, None)
+                        continue
                     proc.kill()
                     proc.wait()
                     for reader in readers:
@@ -1099,6 +1107,7 @@ def run_forwarding_termination(
             text(stderr_chunks),
             received[0] if received else None,
             cleanup_incomplete,
+            timed_out,
         )
     finally:
         for signum, handler in previous.items():
