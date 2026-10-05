@@ -145,5 +145,36 @@ class StallDumpTest(unittest.TestCase):
                 faulthandler.disable()
 
 
+    def test_an_unused_dump_file_does_not_outlive_the_process(self):
+        import os
+        import signal
+        import subprocess
+        import tempfile
+        if not hasattr(signal, "SIGUSR1"):
+            self.skipTest("platform has no SIGUSR1")
+        script = (
+            "import os, signal, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from fleet import fleet\n"
+            "fleet._arm_stall_dump()\n"
+            "if sys.argv[2] == 'dump':\n"
+            "    os.kill(os.getpid(), signal.SIGUSR1)\n"
+            "print(os.getpid())\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            env = dict(os.environ, TMPDIR=temporary)
+            outcomes = {}
+            for mode in ("quiet", "dump"):
+                done = subprocess.run(
+                    [sys.executable, "-c", script, str(TOOLS), mode],
+                    env=env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                path = os.path.join(temporary, "fleet-stall-%s.txt" % done.stdout.strip())
+                outcomes[mode] = os.path.exists(path)
+            # Armed and never used: gone. Actually dumped into: evidence, kept.
+            self.assertEqual(outcomes, {"quiet": False, "dump": True})
+
+
 if __name__ == "__main__":
     unittest.main()
