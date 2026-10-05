@@ -13,6 +13,14 @@ Standalone and Python-stdlib-only, like ``host_probes.py``. Ownership
 boundary: only symlinks this module itself created (targets inside our
 node root) are ever replaced; a foreign ``node`` on PATH or a foreign file
 at the expose path is reported, never touched.
+
+One more shape is ours: a *dangling* launcher link whose target follows the
+managed layout (``<data>/hearting/node/current/bin/<name>``) but whose node
+root is gone -- an isolated fixture's temp data root, an uninstalled data
+dir. Only ``_expose`` writes that spelling, the link executes nothing, and
+``_owned_link`` can never claim it again because it resolves into no live
+root. ``sweep_dangling_links`` removes exactly those on install, update, and
+runtime activation; ``launcher_status`` reports them for ``harness verify``.
 """
 from __future__ import annotations
 
@@ -40,8 +48,8 @@ EXPOSED = ("node", "npm", "npx")
 _ARCHES = {"x86_64": "x64", "aarch64": "arm64"}
 
 
-def _result(status: str, detail: str) -> dict:
-    return {"id": "host.node-runtime", "status": status, "detail": detail}
+def _result(status: str, detail: str, probe_id: str = "host.node-runtime") -> dict:
+    return {"id": probe_id, "status": status, "detail": detail}
 
 
 def _node_root() -> Path:
@@ -156,6 +164,134 @@ def _owned_link(path: Path, root: Path) -> bool:
         return False
 
 
+def _managed_layout(target: Path, name: str) -> bool:
+    """Whether ``target`` is where a managed node root exposes ``name``.
+
+    ``_expose`` always links ``<bin>/<name>`` to
+    ``<data>/hearting/node/current/bin/<name>``. The data root varies
+    (``XDG_DATA_HOME``, an isolated fixture's temp root); the five trailing
+    components never do.
+    """
+    parts = target.parts
+    return (
+        len(parts) >= 5
+        and parts[-1] == name
+        and parts[-2] == "bin"
+        and parts[-3] == "current"
+        and parts[-4] == "node"
+        and parts[-5] == "hearting"
+    )
+
+
+def _dangling_managed_link(link: Path, name: str) -> bool:
+    """A symlink at ``link`` in the managed layout whose target no longer exists.
+
+    Only ``_expose`` writes that spelling, so the link is ours even when its
+    node root was a different data root than the current one. A dangling
+    entry executes nothing and shadows nothing (``shutil.which`` and the
+    shell both skip it), so removing it changes no behaviour; keeping it
+    leaves a broken ``node`` in the launcher dir forever, because
+    ``_owned_link`` resolves it into no live root and ``_expose`` then
+    treats it as foreign.
+    """
+    if not link.is_symlink():
+        return False
+    try:
+        target = Path(os.readlink(link))
+    except OSError:
+        return False
+    if not target.is_absolute():
+        target = link.parent / target
+    if not _managed_layout(target, name):
+        return False
+    try:
+        return not link.exists()
+    except OSError:
+        return False
+
+
+def dangling_links() -> list:
+    """Exposed names whose launcher link is a dangling managed link (read-only)."""
+    bin_dir = _bin_dir()
+    return [name for name in EXPOSED if _dangling_managed_link(bin_dir / name, name)]
+
+
+def sweep_dangling_links() -> list:
+    """Remove every dangling managed link from the launcher dir; never raises.
+
+    Returns the names removed. A live link (target present), a foreign link
+    (target outside the managed layout), and a regular file are never
+    touched; a link that changes under us is left for the next pass.
+    """
+    removed = []
+    bin_dir = _bin_dir()
+    for name in EXPOSED:
+        link = bin_dir / name
+        try:
+            if not _dangling_managed_link(link, name):
+                continue
+            state = safe_fs.capture_state(link)
+            if state.kind != "symlink":
+                continue
+            auth = safe_fs.authority(
+                link,
+                owner=f"node-runtime:dangling-{name}",
+                allowed_paths=(link,),
+                expected=state,
+            )
+            safe_fs.remove_exact(auth)
+        except (OSError, safe_fs.SafetyError):
+            continue
+        removed.append(name)
+    return removed
+
+
+def _swept_detail(removed: list) -> str:
+    if not removed:
+        return ""
+    return f"; removed dangling managed {'/'.join(removed)} from {_bin_dir()}"
+
+
+def launcher_status() -> dict:
+    """Read-only row for ``harness verify``: are the managed launcher links sound?"""
+    dangling = dangling_links()
+    if dangling:
+        return _result(
+            "dangling",
+            f"dangling managed {'/'.join(dangling)} in {_bin_dir()}; "
+            "harness update removes them",
+            probe_id="host.node-launchers",
+        )
+    return _result(
+        "ok",
+        f"no dangling managed node links in {_bin_dir()}",
+        probe_id="host.node-launchers",
+    )
+
+
+def reconcile_launchers() -> dict:
+    """Mutating row for ``harness update`` and ``runtime activate``: sweep, then report."""
+    removed = sweep_dangling_links()
+    left = dangling_links()
+    if left:
+        return _result(
+            "warning",
+            f"could not remove dangling managed {'/'.join(left)} from {_bin_dir()}",
+            probe_id="host.node-launchers",
+        )
+    if removed:
+        return _result(
+            "repaired",
+            f"removed dangling managed {'/'.join(removed)} from {_bin_dir()}",
+            probe_id="host.node-launchers",
+        )
+    return _result(
+        "ok",
+        f"no dangling managed node links in {_bin_dir()}",
+        probe_id="host.node-launchers",
+    )
+
+
 def _expose(install_dir: Path, root: Path) -> list:
     """Symlink node/npm/npx into the bin dir; never replace a foreign entry."""
     bin_dir = _bin_dir()
@@ -197,12 +333,19 @@ def _expose(install_dir: Path, root: Path) -> list:
 def ensure_node() -> dict:
     """Reuse a compatible node, else install a verified LTS. Never raises."""
     try:
+        # Our own leftovers go first, before any policy decision: a dangling
+        # managed link is never a usable node, so neither the opt-out nor a
+        # reusable node on PATH is a reason to keep it.
+        swept = sweep_dangling_links()
         if os.environ.get("HARNESS_NO_NODE_INSTALL") == "1":
-            return _result("ok", "node ensure skipped (HARNESS_NO_NODE_INSTALL=1)")
+            return _result(
+                "ok",
+                "node ensure skipped (HARNESS_NO_NODE_INSTALL=1)" + _swept_detail(swept),
+            )
         found = _current_node_version()
         if found is not None and found >= MIN_NODE:
             return _result(
-                "ok", "reusing node v%d.%d.%d from PATH" % found
+                "ok", ("reusing node v%d.%d.%d from PATH" % found) + _swept_detail(swept)
             )
         arch = _ARCHES.get(platform.machine())
         if platform.system() != "Linux" or arch is None:
@@ -248,7 +391,7 @@ def ensure_node() -> dict:
                 "warning", f"installed node failed its version check: {smoke.stderr.strip()}"
             )
         skipped = _expose(install_dir, root)
-        detail = f"installed node {version} at {install_dir}"
+        detail = f"installed node {version} at {install_dir}" + _swept_detail(swept)
         if found is not None:
             detail += "; existing node v%d.%d.%d on PATH is below %d.%d.%d and was left untouched" % (
                 found + MIN_NODE

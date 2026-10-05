@@ -202,6 +202,7 @@ assert {item["id"] for item in row["checks"]} == {
     "compute-hosts-config.inventory",
     "memory-sync-config.policy",
     "bootstrap.launcher.compute-hosts",
+    "environment.node-launchers",
 }, row
 PY
 
