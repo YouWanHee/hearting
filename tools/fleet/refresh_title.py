@@ -1307,8 +1307,37 @@ def run_provider_cascade(commands, *, timeout, env, cwd=None):
     return "", None
 
 
-def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, label=""):
-    """Run the title-provider cascade with no shell; all failures degrade to ``''``."""
+def _answering_provider(commands, index):
+    """Provider name of the cascade's answering command, or None.
+
+    The name is the invoked executable itself (`provider_command` builds it
+    from the adapter), `"custom"` for an operator command; anything
+    unresolvable degrades to None so the caller keeps the previous source.
+    """
+    if not isinstance(index, int) or isinstance(index, bool):
+        return None
+    if not isinstance(commands, (list, tuple)) or not 0 <= index < len(commands):
+        return None
+    if (os.environ.get("FLEET_TITLE_COMMAND") or "").strip():
+        return "custom"
+    try:
+        argv = commands[index][0]
+    except (IndexError, TypeError):
+        return None
+    if not isinstance(argv, (list, tuple)) or not argv:
+        return None
+    name = os.path.basename(argv[0]) if isinstance(argv[0], str) else ""
+    return name.strip().lower() or None
+
+
+def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, label="",
+               provider_box=None):
+    """Run the title-provider cascade with no shell; all failures degrade to ``''``.
+
+    When `provider_box` (a dict) is given, the answering provider name is
+    recorded under `"provider"` (None when none answered) so the caller can
+    attribute the sidecar source without recomputing the cascade order.
+    """
     if refresh_disabled():
         return ""
     commands = _resolve_commands(prompt, model=model)
@@ -1349,7 +1378,9 @@ def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, 
         governor_module = importlib.util.module_from_spec(spec); spec.loader.exec_module(governor_module)
         governor_root = governor_module.default_root()
         governor_token = governor_module.acquire(governor_root, "title", label=label)
-        text, _index = run_provider_cascade(commands, timeout=timeout, env=env)
+        text, index = run_provider_cascade(commands, timeout=timeout, env=env)
+        if provider_box is not None:
+            provider_box["provider"] = _answering_provider(commands, index)
         return text
     except Exception:
         return ""
@@ -1374,11 +1405,11 @@ def active_provider():
 
 
 def _provider_source():
-    """Name the provider that actually answered, not the one that used to be assumed.
+    """Fallback source label: the provider the cascade would pick right now.
 
-    The sidecar's `source` is evidence — it is how a later reader tells which runtime
-    wrote a title. While this module only ever called claude, the constant was honest;
-    with a cascade it would be a lie whenever the first provider is not claude.
+    This is the current selection candidate, not evidence of who answered —
+    the actual responder is recorded by `run_worker` (provider_box) at the
+    write site. Direct users get the candidate, never proof.
     """
     return "refresher:" + (active_provider() or "none")
 
@@ -1682,9 +1713,10 @@ def main(argv=None):
             titles.sweep()
             return 0
 
+        provider_box = {}
         output = run_worker(
             _prompt(delta, prior_title=previous_title, anchor=anchor),
-            capacity_held=True, label=args.sid,
+            capacity_held=True, label=args.sid, provider_box=provider_box,
         )
         title = validate_title(output)
         if title and title.lower() == "untitled":
@@ -1692,10 +1724,15 @@ def main(argv=None):
         summary = validate_summary(_labeled_line(output, _NOW_LINE_RE))
         summary_failures = (0 if summary else
                             min(len(SUMMARY_RETRY_DELAYS), previous_failures + 1))
+        # The answering provider recorded above is the source evidence; any
+        # other case (no answer, or a caller that bypassed run_worker) keeps
+        # the previous behavior: current candidate on title, previous on none.
+        answered = provider_box.get("provider")
         titles.write(
             args.sid,
             title if title else previous_title,
-            source=_provider_source() if title else source,
+            source=("refresher:" + answered) if (title and answered)
+            else (_provider_source() if title else source),
             offset=new_offset if summary else offset,
             harness=args.harness,
             summary=summary or previous_summary,
