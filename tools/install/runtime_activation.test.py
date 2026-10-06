@@ -962,5 +962,112 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertTrue(conflicts)
 
 
+class OpencodeTuiSeedTest(unittest.TestCase):
+    """The TUI identity entry registers through an absent-only tui.json seed."""
+
+    def _release(self, root: Path) -> Path:
+        release = root / "release"
+        template_dir = release / "adapters" / "opencode" / "tui"
+        template_dir.mkdir(parents=True)
+        (template_dir / "tui.json").write_bytes(
+            (REPO_ROOT / "adapters/opencode/tui/tui.json").read_bytes())
+        return release
+
+    def _seed(self, home, release, previous=None):
+        original = activation.paths.runtime_home
+        activation.paths.runtime_home = lambda runtime, scope="global": home
+        try:
+            return activation._seed_opencode_tui_entry(release, previous, "global")
+        finally:
+            activation.paths.runtime_home = original
+
+    def _unseed(self, home, state, dry_run=False):
+        original = activation.paths.runtime_home
+        activation.paths.runtime_home = lambda runtime, scope="global": home
+        try:
+            return activation._unseed_opencode_tui_entry(state, "global", dry_run=dry_run)
+        finally:
+            activation.paths.runtime_home = original
+
+    def test_absent_config_gets_the_seed_and_a_second_seed_is_present(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            release = self._release(root)
+            first = self._seed(home, release)
+            self.assertEqual(first["status"], "seeded")
+            target = home / "tui.json"
+            self.assertEqual(target.read_bytes(),
+                             (REPO_ROOT / "adapters/opencode/tui/tui.json").read_bytes())
+            second = self._seed(home, release, {"managed_config": {"opencode_tui": first["managed_config"]}})
+            self.assertEqual(second["status"], "present")
+            self.assertEqual(target.read_bytes(),
+                             (REPO_ROOT / "adapters/opencode/tui/tui.json").read_bytes())
+
+    def test_an_existing_user_file_stays_byte_identical_and_unowned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir(parents=True)
+            target = home / "tui.json"
+            body = '{"plugin": ["user-entry.ts"], "theme": "user-theme"}\n'
+            target.write_text(body, encoding="utf-8")
+            release = self._release(root)
+            result = self._seed(home, release)
+            self.assertEqual(result["status"], "user-managed")
+            self.assertIsNone(result["managed_config"])
+            self.assertEqual(target.read_text(encoding="utf-8"), body)
+
+    def test_same_bytes_without_a_prior_record_are_still_unowned(self):
+        # F3: byte equality alone never creates ownership, so uninstall
+        # must not select the file.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir(parents=True)
+            target = home / "tui.json"
+            target.write_bytes((REPO_ROOT / "adapters/opencode/tui/tui.json").read_bytes())
+            release = self._release(root)
+            result = self._seed(home, release)
+            self.assertEqual(result["status"], "user-managed")
+            self.assertIsNone(result["managed_config"])
+            self.assertEqual(self._unseed(home, {"managed_config": {}}, dry_run=True), [])
+            self.assertTrue(target.is_file())
+
+    def test_a_symlink_is_never_claimed_or_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir(parents=True)
+            real = root / "real-tui.json"
+            real.write_text('{"plugin": []}\n', encoding="utf-8")
+            (home / "tui.json").symlink_to(real)
+            release = self._release(root)
+            result = self._seed(home, release)
+            self.assertEqual(result["status"], "user-managed")
+            self.assertIsNone(result["managed_config"])
+            state = {"managed_config": {"opencode_tui": {"seeded": real.read_text(encoding="utf-8")}}}
+            self.assertEqual(self._unseed(home, state), [])
+            self.assertTrue((home / "tui.json").is_symlink())
+
+    def test_unseed_removes_only_the_exact_bytes_it_wrote(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            release = self._release(root)
+            first = self._seed(home, release)
+            state = {"managed_config": {"opencode_tui": first["managed_config"]}}
+            self.assertEqual(self._unseed(home, state, dry_run=True), [str(home / "tui.json")])
+            self.assertTrue((home / "tui.json").is_file())
+            self.assertEqual(self._unseed(home, state), [str(home / "tui.json")])
+            self.assertFalse((home / "tui.json").exists())
+            again = self._seed(home, release)
+            edited = (home / "tui.json").read_text(encoding="utf-8") + "\n"
+            (home / "tui.json").write_text(edited, encoding="utf-8")
+            kept = {"managed_config": {"opencode_tui": again["managed_config"]}}
+            self.assertEqual(self._unseed(home, kept), [])
+            self.assertEqual((home / "tui.json").read_text(encoding="utf-8"), edited)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
