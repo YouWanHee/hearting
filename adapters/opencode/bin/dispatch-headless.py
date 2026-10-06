@@ -87,6 +87,7 @@ import dispatch_wrapper_common as WRAPPER_COMMON  # noqa: E402
 _is_report_bundle_publish_stage = WRAPPER_COMMON.is_report_bundle_publish_stage
 _route_node_leg_fields = WRAPPER_COMMON.route_node_leg_fields
 _supervisor_route = WRAPPER_COMMON.supervisor_route
+watch_early_death = WRAPPER_COMMON.watch_early_death
 fail = WRAPPER_COMMON.fail
 jobs_lock = WRAPPER_COMMON.jobs_lock
 prepare_review_output_request = WRAPPER_COMMON.prepare_review_output_request
@@ -362,15 +363,7 @@ def _require_headless_model(model: str, source: str) -> None:
 
 
 def _model_config_state() -> tuple[str, str]:
-    """Which models.conf this launch resolved (`user` or `shipped`) and why --
-    on the receipt so a user copy silently replaced by the shipped file is
-    visible (top review B2)."""
-
-    try:
-        _values, receipt = resolve_config("opencode", source_root=ROOT)
-    except ModelConfigError as exc:
-        return "unavailable", str(exc)[:80]
-    return receipt.source, receipt.reason
+    return WRAPPER_COMMON.model_config_state("opencode")
 
 
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
@@ -994,14 +987,8 @@ def _supervised_owner(args: argparse.Namespace) -> bool:
 
 
 def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> None:
-    """Open correction admission at registration; without it `correct` stays unsupported."""
-    if not _supervised_owner(args):
-        return
-    try:
-        from dispatch_owner_input import initialize_owner_input
-        initialize_owner_input(jobs, args.attempt_id, "opencode-next-turn")
-    except Exception as exc:
-        sys.stderr.write(f"owner-input-init-skipped attempt_id={args.attempt_id} reason={type(exc).__name__}\n")
+    WRAPPER_COMMON.initialize_owner_input_when(
+        args, jobs, supervised=_supervised_owner(args), input_kind="opencode-next-turn")
 
 
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
@@ -1389,50 +1376,6 @@ def write_reset_cache(agent_home: Path, harness: str, reason: str, reset: str, j
         pass
 
 
-def watch_early_death(
-    proc: subprocess.Popen, log_path: Path, watch_secs: float
-) -> tuple[str, str] | None:
-    """SD-15: poll a just-launched child for a limit/auth early death.
-
-    Returns (reason, reset) if the child exits within watch_secs AND its log tail matches
-    a DEATH_PATTERN; otherwise None. ADAPTATION note: `opencode run` may hang on API
-    errors (#8203) instead of exiting. An anchored capacity line is the SD-59
-    exception: it is interrupted and closed immediately so the orchestrator can
-    use its one checked alternative. Other hung limit classes remain liveness-owned.
-    """
-    if watch_secs <= 0:
-        return None
-    deadline = time.monotonic() + watch_secs
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            break
-        try:
-            live_tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
-        except OSError:
-            live_tail = ""
-        live_death = scan_anchored_death(live_tail)
-        if live_death and live_death[0] == "capacity":
-            try:
-                os.killpg(proc.pid, signal.SIGINT)
-                proc.wait(timeout=2)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
-            return live_death
-        time.sleep(0.5)
-    if proc.poll() is None:
-        return None  # still alive/hanging past the watch window — not a clean early death
-    try:
-        tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
-    except OSError:
-        tail = ""
-    death = scan_anchored_death(tail)
-    if death:
-        return death
-    if proc.returncode:
-        return f"launch-exit-{proc.returncode}", ""
-    return None
-
-
 def resolve_agent_home() -> Path:
     # Delegates to the one canonical resolver, passing this runtime's bundle
     # pointer (~/.config/opencode/hearting) so opencode's deliberate
@@ -1523,67 +1466,7 @@ def validate_dispatch_metadata(args: argparse.Namespace) -> int:
 
 
 def bind_internal_eligibility_probe(args: argparse.Namespace) -> None:
-    """SD-66 fix-forward: run the nested-eligibility probe in-wrapper when a
-    dispatch-depth-2 ``--start`` carries no explicit evidence, instead of failing
-    closed on missing flags a caller never had reason to supply by hand.
-
-    Triggers only when both evidence options are still at their parser
-    default (``unknown``/empty) and the parent identity needed to run the
-    probe is fully known. Explicit supported/unsupported/unknown/partial
-    evidence, dispatch-depth-1, and dry-run/register never reach this function's
-    trigger path (callers gate on depth/action before calling it). The probe's
-    own JSON status is trusted only when every identity field it echoes back
-    matches the request; a malformed/mismatched/erroring probe leaves
-    ``nested_eligibility`` at its unknown default so `validate_nested_eligibility`
-    still fails closed. OpenCode config/runtime and hang-on-limit behavior stay
-    inside the probe itself, not here.
-    """
-    if args.dispatch_depth < 2 or args.action != "start":
-        return
-    if getattr(args, "nested_eligibility_explicit", False):
-        return
-    if args.nested_eligibility != "unknown" or args.eligibility_source:
-        return
-    if not all((args.parent_harness, args.parent_transport, args.parent_sandbox, args.launch_authority)):
-        return
-    if "unknown" in (args.parent_harness, args.parent_transport, args.parent_sandbox):
-        return
-    args.eligibility_probe = "internal"
-    probe = ROOT / "utilities" / "nested-dispatch-eligibility.py"
-    result = subprocess.run(
-        [
-            sys.executable, str(probe),
-            "--parent-harness", args.parent_harness,
-            "--parent-transport", args.parent_transport,
-            "--parent-sandbox", args.parent_sandbox,
-            "--child-harness", "opencode",
-            "--launch-authority", args.launch_authority,
-            "--worktree", args.worktree,
-            "--json",
-        ],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
-    )
-    try:
-        row = json.loads(result.stdout)
-    except (ValueError, TypeError):
-        return
-    if (
-        row.get("parent_harness") != args.parent_harness
-        or row.get("parent_transport") != args.parent_transport
-        or row.get("parent_sandbox") != args.parent_sandbox
-        or row.get("child_harness") != "opencode"
-        or row.get("launch_authority") != args.launch_authority
-        or row.get("status") not in ("supported", "unsupported", "unknown")
-    ):
-        return
-    if row["status"] == "supported" and result.returncode != 0:
-        # A failed probe process cannot mint launch-eligible evidence, even if
-        # its stdout says supported; checked unsupported/unknown results keep
-        # their nonzero-rc path and still fail closed downstream.
-        return
-    args.nested_eligibility = row["status"]
-    args.eligibility_source = row.get("probe_source") or ""
-    args.eligibility_failure_class = row.get("failure_class") or ""
+    WRAPPER_COMMON.bind_internal_eligibility_probe(args, "opencode")
 
 
 def validate_route_record(args: argparse.Namespace) -> int:

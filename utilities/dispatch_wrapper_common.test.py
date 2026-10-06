@@ -23,6 +23,7 @@ ALIASES = {
     "resolve_report_bundle_root": "resolve_report_bundle_root", "seed_launch_heartbeat": "seed_launch_heartbeat",
     "_route_node_leg_fields": "route_node_leg_fields", "_supervisor_route": "supervisor_route",
     "prepare_review_output_request": "prepare_review_output_request",
+    "watch_early_death": "watch_early_death",
 }
 
 
@@ -58,6 +59,28 @@ class WrapperCommonTest(unittest.TestCase):
             with C.jobs_lock(jobs):
                 self.assertTrue(Path(f"{jobs}.lock").exists())
 
+
+    def test_the_harness_name_is_the_only_translation(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(C, "model_config_state", return_value=("s", "r")) as state:
+                    self.assertEqual(wrapper._model_config_state(), ("s", "r"))
+                state.assert_called_once_with(harness)
+                args = argparse.Namespace()
+                with mock.patch.object(C, "bind_internal_eligibility_probe") as probe:
+                    wrapper.bind_internal_eligibility_probe(args)
+                probe.assert_called_once_with(args, harness)
+
+    def test_owner_input_opens_only_for_a_supervised_owner(self):
+        from unittest import mock
+        args = argparse.Namespace(attempt_id="att-1")
+        with mock.patch("dispatch_owner_input.initialize_owner_input") as init:
+            C.initialize_owner_input_when(args, Path("/j"), supervised=False, input_kind="k")
+            init.assert_not_called()
+            C.initialize_owner_input_when(args, Path("/j"), supervised=True, input_kind="k")
+            init.assert_called_once_with(Path("/j"), "att-1", "k")
 
 if __name__ == "__main__":
     unittest.main()
