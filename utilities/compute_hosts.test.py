@@ -1017,6 +1017,318 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertFalse((natural / "stop_reason").exists())
 
 
+class LauncherProvenanceTest(unittest.TestCase):
+    """The launcher forwards runtime-known provenance into detached payloads.
+
+    Regression cover for the 2026-10-06 BC_ResNet eval loss
+    (`moving4-20261006-102542`): the payload's guard read exactly
+    `AGENT_HOME` and `AGENT_DISPATCH_ATTEMPT_ID` with strict lookups and died
+    with `KeyError` before the first inference, while the launch receipt
+    (`env=null`, no `AGENT_*`) shows the launcher forwarded neither. The
+    launcher must now inject what it actually knows across the
+    local/SSH/tmux/setsid boundary, omit what it cannot validate, and never
+    forward credentials, registry paths, or arbitrary env.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.root = Path(self.tmp.name)
+        self.run_root = self.root / "runs"
+        self.config = self.root / "compute-hosts.yaml"
+        self.config.write_text(
+            "schema_version: 1\n"
+            f"run_root: {self.run_root}\n"
+            "hosts:\n"
+            "  here:\n"
+            "    ssh_host: local\n"
+            "    note: local fixture\n",
+            encoding="utf-8")
+        environ = mock.patch.dict(os.environ, {"TMPDIR": str(self.root)})
+        environ.start()
+        self.addCleanup(environ.stop)
+        self.env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.config)}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def make_home(self, name="fake-home"):
+        home = self.root / name
+        (home / "core").mkdir(parents=True)
+        (home / "core" / "CORE.md").write_text("# fixture root\n", encoding="utf-8")
+        return home
+
+    def scrubbed_env(self, **overrides):
+        module = load_module()
+        session_keys = {key for key, _harness in module.SESSION_ENV_KEYS}
+        env = {key: value for key, value in self.env.items()
+               if key not in session_keys
+               and key not in ("AGENT_HOME", "CLAUDE_HOME",
+                               "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_JOBS")}
+        empty = self.root / "empty-home"
+        empty.mkdir(exist_ok=True)
+        env["HOME"] = str(empty)
+        env["XDG_DATA_HOME"] = str(empty / ".local" / "share")
+        env.update(overrides)
+        return env
+
+    def run_tool(self, *args, env=None):
+        return subprocess.run([sys.executable, str(TOOL), *args],
+                              text=True, capture_output=True,
+                              env=self.env if env is None else env)
+
+    def wait_exit(self, run_id, tries=50):
+        exit_path = self.run_root / run_id / "exit_code"
+        for _ in range(tries):
+            if exit_path.is_file():
+                return exit_path
+            time.sleep(0.1)
+        self.fail(f"no exit code for {run_id}")
+
+    def test_provenance_selection_is_allowlisted_and_validated(self):
+        module = load_module()
+        home = self.make_home()
+        self.assertEqual(
+            module._launcher_provenance({
+                "AGENT_HOME": str(home),
+                "AGENT_DISPATCH_ATTEMPT_ID": "att-9f2c4b1ad34e",
+            }),
+            {"AGENT_HOME": str(home.resolve()),
+             "AGENT_DISPATCH_ATTEMPT_ID": "att-9f2c4b1ad34e"})
+        # An unknown attempt shape is omitted, never forwarded or executed.
+        self.assertEqual(
+            module._launcher_provenance({
+                "AGENT_HOME": str(home),
+                "AGENT_DISPATCH_ATTEMPT_ID": "bogus; touch /tmp/pwned",
+            }),
+            {"AGENT_HOME": str(home.resolve())})
+        for bad in ("", "att-", "ATT-9f2c", "att-with space",
+                    "att-" + "x" * 241, None, 7, ["att-9f2c"]):
+            with self.subTest(bad=bad):
+                self.assertFalse(module._valid_attempt_id(bad))
+        for good in ("att-9f2c4b1ad34e", "att-retry-abc123", "att-x",
+                     "att-a.B_c-d"):
+            with self.subTest(good=good):
+                self.assertTrue(module._valid_attempt_id(good))
+
+    def test_agent_home_prefers_env_then_resolver_then_nothing(self):
+        module = load_module()
+        home = self.make_home()
+        other = self.make_home("other-home")
+
+        def fail():
+            raise AssertionError("resolver must not run when env is valid")
+
+        self.assertEqual(
+            module._resolve_launcher_agent_home({"AGENT_HOME": str(home)},
+                                                _resolver=fail),
+            str(home.resolve()))
+        # A dangling env root falls through to the resolver, not to fabrication.
+        self.assertEqual(
+            module._resolve_launcher_agent_home(
+                {"AGENT_HOME": str(self.root / "absent")},
+                _resolver=lambda: str(other)),
+            str(other.resolve()))
+        self.assertEqual(
+            module._resolve_launcher_agent_home(
+                {}, _resolver=lambda: str(other)),
+            str(other.resolve()))
+        self.assertEqual(
+            module._resolve_launcher_agent_home(
+                {"CLAUDE_HOME": str(other)}, _resolver=fail),
+            str(other.resolve()))
+        for resolver in (lambda: str(self.root / "absent"),
+                         lambda: "relative/path",
+                         lambda: "",
+                         lambda: (_ for _ in ()).throw(OSError("denied"))):
+            with self.subTest(resolver=resolver):
+                self.assertEqual(
+                    module._resolve_launcher_agent_home({}, _resolver=resolver),
+                    "")
+
+    def test_agent_home_pins_a_pointer_release(self):
+        module = load_module()
+        real = self.make_home("release-1.2.3")
+        link = self.root / "current"
+        link.symlink_to(real)
+
+        def fail():
+            raise AssertionError("resolver must not run when env is valid")
+
+        self.assertEqual(
+            module._resolve_launcher_agent_home({"AGENT_HOME": str(link)},
+                                                _resolver=fail),
+            str(real.resolve()))
+
+    def test_dry_run_shows_provenance_without_credentials_or_registry_paths(self):
+        home = self.make_home()
+        env = self.scrubbed_env(
+            AGENT_HOME=str(home),
+            AGENT_DISPATCH_ATTEMPT_ID="att-9f2c4b1ad34e",
+            AWS_SECRET_ACCESS_KEY="canary-secret",
+            SSH_AUTH_SOCK="/tmp/canary-agent.sock",
+            AGENT_DISPATCH_JOBS="/tmp/canary-jobs.log",
+            MY_ARBITRARY="canary-arbitrary",
+            CODEX_THREAD_ID="launch-thread")
+        result = self.run_tool("run", "here", "--name", "prov", "--dry-run",
+                               "--", "bash", "-c", "echo hi", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("export AGENT_HOME=", result.stdout)
+        self.assertIn(str(home.resolve()), result.stdout)
+        self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=att-9f2c4b1ad34e",
+                      result.stdout)
+        # Session identity keeps its existing independent path.
+        self.assertIn("export CODEX_THREAD_ID=launch-thread", result.stdout)
+        for canary in ("canary-secret", "canary-agent.sock", "canary-jobs.log",
+                       "canary-arbitrary", "AWS_SECRET_ACCESS_KEY",
+                       "SSH_AUTH_SOCK", "AGENT_DISPATCH_JOBS", "MY_ARBITRARY"):
+            self.assertNotIn(canary, result.stdout)
+
+    def test_unknown_provenance_is_omitted_and_launch_stays_whole(self):
+        env = self.scrubbed_env()
+        dry = self.run_tool("run", "here", "--name", "bare", "--dry-run",
+                            "--", "bash", "-c", "echo hi", env=env)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertNotIn("export AGENT_HOME", dry.stdout)
+        self.assertNotIn("export AGENT_DISPATCH_ATTEMPT_ID", dry.stdout)
+        self.assertIn("export HEARTING_COMPUTE_RUN_ID=", dry.stdout)
+        result = self.run_tool("run", "here", "--name", "bare", "--",
+                               "bash", "-c", "echo survived", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        self.wait_exit(run_id)
+        self.assertEqual(
+            (self.run_root / run_id / "log").read_text(encoding="utf-8").strip(),
+            "survived")
+        meta = json.loads(
+            (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["provenance"],
+                         {"agent_home": None, "attempt_id": None})
+        # The conda-selection field keeps its own meaning beside provenance.
+        self.assertIsNone(meta["env"])
+
+    def test_forwarded_provenance_crosses_a_scrubbed_tmux_boundary(self):
+        home = self.make_home()
+        attempt = "att-9f2c4b1ad34e"
+        fakebin = self.root / "tmux-bin"
+        fakebin.mkdir()
+        tmux = fakebin / "tmux"
+        tmux.write_text(
+            "#!/bin/sh\n"
+            "while [ \"$#\" -gt 1 ]; do shift; done\n"
+            "env -u AGENT_HOME -u AGENT_DISPATCH_ATTEMPT_ID "
+            "/bin/bash -lc \"$1\"\n",
+            encoding="utf-8",
+        )
+        tmux.chmod(0o755)
+        env = self.scrubbed_env(
+            AGENT_HOME=str(home), AGENT_DISPATCH_ATTEMPT_ID=attempt,
+            PATH=str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
+        result = self.run_tool(
+            "run", "here", "--name", "prov-cross", "--", "bash", "-c",
+            "printf '%s|%s' \"$AGENT_HOME\" \"${AGENT_DISPATCH_ATTEMPT_ID-}\"",
+            env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        self.wait_exit(run_id)
+        # Only the preamble exports could have supplied these: the transport
+        # itself started scrubbed.
+        self.assertEqual(
+            (self.run_root / run_id / "log").read_text(encoding="utf-8"),
+            f"{home.resolve()}|{attempt}")
+        meta = json.loads(
+            (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["provenance"],
+                         {"agent_home": str(home.resolve()),
+                          "attempt_id": attempt})
+
+    def test_invalid_attempt_never_reaches_the_payload(self):
+        home = self.make_home()
+        env = self.scrubbed_env(
+            AGENT_HOME=str(home),
+            AGENT_DISPATCH_ATTEMPT_ID="bogus; touch /tmp/prov-pwned")
+        dry = self.run_tool("run", "here", "--name", "prov-bad", "--dry-run",
+                            "--", "bash", "-c", "echo hi", env=env)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("export AGENT_HOME=", dry.stdout)
+        self.assertNotIn("export AGENT_DISPATCH_ATTEMPT_ID", dry.stdout)
+        self.assertNotIn("prov-pwned", dry.stdout)
+
+    def test_provenance_unset_precedes_validated_exports(self):
+        home = self.make_home()
+        env = self.scrubbed_env(
+            AGENT_HOME=str(home),
+            AGENT_DISPATCH_ATTEMPT_ID="att-9f2c4b1ad34e")
+        dry = self.run_tool("run", "here", "--name", "prov-order",
+                            "--dry-run", "--", "bash", "-c", "echo hi", env=env)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        setup = dry.stdout.split("setup: ", 1)[1]
+        unset_at = setup.index("unset AGENT_HOME AGENT_DISPATCH_ATTEMPT_ID")
+        self.assertLess(unset_at, setup.index("export AGENT_HOME="))
+        self.assertLess(
+            unset_at, setup.index("export AGENT_DISPATCH_ATTEMPT_ID="))
+
+    def run_with_foreign_transport(self, name, env):
+        """Launch through a tmux server that retains unrelated old values.
+
+        A long-lived tmux server keeps the environment of whichever client
+        created it; the fixture pins exactly that: foreign provenance the
+        launcher never issued.
+        """
+        fakebin = self.root / name
+        fakebin.mkdir()
+        tmux = fakebin / "tmux"
+        tmux.write_text(
+            "#!/bin/sh\n"
+            "while [ \"$#\" -gt 1 ]; do shift; done\n"
+            "AGENT_HOME=/foreign/stale-home "
+            "AGENT_DISPATCH_ATTEMPT_ID=att-unrelated-old-owner "
+            "/bin/bash -lc \"$1\"\n",
+            encoding="utf-8",
+        )
+        tmux.chmod(0o755)
+        env = {**env, "PATH": str(fakebin) + os.pathsep
+               + os.environ.get("PATH", "")}
+        result = self.run_tool(
+            "run", "here", "--name", name, "--", "bash", "-c",
+            "printf '%s|%s' \"$AGENT_HOME\" \"${AGENT_DISPATCH_ATTEMPT_ID-}\"",
+            env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        self.wait_exit(run_id)
+        return run_id
+
+    def test_unknown_provenance_clears_foreign_values(self):
+        run_id = self.run_with_foreign_transport(
+            "prov-foreign-unknown", self.scrubbed_env())
+        self.assertEqual(
+            (self.run_root / run_id / "log").read_text(encoding="utf-8"), "|")
+        meta = json.loads(
+            (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["provenance"],
+                         {"agent_home": None, "attempt_id": None})
+
+    def test_invalid_attempt_clears_foreign_attempt_only(self):
+        home = self.make_home()
+        run_id = self.run_with_foreign_transport(
+            "prov-foreign-invalid",
+            self.scrubbed_env(AGENT_HOME=str(home),
+                              AGENT_DISPATCH_ATTEMPT_ID="bogus-value"))
+        self.assertEqual(
+            (self.run_root / run_id / "log").read_text(encoding="utf-8"),
+            f"{home.resolve()}|")
+
+    def test_known_provenance_overrides_foreign_values(self):
+        home = self.make_home()
+        attempt = "att-9f2c4b1ad34e"
+        run_id = self.run_with_foreign_transport(
+            "prov-foreign-known",
+            self.scrubbed_env(AGENT_HOME=str(home),
+                              AGENT_DISPATCH_ATTEMPT_ID=attempt))
+        self.assertEqual(
+            (self.run_root / run_id / "log").read_text(encoding="utf-8"),
+            f"{home.resolve()}|{attempt}")
+
+
 def probe_namespace():
     """The probe script's helper functions, without running its collection body."""
     source = load_module().PROBE_SCRIPT.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
@@ -1101,8 +1413,24 @@ class ProbeProgressTest(unittest.TestCase):
         pread.assert_called_once()
         self.assertEqual(progress["line"], raw[:200])
         self.assertEqual(progress["summary"],
-                         "training-updates · baseline · successful 17808")
+                         "training-updates · baseline · attempt 17808 · successful 17808")
         self.assertNotIn("epoch", progress)
+
+    def test_json_progress_keeps_attempt_and_successful_as_separate_units(self):
+        summarize = self.ns["progress_json_summary"]
+        self.assertEqual(summarize(b'{"attempt":9}'), "attempt 9")
+        self.assertEqual(summarize(b'{"successful":8}'), "successful 8")
+        self.assertEqual(
+            summarize(b'{"phase":"training-updates","arm":"baseline",'
+                      b'"attempt":17808,"successful":17808}'),
+            "training-updates · baseline · attempt 17808 · successful 17808")
+        self.assertEqual(
+            summarize(b'{"attempt":100,"successful":95}'),
+            "attempt 100 · successful 95")
+        for raw in (b'{"attempt":true}', b'{"attempt":-1}', b'{"attempt":1.5}',
+                    b'{"attempt":"3"}', b'{"attempt":1000000000000}'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(summarize(raw))
 
     def test_json_progress_unknown_and_partial_records_keep_raw_fallback(self):
         for raw in (b'{"phase":"train","step":', b'{"step":true}',
