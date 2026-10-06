@@ -19,6 +19,7 @@ tokens_input is a cumulative cost-side aggregate, NOT the current context size.
 """
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -162,6 +163,102 @@ def _process_started_ms(sess):
     return int((boot + ticks / clock_ticks) * 1000)
 
 
+SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]{1,252}$")
+TUI_SELECTION_SCHEMA = "hearting-tui-selection-v1"
+TUI_SELECTION_MAX_BYTES = 1024
+# Words that make an `opencode` command line something other than an interactive pane.
+_NON_PANE_COMMANDS = frozenset(("run", "serve", "attach", "web", "auth", "agent", "models", "stats",
+                                "export", "import", "session", "upgrade", "uninstall", "mcp", "acp",
+                                "debug", "completion"))
+
+
+def _proc_start_ticks(pid):
+    try:
+        with open("/proc/%d/stat" % int(pid), encoding="ascii", errors="replace") as handle:
+            stat = handle.read()
+        fields = stat[stat.rindex(") ") + 2:].split()
+        return fields[19] if fields[19].isdigit() else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as handle:
+            raw = handle.read(32769)
+    except (OSError, ValueError):
+        return None
+    if len(raw) > 32768:
+        return None
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _argv_session(argv):
+    """The `--session`/`-s` id an `opencode` pane was started on, or None."""
+    if not argv or os.path.basename(argv[0]) != "opencode":
+        return None
+    found = None
+    for index, arg in enumerate(argv[1:], 1):
+        if arg in _NON_PANE_COMMANDS:
+            return None
+        key, equal, value = arg.partition("=")
+        if key not in ("--session", "-s"):
+            continue
+        if not equal:
+            value = argv[index + 1] if index + 1 < len(argv) else ""
+        if found is not None or not SESSION_ID_RE.match(value or ""):
+            return None
+        found = value
+    return found
+
+
+def _tui_selection(pid, start, environ=None):
+    """The session the pane's own TUI says it shows (PR190 record), or None.
+
+    The TUI writes `<state>/hearting/tui-identity/<pid>-<start>.json` for its own
+    process and removes it on the home screen, so a record naming this exact pid
+    and start time is the current selection."""
+    env = os.environ if environ is None else environ
+    home = env.get("HOME") or ""
+    base = env.get("XDG_STATE_HOME") or (os.path.join(home, ".local", "state") if home else "")
+    if not base or not start:
+        return None
+    path = os.path.join(base, "hearting", "tui-identity", "%d-%s.json" % (int(pid), start))
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(TUI_SELECTION_MAX_BYTES + 1)
+        row = json.loads(raw.decode("utf-8")) if len(raw) <= TUI_SELECTION_MAX_BYTES else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if (not isinstance(row, dict) or row.get("schema") != TUI_SELECTION_SCHEMA
+            or row.get("pid") != int(pid) or str(row.get("start")) != str(start)
+            or not SESSION_ID_RE.match(str(row.get("sessionID") or ""))):
+        return None
+    return row["sessionID"]
+
+
+def session_of_process(pid, environ=None):
+    """`(session_id, source)` an OpenCode process proves about itself, or `(None, "")`.
+
+    Its TUI's own selection record first (it follows `/new` and session switches),
+    then the `--session` it was started with. Never the database's newest session,
+    which is a guess shared by every pane in the directory."""
+    start = _proc_start_ticks(pid)
+    if start is None:
+        return None, ""
+    selected = _tui_selection(pid, start, environ)
+    if selected:
+        return selected, "opencode-tui-selection"
+    started_on = _argv_session(_cmdline(pid))
+    if started_on and _proc_start_ticks(pid) == start:
+        return started_on, "opencode-argv"
+    return None, ""
+
+
+def session_id_of_process(pid, environ=None):
+    return session_of_process(pid, environ)[0]
+
+
 def prepare_tick(sessions):
     """`{pid: next same-directory opencode start (ms) | None}` for this tick.
 
@@ -185,8 +282,9 @@ def prepare_tick(sessions):
 
 
 def _keeper_key(sess):
-    """Sort key for one member of a shared session id: window-bound rows created
-    the session (exact ownership), then earliest process start (the creator
+    """Sort key for one member of a shared session id: a row its own process proved
+    (TUI selection or `--session`) first, then window-bound rows that created the
+    session (exact ownership), then earliest process start (the creator
     started before any attacher or helper), then lowest pid. Missing evidence
     sorts last — never used as a fact."""
     kind = getattr(sess, "_opencode_bind_kind", None)
@@ -199,7 +297,7 @@ def _keeper_key(sess):
     except (TypeError, ValueError):
         pid = None
     return (
-        0 if kind == "window" else 1,
+        {"process": 0, "window": 1}.get(kind, 2),
         started if started is not None and started >= 0 else float("inf"),
         pid if pid is not None else float("inf"),
     )
@@ -396,7 +494,12 @@ def enrich(sess, tick=None):
         cur = con.cursor()
         start_ms = _process_started_ms(sess)
         row, sess._opencode_bind_kind = None, None
-        if start_ms is not None:
+        proven = session_id_of_process(sess.pid) if getattr(sess, "pid", None) else None
+        if proven:
+            row = cur.execute("SELECT %s FROM session WHERE id=? LIMIT 1" % _COLS, (proven,)).fetchone()
+            if row:
+                sess._opencode_bind_kind = "process"
+        if row is None and start_ms is not None:
             row = _query_window(cur, sess.cwd, start_ms, (tick or {}).get(sess.pid))
             if row:
                 sess._opencode_bind_kind = "window"
