@@ -167,6 +167,7 @@ utility-deferred	frame_interview.py
 utility-deferred	harness-capacity.py
 utility-deferred	harness_capabilities.py
 utility-deferred	harness_capabilities.test.py
+utility-deferred	harness_state_roots.py
 utility-deferred	human_gate_receipt.py
 utility-deferred	inline_finish.py
 utility-deferred	launch-fence.py
