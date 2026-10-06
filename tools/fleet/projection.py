@@ -1189,6 +1189,48 @@ def _owner_route_binding(entity):
     return values, None
 
 
+def _adopt_exact_owner_job_binding(entity, jobs):
+    """Consume one exact registered owner's validated binding for a node-less owner row.
+
+    A node-less owner Session carries only the generic route tuple (the
+    wrapper exports file/id but no node), so the owner-binding path above
+    cannot serve it and the generic stage branch below would fail its absent
+    node as `route-record-mismatch` even though the exact registered owner
+    row for the same attempt holds a complete validated binding. Reuse the
+    collector's exact association (same attempt id + exact runtime session
+    id, same harness): adopt that one job's binding so the row flows through
+    the same verified owner path below — no node is invented, no registry row
+    is rewritten, and no cwd/title/time inference is used. Zero exact
+    candidates keep the existing fall-through; multiple stay a conflict.
+    """
+    if (_field(entity, "worker_type") != "owner"
+            or _field(entity, "route_node") not in (None, "")
+            or not _field(entity, "attempt_id")
+            or not _field(entity, "session_id")):
+        return None, None
+    entity_harness = _field(entity, "harness")
+    candidates = []
+    for job in jobs or ():
+        if job is entity:
+            continue
+        if _field(job, "attempt_id") != _field(entity, "attempt_id"):
+            continue
+        if _field(job, "_runtime_session_id") != _field(entity, "session_id"):
+            continue
+        job_harness = _field(job, "harness")
+        if entity_harness and job_harness and job_harness != entity_harness:
+            continue
+        candidates.append(job)
+    if len(candidates) > 1:
+        return None, MULTIPLE_OWNER_ROUTES
+    if not candidates:
+        return None, None
+    binding, error = _owner_route_binding(candidates[0])
+    if error or not binding:
+        return None, None
+    return binding, None
+
+
 def _owner_children(entity, jobs):
     """Return only children named by the stable owner-link contracts."""
     sid = _field(entity, "session_id")
@@ -1239,6 +1281,13 @@ def resolve_work_projection(entity, jobs=(), route_records=None, node_evidence=N
             attempt_id=_field(entity, "attempt_id"), node_state="unknown",
             ambiguity=owner_binding_error,
         )
+    if owner_binding is None:
+        owner_binding, owner_binding_error = _adopt_exact_owner_job_binding(entity, jobs)
+        if owner_binding_error:
+            return WorkProjection(
+                source="none", attempt_id=_field(entity, "attempt_id"),
+                node_state="unknown", ambiguity=owner_binding_error,
+            )
     advance_binding, advance_status = _owner_route_advance_binding(entity, owner_binding)
     if advance_status == "multiple":
         return WorkProjection(
@@ -1590,16 +1639,42 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
 attach_work_projections = attach_projections
 
 
+def _verified_route_summary_item(item):
+    """Whether a summary row carries a verified backing rather than an empty row."""
+    return bool(item["nodes"]) or item["progress"] is not None or (
+        not item["ambiguity"] and bool(item["route_hash"]))
+
+
+def _select_route_summary_item(items):
+    """Prefer a verified backing within one route; never let an empty first row hide it.
+
+    First-seen route order is preserved by the caller. Genuinely conflicting
+    exact bindings/hashes stay a conflict instead of silently losing to order.
+    """
+    verified = [item for item in items if _verified_route_summary_item(item)]
+    if not verified:
+        return items[0]
+    hashes = {item["route_hash"] for item in verified if item["route_hash"]}
+    if len(hashes) > 1:
+        chosen = dict(verified[0])
+        ambiguity = list(chosen.get("ambiguity") or [])
+        if OWNER_ROUTE_CONFLICT not in ambiguity:
+            ambiguity.append(OWNER_ROUTE_CONFLICT)
+        chosen["ambiguity"] = ambiguity
+        return chosen
+    return verified[0]
+
+
 def route_summary_from_projections(entities):
     """Serialize route backing data already attached to rows; never reopens a route file."""
-    out, seen = [], set()
+    grouped, order = {}, []
     for entity in entities:
         projection = _field(entity, "work_projection")
         if not isinstance(projection, WorkProjection) or not projection.route_id:
             continue
-        if projection.route_id in seen:
-            continue
-        seen.add(projection.route_id)
+        if projection.route_id not in grouped:
+            grouped[projection.route_id] = []
+            order.append(projection.route_id)
         backing = projection._route_view or {}
         record = backing.get("record") or {}
         legacy_view = backing.get("view") or {}
@@ -1632,5 +1707,5 @@ def route_summary_from_projections(entities):
         }
         if legacy_view.get("lineage") is not None:
             item["lineage"] = legacy_view["lineage"]
-        out.append(item)
-    return out
+        grouped[projection.route_id].append(item)
+    return [_select_route_summary_item(grouped[route_id]) for route_id in order]
