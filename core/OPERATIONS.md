@@ -1116,9 +1116,12 @@ starts stay exactly attributable; time-candidate threads stay out of Embedded
 attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
 Same-seat succession uses `peer-steward.py start --beside <predecessor-pane>`
-to open the successor to its right in the same tab without focus. The predecessor
-hands over its card and documents, receives the successor's ACK, leaves its last
-result and becomes idle; the successor then uses `retire <predecessor>` to send
+to open the successor to its right in the same tab without focus. The new pane's
+split-cwd and launcher preparation finish under one fixed
+monotonic deadline before its single start request; caller-provided panes keep
+their existing path, and uncertain readiness leaves the new pane retained.
+The predecessor hands over its card and documents, receives the successor's ACK,
+leaves its last result and becomes idle; the successor then uses `retire <predecessor>` to send
 one normal exit action (Claude `/exit` + Enter; Codex/OpenCode Ctrl+D) and close
 that pane only after its original shell returns. A refused start closes
 its own newly split pane only when the same shell is agent-free and its visible

@@ -3118,6 +3118,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
              mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
              mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None) as ingress, \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
              mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="recorded screen"), \
              mock.patch.object(peer_steward, "_read_screen", return_value=None), \
@@ -3129,9 +3130,104 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                                    "right", "--no-focus", "--cwd", cwd])
         self.assertEqual(calls[1], ["herdr", "agent", "start", "new", "--kind", "claude",
                                    "--pane", "w1:pN", "--", "--model", "opus"])
-        ingress.assert_called_once_with("w1:pN", "claude", cwd)
+        ingress.assert_called_once_with("w1:pN", "claude", None)
         self.assertIn("started=true", printed.call_args[0][0])
         self.assertIn("pane=w1:pN", printed.call_args[0][0])
+
+    def test_beside_waits_for_delayed_split_cwd_before_single_start(self):
+        calls, events = [], []
+        cwd = str(self.tmp_root)
+        clock = {"now": 0.0}
+
+        def run(argv, **kw):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "pane", "split"]:
+                self.assertEqual(argv[-2:], ["--cwd", cwd])
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+            if argv[:3] == ["herdr", "pane", "get"]:
+                return _herdr_json({"result": {"pane": {"agent": None}}})
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                busy = clock["now"] < .2
+                return _herdr_json({"result": {"process_info": {"pane_id": "w1:pN",
+                    "shell_pid": 101, "foreground_process_group_id": 202 if busy else 101,
+                    "foreground_processes": [{"pid": 202 if busy else 101}]}}})
+            if argv[:3] == ["herdr", "pane", "wait-output"]:
+                self.assertGreaterEqual(clock["now"], .2)
+                events.append("ready prompt")
+                return subprocess.CompletedProcess(argv, 0, stdout="prompt", stderr="")
+            if argv[:3] == ["herdr", "agent", "start"]:
+                self.assertGreaterEqual(clock["now"], .2)
+                self.assertIn("snapshot", events)
+                events.append("native start")
+                return _herdr_json({"result": {"agent": {"agent": "claude", "name": "new",
+                    "pane_id": "w1:pN", "agent_session": {"value": "new-native-sid"}}}})
+            raise AssertionError(argv)
+
+        def snapshot(pane, shell):
+            self.assertGreaterEqual(clock["now"], .2)
+            self.assertEqual((pane, shell), ("w1:pN", (101, "700")))
+            events.append("snapshot")
+            return "ready screen"
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+             mock.patch.object(peer_steward, "_proc_cwd", side_effect=lambda pid:
+                               cwd if clock["now"] >= .2 else "/previous"), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch.object(peer_steward.time, "sleep", side_effect=lambda seconds:
+                               clock.update(now=clock["now"] + seconds)), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", side_effect=snapshot), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch.object(peer_steward, "_close_pane") as close, mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["start", "new", "--kind", "claude", "--beside", "w1:pOld",
+                                   "--cwd", cwd, "--permission-mode", "inherit"])
+        self.assertEqual(rc, 0)
+        self.assertIn("started=true", printed.call_args[0][0])
+        self.assertEqual(sum(a[:3] == ["herdr", "agent", "start"] for a in calls), 1)
+        self.assertFalse(any(a[:3] in (["herdr", "pane", "send-text"],
+                                     ["herdr", "pane", "send-keys"]) for a in calls))
+        self.assertEqual(events[-2:], ["snapshot", "native start"])
+        close.assert_not_called()
+
+    def test_beside_readiness_deadline_retains_pane_without_start_or_snapshot(self):
+        clock = {"now": 0.0}
+        calls = []
+        cwd = str(self.tmp_root)
+
+        def run(argv, **kw):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+            if argv[:3] == ["herdr", "pane", "get"]:
+                return _herdr_json({"result": {"pane": {"agent": None}}})
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {"pane_id": "w1:pN",
+                    "shell_pid": 101, "foreground_process_group_id": 101,
+                    "foreground_processes": [{"pid": 101}]}}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_BESIDE_READY_SECONDS", .1), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+             mock.patch.object(peer_steward, "_proc_cwd", return_value="/previous"), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch.object(peer_steward.time, "sleep", side_effect=lambda seconds:
+                               clock.update(now=clock["now"] + seconds)), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress") as ingress, \
+             mock.patch.object(peer_steward, "_start_shell_snapshot") as snapshot, \
+             mock.patch.object(peer_steward, "_close_pane") as close, mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["start", "new", "--kind", "claude", "--beside", "w1:pOld",
+                                   "--cwd", cwd, "--permission-mode", "inherit"])
+        self.assertEqual(rc, 1)
+        self.assertIn("started=false reason=beside-shell-readiness-timeout", printed.call_args[0][0])
+        self.assertIn("pane=w1:pN", printed.call_args[0][0])
+        self.assertIn("pane_cleanup=retained", printed.call_args[0][0])
+        self.assertEqual(clock["now"], .1)
+        self.assertFalse(any(a[:3] == ["herdr", "agent", "start"] for a in calls))
+        ingress.assert_not_called(); snapshot.assert_not_called(); close.assert_not_called()
 
     def test_split_failure_malformed_focused_or_same_pane_never_starts_or_types(self):
         cases = [subprocess.CompletedProcess([], 1, stdout="", stderr="denied"),
@@ -3171,6 +3267,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
              mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
              mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="recorded screen"), \
              mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
              mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
@@ -3206,12 +3303,14 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
     def test_existing_pane_failure_never_cleans_up_and_stderr_is_bounded(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
              mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell") as readiness, \
              mock.patch.object(peer_steward.subprocess, "run", return_value=subprocess.CompletedProcess(
                  [], 1, stdout="", stderr="Error: duplicate name\n")) as run, \
              mock.patch.object(peer_steward, "_failed_start_cleanup") as cleanup, mock.patch("builtins.print") as printed:
             peer_steward.main(["start", "old", "--kind", "claude", "--pane", "w1:pOld"])
             self.assertIn("reason=herdr-stderr-error-duplicate-name", printed.call_args[0][0])
             cleanup.assert_not_called(); self.assertEqual(run.call_count, 1)
+            readiness.assert_not_called()
         code = peer_steward._start_stderr_code("Error: " + "long\tvalue\x00" * 100 + "\n")
         self.assertLessEqual(len(code.encode()), 80)
         self.assertRegex(code, r"^[a-z0-9_-]+$")
@@ -3301,6 +3400,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
              mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
              mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
              mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
              mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
