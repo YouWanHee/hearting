@@ -147,6 +147,7 @@ from model_profile import (  # noqa: E402
 )
 from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt  # noqa: E402
+from foreground_terminal import settle_foreground_exit  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
     JoinContractError,
     close_wrapper_pass,
@@ -3304,58 +3305,18 @@ def main(argv: list[str]) -> int:
             )
             args.worker_exit = outcome.exit_code
             args.worker_failure = outcome.failure
-            terminal = inspect_terminal_attempt(
-                log_path,
-                worktree=args.worktree,
-                artifact_root_metadata=args.artifact_root,
-                worker_type=args.worker_type,
+            settled = settle_foreground_exit(
+                jobs, args.attempt_id, log_path, outcome, worktree=args.worktree,
+                artifact_root=args.artifact_root, worker_type=args.worker_type,
+                legacy_close=lambda failure: close_job_row(
+                    jobs, args.slug, args.worktree, failure, "", args.attempt_id),
             )
+            terminal = settled["inspection"]
             args.terminal_inspection = terminal
-            args.terminal_verdict = (
-                terminal.get("verdict") if terminal.get("state") == "valid" else None
-            )
-            terminal_note = (
-                terminal.get("failure_note", "")
-                if terminal.get("state") == "valid"
-                else ""
-            )
-            # SD-72: an envelope is a semantic observation, not an OS exit
-            # receipt. Preserve the actual failure even when the final text
-            # says PASS (or reports a completed blocking review).
-            if outcome.failure:
-                terminal_note = f"dead-{outcome.failure}"
-            terminal_closed = False
-            if terminal_note:
-                terminal_evidence = {
-                    "detected_by": "foreground-terminal-handoff",
-                    "failure_class": terminal.get("failure_class", "runtime"),
-                    "terminal_event": terminal.get("terminal_event", "-"),
-                    "log_file": str(log_path),
-                    "process_exit": str(outcome.exit_code),
-                }
-                if outcome.failure:
-                    terminal_evidence.update(
-                        detected_by="foreground-process-exit",
-                        failure_class="runtime",
-                        reconcile_reason=outcome.failure,
-                    )
-                if terminal_note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
-                    # OPERATIONS §5.10: seal the named review artifact like the join does.
-                    terminal_evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
-                terminal_closed = close_attempt_row(
-                    jobs,
-                    args.attempt_id,
-                    terminal_note,
-                    evidence=terminal_evidence,
-                )
-                if terminal_closed:
-                    materialize_after_terminal_close(jobs, args.attempt_id)
-                args.worker_failure = outcome.failure or terminal_note
-            if outcome.failure and not terminal_closed:
-                close_job_row(
-                    jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
-                )
-            elif (
+            args.terminal_verdict = settled["verdict"]
+            args.worker_failure = settled["worker_failure"]
+            terminal_closed = settled["closed"]
+            if (
                 not outcome.failure
                 and not terminal_closed
                 and args.registered_worker
