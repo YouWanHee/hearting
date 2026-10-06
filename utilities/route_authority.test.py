@@ -8,6 +8,8 @@ matching row here on purpose (ROUTE-AUTHORITY-DESIGN-REVIEW-1006.md §2).
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -308,6 +310,62 @@ class OneHomeTest(unittest.TestCase):
         for old, new in pairs:
             self.assertIs(old, new)
 
+
+
+class WrapperAdmissionTest(unittest.TestCase):
+    """RA-11 (stage 3): the three wrappers' completion/preview gate and access binding are
+    route_authority's, and they read the same registry before the claim."""
+
+    WRAPPERS = ("claude", "codex", "opencode")
+
+    def test_the_three_wrappers_call_the_one_admission(self):
+        for harness in self.WRAPPERS:
+            with self.subTest(harness=harness):
+                wrapper = _load(f"route_authority_{harness}_wrapper", f"adapters/{harness}/bin/dispatch-headless.py")
+                self.assertIs(wrapper.completion_gate_fail_fields, RA.completion_gate_fail_fields)
+                source = (ROOT / f"adapters/{harness}/bin/dispatch-headless.py").read_text(encoding="utf-8")
+                self.assertEqual(source.count("route_authority.completion_gate("), 2)
+                self.assertEqual(source.count("route_authority.bind_launch_access("), 1)
+                self.assertNotIn("load_parent_effective_grant(", source)
+                self.assertNotIn("recover_preview_gate_after_refusal(", source)
+
+    def test_a_refused_gate_comes_back_with_its_preview_recovery_and_fields(self):
+        args = SimpleNamespace(route_file="/r/route.json", route_node="test", attempt_id="att-x",
+                               jobs=None, agent_home=ROOT)
+        seen = []
+        def refusing(*a, **k):
+            seen.append(k["planned_revision_nodes"])
+            raise DC.DispatchContractError("human-gate-not-raised", "preview-disposition")
+        with mock.patch("review_input.preview_request_nodes", return_value=("plan",)), \
+             mock.patch.object(DC, "recover_preview_gate_after_refusal", return_value="preview_gate_recovery=unavailable"):
+            reason, code, fields = RA.completion_gate(args, "start", ROOT, Path("/j/jobs.log"), gate=refusing,
+                                                      before=(lambda: seen.append("before"),))
+        self.assertEqual(seen, ["before", ("plan",)])
+        self.assertEqual((reason, code, fields["detail"], fields["child_spawned"]),
+                         ("human-gate-not-raised", 65, "preview_gate_recovery=unavailable", "0"))
+        self.assertIsNone(RA.completion_gate(args, "start", ROOT, Path("/j/jobs.log"), gate=lambda *a, **k: None))
+
+    def test_the_registry_before_the_claim_is_one_rule(self):
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": "/inherited/jobs.log"}):
+            self.assertEqual(RA.prelaunch_registry(SimpleNamespace(jobs="/explicit/jobs.log", agent_home=ROOT)),
+                             Path("/explicit/jobs.log"))
+            self.assertEqual(RA.prelaunch_registry(SimpleNamespace(jobs=None, agent_home=ROOT)),
+                             Path("/inherited/jobs.log"))
+
+    def test_a_child_access_request_needs_its_exact_parent(self):
+        from execution_access import ExecutionAccessError
+        with tempfile.TemporaryDirectory() as td:
+            request = Path(td) / "request.json"
+            request.write_text("{}")
+            args = SimpleNamespace(worktree=td, artifact_root=td, jobs_path=Path(td) / "jobs.log", agent_home=ROOT,
+                                   dispatch_depth=2, execution_access_file=str(request), parent_binding=None)
+            with self.assertRaises(ExecutionAccessError) as refused:
+                RA.bind_launch_access(args, runtime="opencode", default_roots=())
+            self.assertEqual(refused.exception.reason, "execution-access-exceeds-parent:parent-grant-unknown")
+            args.execution_access_file = None
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+                self.assertIsNone(RA.bind_launch_access(args, runtime="opencode", default_roots=()))
 
 if __name__ == "__main__":
     unittest.main()

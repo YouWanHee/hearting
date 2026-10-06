@@ -154,6 +154,7 @@ from execution_access import (  # noqa: E402
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
 )
+import route_authority  # noqa: E402
 from route_authority import (  # noqa: E402
     bind_access_request as bind_execution_access_request,
     bind_runtime_parent,
@@ -304,16 +305,8 @@ def fail(reason: str, code: int, **fields: str) -> int:
     return code
 
 
-def completion_gate_fail_fields(error: DispatchContractError, route_file, route_node) -> dict:
-    """SD-154/B-2: a route-state refusal (13.59.3 rule 6) carries a supported
-    `next_action` so a caller stops instead of misreading it as a transient
-    runtime-unavailable and descending to inline."""
-    fields = {"detail": error.detail, "child_spawned": "0"}
-    if error.reason in ROUTE_STATE_REFUSAL_REASONS:
-        fields["next_action"] = error.next_action or route_state_next_action(
-            error.reason, error.detail, str(route_file), route_node,
-        )
-    return fields
+# One copy, shared by the three wrappers (`route_authority`); the name stays for readers.
+completion_gate_fail_fields = route_authority.completion_gate_fail_fields
 
 
 def read_launch_fence_failure(fd: int) -> tuple[dict[str, object] | None, bool]:
@@ -1748,26 +1741,12 @@ def validate_route_record(args: argparse.Namespace) -> int:
             child_spawned="0",
         )
     args.route_validation=result.stdout.strip()
-    explicit_or_inherited_jobs = args.jobs or os.environ.get("AGENT_DISPATCH_JOBS", "")
-    early_jobs = (
-        Path(explicit_or_inherited_jobs)
-        if explicit_or_inherited_jobs
-        else dispatch_state_roots(args.agent_home)[0] / "jobs.log"
-    )
-    try:
-        completion_marker_gate(
-            args.route_file, args.route_node, args.action, args.agent_home,
-            early_jobs, attempt_id=args.attempt_id,
-            planned_revision_nodes=preview_request_nodes(args, early_jobs),
-        )
-    except DispatchContractError as e:
-        e.detail = recover_preview_gate_after_refusal(
-            args.route_file, args.route_node, args.action, args.agent_home, early_jobs, e)
-        return fail(
-            e.reason,
-            78 if e.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
-            **completion_gate_fail_fields(e, args.route_file, args.route_node),
-        )
+    refusal = route_authority.completion_gate(
+        args, args.action, args.agent_home, route_authority.prelaunch_registry(args),
+        gate=completion_marker_gate)
+    if refusal:
+        reason, code, fields = refusal
+        return fail(reason, code, **fields)
     return 0
 
 
@@ -1971,18 +1950,12 @@ def main(argv: list[str]) -> int:
         bind_stage_session(args, artifact_root=args.artifact_root, action=action)
     except DispatchContractError as e:
         return fail(e.reason, 65, detail=e.detail, child_spawned="0")
-    try:
-        owner_frame_launch_gate(args.owner_route_binding, action, agent_home, jobs)
-        completion_marker_gate(
-            args.route_file, args.route_node, action, agent_home, jobs,
-            attempt_id=args.attempt_id,
-            planned_revision_nodes=preview_request_nodes(args, jobs),
-        )
-    except DispatchContractError as e:
-        e.detail = recover_preview_gate_after_refusal(
-            args.route_file, args.route_node, action, agent_home, jobs, e)
-        return fail(e.reason, 78 if e.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
-                    **completion_gate_fail_fields(e, args.route_file, args.route_node))
+    refusal = route_authority.completion_gate(
+        args, action, agent_home, jobs, gate=completion_marker_gate,
+        before=(lambda: owner_frame_launch_gate(args.owner_route_binding, action, agent_home, jobs),))
+    if refusal:
+        reason, code, fields = refusal
+        return fail(reason, code, **fields)
     # Item 5-1 (SD-48~50 exact parent binding), ported from the Claude wrapper.
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):
@@ -2029,32 +2002,9 @@ def main(argv: list[str]) -> int:
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
     try:
-        access_context = AccessContext.build(
-            worktree=args.worktree,
-            artifact_root=args.artifact_root,
-            dispatch_state_root=dispatch_state_root(args.jobs_path),
-            agent_home=args.agent_home,
-            environ=os.environ,
-        )
         default_roots = adapter_default_roots(args)
-        access_parent = None
-        if args.dispatch_depth >= 2 and execution_access_request_path(args.execution_access_file, os.environ) is not None:
-            if args.parent_binding is None:
-                raise ExecutionAccessError("execution-access-exceeds-parent:parent-grant-unknown")
-            access_parent = load_parent_effective_grant(
-                jobs=args.jobs_path,
-                parent_attempt_id=args.parent_binding.attempt_id,
-                context=access_context,
-            )
-        args.execution_access_grant = bind_execution_access_request(
-            args.execution_access_file,
-            environ=os.environ,
-            context=access_context,
-            is_child=args.dispatch_depth >= 2,
-            parent=access_parent,
-            runtime="opencode",
-            default_writable_roots=default_roots,
-        )
+        args.execution_access_grant = route_authority.bind_launch_access(
+            args, runtime="opencode", default_roots=default_roots)
         if args.execution_access_grant is not None:
             args.opencode_config_content = scoped_external_directory_config(
                 args.artifact_root,
