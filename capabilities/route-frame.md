@@ -10,24 +10,24 @@ This is the portable contract for `route-frame`, the compiler-internal capabilit
 | Identifier | `route-frame` |
 | Group | `sub` |
 | Supported modes | `none` |
-| Portable meaning | Compiler-internal framed front end: two top-tier frame legs and a model-less runtime terminal that fixes the route decision. |
+| Portable meaning | Compiler-internal framed front end: one frame leg (both top-tier legs for uncertain or hard-to-reverse work) and a model-less runtime terminal that fixes the route decision. |
 | Argument shape | `compose --shape framed --campaign-key <key> --start --prompt-file <task>` |
 
 ## Shape
 
-A framed route is sealed at intensity `standard` with exactly three nodes:
+A framed route is sealed at intensity `standard`. Ordinary work runs one frame leg; `compose --shape framed --intensity strong` (or higher) marks the work uncertain or hard to reverse and runs both legs:
 
 | Node | Kind | Runs as | Model |
 |---|---|---|---|
-| `frame` | map-worker, unit `plan/frame` | registered depth-1 attempt, launched by the depth-0 session | `top` |
-| `frame-alternative` | map-worker, unit `plan/frame` | a separate registered depth-1 attempt, never a batch with its sibling | `top` |
+| `frame` | map-worker, unit `plan/frame` | registered depth-1 attempt, launched by the depth-0 session | `deep` alone, `top` beside the alternative |
+| `frame-alternative` | map-worker, unit `plan/frame` | only with both legs: a separate registered depth-1 attempt, never a batch with its sibling | `top` |
 | `route-decision` | runtime-terminal | the runtime itself; no attempt, no unit, no role | none |
 
-The two legs never read each other's brief. The terminal depends on both and carries the one `frame-review` human gate at its entry. There is no owner node and no owner launch.
+Two legs never read each other's brief. The terminal depends on every frame leg and carries the one `frame-review` human gate at its entry. There is no owner node and no owner launch.
 
 ## What the runtime does
 
-1. `start` launches the two legs as separate registrations and joins them.
+1. `start` launches the frame legs as separate registrations and joins them.
 2. The existing single frame interview (`needs-interview`, then `needs-question`) asks the person once.
 3. On `proceed` the runtime fixes one `route_decision_v1` record, completes the terminal with that record as its evidence, closes the route and finalizes the producer cycle.
 4. `revise` and `stop` behave as they do for every other frame route.

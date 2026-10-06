@@ -624,6 +624,31 @@ class RuntimeBuiltInterviewTest(StartBase):
         self.assertEqual(W._marked_route_proposals(self.route, self.jobs, plain), (plain, []))
 
 
+class OneLegFramedTest(StartBase):
+    """User decision 2026-10-07: ordinary work frames with one leg, and the same decision follows."""
+    FRAME_INTENSITY = None
+
+    def test_one_leg_reads_one_brief_and_its_proposal_starts_the_first_leg(self):
+        self.assertEqual(RP.frame_legs(self.route), ("frame",))
+        root, record, output = W._framed_cycle(self.route)
+        rows = W._proposal_rows(self.route, self.jobs, root, record, output)
+        self.assertEqual([row["node"] for row in rows], ["frame"])
+        route_question, = W._interview_questions(rows)
+        self.assertEqual((route_question["kind"], [o.get(FI.PROPOSAL_MARK) for o in route_question["options"]]),
+                         ("yes-no", ["frame", None]))
+        result = self.settle()
+        self.assertEqual(result["state"], "inline", result)
+        decision = self.record()["decision"]
+        self.assertEqual([row["node"] for row in decision["briefs"]], ["frame"])
+        self.assertEqual([row["node"] for row in decision["proposals"]], ["frame"])
+        self.assertEqual(len(self.leg_routes()), 1)
+
+    def test_a_none_ending_names_only_the_one_leg(self):
+        del self.interview["route_proposals"]
+        NoneEndingTest.assert_none(self, "proposal-not-read")
+        self.assertEqual([row["node"] for row in self.record()["decision"]["proposals"]], ["frame"])
+
+
 class FailureTableTest(StartBase):
     def test_a164_11_a_first_leg_compose_refusal_keeps_the_record_and_the_same_start_resumes(self):
         with mock.patch.object(R, "compile_first_leg", side_effect=ValueError("compose-graph-order:test-before-execute")):

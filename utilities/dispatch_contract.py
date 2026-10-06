@@ -6879,7 +6879,8 @@ def owner_frame_launch_gate(binding, action: str, agent_home: Path,
     # A recipe may fan out after the frame pair (autopilot-spec standard+ starts
     # research and research-alternative together); every entry waits on the
     # same approved frames, so each is checked rather than requiring exactly one.
-    if frames != {"frame", "frame-alternative"} or not entries:
+    import route_plan as RP
+    if not RP.valid_frame_legs(route, frames) or not entries:
         raise DispatchContractError("frame-owner-entry-invalid", str(route.get("route_id")))
     for entry in entries:
         completion_marker_gate(binding.route_file, entry["id"], action, agent_home, jobs)
@@ -6924,15 +6925,17 @@ def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
     field must be nonempty and distinct, regardless of the selected harnesses.
     The empty proof list is retained for callers of the old admission API.
     """
+    import route_plan as RP
     frames = [node for node in route.get("nodes", [])
               if node.get("id") in {"frame", "frame-alternative"}]
-    if len(frames) != 2 or {node.get("id") for node in frames} != {"frame", "frame-alternative"}:
+    if not RP.valid_frame_legs(route, [node.get("id") for node in frames]) or len(frames) != len(
+            {node.get("id") for node in frames}):
         raise DispatchContractError("frame-pair-incomplete", str(route.get("route_id")))
     perspectives = [node.get("perspective", {"frame": "primary-frame",
                                            "frame-alternative": "alternative-frame"}[node["id"]])
                     for node in frames]
     if (any(not isinstance(value, str) or not value.strip() for value in perspectives)
-            or len({value.strip() for value in perspectives}) != 2):
+            or len({value.strip() for value in perspectives}) != len(frames)):
         raise DispatchContractError("frame-perspective-duplicate", str(perspectives))
     if route.get("effective_intensity") == "quick":
         candidates, field = route.get("registered_headless_candidates") or [], "harness"
@@ -6942,7 +6945,7 @@ def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
     supported = {r.get(field) for r in candidates
                  if isinstance(r, dict) and r.get("status") == "supported"}
     supported &= {"codex", "claude", "opencode"}
-    if len(harnesses) != 2 or not supported or not set(harnesses).issubset(supported):
+    if len(harnesses) != len(frames) or not supported or not set(harnesses).issubset(supported):
         raise DispatchContractError("frame-harness-unsupported", str(harnesses))
     return []
 
@@ -6970,7 +6973,8 @@ def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
               and n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1]
     if not frames:
         return
-    if {n.get("id") for n in frames} != {"frame", "frame-alternative"}:
+    import route_plan as RP
+    if not RP.valid_frame_legs(route, [n.get("id") for n in frames]):
         raise DispatchContractError("frame-pair-incomplete", str(node.get("id")))
     try:
         lines = registry_lines if registry_lines is not None else jobs.read_text().splitlines()
@@ -7001,7 +7005,7 @@ def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
             raise DispatchContractError("frame-attempt-unverifiable", str(attempt))
         attempts.append(attempt)
         harnesses.append(metadata["harness"])
-    if len(set(attempts)) != 2:
+    if len(set(attempts)) != len(frames):
         raise DispatchContractError("frame-attempt-duplicate", str(attempts))
     frame_harness_admission(route, jobs, lines, harnesses,
                             [f.get("model_profile") for f in frames])
@@ -7213,7 +7217,8 @@ def completion_marker_gate(
                                  jobs or (resolve_dispatch_state_root(agent_home) / "jobs.log"),
                                  registry_lines)
     if _raising_frame_gate:
-        if set(node.get("depends_on", [])) != {"frame", "frame-alternative"}:
+        import route_plan as RP
+        if not RP.valid_frame_legs(route, node.get("depends_on", [])):
             raise DispatchContractError("frame-owner-entry-invalid", str(node.get("id")))
     else:
         _human_gate_entry_fence(route, node, jobs)

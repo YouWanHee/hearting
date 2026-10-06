@@ -201,7 +201,8 @@ def golden_payload(case):
     record("prior:lab-eval:full", lambda: case.compose("autopilot-lab", "eval", ",".join(lab_ids),
                                                         campaign_key="sd165-lab"))
     # The compiler-internal framed route: its own scenario, never part of the user-preset enumeration.
-    record("framed:route-frame", lambda: case.compose_framed())
+    # The golden holds the two-leg framed route; one leg is the default now, so ask for both.
+    record("framed:route-frame", lambda: case.compose_framed(intensity="strong"))
     registry = TOPO.load_registry()
     registry = json.loads(json.dumps(registry))
     registry["recipes"] = [_historical_setup_projection(recipe, case) for recipe in registry["recipes"]]

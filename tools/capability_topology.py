@@ -135,6 +135,8 @@ def recipe_keys(registry):
 ROUTE_FRAME_CAPABILITY = "route-frame"
 ROUTE_DECISION_KIND = "runtime-terminal"
 ROUTE_FRAME_NODE_IDS = ["frame", "frame-alternative", "route-decision"]
+# A framed route that runs one frame leg seals this projection of the same recipe.
+ROUTE_FRAME_ONE_LEG_NODE_IDS = ["frame", "route-decision"]
 
 
 def is_route_frame_terminal(recipe, node):

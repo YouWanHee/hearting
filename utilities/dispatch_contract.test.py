@@ -176,6 +176,23 @@ class FrameLaunchGateTest(unittest.TestCase):
       D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
      self.assertEqual(caught.exception.reason,"frame-perspective-duplicate")
 
+ def test_one_frame_leg_passes_only_on_a_framed_route(self):
+  # User decision 2026-10-07: a framed route may run one leg; a recipe still frames with the pair.
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);route,path,jobs,markers,rows=self.fixture(base)
+   route["nodes"]=[route["nodes"][0],{"id":"route-decision","kind":"runtime-terminal","terminal":True,
+                                       "depends_on":["frame"]}]
+   del markers["frame-alternative"]
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
+   self.assertEqual(caught.exception.reason,"frame-pair-incomplete")
+   route.update(capability="route-frame",selection={"shape":"framed"})
+   D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
+   self.assertEqual(D.frame_harness_admission(route,jobs,rows,["codex"],[None]),[])
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.frame_harness_admission(route,jobs,rows,["codex","claude"],[None,None])
+   self.assertEqual(caught.exception.reason,"frame-harness-unsupported")
+
  def test_same_attempt_cannot_supply_both_frame_personas(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td);route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))

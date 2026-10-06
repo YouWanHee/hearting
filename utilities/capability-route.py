@@ -1783,9 +1783,10 @@ def _evidence_parent_dispatch_depth(nodes, owner_dispatch_depth):
     if a recipe ever seals evidence at another depth, and cross-checks the two
     structural facts the route already states about itself.
     """
-    if [n.get("id") for n in nodes] == list(TOPO.ROUTE_FRAME_NODE_IDS) and nodes[-1].get("kind") == TOPO.ROUTE_DECISION_KIND:
+    if ([n.get("id") for n in nodes] in (list(TOPO.ROUTE_FRAME_NODE_IDS), list(TOPO.ROUTE_FRAME_ONE_LEG_NODE_IDS))
+            and nodes[-1].get("kind") == TOPO.ROUTE_DECISION_KIND):
         # The framed route has no depth-2 consumer: its checked tuples describe the runtime that
-        # launches the two frame legs, and it names the same parent depth as every recipe.
+        # launches its frame legs, and it names the same parent depth as every recipe.
         return owner_dispatch_depth
     if not any(node.get("dispatch_depth") == EVIDENCE_CONSUMER_DISPATCH_DEPTH for node in nodes):
         raise ValueError(
@@ -2379,6 +2380,9 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=Tr
     passes it."""
 
     rungs = PROFILE.frame_profile_for_owner(owner_profile, prior=prior)
+    if sum(1 for node in nodes if _frame_node(node)) == 1 and not prior:
+        # A framed route's one leg (only a framed route has a single frame leg).
+        rungs = {"anchor": PROFILE.FRAME_SINGLE_LEG_PROFILE, "others": PROFILE.FRAME_SINGLE_LEG_PROFILE}
     for node in nodes:
         if not _frame_node(node):
             continue
@@ -2450,6 +2454,18 @@ def _quick_gate_bindings(recipe):
     bindings.extend({"gate": gate, "node": "one-shot", "position": "terminal"}
                     for gate in recipe["quick"].get("inline_human_gates", []))
     return bindings
+
+
+def _one_leg_frame_recipe(recipe):
+    """The framed recipe that runs one frame leg: the alternative leg is gone and the decision
+    terminal depends on `frame` alone. ONE projection, used by the compiler and `verify_route`."""
+    view=json.loads(json.dumps(recipe))
+    nodes=[n for n in view["standard_plus"]["nodes"] if n.get("id")!="frame-alternative"]
+    for node in nodes:
+        if node.get("id")=="route-decision":
+            node["depends_on"]=["frame"]
+    view["standard_plus"]["nodes"]=nodes
+    return view
 
 
 def _frameless_recipe(recipe):
@@ -2656,7 +2672,7 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   registered_headless_evidence=None, slug=None,
                          route_origin="preset", shape=None, profile_demands=None,
                          explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None,
-                         route_plan=None, frameless=False):
+                         route_plan=None, frameless=False, frame_legs=2):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -2669,7 +2685,7 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         campaign_key=campaign_key, parent_cycle_id=parent_cycle_id,
         route_origin=route_origin, shape=shape, profile_demands=profile_demands,
         explicit_profiles=explicit_profiles, profile=profile,
-        route_plan=route_plan, frameless=frameless)
+        route_plan=route_plan, frameless=frameless, frame_legs=frame_legs)
 
 # ---------------------------------------------------------------------------
 # compose: the preset-free work route (SD-135).
@@ -3555,8 +3571,13 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             ("capability", capability), ("capability_mode", capability_mode),
             ("graph", graph), ("profile", profile)) if value}
         capability, capability_mode, graph, profile = ROUTE_FRAME_CAPABILITY, "default", None, None
-        if intensity not in (None, "standard"):
-            raise ValueError("compose-shape-intensity-mismatch:framed")
+        if intensity is not None and intensity not in ORDER:
+            raise ValueError("invalid intensity")
+        # One frame leg for ordinary work; both top legs when the session marks the work uncertain
+        # or hard to reverse with a higher intensity (user decision 2026-10-07). The framed route
+        # itself is always sealed at `standard`.
+        frame_legs = 2 if intensity is not None and ORDER[intensity] > ORDER["standard"] else 1
+        intensity = None
     resume_graph = (shape in ("direct", "solo") and RESOURCE_RESUME.selected(
         capability, capability_mode or "setup", graph.split(",") if graph else None))
     if shape != "staged" and graph and not resume_graph:
@@ -3686,6 +3707,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         route_origin="compose", shape=shape,
         profile_demands=profile_demands, explicit_profiles=explicit_profiles, profile=profile,
         route_plan=sealed_plan, frameless=frameless,
+        **({"frame_legs": frame_legs} if shape == "framed" else {}),
     )
     if graph_spec is not None:
         recipe = selected_recipe
@@ -4117,8 +4139,10 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
                                  else compose_campaign_selection(route))
     )
     if framed:
+        pair = len([n for n in route.get("nodes", []) if _frame_node(n)]) == 2
         card += ("\n  frame이 방향과 경로를 조립해 제안합니다"
-                 "\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회")
+                 + ("\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회" if pair
+                    else "\n  비용: frame 한 갈래 · 방향 확인 질문 1회"))
     sourced = {}
     for node in route["nodes"]:
         for name, source in (node.get("input_sources") or {}).items():
@@ -4182,11 +4206,13 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          registered_headless_evidence=None, slug=None, composed=False,
                   route_origin="preset", shape=None, profile_demands=None,
                   explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None,
-                  route_plan=None, frameless=False):
+                  route_plan=None, frameless=False, frame_legs=2):
     dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     if (capability==ROUTE_FRAME_CAPABILITY) != (shape=="framed"):
         raise ValueError(f"compose-shape-invalid:{shape}")
+    if capability==ROUTE_FRAME_CAPABILITY and frame_legs==1:
+        recipe=_one_leg_frame_recipe(recipe)
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
     slug_fields={}
@@ -4775,6 +4801,9 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         if (route.get("route_plan") is not None or decided) and route.get("effective_intensity")=="quick":
             # A leg of a plan, or a decided compose shape; a route sealed with its frame pair keeps it.
             route_recipe=_frameless_recipe(route_recipe)
+        if (route.get("capability")==ROUTE_FRAME_CAPABILITY
+                and [n.get("id") for n in route.get("nodes",[])]==TOPO.ROUTE_FRAME_ONE_LEG_NODE_IDS):
+            route_recipe=_one_leg_frame_recipe(route_recipe)
         if route.get("effective_intensity") not in ("direct", "quick"):
             expected_nodes=json.loads(json.dumps(route_recipe["standard_plus"]["nodes"]))
             expected_nodes=_expand_parallel_groups(

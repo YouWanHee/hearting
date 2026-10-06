@@ -592,7 +592,7 @@
    "group": "sub",
    "family": "sub",
    "modes": [],
-   "summary": "Compiler-internal framed front end: two top-tier frame legs and a model-less runtime terminal that fixes the route decision.",
+   "summary": "Compiler-internal framed front end: one frame leg (both top-tier legs for uncertain or hard-to-reverse work) and a model-less runtime terminal that fixes the route decision.",
    "invocation": {
     "class": "compiler-internal",
     "use_when": "Use only as the route compiler's own framed shape (compose --shape framed); no person or model invokes it by name.",

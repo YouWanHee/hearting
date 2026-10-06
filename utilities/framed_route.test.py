@@ -40,6 +40,7 @@ import work_start as W  # noqa: E402
 import capability_topology as CT  # noqa: E402
 
 FRAME_IDS = ["frame", "frame-alternative"]
+ONE_LEG_IDS = ["frame", "route-decision"]
 NODE_IDS = FRAME_IDS + ["route-decision"]
 
 # Frozen from `git show 45edc48a:capabilities/topologies.json` (the registry before the route-frame
@@ -132,9 +133,13 @@ class FramedBase(T.ProducerTestBase):
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         self.activate()
 
+    # Both frame legs, as before the one-leg default: most tests here exercise the pair.
+    FRAME_INTENSITY = "strong"
+
     def compose(self, **kw):
         arguments = dict(
             capability=None, capability_mode=None, shape="framed", graph=None, slug="framed-fixture",
+            intensity=self.FRAME_INTENSITY,
             cwd=R.ROOT, artifact_root=self.root, spec_read="fixture", campaign_key="framed-key",
             dispatch_evidence={"tuples": [T.nested("claude", "codex")]},
             work_request={"text": "Decide how to do this", "owner_harness": None})
@@ -236,12 +241,34 @@ class FramedRouteCompileTest(FramedBase):
         self.assertEqual(self.compose(campaign_key=None, parent_cycle_id="cyc_" + "a" * 32)["parent_cycle_id"],
                          "cyc_" + "a" * 32)
 
-    def test_framed_accepts_only_standard_intensity(self):
-        self.assertEqual(self.compose(intensity="standard")["effective_intensity"], "standard")
-        for intensity in ("direct", "quick", "strong"):
-            with self.subTest(intensity=intensity), self.assertRaisesRegex(
-                    ValueError, "compose-shape-intensity-mismatch:framed"):
-                self.compose(intensity=intensity)
+    def test_intensity_picks_one_frame_leg_or_both_top_legs(self):
+        """User decision 2026-10-07: one leg for ordinary work, both top legs for uncertain or
+        hard-to-reverse work. The framed route itself is sealed at standard either way."""
+        for intensity, ids in ((None, ONE_LEG_IDS), ("direct", ONE_LEG_IDS), ("quick", ONE_LEG_IDS),
+                               ("standard", ONE_LEG_IDS), ("strong", NODE_IDS), ("thorough", NODE_IDS)):
+            with self.subTest(intensity=intensity):
+                route = self.compose(intensity=intensity)
+                self.assertEqual([n["id"] for n in route["nodes"]], ids)
+                self.assertEqual((route["requested_intensity"], route["effective_intensity"]), ("standard", "standard"))
+                nodes = {n["id"]: n for n in route["nodes"]}
+                self.assertEqual(nodes["route-decision"]["depends_on"], ids[:-1])
+                self.assertEqual({nodes[leg]["model_profile"] for leg in ids[:-1]},
+                                 {"deep"} if len(ids) == 2 else {"top"})
+                self.assertEqual(route["human_gate_bindings"],
+                                 [{"gate": "frame-review", "node": "route-decision", "position": "entry"}])
+                self.assertTrue(RP.is_framed_route(R.verify_route(json.loads(json.dumps(route)), R.ROOT)))
+                self.assertEqual(RP.frame_legs(route), tuple(ids[:-1]))
+        with self.assertRaisesRegex(ValueError, "invalid intensity"):
+            self.compose(intensity="bogus")
+        one = self.compose(intensity=None)
+        self.assertFalse(RP.valid_frame_legs({"nodes": []}, ["frame"]))           # a lone leg only on a framed route
+        self.assertTrue(RP.valid_frame_legs(one, ["frame"]))
+        tampered = json.loads(json.dumps(one))
+        tampered["nodes"][0]["model_profile"] = "top"
+        tampered["route_hash"] = R.route_hash(tampered)
+        tampered["route_id"] = "rt-" + tampered["route_hash"].split(":", 1)[1][:16]
+        with self.assertRaises(ValueError):
+            R.verify_route(tampered, R.ROOT)
 
     def test_the_card_shows_the_two_framed_lines_and_no_other_shape_does(self):
         card = R.compose_card(self.compose())
@@ -315,6 +342,10 @@ class FramedRouteCompileTest(FramedBase):
         base = [sys.executable, str(HERE / "capability-route.py"), "compose", "--shape", "framed",
                 "--cwd", str(R.ROOT), "--artifact-root", str(self.root), "--spec-read", "fixture",
                 "--dispatch-evidence", str(evidence), "--prompt-file", str(task), "--slug", "cli-framed"]
+        one = subprocess.run(base + ["--unassigned", "--explain"], text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(one.returncode, 0, one.stderr)
+        self.assertIn("비용: frame 한 갈래 · 방향 확인 질문 1회", one.stderr)
+        base += ["--intensity", "strong"]
         done = subprocess.run(
             base + ["--campaign-key", "cli-key", "--capability", "autopilot-refine", "--graph", "review",
                     "--profile", "light"], text=True, capture_output=True, env=env, check=False)

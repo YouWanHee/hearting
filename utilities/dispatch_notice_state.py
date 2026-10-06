@@ -158,7 +158,11 @@ def framed_decision_consumed(record: dict, metadata: dict, jobs: Path) -> bool:
     frame_attempts = {}
     briefs = {item.get("node"): item for item in decision_record["decision"].get("briefs", [])
               if isinstance(item, dict)}
-    for node_id in ("frame", "frame-alternative"):
+    import route_plan as RP
+    legs = RP.frame_legs(route)
+    if not RP.valid_frame_legs(route, legs):
+        return False
+    for node_id in legs:
         node = nodes.get(node_id)
         if not node:
             return False
