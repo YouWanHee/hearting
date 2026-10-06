@@ -10,6 +10,27 @@ does not mean adopting a particular outside methodology. It adds no procedure to
 read or submit for each new task. Maintainers apply it when judging whether a
 structure or a change is sound.
 
+## 0. Three standing goals
+
+The user set these as Hearting's core goals (2026-10-06). Sections 1–6
+describe how to reach them; judge any structure or change against these first.
+
+1. **Light dispatch surface.** An agent that dispatches work states only the
+   goal, inputs, scope, and completion condition. Whatever the runtime already
+   knows or can settle on its own — provenance, paths, parent and identity,
+   default model and harness, access, retry and recovery commands — Hearting
+   fills in. (See §2.)
+2. **Free but systematic planning at frame.** The frame stage shapes the plan
+   to the task instead of forcing a fixed template, fitting the work like a
+   tailored suit, yet the plan names its stages, parallel parts, verification,
+   and completion conditions clearly enough to run, resume, and hand off
+   without deciding them again. Recipes and presets are only default shapes.
+3. **Harness-independent consistency.** The same request means the same thing,
+   is judged the same way, and finishes the same way on Claude, Codex, and
+   OpenCode. Decisions live once in the shared layer; adapters only translate
+   execution. There are no per-harness exception branches or duplicated
+   judgments. (See §3 and §5.)
+
 ## 1. The unit of a feature is a responsibility carried to the end
 
 `intent → execution → observation → result settlement → follow-up or recovery → closure → handoff`
