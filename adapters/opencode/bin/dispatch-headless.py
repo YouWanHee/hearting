@@ -832,21 +832,27 @@ def scoped_external_directory_config(
         else:
             raise ValueError("OpenCode agent permission must be a string or object")
         original_local = dict(local)
+        # Triples accumulate into one overlay per tool in listed order, so a
+        # later triple wins on overlap (native last-match) without wiping an
+        # earlier triple's unrelated patterns.
+        overlaid: dict[str, dict] = {}
         for tool, action, roots in (("external_directory", "allow", contract_roots),
                                     ("edit", "deny", contract_roots),
                                     ("external_directory", "allow", read_deny_roots),
                                     ("edit", "deny", read_deny_roots)):
             if not roots:
                 continue
-            old = effective_tool(original_local, tool)
-            if old is None:
-                overlay = {}
-            elif isinstance(old, str):
-                overlay = {"*": old}
-            elif isinstance(old, dict):
-                overlay = dict(old)
-            else:
-                raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
+            if tool not in overlaid:
+                old = effective_tool(original_local, tool)
+                if old is None:
+                    overlaid[tool] = {}
+                elif isinstance(old, str):
+                    overlaid[tool] = {"*": old}
+                elif isinstance(old, dict):
+                    overlaid[tool] = dict(old)
+                else:
+                    raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
+            overlay = overlaid[tool]
             for root in roots:
                 directories = (root,)
                 if tool == "edit" and worktree is not None:
@@ -855,6 +861,7 @@ def scoped_external_directory_config(
                     for pattern in (directory, f"{directory}/**"):
                         overlay.pop(pattern, None)
                         overlay[pattern] = action
+        for tool, overlay in overlaid.items():
             local.pop(tool, None)
             local[tool] = overlay
         if write_keep_roots:

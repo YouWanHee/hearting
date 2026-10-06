@@ -633,6 +633,33 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             self.assertEqual((), other.read_roots)
             self.assertIn("read-roots-unprojected", other.unmet)
 
+    def test_read_overlay_keeps_contract_deny_inside_selected_agent(self) -> None:
+        readonly = self.root / "readonly-data"
+        readonly.mkdir()
+        install = self.root / "installed-contract"
+        (install / "capabilities").mkdir(parents=True)
+        alias = self.root / "agent-home"
+        alias.symlink_to(install, target_is_directory=True)
+        existing = {"permission": {"external_directory": {"*": "deny"}},
+                    "agent": {"build": {"permission": {"edit": "allow"}}}}
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(existing)}):
+            without = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), agent_home=alias, worktree=str(self.worktree),
+                selected_agent="build",
+            ))
+            with_read = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), agent_home=alias, worktree=str(self.worktree),
+                selected_agent="build",
+                execution_access_read_roots=(readonly,),
+            ))
+        for directory in (alias / "capabilities", install / "capabilities"):
+            for pattern in (str(directory), f"{directory}/**"):
+                self.assertEqual("deny", without["agent"]["build"]["permission"]["edit"][pattern])
+                self.assertEqual("deny", with_read["agent"]["build"]["permission"]["edit"][pattern])
+        self.assertEqual("allow", with_read["agent"]["build"]["permission"]["external_directory"][str(readonly)])
+        self.assertEqual("deny", with_read["agent"]["build"]["permission"]["edit"][str(readonly)])
+        self.assertEqual("deny", with_read["agent"]["build"]["permission"]["external_directory"]["*"])
+
     def test_receipt_matches_projection_and_is_absent_without_request(self) -> None:
         self.assertEqual("", receipt_fragment(None))
         grants = (
