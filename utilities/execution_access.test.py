@@ -928,6 +928,22 @@ class DerivedAccessTest(unittest.TestCase):
             "범위: /data/input 저장": {"/data/input": "write"},
             "범위: 읽기만, /x/a 저장": {"/x/a": "read"},
             "범위: 다음은 제외, /x/a 저장, /x/b 저장": {"/x/a": "excluded", "/x/b": "excluded"},
+            # A negated action is not a write (hearting-verify-cc PROBE3).
+            "범위: /x/out 생성, /x/raw 수정 안 함": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 생성, /x/raw 변경 없음": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 쓰기 불가": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 삭제하면 안 됨": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 못 함": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정하지 않음": {"/x/out": "write", "/x/raw": "excluded"},
+            "Scope: /x/out (write), /x/raw (no writes)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, don't modify /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw cannot be modified": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw shouldn't be edited": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, avoid writing /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, do not modify /x/raw": {"/x/out": "write", "/x/raw": "excluded"},
+            # A write word about something else does not attach to a path.
+            "범위: 결과 보고서 작성, /x/raw": {"/x/raw": "read"},
+            "범위: /x/raw, 결과 보고서 작성": {"/x/raw": "read"},
         }
         for line, expected in cases.items():
             with self.subTest(line=line):

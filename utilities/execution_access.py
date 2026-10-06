@@ -376,6 +376,10 @@ _SCOPE_READ_ONLY = re.compile(
     r"읽|참조|참고|조회|입력|보기|확인|보존|불변|유지|그대로|조사|분석|검토|비교"
     r"|\b(?:read\w*|referenc\w*|input\w*|inspect\w*|view\w*|preserv\w*|keep|analy[sz]\w*|review\w*)\b",
     re.I)
+# A negated action keeps a path read only ("수정 안 함", "쓰기 불가", "don't modify").
+_SCOPE_NEGATED = re.compile(
+    r"안\s*(?:함|한다|하|됨|된다|되)|없음|없다|없이|불가|못\s*(?:함|한다|하)"
+    r"|\b(?:no|cannot|none|avoid\w*|forbid\w*|prohibit\w*|disallow\w*)\b|n't\b", re.I)
 # Only a clause that says it writes there, and nothing else, makes a write root.
 _SCOPE_WRITES = re.compile(
     r"쓰기|쓴다|써서|저장|수정|생성|작성|갱신|적용|만들|추가|변경|편집|삭제|이동|복사|옮기|출력|기록"
@@ -417,28 +421,40 @@ def _strip_particles(token: str) -> str:
     return token
 
 
-def _scope_access(clauses: list[str]) -> list[tuple[str, str]]:
+def _scope_access(clauses: list[str], parenthesized: list[bool] | None = None) -> list[tuple[str, str]]:
     """`(access, why)` for each clause of the scope field: `write` only where the
-    clause says it writes there and says nothing that reads or excludes, `excluded`
-    from the first excluding clause on, otherwise `read`. A clause that names no
-    path qualifies the nearest clause before it that does (`…/raw (제외)`, `…/raw,
-    읽기만`). Any doubt falls toward less access, never toward write."""
+    clause says it writes there and says nothing that reads, negates or excludes,
+    `excluded` from the first excluding clause on, otherwise `read`. A clause that
+    names no path qualifies the nearest path clause (before it, or the first one after
+    a leading clause) with what it reads, negates or excludes (`…/raw (제외)`, `…/raw,
+    읽기만`); its write words pass only as a parenthesis right after the path
+    (`…/out (write)`), never from a clause about something else. Any doubt falls
+    toward less access, never toward write."""
 
+    parenthesized = parenthesized or [False] * len(clauses)
     marks: list[dict[str, str]] = [{} for _ in clauses]
     owner = None
     leading: dict[str, str] = {}
     excluded_from = None
     for index, clause in enumerate(clauses):
-        if _TASK_PATH.search(clause):
+        has_path = bool(_TASK_PATH.search(clause))
+        if has_path:
             owner = index
             for kind, word in leading.items():   # a path-less clause before the first path
                 marks[owner].setdefault(kind, word)
             leading = {}
         words = _TASK_PATH.sub(" ", clause)        # a path's own letters say nothing
-        for kind, pattern in (("exclude", _SCOPE_EXCLUDED), ("read", _SCOPE_READ_ONLY), ("write", _SCOPE_WRITES)):
+        for kind, pattern in (("exclude", _SCOPE_EXCLUDED), ("read", _SCOPE_READ_ONLY),
+                              ("negated", _SCOPE_NEGATED), ("write", _SCOPE_WRITES)):
             found = pattern.search(words)
-            if found:
+            if not found:
+                continue
+            if has_path:
+                marks[index].setdefault(kind, found.group(0))
+            elif kind != "write":
                 (marks[owner] if owner is not None else leading).setdefault(kind, found.group(0))
+            elif owner == index - 1 and parenthesized[index]:
+                marks[owner].setdefault(kind, found.group(0))
         if excluded_from is None and owner is not None and "exclude" in marks[owner]:
             excluded_from = owner
     result = []
@@ -446,12 +462,14 @@ def _scope_access(clauses: list[str]) -> list[tuple[str, str]]:
         if excluded_from is not None and index >= excluded_from:
             word = mark.get("exclude") or marks[excluded_from].get("exclude", "")
             result.append(("excluded", f"excluded:{word}"))
+        elif "write" in mark and "negated" in mark:
+            result.append(("read", f"negated:{mark['negated']}/{mark['write']}"))
         elif "write" in mark and "read" not in mark:
             result.append(("write", f"writes:{mark['write']}"))
         elif "write" in mark:
             result.append(("read", f"both read and write:{mark['read']}/{mark['write']}"))
-        elif "read" in mark:
-            result.append(("read", f"reads:{mark['read']}"))
+        elif "read" in mark or "negated" in mark:
+            result.append(("read", f"reads:{mark.get('read') or mark['negated']}"))
         else:
             result.append(("read", "no write word"))
     return result
@@ -469,8 +487,11 @@ def _task_paths(text: str) -> list[tuple[int, str, str, str, str, str]]:
         if scope is None:
             clauses = [(line, ("read", "task text"))]
         else:
-            parts = [m.group(0) for m in _SCOPE_CLAUSE.finditer(scope.group(1))]
-            clauses = list(zip(parts, _scope_access(parts)))
+            value = scope.group(1)
+            spans = list(_SCOPE_CLAUSE.finditer(value))
+            parts = [m.group(0) for m in spans]
+            opened = [m.start() > 0 and value[m.start() - 1] == "(" for m in spans]
+            clauses = list(zip(parts, _scope_access(parts, opened)))
         for clause, (access, why) in clauses:
             for match in _TASK_PATH.finditer(clause):
                 if not match.group(0).startswith("//"):
