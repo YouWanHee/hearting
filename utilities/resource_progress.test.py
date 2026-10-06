@@ -362,5 +362,100 @@ class ResourceProgressProductionTest(unittest.TestCase):
         self.assertIsNone(self.collect({"arms": [arm, copy.deepcopy(arm)]}))
 
 
+class RemoteCandidatesTest(unittest.TestCase):
+    """Display-only remote arms: multi-arm join input, never liveness proof.
+
+    Mirrors the cnn T/B bridge: producer identity/directory/config live in
+    arm["production"] with an explicit host, progress/config files stay
+    hash-checked, and no local /proc lookup can occur (no reader exists).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        (self.repo / "configs").mkdir(parents=True)
+        self.cfg = self.root / "outside-cfg"
+        self.cfg.mkdir()
+        self.config = self.cfg / "scratch_t.json"
+        self.config.write_text(json.dumps({"training": {"attempts": 400000, "epochs": 20,
+                                                         "blocks_per_epoch": 1000,
+                                                         "updates_per_block": 20}}))
+        self.digest = hashlib.sha256(self.config.read_bytes()).hexdigest()
+        self.now = time.time()
+        self.run = {"pid": 4, "starttime": "10", "command_hash": "a" * 64,
+                    "process_group": 4, "cwd": str(self.repo)}
+
+    def arm(self, capacity="T", pid=3945450, start=565464077, host="cnn",
+            run="t_baseline_20261006", gpu=0, attempt=67117, successful=67096,
+            skipped=21, loss=0.00985, set_config=True):
+        directory = self.root / ("runs-%s" % capacity.lower()) / run
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "progress.json").write_text(json.dumps({
+            "attempt": attempt, "successful": successful, "skipped": skipped,
+            "last": {"attempt": attempt, "metrics": {"loss": loss}}}))
+        os.utime(directory / "progress.json", (self.now - 600, self.now - 600))
+        config_sha = self.digest if set_config else "0" * 64
+        return {"capacity": capacity, "state": "training-updates",
+                "run_id": "cnn-20261006-%s" % capacity.lower(),
+                "compute_host_receipt": {"host": host},
+                "production": {
+                    "schema": "tf-rehancer.cnn-production/v1", "host": host,
+                    "capacity": capacity, "gpu_index": gpu,
+                    "directory": str(directory), "config_sha256": config_sha,
+                    "state": "training-updates", "run_name": run,
+                    "compute_run_id": "cnn-20261006-%s" % capacity.lower(),
+                    "command": ["/bin/tf-rehancer-train", "--config", str(self.config)],
+                    "process_identity": {"pid": pid, "starttime": start,
+                                         "cmdline_sha256": "d" * 64}}}
+
+    def collect_remote(self, metadata):
+        (self.root / "run.json").write_text(json.dumps(metadata))
+        return progress.remote_candidates(self.run, self.root / "resource-runs.json",
+                                          self.now)
+
+    def test_two_remote_arms_yield_two_display_candidates(self):
+        found = self.collect_remote({"arms": [self.arm("T"), self.arm(
+            "B", pid=3945451, start=565464078, run="b_baseline_20261006", gpu=1,
+            successful=67100, skipped=17)]})
+        self.assertEqual(len(found), 2)
+        by_cap = {item["capacity"]: item for item in found}
+        self.assertEqual((by_cap["T"]["attempt"], by_cap["T"]["attempt_total"],
+                          by_cap["T"]["successful"], by_cap["T"]["skipped"]),
+                         (67117, 400000, 67096, 21))
+        self.assertEqual(by_cap["T"]["schedule_epoch"]["current"], 4)
+        self.assertEqual(by_cap["T"]["loss_kind"], "last-batch")
+        for item in found:
+            self.assertTrue(item["remote"])
+            self.assertEqual(item["host"], "cnn")
+            self.assertEqual(item["config_ref"], "config:scratch_t.json")
+            self.assertIsNotNone(item["production_origin"])
+
+    def test_counter_config_and_local_shapes_fail_soft(self):
+        good = self.arm("T")
+        bad_counter = self.arm("B", pid=3945451, start=565464078,
+                               run="b_baseline_20261006", gpu=1,
+                               successful=67100, skipped=18)
+        bad_config = self.arm("T", pid=3945452, start=565464079)
+        bad_config["production"] = {**bad_config["production"]}
+        bad_config["production"]["config_sha256"] = "0" * 64
+        plain = {"name": "first", "state": "training-updates",
+                 "directory": str(self.root), "config_sha256": self.digest,
+                 "process_identity": {"pid": 42, "starttime": 11,
+                                      "cmdline_sha256": "b" * 64}}
+        found = self.collect_remote({"arms": [good, bad_counter, bad_config, plain]})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["capacity"], "T")
+
+    def test_same_pid_on_other_hosts_stays_host_qualified(self):
+        first = self.arm("T", pid=42, start=11)
+        second = self.arm("B", pid=42, start=11, host="moving4",
+                          run="b_baseline_20261006", gpu=1)
+        found = self.collect_remote({"arms": [first, second]})
+        self.assertEqual([(item["host"], item["pid"]) for item in found],
+                         [("cnn", 42), ("moving4", 42)])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -148,11 +148,18 @@ def with_training_progress(snapshot, resource_jobs=(), now=None):
     The resource collector has already bound config/progress bytes to a stable
     wrapper and child. A fresh self-host GPU sample must still name that exact
     child. Heartbeat freshness never resets the progress file's age.
+
+    Remote production arms ride along as display-only candidates (no
+    live/done claim) and join only their own non-self host, keyed by exact
+    host-qualified pid/start plus command hash when both sides carry it. Same
+    pid on another host, euid-gated absence, or any mismatch fails soft back
+    to the raw probe line. Verified local training always wins its own host.
     """
     if not isinstance(snapshot, dict) or snapshot.get("error"):
         return snapshot
     now = time.time() if now is None else now
     matches = {}
+    remote_matches = {}
     for job in resource_jobs or ():
         training = getattr(job, "training_progress", None)
         if getattr(job, "liveness", None) != "working" or not isinstance(training, dict):
@@ -172,17 +179,39 @@ def with_training_progress(snapshot, resource_jobs=(), now=None):
             matches[key] = None
         else:
             matches.setdefault(key, training)
+        for candidate in getattr(job, "remote_training", None) or ():
+            if not isinstance(candidate, dict) or candidate.get("remote") is not True:
+                continue
+            host = candidate.get("host")
+            if not isinstance(host, str) or not host:
+                continue
+            seen = candidate.get("observed_at")
+            changed = candidate.get("progress_updated_at")
+            if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                       and math.isfinite(value) for value in (seen, changed)) \
+                    or not 0 <= now - seen <= 30:
+                continue
+            remote_key = (host, candidate.get("pid"), str(candidate.get("starttime")))
+            if not _pos_int(remote_key[1]):
+                continue
+            if remote_key in remote_matches and remote_matches[remote_key] != candidate:
+                remote_matches[remote_key] = None
+            else:
+                remote_matches.setdefault(remote_key, candidate)
     hosts = []
     for host in snapshot.get("hosts") or ():
         if not isinstance(host, dict):
             hosts.append(host)
             continue
         observed = host.get("observed_at", snapshot.get("observed_at"))
-        if host.get("self") is not True or host.get("reachable") is not True \
+        if host.get("reachable") is not True \
                 or not isinstance(observed, (int, float)) or isinstance(observed, bool) \
                 or not math.isfinite(observed) or not 0 <= now - observed <= 30:
             hosts.append(host)
             continue
+        is_self = host.get("self") is True
+        names = {value for value in (host.get("host"), host.get("hostname"))
+                 if isinstance(value, str) and value}
         gpus = []
         for gpu in host.get("gpus") or ():
             if not isinstance(gpu, dict):
@@ -193,7 +222,10 @@ def with_training_progress(snapshot, resource_jobs=(), now=None):
                 training = None
                 if isinstance(process, dict) and _pos_int(process.get("pid")) \
                         and _pos_int(process.get("pgid")):
-                    training = matches.get((process["pid"], str(process.get("proc_start")), process["pgid"]))
+                    if is_self:
+                        training = matches.get((process["pid"], str(process.get("proc_start")), process["pgid"]))
+                    else:
+                        training = _remote_hit(remote_matches, names, process)
                 if training is not None:
                     training = dict(training)
                     training["progress_age_s"] = max(0.0, now - training["progress_updated_at"])
@@ -205,6 +237,33 @@ def with_training_progress(snapshot, resource_jobs=(), now=None):
             gpus.append({**gpu, "processes": processes})
         hosts.append({**host, "gpus": gpus})
     return {**snapshot, "hosts": hosts}
+
+
+def _remote_hit(remote_matches, names, process):
+    """One display candidate for this exact remote process, else None.
+
+    Host-qualified pid/start, plus command-hash equality when both sides
+    carry one. Distinct observations for one process stay ambiguous (None);
+    a process the probe could not read as its own user (`command` absent
+    under the host-local euid gate) never joins.
+    """
+    if process.get("command") is None:
+        return None
+    found = []
+    for name in names:
+        hit = remote_matches.get((name, process["pid"], str(process.get("proc_start"))))
+        if hit is not None and all(hit != prior for prior in found):
+            found.append(hit)
+    if len(found) != 1:
+        return None
+    candidate = found[0]
+    probe_hash = process.get("command_hash")
+    candidate_hash = candidate.get("command_hash")
+    if isinstance(probe_hash, str) and probe_hash \
+            and isinstance(candidate_hash, str) and candidate_hash \
+            and probe_hash != candidate_hash:
+        return None
+    return candidate
 
 
 def unregistered_gpu(snapshot, resource_jobs=(), shown_sessions=frozenset(), age_s=0.0):

@@ -832,6 +832,20 @@ def proc_cmdline_sha256(pid):
     return hashlib.sha256(raw).hexdigest()
 
 
+def process_command_hash(pid, expected_start):
+    # Full-cmdline sha256 across one same-EUID, stable pid/start observation.
+    # Matches producer cmdline_sha256 for the host-qualified training join;
+    # any instability fails soft to None (the join allows a missing hash).
+    before = proc_stat(pid)
+    if (before is None or before["start"] != expected_start or not same_euid(pid)):
+        return None
+    digest = proc_cmdline_sha256(pid)
+    after = proc_stat(pid)
+    if (after is None or after["start"] != expected_start or not same_euid(pid)):
+        return None
+    return digest
+
+
 def cpu_sample(cpu_count=None):
     def read():
         rows = {}
@@ -1808,6 +1822,8 @@ else:
             "process_name": process_name or None, "used_memory_mib": integer(used),
             "command": process_command(pid, stat["start"], process_name)
             if stat is not None else command_text([process_name]),
+            "command_hash": process_command_hash(pid, stat["start"])
+            if stat is not None else None,
             "owner": owner, "attribution_reason": reason,
             "pgid": stat["pgid"] if stat is not None else None,
             "cwd": process_cwd(pid, stat["start"]) if stat is not None else None,

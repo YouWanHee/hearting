@@ -610,6 +610,10 @@ class ResourceJob:
     source_git_state: Optional[str] = None
     started_at: Optional[float] = None
     training_progress: Optional[dict] = None
+    # Display-only remote production candidates (no liveness verdict); joined
+    # to non-self compute hosts by host-qualified identity, never consumed as
+    # local proof. Emitted by the registry scanner, hence a pinned field.
+    remote_training: Optional[list] = None
     # Tracked-workflow projection (OPERATIONS §5.12): a resource row exposes why it
     # ended, which registered attempt owns it, and what the workflow thinks it is.
     workflow_state: Optional[str] = None

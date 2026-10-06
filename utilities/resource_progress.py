@@ -306,3 +306,139 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
     except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError,
             OverflowError, subprocess.SubprocessError):
         return None
+
+
+def _read_unrooted(path):
+    """Bounded regular-file read without a containing root.
+
+    Display-only path for remote production configs, which live outside the
+    run root. Same size/stability guards as `_read`, no root pinning, no
+    liveness meaning: hash equality against the producer declaration is still
+    required by the caller.
+    """
+    raw = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(raw, "rb") as stream:
+        first = os.fstat(stream.fileno())
+        if not stat.S_ISREG(first.st_mode) or first.st_size > MAX_BYTES:
+            raise ValueError("remote-not-bounded-file")
+        data = stream.read(MAX_BYTES + 1)
+        last = os.fstat(stream.fileno())
+    if len(data) > MAX_BYTES or _signature(first) != _signature(last):
+        raise ValueError("remote-changed-during-read")
+    return data, last.st_mtime
+
+
+def remote_candidates(run, registry, now):
+    """Display-only remote production arms; never a liveness verdict.
+
+    Preserves the indexed bridge's recognized remote arms as joinable display
+    candidates without any local /proc lookup and without treating metadata
+    as live/done proof. Each candidate binds the producer-declared identity
+    (host-qualified pid/start/command hash), the NAS-readable progress file
+    under the run root, and the hash-checked config outside it. Anything
+    missing, mismatched, or raced fails soft to `[]`; the caller joins each
+    candidate to its own host/GPU independently, never through the local
+    single-candidate shape. `run` reserves wrapper context and is unused.
+    """
+    found = []
+    try:
+        root = Path(registry).parent.resolve(strict=True)
+        metadata_bytes, metadata_mtime = _read(root / "run.json", root)
+        metadata = _json(metadata_bytes)
+        arms = metadata.get("arms", [metadata])
+        if not isinstance(arms, list) or not 0 < len(arms) <= MAX_ARMS:
+            return []
+        for arm in arms:
+            try:
+                view, remote = _arm_production_view(arm)
+                if view is None or not remote:
+                    continue
+                identity = view["identity"]
+                pid = identity.get("pid")
+                starttime = identity.get("starttime")
+                command_hash = identity.get("command_hash") \
+                    or identity.get("cmdline_sha256")
+                host = (view["origin"] or {}).get("host")
+                if not isinstance(host, str) or not host:
+                    receipt = arm.get("compute_host_receipt") \
+                        if isinstance(arm, dict) else None
+                    host = receipt.get("host") if isinstance(receipt, dict) else None
+                if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 \
+                        or starttime in (None, "") \
+                        or not isinstance(command_hash, str) or not command_hash \
+                        or not isinstance(host, str) or not host:
+                    continue
+                directory = view["directory"]
+                if not isinstance(directory, str) or not directory:
+                    continue
+                directory = Path(directory)
+                if not directory.is_absolute():
+                    directory = root / directory
+                progress_path = directory / "progress.json"
+                data, progress_mtime = _read(progress_path, root)
+                progress = _json(data)
+                attempt, successful, skipped = (
+                    progress.get(key) for key in ("attempt", "successful", "skipped"))
+                if not all(_count(value) for value in (attempt, successful, skipped)) \
+                        or attempt != successful + skipped:
+                    continue
+                production = arm.get("production") if isinstance(arm, dict) else None
+                argv = production.get("command") if isinstance(production, dict) else None
+                if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+                    continue
+                reference = _config_argument(argv)
+                if reference is None:
+                    continue
+                config_path = Path(reference)
+                if not config_path.is_absolute():
+                    continue
+                config_bytes, _ = _read_unrooted(config_path)
+                digest = hashlib.sha256(config_bytes).hexdigest()
+                if digest != _hash(view["config_sha256"]):
+                    continue
+                config = _json(config_bytes)
+                training = config.get("training")
+                total = training.get("attempts") if isinstance(training, dict) else None
+                if not _count(total) or total <= 0 or attempt > total:
+                    continue
+                epoch = _schedule_epoch(training, attempt, total)
+                last = progress.get("last")
+                loss = None
+                if isinstance(last, dict) and _count(last.get("attempt")) \
+                        and last["attempt"] == attempt:
+                    metrics = last.get("metrics")
+                    value = metrics.get("loss") if isinstance(metrics, dict) else None
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                            and math.isfinite(value):
+                        loss = value
+                found.append({
+                    "remote": True, "host": host,
+                    "pid": pid, "starttime": starttime, "command_hash": command_hash,
+                    "phase": view["state"], "arm": view["name"],
+                    "attempt": attempt, "attempt_total": total,
+                    "percent": attempt * 100.0 / total,
+                    "successful": successful, "skipped": skipped,
+                    "loss": loss, "loss_kind": "last-batch" if loss is not None else None,
+                    "observed_at": float(now), "progress_updated_at": progress_mtime,
+                    "progress_age_s": max(0.0, float(now) - progress_mtime),
+                    "metadata_path": str(root / "run.json"),
+                    "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+                    "metadata_updated_at": metadata_mtime,
+                    "progress_path": str(progress_path),
+                    "progress_sha256": hashlib.sha256(data).hexdigest(),
+                    "config_path": str(config_path),
+                    "config_ref": "config:" + config_path.name,
+                    "config_sha256": digest,
+                    "production_origin": view["origin"],
+                    "compute_run_id": (view["origin"] or {}).get("compute_run_id"),
+                    "run_id": (view["origin"] or {}).get("run_id"),
+                    "capacity": (view["origin"] or {}).get("capacity"),
+                    "gpu_index": (view["origin"] or {}).get("gpu_index"),
+                    **({"schedule_epoch": epoch} if epoch is not None else {}),
+                })
+            except (OSError, ValueError, TypeError, KeyError, IndexError,
+                    OverflowError):
+                continue
+    except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError):
+        return []
+    return found
