@@ -541,7 +541,7 @@ canonical dispatch state root (the registry's parent directory, SD-112
 §13.33.2 — never a release-relative path; SD-16 usage-check cache), and
 surfaces `early_death=`/`row_closed=` on stdout. No retry — detection,
 closure, and surfacing only; re-dispatch/harness failover is the orchestrator's semantic
-zone (⑧). `adapters/codex/bin/dispatch-liveness.py` adds a `LIMIT_RE` log-tail scan (axis 6,
+zone (⑧). `adapters/codex/bin/dispatch-liveness.py` adds the shared `route_authority.scan_anchored_death` log-tail scan (axis 6,
 SD-15b) that judges an open row DEAD when its dispatch log shows a limit/auth pattern,
 independent of transcript mtime. **Parity note vs OpenCode**: codex `exec` exits non-zero on
 retry exhaustion (openai/codex#9148·#12677), so the launch early-exit-watch axis is realized;

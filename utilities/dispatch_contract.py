@@ -466,11 +466,6 @@ FOREGROUND_FAILURES = frozenset({
 # The fixed failure words; `exit-N`/`signal-N` are validated separately.
 _FOREGROUND_FIXED_FAILURES = FOREGROUND_FAILURES - {"none"}
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
-_CAPACITY_TERMINAL_RE = re.compile(
-    r"(?:error\s*[:\-]\s*)?(?:selected\s+)?model(?:\s+[A-Za-z0-9._:/-]+)?\s+"
-    r"(?:is\s+)?at\s+capacity[.!]?",
-    re.I,
-)
 
 
 def codex_standard_owner_network_enabled(
@@ -529,39 +524,8 @@ REPLICA_RESERVATION_ROW_KEYS = (
 )
 
 
-def anchored_capacity_failure(text: str) -> bool:
-    """Accept only a terminal capacity error, never prose discussing one.
-
-    Adapters may emit either a plain CLI line or a JSON event.  The bounded
-    last-three-line rule is shared by the early wrapper watch and the SD-58
-    foreground watchdog so delayed failures receive the same classification.
-    """
-
-    def terminal(value: str) -> bool:
-        return bool(_CAPACITY_TERMINAL_RE.fullmatch(value.strip()))
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()][-3:]
-    for line in lines:
-        if len(line) > 200:
-            continue
-        if terminal(line):
-            return True
-        try:
-            payload = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        pending = [payload]
-        while pending:
-            item = pending.pop()
-            for key, value in item.items():
-                if isinstance(value, dict):
-                    pending.append(value)
-                elif key in {"message", "error", "detail"} and isinstance(value, str) and terminal(value):
-                    return True
-    return False
-
+# One copy of the terminal capacity judgment (route_authority); the name stays for readers.
+from route_authority import anchored_capacity_failure  # noqa: E402,F401
 
 def resolve_agent_home(runtime_pointer: str | Path | None = None) -> Path:
     """Validated AGENT_HOME (source root) resolution shared by every consumer

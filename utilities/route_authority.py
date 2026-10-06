@@ -19,6 +19,7 @@ without a cycle; heavier collaborators are imported where they are used.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -372,6 +373,93 @@ def pass_blocker_violation(verdict, blocker) -> str | None:
     any other blocker text breaks the contract."""
     if verdict == "PASS" and pass_blocker_note(blocker) is None:
         return "pass-blocker-not-none"
+    return None
+
+
+# A worker that died at a usage limit, an auth failure or a provider's capacity
+# prints one terse line at the end of its log. This one ordered table classifies it
+# for every harness, at launch (the wrapper's early watch) and later (liveness);
+# the first match wins and the label becomes the `dead-<label>` note.
+DEATH_PATTERNS = (
+    ("capacity", r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b"),
+    ("network-operation-not-permitted", r"operation not permitted|network is unreachable|network access denied"),
+    ("session-limit", r"hit your (?:session|usage) limit|session limit reached"),
+    ("usage-limit", r"usage[_ ]limit[_ ]reached|usage limit reached|weekly limit|"
+     r"rate limit(?:ed)?|provider rate limit|exceeded retry limit|\b429\b"),
+    ("auth", r"invalid api key|authentication_error|not logged in|please run /login|unauthorized|\b401\b"),
+    ("credit", r"credit balance is too low|insufficient (?:credit|quota|funds)"),
+    ("permission-reject", r"permission requested:.*auto-rejecting"),
+)
+_RESET_RE = re.compile(
+    r"resets?(?:\s+at)?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{1,2}\s*(?:am|pm))",
+    re.I,
+)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_CAPACITY_TERMINAL_RE = re.compile(
+    r"(?:error\s*[:\-]\s*)?(?:selected\s+)?model(?:\s+[A-Za-z0-9._:/-]+)?\s+"
+    r"(?:is\s+)?at\s+capacity[.!]?",
+    re.I,
+)
+
+
+def scan_death(text: str) -> tuple[str, str] | None:
+    """``(label, reset)`` when the text shows a limit/auth death, else None.
+
+    ``reset`` is a best-effort human string ('3pm', '15:45', ...) or '' when absent.
+    """
+    low = text.lower()
+    label = next((name for name, pattern in DEATH_PATTERNS if re.search(pattern, low)), "")
+    if not label:
+        return None
+    match = _RESET_RE.search(text)
+    return label, (re.sub(r"\s+", "", match.group(1)) if match else "")
+
+
+def anchored_capacity_failure(text: str) -> bool:
+    """Accept only a terminal capacity error, never prose discussing one.
+
+    Adapters may emit either a plain CLI line or a JSON event.  The bounded
+    last-three-line rule is shared by the early wrapper watch and the SD-58
+    foreground watchdog so delayed failures receive the same classification.
+    """
+
+    def terminal(value: str) -> bool:
+        return bool(_CAPACITY_TERMINAL_RE.fullmatch(value.strip()))
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()][-3:]
+    for line in lines:
+        if len(line) > 200:
+            continue
+        if terminal(line):
+            return True
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        pending = [payload]
+        while pending:
+            item = pending.pop()
+            for key, value in item.items():
+                if isinstance(value, dict):
+                    pending.append(value)
+                elif key in {"message", "error", "detail"} and isinstance(value, str) and terminal(value):
+                    return True
+    return False
+
+
+def scan_anchored_death(text: str) -> tuple[str, str] | None:
+    """Inspect only terse terminal CLI lines, never completion-report prose: the last
+    three non-empty lines, each at most 200 characters once colors are removed."""
+    for line in [line.strip() for line in text.splitlines() if line.strip()][-3:]:
+        if len(ANSI_RE.sub("", line)) > 200:
+            continue
+        death = scan_death(line)
+        if death:
+            if death[0] == "capacity" and not anchored_capacity_failure(line):
+                continue
+            return death
     return None
 
 
