@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, types, unittest
+import contextlib, errno, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, types, unittest
 from unittest import mock
 from pathlib import Path
 
@@ -4478,6 +4478,68 @@ class ResidueDrainRefreshTest(unittest.TestCase):
    result=D.resolve_residue_drain(self.jobs,self.attempt,apply=True)
   self.assertEqual((result["state"],result["changed"],result["reason"]),
                    ("drained",False,"residue-row-changed"))
+
+
+class DrainReceiptDeniedEnvironTest(unittest.TestCase):
+ """A same-UID process born after a drained attempt whose environment cannot be read
+ (one exiting, an sshd session) is outside that attempt once the watcher sealed it
+ drained; the sealed receipt is not undone by the current process table."""
+
+ def setUp(self):
+  proc=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],start_new_session=True)
+  identity=dict(D.process_launch_identity(proc.pid),pgid=str(proc.pid),
+                attempt_id="att-drained-denied-environ",launch_lifecycle="detached")
+  proc.terminate();proc.wait(timeout=5)
+  self.plain=identity
+  self.sealed=dict(identity,launch_outcome="governed-process-group-drained",
+                   group_reap_proof=D.GROUP_REAP_PROOF,group_reap_pgid=identity["pgid"],
+                   attempt_descendant_proof=D.ATTEMPT_DESCENDANT_PROOF,
+                   attempt_descendant_observer_ns=identity["pid_observer_ns"])
+  self.assertTrue(D._detached_group_drain_receipt(self.sealed))
+  # Born after the attempt: the old rule could only place earlier births outside.
+  self.late=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"])
+  self.addCleanup(self.late.wait,5);self.addCleanup(self.late.terminate)
+
+ def denied(self,error=errno.EACCES):
+  real=Path.read_bytes
+  target=f"/proc/{self.late.pid}/environ"
+  def read_bytes(path):
+   if str(path)==target:
+    raise PermissionError(error,"denied") if error in {errno.EACCES,errno.EPERM} else OSError(error,"io")
+   return real(path)
+  return mock.patch.object(Path,"read_bytes",read_bytes)
+
+ def test_a_sealed_drain_is_not_undone_by_a_later_unreadable_environment(self):
+  with self.denied():
+   self.assertEqual(D.attempt_tagged_descendants(self.sealed).state,"empty")
+   for terminal in (True,False):
+    verdict=D.attempt_process_quiescence(self.sealed,terminal_receipt=terminal)
+    self.assertEqual(verdict.state,"quiescent",(terminal,verdict))
+    self.assertEqual(verdict.reason,D._attempt_process_quiescence_impl(self.sealed).reason)
+
+ def test_without_the_receipt_the_same_process_stays_unverifiable(self):
+  with self.denied():
+   probe=D.attempt_tagged_descendants(self.plain)
+   self.assertEqual((probe.state,probe.reason),
+                    ("unverifiable",f"procfs-environ:{self.late.pid}:same-uid-unobservable"))
+   residue=dict(self.sealed,attempt_descendant_proof=D.ATTEMPT_DESCENDANT_RESIDUE_PROOF)
+   self.assertEqual(D.attempt_tagged_descendants(residue).state,"unverifiable")
+
+ def test_a_readable_tag_is_live_and_another_error_stays_unverifiable(self):
+  tagged=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
+                          env=dict(os.environ,**{D.ATTEMPT_DESCENDANT_ENV:self.sealed["attempt_id"]}))
+  try:
+   with self.denied():
+    verdict=D.attempt_process_quiescence(self.sealed,terminal_receipt=True)
+    self.assertEqual((verdict.state,verdict.reason,verdict.pid),("live","attempt-descendant-live",tagged.pid))
+  finally:
+   tagged.terminate();tagged.wait(timeout=5)
+  with self.denied(errno.EIO):
+   probe=D.attempt_tagged_descendants(self.sealed)
+   self.assertEqual((probe.state,probe.reason),
+                    ("unverifiable",f"procfs-environ:{self.late.pid}:{errno.EIO}"))
+   self.assertEqual(D.attempt_process_quiescence(self.sealed,terminal_receipt=True).reason,
+                    "attempt-descendant-unverifiable")
 
 
 class CancellationReceiptWedgeTest(unittest.TestCase):

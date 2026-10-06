@@ -1711,19 +1711,60 @@ def recovery_instructions(args):
             'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. '
             'Keep existing human answers and gate releases; do not ask the same scope again. '
             'Preserve the original failure and report any second failure as needs-attention.\n')
-    gate = (record.get('proof') or {}).get('parked_gate')
-    if gate:
-        from parent_next_directive import entrypoint
-        read = shlex.join([sys.executable, entrypoint(ROOT, 'utilities/workflow-supervisor.py'), 'await-release',
-                           '--route', record['route_file'], '--gate', gate, '--jobs', str(jobs),
-                           '--max', '0', '--answers-out']) + ' <file>'
-        text += (f'The original owner stopped at human gate {gate} (raise epoch {record["proof"].get("gate_epoch")}); '
-                 'a person released it with proceed. '
-                 f'Read the recorded answers with: {read} '
-                 f'Do not raise {gate} again. Continue from the node it gated through the remaining declared stages.\n')
-    if kind == CORRECTED:
-        text += _correction_context(jobs, prior, record['proof'])
+    # A replacement that never started showed its answers and gate to no model,
+    # so the attempt that takes its place carries them as they were.
+    carried = _unstarted_replacement_claim(jobs, prior) if kind == 'unlaunched' else None
+    carried_proof = (carried or {}).get('proof') or {}
+    if not (carried_proof.get('parked_gate') or carried_proof.get('death_kind') == CORRECTED):
+        carried = None
+    if carried is not None:
+        text += (f'{prior} was itself the continuation of {carried["original_attempt_id"]}; '
+                 'what that continuation was given follows.\n')
+    for claim, answered in ((record, prior), (carried, carried and carried['original_attempt_id'])):
+        proof = (claim or {}).get('proof') or {}
+        if proof.get('parked_gate'):
+            text += _gate_context(jobs, claim)
+        if proof.get('death_kind') == CORRECTED:
+            if claim is carried:
+                text += (f'The owner {answered} ended BLOCKED and a person has answered it; '
+                         'that answer is for this work.\n')
+            text += _correction_context(jobs, answered, proof)
     return text + CONTINUATION_WAIT_NOTE
+
+
+def _gate_context(jobs, record):
+    gate = record['proof']['parked_gate']
+    from parent_next_directive import entrypoint
+    read = shlex.join([sys.executable, entrypoint(ROOT, 'utilities/workflow-supervisor.py'), 'await-release',
+                       '--route', record['route_file'], '--gate', gate, '--jobs', str(jobs),
+                       '--max', '0', '--answers-out']) + ' <file>'
+    return (f'The original owner stopped at human gate {gate} (raise epoch {record["proof"].get("gate_epoch")}); '
+            'a person released it with proceed. '
+            f'Read the recorded answers with: {read} '
+            f'Do not raise {gate} again. Continue from the node it gated through the remaining declared stages.\n')
+
+
+def _unstarted_replacement_claim(jobs, aid):
+    """The claim that created replacement ``aid``, when ``aid`` closed before it spawned;
+    through a run of such replacements, the first claim that is not itself `unlaunched`."""
+    try:
+        rows = _rows(Path(jobs).read_text().splitlines())
+    except (OSError, DC.DispatchContractError):
+        return None
+    for _ in range(8):
+        meta = (rows.get(aid) or ((), {}))[1]
+        family = meta.get('replacement_family_id', '')
+        if (not meta.get('replacement_original_attempt_id') or meta.get('pid')
+                or meta.get('launch_outcome') != 'never-launched' or meta.get('launch_claimed') != '0'
+                or not re.fullmatch(r'[0-9a-f]{64}', family)):
+            return None
+        claim = _check_record(_read(_record_path(jobs, family)), family)
+        if claim['replacement_attempt_id'] != aid:
+            return None
+        if (claim.get('proof') or {}).get('death_kind') != 'unlaunched':
+            return claim
+        aid = claim['original_attempt_id']
+    return None
 
 
 def _correction_context(jobs, prior, proof):
