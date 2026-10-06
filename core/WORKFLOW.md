@@ -414,7 +414,7 @@ fields and this order. In Korean, the canonical card is:
 ```
 
 When the runtime exposes a native structured-question surface (Claude
-`AskUserQuestion`, Codex `request_user_input`), deliver this confirmation
+`AskUserQuestion`, Codex `request_user_input`, OpenCode `question`), deliver this confirmation
 through it: the five confirmation fields form the question body; the optional
 start-approval line is scope metadata, and the options are exactly
 진행 (recommended) / 수정 / 중단. The plain-text card above is the fallback when
@@ -454,15 +454,16 @@ intent, decision record, or work request; no owner asks for another entry
 approval mid-run. New compiles finish their chosen scope without an intermediate
 approval wait. Existing sealed routes retain their gates and continuation.
 
-**Small-work notice (SD-136).** When the compiled route is `direct` or `solo`
-(`quick`) and its sealed `small_work_confirmation` is `notice` — the shipped
-default, `profiles/dispatch-defaults.yaml` `confirmation.small_work` — the
-blocking card above is replaced by one non-blocking line: the `[경로]` line
+**Small-work confirmation (SD-136).** User-authored turns receive the card even
+for `direct` or `solo` (`quick`). A received peer envelope (the existing
+`(peer-from: …)` trailer or notice path) uses one non-blocking `[경로]` line
 `compose` prints (capability · shape · route id · human gates) plus one clause
-of scope, and the work proceeds in the same turn. The card stays blocking,
+of scope and proceeds in the same turn; a steward cannot approve for the user.
+`confirmation.small_work` and its sealed value retain their existing route
+metadata meaning, without changing this distinction. The card stays blocking,
 whatever the sealed value, when the work is destructive (data, history, or
 worktree loss), mutates an external system, deploys, or the user asked to be
-asked. `card` restores the blocking card for every small route. The
+asked. The
 route-participation invariant below is unchanged: notice or card, source work
 still needs the bound route, and the 0–1 / 1–3 inline questions of the frame
 interview (below) are asked only when they exist. A current or immediately preceding user
@@ -524,7 +525,8 @@ card and the interview. User approval precedes the owner and the §0.4 notice:
 → 진행(권장) / 수정: <틀린 부분> / 중단
 ```
 
-Deliver this card through a native structured-question surface when one is
+Deliver this card through the native question tool (Claude `AskUserQuestion`,
+Codex `request_user_input`, OpenCode `question`) when one is
 available, the plain-text form otherwise — the same fallback rule as the §0.4
 card. Only once the direction is confirmed does the owner start, and the §0.4
 gate then arrives as a non-blocking `[실행 통지]` — the same five fields, in
@@ -547,7 +549,8 @@ itself, in this order, and never leaves it to a helper:
 1. Ask first whether the restatement is right — that sentence, verbatim,
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
-3. Ask each interview question through the native question tool, one topic
+3. Ask each interview question through the native question tool (Claude
+   `AskUserQuestion`, Codex `request_user_input`, OpenCode `question`), one topic
    per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
    into harness vocabulary, and never add questions the interview does not

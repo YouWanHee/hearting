@@ -2208,11 +2208,11 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         """SD-122 (11): every pane prompt goes through `peer-steward.py prompt` so
         the ledger row exists -- herdr's server log keeps no target and no
         caller. Asserted over the repo's code (not docs/tests): any other
-        `herdr agent prompt|send-keys` / `herdr pane send-text|send-keys|run`
+        `herdr agent prompt|send-keys` / `herdr pane send-text|send-keys|run|close`
         caller is a defect. Census 2026-09-06: 0 outside this module."""
         import re
         root = (_HERE / "..").resolve()
-        pattern = re.compile(r"herdr[\"', \[]+(agent|pane)[\"', ]+(prompt|send-text|send-keys|run)\b")
+        pattern = re.compile(r"herdr[\"', \[]+(agent|pane)[\"', ]+(prompt|send-text|send-keys|run|close)\b")
         offenders = []
         for path in root.rglob("*"):
             if path.suffix not in {".py", ".sh", ".js", ".mjs", ".ts", ".toml", ".yaml", ".json"}:
@@ -3038,6 +3038,452 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
              mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
             rc = peer_steward.main(["continue", "w1:pX", "--request", str(self.path)])
         self.assertEqual((rc, printed[-1]), (1, "continued=failed reason=herdr-not-found"))
+
+
+
+class BesideStartTest(_TmpRootMixin, unittest.TestCase):
+    def test_same_tab_right_no_focus_split_reuses_start_with_new_pane_and_cwd(self):
+        calls = []
+        cwd = str(self.tmp_root)
+
+        def run(argv, **kw):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False,
+                                                          "tab_id": "w1:tA"}}})
+            if argv[:3] == ["herdr", "agent", "start"]:
+                return _herdr_json({"result": {"agent": {"agent": "claude", "name": "new",
+                    "pane_id": "w1:pN", "agent_session": {"value": "new-native-sid"}}}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None) as ingress, \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="recorded screen"), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["start", "new", "--kind", "claude", "--beside", "w1:pOld",
+                                   "--cwd", cwd, "--permission-mode", "inherit", "--", "--model", "opus"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0], ["herdr", "pane", "split", "--pane", "w1:pOld", "--direction",
+                                   "right", "--no-focus", "--cwd", cwd])
+        self.assertEqual(calls[1], ["herdr", "agent", "start", "new", "--kind", "claude",
+                                   "--pane", "w1:pN", "--", "--model", "opus"])
+        ingress.assert_called_once_with("w1:pN", "claude", cwd)
+        self.assertIn("started=true", printed.call_args[0][0])
+        self.assertIn("pane=w1:pN", printed.call_args[0][0])
+
+    def test_split_failure_malformed_focused_or_same_pane_never_starts_or_types(self):
+        cases = [subprocess.CompletedProcess([], 1, stdout="", stderr="denied"),
+                 subprocess.CompletedProcess([], 0, stdout="null", stderr=""),
+                 _herdr_json({"error": {"code": "pane_not_found"}}),
+                 _herdr_json({"result": {"pane": {"pane_id": "w1:pOld", "focused": False}}}),
+                 _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": True}}}),
+                 _herdr_json({"result": {"pane": {"pane_id": "w1:pN"}}})]
+        for response in cases:
+            with self.subTest(response=response), \
+                 mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=response) as run, \
+                 mock.patch.object(peer_steward, "_ensure_pane_ingress") as ingress, \
+                 mock.patch("builtins.print") as printed:
+                rc = peer_steward.main(["start", "new", "--kind", "codex", "--beside", "w1:pOld"])
+                self.assertEqual(rc, 1)
+                self.assertEqual(run.call_count, 1)
+                ingress.assert_not_called()
+                self.assertIn("started=false reason=pane-split-failed", printed.call_args[0][0])
+
+    def test_non_json_start_failure_has_bounded_reason_and_closes_only_owned_empty_split(self):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+            if argv[:3] == ["herdr", "agent", "start"]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="\x1b[31mError: name too long\x1b[0m\n" + "secret second line")
+            if argv[:3] == ["herdr", "pane", "close"]:
+                return _herdr_json({"result": {"type": "ok"}})
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {"pane_id": "w1:pN", "shell_pid": 101,
+                    "foreground_process_group_id": 101, "foreground_processes": [{"pid": 101}]}}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="recorded screen"), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+             mock.patch.object(peer_steward, "_start_pane_screen", return_value="recorded screen"), \
+             mock.patch("builtins.print") as printed:
+            peer_steward.main(["start", "too-long", "--kind", "claude", "--beside", "w1:pOld"])
+        self.assertIn("started=false", printed.call_args[0][0])
+        self.assertIn("reason=herdr-stderr-error-name-too-long", printed.call_args[0][0])
+        self.assertIn("pane_cleanup=closed", printed.call_args[0][0])
+        self.assertNotIn("secret", printed.call_args[0][0])
+        self.assertEqual(calls[-1], ["herdr", "pane", "close", "w1:pN"])
+        self.assertFalse(any(a[:3] == ["herdr", "pane", "close"] and a[-1] == "w1:pOld" for a in calls))
+
+    def test_failed_cleanup_refuses_agent_changed_shell_unknown_or_draft(self):
+        for occupied, shell, prompt in (("pane-occupied", (101, "700"), True),
+                                        ("pane-unknown", (101, "700"), True),
+                                        (None, (101, "701"), True),
+                                        (None, None, True), (None, (101, "700"), False)):
+            clock = iter(range(20))
+            with self.subTest(occupied=occupied, shell=shell, prompt=prompt), \
+                 mock.patch.object(peer_steward, "_pane_has_agent", return_value=occupied), \
+                 mock.patch.object(peer_steward, "_start_shell_identity", return_value=shell), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", return_value="701" if shell == (101, "701") else "700"), \
+                 mock.patch.object(peer_steward, "_retire_pane_info", return_value=None if shell is None else {"shell_pid": 101}), \
+                 mock.patch.object(peer_steward, "_start_pane_screen", return_value="recorded screen" if prompt else "changed screen"), \
+                 mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+                 mock.patch.object(peer_steward.time, "sleep"), \
+                 mock.patch.object(peer_steward, "_close_pane") as close:
+                self.assertEqual(peer_steward._failed_start_cleanup("w1:pN", (101, "700"), "recorded screen"), "retained")
+                close.assert_not_called()
+
+    def test_existing_pane_failure_never_cleans_up_and_stderr_is_bounded(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 1, stdout="", stderr="Error: duplicate name\n")) as run, \
+             mock.patch.object(peer_steward, "_failed_start_cleanup") as cleanup, mock.patch("builtins.print") as printed:
+            peer_steward.main(["start", "old", "--kind", "claude", "--pane", "w1:pOld"])
+            self.assertIn("reason=herdr-stderr-error-duplicate-name", printed.call_args[0][0])
+            cleanup.assert_not_called(); self.assertEqual(run.call_count, 1)
+        code = peer_steward._start_stderr_code("Error: " + "long\tvalue\x00" * 100 + "\n")
+        self.assertLessEqual(len(code.encode()), 80)
+        self.assertRegex(code, r"^[a-z0-9_-]+$")
+
+    def test_failed_fresh_start_waits_for_same_shell_then_closes_once(self):
+        clock = iter(range(20))
+        with mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value={"shell_pid": 101}), \
+             mock.patch.object(peer_steward, "_start_shell_identity", side_effect=[None, (101, "700"), (101, "700")]), \
+             mock.patch.object(peer_steward, "_start_pane_screen", return_value="recorded screen"), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+             mock.patch.object(peer_steward.time, "sleep") as pause, \
+             mock.patch.object(peer_steward, "_close_pane", return_value=True) as close:
+            self.assertEqual(peer_steward._failed_start_cleanup("w1:pN", (101, "700"), "recorded screen"), "closed")
+            pause.assert_called_once()
+            close.assert_called_once_with("w1:pN")
+
+    def test_fresh_snapshot_requires_two_stable_nonblank_reads_and_same_shell(self):
+        cases = [(["recorded screen", "recorded screen"], "recorded screen"),
+                 (["", "recorded screen", "recorded screen"], "recorded screen"),
+                 ([""] * 100, None), ([str(i) for i in range(100)], None), ([None], None)]
+        for screens, expected in cases:
+            clock = iter(i / 100 for i in range(1000))
+            with self.subTest(screens=screens[:3]), \
+                 mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
+                 mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+                 mock.patch.object(peer_steward, "_start_pane_screen", side_effect=screens), \
+                 mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+                 mock.patch.object(peer_steward.time, "sleep"):
+                self.assertEqual(peer_steward._start_shell_snapshot("w1:pN", (101, "700")), expected)
+        with mock.patch.object(peer_steward, "_pane_has_agent", return_value="pane-unknown"), \
+             mock.patch.object(peer_steward, "_start_pane_screen") as read:
+            self.assertIsNone(peer_steward._start_shell_snapshot("w1:pN", (101, "700")))
+            read.assert_not_called()
+
+    def test_visible_screen_is_verbatim_and_unavailable_read_is_unknown(self):
+        for stdout, rc, expected in (("user@host $ ", 0, "user@host $ "),
+                ("\x1b[0mhost  draft", 0, "\x1b[0mhost  draft"), ("", 0, ""),
+                ("denied", 1, None), ("x" * 65537, 0, None), ('{"error":{"code":"denied"}}', 0, None)):
+            with self.subTest(rc=rc, length=len(stdout)), mock.patch.object(peer_steward.subprocess,
+                    "run", return_value=subprocess.CompletedProcess([], rc, stdout=stdout, stderr="")) as run:
+                self.assertEqual(peer_steward._start_pane_screen("w1:pN"), expected)
+                self.assertEqual(run.call_args[0][0], ["herdr", "pane", "read", "w1:pN",
+                    "--source", "visible", "--format", "ansi"])
+
+    def test_post_record_drafts_and_redraw_never_close_owned_split(self):
+        plain = "user@host $ "
+        powerline = "user@host  /work  main  "
+        styled = "\x1b[0m\x1b[38;5;2m\x1b[0m "
+        cases = [(plain, "user@host $ echo $ "), ("user@host % ", "user@host % printf % "),
+                 ("user@host ❯ ", "user@host ❯ : # "), (plain, "user@host $echo $ "),
+                 ("%", "%printf % "), ("❯", "❯: # "),
+                 (powerline, powerline + "echo " + styled),
+                 (powerline, powerline + "printf " + styled),
+                 (plain, "redrawn prompt"), (plain, None)]
+        for recorded, current in cases:
+            with self.subTest(current=current), \
+                 mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+                 mock.patch.object(peer_steward, "_retire_pane_info", return_value={"shell_pid": 101}), \
+                 mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+                 mock.patch.object(peer_steward, "_start_pane_screen", return_value=current), \
+                 mock.patch.object(peer_steward, "_close_pane", return_value=True) as close:
+                self.assertEqual(peer_steward._failed_start_cleanup("w1:pN", (101, "700"), recorded), "retained")
+                close.assert_not_called()
+        with mock.patch.object(peer_steward, "_close_pane") as close:
+            self.assertEqual(peer_steward._failed_start_cleanup("w1:pN", (101, "700"), None), "retained")
+            close.assert_not_called()
+
+    def test_beside_records_stable_screen_before_start_and_retains_later_change(self):
+        events = []
+        screens = iter(["before", "before", "after draft"])
+        clock = iter(i / 100 for i in range(1000))
+
+        def read(pane):
+            value = next(screens); events.append("screen:" + value); return value
+
+        def run(argv, **kw):
+            if argv[:3] == ["herdr", "pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+            if argv[:3] == ["herdr", "agent", "start"]:
+                events.append("native start")
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="start rejected")
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value={"shell_pid": 101}), \
+             mock.patch.object(peer_steward, "_start_pane_screen", side_effect=read), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+             mock.patch.object(peer_steward.time, "sleep"), \
+             mock.patch.object(peer_steward, "_close_pane") as close, mock.patch("builtins.print") as printed:
+            peer_steward.main(["start", "new", "--kind", "claude", "--beside", "w1:pOld"])
+            self.assertIn("pane_cleanup=retained", printed.call_args[0][0])
+            close.assert_not_called()
+        self.assertEqual(events, ["screen:before", "screen:before", "native start", "screen:after draft"])
+
+    def test_invalid_cwd_does_not_split_and_pane_choices_are_exclusive(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run") as run, mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["start", "new", "--kind", "codex", "--beside", "w1:pOld",
+                                               "--cwd", str(self.tmp_root / "missing")]), 1)
+        run.assert_not_called()
+        with mock.patch.object(peer_steward.sys, "stderr"), self.assertRaises(SystemExit):
+            peer_steward.build_parser().parse_args(["start", "new", "--kind", "codex", "--pane", "w1:pA",
+                                                   "--beside", "w1:pB"])
+
+
+class _RetireWorld:
+    def __init__(self, harness="codex", status="idle", screen=None, exits=True):
+        self.harness, self.status = harness, status
+        self.screen = screen if screen is not None else {
+            "codex": CODEX_EMPTY, "claude": CLAUDE_EMPTY, "opencode": OPENCODE_EMPTY}[harness]
+        self.calls, self.gets, self.process_reads = [], 0, 0
+        self.sent, self.exits, self.changed = False, exits, False
+        self.bad_process = None
+        self.post_unknown, self.close_error, self.send_error = False, False, False
+        self.final_changed = False
+
+    def agent(self):
+        self.gets += 1
+        return {"agent": self.harness, "agent_status": self.status, "name": "old",
+                "pane_id": "w1:pOld", "agent_session": {"value": "other" if self.changed and self.gets > 1 else "old-sid"}}
+
+    def info(self):
+        self.process_reads += 1
+        shell = self.sent and self.exits
+        result = {"pane_id": "w1:pOld", "shell_pid": 101,
+                  "foreground_process_group_id": 101 if shell else 4242,
+                  "foreground_processes": [{"pid": 101 if shell else 4242,
+                    "argv": ["/usr/bin/zsh"] if shell else [self.harness],
+                    "name": "zsh" if shell else self.harness}]}
+        if self.bad_process:
+            result.update(self.bad_process)
+        if self.final_changed and self.process_reads >= 4:
+            result["shell_pid"] = 999
+        return result
+
+    def run(self, argv, **kw):
+        self.calls.append(list(argv))
+        if argv[:3] == ["herdr", "agent", "get"]:
+            return _herdr_json({"result": {"agent": self.agent()}})
+        if argv[:3] == ["herdr", "agent", "read"]:
+            return subprocess.CompletedProcess(argv, 0 if self.screen else 1, stdout=self.screen or "", stderr="")
+        if argv[:3] == ["herdr", "pane", "process-info"]:
+            return (_herdr_json({"error": {"code": "unavailable"}}) if self.sent and self.post_unknown
+                    else _herdr_json({"result": {"process_info": self.info()}}))
+        if argv[:3] == ["herdr", "pane", "send-text"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if argv[:3] == ["herdr", "pane", "send-keys"]:
+            self.sent = True
+            return (subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"error": {"code": "denied"}}), stderr="")
+                    if self.send_error else subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+        if argv[:3] == ["herdr", "pane", "close"]:
+            return _herdr_json({"error": {"code": "denied"}} if self.close_error else {"result": {"type": "ok"}})
+        raise AssertionError(argv)
+
+    def actions(self):
+        return [a for a in self.calls if a[:3] in (["herdr", "pane", "send-text"], ["herdr", "pane", "send-keys"], ["herdr", "pane", "close"])]
+
+
+class RetireTest(_TmpRootMixin, unittest.TestCase):
+    def retire(self, world, record=None):
+        printed = []
+        original_stat = os.stat
+        clock = iter(range(100))
+
+        def stat(path, *a, **kw):
+            if str(path) == "/proc/4242" and world.sent and world.exits:
+                raise FileNotFoundError(path)
+            if str(path) == "/proc/4242":
+                return object()
+            return original_stat(path, *a, **kw)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+             mock.patch.object(peer_steward, "_retire_process_record", return_value=(record if record is not None else
+                              {"start": "800", "group": 4242, "argv": [world.harness]})), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else "800"), \
+             mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+             mock.patch.object(peer_steward.time, "sleep"), \
+             mock.patch("builtins.print", side_effect=lambda *a, **kw: printed.append(" ".join(map(str, a)))):
+            rc = peer_steward.main(["retire", "old"])
+        return rc, printed[-1]
+
+    def test_confirmed_normal_exit_closes_once_and_records_notice(self):
+        for harness, status in (("codex", "idle"), ("opencode", "done"), ("claude", "idle")):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness, status=status)
+                rc, line = self.retire(world)
+                self.assertEqual((rc, line), (0, f"retired=true reason=normal-exit agent={harness} name=old pane=w1:pOld"))
+                expected = ([["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+                             ["herdr", "pane", "send-keys", "w1:pOld", "enter"]] if harness == "claude"
+                            else [["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"]])
+                self.assertEqual(world.actions(), expected + [["herdr", "pane", "close", "w1:pOld"]])
+                row = self._all_records()[-1]
+                self.assertEqual((row["kind"], row["to"]["pane"], row["delivery"]["receipt"]),
+                                 ("notice", "w1:pOld", "normal-exit"))
+
+    def test_busy_form_draft_unknown_self_or_changed_target_receives_no_exit(self):
+        cases = [(_RetireWorld(status=s), "agent-" + s) for s in ("working", "blocked", "unknown")]
+        cases += [(_RetireWorld(screen=s), reason) for s, reason in
+                  ((CODEX_DRAFT, "draft"), (CODEX_POPUP, "draft-unknown"), (NO_BOX, "draft-unknown"),
+                   (CLAUDE_FORM, "form-open"), ("", "screen-unavailable"))]
+        cases += [(_RetireWorld("claude", screen=CLAUDE_DRAFT_SECOND_LINE), "draft"),
+                  (_RetireWorld("opencode", screen=OPENCODE_DRAFT), "draft")]
+        changed = _RetireWorld(); changed.changed = True
+        cases.append((changed, "target-changed"))
+        for world, reason in cases:
+            with self.subTest(reason=reason):
+                rc, line = self.retire(world)
+                self.assertEqual(rc, 1)
+                self.assertIn("reason=" + reason, line)
+                self.assertEqual(world.actions(), [])
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pOld"}):
+            world = _RetireWorld(); rc, line = self.retire(world)
+            self.assertIn("reason=self-target", line); self.assertEqual(world.actions(), [])
+
+    def test_unverified_or_foreign_foreground_receives_no_exit(self):
+        for patch in ({"pane_id": "w1:pForeign"}, {"shell_pid": True},
+                      {"foreground_process_group_id": 999}, {"foreground_processes": []},
+                      {"foreground_processes": [{"pid": 4242, "argv": ["other"]}]}):
+            with self.subTest(patch=patch):
+                world = _RetireWorld(); world.bad_process = patch
+                rc, line = self.retire(world)
+                self.assertIn("reason=foreground-unverified", line); self.assertEqual(world.actions(), [])
+        world = _RetireWorld()
+        rc, line = self.retire(world, {"start": "800", "group": 999, "argv": ["codex"]})
+        self.assertIn("reason=foreground-unverified", line); self.assertEqual(world.actions(), [])
+
+    def test_claude_exit_command_unknown_or_still_live_never_closes_or_retries(self):
+        # One /exit submission; a missing shell return never permits a retry or close.
+        for unknown in (False, True):
+            world = _RetireWorld("claude", exits=False); world.post_unknown = unknown
+            rc, line = self.retire(world)
+            self.assertEqual(rc, 1)
+            self.assertIn("reason=" + ("shell-return-unverified" if unknown else "agent-still-running"), line)
+            self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+                                               ["herdr", "pane", "send-keys", "w1:pOld", "enter"]])
+
+    def test_error_body_on_send_or_close_is_not_success(self):
+        world = _RetireWorld(); world.send_error = True
+        rc, line = self.retire(world)
+        self.assertIn("reason=exit-send-failed", line)
+        self.assertEqual(len(world.actions()), 1)
+        world = _RetireWorld(); world.close_error = True
+        rc, line = self.retire(world)
+        self.assertIn("retired=false reason=pane-close-failed", line)
+        self.assertEqual(len(world.actions()), 2)
+
+    def test_claude_failed_exit_text_or_changed_foreground_never_submits_enter(self):
+        world = _RetireWorld("claude")
+        normal_run = world.run
+
+        def failed_text(argv, **kw):
+            if argv[:3] == ["herdr", "pane", "send-text"]:
+                world.calls.append(list(argv))
+                return _herdr_json({"error": {"code": "denied"}})
+            return normal_run(argv, **kw)
+
+        world.run = failed_text
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 1); self.assertIn("reason=exit-send-failed", line)
+        self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"]])
+        world = _RetireWorld("claude")
+        normal_info = world.info
+
+        def changed_after_text():
+            value = normal_info()
+            if any(a[:3] == ["herdr", "pane", "send-text"] for a in world.calls):
+                value["foreground_process_group_id"] = 999
+            return value
+
+        world.info = changed_after_text
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 1); self.assertIn("reason=foreground-changed", line)
+        self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"]])
+
+    def test_changed_shell_after_exit_is_not_closed(self):
+        world = _RetireWorld(); world.final_changed = True
+        rc, line = self.retire(world)
+        self.assertIn("retired=false reason=shell-changed", line)
+        self.assertEqual(world.actions(), [["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"]])
+
+    def test_protocol_error_or_missing_herdr_is_typed_and_never_exits(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward, "_run_herdr_get", return_value={"result": {"agent": {
+                 "agent": "codex", "agent_status": "idle", "agent_session": "bad"}}}), \
+             mock.patch.object(peer_steward.subprocess, "run") as run, mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["retire", "old"]), 1)
+            self.assertIn("retired=false reason=herdr-protocol-error", printed.call_args[0][0])
+            run.assert_not_called()
+        with mock.patch.object(peer_steward.shutil, "which", return_value=None), \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["retire", "old"]), 1)
+            self.assertIn("retired=false reason=herdr-not-found", printed.call_args[0][0])
+
+    def test_shell_return_requires_original_birth_and_absent_predecessor(self):
+        identity = {"pid": 4242, "shell_pid": 101, "shell_start": "700"}
+        info = {"shell_pid": 101, "foreground_process_group_id": 101, "foreground_processes": [{"pid": 101}]}
+        with mock.patch.object(peer_steward, "_proc_start_ticks", return_value="701"):
+            self.assertFalse(peer_steward._retire_shell_returned(info, identity))
+        for error in (None, PermissionError()):
+            with mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+                 mock.patch.object(peer_steward.os, "stat", return_value=object(), side_effect=error):
+                self.assertFalse(peer_steward._retire_shell_returned(info, identity))
+        with mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+             mock.patch.object(peer_steward.os, "stat", side_effect=FileNotFoundError()):
+            self.assertTrue(peer_steward._retire_shell_returned(info, identity))
+
+    def test_kernel_record_refuses_unreadable_namespace_or_reused_birth(self):
+        stat = "4242 (codex) " + " ".join(["S", "101", "4242"] + ["0"] * 16 + ["800"])
+        for birth, namespaces, read_error in (("800", ["pid:[1]", "pid:[1]"], None),
+                ("801", [], None), ("800", ["pid:[2]", "pid:[1]"], None),
+                ("800", [], PermissionError())):
+            with self.subTest(birth=birth, namespaces=namespaces, read_error=read_error), \
+                 mock.patch.object(peer_steward.Path, "read_text", return_value=stat, side_effect=read_error), \
+                 mock.patch.object(peer_steward.Path, "read_bytes", return_value=b"codex\0"), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", return_value=birth), \
+                 mock.patch.object(peer_steward.os, "readlink", side_effect=namespaces):
+                result = peer_steward._retire_process_record(4242)
+                if birth == "800" and namespaces == ["pid:[1]", "pid:[1]"]:
+                    self.assertEqual(result, {"start": "800", "group": 4242, "argv": ["codex"]})
+                else:
+                    self.assertIsNone(result)
 
 
 if __name__ == "__main__":

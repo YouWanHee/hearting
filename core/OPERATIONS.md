@@ -1115,6 +1115,18 @@ stated otherwise, so the new TUI owns its rollout fd and same-cwd simultaneous
 starts stay exactly attributable; time-candidate threads stay out of Embedded
 attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
+Same-seat succession uses `peer-steward.py start --beside <predecessor-pane>`
+to open the successor to its right in the same tab without focus. The predecessor
+hands over its card and documents, receives the successor's ACK, leaves its last
+result and becomes idle; the successor then uses `retire <predecessor>` to send
+one normal exit action (Claude `/exit` + Enter; Codex/OpenCode Ctrl+D) and close
+that pane only after its original shell returns. A refused start closes
+its own newly split pane only when the same shell is agent-free and its visible
+screen is unchanged from the stable snapshot recorded before native start.
+Retirement refuses busy sessions, open forms, drafts, unknown process identity
+or an unconfirmed shell return; it has no retry, forced kill or forced close.
+Cards, notices and registered parent, route and worker identities are not moved.
+
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused
 or blocked (cross-session permission laundering forbidden); a blocked action reflects
