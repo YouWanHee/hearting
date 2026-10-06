@@ -1051,6 +1051,59 @@ def _export_opencode_tui_scoped(pane):
     return "exported"
 
 
+def _seat_successor_path(pane):
+    digest = hashlib.sha256(str(pane).encode("utf-8")).hexdigest()[:32]
+    return peer_message.peer_state_root() / "seat-successors" / f"{digest}.json"
+
+
+def _mark_seat_successor(pane, beside, kind, session_id):
+    """`start --beside`: the started pane is the seat successor of the agent beside it.
+
+    The one fact a later `retire` from this pane needs to hand that agent's routes on
+    (OPERATIONS same-seat change). Best effort: a missing mark only means no handover."""
+    try:
+        path = _seat_successor_path(pane)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"schema": 1, "pane": pane, "beside": beside,
+                                   "successor": {"harness": kind, "session_id": session_id or ""},
+                                   "at": time.time()}, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _seat_handover(ident, own_sid, own_harness):
+    """After `retire` proved the predecessor exited: when this session runs in the pane started
+    beside the predecessor, its routes become this session's, across harnesses
+    (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
+    this is not a seat change (the receipt then stays as it was); it never fails the retire."""
+    pane = os.environ.get("HERDR_PANE_ID", "")
+    if not pane:
+        return None
+    path = _seat_successor_path(pane)
+    try:
+        mark = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(mark, dict) or mark.get("pane") != pane or mark.get("beside") != ident["pane"]:
+        return None
+    recorded = (mark.get("successor") or {}).get("session_id")
+    if not own_sid or own_harness not in {"claude", "codex", "opencode"} or (recorded and recorded != own_sid):
+        return "skipped:successor-unverified"
+    try:
+        import dispatch_seat_handover as handover
+        row = handover.record_retire_handover(
+            ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ)
+    except Exception:  # noqa: BLE001 - the retire itself already succeeded
+        return "error"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return str(len(row["bindings"])) if row else "none"
+
+
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
@@ -1254,6 +1307,8 @@ def cmd_start(args):
     # Interactive managed ingress is retired, so `managed=false` is no longer a defect
     # signal; the field stays for receipt compatibility and `session_id=` is what says
     # whether the session got an identity.
+    if started and getattr(args, "beside", None):
+        _mark_seat_successor(args.pane, args.beside, args.kind, started_sid)
     managed = "-"
     if started and _MANAGED_INGRESS.get(args.kind):
         verdict = _pane_is_managed(args.pane)
@@ -1376,13 +1431,14 @@ def cmd_retire(args):
     target = args.target
     ident = {"harness": "-", "session_id": "-", "name": target, "pane": "-"}
 
-    def finish(reason, retired=False):
+    def finish(reason, retired=False, handover=None):
+        tail = f" handover={handover}" if handover else ""
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=ident["pane"],
-                summary_text=f"[retire] {target} {reason}", receipt=reason,
+                summary_text=f"[retire] {target} {reason}{tail}", receipt=reason,
                 status="sent" if retired else "failed")
         print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
-              f"name={ident['name']} pane={ident['pane']}")
+              f"name={ident['name']} pane={ident['pane']}{tail}")
         return 0 if retired else 1
 
     if _herdr_missing():
@@ -1439,9 +1495,11 @@ def cmd_retire(args):
             # A final exact shell read is required immediately before closing.
             if not _retire_shell_returned(_retire_pane_info(pane), identity):
                 return finish("shell-changed")
+            # The predecessor has exited: a seat successor now answers for its routes.
+            handover = _seat_handover(ident, own_sid, own_harness)
             if not _close_pane(pane):
-                return finish("pane-close-failed")
-            return finish("normal-exit", True)
+                return finish("pane-close-failed", handover=handover)
+            return finish("normal-exit", True, handover=handover)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
     return finish("agent-still-running")
 

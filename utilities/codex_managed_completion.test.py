@@ -855,8 +855,13 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)      # no registry: registered
             jobs.write_text("t\topen\t/w\t/w\tslug\tattempt_id=att-one,parent_sid=" + SESSION + "\n", encoding="utf-8")
             self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
-            with mock.patch.object(handover, "effective_parent", return_value="successor-thread"):
+            with mock.patch.object(handover, "effective_parent", return_value="successor-thread"), \
+                 mock.patch.object(handover, "effective_parent_harness", return_value="codex"):
                 self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), "successor-thread")
+            # RA-2: a successor on another harness has no Codex queue; it reads the stored record.
+            with mock.patch.object(handover, "effective_parent", return_value="claude-successor"), \
+                 mock.patch.object(handover, "effective_parent_harness", return_value="claude"):
+                self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
             with mock.patch.object(handover, "effective_parent", side_effect=OSError("boom")):
                 self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
 

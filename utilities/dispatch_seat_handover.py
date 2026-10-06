@@ -15,11 +15,14 @@ The relation is one fact in two files under the session-tidy state folder:
 ``sessions/<seat>.jsonl``  the seat ledger; ``run_hook`` appends one ``event=handover`` row
                            (A -> B, with the bindings) when it sees B's confirmed start.
 
-Rules: one direction (A -> B), the same pane only, a confirmed clear only (a ``clear`` start
-source or the clear booking's own observation; OpenCode has no start hook, so its first
-message in a new session after the snapshot), never A -> B and A -> C, B -> C only through
-B's own next tidy.  Everything here is read-only except :func:`record_locked` /
-:func:`write_snapshot_locked` (caller holds the seat lock).
+Rules: one direction (A -> B), never A -> B and A -> C, B -> C only through B's own next
+tidy.  Two ways in: a confirmed clear at the same pane and harness (a ``clear`` start source
+or the clear booking's own observation; OpenCode has no start hook, so its first message in
+a new session after the snapshot), or the official seat change across panes and harnesses
+(``peer-steward start --beside`` -> ACK -> ``retire`` from the pane started beside the
+predecessor, :func:`record_retire_handover`).  Everything here is read-only except
+:func:`record_locked` / :func:`write_snapshot_locked` (caller holds the seat lock) and
+:func:`record_retire_handover`.
 
 Two questions, two functions:
 
@@ -171,8 +174,10 @@ def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 def binding_of(jobs, meta: dict) -> dict:
+    """``parent`` is the registered parent, the key its pending records stay stored under."""
     route, digest, node = route_identity(meta)
-    return {"jobs": _jobs_key(jobs), "attempt": meta["attempt_id"], "route": route, "hash": digest, "node": node}
+    return {"jobs": _jobs_key(jobs), "attempt": meta["attempt_id"], "route": route, "hash": digest, "node": node,
+            "parent": str(meta.get("parent_sid") or "")}
 
 
 def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
@@ -185,26 +190,38 @@ def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
                and b.get("node") == node for b in bindings if isinstance(b, dict))
 
 
+def _effective(meta: dict, jobs=None) -> tuple[str, str]:
+    """``(session, harness)`` answering for ``meta``'s attempt now.  The chain may cross panes
+    and harnesses (a seat change hands a Codex parent's route to a Claude successor), so the
+    rows of every seat whose snapshot binds the attempt are read together, oldest first."""
+    registered = str(meta.get("parent_sid") or "")
+    harness = str(meta.get("parent_harness") or "")
+    if not registered or jobs is None or not eligible_row(meta):
+        return registered, harness
+    try:
+        rows = sorted((row for seat in _seats_for_binding(jobs, meta) for row in handover_rows(seat)),
+                      key=lambda r: float(r.get("ts", 0) or 0))
+        current, seen = registered, {registered}
+        for row in rows:
+            if row.get("from") == current and _binds(row.get("bindings") or (), jobs, meta) \
+                    and row.get("sid") not in seen:
+                current = str(row["sid"])
+                harness = str(row.get("harness") or harness)
+                seen.add(current)
+        return current, harness
+    except Exception:  # noqa: BLE001 - the registered answer is always safe
+        return registered, str(meta.get("parent_harness") or "")
+
+
 def effective_parent(meta: dict, jobs=None) -> str:
     """The session that answers for ``meta``'s attempt now: the registered ``parent_sid``, or
     the end of its A -> B (-> C) handover chain.  Any failure answers the registered parent."""
-    registered = str(meta.get("parent_sid") or "")
-    if not registered or jobs is None or not eligible_row(meta):
-        return registered
-    try:
-        seat = _seat_for_binding(jobs, meta)
-        if seat is None:
-            return registered
-        rows = handover_rows(seat)
-        current, seen = registered, {registered}
-        for row in rows:
-            if row.get("from") == current and row.get("harness") == meta.get("parent_harness", row.get("harness")) \
-                    and _binds(row.get("bindings") or (), jobs, meta) and row.get("sid") not in seen:
-                current = str(row["sid"])
-                seen.add(current)
-        return current
-    except Exception:  # noqa: BLE001 - the registered answer is always safe
-        return registered
+    return _effective(meta, jobs)[0]
+
+
+def effective_parent_harness(meta: dict, jobs=None) -> str:
+    """The harness of :func:`effective_parent` (the registered ``parent_harness`` without a handover)."""
+    return _effective(meta, jobs)[1]
 
 
 def owns(meta: dict, session: str, jobs=None) -> bool:
@@ -214,13 +231,12 @@ def owns(meta: dict, session: str, jobs=None) -> bool:
     return meta.get("parent_sid") == session or (jobs is not None and effective_parent(meta, jobs) == session)
 
 
-def _seat_for_binding(jobs, meta: dict):
-    """The seat whose snapshot binds this exact registry/route/node, or None.  No recency, cwd
-    or pane name decides it: only an exact binding."""
-    hits = [s for s in _all_snapshots() if _binds(s["bindings"], jobs, meta)]
-    if len(hits) != 1:
-        return None
-    return _seat_of(str(hits[0]["seat"].get("key") or ""), hits[0]) if isinstance(hits[0].get("seat"), dict) else None
+def _seats_for_binding(jobs, meta: dict) -> list:
+    """Every seat whose snapshot binds this exact registry/route/node.  No recency, cwd or pane
+    name decides it: only an exact binding.  A snapshot is written only by a session that
+    answered for the attempt, so each one belongs to the same chain."""
+    return [_seat_of(str(s["seat"].get("key") or ""), s) for s in _all_snapshots()
+            if isinstance(s.get("seat"), dict) and _binds(s["bindings"], jobs, meta)]
 
 
 def storage_recipients(session: str, env=None, harness: Optional[str] = None) -> list:
@@ -237,9 +253,11 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
             return out
         owed: dict = {}
         for row in _chain_to(handover_rows(seat), session):     # A -> B -> ... -> session
-
-            attempts = {b.get("attempt") for b in row.get("bindings") or () if isinstance(b, dict)}
-            owed.setdefault(str(row["from"]), set()).update(a for a in attempts if a)
+            bindings = [b for b in row.get("bindings") or () if isinstance(b, dict) and b.get("attempt")]
+            owed.setdefault(str(row["from"]), set()).update(b["attempt"] for b in bindings)
+            for binding in bindings:     # a chain that began at another seat: the registered key
+                if binding.get("parent"):
+                    owed.setdefault(str(binding["parent"]), set()).add(binding["attempt"])
         for key, attempts in owed.items():
             if key != session:
                 out.append((key, frozenset(attempts)))
@@ -301,14 +319,15 @@ def _delivery_open(jobs, meta: dict) -> bool:
 
 
 def current_bindings(harness: str, sid: str, jobs=None) -> list:
-    """The live depth-1 attempts ``sid`` answers for at ``harness``: those it registered and those
-    handed to it.  A finished one counts only while its completion record is still open."""
+    """The live depth-1 attempts ``sid`` answers for: those it registered and those handed to it,
+    whatever harness registered them.  A finished one counts only while its completion record
+    is still open.  ``harness`` is kept for callers; ownership alone decides."""
     jobs = jobs or _default_jobs()
     if jobs is None or not Path(jobs).is_file():
         return []
     found = []
     for aid, (status, meta) in latest_rows(jobs).items():
-        if not eligible_row(meta) or meta.get("parent_harness", harness) != harness:
+        if not eligible_row(meta):
             continue
         if status not in OPEN_ROW_STATUSES and not (status == "done" and _delivery_open(jobs, meta)):
             continue
@@ -374,6 +393,64 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
     finally:
         os.close(fd)
     return row
+
+
+def record_retire_handover(predecessor_sid: str, predecessor_harness: str, successor_sid: str,
+                           successor_harness: str, *, env=None, jobs=None,
+                           now: Optional[float] = None) -> Optional[dict]:
+    """Hand a retired predecessor's routes to its seat successor, across harnesses.
+
+    Called after ``peer-steward retire`` proved the predecessor exited and the caller runs in the
+    pane started beside it.  The predecessor's live depth-1 attempts (registered or inherited)
+    are bound to the successor in the successor's seat: one ledger row, whose bindings name the
+    registered parent their pending records stay stored under, and the seat's snapshot (now
+    naming the successor) that lets :func:`effective_parent` find it.  Registry rows are untouched.
+    Returns the row (the existing one when repeated), or None when there is nothing to hand over
+    -- including attempts the predecessor already handed to another session.
+    """
+    if not predecessor_sid or not successor_sid or predecessor_sid == successor_sid:
+        return None
+    st = _st()
+    seat = pane_seat(env, successor_harness, successor_sid)
+    if seat is None:
+        return None
+    jobs = jobs or _default_jobs()
+    now = st.now_epoch() if now is None else now
+    with st.seat_lock(seat.key):
+        existing = next((r for r in handover_rows(seat)
+                         if r.get("from") == predecessor_sid and r.get("sid") == successor_sid), None)
+        if existing is not None:
+            return existing
+        # Only what the predecessor answers for now: a registered parent that already handed an
+        # attempt on keeps its name but no longer answers for it (never A -> B and A -> C).
+        rows = latest_rows(jobs) if jobs else {}
+        bindings = [b for b in current_bindings(predecessor_harness, predecessor_sid, jobs)
+                    if b["attempt"] in rows and effective_parent(rows[b["attempt"]][1], jobs) == predecessor_sid]
+        if not bindings:
+            return None
+        # The seat's snapshot names the session now at it (the successor), so its own later
+        # /clear hands everything on; what its own snapshot already bound is kept.
+        own = read_snapshot(seat.key)
+        kept = own["bindings"] if own and (own["from"].get("sid") == successor_sid) else []
+        merged: dict = {}
+        for binding in [*kept, *bindings]:
+            if isinstance(binding, dict):
+                merged[(binding.get("jobs"), binding.get("route"), binding.get("hash"), binding.get("node"))] = binding
+        st.atomic_write_json(_snapshot_path(seat.key), {
+            "schema": SCHEMA, "seat": seat.as_dict(),
+            "from": {"harness": successor_harness, "sid": successor_sid}, "at": now,
+            "bindings": list(merged.values())[-MAX_BINDINGS:]})
+        row = {"ts": now, "harness": successor_harness, "sid": successor_sid, "event": ROW_EVENT,
+               "from": predecessor_sid, "source": "retire", "bindings": bindings}
+        path = st._ledger_path(seat)
+        st.ensure_dir(path.parent)
+        st._reject_symlink(path)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return row
 
 
 def _confirmed_clear(seat, harness: str, old: str, sid: str, event: str, source: str) -> bool:
