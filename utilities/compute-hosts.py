@@ -37,6 +37,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -2215,12 +2216,76 @@ def cmd_run(args):
             encoding="utf-8")
     except OSError as exc:
         print(f"note: could not record run metadata: {exc}", file=sys.stderr)
+    watching = _spawn_completion_watch(run_dir, meta)
     if args.json:
         print(json.dumps(meta, ensure_ascii=False, sort_keys=True))
     else:
         print(f"started {run_id} on {name}")
+        if watching:
+            print("  done: this session gets one notice when it ends")
         print(f"  log:  {run_dir / 'log'}")
         print(f"  tail: compute-hosts tail {run_id}")
+    return 0
+
+
+COMPLETION_WATCH_SECONDS = 14 * 24 * 3600
+COMPLETION_POLL_SECONDS = 60
+
+
+def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Popen):
+    """Watch for this run's exit code and tell the launching session once (audit §4 #18).
+
+    Only an interactive (dispatch-depth-0) launch in one known harness session is
+    watched; a registered worker's own flow tracks its runs. Returns whether a watch
+    was started. Never refuses the launch.
+    """
+    env = os.environ if environ is None else environ
+    session = (meta.get("provenance") or {}).get("session")
+    if not session or str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
+        return False
+    try:
+        with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as out:
+            spawn([sys.executable, str(Path(__file__).resolve()), "watch-run", str(run_dir)],
+                  stdin=stdin, stdout=out, stderr=out, env=dict(env),
+                  start_new_session=True, close_fds=True)
+    except OSError:
+        return False
+    return True
+
+
+def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
+    """Internal: wait for `<run_dir>/exit_code`, then leave the launcher one notice."""
+    run_dir = Path(args.run_dir)
+    deadline = now() + COMPLETION_WATCH_SECONDS
+    exit_path = run_dir / "exit_code"
+    while not exit_path.is_file():
+        if now() >= deadline or not run_dir.is_dir():
+            return 0
+        sleep(COMPLETION_POLL_SECONDS)
+    try:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        code = exit_path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return 0
+    provenance = meta.get("provenance") or {}
+    session, route = provenance.get("session") or {}, provenance.get("route") or {}
+    if not session.get("harness") or not session.get("id"):
+        return 0
+    run_id = meta.get("run_id") or run_dir.name
+    stop = _read_stop_reason(run_dir)
+    text = (f"run {run_id} on {meta.get('host', '-')} ended with exit {code}"
+            + (f" ({stop})" if stop else "")
+            + f"; read it with: compute-hosts tail {run_id}")
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from session_notice import notify
+        notify(session["harness"], session["id"], key=f"compute-run:{run_id}",
+               subject="compute run", text=text, route_id=route.get("route_id") or "route-free",
+               required_action="report-to-user")
+    except Exception:  # noqa: BLE001 -- the run and its exit code are already recorded
+        return 0
     return 0
 
 
@@ -2476,6 +2541,11 @@ def build_parser():
     p_stop = sub.add_parser("stop", help="Stop a detached run")
     p_stop.add_argument("run_id")
     p_stop.set_defaults(func=cmd_stop)
+
+    # Internal: the completion watch `run` starts for an interactive session.
+    p_watch = sub.add_parser("watch-run", help=argparse.SUPPRESS)
+    p_watch.add_argument("run_dir")
+    p_watch.set_defaults(func=cmd_watch_run)
     return parser
 
 

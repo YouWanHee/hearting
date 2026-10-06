@@ -1059,6 +1059,10 @@ attempt binding, because the work usually outlives the session that started it.
 Use the resource-job lifecycle when a registered attempt must own the run;
 use `compute-hosts` when the run belongs on another machine. A run that needs
 both is a resource job whose payload is a `compute-hosts run` invocation.
+Started from an interactive session, `run` records that session and its latest
+route in `meta.json` and starts a detached completion watch: when the run's exit
+code appears, the session gets one notice through its harness carrier
+(`session_notice`), with the exit code and the `compute-hosts tail` command.
 
 ### §5.14. Peer-Session Steering (steward role)
 
