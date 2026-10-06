@@ -184,18 +184,18 @@ def seal_launch_input(args, harness: str, task: str) -> str:
     return ',replacement_input_digest='+_digest(payload)
 
 
-# A later launcher of the same attempt may run from a newer release and resolve
-# afresh (admission still checks that against the source). The work and the
-# permissions it is granted must not change.
-_RESEAL_STABLE_KEYS = ('schema', 'attempt_id', 'harness', 'jobs', 'worktree', 'argv', 'task',
-                       'route_id', 'route_node', 'owner_route_id', 'applied_permissions')
+# A later launcher of the same attempt may run from a newer release or another place (inside
+# the parent's sandbox or on the host) and resolve afresh (admission still checks that against
+# the source). The work and the permissions it is granted must not change
+# (`route_authority.same_sealed_work`).
+_RESEAL_STABLE_KEYS = route_authority.RESEAL_STABLE_KEYS
 
 
 def _reseal_allowed(jobs, aid, path, payload):
     """A launcher stopped before its claim sealed this input; the next one may reseal it."""
     previous = _read(path)
     stored = json.loads(_bytes(payload))  # compare in the stored form: a tuple reads back as a list
-    if not previous or any(previous.get(key) != stored.get(key) for key in _RESEAL_STABLE_KEYS):
+    if not previous or not route_authority.same_sealed_work(previous, stored):
         return False
     rows = []
     for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
@@ -1132,7 +1132,9 @@ def _check_tuple(candidate, replay, transition=None):
                 same_work_or_refuse('replacement-runtime-drift', key)
             else:
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
-    if candidate.get('applied_permissions') != replay.get('applied_permissions'):
+    # Where the replacement's launcher runs is not a permission change (route_authority).
+    if (route_authority.granted_permissions(candidate.get('applied_permissions'))
+            != route_authority.granted_permissions(replay.get('applied_permissions'))):
         if not drift:
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'applied_permissions')
         from hearting_gates import same_work_or_refuse

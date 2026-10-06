@@ -9552,14 +9552,9 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
 
 
 # Stable facts of one attempt's work. A row whose launcher never claimed it may be
-# relaunched by a new launcher whose per-launch values (lease nonce, release home,
-# parent runtime pid, sealed input digest) differ.
-_RELAUNCH_STABLE_KEYS = (
-    "attempt_id", "attempt_schema_version", "harness", "worker_type", "dispatch_depth",
-    "capability", "parent_sid", "parent_attempt_id", "route_id", "route_hash", "route_node",
-    "owner_route_id", "owner_route_hash", "automatic_retry_of",
-    "replacement_original_attempt_id", "replacement_family_id", "replacement_claim_digest",
-)
+# relaunched by a new launcher whose per-launch values differ; the one definition of
+# "same work, another launcher" is `route_authority`'s.
+from route_authority import RELAUNCH_STABLE_KEYS as _RELAUNCH_STABLE_KEYS  # noqa: E402
 
 
 def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> bool:
