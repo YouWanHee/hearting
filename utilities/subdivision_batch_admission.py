@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 
 from hearting_gates import gates_on  # noqa: E402
-from model_profile import pinned_launch_harness  # noqa: E402
+from route_authority import pinned_launch_harness  # noqa: E402
 from stage_session_contract import (  # noqa: E402
     ADAPTERS,
     StageSessionError,

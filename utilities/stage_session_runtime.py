@@ -12,6 +12,8 @@ import sys
 import artifact_producer
 from stage_session_contract import slice_files_sha256, slice_text_sha256
 from dispatch_contract import DispatchContractError, validate_attempt_metadata
+# The declaration judgment is a route authority one; `declared` stays for importers.
+from route_authority import declared_subsession as declared  # noqa: F401
 
 STATE_BUCKET = (".runtime", "stage-sessions")
 
@@ -52,38 +54,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 _sha_text = slice_text_sha256
 _sha_files = slice_files_sha256
-
-
-def declared(args: argparse.Namespace) -> bool:
-    """The one stage-session declaration judgment, read by `bind` and the dry-run preview.
-
-    True for a complete sub-session declaration (every axis, `stage_authority=0`,
-    bound to a dispatch-depth-2 route node), False for an ordinary full-stage
-    launch. A partial or contradictory declaration is refused, so no caller can
-    turn one raw flag into a sub-session.
-    """
-
-    def value(name):
-        return getattr(args, name, None)
-
-    values = tuple(value(name) for name in (
-        "subsession_id", "subsession_index", "subsession_count", "subsession_mode",
-        "session_chain_id", "phase_brief", "narrow_verify", "expected_round_trips",
-    ))
-    if any(item is not None for item in values) and not all(item is not None for item in values):
-        raise DispatchContractError("subsession-arguments-incomplete", "all stage-session axes are required")
-    stage_authority = getattr(args, "stage_authority", 1)
-    if not value("subsession_id"):
-        if stage_authority != 1:
-            raise DispatchContractError(
-                "stage-authority-zero-without-subsession", str(value("route_node") or "")
-            )
-        return False
-    if stage_authority != 0:
-        raise DispatchContractError("subsession-stage-authority-forbidden", value("subsession_id"))
-    if value("dispatch_depth") != 2 or not value("route_id") or not value("route_node"):
-        raise DispatchContractError("subsession-route-binding-invalid", value("subsession_id"))
-    return True
 
 
 def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) -> None:

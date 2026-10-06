@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from model_config import ModelConfigError, resolve_config  # noqa: E402
-from model_profile import sealed_pin_harness  # noqa: E402
+from route_authority import retry_predecessor, sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -718,32 +718,6 @@ def own_registered_attempt(args: argparse.Namespace, route: dict, node: dict) ->
             if row["_status"] == "open" and row.get("launch_claimed") == "0" and not row.get("pid")
             and row["_slug"] == args.slug and row.get("parent_attempt_id", "") == (args.parent_attempt_id or "")]
     return rows[0].get("attempt_id") if len(rows) == 1 else None
-
-
-def retry_predecessor(prior_rows, node, round_admission=None):
-    """Transport replacement and an admitted verdict round are different work.
-
-    The shared round admission already counts the exact node's verdict and
-    revisions, and attempt_identity salts the new round. A genuine FAIL from
-    a transport successor still owns a verdict; its old retry link is not a
-    second death to replace. No original row or replacement budget is changed.
-    Uncapped work and verdictless failures retain the existing retry binding.
-    """
-    if not prior_rows:
-        return ""
-    latest = prior_rows[-1]
-    status = latest["_status"]
-    if committed_outcome(status, latest) == "failed":
-        worker_type = latest.get("worker_type") or worker_type_for_kind(node["kind"])
-        if (round_admission is not None and round_admission.budget.state == "admit"
-                and classify_round_row(status, latest, worker_type=worker_type) == "verdict"):
-            return ""
-        return latest.get("attempt_id", "")
-    if status == "open" and latest.get("launch_claimed") == "0":
-        # Register/start reuse the same unlaunched transport successor. A
-        # semantic round has no such link and keeps its own round identity.
-        return latest.get("automatic_retry_of", "")
-    return ""
 
 
 def metadata_tuple_key(metadata: dict[str, str]) -> str:

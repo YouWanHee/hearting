@@ -140,7 +140,6 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
-    pin_target,
     require_top_route,
     resolve_runtime_profile,
     route_selection_pin,
@@ -167,11 +166,15 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    bind_request as bind_execution_access_request,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
+)
+import route_authority  # noqa: E402
+from route_authority import (  # noqa: E402
+    bind_access_request as bind_execution_access_request,
+    pin_target,
 )
 # Verification rigor is derived from intensity via resolve_qa
 # (dispatch_mode_contract.py, the single qa/intensity SoT — CONVENTIONS §1.1).
@@ -382,27 +385,8 @@ def _bind_runtime_parent(args: argparse.Namespace) -> None:
     Dispatch-depth-2 workers keep their explicit conductor/owner envelope; the legacy
     force switch remains available when a checked fallback intentionally rebinds it.
     """
-    force_current = os.environ.get("CODEX_DISPATCH_PARENT_CURRENT_FORCE") == "1"
-    current_thread = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
-    claude_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    caller_harness = (
-        os.environ.get("AGENT_DISPATCH_CALLER_HARNESS")
-        or ("codex" if current_thread and not claude_session else None)
-        or ("claude" if claude_session and not current_thread else None)
-    )
-    if args.dispatch_depth == 1:
-        if current_thread and caller_harness == "codex":
-            args.parent_session_id = current_thread
-            args.parent_harness = "codex"
-            args.parent_slug = None
-        elif claude_session and caller_harness == "claude":
-            args.parent_session_id = claude_session
-            args.parent_harness = "claude"
-            args.parent_slug = None
-        elif force_current:
-            args.parent_slug = None
-    elif force_current and current_thread:
-        args.parent_session_id = current_thread
+
+    route_authority.bind_runtime_parent(args, honor_force=True)
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:

@@ -22,6 +22,7 @@ import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
+import route_authority as ROUTE_AUTHORITY
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import gpu_execution_sandbox as GPU_SANDBOX
 import resource_resume as RESOURCE_RESUME
@@ -2692,7 +2693,7 @@ COMPOSE_DEFAULT_CAPABILITY = "autopilot-code"
 # Fallback when the user's policy names no enabled harnesses (no file, unreadable):
 # the shipped default enables all three.
 COMPOSE_DEFAULT_CHILDREN = ("claude", "codex", "opencode")
-SELECTION_PIN_TARGETS = ("owner", "frame", "worker")
+SELECTION_PIN_TARGETS = ROUTE_AUTHORITY.PIN_TARGETS
 SELECTION_PIN_CONTRACT_VERSION = 1
 # The harness is split at the first ":" and the effort at the last "@", so a
 # model id may itself contain ":" (a provider tag) but never "@", whitespace,
@@ -6874,28 +6875,7 @@ def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=
 
 def _review_owner_authority(route, jobs, author_attempt_id):
     """Prove the current registered owner without taking or creating locks."""
-    from owner_route_binding import resolve_owner_route_lifecycle
-    if not author_attempt_id:
-        raise ValueError("review-input-revision-owner-required")
-    caller = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
-    if caller and caller != author_attempt_id:
-        raise ValueError("review-input-revision-owner-caller-mismatch")
-    matches = []
-    for line in Path(jobs).read_text(encoding="utf-8").splitlines():
-        fields = line.split("\t")
-        if len(fields) == 6:
-            meta = parse_registry_metadata(fields[5])
-            if meta.get("attempt_id") == author_attempt_id:
-                matches.append((fields, meta))
-    if len(matches) != 1:
-        raise ValueError("review-input-revision-owner-not-exact")
-    fields, meta = matches[0]
-    if (fields[1] not in _LIVE_ROW_STATUSES or meta.get("worker_type") != "owner"
-            or meta.get("dispatch_depth") != "1" or meta.get("registered_worker") != "1"):
-        raise ValueError("review-input-revision-owner-invalid")
-    binding, _ = resolve_owner_route_lifecycle(jobs, owner_attempt_id=author_attempt_id)
-    if binding is None or (binding.route_id, binding.route_hash) != (route["route_id"], route["route_hash"]):
-        raise ValueError("review-input-revision-owner-route-mismatch")
+    ROUTE_AUTHORITY.review_owner_authority(route, jobs, author_attempt_id)
 
 
 def _review_input_revision_records(route, node_id, jobs):
@@ -7740,7 +7720,7 @@ def _launch_open_cycle_checkpoint(route):
 _OWNER_CLOSURE_SUFFIX=".owner-closure.md"
 _OWNER_CLOSURE_VERDICT="closed-by-owner"
 _REGISTRY_UNSAFE_CHARS=(",","=","\t","\n","\r")
-_LIVE_ROW_STATUSES={"open","running"}
+_LIVE_ROW_STATUSES=ROUTE_AUTHORITY.LIVE_ROW_STATUSES
 
 def _registry_unsafe(value):
     """True when a value cannot be sealed into the comma/=/tab/newline registry pipe."""
@@ -7783,7 +7763,7 @@ def review_round_records(lines, route_ids, node_id, *, jobs=None):
             continue
         if metadata.get("route_node")!=node_id:
             continue
-        if str(metadata.get("stage_authority","1")).lower() in {"0", "false"}:
+        if ROUTE_AUTHORITY.no_stage_authority(metadata):
             continue
         rows.append((fields,metadata))
     return REVIEW_ROUND_CAP.logical_round_records(rows,jobs=jobs)
@@ -8138,7 +8118,7 @@ def owner_closure_plan(route, node, evidence, jobs, attempt_id, *, lines=None):
         validate_attempt_metadata(selected)
     except DispatchContractError as exc:
         raise ValueError(f"row-contract-invalid:{exc.reason}") from exc
-    if selected.get("subsession_id") or str(selected.get("stage_authority", "1")).lower() in {"0", "false"}:
+    if ROUTE_AUTHORITY.subsession_row(selected):
         raise ValueError("subsession-has-no-stage-gate-authority")
     current = ROUTE_IDENTITY.registered_node_identity(selected, node) == (
         route["route_id"], route["route_hash"], node["id"])
@@ -8470,7 +8450,7 @@ def _complete_node_locked(
                 validate_attempt_metadata(row_metadata)
             except DispatchContractError as exc:
                 raise ValueError(f"row-contract-invalid:{exc.reason}") from exc
-            if row_metadata.get("subsession_id") or str(row_metadata.get("stage_authority", "1")).lower() in {"0", "false"}:
+            if ROUTE_AUTHORITY.subsession_row(row_metadata):
                 raise ValueError("subsession-has-no-stage-gate-authority")
             if ROUTE_IDENTITY.registered_node_identity(row_metadata, node) != (
                 route["route_id"], route["route_hash"], node_id

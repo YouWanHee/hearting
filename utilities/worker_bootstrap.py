@@ -308,7 +308,8 @@ def route_node_commit_expected(route, node_id: str | None, worker_type: str,
                               *, subsession_id: str | None = None,
                               stage_authority: int = 1) -> bool:
     """Read the sealed route's commit policy without inferring it from depth."""
-    if worker_type != "stage" or subsession_id or stage_authority == 0 or not node_id:
+    from route_authority import subsession_launch
+    if worker_type != "stage" or subsession_launch(subsession_id, stage_authority) or not node_id:
         return False
     node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
     return bool(node and node.get("commit_expected") is True)
@@ -324,7 +325,8 @@ def stage_commit_enabled(args) -> bool:
     worker_type = getattr(args, "worker_type", None)
     subsession_id = getattr(args, "subsession_id", None)
     authority = getattr(args, "stage_authority", 1)
-    if worker_type != "stage" or subsession_id or authority == 0:
+    from route_authority import subsession_launch
+    if worker_type != "stage" or subsession_launch(subsession_id, authority):
         return False
     route_path = getattr(args, "route_file", None)
     node_id = getattr(args, "route_node", None)

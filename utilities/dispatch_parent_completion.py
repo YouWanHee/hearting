@@ -14,51 +14,16 @@ from codex_managed_dispatch import (
 )
 from dispatch_contract import (DispatchContractError, annotate_attempt_row,
                                parse_registry_metadata, supervisor_lease_is_held)
-
-
-def interactive_parent_identity(environ=None) -> tuple[str, str]:
-    """Resolve the caller's native identity, independently of the child adapter."""
-    env = os.environ if environ is None else environ
-    sessions = {
-        "codex": env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID") or "",
-        "claude": env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_SESSION_ID") or "",
-        "opencode": env.get("OPENCODE_SESSION_ID") or "",
-    }
-    explicit = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
-    if explicit:
-        if explicit not in sessions:
-            raise DispatchContractError("caller-harness-invalid")
-        return explicit, sessions[explicit]
-    detected = [(harness, session) for harness, session in sessions.items() if session]
-    if len(detected) > 1:
-        raise DispatchContractError("caller-harness-ambiguous")
-    return detected[0] if detected else ("", "")
-
-
-def default_parent_session_id(environ=None) -> str | None:
-    env = os.environ if environ is None else environ
-    # A directly running interactive host is the authority for its own TUI
-    # thread. Managed entry used to export a second parent id after observing
-    # an App Server sibling, which could override the real Codex thread and
-    # strand every completion. Preserve the explicit binding only for nested
-    # workers, whose environment marks that dispatch boundary.
-    if env.get("AGENT_DISPATCH_CHILD") != "1":
-        native_session = interactive_parent_identity(env)[1]
-        if native_session:
-            return native_session
-    return env.get("AGENT_DISPATCH_PARENT_SESSION_ID") or interactive_parent_identity(env)[1] or None
+# Who the caller is, and which session a new attempt reports to, is a route
+# authority judgment (`route_authority`); these names remain for importers.
+from route_authority import (caller_identity as interactive_parent_identity,  # noqa: F401
+                             default_parent_harness, default_parent_session_id)
 
 
 def worker_runtime_identity(harness: str) -> dict[str, str]:
     """The launched worker becomes the caller of its own subsequent children."""
     return {"AGENT_DISPATCH_CURRENT_HARNESS": harness,
             "AGENT_DISPATCH_CALLER_HARNESS": harness}
-
-
-def default_parent_harness(fallback: str, environ=None) -> str:
-    """A selected child's runtime never replaces its caller's identity."""
-    env = os.environ if environ is None else environ
-    return interactive_parent_identity(env)[0] or env.get("AGENT_DISPATCH_OWNER_HARNESS") or fallback
 
 
 _CODEX_THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")

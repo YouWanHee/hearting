@@ -385,11 +385,11 @@ def require_top_route(route_file, *, profile: str, node: str | None = None) -> N
 # carries one pin per target; every wrapper reads it from the route file the
 # launch is bound to, so a resume, a capacity replacement or a stage fallback
 # lands on the same choice without any launch-time flag.
-PIN_TARGETS = ("owner", "frame", "worker")
-
-
-def pin_target(worker_type: str | None) -> str:
-    return "frame" if worker_type == "frame" else "owner" if worker_type == "owner" else "worker"
+# The pin targets and the harness a pin seals are route authority judgments;
+# the names stay here for importers.
+from route_authority import (  # noqa: E402,F401
+    PIN_TARGETS, pin_target, pinned_launch_harness, sealed_pin_harness,
+)
 
 
 def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) -> dict[str, object]:
@@ -421,28 +421,6 @@ def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) ->
     if not model:
         return {"status": "harness-only"}
     return {"status": "applied", "model": model, "effort": pin.get("effort") or None}
-
-
-def sealed_pin_harness(route, *, worker_type: str | None) -> str | None:
-    """The harness this route sealed for the launch's pin target, or None."""
-
-    pins = route.get("selection_pins") if isinstance(route, dict) else None
-    pin = pins.get(pin_target(worker_type)) if isinstance(pins, dict) else None
-    return (pin.get("harness") or None) if isinstance(pin, dict) else None
-
-
-def pinned_launch_harness(route, *, worker_type: str | None, requested: str | None, available) -> tuple[str | None, str | None]:
-    """A sealed pin beats the requested harness while the pinned one is available.
-
-    Returns `(harness, overridden_request)`; the second item is the request the pin replaced
-    (None when nothing was replaced), so the caller can record it.  An unavailable pin, or no
-    pin, leaves the request alone.  `available` is the caller's own hard-eligibility test.
-    """
-
-    pinned = sealed_pin_harness(route, worker_type=worker_type)
-    if not pinned or (pinned != requested and not available(pinned)):
-        return requested, None
-    return pinned, (requested if requested not in (None, pinned) else None)
 
 
 # The frame bootstrap tier ladder -- ONE function, ONE home.

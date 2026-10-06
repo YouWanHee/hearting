@@ -18,6 +18,7 @@ import uuid
 
 from dispatch_completion_join import JoinContractError, exact_attempt_row
 from dispatch_contract import supervisor_lease_is_held, supervisor_lease_path
+import route_authority
 
 
 PLACEHOLDER_THREAD = "pending-native-session"
@@ -194,8 +195,7 @@ def submit(jobs, attempt, text, request_id=None):
                 raise InputError("owner-input-unavailable-retain-correction")
             retain = True
         item = {"id": request_id, "digest": digest, "text": text, "events": [],
-                "source_session": os.environ.get("CODEX_THREAD_ID") or
-                os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or "operator"}
+                "source_session": route_authority.correction_source_session()}
         _transition(item, "retained" if retain else "queued")
         value["requests"].append(item)
         _write(path, value)
