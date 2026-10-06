@@ -1216,6 +1216,16 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
     def _parse(self, *extra):
         return OWNER._parse([*self._BASE, *extra])
 
+    def test_action_start_is_the_same_request_as_start(self):
+        base = [*(arg for arg in self._BASE if arg != "--dry-run"), "--worker-type", "review", "--unit", "qa/code-review"]
+        for spelling in (["--action", "start"], ["--action=start"]):
+            with self.subTest(spelling=spelling):
+                _, _, forwarded, _, _ = OWNER._parse([*base, *spelling])
+                self.assertIn("--start", forwarded)
+                self.assertNotIn("--action", forwarded)
+        with self.assertRaises(OWNER.OwnerError):
+            OWNER._parse([*base, "--action", "launch"])
+
     def test_a_review_tuple_launches_when_it_names_a_catalog_unit(self):
         _, values, forwarded, _, _ = self._parse(
             "--worker-type", "review", "--unit", "qa/code-review")

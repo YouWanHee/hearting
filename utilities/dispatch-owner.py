@@ -398,6 +398,16 @@ def _parse(argv):
             i += 1
             continue
         name, equal, value = arg.partition("=")
+        if name == "--action":
+            # The stage tools spell the same request `--action start`.
+            if not equal:
+                if i + 1 >= len(argv):
+                    raise OwnerError("invalid-action:--action")
+                value = argv[i + 1]
+                i += 1
+            if value not in {"dry-run", "register", "start"}:
+                raise OwnerError(f"invalid-action:--action={value}")
+            name, equal, arg = f"--{value}", "", f"--{value}"
         if name in {"--dry-run", "--register", "--start"}:
             if equal:
                 raise OwnerError(f"invalid-action:{arg}")

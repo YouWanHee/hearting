@@ -4168,7 +4168,8 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
     NOTICE = ("notice: --parent wrong-owner is not this session's name; "
               "using owner (from AGENT_DISPATCH_SELF_SLUG).")
 
-    def run_main(self, *, parent="wrong-owner", gates="on", lifecycle=None, self_slug="owner"):
+    def run_main(self, *, parent="wrong-owner", gates="on", lifecycle=None, self_slug="owner", argv=None, env=None,
+                 route_default=None):
         stack, assignments = self.common_patches()
         out, err = io.StringIO(), io.StringIO()
         seen = {}
@@ -4177,9 +4178,10 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
             seen.update(kwargs)
             raise DispatchContractError("parent-attempt-not-found", "fixture stop")
 
-        argv = self.argv()
-        argv[argv.index("--parent") + 1] = parent
-        environment = {
+        if argv is None:
+            argv = self.argv()
+            argv[argv.index("--parent") + 1] = parent
+        environment = {**(env or {}),
             "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture", "HEARTING_GATES": gates,
             "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
             "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
@@ -4200,6 +4202,9 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 BATCH, "select_launch_lifecycle", return_value=lifecycle or BATCH_LIFECYCLE.DETACHED))
             popen = stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+            if route_default:
+                stack.enter_context(mock.patch("owner_route_binding.default_owner_route_file",
+                                               return_value=route_default))
             stack.enter_context(mock.patch.dict(os.environ, environment))
             if not self_slug:
                 os.environ.pop("AGENT_DISPATCH_SELF_SLUG", None)
@@ -4207,6 +4212,13 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
                 rc = BATCH.main(argv)
         popen.assert_not_called()
         return rc, json.loads(out.getvalue()), err.getvalue(), seen
+
+    def test_an_owner_names_only_the_group_and_start(self):
+        rc, _receipt, err, seen = self.run_main(
+            argv=["--replica-group", "plan", "--start", "--jobs", str(self.jobs)],
+            env={}, route_default=str(self.route_path))
+        self.assertEqual(seen["parent_slug"], "owner")
+        self.assertNotIn("notice: --parent", err)
 
     def test_group_start_uses_the_session_name_whatever_the_gates(self):
         for gates in ("on", "off"):

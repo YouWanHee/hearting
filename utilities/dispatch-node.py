@@ -697,10 +697,17 @@ def replacement_task(args, route, node, jobs):
 
 
 def main():
- p=argparse.ArgumentParser(); p.add_argument("--route",required=True); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--slug",required=True); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
+ p=argparse.ArgumentParser(); p.add_argument("--route",help="default: this owner's current route"); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--start",dest="action",action="store_const",const="start",help="same as --action start"); p.add_argument("--slug",help="default: <parent>-<node>"); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
  from review_input import add_arguments, drop_inapplicable, resolve_input
  add_arguments(p)
  a=p.parse_args()
+ if a.route is None:
+  from owner_route_binding import OwnerRouteBindingError, default_owner_route_file
+  try:
+   a.route=default_owner_route_file(a.jobs)
+  except OwnerRouteBindingError as exc:
+   print(f"check=failed\nreason={exc}\ndetail=name the route with --route\nchild_spawned=0"); raise SystemExit(64)
+ a.slug=a.slug or f"{a.parent or os.environ.get('AGENT_DISPATCH_SELF_SLUG') or 'stage'}-{a.node}"
  lifecycle=requested_launch_lifecycle(a.adapter_args)
  if a.action=="start" and lifecycle==FOREGROUND_SCOPED:
   print(FOREGROUND_NOTICE,file=sys.stderr,flush=True)
