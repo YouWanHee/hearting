@@ -839,7 +839,8 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'End with the kernel' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'prompt_path.write_text(prompt_text, encoding="utf-8")' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'fcntl.flock' adapters/codex/bin/dispatch-headless.py \
-    || ! grep -Fq 'registry_lock={jobs}.lock' adapters/codex/bin/dispatch-headless.py \
+    || ! grep -Fq 'registry_lock={jobs}.lock' utilities/launch_receipt.py \
+    || ! grep -Fq 'launch_receipt.attempt_lines(' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'close_attempt_row' adapters/codex/bin/dispatch-harvest.py \
     || ! grep -Fq 'ROUTE.complete_node' adapters/codex/bin/dispatch-harvest.py \
     || ! grep -Fq 'registry_lock={jobs}.lock' adapters/codex/bin/dispatch-harvest.py; then
