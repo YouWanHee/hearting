@@ -104,6 +104,9 @@ def _bounded_receipt_text(record: dict) -> str:
     if receipt.get("kind") == "supervision":
         from dispatch_supervision import render_text
         return render_text(receipt)
+    if receipt.get("kind") == "notice":
+        from session_notice import render_text
+        return render_text(receipt)
     children = receipt.get("children") if isinstance(receipt.get("children"), list) else []
     parts = []
     for child in children:
@@ -210,6 +213,13 @@ def sweep_deliver(
     return claimed, len(entries)
 
 
+NOTICE_DELIVERY_HEADER = (
+    "Hearting notice about work you started (a paused route resumed, a remote run ended). "
+    "Tell the user in one line; act only where a line's required_action asks for it. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+
+
 GATE_DELIVERY_HEADER = (
     "Hearting human gate awaiting your decision (SD-123/129). Read the named artifact "
     "(an interview file or a frame summary), put the [방향 확인] card and every interview "
@@ -236,7 +246,7 @@ COMPLETION_DELIVERY_HEADER = (
 def _followup(root: Path, record: dict) -> str:
     """The exact next handle for one completion record (the queue carrier's text); never raises."""
     receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
-    if receipt.get("kind") == "supervision" or not isinstance(receipt.get("children"), list):
+    if receipt.get("kind") in {"supervision", "notice"} or not isinstance(receipt.get("children"), list):
         return ""
     try:
         from dispatch_completion_join import completion_followup_text
@@ -255,6 +265,7 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
     """
 
     gate_lines: list[str] = []
+    notice_lines: list[str] = []
     lines: list[str] = []
     followups: list[str] = []
     for root, records in batches:
@@ -263,6 +274,9 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
             if is_human_gate_record(record):
                 gate_lines.append(text)
                 continue
+            if (record.get("receipt") or {}).get("kind") == "notice":
+                notice_lines.append(text)
+                continue
             lines.append(text)
             follow = _followup(root, record)
             if follow and follow not in followups:
@@ -270,6 +284,8 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
     blocks: list[str] = []
     if gate_lines:
         blocks.append(GATE_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in gate_lines))
+    if notice_lines:
+        blocks.append(NOTICE_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in notice_lines))
     if lines:
         blocks.append(COMPLETION_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in lines)
                       + "".join("\n" + follow for follow in followups))
