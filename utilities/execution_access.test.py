@@ -906,6 +906,23 @@ class DerivedAccessTest(unittest.TestCase):
         self.assertEqual(binding["derivation"]["granted"], [])
         self.assertTrue(binding["derivation"]["dropped"].startswith("execution-access-root-too-broad"))
 
+    def test_a_qualifier_after_a_scope_path_belongs_to_that_path(self):
+        # The start card's scope holds what is included and what is excluded (WORKFLOW §0.4).
+        cases = {
+            "범위: /x/out, /x/raw(제외)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out 쓰기, /x/raw (읽기 전용)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out (write), /x/raw (read-only)": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out, /x/raw (손대지 않음)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out, /x/raw, 읽기만": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 쓰기 (원본 /x/raw 제외)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out, 원본 /x/raw 유지": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out, /x/raw is off-limits": {"/x/out": "write", "/x/raw": "excluded"},
+            "> 범위: /x/quoted": {"/x/quoted": "read"},
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual({path: access for _, path, access, _, _ in EA._task_paths(line)}, expected)
+
     def test_the_task_text_reader(self):
         rows = EA._task_paths(
             "**범위:** /a/out에 저장, /a/ref 참조, /a/raw 제외, /a/after\n"

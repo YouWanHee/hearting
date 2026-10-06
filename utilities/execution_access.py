@@ -366,14 +366,15 @@ def resolve_task_targets(route: Mapping[str, object]) -> ResolvedTaskTargets | N
 # Read roots come from any absolute path in the task text. Write roots come only
 # from the approved scope: the start card's `범위:` (`Scope:`) field as sealed in
 # the task, and in it only the paths outside a read-only or excluded clause.
-_SCOPE_FIELD = re.compile(r"^[\s>*-]*(?:\*\*)?(?:범위|[Ss]cope)(?:\*\*)?\s*[:：]\s*(?:\*\*)?(.*)$")
+_SCOPE_FIELD = re.compile(r"^[\s*-]*(?:\*\*)?(?:범위|[Ss]cope)(?:\*\*)?\s*[:：]\s*(?:\*\*)?(.*)$")
 _TASK_PATH = re.compile(r"(?<![\w.~/\\-])/[^\s`'\"<>()\[\]{}|,;*?=]+")
 _SCOPE_CLAUSE = re.compile(r"[^,;·、，()]+")
 _SCOPE_EXCLUDED = re.compile(
-    r"제외|금지|않|말고|빼고|건드리지|손대지|\b(?:exclud\w*|except|never|not|without|untouched)\b", re.I)
+    r"제외|금지|않|말고|빼고|건드리지|손대지"
+    r"|\b(?:exclud\w*|except|never|not|without|untouched|off[- ]limits)\b", re.I)
 _SCOPE_READ_ONLY = re.compile(
-    r"읽|참조|참고|조회|입력|보기|확인|보존|불변|\b(?:read\w*|referenc\w*|input\w*|inspect\w*|view\w*|preserv\w*|keep)\b",
-    re.I)
+    r"읽|참조|참고|조회|입력|보기|확인|보존|불변|유지|그대로"
+    r"|\b(?:read\w*|referenc\w*|input\w*|inspect\w*|view\w*|preserv\w*|keep)\b", re.I)
 _PATH_PARTICLES = ("에서는", "에서도", "으로는", "에서", "에게", "에는", "에도", "으로", "까지", "부터",
                    "처럼", "이나", "안에", "아래", "폴더", "경로", "로", "에", "의", "을", "를", "은",
                    "는", "이", "가", "와", "과", "도", "만", "나", "안")
@@ -410,24 +411,42 @@ def _strip_particles(token: str) -> str:
     return token
 
 
+def _scope_access(clauses: list[str]) -> list[str]:
+    """`write`, `read` or `excluded` for each clause of the scope field. A clause
+    that names no path qualifies the nearest clause before it that does (`…/raw
+    (제외)`, `…/raw, 읽기만`); everything from the first excluded clause on is excluded."""
+
+    access = ["write"] * len(clauses)
+    owner = None
+    excluded_from = None
+    for index, clause in enumerate(clauses):
+        if _TASK_PATH.search(clause):
+            owner = index
+        target = index if owner is None else owner
+        if excluded_from is None and _SCOPE_EXCLUDED.search(clause):
+            excluded_from = target
+        if _SCOPE_READ_ONLY.search(clause):
+            access[target] = "read"
+    if excluded_from is not None:
+        access[excluded_from:] = ["excluded"] * (len(clauses) - excluded_from)
+    return access
+
+
 def _task_paths(text: str) -> list[tuple[int, str, str, str, str]]:
     """`(line, path, access, source, quote)` for each absolute path the task
     names: `source` is `scope` on the approved scope field, else `task`; `access`
-    is `write`, `read` or `excluded`; `quote` is the scope clause or the words
-    around the path. Everything from the first excluding clause of the scope
-    field on is excluded; a read-only clause is read."""
+    is `write`, `read` or `excluded` (`_scope_access`); `quote` is the scope clause
+    or the words around the path."""
 
     found: list[tuple[int, str, str, str, str]] = []
     for number, line in enumerate(text.splitlines(), 1):
         scope = _SCOPE_FIELD.match(line)
-        clauses = ([(line, "read")] if scope is None
-                   else [(m.group(0), None) for m in _SCOPE_CLAUSE.finditer(scope.group(1))])
-        excluding = False
+        if scope is None:
+            clauses = [(line, "read")]
+        else:
+            parts = [m.group(0) for m in _SCOPE_CLAUSE.finditer(scope.group(1))]
+            clauses = list(zip(parts, _scope_access(parts)))
         for clause, access in clauses:
-            if access is None:
-                excluding = excluding or bool(_SCOPE_EXCLUDED.search(clause))
-                access = ("excluded" if excluding
-                          else "read" if _SCOPE_READ_ONLY.search(clause) else "write")
             for match in _TASK_PATH.finditer(clause):
                 if not match.group(0).startswith("//"):
                     quote = (clause if scope is not None
