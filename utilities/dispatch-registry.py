@@ -77,6 +77,7 @@ from dispatch_registry_inventory import (  # noqa: E402
     import_archive as inventory_import_archive,
     inventory_query,
 )
+from codex_dispatch_terminal import EXACT_BOUNDARY_SOURCES, exact_boundary  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
     REVIEW_BLOCKING_NOTE,
     carrier_terminal_note,
@@ -658,7 +659,7 @@ def _foreground_stage_terminal(row):
     meta = row["meta"]
     attempt = meta.get("attempt_id", "")
     log = Path(meta.get("log_file") or "")
-    runtime = next((name for name in ("codex", "claude")
+    runtime = next((name for name in EXACT_BOUNDARY_SOURCES
                     if attempt and log.name.endswith(f".{attempt}.{name}.jsonl")), None)
     if (runtime is None or not log.is_absolute() or log.is_symlink()
             or meta.get("harness", runtime) != runtime):
@@ -666,15 +667,7 @@ def _foreground_stage_terminal(row):
     terminal = inspect_terminal_attempt(
         log, worktree=row.get("worktree"), artifact_root_metadata=meta.get("artifact_root"),
     )
-    boundary = (
-        terminal.get("source") == "exact-turn-completed"
-        and terminal.get("terminal_event") == "turn.completed"
-    ) if runtime == "codex" else (
-        terminal.get("source") == "exact-claude-result"
-        and terminal.get("terminal_event") == "result"
-        and terminal.get("native_completed") is True
-    )
-    return bool(boundary and terminal.get("state") == "valid"
+    return bool(exact_boundary(terminal, runtime) and terminal.get("state") == "valid"
                 and terminal.get("verdict") == "PASS"
                 and terminal.get("failure_class") == "pass"
                 and terminal.get("artifact_state") == "readable"
@@ -841,15 +834,15 @@ def _untrusted_foreground_review_failure(row):
             or not meta.get("route_id") or not meta.get("route_node")):
         return False
     raw_terminal = inspect_terminal_log(meta.get("log_file"))
-    if (not raw_terminal or raw_terminal.get("verdict") != "FAIL"
-            or raw_terminal.get("terminal_event") != "turn.completed"):
+    if not raw_terminal or raw_terminal.get("verdict") != "FAIL":
         return False
     terminal = inspect_terminal_attempt(
         meta.get("log_file"), worktree=row.get("worktree"),
         artifact_root_metadata=meta.get("artifact_root"), worker_type="review",
     )
+    harness = meta.get("harness") or "codex"
     return (terminal.get("state") == "invalid"
-            and terminal.get("source") == "exact-turn-completed"
+            and terminal.get("source") in EXACT_BOUNDARY_SOURCES.get(harness, ())
             and terminal.get("reason") == "artifact-outside-root")
 
 

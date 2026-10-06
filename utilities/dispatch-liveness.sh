@@ -92,7 +92,7 @@ while IFS=$'\t' read -r ts status repo wt slug pipe || [ -n "${ts:-}" ]; do
     observed_process_reason=$(printf '%s\n' "$observed_out" | sed -n 's/^process_reason=//p' | head -1)
   fi
   terminal_state=""; terminal_source=""; terminal_verdict=""; terminal_artifact=""; terminal_blocker=""
-  if { [ "$harness" = "codex" ] || [ "$harness" = "claude" ]; } && [ -n "$log_file" ]; then
+  if { [ "$harness" = "codex" ] || [ "$harness" = "claude" ] || [ "$harness" = "opencode" ]; } && [ -n "$log_file" ]; then
     wire_out=$(python3 "$CODEX_TERMINAL_INSPECTOR" \
       --worktree "$wt" --artifact-root-metadata "${artifact_root:--}" "$log_file" 2>/dev/null)
     wire_rc=$?
@@ -101,35 +101,27 @@ while IFS=$'\t' read -r ts status repo wt slug pipe || [ -n "${ts:-}" ]; do
       END { if (NR == 1 && good) print "ok"; else print "bad" }')
     if [ "$wire_shape" = "ok" ]; then
       IFS=$'\t' read -r _wire terminal_state terminal_source terminal_verdict terminal_artifact terminal_blocker <<< "$wire_out"
-      wire_key="$wire_rc|$terminal_state|$terminal_source|$terminal_verdict|$terminal_artifact|$terminal_blocker"
+      # Each harness's exact turn boundary (codex_dispatch_terminal.EXACT_BOUNDARY_SOURCES).
+      case "$terminal_source" in
+        exact-turn-completed|exact-claude-result|exact-step-finish-stop|exact-opencode-result) wire_source=exact ;;
+        *) wire_source="$terminal_source" ;;
+      esac
+      wire_key="$wire_rc|$terminal_state|$wire_source|$terminal_verdict|$terminal_artifact|$terminal_blocker"
       case "$wire_key" in
-        0\|valid\|exact-turn-completed\|PASS\|none\|none|\
-        0\|valid\|exact-claude-result\|PASS\|none\|none|\
-        0\|valid\|exact-turn-completed\|PASS\|readable\|none|\
-        0\|valid\|exact-claude-result\|PASS\|readable\|none|\
-        0\|valid\|exact-turn-completed\|FAIL\|none\|none|\
-        0\|valid\|exact-claude-result\|FAIL\|none\|none|\
-        0\|valid\|exact-turn-completed\|FAIL\|none\|worker-reported|\
-        0\|valid\|exact-claude-result\|FAIL\|none\|worker-reported|\
-        0\|valid\|exact-turn-completed\|FAIL\|readable\|none|\
-        0\|valid\|exact-claude-result\|FAIL\|readable\|none|\
-        0\|valid\|exact-turn-completed\|FAIL\|readable\|worker-reported|\
-        0\|valid\|exact-claude-result\|FAIL\|readable\|worker-reported|\
-        0\|valid\|exact-turn-completed\|BLOCKED\|none\|none|\
-        0\|valid\|exact-claude-result\|BLOCKED\|none\|none|\
-        0\|valid\|exact-turn-completed\|BLOCKED\|none\|worker-reported|\
-        0\|valid\|exact-claude-result\|BLOCKED\|none\|worker-reported|\
-        0\|valid\|exact-turn-completed\|BLOCKED\|readable\|none|\
-        0\|valid\|exact-claude-result\|BLOCKED\|readable\|none|\
-        0\|valid\|exact-turn-completed\|BLOCKED\|readable\|worker-reported|\
-        0\|valid\|exact-claude-result\|BLOCKED\|readable\|worker-reported|\
+        0\|valid\|exact\|PASS\|none\|none|\
+        0\|valid\|exact\|PASS\|readable\|none|\
+        0\|valid\|exact\|FAIL\|none\|none|\
+        0\|valid\|exact\|FAIL\|none\|worker-reported|\
+        0\|valid\|exact\|FAIL\|readable\|none|\
+        0\|valid\|exact\|FAIL\|readable\|worker-reported|\
+        0\|valid\|exact\|BLOCKED\|none\|none|\
+        0\|valid\|exact\|BLOCKED\|none\|worker-reported|\
+        0\|valid\|exact\|BLOCKED\|readable\|none|\
+        0\|valid\|exact\|BLOCKED\|readable\|worker-reported|\
         2\|absent\|none\|-\|unchecked\|-|\
-        3\|invalid\|exact-turn-completed\|-\|unchecked\|contract-violation|\
-        3\|invalid\|exact-claude-result\|-\|unchecked\|contract-violation|\
-        3\|invalid\|exact-turn-completed\|-\|missing\|contract-violation|\
-        3\|invalid\|exact-claude-result\|-\|missing\|contract-violation|\
-        3\|invalid\|exact-turn-completed\|-\|outside-root\|contract-violation|\
-        3\|invalid\|exact-claude-result\|-\|outside-root\|contract-violation|\
+        3\|invalid\|exact\|-\|unchecked\|contract-violation|\
+        3\|invalid\|exact\|-\|missing\|contract-violation|\
+        3\|invalid\|exact\|-\|outside-root\|contract-violation|\
         4\|error\|runtime-error\|-\|unchecked\|contract-violation|\
         4\|error\|runtime-error\|-\|unsafe-root\|contract-violation) ;;
         *) terminal_state="wire-invalid" ;;
@@ -177,8 +169,12 @@ while IFS=$'\t' read -r ts status repo wt slug pipe || [ -n "${ts:-}" ]; do
 
   case "$terminal_state" in
     valid)
-      terminal_event_label="turn.completed"
-      [ "$terminal_source" = "exact-claude-result" ] && terminal_event_label="Claude result"
+      case "$terminal_source" in
+        exact-claude-result) terminal_event_label="Claude result" ;;
+        exact-step-finish-stop) terminal_event_label="OpenCode step finish" ;;
+        exact-opencode-result) terminal_event_label="OpenCode result" ;;
+        *) terminal_event_label="turn.completed" ;;
+      esac
       if [ "$terminal_verdict" = "PASS" ]; then
         echo "⚠️ COMPLETED ${slug:-?}  — exact $terminal_event_label PASS; harvest required (artifact_state=$terminal_artifact; blocker_reason=none)  [open: $ts]"
       else

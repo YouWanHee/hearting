@@ -74,6 +74,35 @@ _TERMINAL_SOURCES = (
     "exact-opencode-result",
     "exact-step-finish-stop",
 )
+# Which inspector sources mark each harness's own exact turn boundary, and the
+# name a person reads for it. Every recovery and liveness reader asks these
+# instead of naming one harness's event.
+EXACT_BOUNDARY_SOURCES = {
+    "codex": frozenset({"exact-turn-completed"}),
+    "claude": frozenset({"exact-claude-result"}),
+    "opencode": frozenset({"exact-step-finish-stop", "exact-opencode-result"}),
+}
+BOUNDARY_LABELS = {
+    "exact-turn-completed": "turn.completed",
+    "exact-claude-result": "Claude result",
+    "exact-step-finish-stop": "OpenCode step finish",
+    "exact-opencode-result": "OpenCode result",
+}
+
+
+def exact_boundary(terminal: dict, harness: str) -> bool:
+    """The inspected log ends on `harness`'s own exact turn boundary.
+
+    Claude's `result` row counts only with its native completion proof, as before.
+    """
+    source = terminal.get("source")
+    if source not in EXACT_BOUNDARY_SOURCES.get(harness, ()):
+        return False
+    return harness != "claude" or terminal.get("native_completed") is True
+
+
+def boundary_label(source) -> str:
+    return BOUNDARY_LABELS.get(source, str(source or "-"))
 _LEGAL_WIRE = frozenset(
     {
         *(

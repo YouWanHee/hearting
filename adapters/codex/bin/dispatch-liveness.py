@@ -24,6 +24,7 @@ from dispatch_contract import (  # noqa: E402
     resolve_agent_home as _resolve_agent_home,
     resolve_dispatch_state_root,
 )
+from codex_dispatch_terminal import boundary_label  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
     inspect_terminal_attempt,
     terminal_envelope_observed,
@@ -391,11 +392,7 @@ def main(argv: list[str]) -> int:
             if terminal and terminal.get("state") == "valid":
                 verdict = terminal["verdict"]
                 artifact_state = terminal["artifact_state"]
-                terminal_label = (
-                    "Claude result"
-                    if terminal.get("source") == "exact-claude-result"
-                    else "turn.completed"
-                )
+                terminal_label = boundary_label(terminal.get("source"))
                 if verdict == "PASS":
                     print(
                         f"COMPLETED {label} - exact {terminal_label} PASS; harvest required "
