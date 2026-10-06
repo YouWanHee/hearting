@@ -1107,6 +1107,21 @@ class ReviewRoundCapTest(unittest.TestCase):
                      "stage_authority=0,session_chain_id=ssc-gap-1,attempt_id=att-gap-0\n")
         self.assertEqual(self._subsession_purpose(chain_row + failed), (0, "planned"))
 
+    def test_subsession_after_a_blocked_round_is_a_gap_retry_too(self):
+        # A BLOCKED (unfinished) round spends no round, yet the phases that finish its
+        # remaining items are the gap retry of that round, not planned subdivision.
+        blocked = self._rows("test", 1).replace("note=dead-worker-fail,failure_class=fail",
+                                                "note=dead-worker-blocked,failure_class=blocked")
+        self.assertEqual(self._subsession_purpose(blocked), (0, "gap-retry"))
+        crash = blocked.splitlines(True)[-1].replace(
+            "note=dead-worker-blocked,failure_class=blocked", "note=dead-exact-pid,failure_class=contract"
+        ).replace("att-test-1", "att-test-crash")
+        self.assertEqual(self._subsession_purpose(blocked + crash), (0, "gap-retry"))   # a death answers nothing
+        passed = blocked.splitlines(True)[-1].replace(
+            "note=dead-worker-blocked,failure_class=blocked", "note=completed-marker"
+        ).replace("att-test-1", "att-test-pass")
+        self.assertEqual(self._subsession_purpose(blocked + passed), (0, "planned"))
+
     def test_a_sd154_10_admit_round_is_the_one_admission_entry_on_every_surface(self):
         """A-SD154-10 parity: `dispatch-node.py`'s own `main()`, `dispatch-
         batch.py` and `stage-dispatch-fallback.py` all call the SAME

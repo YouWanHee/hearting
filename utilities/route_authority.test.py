@@ -123,6 +123,14 @@ class Case3TestRoundTest(unittest.TestCase):
         budget = RA.round_budget(self.ROUTE, self.NODE, rows)
         self.assertEqual((budget.state, budget.verdict_rounds, budget.cap), ("exhausted", 2, 2))
         self.assertTrue(RA.last_verdict_blocking(rows, "test"))
+        self.assertTrue(RA.gate_unmet(rows, "test"))
+        # RA-5 (stage 2): an unfinished round ends BLOCKED; it spends no round and leaves
+        # the gate unmet, so the phases after it are a gap retry. Two BLOCKED in a row still bind.
+        blocked = [("done", {"note": "dead-worker-blocked", "failure_class": "blocked", "worker_type": "stage"})]
+        self.assertEqual(RA.round_budget(self.ROUTE, self.NODE, blocked).verdict_rounds, 0)
+        self.assertTrue(RA.gate_unmet(blocked, "test"))
+        self.assertFalse(RA.gate_unmet(rows + [("done", {"note": "completed-marker", "worker_type": "stage"})], "test"))
+        self.assertEqual(RA.round_budget(self.ROUTE, self.NODE, blocked * 2).state, "verdictless-bound")
 
     def test_a_declared_phase_is_outside_the_full_stage_rounds(self):
         phase = SimpleNamespace(subsession_id="ss-gap-1", subsession_index=1, subsession_count=5,
