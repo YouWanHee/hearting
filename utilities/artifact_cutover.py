@@ -1957,9 +1957,12 @@ def resolve_legacy(root: Path, rel: str) -> Dict[str, Any]:
     if direct.exists() and not os.path.islink(str(direct)):
         return {"path": rel, "resolution": "present", "target": rel, "absolute": str(direct)}
     maps = _load_maps(root)
+    missed: List[str] = [os.path.normpath(str(direct))]
     for name, table in reversed(maps):  # latest map wins
         if rel in table and (root / table[rel]).exists():
             return {"path": rel, "resolution": "mapped", "target": table[rel], "absolute": str(root / table[rel]), "map": name}
+        if rel in table:
+            missed.append(os.path.normpath(str(root / table[rel])))
     # longest mapped ancestor directory
     parts = rel.split("/")
     for depth in range(len(parts) - 1, 0, -1):
@@ -1969,7 +1972,112 @@ def resolve_legacy(root: Path, rel: str) -> Dict[str, Any]:
             if ancestor in table and (root / table[ancestor] / tail).exists():
                 return {"path": rel, "resolution": "mapped-ancestor", "target": table[ancestor] + "/" + tail,
                         "absolute": str(root / table[ancestor] / tail), "map": name}
+            if ancestor in table:
+                missed.append(os.path.normpath(str(root / table[ancestor] / tail)))
+    for candidate in dict.fromkeys(missed):
+        target, evidence = _follow_relocated(Path(candidate))
+        if target is not None:
+            try:
+                target_rel = target.relative_to(root).as_posix()
+            except ValueError:
+                target_rel = str(target)
+            result: Dict[str, Any] = {"path": rel, "resolution": "relocated",
+                                      "target": target_rel, "absolute": str(target),
+                                      "pointer": evidence[-1]}
+            if len(evidence) > 1:
+                result["chain"] = evidence
+            return result
     return {"path": rel, "resolution": "unresolved", "target": None, "absolute": None}
+
+
+_RELOCATED_SCHEMA = "fleet-payload-pointer.v1"
+_RELOCATED_SUFFIX = ".RELOCATED.json"
+_RELOCATED_MAX_BYTES = 1 << 20
+_RELOCATED_MAX_HOPS = 8
+
+
+def _relocated_pointer_target(pointer: Path) -> Optional[Path]:
+    """Validate one sibling `<name>.RELOCATED.json` pointer file (read-only).
+
+    Returns the absolute new location, or None when the pointer is absent,
+    unreadable, a symlink, schema-mismatched, fieldless, relative, missing,
+    or itself a symlink. Anything invalid is simply not evidence.
+    """
+    try:
+        if not pointer.is_file() or os.path.islink(str(pointer)):
+            return None
+        if pointer.stat().st_size > _RELOCATED_MAX_BYTES:
+            return None
+        record = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("schema") != _RELOCATED_SCHEMA:
+        return None
+    new_path = record.get("new_path")
+    if not isinstance(new_path, str) or not new_path:
+        return None
+    target = Path(os.path.normpath(new_path))
+    if not target.is_absolute():
+        return None
+    try:
+        if not target.exists() or os.path.islink(str(target)):
+            return None
+    except OSError:
+        return None
+    return target
+
+
+def _deepest_relocated_slot(current: Path) -> Optional[Tuple[Path, str, str]]:
+    """Deepest ancestor-or-self slot of `current` holding a valid pointer.
+
+    Returns (new base, remaining tail, pointer path). Walks from `current`
+    up to the filesystem root; deeper slots win over outer ones,
+    deterministically. Read-only.
+    """
+    node, tail_parts = current, []
+    while True:
+        if node.name:
+            pointer = node.parent / (node.name + _RELOCATED_SUFFIX)
+            target = _relocated_pointer_target(pointer)
+            if target is not None:
+                return target, "/".join(reversed(tail_parts)), str(pointer)
+        if node == node.parent:
+            return None
+        tail_parts.append(node.name)
+        node = node.parent
+
+
+def _follow_relocated(candidate: Path) -> Tuple[Optional[Path], List[str]]:
+    """Follow sibling RELOCATED pointers from a missed candidate path.
+
+    Returns (landed absolute target, pointer evidence paths oldest-first) or
+    (None, []). Hops are bounded with a visited-set cycle guard; a chain that
+    never lands on an existing target resolves to unresolved. Read-only: no
+    file or map is written.
+    """
+    evidence: List[str] = []
+    seen = {os.path.normpath(str(candidate))}
+    current = candidate
+    for _hop in range(_RELOCATED_MAX_HOPS):
+        slot = _deepest_relocated_slot(current)
+        if slot is None:
+            return None, []
+        target_base, tail, pointer = slot
+        current = target_base if not tail else target_base / tail
+        evidence.append(pointer)
+        norm = os.path.normpath(str(current))
+        if norm in seen:
+            return None, []
+        seen.add(norm)
+        try:
+            landed = current.exists() and not os.path.islink(str(current))
+        except OSError:
+            return None, []
+        if landed:
+            return current, evidence
+    return None, []
 
 
 def latest_shared_revision(root: Path, kind: str) -> Optional[Path]:
