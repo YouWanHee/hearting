@@ -146,6 +146,51 @@ class CodexDispatchTerminalTest(unittest.TestCase):
                 result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact=str(path), sandbox=False))
                 self.assertEqual(result["reason"], "artifact-outside-root")
 
+    def test_a_relative_path_is_read_against_the_root_then_the_worktree(self):
+        real = self.root / "campaigns/cycle/artifacts/plans/plan.md"
+        real.parent.mkdir(parents=True)
+        real.write_text("plan\n")
+        relative = "campaigns/cycle/artifacts/plans/plan.md"
+        for verdict, blocker in (("PASS", "none"), ("FAIL", "G1 wrong padding")):
+            with self.subTest(verdict=verdict):
+                result = self.inspect(self.write_log(verdict=verdict, blocker=blocker, artifact=relative, sandbox=False))
+                self.assertEqual((result["state"], result["verdict"], result["artifact_state"]),
+                                 ("valid", verdict, "readable"))
+                self.assertEqual(self._path(result["artifact_path_b64"]), real)
+                self.assertEqual(str(self._path(result["artifact_named_path_b64"])), relative)
+                self.assertEqual(result["envelope_normalized"], "artifact-relative")
+
+    def test_an_unusable_relative_path_names_the_root_and_every_path_tried(self):
+        # missing everywhere
+        result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="plans/absent.md", sandbox=False))
+        self.assertEqual((result["state"], result["reason"], result["artifact_state"]),
+                         ("invalid", "artifact-outside-root", "missing"))
+        self.assertEqual(self._path(result["artifact_base_root_b64"]), self.root)
+        self.assertEqual(str(self._path(result["artifact_candidates_b64"])).split("\n"),
+                         [str(self.root / "plans/absent.md"), str(self.worktree / "plans/absent.md")])
+        # present only in the worktree, outside the root
+        (self.worktree / "notes.md").write_text("draft\n")
+        result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="notes.md", sandbox=False))
+        self.assertEqual((result["reason"], result["artifact_state"]), ("artifact-outside-root", "outside-root"))
+        # two different in-root targets
+        (self.root / "twice.md").write_text("one\n")
+        (self.worktree / "twice.md").symlink_to(self.root / "campaigns")
+        (self.root / "campaigns").mkdir(exist_ok=True)
+        result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="twice.md", sandbox=False))
+        self.assertEqual((result["reason"], result["artifact_state"]), ("artifact-outside-root", "unchecked"))
+        self.assertEqual(len(str(self._path(result["artifact_candidates_b64"])).split("\n")), 2)
+        # parent steps never leave through a relative path
+        result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="../x.md", sandbox=False))
+        self.assertEqual(result["reason"], "artifact-outside-root")
+
+    def test_an_absolute_path_outside_the_root_names_the_root(self):
+        outside = self.base / "other.md"
+        outside.write_text("x\n")
+        result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact=str(outside), sandbox=False))
+        self.assertEqual(result["reason"], "artifact-outside-root")
+        self.assertEqual(self._path(result["artifact_base_root_b64"]), self.root)
+        self.assertEqual(self._path(result["artifact_candidates_b64"]), outside)
+
     def test_a_pass_with_an_explained_none_blocker_is_a_pass_and_keeps_the_note(self):
         # RA-8, BC C route test: `blocker: none (...)` was discarded and rerun for ~13 min.
         artifact = self.root / "envelope.md"

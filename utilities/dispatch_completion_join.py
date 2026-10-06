@@ -70,6 +70,7 @@ from dispatch_contract import (  # noqa: E402
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 import dispatch_subsession_advance as subsession_advance  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
+    ARTIFACT_HINT_KEYS,
     REVIEW_BLOCKING_NOTE,
     review_blocking_handoff,
     inspect_terminal_attempt,
@@ -4116,7 +4117,8 @@ def close_finished_child(
             ):
                 return ""
         if str(terminal.get("state")) == "invalid" and _close_invalid_envelope_child(
-            row, jobs=jobs, reason=reason
+            row, jobs=jobs, reason=reason,
+            extra_evidence={key: str(terminal.get(key) or "") for key in ARTIFACT_HINT_KEYS},
         ):
             return ""
         return reason

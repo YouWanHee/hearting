@@ -87,5 +87,16 @@ class EveryWrapperUsesItTest(unittest.TestCase):
                 self.assertNotIn("terminal_note = f\"dead-{outcome.failure}\"", source)
 
 
+
+class ArtifactHintTest(unittest.TestCase):
+    def test_the_close_carries_where_an_invalid_artifact_was_looked_for(self):
+        from codex_dispatch_terminal import ARTIFACT_HINT_KEYS
+        from dispatch_contract import ATTEMPT_TERMINAL_EVIDENCE_KEYS
+        terminal = {"artifact_base_root_b64": "cm9vdA", "artifact_candidates_b64": "YQ"}
+        evidence = F.terminal_evidence(terminal, "dead-nonzero-exit", "/tmp/log")
+        self.assertEqual({key: evidence[key] for key in ARTIFACT_HINT_KEYS}, terminal)
+        # a key the registry would refuse would make the whole close fail
+        self.assertLessEqual(set(ARTIFACT_HINT_KEYS), ATTEMPT_TERMINAL_EVIDENCE_KEYS)
+
 if __name__ == "__main__":
     unittest.main()

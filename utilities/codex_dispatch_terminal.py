@@ -651,6 +651,52 @@ def same_tail_artifact(candidate: Path, root: Path) -> Path | None:
     return next(iter(found)) if len(found) == 1 else None
 
 
+def relative_artifact(artifact: str, root: Path, worktree: str | Path | None) -> dict[str, object]:
+    """Where a relative ``artifact:`` value points: the artifact root first, then the worktree.
+
+    Returns ``{"path": <resolved in-root path> | None, "reason", "tried", "artifact_state"}``.
+    One existing in-root target is the artifact. None existing (`missing`), a
+    target outside the root (`outside-root`), or two different targets
+    (`unchecked`) leave the envelope invalid with the same
+    `artifact-outside-root` reason a relative path always had, so every reader
+    that holds or refuses on it keeps doing so; ``tried`` names every path that
+    was looked at so the next attempt can report the right one.
+    """
+    relative = Path(artifact)
+    tried = [root / relative] + ([Path(worktree) / relative] if worktree else [])
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "outside-root"}
+    found: list[Path] = []
+    outside = False
+    for path in tried:
+        if not os.path.lexists(path):
+            continue
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            outside = True
+            continue
+        if resolved not in found:
+            found.append(resolved)
+    if len(found) == 1:
+        return {"path": found[0], "reason": "none", "tried": tried, "artifact_state": "readable"}
+    if found:
+        return {"path": None, "reason": "artifact-outside-root", "tried": found, "artifact_state": "unchecked"}
+    if outside:
+        return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "outside-root"}
+    return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "missing"}
+
+
+ARTIFACT_HINT_KEYS = ("artifact_base_root_b64", "artifact_candidates_b64")
+
+
+def artifact_hint(root: Path, tried) -> dict[str, str]:
+    """The base root and the exact paths an invalid artifact was checked against."""
+    return {"artifact_base_root_b64": _encode_path(root),
+            "artifact_candidates_b64": _encode_path(Path("\n".join(str(path) for path in tried)))}
+
+
 def _encode_path(path: Path) -> str:
     return base64.urlsafe_b64encode(str(path).encode("utf-8")).decode("ascii").rstrip("=")
 
@@ -722,7 +768,7 @@ def inspect_terminal_attempt(
         parsed["artifact_state"] = "none"
     else:
         candidate = Path(artifact)
-        if not candidate.is_absolute() or _has_control(artifact):
+        if _has_control(artifact):
             return _result(
                 3,
                 "invalid",
@@ -732,6 +778,19 @@ def inspect_terminal_attempt(
                 "contract-violation",
                 reason="artifact-outside-root",
             )
+        if not candidate.is_absolute():
+            # A relative path is read against the artifact root, then the worktree.
+            relative = relative_artifact(artifact, root, worktree)
+            if relative["path"] is None:
+                return _result(
+                    3, "invalid", str(parsed["source"]), "-", str(relative["artifact_state"]),
+                    "contract-violation", reason=str(relative["reason"]),
+                    **artifact_hint(root, relative["tried"]),
+                )
+            parsed["artifact_named_path_b64"] = _encode_path(candidate)
+            parsed["envelope_normalized"] = ",".join(
+                filter(None, (parsed.get("envelope_normalized"), "artifact-relative")))
+            candidate = relative["path"]
         # RA-8: a missing path that names one existing file under the root by
         # the same tail is that file; the path the worker wrote is kept.
         named = same_tail_artifact(candidate, root) if not os.path.lexists(candidate) else None
@@ -747,6 +806,7 @@ def inspect_terminal_attempt(
                 "outside-root",
                 "contract-violation",
                 reason="artifact-outside-root",
+                **artifact_hint(root, [candidate]),
             )
         if named is not None:
             parsed["artifact_named_path_b64"] = _encode_path(candidate)
