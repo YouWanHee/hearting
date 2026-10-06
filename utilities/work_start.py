@@ -870,6 +870,7 @@ def _proposal_review(route, path, jobs, rows=None):
             "display": RP.none_text(row["reason"]) if row["proposal"] is None else "proposal",
             "legs": (row.get("facts") or {}).get("legs", []),
             "start_approvals": _grouped_approvals(row),
+            **({"read_notes": row["read_notes"]} if row.get("read_notes") else {}),
             **({"question_renames": renames} if (renames := RP.question_renames(row.get("source") or "")) else {})}
            for row in rows],
         "equal": RP.proposals_equal(rows),
@@ -939,8 +940,8 @@ def _decide(route, jobs, root, record, output, briefs, intent):
     if not isinstance(interview, dict) or not isinstance(answers, dict) or "route_proposals" not in interview:
         return ended(RP.NO_PROPOSAL_READ)
     rows = _proposal_rows(route, jobs, root, record, output)
-    shown = [{key: row[key] for key in ("node", "proposal", "reason", "brief_path", "sha256", "source") if key in row}
-             for row in rows]
+    shown = [{key: row[key] for key in ("node", "proposal", "reason", "brief_path", "sha256", "source", "read_notes")
+              if key in row} for row in rows]
     choice = FI.route_choice(interview, answers)
     if choice is None:
         return ended(RP.NO_PROPOSAL_READ)

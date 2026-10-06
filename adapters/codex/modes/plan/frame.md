@@ -144,8 +144,11 @@ created: {YYYY-MM-DD}
      execution_scope: complete   # optional: complete (default) | report
    ```
 
-   Anything that is not a valid proposal is read as "no proposal"; it never
-   blocks the brief.
+   The runtime reads section 8 under any title (the whole brief when it has no
+   section 8 heading), takes the first readable block when there are several,
+   ignores fields it does not know, and keeps the legs before an invalid one;
+   the review shows the person each of these. A brief whose first leg is
+   invalid has no proposal; it never blocks the brief.
 
 ## Constraints
 

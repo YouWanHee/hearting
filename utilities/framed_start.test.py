@@ -396,16 +396,17 @@ class NoneEndingTest(StartBase):
         self.set_briefs(brief([DIRECT], section=False), "## 8. 경로 조립 제안\n\nnothing fenced\n")
         result = self.assert_none("proposal-not-verified")
         rows = {row["node"]: row for row in self.record()["decision"]["proposals"]}
-        self.assertEqual(rows["frame"]["reason"], "section-missing")
+        self.assertEqual(rows["frame"]["reason"], "block-missing")          # section 8 under another title
         self.assertEqual(rows["frame-alternative"]["reason"], "block-missing")
 
-    def test_a164_4_one_invalid_leg_makes_the_whole_brief_none(self):
+    def test_an_invalid_later_leg_is_cut_and_named_and_a_copy_with_it_is_not_verified(self):
         bad = {"capability": "autopilot-code", "shape": "staged", "graph": ["execute", "no-such-stage"]}
         self.set_briefs([DIRECT, bad], DIRECT)
         self.set_interview({"legs": [DIRECT, bad]})
         self.assert_none("proposal-not-verified")
         rows = {row["node"]: row for row in self.record()["decision"]["proposals"]}
-        self.assertRegex(rows["frame"]["reason"], r"^leg-invalid:1:compose-graph-unknown-node")
+        self.assertEqual((rows["frame"]["reason"], len(rows["frame"]["proposal"]["legs"])), ("valid", 1))
+        self.assertRegex(rows["frame"]["read_notes"][0], r"^leg-invalid:1:compose-graph-unknown-node")
         self.assertEqual(rows["frame-alternative"]["reason"], "valid")
 
 
