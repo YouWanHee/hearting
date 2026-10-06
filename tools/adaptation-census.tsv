@@ -98,6 +98,7 @@ utility-deferred	codex_hook_definition_age.py
 utility-deferred	codex_managed_dispatch.py
 utility-deferred	codex_queue_delivery.py
 utility-deferred	codex_queue_dispatch.py
+utility-deferred	commit_policy.py
 utility-deferred	compose-route.py
 utility-deferred	compose_route.test.py
 utility-deferred	compute-hosts.py

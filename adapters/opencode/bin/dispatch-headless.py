@@ -132,6 +132,7 @@ from stage_session_runtime import (  # noqa: E402
     metadata as stage_session_metadata,
     prompt_fragment as stage_session_prompt,
 )
+import commit_policy  # noqa: E402
 from model_config import (  # noqa: E402
     ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
     main_session_only_state, resolve_config, restricted_model,
@@ -1032,6 +1033,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"{contract_read_prompt(args, 'opencode')}"
         "- Preserve the reported QA/tool contracts in the artifact; owner workers launch checked adapter wrappers directly.\n\n"
         f"{heartbeat}"
+        f"{commit_policy.prompt_clause(args)}"
         f"{stage_session_prompt(args)}"
         f"{released_task_prompt(args)}"
         f"{unit_bootstrap_prompt(args, task, os.environ)}"
@@ -1393,6 +1395,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         pipe += f",broker_request_id={args.broker_request_id}"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     from review_input import registration_fragment
+    pipe += commit_policy.registry_fragment(args)
     pipe += registration_fragment(args)
     from dispatch_replacement import seal_launch_input
     pipe += seal_launch_input(args, 'opencode', getattr(args, "replacement_raw_task", ""))
