@@ -1697,11 +1697,17 @@ def reconcile(rows, args):
         # transaction a carrier for unrelated pending deliveries.
         record["pending_delivery"] = {"skipped": "exact-attempt-only"}
     elif args.apply and exact_selection:
-        # A normal exact --attempt apply stays scoped to that attempt, its
-        # process drain, and its related join-recovery, which already ran
-        # through the exact per-attempt APIs above. Unrelated pending and
-        # outbox rows stay for the selector-less bulk maintenance path.
-        record["pending_delivery"] = {"skipped": "exact-attempt-only"}
+        # Normal exact --attempt scope: the target attempt's own missing
+        # delivery record (close/commit-to-trigger-1 crash window) is still
+        # repaired through the exact per-attempt backstop API. Unrelated
+        # recipient expiry and the global retention prune stay with the
+        # selector-less bulk maintenance path.
+        materialized = 0
+        if selected[0]["meta"].get("delivery_intent") == "1" \
+                and materialize_after_terminal_close(args.jobs, args.attempt) is not None:
+            materialized = 1
+        record["pending_delivery"] = {"applied": {"materialized": materialized},
+                                      "scope": "exact-attempt-only"}
     elif args.apply:
         # SD-111 P2 §2-b-2/§2-c: this `reconcile` call is the existing
         # bounded-cadence "dispatch reconcile path" -- the materialize

@@ -2207,28 +2207,37 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   # BC observation: installed `reconcile --attempt <id> --apply` on a settled
   # drain (attempted=1, target unchanged) also swept the global pending
   # outbox (pruned 78, skipped 6, unknown recipients, old digest skew). A
-  # normal exact --attempt apply stays scoped to its attempt, process drain,
-  # and related join-recovery; the selector-less bulk path keeps global
-  # maintenance. The planted record is prune-eligible (terminal + older than
-  # retention), so the old code would unlink it here.
+  # normal exact --attempt apply repairs at most its target's own delivery
+  # backstop; unrelated recipient expiry and the retention prune stay with
+  # the selector-less bulk path. The planted record is prune-eligible
+  # (terminal + older than retention), so the old code would unlink it here.
+  # The first apply may attach the target's own cleanup receipt (in-scope
+  # target behavior, not unrelated churn), so snapshot only once settled.
   self.write_row()
   self.assertEqual(self.seal("--apply")["sealed"],1)
+  first=self.invoke("reconcile","--attempt",self.attempt,"--apply")
+  self.assertEqual(first.returncode,0,first.stdout+first.stderr)
+  first_record=json.loads(first.stdout)
+  self.assertEqual(first_record["decisions"][0]["category"],"terminal-settled",first_record)
   unrelated=self.base/"pending-delivery"/"fixture-recipient"/"unrelated-acked.json"
   unrelated.parent.mkdir(parents=True)
-  unrelated.write_text(json.dumps({"state":"acked","delivery_id":"unrelated-1","recipient_key":"fixture-recipient","expiry_reason":"fixture"},sort_keys=True))
+  unrelated.write_text(json.dumps({"state":"acked","delivery_id":"unrelated-1",
+   "recipient_key":"fixture-recipient","expiry_reason":"fixture"},sort_keys=True))
   old=time.time()-8*86400;os.utime(unrelated,(old,old))
   before_jobs=self.jobs.read_bytes();before_outbox=unrelated.read_bytes()
-  recovery=self.invoke("reconcile","--attempt",self.attempt,"--apply")
-  self.assertEqual(recovery.returncode,0,recovery.stdout+recovery.stderr)
-  record=json.loads(recovery.stdout)
+  second=self.invoke("reconcile","--attempt",self.attempt,"--apply")
+  self.assertEqual(second.returncode,0,second.stdout+second.stderr)
+  record=json.loads(second.stdout)
   self.assertEqual(record["attempted"],1,record)
   self.assertEqual(record["decisions"][0]["category"],"terminal-settled",record)
   self.assertFalse(record["decisions"][0]["closed"])
-  self.assertEqual(record["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(record["pending_delivery"],
+                   {"applied":{"materialized":0},"scope":"exact-attempt-only"})
   self.assertEqual(self.jobs.read_bytes(),before_jobs)
   self.assertEqual(unrelated.read_bytes(),before_outbox)
   names=sorted(path.name for path in unrelated.parent.iterdir())
   self.assertEqual(names,["unrelated-acked.json"])
+
  def test_seal_survives_a_live_tagged_process_that_outlived_the_worker(self):
   """The exact shape that made the receipt unissuable: a leaked tagged process."""
   child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
@@ -2333,6 +2342,54 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
                      "--seal-artifact-proof-receipt","--cancel-receiptless-namespace")
   self.assertEqual(result.returncode,64)
   self.assertIn("receipt-recovery-mode-conflict",result.stdout)
+
+
+class ExactAttemptDeliveryBackstopTest(unittest.TestCase):
+ """Normal exact --attempt --apply repairs its target's own backstop only.
+
+ Crash-window shape (proven by ReconcilePendingDeliveryTest): the row is
+ closed with delivery intent while trigger 1 is skipped, so no record
+ exists yet. The exact apply must materialize that one target record
+ through the exact per-attempt API and leave every unrelated outbox row
+ (including prune-eligible terminal records) untouched.
+ """
+ def test_exact_apply_materializes_only_its_target_attempt(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log"
+   attempt="att-exact-backstop-1"
+   jobs.write_text(
+    "2026-08-28T00:00:00Z\topen\t/r\t/w\texecute\t"
+    "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+    "execution_surface=registered-headless,registered_worker=1,"
+    "fallback_hop=same-harness-headless,"
+    f"attempt_id={attempt},parent_attempt_id=att-reconcile-parent,"
+    "parent_completion_delivery=claude-parent-runtime,"
+    f"parent_sid=sess-{attempt},route_id=rt-reconcile-fixture,"
+    "route_node=execute,harness=claude\n")
+   self.assertTrue(D.close_attempt_row(jobs,attempt,"completed-marker"))
+   unrelated=base/"pending-delivery"/"fixture-recipient"/"unrelated-acked.json"
+   unrelated.parent.mkdir(parents=True)
+   unrelated.write_text(json.dumps({"state":"acked","delivery_id":"unrelated-1",
+    "recipient_key":"fixture-recipient","expiry_reason":"fixture"},sort_keys=True))
+   old=time.time()-8*86400;os.utime(unrelated,(old,old))
+   before_outbox=unrelated.read_bytes()
+   result=subprocess.run([sys.executable,str(SCRIPT),"reconcile","--jobs",str(jobs),
+    "--agent-home",str(base),"--attempt",attempt,"--apply"],
+    capture_output=True,text=True)
+   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+   record=json.loads(result.stdout)
+   self.assertEqual(record["attempted"],1,record)
+   self.assertEqual(record["pending_delivery"],
+                    {"applied":{"materialized":1},"scope":"exact-attempt-only"})
+   root=jobs.resolve(strict=False).parent
+   outbox=root/"pending-delivery"
+   peers=sorted(path for path in outbox.glob("*/*.json") if path != unrelated)
+   self.assertEqual(len(peers),1)
+   self.assertIn(attempt,peers[0].read_text(encoding="utf-8"))
+   self.assertEqual(unrelated.read_bytes(),before_outbox)
+   self.assertEqual(sorted(path.name for path in unrelated.parent.iterdir()),
+                    ["unrelated-acked.json"])
+   self.assertEqual(list(outbox.rglob("*.pruned")),[])
 
 
 class DetachedResidueDrainReconcileTest(unittest.TestCase):
