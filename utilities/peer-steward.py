@@ -939,6 +939,41 @@ def _start_shell_snapshot(pane, original_shell):
     return None
 
 
+_BESIDE_READY_SECONDS = 15
+
+
+def _wait_for_created_shell(pane, cwd, original_shell, deadline):
+    """Finish this split's cwd/bootstrap before snapshot and the one start request."""
+    while time.monotonic() < deadline:
+        occupied = _pane_has_agent(pane)
+        if occupied:
+            return occupied, original_shell
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        info = _retire_pane_info(pane, timeout=min(5, remaining))
+        if info is None:
+            return "beside-shell-unverified", original_shell
+        start = _proc_start_ticks(info["shell_pid"])
+        if not start:
+            return "beside-shell-unverified", original_shell
+        current = (info["shell_pid"], start)
+        if original_shell is None:
+            original_shell = current
+        if current != original_shell:
+            return "beside-shell-changed", original_shell
+        remaining = deadline - time.monotonic()
+        if (remaining > 0 and _start_shell_identity(pane) == original_shell
+                and (cwd is None or _proc_cwd(original_shell[0]) == cwd)
+                and _wait_for_shell_prompt(pane, timeout_ms=max(1, min(200, int(remaining * 1000))))
+                and time.monotonic() < deadline
+                and _start_shell_identity(pane) == original_shell
+                and _pane_has_agent(pane) is None):
+            return None, original_shell
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    return "beside-shell-readiness-timeout", original_shell
+
+
 def _failed_start_cleanup(pane, original_shell, original_screen):
     # Never close a caller-provided pane, a replaced shell or a late-starting
     # agent. The fresh split is the only pane owned by this failed invocation.
@@ -1032,7 +1067,7 @@ def cmd_start(args):
         if flag:
             cwd_flag = [flag, pane_cwd]
 
-    created_shell = created_screen = None
+    created_shell = created_screen = created_deadline = None
     created_pane = False
 
     def cleanup():
@@ -1063,10 +1098,19 @@ def cmd_start(args):
         args.pane = new_id
         created_pane = True
         created_shell = _start_shell_identity(new_id)
+        created_deadline = time.monotonic() + _BESIDE_READY_SECONDS
+        readiness, created_shell = _wait_for_created_shell(
+            args.pane, pane_cwd, created_shell, created_deadline)
+        if readiness:
+            print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
+                  f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
+            return 1
 
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
-    ingress_note = _ensure_pane_ingress(args.pane, args.kind, pane_cwd)
+    # split --cwd already supplies cwd in our new shell. Do not type a second
+    # Claude cd; existing caller-provided panes still use their normal bootstrap.
+    ingress_note = _ensure_pane_ingress(args.pane, args.kind, None if created_pane else pane_cwd)
     if ingress_note:
         print(f"started=false reason={ingress_note} agent={args.kind} name={args.name} "
               f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
@@ -1111,6 +1155,12 @@ def cmd_start(args):
         cmd += ["--"] + full_agent_args
 
     if created_pane:
+        readiness, created_shell = _wait_for_created_shell(
+            args.pane, pane_cwd, created_shell, created_deadline)
+        if readiness:
+            print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
+                  f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
+            return 1
         created_screen = _start_shell_snapshot(args.pane, created_shell)
 
     try:
