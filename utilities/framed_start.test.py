@@ -809,12 +809,14 @@ class PlanExtraStageTest(StartBase):
                                                {"id": "y", "unit": "qa/test", "after": "report"},
                                                {"id": "z", "unit": "qa/test", "after": "nowhere"},
                                                # an approval-gated stage (deploy, full-run...) is never a template
-                                               {"id": "w", "unit": "_kernel/resource", "after": "test"}]}
+                                               {"id": "w", "unit": "_kernel/resource", "after": "test"},
+                                               # a stage that changes the source would land after the last check
+                                               {"id": "patch", "unit": "dev/backend", "after": "test"}]}
         route = self.leg_route(leg)
         self.assertFalse([n for n in route["nodes"] if n.get("plan_stage")])
         row = next(r for r in self.record()["decision"]["proposals"] if r["node"] == "frame")
         self.assertEqual(sorted(note for note in row["read_notes"] if note.startswith("extra-stage")),
-                         ["extra-stage-not-compiled:w", "extra-stage-not-compiled:x",
+                         ["extra-stage-not-compiled:patch", "extra-stage-not-compiled:w", "extra-stage-not-compiled:x",
                           "extra-stage-not-compiled:y", "extra-stage-not-compiled:z"])
 
 

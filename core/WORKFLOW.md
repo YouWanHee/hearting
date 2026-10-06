@@ -298,8 +298,9 @@ and `hands_over`, and the brief whose route the person chose, reach the owner an
 every stage worker of that leg from the sealed decision; a `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
 `route_plan.read_leg_items`). A leg's `extra_stages` entry becomes node
-`plan-<id>` right after its `after` stage, shaped on the catalogue stage of the
-same unit (its gate, review budget and start approval) and writing under
+`plan-<id>` right after its `after` stage, shaped on a catalogue check or
+measurement stage of the same unit (one that writes no source; its gate, review
+budget and start approval) and writing under
 `parts/plan/<id>/`; one that cannot be placed is named in `read_notes`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file

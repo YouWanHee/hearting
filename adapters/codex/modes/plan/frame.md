@@ -147,7 +147,7 @@ created: {YYYY-MM-DD}
          verify: "one line: what verification looks at"   # optional
          hands_over: [reports/latency.md]                   # optional: what the next leg reads
          parallel: [...]                                    # optional: work the owner may split into slices
-         extra_stages: [{id, unit, after, verify}]          # optional: compiled as node plan-<id> after `after`, shaped on a catalogue stage of that unit
+         extra_stages: [{id, unit, after, verify}]          # optional: compiled as node plan-<id> after `after`, shaped on a catalogue check/measurement stage of that unit (never one that edits source)
      execution_scope: complete   # optional: complete (default) | report
    ```
 
