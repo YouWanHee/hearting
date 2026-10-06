@@ -1463,5 +1463,58 @@ class NowLangTest(unittest.TestCase):
         self.assertIn("in the conversation's own language,", rt._prompt("d"))
 
 
+class AnsweringProviderSourceTest(_ConfigHomeMixin, unittest.TestCase):
+    """Sidecar source names the provider that actually answered.
+
+    The cascade index is carried as the invoked executable's own name
+    ("custom" for an operator command); a total failure records None so the
+    previous source is kept. No live provider is invoked.
+    """
+
+    class _Completed:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def test_first_failure_records_second_provider(self):
+        commands = [(["claude", "-p"], None, None), (["codex", "exec"], None, None)]
+        box = {}
+        with mock.patch.object(rt, "_resolve_commands", return_value=commands), \
+             mock.patch.object(subprocess, "run", side_effect=[
+                 self._Completed("   "), self._Completed("TITLE: T\nNOW: s"),
+             ]):
+            self.assertEqual(rt.run_worker("prompt", timeout=30,
+                                           provider_box=box), "TITLE: T\nNOW: s")
+        self.assertEqual(box, {"provider": "codex"})
+
+    def test_total_failure_records_none(self):
+        commands = [(["claude", "-p"], None, None)]
+        box = {}
+        with mock.patch.object(rt, "_resolve_commands", return_value=commands), \
+             mock.patch.object(subprocess, "run",
+                               return_value=self._Completed("", 1)):
+            self.assertEqual(rt.run_worker("prompt", timeout=30,
+                                           provider_box=box), "")
+        self.assertEqual(box, {"provider": None})
+
+    def test_main_writes_answering_provider_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"message": "please rename this session"}) + "\n")
+            commands = [(["claude", "-p"], None, None),
+                        (["codex", "exec"], None, None)]
+            with mock.patch.object(rt, "_resolve_commands", return_value=commands), \
+                 mock.patch.object(subprocess, "run", side_effect=[
+                     self._Completed("   "),
+                     self._Completed("TITLE: Answered Title\nNOW: 답변 요약"),
+                 ]):
+                rt.main(["--sid", "sidProv", "--transcript", path])
+            d = titles.read("sidProv")
+            self.assertEqual(d["title"], "Answered Title")
+            self.assertEqual(d["summary"], "답변 요약")
+            self.assertEqual(d["source"], "refresher:codex")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
