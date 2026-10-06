@@ -90,13 +90,10 @@ OPTIONAL_PROFILE_KEYS = frozenset({
 # as absent (top review B2, 2026-09-10: the codex main-session-only key made
 # every earlier codex copy `user-incomplete`, replacing the user's whole
 # policy with the shipped file while the docs promised "no restriction").
-# Only a key whose consumer tolerates absence belongs here. The codex
-# wrapper reads its main-only list with a default (`policy.get(key, "")`), so
-# an older copy without it is unrestricted and says so on the receipt
-# (`main_session_only_policy=absent`); the Claude wrapper *raises*
-# `dispatch-model-policy-unavailable` when its key is missing, so making that
-# one optional would refuse every Claude dispatch instead of protecting it --
-# it stays required (combined review m1).
+# An absent main-session-only key means no restriction on every adapter
+# (`headless_model_refusal` below). Claude's key stays required instead: a
+# Claude copy without it is replaced by the shipped file, which keeps the
+# shipped restriction rather than lifting it (combined review m1).
 OPTIONAL_POLICY_KEYS: dict[str, frozenset[str]] = {
     "codex": frozenset({"CFG_MAIN_SESSION_ONLY_MODELS"}),
 }
@@ -127,6 +124,48 @@ def restricted_model(model: str, restricted: list[str] | tuple[str, ...] | str) 
         if alias == lowered or (re.fullmatch(r"[a-z0-9]+", alias) and alias in tokens):
             return True
     return False
+
+
+MAIN_SESSION_ONLY_KEY = "CFG_MAIN_SESSION_ONLY_MODELS"
+
+
+def main_session_only_models(policy: Mapping[str, str]) -> tuple[str, ...]:
+    """The models a registered headless launch may not select; none when the key is absent."""
+    return tuple(policy.get(MAIN_SESSION_ONLY_KEY, "").split())
+
+
+def main_session_only_state(policy: Mapping[str, str]) -> str:
+    """`declared` or `absent`, for the launch receipt (review R1 M3)."""
+    return "declared" if MAIN_SESSION_ONLY_KEY in policy else "absent"
+
+
+def headless_model_refusal(policy: Mapping[str, str], model: str, source: str) -> tuple[str, str] | None:
+    """`(reason, message)` when a headless launch selected a main-session-only model.
+
+    One rule for every adapter wrapper (audit §4 #8, A8); the OpenCode wrapper
+    used to skip this check and the Claude one refused when the key was absent.
+    """
+    if restricted_model(model, main_session_only_models(policy)):
+        return ("headless-main-session-only-model",
+                f"model selected by {source} is interactive dispatch-depth-0 main-session only")
+    return None
+
+
+def inheritance_refusal(policy: Mapping[str, str], harness: str) -> tuple[str, str] | None:
+    """`(reason, message)` when `--inherit-model-settings` may not run headless.
+
+    A headless launch cannot prove which model the inherited interactive
+    settings name, so inheritance is refused exactly when the adapter declares
+    a main-session-only model it could leak (top review M1, combined review
+    B1). An adapter that declares none has nothing to leak.
+    """
+    restricted = main_session_only_models(policy)
+    if not restricted:
+        return None
+    return ("headless-model-inheritance-ineligible",
+            f"registered headless {harness} dispatch cannot prove that inherited interactive settings "
+            f"exclude a main-session-only model ({' '.join(restricted)}); select a model profile, a model role, "
+            "or an explicit model")
 
 
 def _referenced_tiers(values: Mapping[str, str]) -> set[str]:

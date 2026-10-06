@@ -131,7 +131,10 @@ from stage_session_runtime import (  # noqa: E402
     metadata as stage_session_metadata,
     prompt_fragment as stage_session_prompt,
 )
-from model_config import ModelConfigError, resolve_config  # noqa: E402
+from model_config import (  # noqa: E402
+    ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
+    main_session_only_state, resolve_config, restricted_model,
+)
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
@@ -372,6 +375,33 @@ def role_map(role: str) -> dict[str, str]:
     return fields
 
 
+def _model_policy() -> dict[str, str]:
+    try:
+        values, _receipt = resolve_config("opencode", source_root=ROOT)
+    except ModelConfigError as exc:
+        raise ModelSelectionError(
+            "dispatch-model-policy-unavailable", str(exc)
+        ) from exc
+    return values
+
+
+def _main_session_only_model(model: str) -> bool:
+    return restricted_model(model, main_session_only_models(_model_policy()))
+
+
+def _main_session_only_policy_state() -> str:
+    try:
+        return main_session_only_state(_model_policy())
+    except ModelSelectionError:
+        return "unavailable"
+
+
+def _require_headless_model(model: str, source: str) -> None:
+    refusal = headless_model_refusal(_model_policy(), model, source)
+    if refusal:
+        raise ModelSelectionError(*refusal)
+
+
 def _model_config_state() -> tuple[str, str]:
     """Which models.conf this launch resolved (`user` or `shipped`) and why --
     on the receipt so a user copy silently replaced by the shipped file is
@@ -414,6 +444,9 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "invalid-dispatch-model-selection",
                 "--inherit-model-settings is mutually exclusive with --model-profile, --model-role, --model, and --variant",
             )
+        refusal = inheritance_refusal(_model_policy(), "OpenCode")
+        if refusal:
+            raise ModelSelectionError(*refusal)
         return {
             "source": "inherit", "role": "inherit", "profile": "unsealed",
             "tier": "inherit", "granularity": "legacy", "model": "inherit", "variant": "inherit",
@@ -472,6 +505,12 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             if not args.model:
                 model, variant = pin["model"], pin["effort"] or resolved["budget"]
             source = "pin+capacity" if args.model else "pin"
+            if route_authority.pin_target(args.worker_type) != "frame":
+                _require_headless_model(model, source)
+        elif args.model_profile != TOP_PROFILE:
+            # The route-sealed `top` profile is the one door to a main-session-only
+            # model, as on the other adapters.
+            _require_headless_model(model, f"profile:{args.model_profile}")
         return {
             "source": source,
             "role": args.model_role or "_kernel/owner",
@@ -500,6 +539,7 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "invalid-dispatch-model-role",
                 f"model role {args.model_role!r} resolved to runtime defaults; configure AGENT_MODEL_* and AGENT_VARIANT_* or pass --model/--variant",
             )
+        _require_headless_model(model, f"role:{args.model_role}")
         # 역할 티어 고정 + 상황별 variant 오버라이드 (2026-07-22 사용자 원칙).
         if args.variant:
             return {
@@ -520,6 +560,7 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             "invalid-dispatch-model-selection",
             "--model and --variant must be provided together",
         )
+    _require_headless_model(args.model, "explicit")
     return {
         "source": "explicit", "role": "-", "profile": "unsealed",
         "tier": "explicit", "granularity": "legacy", "model": args.model, "variant": args.variant,
@@ -2653,6 +2694,7 @@ def main(argv: list[str]) -> int:
     print(f"model_config_source={_config_source}")
     print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
+    print(f"main_session_only_policy={_main_session_only_policy_state()}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")
     print(f"model={settings['model']}")

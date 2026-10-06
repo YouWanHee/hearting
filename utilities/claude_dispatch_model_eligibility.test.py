@@ -129,16 +129,14 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
             "headless-model-inheritance-ineligible",
         )
 
-    def test_missing_main_only_policy_fails_closed(self):
+    def test_missing_main_only_key_carries_no_restriction(self):
+        # One rule on every adapter (model_config.headless_model_refusal). A
+        # Claude user copy without the key never gets here: the key is required,
+        # so that copy is replaced by the shipped file and its restriction.
         with mock.patch.object(WRAPPER, "_model_policy", return_value={}):
-            with self.assertRaises(WRAPPER.ModelSelectionError) as unavailable:
-                WRAPPER.resolve_model_settings(
-                    selection(model="sonnet", effort="high")
-                )
-        self.assertEqual(
-            unavailable.exception.reason,
-            "dispatch-model-policy-unavailable",
-        )
+            result = WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="high"))
+            self.assertEqual(WRAPPER._main_session_only_policy_state(), "absent")
+        self.assertEqual(result["source"], "explicit")
 
     def test_explicit_eligible_model_remains_explicit(self):
         result = WRAPPER.resolve_model_settings(

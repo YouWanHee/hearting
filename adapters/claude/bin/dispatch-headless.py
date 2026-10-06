@@ -145,7 +145,10 @@ from model_profile import (  # noqa: E402
     route_selection_pin,
     validate_registered_profile,
 )
-from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
+from model_config import (  # noqa: E402
+    ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
+    main_session_only_state, resolve_config, restricted_model,
+)
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt  # noqa: E402
 from codex_managed_dispatch import (  # noqa: E402
     MANAGED_PARENT_DELIVERY,
@@ -388,21 +391,20 @@ def _model_policy() -> dict[str, str]:
 
 
 def _main_session_only_model(model: str) -> bool:
-    policy = _model_policy()
-    if "CFG_MAIN_SESSION_ONLY_MODELS" not in policy:
-        raise ModelSelectionError(
-            "dispatch-model-policy-unavailable",
-            "CFG_MAIN_SESSION_ONLY_MODELS is not declared",
-        )
-    return restricted_model(model, policy["CFG_MAIN_SESSION_ONLY_MODELS"])
+    return restricted_model(model, main_session_only_models(_model_policy()))
+
+
+def _main_session_only_policy_state() -> str:
+    try:
+        return main_session_only_state(_model_policy())
+    except ModelSelectionError:
+        return "unavailable"
 
 
 def _require_headless_model(model: str, source: str) -> None:
-    if _main_session_only_model(model):
-        raise ModelSelectionError(
-            "headless-main-session-only-model",
-            f"model selected by {source} is interactive dispatch-depth-0 main-session only",
-        )
+    refusal = headless_model_refusal(_model_policy(), model, source)
+    if refusal:
+        raise ModelSelectionError(*refusal)
 
 
 def _model_config_state() -> tuple[str, str]:
@@ -447,10 +449,13 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "invalid-dispatch-model-selection",
                 "--inherit-model-settings is mutually exclusive with --model-profile, --model-role, --model, and --effort",
             )
-        raise ModelSelectionError(
-            "headless-model-inheritance-ineligible",
-            "registered headless Claude dispatch cannot prove that inherited main-session settings exclude a main-only model; select --model-role or --model with --effort",
-        )
+        refusal = inheritance_refusal(_model_policy(), "Claude")
+        if refusal:
+            raise ModelSelectionError(*refusal)
+        return {
+            "source": "inherit", "role": "inherit", "profile": "unsealed",
+            "tier": "inherit", "granularity": "legacy", "model": "inherit", "effort": "inherit",
+        }
     if args.model_profile:
         if not args.model_role and args.worker_type != "owner":
             raise ModelSelectionError(
@@ -2956,6 +2961,7 @@ def main(argv: list[str]) -> int:
     print(f"model_config_source={_config_source}")
     print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
+    print(f"main_session_only_policy={_main_session_only_policy_state()}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")
     print(f"model={settings['model']}")
