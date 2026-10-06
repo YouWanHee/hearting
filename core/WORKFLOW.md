@@ -361,7 +361,8 @@ remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
 to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
 non-direct `--start` whose stages change source from a primary checkout, the worktree
-`<repo>-wt/<slug>` on branch `<slug>` from the latest base, created or reused; a framed
+`<repo>-wt/<slug>` on branch `<slug>` from the latest base, created or reused, unless the
+checkout holds work the base lacks; a framed
 decision's first such leg does the same under the frame's slug), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
@@ -712,7 +713,8 @@ python3 utilities/capability-route.py status [--artifact-root <dir>] --open-only
 `status` defaults the artifact root from the cwd, and each open row carries its
 `resume_command`. A `start` without `--route` continues this session's newest
 open route (its route-chain ledger), or else the one open route sealed for the
-cwd; with none or several it lists them and starts nothing.
+cwd (or, with none there, for a worktree of its repository); with none or several
+it lists them and starts nothing.
 
 `close` may preserve `terminal_gate_proven=false`; later exact completion on the
 same route is consumed by complete/finish/close/finalize (artifact-path-contract

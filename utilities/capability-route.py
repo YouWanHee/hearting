@@ -9399,7 +9399,8 @@ def prepare_isolated_worktree(cwd, slug):
     `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
     `origin/<default>`, or the existing worktree at that path, reused as it is. Returns
     `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
-    caller's cwd stays the route cwd (not a primary checkout, or the path or branch is taken).
+    caller's cwd stays the route cwd (not a primary checkout, local work the base lacks, or the path
+    or branch is taken).
     Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
     if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
         return {"state": "skipped", "reason": "not-primary-checkout"}
@@ -9418,6 +9419,11 @@ def prepare_isolated_worktree(cwd, slug):
     default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
     _git(top, "fetch", "-q", "origin", default)
     base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
+    # Work in progress in the checkout (uncommitted changes, or commits the base lacks) is what the
+    # work may build on; a worktree from the base would leave it behind, so the cwd stays as asked.
+    if (_git(top, "status", "--porcelain", "--untracked-files=no") != ""
+            or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
+        return {"state": "skipped", "reason": "primary-has-local-work"}
     if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
         made = _git(top, "worktree", "add", str(path), slug)
     else:
@@ -9432,7 +9438,7 @@ def caller_open_route(cwd):
 
     This session's own newest open route first (its route-chain ledger, which every
     compose and start writes); otherwise the one open route sealed for this cwd under
-    the cwd's artifact root. `rows` are the open routes that were looked at, each with
+    the cwd's artifact root, or, with none there, for a worktree of the cwd's repository. `rows` are the open routes that were looked at, each with
     its `resume_command`, so a caller that finds none or several sees what is there."""
     from parent_next_directive import resume_command
     rc = _route_chain_module()
@@ -9446,7 +9452,8 @@ def caller_open_route(cwd):
     except ValueError:
         return None, "none", []
     here = os.path.realpath(cwd)
-    rows = []
+    repository = lambda path: _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    rows, same_repository = [], []
     for row in route_status(artifact_root):
         if row["closed"] or row.get("read_only"):
             continue
@@ -9454,10 +9461,18 @@ def caller_open_route(cwd):
             sealed_cwd = json.loads(Path(row["route_file"]).read_text(encoding="utf-8")).get("cwd")
         except (OSError, ValueError):
             continue
-        if isinstance(sealed_cwd, str) and os.path.realpath(sealed_cwd) == here:
-            rows.append({"route_id": row["route_id"], "capability": row["capability"],
-                         "route_file": row["route_file"],
-                         "resume_command": resume_command(row["route_file"], agent_home=ROOT)})
+        if not isinstance(sealed_cwd, str):
+            continue
+        found = {"route_id": row["route_id"], "capability": row["capability"], "route_file": row["route_file"],
+                 "cwd": sealed_cwd, "resume_command": resume_command(row["route_file"], agent_home=ROOT)}
+        if os.path.realpath(sealed_cwd) == here:
+            rows.append(found)
+        else:
+            same_repository.append(found)
+    if not rows and same_repository:
+        # A route compose moved into the repository's own worktree (`prepare_isolated_worktree`).
+        mine = repository(here)
+        rows = [row for row in same_repository if mine and os.path.isdir(row["cwd"]) and repository(row["cwd"]) == mine]
     if len(rows) == 1:
         return rows[0]["route_file"], "cwd", rows
     return None, "ambiguous" if rows else "none", rows

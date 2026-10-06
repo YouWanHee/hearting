@@ -7563,7 +7563,8 @@ class ComposeRouteTest(TestRoute):
    git=lambda cwd,*args: subprocess.run(["git","-C",str(cwd),*args],check=True,capture_output=True,text=True).stdout.strip()
    origin=Path(tmp)/"origin.git"; primary=Path(tmp)/"repo"
    git(tmp,"init","-q","--bare","-b","main",str(origin)); git(tmp,"clone","-q",str(origin),str(primary))
-   git(primary,"-c","user.name=t","-c","user.email=t@t","commit","-q","--allow-empty","-m","base"); git(primary,"push","-q","origin","main")
+   commit=lambda *args: git(primary,"-c","user.name=t","-c","user.email=t@t","commit","-q",*args)
+   (primary/"a.txt").write_text("a\n"); git(primary,"add","a.txt"); commit("-m","base"); git(primary,"push","-q","origin","main")
    (primary/"pkg").mkdir()
    made=R.prepare_isolated_worktree(primary/"pkg","fix-x")
    wt=Path(tmp)/"repo-wt"/"fix-x"
@@ -7576,6 +7577,19 @@ class ComposeRouteTest(TestRoute):
    (Path(tmp)/"repo-wt"/"taken").mkdir()
    self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
    self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
+   # work in progress stays where it is: an uncommitted change, or a commit the base lacks
+   (primary/"a.txt").write_text("changed\n")
+   self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
+   git(primary,"switch","-q","-c","feature-x"); (primary/"b.txt").write_text("b\n"); git(primary,"add","b.txt","a.txt"); commit("-m","wip")
+   self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
+   self.assertFalse((Path(tmp)/"repo-wt"/"y").exists())
+   # the route compose moved into that worktree is found from the primary checkout after /clear
+   routes=Path(tmp)/"reports"; R.canonical_routes_dir(routes).mkdir(parents=True)
+   path=R.canonical_routes_dir(routes)/("rt-"+"f"*16+".json")
+   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"artifact_root":str(routes)}),encoding="utf-8")
+   with mock.patch.object(R,"_route_chain_module",return_value=None), \
+        mock.patch.object(R,"_compose_artifact_root",return_value=str(routes)):
+    self.assertEqual(R.caller_open_route(primary)[:2],(str(path),"cwd"))
  def test_only_source_changing_routes_with_a_real_artifact_root_are_isolated(self):
   source={"id":"execute","write_scope":["source/**"]}; plan={"id":"plan","write_scope":["artifacts/plans/**"]}
   real=str(Path.home()/"project"/".agent_reports")
