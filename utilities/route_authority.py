@@ -221,6 +221,41 @@ def pinned_launch_harness(route, *, worker_type: str | None, requested: str | No
 REPLACEMENT_FIXED_KEYS = ("harness", "jobs", "worktree")
 
 
+# Same work, another launcher. Never-started work may be taken over by a launcher that runs
+# somewhere else: inside the parent's OS sandbox (a Codex owner's tool shell) or on the host
+# beside it (the session supervisor advancing a serial chain). Where a launcher runs decides
+# these realized values -- the wrapper's lifetime scope and, for Codex, whether its own sandbox
+# nests inside the parent's -- while the work and the permissions granted to it (argv with
+# `--sandbox` and the parent tuple, network, the access grant, Claude/OpenCode permissions)
+# stay the same and are still compared.
+LAUNCH_LOCATION_VALUES = frozenset({"launch_lifecycle", "runtime_sandbox"})
+
+# The sealed launch input of one attempt: the work and its granted permissions.
+RESEAL_STABLE_KEYS = ("schema", "attempt_id", "harness", "jobs", "worktree", "argv", "task",
+                      "route_id", "route_node", "owner_route_id")
+
+# The registry row of one never-started attempt. Per-launch values (lease nonce, release home,
+# parent runtime pid, sealed input digest, lifetime scope) may differ.
+RELAUNCH_STABLE_KEYS = (
+    "attempt_id", "attempt_schema_version", "harness", "worker_type", "dispatch_depth",
+    "capability", "parent_sid", "parent_attempt_id", "route_id", "route_hash", "route_node",
+    "owner_route_id", "owner_route_hash", "automatic_retry_of",
+    "replacement_original_attempt_id", "replacement_family_id", "replacement_claim_digest",
+)
+
+
+def granted_permissions(applied) -> dict:
+    """``applied_permissions`` without the values the launcher's location decides."""
+    return {key: value for key, value in (applied or {}).items() if key not in LAUNCH_LOCATION_VALUES}
+
+
+def same_sealed_work(previous, current) -> bool:
+    """Whether two sealed launch inputs describe the same work with the same granted permissions."""
+    return (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
+            and granted_permissions(previous.get("applied_permissions"))
+            == granted_permissions(current.get("applied_permissions")))
+
+
 # ---------------------------------------------------------------------------
 # 3. How many attempts, of which kind
 # ---------------------------------------------------------------------------

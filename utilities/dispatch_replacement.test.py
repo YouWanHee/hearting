@@ -212,6 +212,62 @@ class ReplacementTest(unittest.TestCase):
                 R.seal_launch_input(args,'codex','the raw task')
         self.assertEqual(caught.exception.reason,'replacement-record-conflict')
 
+    def test_a_launcher_elsewhere_reseals_never_started_work_but_not_other_permissions(self):
+        # BC rt-96bab699 (DIAG-1007): a Codex owner's tool shell sealed serial-chain phase G2 as
+        # foreground-scoped / danger-full-access inside its own sandbox; the host-side session
+        # supervisor advancing the chain seals the same work detached / workspace-write.
+        args=SimpleNamespace(**vars(self.args));args.attempt_id='att-g2'
+        args.replacement_input_argv=['--start','--attempt-id','att-g2','--sandbox','workspace-write',
+                                     '--prompt-text','phase g2']
+        args.launch_lifecycle='foreground-scoped';args.nested_headless_network=False
+        args.replacement_runtime_sandbox='danger-full-access'
+        first=R.seal_launch_input(args,'codex','phase g2')
+        self.write({**self.meta,'attempt_id':'att-g2','launch_claimed':'0',
+                    **D.parse_registry_metadata(first)},'open',append=True)
+        host=SimpleNamespace(**vars(args));host.launch_lifecycle='detached'
+        host.replacement_runtime_sandbox='workspace-write'
+        second=R.seal_launch_input(host,'codex','phase g2')
+        saved=json.loads((R._directory(self.jobs)/'inputs'/'att-g2.json').read_text())
+        self.assertEqual((saved['applied_permissions']['launch_lifecycle'],saved['applied_permissions']['runtime_sandbox']),
+                         ('detached','workspace-write'))
+        self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
+        # A granted permission, the work or the sandbox it asks for still conflicts.
+        for changes in ({'nested_headless_network':True},
+                        {'resolved_permission_posture':{'mode':'bypass','mode_flag':'bypassPermissions',
+                                                        'allowed_tools':('Read',),'inherited_default_mode':'default'}},
+                        {'replacement_input_argv':['--start','--attempt-id','att-g2','--sandbox','danger-full-access',
+                                                   '--prompt-text','phase g2']}):
+            with self.subTest(changed=sorted(changes)):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.seal_launch_input(SimpleNamespace(**{**vars(host),**changes}),'codex','phase g2')
+                self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+        with self.assertRaises(D.DispatchContractError):R.seal_launch_input(host,'codex','another phase')
+        # Once claimed, even the launcher's location may not reseal it.
+        self.write({**self.meta,'attempt_id':'att-g2','launch_claimed':'1'},'open',append=True)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.seal_launch_input(args,'codex','phase g2')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+
+    def test_the_registry_and_the_replacement_tuple_read_the_same_definition(self):
+        import route_authority
+        self.assertIs(D._RELAUNCH_STABLE_KEYS,route_authority.RELAUNCH_STABLE_KEYS)
+        self.assertIs(R._RESEAL_STABLE_KEYS,route_authority.RESEAL_STABLE_KEYS)
+        base=['2026-10-07T00:00:00Z','open','/repo','/wt','phase-g2']
+        row={'attempt_id':'att-g2','parent_attempt_id':'att-owner','route_id':'rt-1','route_node':'test',
+             'launch_claimed':'0','launch_lifecycle':'foreground-scoped','replacement_input_digest':'a'*64}
+        relaunch={**row,'launch_lifecycle':'detached','replacement_input_digest':'b'*64,'launch_home':'/host'}
+        self.assertTrue(D._never_launched_same_work(base,row,base,relaunch))
+        self.assertFalse(D._never_launched_same_work(base,row,base,{**relaunch,'parent_attempt_id':'att-other'}))
+        replay=R.launch_input(self.jobs,'att-source',R._rows(self.jobs.read_text().splitlines())['att-source'][1])
+        shell={**replay,'applied_permissions':{'launch_lifecycle':'foreground-scoped','runtime_sandbox':'danger-full-access',
+                                               'nested_headless_network':False}}
+        R._check_tuple({**shell,'applied_permissions':{'launch_lifecycle':'detached','runtime_sandbox':'workspace-write',
+                                                        'nested_headless_network':False}},shell)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R._check_tuple({**shell,'applied_permissions':{**shell['applied_permissions'],'nested_headless_network':True}},shell)
+        self.assertEqual((caught.exception.reason,caught.exception.detail),
+                         ('replacement-input-tuple-mismatch','applied_permissions'))
+
     def test_claim_publication_crash_blocks_legacy_retry(self):
         for fail_before_record in [True,False]:
             with self.subTest(before_record=fail_before_record):
