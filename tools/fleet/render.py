@@ -4650,6 +4650,12 @@ def _gpu_model_key(model, active=False):
     return key + "_active" if active else key
 
 
+def _gpu_display_command(command):
+    """Shorten the first command token only; retain the argument text verbatim."""
+    return re.sub(r"^(\s*)(\S+)",
+                  lambda match: match[1] + os.path.basename(match[2]), command, count=1)
+
+
 def _gpu_process_rows(gpu, indent, width):
     """Bounded command-only process rows; evidence stays in structured output."""
     rows = []
@@ -4661,7 +4667,7 @@ def _gpu_process_rows(gpu, indent, width):
         process.get("pid") if isinstance(process.get("pid"), int) else 2**63,
     ))
     for process in processes:
-        command = _gpu_safe_text(process.get("command"))
+        command = _gpu_display_command(_gpu_safe_text(process.get("command")))
         if not command:
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
         row = [(indent + "    ", None), ("↳ ", "dim"), (command, "dim")]
@@ -5022,6 +5028,8 @@ def _gpu_work_row(entry, term_width=None):
     command = _gpu_safe_text(entry.get("command"))
     if command:
         name = _gpu_process_label(command)
+        if name == command:
+            name = _gpu_display_command(command)
     else:
         name = os.path.basename(_gpu_safe_text(entry.get("process_name"))) or "process"
     name = _clip_w(name, _GPU_WORK_NAME_W)

@@ -192,7 +192,7 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                     "memory_used_mib": 12288, "memory_total_mib": 40960,
                     "processes": [
                         {"pid": 300, "proc_start": 42, "used_memory_mib": 8192,
-                         "command": "python train.py --epochs 10",
+                         "command": "/home/test/envs/xxx/bin/python train.py  --epochs 10 --output /keep/full-path",
                          "owner": {"kind": "job", "id": "att-one", "label": "job:train"},
                          "session_owner": {"kind": "session", "harness": "codex",
                                            "id": "sid-exact"}},
@@ -220,6 +220,7 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         self.addCleanup(render.set_process_view, False)
 
     def test_upper_rows_are_owner_free_command_only_and_bounded(self):
+        original = json.dumps(self.snapshot, sort_keys=True)
         for width in (168, 100, 60):
             rows = render._compute_host_rows(width, [self.session])
             self.assertTrue(all(render._dw(render._plain(row)) <= width for row in rows))
@@ -233,6 +234,10 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
             self.assertNotIn("PID ", process_text)
             self.assertNotIn("VRAM ", process_text)
             self.assertNotIn("MiB", process_text)
+            self.assertNotIn("/home/test/envs/xxx/bin/python", process_text)
+            if width == 168:
+                self.assertIn("↳ python train.py  --epochs 10 --output /keep/full-path", process_text)
+            self.assertEqual(json.dumps(self.snapshot, sort_keys=True), original)
 
     def test_exact_relation_aggregates_multi_gpu_in_stable_order(self):
         resources = render._gpu_session_resources(self.snapshot)
