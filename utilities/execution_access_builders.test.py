@@ -703,7 +703,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
     def test_invalid_request_precedes_registry_and_model_spawn_in_all_adapters(self) -> None:
         for module in (self.codex, self.claude, self.opencode):
             source = Path(module.__file__).read_text(encoding="utf-8")
-            bind_at = source.index("args.execution_access_grant = bind_execution_access_request")
+            bind_at = source.index("args.execution_access_grant = route_authority.bind_launch_access")
             append_at = source.index("args.attempt_claimed = append_job", bind_at)
             spawn_at = source.index("spawn_claimed_attempt", append_at)
             self.assertLess(bind_at, append_at)

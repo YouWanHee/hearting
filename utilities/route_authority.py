@@ -593,3 +593,81 @@ def access_grant(*args, **kwargs):
     """The effective explicit grant for one runtime; never creates runtime argv."""
     from execution_access import build_grant
     return build_grant(*args, **kwargs)
+
+
+def bind_launch_access(args, *, runtime: str, default_roots, network_available: bool = False,
+                       parent_network: bool = False, effective_sandbox: str = "workspace-write",
+                       gpu_resource_scope: bool = False, inherit_parent_sandbox: bool = False):
+    """One launch's execution access, for every adapter: the request, the exact live
+    parent's effective grant for a dispatch-depth-2 child, and the graded grant (None
+    without a request). The adapter passes only what its own launch realizes."""
+    from dispatch_contract import dispatch_state_root
+    from execution_access import (AccessContext, ExecutionAccessError, bind_request,
+                                  load_parent_effective_grant, request_path)
+    context = AccessContext.build(worktree=args.worktree, artifact_root=args.artifact_root,
+                                  dispatch_state_root=dispatch_state_root(args.jobs_path),
+                                  agent_home=args.agent_home, environ=os.environ)
+    parent = None
+    if args.dispatch_depth >= 2 and request_path(args.execution_access_file, os.environ) is not None:
+        if args.parent_binding is None:
+            raise ExecutionAccessError("execution-access-exceeds-parent:parent-grant-unknown")
+        parent = load_parent_effective_grant(jobs=args.jobs_path, parent_attempt_id=args.parent_binding.attempt_id,
+                                             context=context)
+    return bind_request(
+        args.execution_access_file, environ=os.environ, context=context,
+        is_child=args.dispatch_depth >= 2, parent=parent, runtime=runtime,
+        default_writable_roots=default_roots,
+        network_available=network_available or bool(parent_network and parent is not None
+                                                     and parent.network_allowed),
+        effective_sandbox=effective_sandbox, gpu_resource_scope=gpu_resource_scope,
+        inherit_parent_sandbox=inherit_parent_sandbox)
+
+
+# ---------------------------------------------------------------------------
+# Launch admission shared by the three adapter wrappers
+# ---------------------------------------------------------------------------
+
+def prelaunch_registry(args) -> Path:
+    """The registry the route's completion gate reads before the authoritative one
+    is resolved: explicit, else inherited, else the agent home's first state root.
+    The launch revalidates the authoritative registry immediately before its claim."""
+    explicit_or_inherited = args.jobs or os.environ.get("AGENT_DISPATCH_JOBS", "")
+    if explicit_or_inherited:
+        return Path(explicit_or_inherited)
+    from dispatch_contract import dispatch_state_roots
+    return dispatch_state_roots(args.agent_home)[0] / "jobs.log"
+
+
+def completion_gate_fail_fields(error, route_file, route_node) -> dict:
+    """SD-154/B-2: a route-state refusal (13.59.3 rule 6) carries a supported
+    `next_action` so a caller stops instead of misreading it as a transient
+    runtime-unavailable and descending to inline."""
+    from dispatch_contract import ROUTE_STATE_REFUSAL_REASONS, route_state_next_action
+    fields = {"detail": error.detail, "child_spawned": "0"}
+    if error.reason in ROUTE_STATE_REFUSAL_REASONS:
+        fields["next_action"] = error.next_action or route_state_next_action(
+            error.reason, error.detail, str(route_file), route_node,
+        )
+    return fields
+
+
+def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
+    """The route's completion and preview gate for one launch, the same in every wrapper.
+
+    `gate` is the wrapper's `completion_marker_gate`; `before` are checks that share its
+    refusal handling. A refusal returns `(reason, exit code, receipt fields)` with the
+    preview-gate recovery detail attached; None admits the launch."""
+    from dispatch_contract import (DispatchContractError, PRELAUNCH_PROCESS_BLOCK_REASONS,
+                                   recover_preview_gate_after_refusal)
+    from review_input import preview_request_nodes
+    try:
+        for check in before:
+            check()
+        gate(args.route_file, args.route_node, action, agent_home, jobs, attempt_id=args.attempt_id,
+             planned_revision_nodes=preview_request_nodes(args, jobs))
+    except DispatchContractError as error:
+        error.detail = recover_preview_gate_after_refusal(
+            args.route_file, args.route_node, action, agent_home, jobs, error)
+        return (error.reason, 78 if error.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
+                completion_gate_fail_fields(error, args.route_file, args.route_node))
+    return None
