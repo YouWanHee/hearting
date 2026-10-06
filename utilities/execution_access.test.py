@@ -25,6 +25,7 @@ from execution_access import (
     read_roots_data,
     resolve_task_targets,
 )
+import execution_access as EA
 
 
 class ExecutionAccessTest(unittest.TestCase):
@@ -778,6 +779,146 @@ class ExecutionAccessTest(unittest.TestCase):
             "execution-access-enforcement-unavailable:codex-network-hosts",
             raised.exception.reason,
         )
+
+
+class DerivedAccessTest(unittest.TestCase):
+    """A task folder outside the worktree reaches every harness without a hand-written
+    request: the task text names read roots, only the approved scope names write roots."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.home = self.root / "home"
+        self.worktree = self.root / "worktree"
+        self.artifact = self.root / "artifact"
+        self.state = self.root / "state" / "dispatch"
+        self.other = self.root / "projects" / "other"
+        self.elsewhere = self.root / "projects" / "elsewhere"
+        for path in (self.home / ".ssh", self.worktree / "src", self.artifact, self.state,
+                     self.other / "out", self.other / "ref", self.other / "data" / "raw",
+                     self.other / "docs", self.elsewhere):
+            path.mkdir(parents=True)
+        (self.other / "docs" / "prd.md").write_text("spec\n", encoding="utf-8")
+        env = {"HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
+               "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "XDG_CONFIG_HOME": str(self.home / ".config")}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+        self.jobs = self.state / "jobs.log"
+
+    def route(self, text, *, capability="autopilot-code"):
+        return {"route_id": "rt-derive", "route_hash": "sha256:" + "d" * 64, "cwd": str(self.worktree),
+                "artifact_root": str(self.artifact), "capability": capability, "work_request": {"text": text}}
+
+    def task(self):
+        o = self.other
+        return ("# 다른 프로젝트 정리\n"
+                f"범위: {o}/out에 결과 저장, {o}/ref 읽기만, {o}/data/raw 제외\n"
+                f"입력: {o}/data 와 {o}/docs/prd.md, 참고 {self.elsewhere}\n"
+                f"{self.home}/.ssh/config, {self.worktree}/src, {o}/missing, /tmp\n")
+
+    def prepared(self, path):
+        return (json.loads(path.read_text(encoding="utf-8")),
+                json.loads(path.with_name("binding.json").read_text(encoding="utf-8")))
+
+    def test_the_approved_scope_writes_and_the_task_text_only_reads(self):
+        path = prepare_task_request(self.route(self.task()), self.jobs)
+        request, binding = self.prepared(path)
+        o = self.other
+        self.assertEqual(request["writable_roots"], [str(o / "out")])
+        self.assertEqual(request["read_roots"], sorted([str(o / "docs"), str(o / "ref"), str(self.elsewhere)]))
+        self.assertIn("approved scope field (line 2)", request["justification"][str(o / "out")])
+        self.assertIn("task text (line 3)", request["justification"][str(self.elsewhere)])
+        skipped = {row["path"]: row["reason"] for row in binding["derivation"]["skipped"]}
+        self.assertEqual(skipped[str(o / "data" / "raw")], "excluded-by-scope")
+        self.assertEqual(skipped[str(o / "data")], "holds-excluded-path")
+        self.assertEqual(skipped[str(self.home / ".ssh" / "config")], "sensitive")
+        self.assertEqual(skipped[str(self.worktree / "src")], "already-granted")
+        self.assertEqual(skipped[str(o / "missing")], "missing")
+        self.assertEqual(skipped["/tmp"], "too-broad")
+        self.assertEqual(path, prepare_task_request(self.route(self.task()), self.jobs))
+
+    def test_every_harness_projects_the_same_derived_roots(self):
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / "install")
+        request = load_request(prepare_task_request(self.route(self.task()), self.jobs), context=context)
+        grants = [build_grant(request, runtime=runtime, default_writable_roots=(self.worktree,))
+                  for runtime in ("codex-exec", "claude-cli", "opencode")]
+        self.assertEqual({(g.writable_roots, g.read_roots) for g in grants},
+                         {(request.writable_roots, request.read_roots)})
+        self.assertEqual([g.read_enforcement for g in grants], ["os-sandbox", "tool-permission", "tool-permission"])
+
+    def test_a_node_other_than_the_owner_only_reads(self):
+        path = prepare_task_request(self.route(self.task()), self.jobs, node="frame")
+        self.assertEqual(path.parent.name, "frame")
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], [])
+        self.assertIn(str(self.other / "out"), request["read_roots"])
+        notes = {row["path"]: row.get("note") for row in binding["derivation"]["granted"]}
+        self.assertEqual(notes[str(self.other / "out")], "node-reads-only")
+
+    def test_a_manual_request_wins_over_derivation(self):
+        manual = self.root / "manual.json"
+        manual.write_text(json.dumps({"schema_version": 1, "writable_roots": [str(self.elsewhere)],
+                                      "read_roots": [], "network": {"required": False}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(manual)}):
+            self.assertIsNone(prepare_task_request(self.route(self.task()), self.jobs))
+            run_root = self.root / "runs"
+            with mock.patch.object(EA, "_lab_run_root", return_value=run_root):
+                path = prepare_task_request(self.route(self.task(), capability="autopilot-lab"), self.jobs)
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], sorted([str(self.elsewhere), str(run_root)]))
+        self.assertEqual(request["read_roots"], [])
+        self.assertNotIn("derivation", binding)
+
+    def test_a_node_keeps_what_it_derived_at_its_first_preparation(self):
+        (self.other / "out").rmdir()
+        first = prepare_task_request(self.route(self.task()), self.jobs)
+        before = first.read_bytes()
+        (self.other / "out").mkdir()      # appears later: a resume does not widen the grant
+        self.assertEqual(prepare_task_request(self.route(self.task()), self.jobs), first)
+        self.assertEqual(first.read_bytes(), before)
+        self.assertEqual(json.loads(before)["writable_roots"], [])
+
+    def test_a_preparation_from_before_derivation_keeps_deriving_nothing(self):
+        route = self.route(self.task())
+        with mock.patch.object(EA, "_lab_run_root", return_value=self.root / "runs"), \
+                mock.patch.object(EA, "derive_task_access", return_value=EA.DerivedAccess((), (), (), {})):
+            old = prepare_task_request(dict(route, capability="autopilot-lab"), self.jobs)
+        self.assertNotIn("derivation", self.prepared(old)[1])
+        with mock.patch.object(EA, "_lab_run_root", return_value=self.root / "runs"):
+            again = prepare_task_request(dict(route, capability="autopilot-lab"), self.jobs)
+        self.assertEqual(again, old)
+        self.assertEqual(self.prepared(again)[0]["read_roots"], [])
+
+    def test_a_derived_root_the_validator_refuses_is_dropped_not_refused(self):
+        broad = EA.DerivedAccess((Path("/"),), (), (("/", "Derived write root"),),
+                                 {"granted": [{"path": "/", "access": "write", "line": 1, "source": "scope",
+                                               "text": "범위: /"}], "skipped": []})
+        with mock.patch.object(EA, "derive_task_access", return_value=broad):
+            self.assertIsNone(prepare_task_request(self.route("범위: /\n"), self.jobs))
+            with mock.patch.object(EA, "_lab_run_root", return_value=self.root / "runs"):
+                path = prepare_task_request(self.route("범위: /\n", capability="autopilot-lab"), self.jobs)
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], [str(self.root / "runs")])
+        self.assertEqual(binding["derivation"]["granted"], [])
+        self.assertTrue(binding["derivation"]["dropped"].startswith("execution-access-root-too-broad"))
+
+    def test_the_task_text_reader(self):
+        rows = EA._task_paths(
+            "**범위:** /a/out에 저장, /a/ref 참조, /a/raw 제외, /a/after\n"
+            "- Scope: /b/x (read-only /b/y)\n"
+            "scope: {writes: [\"/c/w\"], reads: [\"/c/r\"]}\n"
+            "see https://example.com/d/e and 경로:/f/g. and /h/보고서_v2초안\n"
+            "범위 변경: /i/j\n")
+        found = {(path, access, source) for _, path, access, source, _ in rows}
+        self.assertEqual(found, {
+            ("/a/out", "write", "scope"), ("/a/ref", "read", "scope"), ("/a/raw", "excluded", "scope"),
+            ("/a/after", "excluded", "scope"), ("/b/x", "write", "scope"), ("/b/y", "read", "scope"),
+            ("/c/w", "write", "scope"), ("/c/r", "read", "scope"), ("/f/g", "read", "task"),
+            ("/h/보고서_v2초안", "read", "task"), ("/i/j", "read", "task")})
 
 
 if __name__ == "__main__":
