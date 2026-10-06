@@ -649,6 +649,67 @@ class OneLegFramedTest(StartBase):
         self.assertEqual([row["node"] for row in self.record()["decision"]["proposals"]], ["frame"])
 
 
+class LegPlanTest(StartBase):
+    """The plan fields the frame wrote reach the owner and every stage worker, sealed, never copied."""
+
+    PLANNED = {**CODE_STAGED, "done_when": ["the abort tests pass", {"text": "latency report written",
+                                                                     "check": "test -f reports/latency.md"}],
+               "verify": "run the abort tests and compare the median", "hands_over": ["reports/latency.md"]}
+
+    def planned_leg(self):
+        self.set_briefs(self.PLANNED, self.PLANNED)
+        self.set_interview({"legs": [self.PLANNED]})
+        self.settle()
+        (path,) = self.leg_routes()
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_the_leg_plan_and_the_adopted_brief_are_read_from_the_sealed_decision(self):
+        route = self.planned_leg()
+        plan = RP.leg_plan(route)
+        self.assertEqual([item["id"] for item in plan["leg"]["done_when"]], ["d1", "d2"])
+        self.assertEqual(plan["leg"]["verify"], "run the abort tests and compare the median")
+        self.assertTrue(plan["adopted_brief"].endswith("shards/frame/direction-brief.md"))
+        task = self.leg_calls[0][self.leg_calls[0].index("--prompt-text") + 1]
+        self.assertIn("frame/direction-brief.md (sha256", task)
+        self.assertIn("adopted direction: the person chose this brief's route", task)
+        self.assertIsNone(RP.leg_plan({**route, "route_plan": None}))
+
+    def test_owner_and_verification_prompts_carry_the_plan_and_the_items_file(self):
+        import worker_bootstrap as WB
+        route = self.planned_leg()
+        owner = WB.plan_leg_prompt(route, None)
+        self.assertIn("- d1: the abort tests pass", owner)
+        self.assertIn("- d2: latency report written (check: `test -f reports/latency.md`)", owner)
+        self.assertIn("Verify: run the abort tests and compare the median", owner)
+        self.assertNotIn("items.json", owner)
+        test_node = next(n["id"] for n in route["nodes"] if str(n.get("unit") or "").startswith("qa/"))
+        verifier = WB.plan_leg_prompt(route, test_node)
+        self.assertIn("`<artifact>.items.json`", verifier)
+        self.assertIn('"route_id": "' + route["route_id"] + '"', verifier)
+        self.assertEqual(WB.plan_leg_prompt({**route, "route_plan": None}, test_node), "")
+
+    def test_the_items_file_is_read_against_the_sealed_ids(self):
+        route = self.planned_leg()
+        artifact = self.root / "test-report.md"
+        artifact.write_text("report\n", encoding="utf-8")
+        sidecar = RP.leg_items_path(artifact)
+        write = lambda items, **extra: sidecar.write_text(json.dumps(
+            {"schema": "leg_items_v1", "route_id": route["route_id"], "node": "test", "attempt_id": "att-1",
+             "items": items, **extra}), encoding="utf-8")
+        self.assertIsNone(RP.read_leg_items(route, artifact))                      # no file: cannot judge
+        write([{"id": "d1", "state": "met", "note": "ok"}, {"id": "d2", "state": "unknown"}])
+        self.assertEqual(RP.read_leg_items(route, artifact),
+                         {"ids": ["d1", "d2"], "unmet": ["d2"], "node": "test", "attempt_id": "att-1"})
+        write([{"id": "d1", "state": "met"}])                                      # a left-out id is unmet
+        self.assertEqual(RP.read_leg_items(route, artifact)["unmet"], ["d2"])
+        for items, extra in (([{"id": "d3", "state": "met"}], {}), ([{"id": "d1", "state": "done"}], {}),
+                             ([{"id": "d1", "state": "met"}, {"id": "d1", "state": "met"}], {}),
+                             ([{"id": "d1", "state": "met"}], {"route_id": "rt-other"})):
+            with self.subTest(items=items, extra=extra):
+                write(items, **extra)
+                self.assertIsNone(RP.read_leg_items(route, artifact))
+
+
 class FailureTableTest(StartBase):
     def test_a164_11_a_first_leg_compose_refusal_keeps_the_record_and_the_same_start_resumes(self):
         with mock.patch.object(R, "compile_first_leg", side_effect=ValueError("compose-graph-order:test-before-execute")):
@@ -798,6 +859,19 @@ class FirstLegStateReplayTest(StartBase):
         replayed = self.replay()
         self.assertEqual((replayed["route_id"], replayed["state"]), (second["route_id"], "inline"), replayed)
         self.assertEqual((len(self.leg_routes()), len(self.cursor())), (before, 1))
+
+    def test_the_next_legs_own_start_arms_its_resume_and_the_finished_leg_arms_none(self):
+        self.set_briefs([DIRECT, self.SECOND], [DIRECT, self.SECOND])
+        self.set_interview({"legs": [DIRECT, self.SECOND]})
+        self.settle()
+        route, leg_path = self.leg()
+        self.finish_leg(route, leg_path)
+        armed = []
+        real = W._arm_capacity_resume
+        with mock.patch.object(W, "_arm_capacity_resume",
+                               side_effect=lambda result, path, jobs: armed.append(str(path)) or real(result, path, jobs)):
+            again = W.start_work(route, leg_path, self.jobs)
+        self.assertEqual(armed, [again["plan_advanced"]["route_file"]])
 
     def test_a_successor_session_continues_the_plan_on_the_same_resume_line(self):
         self.set_briefs([DIRECT, self.SECOND], [DIRECT, self.SECOND])

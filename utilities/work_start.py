@@ -911,13 +911,16 @@ def _recorded_interview(route, jobs):
     return json.loads(Path(artifact).read_text()), answers
 
 
-def _leg_task_text(route, root, output, briefs, intent, approvals):
+def _leg_task_text(route, root, output, briefs, intent, approvals, adopted=None):
     """The work request of every leg of an approved route: the original request, the agreed intent,
-    the brief paths with their digests, and the approvals actually given."""
+    the brief paths with their digests (the one whose route the person chose marked), and the
+    approvals actually given."""
     lines = [route["work_request"]["text"].rstrip(), "", "## Agreed intent", "",
              (output / "shards/frame/intent.md").read_text(encoding="utf-8").rstrip(), "",
              "## Frame briefs (read-only input)", ""]
-    lines += [f"- {root / row['path']} (sha256 {row['sha256']})" for row in briefs]
+    lines += [f"- {root / row['path']} (sha256 {row['sha256']})"
+              + (" — adopted direction: the person chose this brief's route" if row["path"] == adopted else "")
+              for row in briefs]
     lines += ["", "## Execution scope", "", approvals.get("execution_scope", "complete"),
               "", "## Start approvals given", ""]
     lines += [f"- {row['key']} for leg {row['leg']} ({', '.join(row['parts']) or 'steps named in the question'}): "
@@ -971,7 +974,8 @@ def _decide(route, jobs, root, record, output, briefs, intent):
         return ended("proposal-not-verified", shown)
     approvals = {"given": given, "execution_scope": execution_scope}
     prompt = _decision_home(root) / f"{route['route_id']}.leg-task.md"
-    task = _keep_first(prompt, _leg_task_text(route, root, output, briefs, intent, approvals).encode("utf-8"))
+    task = _keep_first(prompt, _leg_task_text(route, root, output, briefs, intent, approvals,
+                                              adopted=match.get("brief_path")).encode("utf-8"))
     leg = match["proposal"]["legs"][0]
     projected_leg = module.project_entry_execution_scope(leg, execution_scope)
     execution_graph = list(projected_leg.get("graph") or [])

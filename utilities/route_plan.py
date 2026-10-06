@@ -283,7 +283,71 @@ def _text(value, *, name, required=False):
     return value.strip()
 
 
-_LEG_FIELDS = frozenset({"capability", "mode", "shape", "graph", "intensity", "why"})
+_LEG_FIELDS = frozenset({"capability", "mode", "shape", "graph", "intensity", "why",
+                         "done_when", "verify", "hands_over", "parallel", "extra_stages"})
+MAX_DONE_WHEN = 5
+MAX_PLAN_NOTES = 8
+
+
+def _plan_fields(raw, index, notes):
+    """The leg's optional plan fields, normalized; a malformed one is left out and named in `notes`.
+
+    `done_when`: 1-5 checks that the leg is finished, each a sentence or `{text, check}` (`check` is a
+    command), sealed with stable ids `d1`, `d2`... in the order written. `verify`: one line saying
+    what verification looks at. `hands_over`: what the next leg reads. `parallel` and `extra_stages`
+    are notes for the owner: the compiler does not turn them into nodes."""
+    fields = {}
+
+    def bad(name):
+        if notes is not None:
+            notes.append(f"ignored:legs[{index}].{name}")
+
+    def line(value, limit=MAX_TEXT):
+        return value.strip() if isinstance(value, str) and value.strip() and len(value) <= limit else None
+    if "done_when" in raw:
+        items, rows = raw["done_when"], []
+        if isinstance(items, (str, dict)):
+            items = [items]
+        if isinstance(items, list) and 1 <= len(items) <= MAX_DONE_WHEN:
+            for item in items:
+                text = line(item) if isinstance(item, str) else line(item.get("text")) if isinstance(item, dict) else None
+                check = line(item.get("check")) if isinstance(item, dict) and item.get("check") is not None else None
+                if text is None or (isinstance(item, dict) and item.get("check") is not None and check is None):
+                    rows = None
+                    break
+                rows.append({"id": f"d{len(rows) + 1}", "text": text, **({"check": check} if check else {})})
+        if rows:
+            fields["done_when"] = rows
+        else:
+            bad("done_when")
+    if "verify" in raw:
+        if line(raw["verify"]):
+            fields["verify"] = line(raw["verify"])
+        else:
+            bad("verify")
+    for name in ("hands_over", "parallel"):
+        if name in raw:
+            values = raw[name] if isinstance(raw[name], list) else [raw[name]]
+            kept = [line(v, 200) for v in values]
+            if values and len(values) <= MAX_PLAN_NOTES and all(kept):
+                fields[name] = kept
+            else:
+                bad(name)
+    if "extra_stages" in raw:
+        values, kept = raw["extra_stages"], []
+        for value in values if isinstance(values, list) else []:
+            row = {key: line(value.get(key), 200) for key in ("id", "unit", "after", "verify")
+                   if isinstance(value, dict) and value.get(key) is not None}
+            if not isinstance(value, dict) or not row.get("id") or len(row) != len(
+                    [k for k in ("id", "unit", "after", "verify") if value.get(k) is not None]):
+                kept = None
+                break
+            kept.append(row)
+        if kept and len(kept) <= MAX_PLAN_NOTES:
+            fields["extra_stages"] = kept
+        else:
+            bad("extra_stages")
+    return fields
 _DOCUMENT_FIELDS = frozenset({"summary", "legs", "entry_approvals", "execution_scope"})
 
 
@@ -314,7 +378,8 @@ def _normal_leg(raw, index, notes=None):
             if set(token.split(":")[:2]) & set(_FRAME_NODES):
                 raise ProposalError(f"leg-invalid:{index}:frame-stage-not-allowed")
     return {"capability": capability, "mode": mode, "shape": shape, "graph": list(graph) if graph else None,
-            "intensity": intensity, "why": _text(raw.get("why"), name=f"legs[{index}].why")}
+            "intensity": intensity, "why": _text(raw.get("why"), name=f"legs[{index}].why"),
+            **_plan_fields(raw, index, notes)}
 
 
 def _question_id(original, row, used) -> str:
@@ -774,6 +839,68 @@ def latest_leg_route(route):
             return current
         current = max(found, key=lambda row: row[0])[1]
     return current
+
+
+# --- The approved plan of one leg ---------------------------------------------------------
+
+LEG_ITEMS_SCHEMA = "leg_items_v1"
+LEG_ITEM_STATES = ("met", "unmet", "unknown")
+
+
+def leg_plan(route):
+    """What the approved plan says about this route's leg, or None for a route made from no plan.
+
+    `{index, leg, legs, adopted_brief, handed_over}`: the sealed leg with its optional `done_when`,
+    `verify`, `hands_over`, `parallel` and `extra_stages`; the brief whose proposal the person chose;
+    and what the earlier legs said they hand over. Read from the sealed decision, never copied."""
+    try:
+        sealed = validate_sealed(route.get("route_plan"))
+        root = Path(route["artifact_root"]).resolve()
+        binding = read_route_plan(f"{root / sealed['decision']}#{sealed['index']}", root)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if binding["digest"] != sealed["digest"]:
+        return None
+    decision = binding["record"]["decision"]
+    adopted = next((row.get("brief_path") for row in decision.get("proposals") or []
+                    if isinstance(row, dict) and isinstance(row.get("proposal"), dict)
+                    and same_proposal(row["proposal"], decision["proposal"])), None)
+    legs, index = binding["legs"], binding["index"]
+    return {"index": index, "leg": binding["leg"], "legs": legs, "adopted_brief": adopted,
+            "handed_over": [{"leg": at, "items": legs[at]["hands_over"]} for at in range(index)
+                            if isinstance(legs[at], dict) and legs[at].get("hands_over")]}
+
+
+def leg_items_path(artifact) -> Path:
+    """Where a verification stage records the state of each `done_when` item: beside its artifact."""
+    return Path(str(artifact) + ".items.json")
+
+
+def read_leg_items(route, artifact):
+    """`{ids, unmet, node, attempt_id}` from the sidecar a verification stage wrote beside `artifact`,
+    or None when it cannot be judged (no `done_when`, no file, another route, a malformed file, or an
+    id the plan did not seal). `ids` follow the sealed `done_when` order; `unmet` is every id whose
+    state is not `met`, an id the file leaves out included."""
+    plan = leg_plan(route)
+    ids = [item["id"] for item in ((plan or {}).get("leg") or {}).get("done_when") or []]
+    if not ids:
+        return None
+    try:
+        value = json.loads(leg_items_path(artifact).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    items = value.get("items") if isinstance(value, dict) else None
+    if (value.get("schema") != LEG_ITEMS_SCHEMA if isinstance(value, dict) else True) \
+            or value.get("route_id") != route.get("route_id") or not isinstance(items, list):
+        return None
+    states = {}
+    for item in items:
+        if (not isinstance(item, dict) or item.get("id") not in ids or item["id"] in states
+                or item.get("state") not in LEG_ITEM_STATES):
+            return None
+        states[item["id"]] = item["state"]
+    return {"ids": ids, "unmet": [i for i in ids if states.get(i) != "met"],
+            "node": value.get("node"), "attempt_id": value.get("attempt_id")}
 
 
 # --- The plan cursor -------------------------------------------------------------------
