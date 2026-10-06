@@ -72,35 +72,27 @@ def default_parent_harness(fallback: str, environ=None) -> str:
 
 
 def bind_runtime_parent(args, *, honor_force: bool = False, environ=None) -> None:
-    """Bind a dispatch-depth-1 job to the actual calling Codex or Claude session.
+    """Bind a dispatch-depth-1 job to the actual calling session, on any harness.
 
     Callers historically supplied a synthetic ``--parent-session-id``; the
-    running session overrides it. Dispatch-depth-2 workers keep their explicit
-    conductor/owner envelope. Only the Codex wrapper honors the legacy
+    running session overrides it. The caller is read by
+    `session_identity.identity()`; an ambiguous or unnamed caller binds
+    nothing. Dispatch-depth-2 workers keep their explicit conductor/owner
+    envelope. Only the Codex wrapper honors the legacy
     ``CODEX_DISPATCH_PARENT_CURRENT_FORCE`` switch (``honor_force``).
     """
     env = os.environ if environ is None else environ
     force_current = honor_force and env.get("CODEX_DISPATCH_PARENT_CURRENT_FORCE") == "1"
-    current_thread = env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID")
-    claude_session = env.get("CLAUDE_CODE_SESSION_ID")
-    caller_harness = (
-        env.get("AGENT_DISPATCH_CALLER_HARNESS")
-        or ("codex" if current_thread and not claude_session else None)
-        or ("claude" if claude_session and not current_thread else None)
-    )
+    caller = session_identity(env)
     if args.dispatch_depth == 1:
-        if current_thread and caller_harness == "codex":
-            args.parent_session_id = current_thread
-            args.parent_harness = "codex"
-            args.parent_slug = None
-        elif claude_session and caller_harness == "claude":
-            args.parent_session_id = claude_session
-            args.parent_harness = "claude"
+        if caller.known and caller.session_id:
+            args.parent_session_id = caller.session_id
+            args.parent_harness = caller.harness
             args.parent_slug = None
         elif force_current:
             args.parent_slug = None
-    elif force_current and current_thread:
-        args.parent_session_id = current_thread
+    elif force_current and caller.harness == "codex" and caller.session_id:
+        args.parent_session_id = caller.session_id
 
 
 def correction_source_session(environ=None) -> str:

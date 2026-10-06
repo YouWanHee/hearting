@@ -1544,20 +1544,19 @@ def _dispatch_contract_module():
 
 
 def _resolve_session_identity(args):
-    """Session id from `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` / explicit
-    `--session-id`; none resolvable → a typed error, nothing written."""
+    """This session's harness and id (`utilities/session_identity`), or an explicit
+    `--session-id --harness`; none resolvable → a typed error, nothing written."""
     if args.session_id:
         if not args.harness:
             return None, None, "--session-id requires --harness"
         return args.harness, args.session_id, None
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if sid:
-        return "claude", sid, None
-    sid = os.environ.get("CODEX_THREAD_ID")
-    if sid:
-        return "codex", sid, None
+    _dispatch_contract_module()  # puts utilities/ on sys.path
+    from session_identity import identity
+    found = identity()
+    if found.known and found.session_id:
+        return found.harness, found.session_id, None
     return None, None, ("no session id resolvable "
-                         "(set CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID, or pass --session-id --harness)")
+                         f"({found.confidence}: run inside a harness session, or pass --session-id --harness)")
 
 
 def cmd_session(args):

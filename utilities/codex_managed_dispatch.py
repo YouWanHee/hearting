@@ -153,7 +153,8 @@ def probe_managed_codex_parent(
         raise ManagedDispatchError("managed-parent-runtime-mismatch")
     if parent_harness != "codex":
         raise ManagedDispatchError("managed-parent-harness-mismatch")
-    current_thread = env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID")
+    from session_identity import session_ids
+    current_thread = session_ids(env).get("codex", ("", ""))[0]
     if not current_thread or parent_session_id != current_thread:
         raise ManagedDispatchError("managed-parent-thread-mismatch")
     raw_control = env.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET", "")

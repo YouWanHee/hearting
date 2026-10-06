@@ -89,6 +89,16 @@ class Case1ParentSessionTest(unittest.TestCase):
         RA.bind_runtime_parent(args, environ={"CLAUDE_CODE_SESSION_ID": "claude-sid"})
         self.assertEqual((args.parent_session_id, args.parent_harness, args.parent_slug),
                          ("claude-sid", "claude", None))
+        # Every harness binds the same way: an OpenCode caller is its own runtime parent too,
+        # and an ambiguous caller binds nothing.
+        for env, expected in (({"OPENCODE_SESSION_ID": "ses_1"}, ("ses_1", "opencode", None)),
+                              ({"CLAUDE_SESSION_ID": "claude-old"}, ("claude-old", "claude", None)),
+                              ({"CODEX_THREAD_ID": "x", "CLAUDE_CODE_SESSION_ID": "c"},
+                               ("synthetic", "claude", "owner"))):
+            args = SimpleNamespace(dispatch_depth=1, parent_session_id="synthetic",
+                                   parent_slug="owner", parent_harness="claude")
+            RA.bind_runtime_parent(args, environ=env)
+            self.assertEqual((args.parent_session_id, args.parent_harness, args.parent_slug), expected)
         self.assertEqual(RA.caller_identity({"CLAUDE_CODE_SESSION_ID": "claude-sid"}), ("claude", "claude-sid"))
         # One reading now: the correction sender is the same session caller_identity names
         # (the old copy did not read CLAUDE_CODE_SESSION_ID and labelled it "operator").
