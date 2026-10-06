@@ -472,6 +472,42 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
         self.assertEqual(len(result["prompts"]), 1)
         self.assertEqual(self.state(), "pending")
 
+    def test_a_record_written_after_the_parent_went_idle_arrives_by_the_interval_look(self):
+        # The usual order: the parent yields first, the owner finishes later. Only the
+        # plugin's own interval look (no event from the idle session) can deliver it.
+        js = r'''
+import { pathToFileURL } from "node:url";
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
+const prompts = [];
+const session = {messages: async () => ({data: []}), prompt: async () => ({data: null}),
+  promptAsync: async (request) => { prompts.push(request); return {response: {ok: true, status: 204}} }};
+process.env.HERDR_PANE_ID = "";
+const hooks = await AgentHarnessGuards({client: {app: {log: async () => {}}, session}, directory: process.cwd()});
+await hooks["shell.env"]({sessionID: "ses-oc-parent"}, {env: {}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses-oc-parent"}}});
+console.log("idle");
+for (let i = 0; i < 300 && !prompts.length; i++) await new Promise(r => setTimeout(r, 100));
+await new Promise(r => setTimeout(r, 1500));
+hooks.dispose();
+console.log(JSON.stringify({prompts}));
+process.exit(0);
+'''
+        self.env()
+        node = subprocess.Popen(["node", "--input-type=module", "-e", js], env=self.env(), cwd=str(self.root),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(node.stdout.readline().strip(), "idle")
+            self.seed_turn()                                    # the owner finishes now
+            out, err = node.communicate(timeout=60)
+        finally:
+            if node.poll() is None:
+                node.kill()
+        self.assertEqual(node.returncode, 0, err)
+        prompts = json.loads(out.strip().splitlines()[-1])["prompts"]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("att-0000000000000000000000000000bbbb", prompts[0]["body"]["parts"][0]["text"])
+        self.assertEqual(self.state(), "acked")
+
     def test_the_carrier_names_itself_only_where_it_can_carry(self):
         script = r'''
 const out = {env: {}};
