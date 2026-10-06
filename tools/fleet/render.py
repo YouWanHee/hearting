@@ -5025,9 +5025,11 @@ def _gpu_work_row(entry, term_width=None):
     """F-104 card row for a live GPU process no run registry or session line shows."""
     indent = _conn_indent(0, False)
     width = max(20, int(term_width or 200))
-    command = _gpu_display_command(_gpu_safe_text(entry.get("command")))
+    command = _gpu_safe_text(entry.get("command"))
     if command:
         name = _gpu_process_label(command)
+        if name == command:
+            name = _gpu_display_command(command)
     else:
         name = os.path.basename(_gpu_safe_text(entry.get("process_name"))) or "process"
     name = _clip_w(name, _GPU_WORK_NAME_W)

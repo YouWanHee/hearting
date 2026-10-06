@@ -163,6 +163,14 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
                 self.assertIn("python run.py  --flag '/keep/full path'", row)
             self.assertEqual(json.dumps(entry, sort_keys=True), original)
 
+        quoted = compute_hosts.unregistered_gpu(_snapshot((0, [_process(
+            command='"/env space/bin/python" run.py --config "/cfg space/m6.json"'
+        )])))[0]
+        original_quoted = json.dumps(quoted, sort_keys=True)
+        quoted_row = render._plain(render._gpu_work_row(quoted, 168))
+        self.assertIn(" · M6 · ", quoted_row)
+        self.assertEqual(json.dumps(quoted, sort_keys=True), original_quoted)
+
     def test_multi_gpu_process_is_one_row_and_dispatch_section_only(self):
         shared = _process(used_memory_mib=9604)
         snapshot = _snapshot((0, [shared]), (1, [dict(shared)]), host="cnn", is_self=False)
