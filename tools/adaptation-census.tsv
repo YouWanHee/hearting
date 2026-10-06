@@ -167,6 +167,7 @@ utility-deferred	harness_capabilities.test.py
 utility-deferred	human_gate_receipt.py
 utility-deferred	inline_finish.py
 utility-deferred	launch-fence.py
+utility-deferred	launch_receipt.py
 utility-deferred	model-config.sh
 utility-deferred	model-worker-governor.py
 utility-deferred	model_config.py

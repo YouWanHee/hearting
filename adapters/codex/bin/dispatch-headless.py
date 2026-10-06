@@ -85,6 +85,7 @@ from dispatch_contract import (
     diff_attribution_lines,
 )
 from parent_next_directive import receipt_lines as parent_next_receipt_lines  # noqa: E402
+import launch_receipt  # noqa: E402
 from dispatch_summary import launch_summary_owner, owner_root  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
@@ -404,25 +405,7 @@ def read_launch_fence_failure(fd: int) -> tuple[dict[str, object] | None, bool]:
     return record, True
 
 
-def terminal_receipt_fields(terminal: dict | None) -> dict[str, str]:
-    """Return only bounded typed terminal metadata for the launch receipt."""
-    value = terminal or {
-        "state": "absent",
-        "source": "none",
-        "verdict": "-",
-        "artifact_state": "unchecked",
-        "blocker_reason": "-",
-    }
-    artifact_state = str(value["artifact_state"])
-    return {
-        "handoff_state": str(value["state"]),
-        "handoff_source": str(value["source"]),
-        "handoff_verdict": str(value["verdict"]),
-        "artifact_state": artifact_state,
-        "artifact_readable": "1" if artifact_state == "readable" else "0",
-        "artifact_path_b64": str(value.get("artifact_path_b64", "-")),
-        "blocker_reason": str(value["blocker_reason"]),
-    }
+terminal_receipt_fields = launch_receipt.terminal_fields  # shared launch receipt fields
 
 
 def task_prompt(args: argparse.Namespace) -> tuple[str, str]:
@@ -3387,16 +3370,8 @@ def main(argv: list[str]) -> int:
     print("check=ok")
     print("adapter=codex")
     print("runtime_surface=codex-exec-headless")
-    print(f"completion_delivery={args.resolved_completion_delivery}")
-    print(f"completion_delivery_reason={getattr(args, 'completion_delivery_reason', 'not-applicable')}")
-    print(f"parent_completion_delivery={args.parent_completion_delivery}")
-    print(f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}")
-    print(f"parent_completion_reason_class={getattr(args, 'parent_completion_reason_class', '-')}")
-    print(f"managed_sidecar_state={getattr(args, 'managed_sidecar_state', 'not-started')}")
-    print(f"managed_sidecar_reason={getattr(args, 'managed_sidecar_reason', '-')}")
-    print(f"managed_sidecar_pid={getattr(args, 'managed_sidecar_pid', '-')}")
-    print(f"managed_sealed_batch_id={getattr(args, 'managed_sealed_batch_id', '-')}")
-    print(f"managed_sidecar_log={getattr(args, 'managed_sidecar_log', '-')}")
+    for line in launch_receipt.completion_lines(args):
+        print(line)
     print(
         "supervisor_lease_file="
         + (
@@ -3455,75 +3430,17 @@ def main(argv: list[str]) -> int:
     print(f"sole_gate={os.environ.get('AGENT_DISPATCH_SOLE_GATE', '-')}")
     print(f"profile={args.profile or '-'}")
     print(f"runtime_home_projection={runtime_home_projection or '-'}")
-    print(f"job_registry={jobs}")
-    print("broker_lifecycle=retired")
-    print(
-        "governor_reservation="
-        + (str(getattr(args, "governor_reservation", {}).get("state", "-")))
-    )
-    print(f"registry_authority={registry.source}")
-    print(f"preview={1 if action == 'dry-run' else 0}")
-    print(f"attempt_id={args.attempt_id or '-'}")
-    print(f"launch_authority={args.launch_authority}")
-    print(f"fallback_ordinal={args.fallback_ordinal}")
-    print(f"fallback_hop={args.fallback_hop}")
-    print(f"execution_surface={args.execution_surface}")
-    print(f"registered_worker={int(bool(args.registered_worker))}")
-    print(f"registry_lock={jobs}.lock")
-    print(f"duplicate_attempt={0 if args.attempt_claimed or action == 'dry-run' else 1}")
-    print(
-        "launch_state="
-        + attempt_launch_state(
-            jobs, args.attempt_id, claimed=args.attempt_claimed, action=action
-        )
-    )
-    print(f"registered={1 if args.attempt_claimed else 0}")
-    print(f"started={1 if action == 'start' and args.attempt_claimed else 0}")
-    spawned_child = int(
-        action == "start"
-        and bool(args.attempt_claimed)
-        and bool(getattr(args, "child_pid", None))
-    )
-    print(f"child_spawned={spawned_child}")
-    if spawned_child:
-        # The receipt states the parent's next action itself, so a parent does
-        # not have to carry the completion-delivery taxonomy in its own
-        # instructions (`utilities/parent_next_directive.py`).
-        for directive_line in parent_next_receipt_lines(
-            getattr(args, "parent_completion_delivery", ""), args.attempt_id,
-            agent_home=args.agent_home,
-        ):
-            print(directive_line)
-    print(f"child_pid={getattr(args, 'child_pid', None) or '-'}")
-    print(f"child_pid_start={getattr(args, 'child_pid_start', None) or '-'}")
-    print(f"launch_heartbeat={getattr(args, 'launch_heartbeat', 'not-started')}")
-    print(f"launch_lifecycle={args.launch_lifecycle}")
-    print(f"launch_lifecycle_requested={args.launch_lifecycle_requested}")
-    print(f"launch_lifecycle_reselection={args.launch_lifecycle_resolution.reselection}")
-    print(f"launch_lifecycle_override={args.launch_lifecycle_resolution.override}")
-    print(f"runtime_sandbox={effective_runtime_sandbox(args)}")
-    print(f"worker_exit={getattr(args, 'worker_exit', '-')}")
-    print(f"worker_failure={getattr(args, 'worker_failure', None) or '-'}")
-    print(f"terminal_verdict={getattr(args, 'terminal_verdict', None) or '-'}")
-    for key, value in terminal_receipt_fields(
-        getattr(args, "terminal_inspection", None)
-    ).items():
-        print(f"{key}={value}")
-    print(f"require_hook_trust={1 if args.require_hook_trust else 0}")
-    print(f"nested_headless_network={1 if args.nested_headless_network else 0}")
-    print(f"nested_codex_home={args.nested_codex_home_path or '-'}")
-    print(
-        "nested_owner_writable_dirs="
-        + (";".join(map(str, nested_owner_writable_dirs(args))) or "-")
-    )
-    early_death = getattr(args, "early_death", None)
-    if early_death:
-        reason, reset = early_death
-        print(f"early_death={reason}")
-        print(f"early_death_reset={reset or '-'}")
-        print(f"row_closed=done,note=dead-{reason}")
-    else:
-        print("early_death=-")
+    for line in launch_receipt.attempt_lines(
+            args, jobs=jobs, registry_source=registry.source, action=action,
+            launch_state=attempt_launch_state(jobs, args.attempt_id, claimed=args.attempt_claimed, action=action),
+            after_lifecycle=[f"runtime_sandbox={effective_runtime_sandbox(args)}"],
+            before_early_death=[
+                f"require_hook_trust={1 if args.require_hook_trust else 0}",
+                f"nested_headless_network={1 if args.nested_headless_network else 0}",
+                f"nested_codex_home={args.nested_codex_home_path or '-'}",
+                "nested_owner_writable_dirs=" + (";".join(map(str, nested_owner_writable_dirs(args))) or "-"),
+            ]):
+        print(line)
     print(f"prompt_source={prompt_source}")
     print(f"prompt_file={prompt_path}")
     print(f"log_file={log_path}")
