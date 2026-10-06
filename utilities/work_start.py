@@ -657,6 +657,15 @@ def _capacity_pause(result, attention, resume):
         waiting["retry_at"] = attention["retry_at"]
     if attention.get("usage_state"):
         waiting["usage_state"] = attention["usage_state"]
+    if attention.get("usage_state") == "allocation-usage-gate":
+        # The route's balanced allocation, not a usage limit, holds this harness.
+        harness, gate = attention.get("harness", ""), attention.get("usage_gate_used_percent")
+        when = ("After retry_at, when the last usage window at the gate resets, run resume_command once"
+                if attention.get("retry_at") else
+                f"No reset time is known: run resume_command once after {harness} usage drops below the {gate}% gate")
+        waiting["next_step"] = (f"The route's balanced allocation holds {harness}: its usage is at or above the "
+            f"{gate}% gate, not at a usage limit. Nothing failed and nothing was started. {when}, "
+            "from the session that owns the route; completed stages are kept.")
     waiting.pop("parent_next", None)
     waiting.pop("parent_next_command", None)
     return waiting

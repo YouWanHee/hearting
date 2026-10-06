@@ -521,6 +521,40 @@ def is_gated(scores, harness, *, usage_gate_used_percent=90):
     return value is not None and float(value) <= gate_cutoff(usage_gate_used_percent)
 
 
+def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None, stale_after=3600):
+    """When `harness` leaves the `balanced` usage gate, if its gauge says so; else None.
+
+    The gate holds while a usage window is at or above the gate and lifts when the
+    last such window resets. Only a score read from the shared usage cache (`live`
+    writes through to it, `cache:<age>s` reads it) has those windows: codex
+    `windows` and opencode `rl_windows`, rows `[label, used, reset_epoch]`. A
+    window at the gate without a future reset makes the answer unknown; a time is
+    never guessed.
+    """
+    if not isinstance(source, str) or not source.startswith(("live", "cache:")):
+        return None
+    cache = _usage_cache()
+    if cache is None:
+        return None
+    now = time.time() if now is None else now
+    payload = cache.read(harness, now=now, stale_max=stale_after).get("payload")
+    rows = payload.get("rl_windows" if harness == "opencode" else "windows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return None
+    release = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        used, reset = row[1], row[2]
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or used < float(usage_gate_used_percent):
+            continue
+        if (isinstance(reset, bool) or not isinstance(reset, (int, float))
+                or not math.isfinite(reset) or reset <= now):
+            return None
+        release = reset if release is None else max(release, reset)
+    return release
+
+
 def rank_band(candidates, states, counts, declared_order, scores, *, strategy="capacity-aware", usage_gate_used_percent=90,
               preferred=None, affinity_weight=0.5, headroom_exponent=1, harness_weights=None):
     """Rank eligible quality peers by headroom, then recent attempts and config order.
