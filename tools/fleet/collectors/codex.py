@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Optional
 
 from fleet import session_registry
 from fleet.model import ContextEvidence, SESSION_WORK_SEC, SubAgent
@@ -79,6 +80,10 @@ class _CodexTick:
     # pids whose rollout was handed to a managed peer — they must not re-claim any
     # rollout via the same-cwd fallback (F-24: one sid, one row).
     no_fallback_pids: frozenset = frozenset()
+    # Exact parent ids the tick's subagent maps were scoped to (prepare_tick);
+    # None means unscoped (legacy full build). enrich widens to full when a
+    # session id outside the scope needs a lookup.
+    subagents_parent_ids: Optional[frozenset] = None
 
 
 def _home():
@@ -775,6 +780,22 @@ def _tick_subagents(tick, home, parent_ids=None):
     if normalized not in tick.subagents_by_home:
         tick.subagents_by_home[normalized] = _thread_subagents(normalized, parent_ids)
     return tick.subagents_by_home[normalized]
+
+
+def _subagents_for_session(tick, home, session_id):
+    """Tick-local subagent map for one session, widened when out of scope.
+
+    A narrowed tick map cannot tell "zero children" from "never scanned" for
+    a session id outside its scope (e.g. heuristic fallback attributions).
+    On such a lookup the tick widens every home map to the full build once --
+    worst case equals the legacy cost, output always equals the legacy map.
+    """
+    scope = tick.subagents_parent_ids
+    if scope is not None and session_id and session_id not in scope:
+        for home_key in list(tick.subagents_by_home):
+            tick.subagents_by_home[home_key] = _thread_subagents(home_key, None)
+        tick.subagents_parent_ids = None
+    return _tick_subagents(tick, home)
 
 
 def _config_model_effort(home):
@@ -1728,7 +1749,8 @@ def prepare_tick(sessions):
     # Exact parents evidenced this tick (pre-existing, registry, proc-owned
     # rollout, herdr pane): the subagent index build reads lifecycle details
     # only for their edges. Heuristic fallback attributions are not exact, so
-    # they stay out of the scope by design.
+    # they stay out of the upfront scope; enrich widens to the full build on
+    # demand when such a session id needs a lookup, keeping output identical.
     exact_parent_ids = set()
     for sess in sessions:
         if getattr(sess, "harness", None) != "codex":
@@ -1752,7 +1774,8 @@ def prepare_tick(sessions):
         if isinstance(sid, str) and sid:
             exact_parent_ids.add(sid)
     tick = _CodexTick(default_home=home, proc_paths=dict(paths), subagents_by_home={},
-                      no_fallback_pids=frozenset(donated | set(pane_ids)))
+                      no_fallback_pids=frozenset(donated | set(pane_ids)),
+                      subagents_parent_ids=frozenset(exact_parent_ids))
     homes = {home} if eligible else set()
     homes.update(
         rollout_home for rollout_home in (_rollout_home(path) for path in paths.values())
@@ -2204,7 +2227,7 @@ def enrich(sess, tick=None):
         )
         runtime_home = _rollout_home(path) or home
         subagent_index = (
-            _tick_subagents(tick, runtime_home)
+            _subagents_for_session(tick, runtime_home, sess.session_id)
             if tick is not None else _thread_subagents(runtime_home)
         )
         if subagent_index is not None:

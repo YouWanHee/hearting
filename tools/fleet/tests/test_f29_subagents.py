@@ -487,6 +487,24 @@ class CodexSubagentTest(unittest.TestCase):
             self.assertIn("parent-a", full)
             self.assertIn("parent-b", full)
 
+    def test_out_of_scope_session_id_widens_tick_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._db(tmp, [("parent", "child", "open")],
+                     [{"id": "child", "agent_role": "explorer"}])
+            tick = codex._CodexTick(tmp, {}, {})
+            tick.subagents_by_home[os.path.abspath(tmp)] = codex._thread_subagents(
+                tmp, {"other-parent"})
+            tick.subagents_parent_ids = frozenset({"other-parent"})
+            widened = codex._subagents_for_session(tick, tmp, "parent")
+            self.assertIn("parent", widened)
+            self.assertEqual(
+                [(s.agent_type, s.active) for s in widened["parent"]],
+                [("explorer", True)])
+            self.assertIsNone(tick.subagents_parent_ids)
+            # A second unscanned lookup reuses the widened full map.
+            self.assertIs(
+                widened, codex._subagents_for_session(tick, tmp, "elsewhere"))
+
     def test_absent_or_malformed_db_preserves_honest_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(codex._thread_subagents(tmp))
