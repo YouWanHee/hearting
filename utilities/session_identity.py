@@ -27,12 +27,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
-# Per harness, the variables that carry its native session id, current name first.
-SESSION_ENV: dict[str, tuple[str, ...]] = {
-    "claude": ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"),
-    "codex": ("CODEX_THREAD_ID", "CODEX_SESSION_ID"),
-    "opencode": ("OPENCODE_SESSION_ID",),
-}
+from harness_capabilities import session_env
+
+# Per harness, the variables that carry its native session id, current name first --
+# each adapter declares them (`harness-capabilities.json` `session_identity.env`).
+SESSION_ENV: dict[str, tuple[str, ...]] = session_env()
 # Variables that name the harness a command runs under, strongest first.
 HARNESS_ENV = ("AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS")
 KNOWN = frozenset(("named", "sole"))

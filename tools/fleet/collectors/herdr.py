@@ -25,11 +25,21 @@ import subprocess
 import time
 
 _TIMEOUT_S = 2.0
-# Harnesses whose Fleet session_id is known to equal herdr's ``agent_session.value``
-# (measured 2026-09-03, herdr 0.8: Claude UUID ↔ ``sessionId``; Codex thread id
-# ``01a064d8-…`` ↔ the rollout session_id, F-100 comms test). A harness outside this
-# set can be promoted to True by a match but never demoted to False.
-VERIFIED_ID_HARNESSES = frozenset({"claude", "codex"})
+def verified_id_harnesses():
+    """Harnesses whose Fleet session_id is known to equal herdr's ``agent_session.value``.
+
+    Each adapter declares it (`harness-capabilities.json` ``session_identity.herdr_session_id``;
+    measured 2026-09-03, herdr 0.8: Claude UUID ↔ ``sessionId``, Codex thread id ↔ the
+    rollout session_id). A harness outside this set can be promoted to True by a match but
+    never demoted to False.
+    """
+    import sys
+    from pathlib import Path
+    utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    from harness_capabilities import herdr_verified_harnesses
+    return herdr_verified_harnesses()
 _CODEX_PANE_CACHE = {"key": None, "until": 0.0, "identities": {}}
 _CODEX_PANE_TTL_S = 10.0
 
@@ -251,7 +261,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None):
             s.herdr_attached = True
         elif probe_ok and pid_in_panes(getattr(s, "pid", None), shells, fg):
             s.herdr_attached = True
-        elif probe_ok or (sid and harness in VERIFIED_ID_HARNESSES):
+        elif probe_ok or (sid and harness in verified_id_harnesses()):
             # herdr answered on both surfaces (or on the id surface for a verified-id
             # harness) and nothing matched → a plain terminal, not a guess.
             s.herdr_attached = False

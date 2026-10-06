@@ -191,6 +191,24 @@ def _artifact_reader():
     return _ARTIFACT_READER or None
 
 
+def _session_id_from_env():
+    """This session's native id (`utilities/session_identity`), or "" when unknown.
+
+    Resolved like `_artifact_reader`; a missing resolver degrades to "", never raises.
+    """
+    for base in (MEM_MODULE_DIR.parents[1] / "utilities", AGENT_HOME / "utilities"):
+        if not (base / "session_identity.py").is_file():
+            continue
+        if str(base) not in sys.path:
+            sys.path.insert(0, str(base))
+        try:
+            from session_identity import session_label
+            return session_label(default="")
+        except Exception:
+            return ""
+    return ""
+
+
 # Auto-commit prefix distinguishes synchronized dumps from manual commits.
 AUTO_DUMP_MSG_PREFIX = "chore: dump — auto-sync"
 
@@ -2576,7 +2594,7 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
     """
     runtime = runtime or os.environ.get("MEM_RECALL_RUNTIME", "unknown")
     session_id = session_id if session_id is not None else (
-        os.environ.get("MEM_SID") or os.environ.get("CODEX_THREAD_ID") or ""
+        os.environ.get("MEM_SID") or _session_id_from_env()
     )
     turn_id = turn_id if turn_id is not None else os.environ.get("MEM_TURN_ID", "")
     project = project_key(Path.cwd())
@@ -3051,11 +3069,7 @@ def recall_gate(decision=None, reason="", query=None, *, outcome=None, gate_id=N
     """Record a work-start recall opportunity without storing raw prompts."""
     runtime = os.environ.get("MEM_RECALL_RUNTIME", "unknown")
     sid = session_id if session_id is not None else (
-        os.environ.get("MEM_SID")
-        or os.environ.get("CLAUDE_CODE_SESSION_ID")
-        or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("OPENCODE_SESSION_ID")
-        or ""
+        os.environ.get("MEM_SID") or _session_id_from_env()
     )
     turn_id = turn_id if turn_id is not None else os.environ.get("MEM_TURN_ID", "")
     project = project_key(Path.cwd())
