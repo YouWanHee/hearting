@@ -7011,7 +7011,7 @@ class ComposeRouteTest(TestRoute):
                            ("autopilot-refine","default"),("autopilot-apply","default")):
     with self.subTest(capability=capability):
      recipe=next(row for row in registry["recipes"] if row["capability"]==capability and mode in row["modes"])
-     expected=[node["id"] for node in recipe["standard_plus"]["nodes"]]
+     expected=[node["id"] for node in recipe["standard_plus"]["nodes"] if not R._frame_node(node)]
      route=self.compose(capability=capability,capability_mode=mode,shape="staged",graph=None,
                         slug="complete-"+capability,artifact_root=tmp,execution_scope="complete")
      self.assertEqual([node["id"] for node in route["nodes"]],expected)
@@ -7272,11 +7272,12 @@ class ComposeRouteTest(TestRoute):
   self.assertIn("small_work_confirmation",route)
   R.verify_route(route,R.ROOT)
  def test_staged_without_graph_uses_recipe_without_another_cli(self):
+  # A staged route is decided work: the recipe's own order without its frame pair.
   route=self.compose(graph=None)
-  self.assertFalse(route.get("composed",False))
   self.assertEqual(route["selection"]["shape"],"staged")
   self.assertEqual([n["id"] for n in route["nodes"]],
-   ["frame","frame-alternative","plan","plan-check","execute","impl-review","test","report"])
+   ["plan","plan-check","execute","impl-review","test","report"])
+  self.assertNotIn("frame-review",route["human_gates"])
   R.verify_route(route,R.ROOT)
  def test_lab_fixed_result_report_subgraph_does_not_require_a_new_eval_run(self):
   """Reporting keeps lab ownership and selected gates without recomputation."""
@@ -7541,7 +7542,8 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["effective_intensity"],"quick")
   # Still exactly one owner -- the frame pair ahead of it are not owners.
   self.assertEqual([n["id"] for n in route["nodes"] if n.get("unit")=="_kernel/owner"],["one-shot"])
-  self.assertEqual([n["id"] for n in route["nodes"]],["frame","frame-alternative","one-shot"])
+  self.assertEqual([n["id"] for n in route["nodes"]],["one-shot"])       # decided work: no frame pair
+  self.assertNotIn("frame-review",route["human_gates"])
   self.assertEqual(route["selection"]["shape"],"solo"); self.assertEqual(route["selection"]["route_origin"],"compose")
   R.verify_route(route,R.ROOT)
  def test_staged_accepts_strong_and_expands_declared_groups(self):
@@ -8840,6 +8842,9 @@ class SealedFrameProfileCompatibilityTest(unittest.TestCase):
  def setUp(self):
   self.base=ComposeRouteTest("test_ship_unspecified_mode_keeps_default_deployment_recipe")
   self.base.setUp(); self.addCleanup(self.base.doCleanups)
+  # These are routes sealed with their recipe frame pair, as compose sealed them before
+  # decided shapes compiled without it.
+  frames=mock.patch.object(R,"DECIDED_SHAPES",()); frames.start(); self.addCleanup(frames.stop)
  @contextlib.contextmanager
  def prior_policy(self):
   demand=json.loads(json.dumps(R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)); demand["execution_reason"]=self.PRIOR_REASON

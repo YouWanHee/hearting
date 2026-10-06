@@ -523,11 +523,14 @@ class RoutePlanCompileTest(PlanFixture):
         self.assertEqual(verified["route_plan"]["index"], 1)
 
     def test_a_staged_route_without_a_graph_is_the_recipe_order_minus_frame_nodes(self):
+        with mock.patch.object(R, "DECIDED_SHAPES", ()):     # the recipe as sealed before decided shapes
+            framed_recipe = self.leg()
         plain = self.leg()
         planned = self.leg(route_plan=self.binding(1))
-        self.assertIn("frame", [n["id"] for n in plain["nodes"]])
+        self.assertIn("frame", [n["id"] for n in framed_recipe["nodes"]])
         ids = [n["id"] for n in planned["nodes"]]
-        self.assertEqual(ids, [i for i in [n["id"] for n in plain["nodes"]] if i not in ("frame", "frame-alternative")])
+        self.assertEqual(ids, [i for i in [n["id"] for n in framed_recipe["nodes"]] if i not in ("frame", "frame-alternative")])
+        self.assertEqual([n["id"] for n in plain["nodes"]], ids)        # a decided staged route: the same order
         self.assertEqual(planned["composed"], True)
         self.assertNotIn("frame-review", planned["human_gates"])
         self.assertEqual(planned["nodes"][0]["depends_on"], [])
@@ -544,9 +547,12 @@ class RoutePlanCompileTest(PlanFixture):
         R.verify_route(json.loads(json.dumps(planned)), R.ROOT)
 
     def test_a_solo_route_runs_its_one_shot_without_the_quick_frame_bootstrap(self):
+        with mock.patch.object(R, "DECIDED_SHAPES", ()):
+            self.assertEqual([n["id"] for n in self.leg(shape="solo")["nodes"]], ["frame", "frame-alternative", "one-shot"])
         plain = self.leg(shape="solo")
         planned = self.leg(shape="solo", route_plan=self.binding(1))
-        self.assertEqual([n["id"] for n in plain["nodes"]], ["frame", "frame-alternative", "one-shot"])
+        self.assertEqual([n["id"] for n in plain["nodes"]], ["one-shot"])
+        R.verify_route(json.loads(json.dumps(plain)), R.ROOT)
         self.assertEqual([n["id"] for n in planned["nodes"]], ["one-shot"])
         self.assertEqual(planned["nodes"][0]["depends_on"], [])
         self.assertNotIn("frame-review", planned["human_gates"])

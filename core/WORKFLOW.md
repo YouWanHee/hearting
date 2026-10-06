@@ -253,8 +253,10 @@ its scope: reuse that record, and choose `framed` again only when the scope
 changed. The main session judges the scope; nothing picks a campaign's latest
 record automatically. `direct` is unchanged. A route made from a proposal
 (`compose --route-plan <record>#<i>`, a command the runtime prints) has no frame
-nodes. Both frame legs of every frame — `framed`, the recipe frames and quick's —
-are `top`: a pin with a profile or an explicit profile wins and is not lowered
+nodes, and neither has a `solo` or `staged` compose: those shapes are chosen for
+decided work, so they compile without the recipe's frame pair (a route sealed
+earlier keeps the frame nodes it was sealed with). Both frame legs of every
+frame — `framed` and a preset recipe's own frame pair — are `top`: a pin with a profile or an explicit profile wins and is not lowered
 automatically; a frame-rule `top` that stops at a usage limit is retried once at
 `deep` through the SD-157 replacement lineage, and the lowering is recorded.
 The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를
@@ -586,8 +588,9 @@ before it reaches anyone; the cap and the wording rules are machine-checked at
 the raise for every route carrying the gate, `quick` included, while steps 1–3
 above stay obligations on the acting session that nothing checks mechanically.
 Only code/design/draft/refine/spec recipes carry the frame pair at `quick` and
-above, before the owner; the `framed` shape (§0.2.1) runs the same pair ahead of
-any non-direct work. Other recipes retain their topology. `direct` asks its
+above, before the owner, when they run as a preset (`compile`); the `framed`
+shape (§0.2.1) runs the same pair ahead of any non-direct work, and a `solo` or
+`staged` compose has none. Other recipes retain their topology. `direct` asks its
 question inline in the §0.4 card and records the answer in the plan or work log.
 The recorded answers become `shards/frame/intent.md`, rendered by depth-0.
 The runtime supplies the released task and decisions to the owner and every

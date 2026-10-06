@@ -1009,7 +1009,8 @@ class CatalogueInputTest(F.FramedBase):
 
     def test_recipe_internal_and_quick_frames_get_the_same_unit_prompt_and_catalogue(self):
         for shape, graph in (("staged", None), ("solo", None)):
-            with self.subTest(shape):
+            # A recipe's own frame pair: as a preset compile seals it (and compose did before decided shapes).
+            with self.subTest(shape), mock.patch.object(R, "DECIDED_SHAPES", ()):
                 route = R.compose_route(
                     capability="autopilot-code", capability_mode=None, shape=shape, graph=graph, slug="frames",
                     cwd=R.ROOT, artifact_root=self.root, spec_read="fixture", campaign_key="k",
