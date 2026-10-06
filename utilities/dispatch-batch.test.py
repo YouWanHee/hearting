@@ -4168,7 +4168,8 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
     NOTICE = ("notice: --parent wrong-owner is not this session's name; "
               "using owner (from AGENT_DISPATCH_SELF_SLUG).")
 
-    def run_main(self, *, parent="wrong-owner", gates="on", lifecycle=None, self_slug="owner", argv=None, env=None):
+    def run_main(self, *, parent="wrong-owner", gates="on", lifecycle=None, self_slug="owner", argv=None, env=None,
+                 route_default=None):
         stack, assignments = self.common_patches()
         out, err = io.StringIO(), io.StringIO()
         seen = {}
@@ -4201,6 +4202,9 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 BATCH, "select_launch_lifecycle", return_value=lifecycle or BATCH_LIFECYCLE.DETACHED))
             popen = stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+            if route_default:
+                stack.enter_context(mock.patch("owner_route_binding.default_owner_route_file",
+                                               return_value=route_default))
             stack.enter_context(mock.patch.dict(os.environ, environment))
             if not self_slug:
                 os.environ.pop("AGENT_DISPATCH_SELF_SLUG", None)
@@ -4212,7 +4216,7 @@ class SelfParentAndForegroundNoticeTest(unittest.TestCase):
     def test_an_owner_names_only_the_group_and_start(self):
         rc, _receipt, err, seen = self.run_main(
             argv=["--replica-group", "plan", "--start", "--jobs", str(self.jobs)],
-            env={"AGENT_OWNER_ROUTE_FILE": str(self.route_path)})
+            env={}, route_default=str(self.route_path))
         self.assertEqual(seen["parent_slug"], "owner")
         self.assertNotIn("notice: --parent", err)
 

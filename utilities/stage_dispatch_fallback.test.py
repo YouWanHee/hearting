@@ -1243,7 +1243,7 @@ class FallbackTest(unittest.TestCase):
   path=self.route(same_status="supported")
   explicit=self.run_chain(path)
   self.seed_predecessor_markers(path,"plan")
-  cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--node","plan","--capability-mode","dev",
+  cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--capability-mode","dev",
        "--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--action","dry-run"]
   clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
@@ -1254,9 +1254,11 @@ class FallbackTest(unittest.TestCase):
   self.assertIn("selected_hop=",implied.stdout)
   self.assertEqual([l for l in implied.stdout.splitlines() if l.startswith("selected_hop=")],
                    [l for l in explicit.stdout.splitlines() if l.startswith("selected_hop=")])
-  env.pop("AGENT_OWNER_ROUTE_FILE")
-  outside=subprocess.run(cmd,text=True,capture_output=True,env=env)
-  self.assertEqual(outside.returncode,2); self.assertIn("AGENT_OWNER_ROUTE_FILE",outside.stderr)
+  # Without --route the owner's current route is used; this fixture owner row carries no
+  # route binding, so the launch route in AGENT_OWNER_ROUTE_FILE is not trusted in its place.
+  unbound=subprocess.run([a for a in cmd if a not in ("--route",str(path))],text=True,capture_output=True,env=env)
+  self.assertEqual(unbound.returncode,64,unbound.stdout+unbound.stderr)
+  self.assertIn("reason=owner-route-default-unresolved",unbound.stdout)
  def test_a_group_member_start_is_its_group_batch(self):
   seen=[]
   args=SimpleNamespace(route=Path("/r/route.json"),node="test-a",parent="owner",qa="standard",jobs=None,

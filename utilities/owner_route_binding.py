@@ -667,6 +667,31 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
     return current, anchor_status if advance_status == "owner-route-advance-absent" else advance_status
 
 
+def default_owner_route_file(jobs: str | Path | None = None, environ=None) -> str:
+    """The route a stage launch that names none means: this owner's current route.
+
+    That is the launch binding or post-launch attachment, followed through
+    child-adopted advances -- not `AGENT_OWNER_ROUTE_FILE`, which keeps the
+    launch route after the owner moves to a continuation. A successor that is
+    compiled but adopted by no child yet leaves the meaning open, so it raises
+    like any other unresolved state and the caller names `--route`.
+    """
+    environ = os.environ if environ is None else environ
+    owner_attempt_id = environ.get("AGENT_DISPATCH_ATTEMPT_ID") or ""
+    registry = jobs or environ.get("AGENT_DISPATCH_JOBS") or ""
+    if not owner_attempt_id or not registry:
+        raise OwnerRouteBindingError("owner-route-default-outside-owner")
+    current, status = resolve_owner_route_lifecycle(registry, owner_attempt_id=owner_attempt_id)
+    if current is None or status not in {"owner-route-launch-binding", "owner-route-post-launch-attachment",
+                                         "owner-route-advance-current"}:
+        raise OwnerRouteBindingError(f"owner-route-default-unresolved:{status}")
+    pending = _advance_root(Path(registry).expanduser().resolve(strict=False)) / _advance_key(
+        owner_attempt_id, current.route_id, current.route_hash)
+    if pending.is_dir() and any(pending.glob("*.json")):
+        raise OwnerRouteBindingError("owner-route-default-unresolved:successor-not-adopted")
+    return current.route_file
+
+
 def _candidate_started_by_owner(
     rows: list[tuple[list[str], dict[str, str]]], *, owner_attempt_id: str,
     candidate: OwnerRouteAdvance, source_route: dict,

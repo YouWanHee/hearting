@@ -1663,7 +1663,7 @@ def start_parallel_group(args: argparse.Namespace, group: str) -> int:
 
 def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--route", type=Path, help="default: this owner's route (AGENT_OWNER_ROUTE_FILE)")
+    p.add_argument("--route", type=Path, help="default: this owner's current route")
     p.add_argument("--node", required=True)
     p.add_argument("--slug", help="default: <parent>-<node>")
     p.add_argument("--parent")
@@ -1697,9 +1697,11 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     action.add_argument("--action", dest="action", choices=("dry-run", "register", "start"))
     args = p.parse_args()
     if args.route is None:
-        if not os.environ.get("AGENT_OWNER_ROUTE_FILE"):
-            p.error("--route is required outside a route owner (AGENT_OWNER_ROUTE_FILE is unset)")
-        args.route = Path(os.environ["AGENT_OWNER_ROUTE_FILE"])
+        from owner_route_binding import OwnerRouteBindingError, default_owner_route_file
+        try:
+            args.route = Path(default_owner_route_file(args.jobs))
+        except OwnerRouteBindingError as exc:
+            return fail(str(exc), 64, detail="name the route with --route", child_spawned="0")
     # The wrappers run with cwd=ROOT, so a relative prompt path would be read
     # against the harness tree instead of the caller's directory (home-os,
     # 2026-09-27: three launches fell through to "inline, runtime-unavailable").

@@ -691,12 +691,13 @@ class MainMaterializationTest(unittest.TestCase):
             out = io.StringIO()
             argv = ["dispatch-node.py", "--node", "execute", "--adapter", "claude", "--start"]
             with mock.patch.object(sys, "argv", argv), \
-                 mock.patch.dict(N.os.environ, {"AGENT_OWNER_ROUTE_FILE": str(route_path)}, clear=True), \
+                 mock.patch.dict(N.os.environ, {}, clear=True), \
+                 mock.patch("owner_route_binding.default_owner_route_file", return_value=str(route_path)), \
                  mock.patch.object(N.subprocess, "run", return_value=mock.Mock(returncode=0)), \
                  contextlib.redirect_stdout(out):
                 with self.assertRaises(SystemExit) as ctx:
                     N.main()
-        # The route came from the owner's environment and --start meant start.
+        # The route came from the owner's current route and --start meant start.
         self.assertEqual(ctx.exception.code, 65)
         self.assertIn("reason=parallel-group-batch-required", out.getvalue())
 
