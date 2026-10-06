@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -20,6 +21,8 @@ from execution_access import (
     bind_request,
     build_grant,
     load_request,
+    load_parent_effective_grant,
+    publish_effective_grant,
     prepare_task_request,
     receipt_fragment,
 )
@@ -291,6 +294,147 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             "execution-access-enforcement-unavailable:codex-read-only",
             raised.exception.reason,
         )
+
+    def checked_parent(self):
+        grant = build_grant(self.request, runtime="codex-app-server")
+        jobs = self.state / "jobs.log"
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        path, digest = publish_effective_grant(
+            jobs=jobs, attempt_id="att-parent", route_id="rt-parent",
+            route_hash="sha256:" + "b" * 64, runtime="codex-app-server",
+            sandbox="workspace-write", grant=grant,
+            default_writable_roots=(self.worktree, self.artifact), network_allowed=False,
+        )
+        jobs.write_text("now\topen\t12\tparent\tparent-slug\t"
+                        "attempt_id=att-parent,route_id=rt-parent,route_hash=sha256:" + "b" * 64
+                        + ",runtime_sandbox=workspace-write,execution_access_effective_file=" + str(path)
+                        + ",execution_access_effective_sha256=" + digest + "\n")
+        return load_parent_effective_grant(jobs=jobs, parent_attempt_id="att-parent",
+                                           context=self.context)
+
+    def nested_grant(self, args, parent):
+        return bind_request(
+            str(self.request_file), environ=self.env, context=self.context,
+            is_child=True, parent=parent, runtime="codex-exec",
+            default_writable_roots=(self.worktree, self.artifact),
+            effective_sandbox=self.codex.effective_runtime_sandbox(args),
+            inherit_parent_sandbox=self.codex.uses_enclosing_codex_sandbox(args),
+        )
+
+    def test_nested_request_uses_exact_outer_boundary_and_actual_inner_argv(self):
+        # The installed failure was an inherited inventory run-root, not a GPU
+        # selection. Strict OS requests must use the same real parent boundary.
+        for required in ("any", "os-sandbox"):
+            with self.subTest(required=required):
+                self.write_request(enforcement_required=required)
+                self.request = load_request(self.request_file, context=self.context)
+                parent = self.checked_parent()
+                for delivery in ("one-shot", "app-server-supervised"):
+                    args = self.codex_args(delivery)
+                    args.dispatch_depth = 2
+                    args.launch_lifecycle = "foreground-scoped"
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CHILD": "1"}):
+                        grant = self.nested_grant(args, parent)
+                        args.execution_access_grant = grant
+                        cmd = self.codex.shell_command(args, self.root / "prompt.txt", self.root / "log")
+                    self.assertIn("--sandbox danger-full-access", cmd)
+                    self.assertNotIn(str(self.scoped), cmd)  # already projected by parent
+                    self.assertEqual("os-sandbox", grant.file_enforcement)
+                    self.assertEqual("att-parent", grant.enclosing_parent_attempt_id)
+                    self.assertEqual((), grant.additional_writable_roots)
+                    self.assertIn(",execution_access_boundary=parent-os-sandbox", receipt_fragment(grant))
+                    self.assertIn(",execution_access_parent_attempt=att-parent", receipt_fragment(grant))
+                    child, _ = publish_effective_grant(
+                        jobs=self.state / "jobs.log", attempt_id="att-" + required + delivery,
+                        route_id="rt-parent", route_hash="sha256:" + "b" * 64,
+                        runtime="codex-exec", sandbox="danger-full-access", grant=grant,
+                        default_writable_roots=(self.worktree, self.artifact), network_allowed=False)
+                    record = json.loads(child.read_text())
+                    self.assertEqual("danger-full-access", record["sandbox"])
+                    self.assertEqual("parent-os-sandbox", record["boundary"])
+                    self.assertEqual("att-parent", record["enclosing_parent_attempt_id"])
+                    self.assertTrue(record["os_filesystem_enforced"])
+                    self.assertFalse(record["network_allowed"])
+                    self.assertEqual([], record["read_roots"])
+                    self.assertIn(str(self.scoped), record["writable_roots"])
+                # Each scenario owns a fresh canonical record, never rewrites it.
+                self.state.joinpath("jobs.log").unlink()
+                import shutil
+                shutil.rmtree(self.state / "execution-access")
+
+    def test_explicit_full_host_detached_and_read_only_never_inherit_os_grade(self):
+        parent = self.checked_parent()
+        for mode, lifecycle, child_env in (
+            ("danger-full-access", "foreground-scoped", "1"),  # explicit or FORCE result
+            ("danger-full-access", "detached", ""),
+            ("read-only", "foreground-scoped", "1"),
+        ):
+            with self.subTest(mode=mode, lifecycle=lifecycle):
+                args = self.codex_args("one-shot")
+                args.dispatch_depth, args.launch_lifecycle, args.sandbox = 2, lifecycle, mode
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CHILD": child_env}):
+                    self.assertFalse(self.codex.uses_enclosing_codex_sandbox(args))
+                    self.assertEqual(mode, self.codex.effective_runtime_sandbox(args))
+                    with self.assertRaises(ExecutionAccessError) as raised:
+                        self.nested_grant(args, parent)
+                self.assertEqual("execution-access-enforcement-unavailable:" +
+                                 ("codex-read-only" if mode == "read-only" else "codex-file-sandbox"),
+                                 raised.exception.reason)
+        for env, change in (("", {}), ("1", {"launch_lifecycle": "detached"}),
+                            ("1", {"parent_transport": "interactive"}),
+                            ("1", {"parent_sandbox": "danger-full-access"}),
+                            ("1", {"parent_harness": "claude"}),
+                            ("1", {"gpu_execution_scope": True})):
+            args = self.codex_args("one-shot")
+            args.dispatch_depth, args.launch_lifecycle = 2, "foreground-scoped"
+            for key, value in change.items():
+                setattr(args, key, value)
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CHILD": env}):
+                self.assertFalse(self.codex.uses_enclosing_codex_sandbox(args))
+                self.assertEqual("workspace-write", self.codex.effective_runtime_sandbox(args))
+
+    def test_nested_missing_enforcement_parent_expansion_and_unsupported_axes_refused(self):
+        parent = self.checked_parent()
+        args = self.codex_args("one-shot")
+        args.dispatch_depth, args.launch_lifecycle = 2, "foreground-scoped"
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CHILD": "1"}):
+            for bad in (replace(parent, file_enforcement="none"),
+                        replace(parent, sandbox="danger-full-access"),
+                        replace(parent, runtime="claude-cli"), replace(parent, attempt_id=""),
+                        replace(parent, network_enforcement="unknown")):
+                with self.subTest(parent=bad), self.assertRaises(ExecutionAccessError) as raised:
+                    self.nested_grant(args, bad)
+                self.assertEqual("execution-access-enforcement-unavailable:codex-parent-sandbox",
+                                 raised.exception.reason)
+            with self.assertRaises(ExecutionAccessError):
+                self.nested_grant(args, None)
+            for bad in (replace(parent, writable_roots=(self.worktree, self.artifact)),
+                        replace(parent, writable_roots=(self.scoped,))):
+                with self.assertRaises(ExecutionAccessError) as raised:
+                    self.nested_grant(args, bad)
+                self.assertTrue(raised.exception.reason.startswith("execution-access-exceeds-parent:"))
+            inherited_network = self.nested_grant(args, replace(parent, network_allowed=True))
+            record_path, _ = publish_effective_grant(
+                jobs=self.state / "jobs.log", attempt_id="att-inherited-network",
+                route_id="rt-parent", route_hash="sha256:" + "b" * 64,
+                runtime="codex-exec", sandbox="danger-full-access", grant=inherited_network,
+                default_writable_roots=(self.worktree, self.artifact), network_allowed=False)
+            self.assertEqual("not-requested", inherited_network.network)
+            self.assertTrue(json.loads(record_path.read_text())["network_allowed"])
+            self.write_request(network={"required": True, "reason": "fetch", "hosts": []})
+            with self.assertRaises(ExecutionAccessError) as raised:
+                self.nested_grant(args, parent)
+            self.assertEqual("execution-access-exceeds-parent:network", raised.exception.reason)
+            self.write_request(network={"required": True, "reason": "fetch", "hosts": ["example.com"]},
+                               enforcement_required="os-sandbox")
+            with self.assertRaises(ExecutionAccessError) as raised:
+                self.nested_grant(args, replace(parent, network_allowed=True))
+            self.assertEqual("execution-access-enforcement-unavailable:codex-network-hosts",
+                             raised.exception.reason)
+            self.write_request(read_roots=[str(self.scoped)], enforcement_required="os-sandbox")
+            with self.assertRaises(ExecutionAccessError) as raised:
+                self.nested_grant(args, parent)
+            self.assertEqual("execution-access-enforcement-unavailable:codex-exec", raised.exception.reason)
 
     def test_claude_and_opencode_project_without_os_claim(self) -> None:
         prompt = self.root / "prompt.txt"

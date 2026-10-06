@@ -1109,21 +1109,23 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
     args.sandbox = selection["sandbox"]
 
 
-def effective_runtime_sandbox(args: argparse.Namespace) -> str:
-    """Avoid nesting Codex's mount sandbox inside an already checked Codex sandbox."""
-
-    if getattr(args, "gpu_execution_scope", False):
-        return args.sandbox  # The shared GPU selection already includes caller constraints.
-    if (
-        getattr(args, "launch_lifecycle", DETACHED) == FOREGROUND_SCOPED
+def uses_enclosing_codex_sandbox(args: argparse.Namespace) -> bool:
+    """The checked foreground child remains inside the parent's OS sandbox."""
+    return (
+        not getattr(args, "gpu_execution_scope", False)
+        and args.sandbox == "workspace-write"
+        and getattr(args, "launch_lifecycle", DETACHED) == FOREGROUND_SCOPED
         and os.environ.get("AGENT_DISPATCH_CHILD") == "1"
         and getattr(args, "dispatch_depth", 1) >= 2
         and getattr(args, "parent_harness", None) == "codex"
         and getattr(args, "parent_transport", None) == "headless"
         and getattr(args, "parent_sandbox", None) == "workspace-write"
-    ):
-        return "danger-full-access"
-    return args.sandbox
+    )
+
+
+def effective_runtime_sandbox(args: argparse.Namespace) -> str:
+    """Avoid nested mounts while preserving caller sandbox constraints."""
+    return "danger-full-access" if uses_enclosing_codex_sandbox(args) else args.sandbox
 
 
 def invalid_codex_mount_target(args: argparse.Namespace, worktree: Path) -> Path | None:
@@ -2797,6 +2799,7 @@ def main(argv: list[str]) -> int:
             effective_sandbox=effective_runtime_sandbox(args),
             gpu_resource_scope=(args.gpu_execution_scope
                                 and effective_runtime_sandbox(args) == "danger-full-access"),
+            inherit_parent_sandbox=uses_enclosing_codex_sandbox(args),
         )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
