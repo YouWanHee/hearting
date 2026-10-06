@@ -38,7 +38,7 @@ from dispatch_completion_join import (  # noqa: E402
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
-from parent_next_directive import entrypoint, resume_command  # noqa: E402
+from parent_next_directive import entrypoint, resume_command, wait_command  # noqa: E402
 from dispatch_session_sweep import (  # noqa: E402
     HUMAN_GATE_PREFIX,
     _bounded_receipt_text,
@@ -1422,8 +1422,9 @@ def no_arm_notice(payload: object, *, reason: str | None = None) -> int:
         f"[dispatch-owner-rewake] schema=2 state=not-armed attempt_id={attempt_id} "
         f"reason={reason} — this owner start reported started=1 but the asyncRewake bridge "
         "did NOT arm, so its completion will not wake this session and no bridge is "
-        "watching it. Watch this exact attempt via the explicit poll-fallback "
-        "(dispatch-wait --attempt-id <id>); do not wait for a wake that cannot arrive."
+        "watching it. Watch this exact attempt once with: "
+        f"{wait_command(attempt_id, agent_home=agent_home())} "
+        "— do not wait for a wake that cannot arrive."
     )
     print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
     print(message, file=sys.stderr)

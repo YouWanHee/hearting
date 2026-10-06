@@ -43,6 +43,30 @@ fi
 
 PY=$(command -v python3 || command -v python || true)
 if [ -z "$PY" ]; then echo "harness: python3 is required." >&2; exit 1; fi
+
+# `hearting run <utility> [args...]` runs one utility from the active root:
+# AGENT_HOME when the caller set one (a checkout, a worker's sealed release),
+# else the release installed right now. It needs no environment, so the same
+# documented or printed command works in a new session of every harness.
+if [ "${1:-}" = run ]; then
+  shift
+  if [ $# -eq 0 ]; then echo "usage: hearting run <utility> [args...]" >&2; exit 2; fi
+  name=$1
+  shift
+  case $name in
+    ""|*/*|.*) echo "harness: not a utility name: $name" >&2; exit 2 ;;
+  esac
+  for entry in "$AGENT_HOME/utilities/$name" "$AGENT_HOME/utilities/$name.py" "$AGENT_HOME/utilities/$name.sh"; do
+    [ -f "$entry" ] || continue
+    case $entry in
+      *.py) exec "$PY" "$entry" "$@" ;;
+    esac
+    if [ -x "$entry" ]; then exec "$entry" "$@"; fi
+    exec sh "$entry" "$@"
+  done
+  echo "harness: no utility named $name under $AGENT_HOME/utilities" >&2
+  exit 2
+fi
 if [ ! -f "$INSTALLER_PY" ]; then echo "harness: installer.py was not found ($INSTALLER_PY)." >&2; exit 1; fi
 
 exec "$PY" "$INSTALLER_PY" "$@"

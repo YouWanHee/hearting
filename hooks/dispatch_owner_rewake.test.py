@@ -1369,6 +1369,8 @@ class RegistryConfirmArmTest(unittest.TestCase):
         self.assertIn("state=not-armed", err.getvalue())
         self.assertIn("attempt_id=att-owner-b", err.getvalue())
         self.assertIn("state=not-armed", json.loads(out.getvalue())["systemMessage"])
+        # The fallback it names is an absolute command, never a bare name off PATH.
+        self.assertRegex(err.getvalue(), r" /\S+/utilities/dispatch-wait\.sh --attempt-id att-owner-b --max \d+")
 
     def test_a_started_receipt_whose_attempt_is_already_watched_stays_silent(self) -> None:
         self.assertIsInstance(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True), rewake.ArmClaim)
