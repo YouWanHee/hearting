@@ -599,16 +599,17 @@ def _blocked_round_items(route, metadata):
     return frozenset(items["unmet"])
 
 
-def blocked_progress(route, rows) -> int:
+def blocked_progress(route, rows, *, worker_type="test") -> int:
     """How many of the newest rounds, all without a verdict, count toward the verdict-less bound
     once progress is taken into account (RA-5).
 
     Two BLOCKED rounds in a row bind a node. A BLOCKED round whose unmet `done_when` items are a
     strict subset of the previous BLOCKED round's is progress: the count starts again at it. When
-    either round's items cannot be judged (no plan items), nothing resets, exactly as before."""
+    either round's items cannot be judged (no plan items), nothing resets, exactly as before.
+    `worker_type` is the node's own, as `round_budget` reads it, for a row that names none."""
     tail = []
     for status, metadata in reversed(list(rows)):
-        kind = classify_round_row(status, metadata, worker_type=metadata.get("worker_type") or "test")
+        kind = classify_round_row(status, metadata, worker_type=metadata.get("worker_type") or worker_type)
         if kind != "verdict-less":
             break
         tail.append(metadata)

@@ -356,7 +356,7 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
     if verdictless_streak >= VERDICTLESS_BOUND and route.get("route_plan") is not None:
         # RA-5: BLOCKED rounds that keep shrinking the leg's unmet items are progress (route_authority).
         import route_authority
-        counted = route_authority.blocked_progress(route, rows)
+        counted = route_authority.blocked_progress(route, rows, worker_type=worker_type)
         progress_reset = counted < verdictless_streak
         verdictless_streak = counted
     if "live" in kinds:

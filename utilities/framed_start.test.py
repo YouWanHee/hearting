@@ -733,9 +733,9 @@ class BlockedProgressTest(LegPlanTest):
                          "worker_type": "stage", "route_node": "test", "log_file": str(log),
                          "artifact_root": str(self.root)})
 
-    def budget(self, route, rows):
+    def budget(self, route, rows, **node_fields):
         import review_round_cap as RC
-        node = next(n for n in route["nodes"] if n["id"] == "test")
+        node = {**next(n for n in route["nodes"] if n["id"] == "test"), **node_fields}
         # The worker's artifact root, as the runtime that launched it names it.
         with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)}):
             return RC.round_budget(route, node, rows)
@@ -758,6 +758,12 @@ class BlockedProgressTest(LegPlanTest):
             with self.subTest(label):
                 rows = [self.blocked_round(route, 1, {"d1", "d2"}), second]
                 self.assertEqual(self.budget(route, rows).state, "verdictless-bound")
+        # A row that names no worker type reads as its node's: a review's FAIL is no verdict.
+        bare = lambda row: (row[0], {k: v for k, v in row[1].items() if k != "worker_type"})
+        failed = ("done", {"attempt_id": "att-test-9", "note": "dead-worker-fail", "failure_class": "fail",
+                           "route_node": "test"})
+        rows = [bare(self.blocked_round(route, 1, {"d1", "d2"})), failed, bare(self.blocked_round(route, 2, {"d2"}))]
+        self.assertEqual(self.budget(route, rows, kind="review-worker").state, "verdictless-bound")
         planless = {**route, "route_plan": None}
         rows = [self.blocked_round(route, 1, {"d1", "d2"}), self.blocked_round(route, 2, {"d2"})]
         self.assertEqual(self.budget(planless, rows).state, "verdictless-bound")
