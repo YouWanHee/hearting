@@ -52,7 +52,7 @@ _PROC_PATHS = {}                                  # pid -> rollout reserved at c
 _CFG = {"ts": 0.0, "model": None, "effort": None}
 _TITLE_INDEX = {"stamp": None, "map": {}, "runtime_map": {}}   # native state stamps -> sid: title
                                                                 # (runtime_map = JSONL thread_name only, F-99a ①)
-_SUBAGENT_INDEX = {}                  # runtime home -> (read time, stamp, map, available)
+_SUBAGENT_INDEX = {}                  # runtime home -> (read time, stamp, map, available, scope)
 _LIFECYCLE_CACHE_MAX = 512
 _LIFECYCLE_CACHE = OrderedDict()
 _LIFECYCLE_CACHE_EVICTIONS = 0
@@ -634,25 +634,54 @@ def _subagent_active(edge_status, rollout_path, updated_at=None, updated_at_ms=N
     return True if age <= SESSION_WORK_SEC else None
 
 
-def _build_thread_subagents(db_path):
-    """Build the exact spawn-edge mapping from one readable Codex state DB."""
+def _build_thread_subagents(db_path, parent_ids=None):
+    """Build the exact spawn-edge mapping from one readable Codex state DB.
+
+    ``parent_ids`` narrows the expensive child-lifecycle reads to edges of
+    exact parents collected this tick; ``None`` keeps the legacy full build.
+    Duplicate/foreign-parent verification always sees every edge (a separate
+    cheap pair query), and out-of-scope children are omitted without any
+    dead/missing claim — the tick-scoped index cache never serves a narrowed
+    map to a wider scope.
+    """
+    scope = None if parent_ids is None else frozenset(
+        parent_id for parent_id in parent_ids
+        if isinstance(parent_id, str) and parent_id)
+    full_rows_query = (
+        "SELECT e.parent_thread_id, e.child_thread_id, e.status, "
+        "t.agent_role, t.agent_path, t.created_at, t.created_at_ms, "
+        "t.thread_source, t.source, t.rollout_path, t.updated_at, t.updated_at_ms "
+        "FROM thread_spawn_edges AS e "
+        "JOIN threads AS t ON t.id = e.child_thread_id"
+    )
     connection = None
     try:
         connection = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
         connection.execute("PRAGMA query_only=ON")
-        rows = list(connection.execute(
-            "SELECT e.parent_thread_id, e.child_thread_id, e.status, "
-            "t.agent_role, t.agent_path, t.created_at, t.created_at_ms, "
-            "t.thread_source, t.source, t.rollout_path, t.updated_at, t.updated_at_ms "
-            "FROM thread_spawn_edges AS e "
-            "JOIN threads AS t ON t.id = e.child_thread_id"
-        ))
+        if scope is None:
+            rows = list(connection.execute(full_rows_query))
+            pair_rows = rows
+        else:
+            pair_rows = list(connection.execute(
+                "SELECT e.parent_thread_id, e.child_thread_id "
+                "FROM thread_spawn_edges AS e"
+            ))
+            if scope:
+                ordered = sorted(scope)
+                placeholders = ",".join("?" for _ in ordered)
+                rows = list(connection.execute(
+                    full_rows_query +
+                    " WHERE e.parent_thread_id IN (%s)" % placeholders,
+                    tuple(ordered),
+                ))
+            else:
+                rows = []
     finally:
         if connection is not None:
             connection.close()
 
     raw_parents = {}
-    for parent_id, child_id, *_rest in rows:
+    for parent_id, child_id, *_rest in pair_rows:
         if isinstance(parent_id, str) and parent_id and isinstance(child_id, str) and child_id:
             raw_parents.setdefault(child_id, set()).add(parent_id)
 
@@ -702,13 +731,20 @@ def _build_thread_subagents(db_path):
     return mapped
 
 
-def _thread_subagents(home):
+def _thread_subagents(home, parent_ids=None):
     """Exact parent-thread subagents from the Codex state DB, read-only and fail-closed.
 
     ``None`` means the source/schema is unavailable; a mapping means the source was
     checked (a missing parent key therefore means zero observed children).  The edge is
     the attribution authority: rollout cwd/mtime/title heuristics never attach children.
+
+    ``parent_ids`` scopes the build to exact parents collected this tick; the
+    index entry is keyed by that scope, so a narrowed map is never served to a
+    wider tick. ``None`` keeps the legacy full build.
     """
+    scope = None if parent_ids is None else frozenset(
+        parent_id for parent_id in parent_ids
+        if isinstance(parent_id, str) and parent_id)
     db_path = _state_db(home)
     stamp = (
         db_path,
@@ -718,25 +754,26 @@ def _thread_subagents(home):
     )
     now = time.time()
     cached = _SUBAGENT_INDEX.get(home)
-    if cached and cached[1] == stamp and now - cached[0] < _INDEX_TTL:
+    if (cached and len(cached) == 5 and cached[1] == stamp
+            and now - cached[0] < _INDEX_TTL and cached[4] == scope):
         return cached[2] if cached[3] else None
     if not db_path:
-        _SUBAGENT_INDEX[home] = (now, stamp, {}, False)
+        _SUBAGENT_INDEX[home] = (now, stamp, {}, False, scope)
         return None
     try:
-        mapped = _build_thread_subagents(db_path)
+        mapped = _build_thread_subagents(db_path, parent_ids=scope)
     except (OSError, sqlite3.Error):
-        _SUBAGENT_INDEX[home] = (now, stamp, {}, False)
+        _SUBAGENT_INDEX[home] = (now, stamp, {}, False, scope)
         return None
-    _SUBAGENT_INDEX[home] = (now, stamp, mapped, True)
+    _SUBAGENT_INDEX[home] = (now, stamp, mapped, True, scope)
     return mapped
 
 
-def _tick_subagents(tick, home):
+def _tick_subagents(tick, home, parent_ids=None):
     """Return one home snapshot, loading it at most once in this collection."""
     normalized = os.path.abspath(home)
     if normalized not in tick.subagents_by_home:
-        tick.subagents_by_home[normalized] = _thread_subagents(normalized)
+        tick.subagents_by_home[normalized] = _thread_subagents(normalized, parent_ids)
     return tick.subagents_by_home[normalized]
 
 
@@ -1688,6 +1725,32 @@ def prepare_tick(sessions):
     _PROC_PATHS.clear()
     _PROC_PATHS.update(paths)
     _FALLBACK_CLAIMS.update(ts=time.time(), sids=claimed)
+    # Exact parents evidenced this tick (pre-existing, registry, proc-owned
+    # rollout, herdr pane): the subagent index build reads lifecycle details
+    # only for their edges. Heuristic fallback attributions are not exact, so
+    # they stay out of the scope by design.
+    exact_parent_ids = set()
+    for sess in sessions:
+        if getattr(sess, "harness", None) != "codex":
+            continue
+        sid = getattr(sess, "session_id", None)
+        if isinstance(sid, str) and sid:
+            exact_parent_ids.add(sid)
+        try:
+            record = session_registry.read("codex", sess.pid)
+        except Exception:
+            record = None
+        if record:
+            sid = record.get("sessionId")
+            if isinstance(sid, str) and sid:
+                exact_parent_ids.add(sid)
+    for path in paths.values():
+        sid = _sid(path)
+        if sid:
+            exact_parent_ids.add(sid)
+    for sid in pane_ids.values():
+        if isinstance(sid, str) and sid:
+            exact_parent_ids.add(sid)
     tick = _CodexTick(default_home=home, proc_paths=dict(paths), subagents_by_home={},
                       no_fallback_pids=frozenset(donated | set(pane_ids)))
     homes = {home} if eligible else set()
@@ -1696,7 +1759,7 @@ def prepare_tick(sessions):
         if rollout_home
     )
     for runtime_home in sorted(homes):
-        _tick_subagents(tick, runtime_home)
+        _tick_subagents(tick, runtime_home, exact_parent_ids)
     return tick
 
 

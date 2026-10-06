@@ -438,6 +438,55 @@ class CodexSubagentTest(unittest.TestCase):
             ])
             self.assertEqual(codex._thread_subagents(tmp), {})
 
+    def test_scoped_build_matches_full_build_for_collected_parents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._db(tmp, [
+                ("parent-a", "child-a", "open"),
+                ("parent-b", "child-b", "open"),
+            ], [
+                {"id": "child-a", "agent_role": "explorer"},
+                {"id": "child-b", "agent_role": "worker",
+                 "lifecycle": "task_complete"},
+            ])
+            scoped = codex._thread_subagents(tmp, {"parent-a"})
+            self.assertIn("parent-a", scoped)
+            self.assertNotIn("parent-b", scoped)
+            # The out-of-scope child rollout is never scanned: no dead/missing
+            # claim is made about it, its lifecycle is simply not read.
+            self.assertNotIn(
+                os.path.realpath(os.path.join(tmp, "child-b.jsonl")),
+                codex._EXACT_LIFECYCLE_CACHE)
+            full = codex._thread_subagents(tmp)
+            self.assertEqual(
+                [(s.agent_type, s.active) for s in scoped["parent-a"]],
+                [(s.agent_type, s.active) for s in full["parent-a"]])
+            self.assertIn("parent-b", full)
+
+    def test_scoped_build_preserves_duplicate_parent_omission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._db(tmp, [
+                ("parent-a", "child", "open"),
+                ("parent-b", "child", "open"),
+            ], [{"id": "child", "agent_role": "worker"}])
+            scoped = codex._thread_subagents(tmp, {"parent-a"})
+            self.assertNotIn("parent-a", scoped)
+            self.assertNotIn("parent-b", scoped)
+
+    def test_scoped_cache_never_serves_a_wider_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._db(tmp, [
+                ("parent-a", "child-a", "open"),
+                ("parent-b", "child-b", "open"),
+            ], [
+                {"id": "child-a", "agent_role": "explorer"},
+                {"id": "child-b", "agent_role": "worker"},
+            ])
+            scoped = codex._thread_subagents(tmp, {"parent-a"})
+            self.assertNotIn("parent-b", scoped)
+            full = codex._thread_subagents(tmp)
+            self.assertIn("parent-a", full)
+            self.assertIn("parent-b", full)
+
     def test_absent_or_malformed_db_preserves_honest_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(codex._thread_subagents(tmp))
