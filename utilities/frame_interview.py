@@ -190,6 +190,52 @@ def understanding_draft(request: str) -> str:
     return _first_paragraph(first, MAX_UNDERSTANDING_CHARS)
 
 
+NATIVE_ANSWERS_NAME = "answers.native.json"
+_RECOMMENDED = re.compile(r"\s*[(（](?:권장|recommended)[)）]\s*$", re.I)
+
+
+def _plain(text) -> str:
+    return " ".join(_RECOMMENDED.sub("", _text(text)).split())
+
+
+def answers_from_native(interview: dict, asked) -> dict | None:
+    """The answers file a native question tool's reply makes, or None when that reply is not
+    an answer to this interview.
+
+    `asked` lists what the tool showed and got back: `{question, options: [label], answer}`.
+    The restatement is asked as its own question (the understanding sentence, verbatim):
+    its first option confirms it and typed text is the correction. Every registered question
+    must be there by its own text; a printed label picks that option and typed text is an
+    off-menu answer with that text as its note. The reply came from the person's native
+    question box, so the source is `user`."""
+    shown = [row for row in asked or [] if isinstance(row, dict) and _plain(row.get("question"))]
+    find = lambda text: next((row for row in shown if _plain(text) and _plain(text) in _plain(row["question"])), None)
+    restatement = find(interview.get("understanding"))
+    if restatement is None:
+        return None
+    options = [_plain(label) for label in restatement.get("options") or []]
+    reply = _plain(restatement.get("answer"))
+    if not reply:
+        return None
+    if options and reply == options[0]:
+        confirmed, correction = True, ""
+    elif reply in options:
+        return None                                   # "no" without saying what is wrong: ask for it
+    else:
+        confirmed, correction = False, _text(restatement.get("answer")).strip()
+    given = {}
+    for question in interview.get("questions") or []:
+        row = find(question.get("question"))
+        if row is None or not _plain(row.get("answer")):
+            return None
+        labels = [_plain(label) for label in _labels(question)]
+        picked = _plain(row.get("answer"))
+        given[_text(question.get("id"))] = ({"choice": labels.index(picked), "note": ""} if picked in labels
+                                            else {"choice": NONE_SENTINEL, "note": _text(row.get("answer")).strip()})
+    return {"schema": ANSWERS_SCHEMA, "route_id": interview.get("route_id"), "round": interview.get("round", 1),
+            "actor_kind": "user", "understanding_confirmed": confirmed, "correction": correction, "answers": given}
+
+
 def approval_question_id(leg, key) -> str:
     """The id of the yes/no question that approves the `key` parts of leg `leg`."""
     return f"{key}-leg{leg}"

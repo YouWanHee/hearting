@@ -144,6 +144,30 @@ def _frame_decision_result(decision, question, question_path, answer_path):
     return result
 
 
+def record_native_answer(route, jobs, asked):
+    """Keep the person's native reply to this route's registered frame question.
+
+    When the frame-review gate waits on a registered question with no answer yet and `asked`
+    (`frame_interview.answers_from_native`) is a valid answer to it, the reply is written once
+    beside the question as `answers.native.json`, and the next `start` takes it as the person's
+    answer. Returns that file, or None (no question waiting, or the reply is not its answer)."""
+    import frame_interview as FI
+    import workflow_state as WS
+    resolution = WS.human_gate_resolution(
+        WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).journal(), "frame-review")
+    question_path = Path(resolution.get("artifact") or "")
+    if resolution.get("status") != "blocked" or not question_path.is_file() \
+            or (question_path.parent / "answers.json").exists():
+        return None
+    question = json.loads(question_path.read_text(encoding="utf-8"))
+    answers = FI.answers_from_native(question, asked)
+    if answers is None or FI.validate_answers(question, answers):
+        return None
+    target = question_path.parent / FI.NATIVE_ANSWERS_NAME
+    target.write_text(json.dumps(answers, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return target
+
+
 def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                          decision="proceed", runtime_root=ROOT, run=subprocess.run):
     """Own raise -> actual answers -> intent -> release through existing commands.
@@ -235,6 +259,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                 "self_path": str(question_path), "summary": str(directory / "frame-summary.json"),
                 "created": original.get("created") or datetime.now(timezone.utc).strftime("%Y-%m-%d")}
     errors = mark_errors + FI.validate(question, intensity=route["effective_intensity"])
+    native = directory / FI.NATIVE_ANSWERS_NAME
+    if not answers and not next_round and resolution["status"] == "blocked" and native.is_file():
+        answers = native                    # the person's native reply, recorded when it arrived
     response = json.loads(Path(answers).read_text()) if answers else None
     # A native timeout/acknowledgement is not an answer file. Keep the same
     # registered question available for a later ordinary conversation reply.
@@ -294,7 +321,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                     "Ask the person to confirm or correct the understanding in their language, and present the "
                     "registered question and choices without changing their words. "
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
-                    "Preserve only the person's actual structured or typed reply in answers_template and set "
+                    "When the native question tool returns the reply, the runtime keeps it beside the question "
+                    "(answers.native.json, recorded by the harness hook): then just rerun resume_command. Otherwise "
+                    "preserve only the person's actual structured or typed reply in answers_template and set "
                     "actor_kind=user for that reply. Keep supervisor/automatic/unknown sources as such; "
                     "an acknowledgement or template is never a user decision. Then rerun "
                     "resume_command with --answers <file>. The runtime renders intent and releases the gate. "
