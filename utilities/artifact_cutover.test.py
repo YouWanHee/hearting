@@ -1207,5 +1207,112 @@ class RouteLivenessOwnerAdvanceTest(unittest.TestCase):
         self.assertEqual(result["state"], "alive")
 
 
+class RelocatedPointerTest(unittest.TestCase):
+    """`resolve_legacy` follows sibling `<name>.RELOCATED.json` payload pointers.
+
+    Bare synthetic root (no cutover maps): the pointer phase runs on the
+    direct candidate alone. Read-only: fixtures only create files, resolve
+    never writes.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "artifact-root"
+        self.root.mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _pointer(self, directory, new_path, schema="fleet-payload-pointer.v1",
+                 raw=None):
+        directory = Path(directory)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        if raw is None:
+            record = {"schema": schema, "old_path": str(directory),
+                      "new_path": new_path}
+        else:
+            record = raw
+        (directory.parent / (directory.name + ".RELOCATED.json")).write_text(
+            record if isinstance(record, str) else json.dumps(record))
+
+    def _moved_dir(self, rel, files=("sub/file.txt",)):
+        target = self.root / rel
+        for name in files:
+            path = target / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("payload\n")
+        return target
+
+    def test_single_hop_preserves_tail(self):
+        new_base = self._moved_dir("store/v3")
+        self._pointer(self.root / "legacy/releases/v3", str(new_base))
+        result = C.resolve_legacy(self.root, "legacy/releases/v3/sub/file.txt")
+        self.assertEqual(result["resolution"], "relocated")
+        self.assertEqual(result["target"], "store/v3/sub/file.txt")
+        self.assertEqual(result["absolute"], str(new_base / "sub/file.txt"))
+        self.assertTrue(result["pointer"].endswith("v3.RELOCATED.json"))
+        self.assertNotIn("chain", result)
+
+    def test_two_hop_chain_reports_evidence(self):
+        final_base = self._moved_dir("final/c")
+        mid = self.root / "_stage/b"
+        self._pointer(self.root / "a", str(mid))
+        self._pointer(mid, str(final_base))
+        result = C.resolve_legacy(self.root, "a/sub/file.txt")
+        self.assertEqual(result["resolution"], "relocated")
+        self.assertEqual(result["absolute"], str(final_base / "sub/file.txt"))
+        self.assertEqual(len(result["chain"]), 2)
+        self.assertTrue(result["chain"][0].endswith("a.RELOCATED.json"))
+        self.assertTrue(result["chain"][1].endswith("b.RELOCATED.json"))
+
+    def test_broken_pointer_stays_unresolved(self):
+        new_base = self._moved_dir("store/v3")
+        cases = [
+            ("wrong-schema", {"schema": "other.v9",
+                              "old_path": "/x", "new_path": str(new_base)}),
+            ("missing-field", {"schema": "fleet-payload-pointer.v1"}),
+            ("missing-target", {"schema": "fleet-payload-pointer.v1",
+                                "old_path": "/x",
+                                "new_path": str(self.root / "nowhere")}),
+            ("relative-target", {"schema": "fleet-payload-pointer.v1",
+                                 "old_path": "/x", "new_path": "store/v3"}),
+            ("not-json", "this is not json{{{"),
+            ("not-dict", [1, 2, 3]),
+        ]
+        for name, raw in cases:
+            with self.subTest(case=name):
+                slot = self.root / ("gone-%s" % name)
+                self._pointer(slot, str(new_base), raw=raw)
+                result = C.resolve_legacy(
+                    self.root, "gone-%s/sub/file.txt" % name)
+                self.assertEqual(result["resolution"], "unresolved")
+                self.assertIsNone(result["absolute"])
+
+    def test_live_outer_pointer_beats_stale_deep_pointer(self):
+        live = self._moved_dir("live/releases", files=("X/sub/file.txt",))
+        self._pointer(self.root / "gone/releases/X", str(self.root / "void"))
+        self._pointer(self.root / "gone/releases", str(self.root / "live/releases"))
+        result = C.resolve_legacy(self.root, "gone/releases/X/sub/file.txt")
+        self.assertEqual(result["resolution"], "relocated")
+        self.assertEqual(result["absolute"], str(live / "X/sub/file.txt"))
+        self.assertNotIn("chain", result)
+
+    def test_cycle_stays_unresolved(self):
+        self._pointer(self.root / "a", str(self.root / "b"))
+        self._pointer(self.root / "b", str(self.root / "a"))
+        result = C.resolve_legacy(self.root, "a/x.txt")
+        self.assertEqual(result["resolution"], "unresolved")
+        self.assertIsNone(result["absolute"])
+
+    def test_outside_root_target_gives_exact_absolute(self):
+        outside = Path(self._tmp.name) / "outside-store"
+        (outside / "sub").mkdir(parents=True)
+        (outside / "sub/file.txt").write_text("payload\n")
+        self._pointer(self.root / "legacy/v3", str(outside))
+        result = C.resolve_legacy(self.root, "legacy/v3/sub/file.txt")
+        self.assertEqual(result["resolution"], "relocated")
+        self.assertEqual(result["absolute"], str(outside / "sub/file.txt"))
+        self.assertEqual(result["target"], result["absolute"])
+        self.assertTrue(os.path.isabs(result["target"]))
+
+
 if __name__ == "__main__":
     unittest.main()
