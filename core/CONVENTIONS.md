@@ -159,7 +159,7 @@ a scalar quality ranking:
 | `balanced` | Predetermined work with an extended multi-step execution | light model with high execution budget | allowed |
 | `light` | Predetermined, short local execution | configured light budget | allowed |
 | `mini` | Lifecycle, classification, title, or explicitly micro-semantic help | configured micro budget | forbidden for substantive registered dispatch-depth-1/2 owner, stage, and review nodes |
-| `top` | Above deep: the harness's main-session-only model, only by a route-sealed explicit selection under important or difficult-uncertain judgment | configured top budget, opt-in (undeclared runtime config refuses typed) | route-sealed dispatch-depth-1 owner only; not a stage node, leg, review worker, matrix cell, policy band, or capacity cascade |
+| `top` | Above deep: the harness's main-session-only model, only by a route-sealed explicit selection under important or difficult-uncertain judgment | configured top budget, opt-in (undeclared runtime config refuses typed; the one exception is an automatic frame leg, which on a complete user copy without the row runs collapsed onto that copy's own deep tier -- recorded `collapsed-top-to-<tier>`, named `top_collapsed=` in the owner audit, with the main-session-only model kept out of it) | route-sealed dispatch-depth-1 owner only; not a stage node, leg, review worker, matrix cell, policy band, or capacity cascade |
 
 Compile and compose use one pure resolver. `profile_demand`
 contains `schema_version: 1`, `judgment_requirement`, `execution_scope`, nonempty

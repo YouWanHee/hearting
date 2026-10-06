@@ -156,6 +156,7 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
+    frame_rule_top_launch,
     require_top_route,
     resolve_runtime_profile,
     route_selection_pin,
@@ -540,8 +541,15 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "(to choose a model, seal it at compose time: capability-route.py compose --pin <target>=<harness>:<model>[@<effort>])",
             )
         try:
-            resolved, _receipt = resolve_runtime_profile(
-                "codex", args.model_profile, source_root=ROOT
+            # Only a frame leg whose `top` the frame rule assigned may run a `top` the user file
+            # does not declare: the copy's own deep tier, collapsed (model_config._derive_top_values).
+            # A `top` the person chose (explicit profile, model/effort pin) and every other launch
+            # keep the contract that an undeclared `top` refuses typed.
+            resolved, receipt = resolve_runtime_profile(
+                "codex", args.model_profile, source_root=ROOT,
+                collapse_top=frame_rule_top_launch(
+                    getattr(args, "route_file", None) or getattr(binding, "route_file", None),
+                    worker_type=args.worker_type, node=getattr(args, "route_node", None)),
             )
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
@@ -576,6 +584,12 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 # guards a route edited after sealing and the model a capacity
                 # retry actually substitutes.
                 _require_headless_model(model, source)
+        elif resolved["profile"] == TOP_PROFILE and (
+                getattr(receipt, "top_provenance", None) or "explicit").startswith("derived"):
+            # A collapsed `top` is the copy's own deep tier, not the door below: the
+            # ordinary headless restriction applies to the model it lands on.
+            _require_headless_model(model, "profile-top-collapsed")
+            source = "profile-top-collapsed"
         elif resolved["profile"] == TOP_PROFILE:
             # The one door to the main-session-only model from registered
             # dispatch: a route-sealed `top` profile (2026-09-09 사용자 결정).

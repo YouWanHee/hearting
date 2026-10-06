@@ -262,6 +262,63 @@ class ModelSettingsCliTest(unittest.TestCase):
             if key not in {"CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED"}:
                 self.assertEqual(after[key], value, key)
 
+    def test_requested_missing_top_declares_only_that_profile(self):
+        # A copy seeded before the `top` profile existed resolves `top` as a collapse onto
+        # its own deep tier (model_config._derive_top_values). `profile/top` is the one
+        # sanctioned write that turns that into the user's explicit declaration; it adds
+        # exactly the one row and leaves every other byte of the policy alone.
+        adapter, home = "codex", self.root / "legacy-top"
+        shipped = model_config.parse_config(model_config.shipped_path(adapter))
+        original = model_config.shipped_path(adapter).read_text(encoding="utf-8")
+        top_rows = ("CFG_MODEL_PROFILE_TOP=", "CFG_MODEL_PROFILE_GRANULARITY_TOP=",
+                    "CFG_TIER_TOP_MODEL=", "CFG_TIER_TOP_EFFORT=")
+        raw = "".join(line for line in original.splitlines(keepends=True) if not line.startswith(top_rows))
+        path = self.user_path(adapter, home)
+        path.parent.mkdir(parents=True)
+        path.write_text(raw, encoding="utf-8")
+        _plain, receipt = model_config.resolve_config(adapter, runtime=home, source_root=ROOT)
+        self.assertEqual((receipt.source, receipt.top_provenance), ("user", "absent"))
+        before_values, receipt = model_config.resolve_config(adapter, runtime=home, source_root=ROOT, collapse_top=True)
+        self.assertEqual((receipt.source, receipt.top_provenance), ("user", "derived-from-user-deep"))
+        collapsed = model_profile.resolve_profile_values(adapter, before_values, "top")
+        self.assertEqual((collapsed["tier"], collapsed["model"]), ("deep", shipped["CFG_TIER_DEEP_MODEL"]))
+        planned = settings.set_model(adapter, "profile/top", "custom-top", runtime=home,
+                                     environ=self.env, source_root=ROOT, dry_run=True)
+        self.assertEqual((planned["status"], planned["old_model"], planned["new_model"], planned["new_budget"]),
+                         ("planned", shipped["CFG_TIER_DEEP_MODEL"], "custom-top", collapsed["budget"]))
+        self.assertEqual(path.read_text(encoding="utf-8"), raw)
+        result = settings.set_model(adapter, "profile/top", "custom-top@xhigh", runtime=home,
+                                    environ=self.env, source_root=ROOT)
+        self.assertEqual(result["status"], "changed")
+        self.assertEqual(result["changed_keys"], ["CFG_MODEL_PROFILE_TOP"])
+        after = model_config.parse_config(path)
+        self.assertEqual(after["CFG_MODEL_PROFILE_TOP"], "model/custom-top:xhigh")
+        self.assertNotIn("CFG_TIER_TOP_MODEL", after)
+        for key, value in shipped.items():
+            if not key.startswith(top_rows[0][:-1]) and key not in {"CFG_MODEL_PROFILE_GRANULARITY_TOP",
+                                                                      "CFG_TIER_TOP_MODEL", "CFG_TIER_TOP_EFFORT"}:
+                self.assertEqual(after[key], value, key)
+        _values, receipt = model_config.resolve_config(adapter, runtime=home, source_root=ROOT)
+        self.assertEqual((receipt.source, receipt.top_provenance), ("user", "explicit"))
+        self.assertEqual(model_profile.resolve_profile_values(adapter, _values, "top")["model"], "custom-top")
+        self.assertTrue(Path(result["backup"]).is_file())
+        # Asking for exactly what the collapse already yields still writes the row: only a row
+        # pins the choice when deep later changes (review finding 2: this ended as a no-op).
+        again = self.root / "legacy-top-same"
+        path2 = self.user_path(adapter, again)
+        path2.parent.mkdir(parents=True)
+        path2.write_text(raw, encoding="utf-8")
+        same = settings.set_model(adapter, "profile/top", f"{shipped['CFG_TIER_DEEP_MODEL']}@{collapsed['budget']}",
+                                  runtime=again, environ=self.env, source_root=ROOT)
+        self.assertEqual((same["status"], same["changed_keys"]), ("changed", ["CFG_MODEL_PROFILE_TOP"]))
+        self.assertEqual(model_config.parse_config(path2)["CFG_MODEL_PROFILE_TOP"],
+                         f"model/{shipped['CFG_TIER_DEEP_MODEL']}:{collapsed['budget']}")
+        self.assertEqual(model_config.resolve_config(adapter, runtime=again, source_root=ROOT)[1].top_provenance, "explicit")
+        # and the same request on a copy that already declares the row is the ordinary no-op
+        repeat = settings.set_model(adapter, "profile/top", f"{shipped['CFG_TIER_DEEP_MODEL']}@{collapsed['budget']}",
+                                    runtime=again, environ=self.env, source_root=ROOT)
+        self.assertEqual(repeat["status"], "unchanged")
+
     def test_noop_does_not_create_lock_backup_or_rewrite(self):
         adapter, home = "opencode", self.root / "opencode"
         path = self.user_path(adapter, home)

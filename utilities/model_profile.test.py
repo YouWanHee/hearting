@@ -707,5 +707,59 @@ class PriorFrameProfilePolicyTest(unittest.TestCase):
             PROFILE.normalize_profile_demand(PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
 
 
+
+class FrameRuleTopPredicateTest(unittest.TestCase):
+    """`frame_rule_top_node` is the one judgment of an automatic frame `top`: the owner selector,
+    the dispatch wrappers and the capacity lowering all read it."""
+
+    def route(self, **extra):
+        return {"route_id": "rt-x", "nodes": [{"id": "frame", "model_profile": "top", "worker_type": "frame"},
+                                              {"id": "frame-alternative", "model_profile": "deep"},
+                                              {"id": "plan", "model_profile": "deep"}], **extra}
+
+    def test_the_frame_rules_top_is_automatic_and_a_chosen_top_is_not(self):
+        self.assertTrue(PROFILE.frame_rule_top_node(self.route(), "frame"))
+        self.assertTrue(PROFILE.frame_rule_top_node(self.route(selection_pins={"frame": {"harness": "codex"}}), "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(explicit_profiles={"frame": "top"}), "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(selection_pins={"frame": {"harness": "codex", "model": "m"}}), "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(selection_pins={"owner": {"harness": "codex", "effort": "high"}}), "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(), "frame-alternative"))  # sealed deep
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(), "plan"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(), "no-such-node"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(), None))
+        self.assertFalse(PROFILE.frame_rule_top_node(None, "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node({"nodes": "garbage"}, "frame"))
+        # a map or pin of the wrong shape cannot prove the frame rule chose it: no
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(explicit_profiles="frame"), "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(selection_pins=["frame"]), "frame"))
+        self.assertFalse(PROFILE.frame_rule_top_node(self.route(selection_pins={"frame": "codex"}), "frame"))
+
+    def test_a_pin_the_parent_changed_later_is_the_pin_in_force(self):
+        # `route_authority.route_in_force`: a frame pin the route's parent moved onto a model
+        # after sealing is a chosen `top`, exactly as if it had been sealed that way.
+        with tempfile.TemporaryDirectory() as tmp:
+            route = self.route(artifact_root=tmp, route_hash="sha256:x")
+            self.assertTrue(PROFILE.frame_rule_top_node(route, "frame"))
+            changes = Path(tmp) / ".runtime" / "routes" / "rt-x.pin-changes.jsonl"
+            changes.parent.mkdir(parents=True)
+            changes.write_text(json.dumps({
+                "schema": 1, "route_id": "rt-x", "route_hash": "sha256:x", "target": "frame",
+                "pin": {"harness": "codex", "model": "m"}}) + "\n", encoding="utf-8")
+            self.assertFalse(PROFILE.frame_rule_top_node(route, "frame"))
+
+    def test_the_launch_form_answers_no_for_anything_it_cannot_prove(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "route.json"
+            path.write_text(json.dumps(self.route()), encoding="utf-8")
+            self.assertTrue(PROFILE.frame_rule_top_launch(str(path), worker_type="frame", node="frame"))
+            self.assertFalse(PROFILE.frame_rule_top_launch(str(path), worker_type="owner", node="frame"))
+            self.assertFalse(PROFILE.frame_rule_top_launch(str(path), worker_type="frame", node=None))
+            self.assertFalse(PROFILE.frame_rule_top_launch(None, worker_type="frame", node="frame"))
+            self.assertFalse(PROFILE.frame_rule_top_launch(str(Path(tmp) / "missing.json"), worker_type="frame", node="frame"))
+            path.write_text("{not json", encoding="utf-8")
+            self.assertFalse(PROFILE.frame_rule_top_launch(str(path), worker_type="frame", node="frame"))
+
+
+
 if __name__ == "__main__":
     unittest.main()

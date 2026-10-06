@@ -324,6 +324,78 @@ class TopExceptionProfileTest(ClaudeDispatchModelEligibilityTest):
             WRAPPER.resolve_model_settings(frame_args("frame-contrarian"))
         self.assertEqual(unknown.exception.reason, "profile-top-route-node-unknown")
 
+    def test_a_frame_leg_on_a_copy_without_top_runs_the_copys_own_deep_tier_under_the_ordinary_restriction(self):
+        # 2026-10-06: a user copy seeded before the `top` profile existed made the framed default
+        # shape refuse every new piece of work. Only an automatic frame leg may now run such a
+        # copy's `top`, collapsed onto the copy's own deep tier (model_config._derive_top_values),
+        # and that model stays under the ordinary headless restriction -- the collapse is not the
+        # door to the main-session-only model. An owner's explicit `top` on the same copy keeps
+        # refusing: the row is still undeclared for every other launch.
+        import json as _json, tempfile as _tempfile
+        home = Path(_tempfile.mkdtemp())
+        legacy = home / "agent-config" / "models.conf"
+        legacy.parent.mkdir()
+        legacy.write_text("".join(
+            line for line in SHIPPED_CONF.read_text(encoding="utf-8").splitlines(keepends=True)
+            if not line.startswith(("CFG_MODEL_PROFILE_TOP=", "CFG_MODEL_PROFILE_GRANULARITY_TOP=",
+                                    "CFG_TIER_TOP_MODEL=", "CFG_TIER_TOP_EFFORT="))), encoding="utf-8")
+        route = home / "frame-route.json"
+        route.write_text(_json.dumps({
+            "route_id": "rt-frame-legacy", "owner_model_profile": "deep",
+            "nodes": [{"id": "frame", "model_profile": "top"}, {"id": "frame-alternative", "model_profile": "top"}],
+        }), encoding="utf-8")
+
+        def frame_args():
+            args = selection(profile="top", route_file=str(route), worker_type="frame", role="deep maker")
+            args.route_node = "frame"
+            return args
+
+        policy = shipped_policy()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+            result = WRAPPER.resolve_model_settings(frame_args())
+            self.assertEqual((result["source"], result["profile"], result["tier"], result["model"],
+                              result["effort"], result["granularity"]),
+                             ("profile-top-collapsed", "top", "deep", policy["CFG_TIER_DEEP_MODEL"],
+                              policy["CFG_TIER_DEEP_EFFORT"], "collapsed-top-to-deep"))
+            self.assertFalse(WRAPPER._main_session_only_model(result["model"]))
+            # the model the collapse lands on is checked like any other headless model
+            with mock.patch.object(WRAPPER, "_model_policy",
+                                   side_effect=lambda: restricted_policy(policy["CFG_TIER_DEEP_MODEL"])):
+                with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                    WRAPPER.resolve_model_settings(frame_args())
+                self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
+            # the owner door is unchanged: an explicit `top` on an undeclared copy refuses typed
+            with self.assertRaises(WRAPPER.ModelSelectionError) as owner:
+                WRAPPER.resolve_model_settings(selection(profile="top", route_file=top_route(home)))
+            self.assertEqual(owner.exception.reason, "invalid-dispatch-model-profile")
+            self.assertIn("does not declare CFG_MODEL_PROFILE_TOP", str(owner.exception))
+            # a `top` the person chose for this leg is never collapsed: explicit profile ...
+            explicit_route = home / "explicit-route.json"
+            explicit_route.write_text(_json.dumps({
+                "route_id": "rt-frame-explicit", "owner_model_profile": "deep",
+                "explicit_profiles": {"frame": "top"},
+                "nodes": [{"id": "frame", "model_profile": "top"}, {"id": "frame-alternative", "model_profile": "top"}],
+            }), encoding="utf-8")
+            chosen = frame_args(); chosen.route_file = str(explicit_route)
+            with self.assertRaises(WRAPPER.ModelSelectionError) as explicit:
+                WRAPPER.resolve_model_settings(chosen)
+            self.assertEqual(explicit.exception.reason, "invalid-dispatch-model-profile")
+            # ... or a pin carrying a model/effort
+            pinned_route = home / "pinned-route.json"
+            pinned_route.write_text(_json.dumps({
+                "route_id": "rt-frame-pinned", "owner_model_profile": "deep",
+                "selection_pins": {"frame": {"harness": "claude", "model": "custom", "effort": "high"}},
+                "nodes": [{"id": "frame", "model_profile": "top"}, {"id": "frame-alternative", "model_profile": "top"}],
+            }), encoding="utf-8")
+            pinned = frame_args(); pinned.route_file = str(pinned_route)
+            with self.assertRaises(WRAPPER.ModelSelectionError) as pin_refused:
+                WRAPPER.resolve_model_settings(pinned)
+            self.assertEqual(pin_refused.exception.reason, "invalid-dispatch-model-profile")
+        # with the row declared, the frame leg goes through the explicit door as before
+        legacy.write_text(SHIPPED_CONF.read_text(encoding="utf-8"), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+            self.assertEqual(WRAPPER.resolve_model_settings(frame_args())["source"], "profile-top")
+
     def test_no_model_override_runs_under_the_top_label(self):
         # top review m1: no cascade in or out, capacity retry included
         for model, effort in (("claude-fable-5", "max"), ("opus", "xhigh")):

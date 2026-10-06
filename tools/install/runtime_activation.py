@@ -3051,6 +3051,7 @@ def _status_missing(runtime: str, scope: str) -> dict:
         "model_config_present": config_path.is_file() and not config_path.is_symlink(),
         "model_config_source": None,
         "model_config_reason": "activation-missing",
+        "model_config_top_provenance": None,
         "freshness": "missing",
         "session_action": SESSION_ACTIONS[runtime],
         "external_dependencies": [],
@@ -3111,12 +3112,15 @@ def status(runtime: str, scope: str = "global") -> dict:
             runtime,
             runtime=paths.runtime_home(runtime, scope),
             source_root=active_root,
+            collapse_top=True,  # status reports what an automatic frame leg would resolve
         )
         model_config_source = model_receipt.source
         model_config_reason = model_receipt.reason
+        model_config_top_provenance = model_receipt.top_provenance
     except model_config.ModelConfigError as exc:
         model_config_source = "unavailable"
         model_config_reason = f"shipped-unusable:{exc}"
+        model_config_top_provenance = None
         missing = True
     bundle_stale = False
     if state.get("mode") == "packaged":
@@ -3178,6 +3182,7 @@ def status(runtime: str, scope: str = "global") -> dict:
         "model_config_present": model_config_present,
         "model_config_source": model_config_source,
         "model_config_reason": model_config_reason,
+        "model_config_top_provenance": model_config_top_provenance,
         "freshness": freshness,
         "session_action": SESSION_ACTIONS[runtime],
         "external_dependencies": [],

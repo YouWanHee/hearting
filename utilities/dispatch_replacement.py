@@ -262,13 +262,12 @@ def _frame_rule_top(jobs, meta):
     if not route or route.get('route_id') != meta.get('route_id'):
         return False
     node = next((n for n in route.get('nodes') or [] if isinstance(n, dict) and n.get('id') == meta['route_node']), None)
-    if not node or node.get('model_profile') != 'top' or node.get('worker_type') != 'frame':
+    if not node or node.get('worker_type') != 'frame':
         return False
-    if (route.get('explicit_profiles') or {}).get(meta['route_node']):
-        return False
-    pins = route_authority.route_in_force(route).get('selection_pins') or {}
-    pin = pins.get('frame') or pins.get('owner') or {}
-    return not (pin.get('model') or pin.get('effort'))
+    # ONE judgment of "the frame rule assigned this top", shared with the owner selector and
+    # the dispatch wrappers (which use it to let a legacy copy's collapsed `top` stand in).
+    from model_profile import frame_rule_top_node
+    return frame_rule_top_node(route, meta['route_node'])
 
 
 def death_kind(fields, meta, *, jobs=None, lines=None):

@@ -17,8 +17,11 @@ PORTABLE_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
 # selection, with a full demand, for its dispatch-depth-1 owner (see
 # `TOP_WORKER_TYPES` and `require_top_route`). It is not portable in the
 # five-profile sense: no matrix cell resolves to it, no policy band names it,
-# no capacity cascade enters or leaves it, and a runtime config that does not
-# declare CFG_MODEL_PROFILE_TOP refuses it typed instead of deriving a model.
+# no capacity cascade enters or leaves it, and `resolve_profile_values` refuses a
+# config that does not declare CFG_MODEL_PROFILE_TOP typed (`profile-top-undeclared`)
+# instead of inventing a model. The one derivation lives upstream of it, in
+# `model_config._derive_top_values`: a complete user copy without the row gets `top`
+# collapsed onto its own deep tier -- never onto a model the user did not choose.
 TOP_PROFILE = "top"
 EXCEPTION_PROFILES = (TOP_PROFILE,)
 KNOWN_PROFILES = PORTABLE_PROFILES + EXCEPTION_PROFILES
@@ -285,8 +288,13 @@ def resolve_runtime_profile(
     runtime: str | Path | None = None,
     environ: dict[str, str] | None = None,
     source_root: str | Path | None = None,
+    collapse_top: bool = False,
 ) -> tuple[dict[str, str], object]:
-    """Resolve a profile from the complete user file or complete shipped fallback."""
+    """Resolve a profile from the complete user file or complete shipped fallback.
+
+    `collapse_top` is the automatic frame path's opt-in (see `model_config.resolve_config`): a
+    complete user copy without `top` then resolves it as a collapse onto its own deep tier, and
+    the returned receipt's `top_provenance` says so (`derived-from-user-…`)."""
     try:
         from model_config import ModelConfigError, resolve_config
     except ImportError:  # package import in focused unit tests
@@ -294,7 +302,8 @@ def resolve_runtime_profile(
 
     try:
         values, receipt = resolve_config(
-            adapter, runtime=runtime, environ=environ, source_root=source_root
+            adapter, runtime=runtime, environ=environ, source_root=source_root,
+            collapse_top=collapse_top,
         )
     except ModelConfigError as exc:
         raise ModelProfileError(f"runtime model config unavailable: {exc}") from exc
@@ -515,6 +524,49 @@ def frame_anchor_shape_demand(*, prior: bool = False) -> dict:
 
     return json.loads(json.dumps(
         PRIOR_FRAME_ANCHOR_SHAPE_DEMAND if prior else FRAME_ANCHOR_SHAPE_DEMAND))
+
+
+def frame_rule_top_node(route, node_id) -> bool:
+    """Whether `route`'s node `node_id` carries `top` from the frame rule itself.
+
+    True only for a node sealed at `top` that no per-node explicit profile and no pin carrying a
+    model or effort chose (a pin naming only a harness chooses no profile). This is the ONE
+    judgment of "automatic frame `top`": the owner selector and the three dispatch wrappers read
+    it to decide whether a legacy user copy's collapsed `top` (`model_config._derive_top_values`)
+    may stand in for the leg, and `dispatch_replacement._frame_rule_top` reads it for the capacity
+    lowering. A `top` the person chose is theirs and is never lowered or collapsed automatically
+    (WORKFLOW §0.2.1). Anything unreadable answers no."""
+    if not isinstance(route, dict) or not node_id:
+        return False
+    node = next((n for n in route.get("nodes") or []
+                 if isinstance(n, dict) and n.get("id") == node_id), None)
+    if not node or node.get("model_profile") != TOP_PROFILE:
+        return False
+    # "Cannot prove" answers no: a map or pin of the wrong shape is not evidence that the
+    # frame rule chose this `top`, so it is treated like a chosen one (never collapsed).
+    explicit = route.get("explicit_profiles") or {}
+    if not isinstance(explicit, dict) or explicit.get(node_id):
+        return False
+    # A pin the route's parent changed later is the pin in force, as in `route_selection_pin`.
+    pins = route_in_force(route).get("selection_pins") or {}
+    if not isinstance(pins, dict):
+        return False
+    pin = pins.get("frame") or pins.get("owner") or {}
+    if not isinstance(pin, dict):
+        return False
+    return not (pin.get("model") or pin.get("effort"))
+
+
+def frame_rule_top_launch(route_file, *, worker_type, node) -> bool:
+    """`frame_rule_top_node` for one launch: a non-frame worker, no node, or a route file that is
+    missing or unreadable answers no, so only a provable frame-rule `top` is ever collapsed."""
+    if worker_type != "frame" or not route_file or not node:
+        return False
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return frame_rule_top_node(route, node)
 
 
 def _lower_launch_verified(args, route, node_id, selection, profile):
