@@ -59,6 +59,7 @@ from dispatch_continuation_budget import (
 )
 import dispatch_budget_record as budget_record
 import dispatch_stage_advance as stage_advance
+import session_supervisor_decisions as DECISIONS
 import dispatch_subsession_advance as subsession_advance
 from dispatch_supervisor_terminal import (
     SupervisorTerminal,
@@ -99,8 +100,7 @@ def harvest_surface(launch_file: str) -> str:
 SHARED_HARVEST_SURFACE = harvest_surface(__file__)
 
 
-class SupervisorError(RuntimeError):
-    """The runtime completion bridge could not preserve its contract."""
+SupervisorError = DECISIONS.SupervisorError
 
 
 class TurnFailed(SupervisorError):
@@ -167,126 +167,10 @@ def emit(value: dict[str, Any]) -> None:
     print(json.dumps(value, separators=(",", ":"), ensure_ascii=False), flush=True)
 
 
-def attempt_stage_advance(
-    args: argparse.Namespace,
-    current_rows: list[object],
-    new_attempts: set[str],
-    delivery_timing: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    """SD-110: best-effort runtime-owned advance for each just-joined
-    route-bound child, at this supervisor's symmetric park point (plan §5
-    block 4 -- immediately after `validate_delivery_timing`, before the
-    receipt is built into the model's resume outbox). This Codex supervisor
-    has no `terminal_route_completion` precedent (plan §8.3-1); that SD-78
-    terminal fast-path is unrelated to `coordinate_stage_advance` (a
-    NON-terminal eligible-linear advance) and its absence does not block this
-    wiring -- the identical logic as `claude-session-supervisor.py`'s
-    `attempt_stage_advance`, kept in sync by hand since each supervisor stays
-    a self-contained process boundary (§13.32.1-(3)G).
-
-    `delivery_timing` (this join round's own `last_child_terminal_ns` /
-    `join_completed_ns`) is reused as the canary's timing basis (block 6,
-    checklist 6.1) -- an advanced outcome stamps `next_stage_start_ns` fresh
-    and leaves `same_thread_resume_ns`/`exact_harvest_ns` explicitly `null`.
-
-    Off by default (`--enable-stage-advance`): with the flag unset this
-    function is a no-op and the existing delivery path is byte-identical. A
-    refusal of any kind, including an unexpected exception from the real
-    services boundary, never propagates -- it means exactly "perform today's
-    unchanged delivery" (§13.32.1-(4)).
-
-    §13.32.1-(2)6/(3)B: `receipt_schema_negotiated=3` and "the model-facing
-    delivery actually carries the `stage_advance` v3 block" are ONE
-    negotiation decision -- an advance the model is never told about is
-    exactly the state (3)B forbids. This function's own
-    `--enable-stage-advance` gate (above) is the only thing that lets
-    `receipt_schema_negotiated` become anything other than 2, and
-    `receipt_with_stage_advance` no longer takes an independent `negotiated`
-    flag -- it derives the same fact from whether the returned record itself
-    carries `outcome == "advanced"`, which is unreachable unless this gate
-    already fired. The durable
-    `stage_advance_record_v1` for the first `outcome == "advanced"` boundary
-    this round is returned so the caller can do exactly that; `None` when
-    nothing advanced.
-    """
-
-    if not getattr(args, "enable_stage_advance", False):
-        return None
-    if not args.route_file or not args.route_id or not args.route_hash:
-        return None
-    advanced_record: dict[str, Any] | None = None
-    open_attempt_ids = frozenset(
-        getattr(row, "attempt_id", "")
-        for row in current_rows
-        if getattr(row, "status", "") in {"open", "running"}
-    ) - {""}
-    open_children = bool(open_attempt_ids)
-    by_attempt = {row.attempt_id: row for row in current_rows}
-    for attempt_id in sorted(new_attempts):
-        row = by_attempt.get(attempt_id)
-        if row is None:
-            continue
-        metadata = getattr(row, "metadata", {}) or {}
-        node = metadata.get("route_node")
-        if (
-            not node
-            or getattr(row, "status", "") != "done"
-            or metadata.get("route_id") != args.route_id
-            or metadata.get("route_hash") != args.route_hash
-        ):
-            continue
-        request = stage_advance.StageAdvanceRequest(
-            jobs=Path(args.jobs),
-            route_file=Path(args.route_file),
-            predecessor_node=node,
-            predecessor_terminal_attempt_id=attempt_id,
-            parent_attempt_id=args.parent_attempt_id,
-            supervisor_phase="running-turn" if open_children else "parked",
-            delivered_open_attempt_ids=open_attempt_ids,
-            receipt_schema_negotiated=3,
-            harness="codex",
-            worktree=args.worktree,
-        )
-        try:
-            result = stage_advance.coordinate_stage_advance(
-                request, stage_advance.RealStageAdvanceServices()
-            )
-        except Exception as exc:  # advance is optional; never break delivery
-            emit(
-                {
-                    "type": "dispatch.supervisor.stage-advance-refused",
-                    "parent_attempt_id": args.parent_attempt_id,
-                    "advance_mode": "runtime-deterministic",
-                    "route_hash": args.route_hash,
-                    "predecessor_node": node,
-                    "successor_node": None,
-                    "outcome": "refused",
-                    "reason": getattr(exc, "reason", type(exc).__name__),
-                }
-            )
-            continue
-        timing = delivery_timing or {}
-        event = stage_advance.stage_advance_event_fields(
-            route_hash=args.route_hash,
-            predecessor_node=node,
-            result=result,
-            last_child_terminal_ns=timing.get("last_child_terminal_ns"),
-            join_completed_ns=timing.get("join_completed_ns"),
-            next_stage_start_ns=(
-                time.monotonic_ns() if result.outcome == "advanced" else None
-            ),
-        )
-        event["parent_attempt_id"] = args.parent_attempt_id
-        emit(event)
-        if result.outcome == "advanced" and advanced_record is None and result.record_path is not None:
-            try:
-                advanced_record = json.loads(
-                    result.record_path.read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError):
-                advanced_record = None
-    return advanced_record
-
+def attempt_stage_advance(args, current_rows, new_attempts, delivery_timing=None):
+    """Shared runtime-owned stage advance (`session_supervisor_decisions`)."""
+    return DECISIONS.attempt_stage_advance(args, current_rows, new_attempts, delivery_timing,
+                                           emit=lambda value: emit(value), default_harness="codex")
 
 def reconcile(args: argparse.Namespace, terminal: SupervisorTerminal) -> bool:
     try:
@@ -819,132 +703,16 @@ def run_turn(
             return final_text, final_item
 
 
-def _apply_notice(prompt: str, notice: str) -> str:
-    """Mirrors claude-session-supervisor.py's identically-named helper --
-    attaches an SD-116 (b)/(c) budget notice outside any prompt's receipt
-    JSON, for the two continuation sites whose prompt builders
-    (`start_retry_prompt`) carry no receipt at all."""
+_apply_notice = DECISIONS.apply_notice
 
-    return f"{prompt}\n{notice}" if notice else prompt
+def _admit_continuation(ledger, state_root, **kwargs):
+    """Shared continuation admission (`session_supervisor_decisions`), with this module's `emit`."""
+    return DECISIONS.admit_continuation(ledger, state_root, emit=lambda value: emit(value), **kwargs)
 
-
-def _admit_continuation(
-    ledger: ContinuationLedger, state_root, *, parent_attempt_id: str,
-    route_id: str, route_hash: str, ordinal: int, purpose: str, stalled: bool,
-    warning_threshold: int = 3,
-) -> tuple[AdmitVerdict, str]:
-    """SD-116 §13.34.4-(2), mirrored from claude-session-supervisor.py's
-    identically-named helper: try the atomic reservation write first, then
-    feed its outcome into `ledger.admit()` as `reservation_ok`, so a forced
-    write failure exercises the admission equation's false branch (D47-3).
-    A budget-exhausted warning record always precedes the caller's
-    `SupervisorError` (D47-5); a warning-write failure is typed and never
-    spends budget or kills the owner (D47-10).
-
-    Returns `(verdict, notice)` -- see the Claude-side docstring for why
-    `notice` is a side value rather than a new frozen-dataclass field."""
-
-    klass = "reserved" if purpose == "terminal-handoff" else ("stall" if stalled else "gross")
-    reservation_ok, _detail = budget_record.reserve(
-        state_root, parent_attempt_id=parent_attempt_id, route_id=route_id,
-        route_hash=route_hash, ordinal=ordinal, purpose=purpose, klass=klass,
-        remaining={
-            "gross_remaining": ledger.gross_remaining,
-            "stall_remaining": ledger.stall_remaining,
-            "reserved_remaining": ledger.reserved_remaining,
-        },
-    )
-    verdict = ledger.admit(purpose=purpose, stalled=stalled, reservation_ok=reservation_ok)
-    notice = ""
-    if not verdict.admitted:
-        try:
-            budget_record.record_warning(
-                state_root, parent_attempt_id=parent_attempt_id,
-                reason="continuation-budget-exhausted",
-                remaining={
-                    "gross_remaining": verdict.gross_remaining,
-                    "stall_remaining": verdict.stall_remaining,
-                    "reserved_remaining": verdict.reserved_remaining,
-                },
-            )
-        except Exception:
-            emit({
-                "type": "dispatch.supervisor.continuation-budget-warning-unrecorded",
-                "parent_attempt_id": parent_attempt_id,
-                "reason": "continuation-budget-exhausted",
-            })
-    elif verdict.gross_remaining <= warning_threshold:
-        reason = "continuation-budget-warning"
-        try:
-            already = budget_record.warning_already_emitted(
-                state_root, parent_attempt_id=parent_attempt_id, reason=reason,
-            )
-        except Exception:
-            already = True
-        if not already:
-            try:
-                recorded, _detail = budget_record.record_warning(
-                    state_root, parent_attempt_id=parent_attempt_id, reason=reason,
-                    remaining={
-                        "gross_remaining": verdict.gross_remaining,
-                        "stall_remaining": verdict.stall_remaining,
-                        "reserved_remaining": verdict.reserved_remaining,
-                    },
-                )
-            except Exception:
-                recorded = "continuation-budget-warning-unrecorded"
-            if recorded:
-                emit({
-                    "type": "dispatch.supervisor.continuation-budget-warning-unrecorded",
-                    "parent_attempt_id": parent_attempt_id,
-                    "reason": reason,
-                })
-            try:
-                notice = budget_record.render_notice(
-                    "budget-warning",
-                    remaining=verdict.gross_remaining,
-                    threshold=warning_threshold,
-                )
-            except Exception:
-                notice = ""
-    return verdict, notice
-
-
-def _seal_terminal_handoff_or_raise(
-    ledger: ContinuationLedger, state_root, *, args: argparse.Namespace,
-    ordinal: int, failure_reason: str, terminal_handoff_issued: list[bool],
-) -> str:
-    """Mirrors claude-session-supervisor.py's identically-named helper
-    (SD-116 (c)): an ordinary/redelivery admit refusal gets exactly one
-    `purpose="terminal-handoff"` admit against the sealed reserve and, on
-    success, a single `budget-exhausted` cleanup turn -- bounded to once per
-    owner lifetime by `terminal_handoff_issued`."""
-
-    if terminal_handoff_issued[0] or ledger.reserved_remaining <= 0:
-        raise SupervisorError(failure_reason)
-    verdict, _notice = _admit_continuation(
-        ledger, state_root,
-        parent_attempt_id=args.parent_attempt_id,
-        route_id=args.route_id, route_hash=args.route_hash,
-        ordinal=ordinal, purpose="terminal-handoff", stalled=False,
-        warning_threshold=args.continuation_warning_threshold,
-    )
-    if not verdict.admitted:
-        raise SupervisorError(failure_reason)
-    terminal_handoff_issued[0] = True
-    try:
-        exhausted_notice = budget_record.render_notice(
-            "budget-exhausted", remaining=0,
-            threshold=args.continuation_warning_threshold,
-        )
-    except Exception:
-        exhausted_notice = "[continuation-budget-exhausted] remaining=0."
-    return _apply_notice(
-        "This is the final continuation turn granted from the reserved "
-        "budget. No further continuation will be granted after this one.",
-        exhausted_notice,
-    )
-
+def _seal_terminal_handoff_or_raise(ledger, state_root, **kwargs):
+    """Shared reserved terminal hand-off (`session_supervisor_decisions`)."""
+    return DECISIONS.seal_terminal_handoff_or_raise(
+        ledger, state_root, admit=lambda *a, **k: _admit_continuation(*a, **k), **kwargs)
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
