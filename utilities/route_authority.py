@@ -621,6 +621,62 @@ def blocked_progress(route, rows) -> int:
     return streak
 
 
+def answerable_owner_end(status, meta) -> str:
+    """How an ended owner's result waits for a person, or "".
+
+    `BLOCKED`: it waits for an answer no declared gate carries. `FAIL`: its own final
+    envelope reported a FAIL a person may answer with an approved fix (`readable_result`).
+    Either answer is kept (`dispatch_owner_input`) and a replacement owner continues the
+    same route with it first (`dispatch_replacement` 'corrected'). A death, an unverifiable
+    end or an invalid envelope keeps its own classification, and a readable FAIL still gets
+    no automatic retry (`retry_predecessor`): only a person's kept answer continues it."""
+    if status != "done":
+        return ""
+    if meta.get("note") == "dead-worker-blocked":
+        return "BLOCKED"
+    return "FAIL" if readable_result(meta) == "FAIL" else ""
+
+
+def fix_answers(route, lines, jobs=None) -> tuple[list[str], list[str]]:
+    """What a person's approved fix for a FAIL-ended owner answers: `(answers, spent)`.
+
+    For every round-capped node whose last full-stage verdict round is a blocking FAIL, the
+    fix answers that FAIL attempt, which gives the node the one closure-check round SD-154
+    admits for a revision that answers its last FAIL, within the verdict ceiling cap + 1
+    (SD-161). A node whose closure-check that answer would not admit (already at the ceiling,
+    or bound by BLOCKED rounds without progress) is `spent` as `<node>:<state>`: the fix makes
+    no round for it."""
+    from dispatch_contract import parse_registry_metadata
+    answers, spent = [], []
+    for node in route.get("nodes") or []:
+        if not is_round_capped_node(node):
+            continue
+        worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        census = []
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            meta = parse_registry_metadata(fields[5])
+            if ((meta.get("route_id") or meta.get("route")) == route.get("route_id")
+                    and meta.get("route_node") == node.get("id") and not no_stage_authority(meta)):
+                census.append((fields, meta))
+        rows = [(fields[1], meta) for fields, meta in _ROUND.logical_round_records(census, jobs=jobs)]
+        if not rows or not last_verdict_blocking(rows, worker_type):
+            continue
+        verdicts = [meta for status, meta in rows if classify_round_row(
+            status, meta, worker_type=meta.get("worker_type") or worker_type) == "verdict"]
+        failed = verdicts[-1].get("attempt_id", "")
+        # Admission's own rule decides: the fix answers this FAIL only when that answer is
+        # what admits the closure-check round (not at cap + 1, not bound by BLOCKED rounds).
+        budget = round_budget(route, node, rows, revisions=[{"answers": [failed]}])
+        if not failed or budget.round_kind != "closure-check":
+            spent.append(f"{node.get('id')}:{budget.state}")
+            continue
+        answers.append(failed)
+    return answers, spent
+
+
 # The round budget already has one implementation (`review_round_cap`); these
 # are its names in this module, not copies.
 classify_round_row = _ROUND.classify_round_row

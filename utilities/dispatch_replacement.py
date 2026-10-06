@@ -276,7 +276,7 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
 
     'parked' is a released human gate, 'capacity' an owner stopped at a usage limit,
     'unlaunched' an owner its launcher closed before spawning, 'corrected' an owner that ended
-    BLOCKED and has since received a person's answer through `correct`,
+    BLOCKED, or with a readable FAIL, and has since received a person's answer through `correct`,
     'silent' a proven silent death, 'frame-capacity' a frame leg at its frame-rule `top` stopped at
     a usage limit (replaced once at `deep`). Anything else, including a user cancel, is None.
     Only a route owner pauses on capacity: a stage worker's limit stays with its owner's
@@ -291,6 +291,10 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
         if (found is None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
                 and _retained_corrections(jobs, meta.get('attempt_id'))):
             return CORRECTED
+    if (jobs is not None and meta.get('worker_type') == 'owner'
+            and route_authority.answerable_owner_end(fields[1], meta) == 'FAIL'
+            and _retained_corrections(jobs, meta.get('attempt_id'))):
+        return CORRECTED  # a person approved a fix for the FAIL it reported; no automatic retry
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
@@ -849,6 +853,14 @@ def claim(jobs: Path, aid: str) -> dict:
         proof = death_proof(fields, meta, jobs=jobs, lines=lines)
         capacity = proof.get('death_kind') in PAUSE_KINDS
         path, route = _route(jobs, aid, meta)
+        if proof.get('death_kind') == CORRECTED and route_authority.answerable_owner_end(fields[1], meta) == 'FAIL':
+            # The approved fix answers each failed check's last FAIL: one closure-check round each,
+            # within the verdict ceiling cap + 1. A check that already used it gets no new round.
+            answers, spent = route_authority.fix_answers(route, lines, jobs)
+            if not answers:
+                raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent) or 'no-failed-check')
+            proof['answers'] = answers
+            proof['source_result'] = 'FAIL'
         logical = _logical_key(route, meta)
         if capacity:
             # Every usage-limit stop opens its own family: a pause, not the one silent replacement.
@@ -893,6 +905,30 @@ def claim(jobs: Path, aid: str) -> dict:
         _once(_record_path(jobs, family), record)
         _bind_source(jobs, lines, aid, record)
         return record
+
+
+def answered_fix_revisions(jobs, route_id):
+    """The approved fixes that answer a route's failed checks: one revision-like entry per
+    claim that continued a FAIL-ended owner of this route with a person's answer, naming the
+    FAIL attempts that claim pinned. Round admission reads them with the node's revisions, so
+    each pinned FAIL gets its one closure-check round."""
+    try:
+        paths = sorted((_directory(jobs)/'claims').glob('*.json'))
+    except OSError:
+        return []
+    found = []
+    for path in paths:
+        try:
+            record = _read(path)
+        except DC.DispatchContractError:
+            continue
+        proof = (record or {}).get('proof') or {}
+        if (record and record.get('route_id') == route_id and proof.get('death_kind') == CORRECTED
+                and proof.get('source_result') == 'FAIL' and proof.get('answers')):
+            found.append({'basis': 'user-direction', 'answers': list(proof['answers']),
+                          'corrections': [item.get('id') for item in proof.get('corrections') or []],
+                          'family_id': record.get('family_id')})
+    return found
 
 
 def _bind_source(jobs, lines, aid, record):
@@ -1719,7 +1755,11 @@ def recovery_instructions(args):
         raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
     completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
     kind = (record.get('proof') or {}).get('death_kind')
-    if kind == CORRECTED:
+    fix = kind == CORRECTED and (record.get('proof') or {}).get('source_result') == 'FAIL'
+    if fix:
+        opening = (f'The previous owner {prior} ended FAIL and a person approved a fix for it; this continues '
+                   f'the same work on the existing route {record["route_id"]}.\n')
+    elif kind == CORRECTED:
         opening = (f'The previous owner {prior} ended BLOCKED and a person has answered it; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == 'capacity':
@@ -1728,12 +1768,20 @@ def recovery_instructions(args):
         opening = f'The previous attempt {prior} never started (its launcher stopped before spawning); this starts the same work on the existing route {record["route_id"]}.\n'
     else:
         opening = f'You replace exact-dead attempt {prior} once, on the existing route {record["route_id"]}.\n'
+    rerun = ('Rerun the stage that makes the approved fix and every check after it; reuse everything '
+             'else. ' if fix else
+             'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. ')
     text = ('\n\n## Verified recovery context\n'
             + opening +
             f'Reuse the existing cycle {record["reuse"]["cycle_id"]} and completion evidence for: {completed}.\n'
-            'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. '
+            + rerun +
             'Keep existing human answers and gate releases; do not ask the same scope again. '
             'Preserve the original failure and report any second failure as needs-attention.\n')
+    if fix:
+        text += ('The failed checks this fix answers ('
+                 + ', '.join(record['proof']['answers']) +
+                 ') each get one more verdict round (closure-check) once the fix is in; there is no '
+                 'further round after it.\n')
     # A replacement that never started showed its answers and gate to no model,
     # so the attempt that takes its place carries them as they were.
     carried = _unstarted_replacement_claim(jobs, prior) if kind == 'unlaunched' else None
@@ -1801,8 +1849,11 @@ def _correction_context(jobs, prior, proof):
             raise DC.DispatchContractError('replacement-correction-drift', str(pinned.get('id')))
         items.append(item)
     handoff = proof.get('handoff')
-    return ((f'The previous owner reported why it stopped in {handoff}. ' if handoff else '')
-            + 'The answer below is the reply to what it was waiting for (for example an approval it asked '
+    answer = ('The answer below is the fix a person approved for the failure it reported. Treat it as '
+              'given: do not ask for it again; apply it, then continue through the remaining declared stages.'
+              if proof.get('source_result') == 'FAIL' else
+              'The answer below is the reply to what it was waiting for (for example an approval it asked '
               'for). Treat it as given: do not ask for it again, and continue from where the previous '
-              'owner stopped through the remaining declared stages.'
-            + OwnerInput.text(items) + '\n')
+              'owner stopped through the remaining declared stages.')
+    return ((f'The previous owner reported why it stopped in {handoff}. ' if handoff else '')
+            + answer + OwnerInput.text(items) + '\n')

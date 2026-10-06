@@ -1323,6 +1323,94 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    # -- an owner that ended with a readable FAIL, answered with a fix a person approved ----------
+    def _failed_owner(self, test_fails=2):
+        """BC rt-96bab699: the owner reported its test FAIL as its result; the check's rounds are spent."""
+        import dispatch_owner_input as I
+        self.route.update(effective_intensity='standard',
+                          nodes=[{'id': 'test', 'kind': 'pipeline-stage', 'worker_type': 'test'}])
+        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-worker-fail', 'failure_class': 'fail'}
+        self.write(meta, 'open')
+        I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
+        for index in range(1, test_fails + 1):
+            self.write({'attempt_schema_version': '2', 'attempt_id': f'att-test-{index}', 'route_id': 'rt-test',
+                        'route_hash': 'sha256:test', 'route_node': 'test', 'worker_type': 'stage',
+                        'dispatch_depth': '2', 'note': 'dead-worker-fail', 'failure_class': 'fail',
+                        'parent_attempt_id': 'att-source'}, append=True)
+        return meta
+
+    def test_a_person_approved_fix_continues_an_owner_that_ended_fail(self):
+        import route_authority as RA
+        import review_round_cap
+        self._failed_owner()
+        fields, meta = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertIsNone(R.death_kind(fields, meta, jobs=self.jobs))   # a readable FAIL is not retried
+        self.assertTrue(self._answer(text='approved fix: guard the abort path', request_id='fix-1')['retained'])
+        self.assertEqual(R.death_kind(fields, meta, jobs=self.jobs), R.CORRECTED)
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        record = result['record']
+        self.assertEqual((record['proof']['source_result'], record['proof']['answers']), ('FAIL', ['att-test-2']))
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        for expected in ('ended FAIL and a person approved a fix', 'approved fix: guard the abort path',
+                         'Rerun the stage that makes the approved fix', 'closure-check', 'att-test-2'):
+            self.assertIn(expected, text)
+        self.assertNotIn('Do not rerun completed nodes', text)
+        # The fix answers the spent check's last FAIL: one closure-check round, from admission's own rule.
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertEqual([item['answers'] for item in revisions], [['att-test-2']])
+        rows = [(status, row) for _aid, (fields_, row) in R._rows(self.jobs.read_text().splitlines()).items()
+                for status in [fields_[1]] if row.get('route_node') == 'test']
+        node = self.route['nodes'][0]
+        self.assertEqual(review_round_cap.round_budget(self.route, node, rows).state, 'exhausted')
+        budget = review_round_cap.round_budget(self.route, node, rows, revisions=revisions)
+        self.assertEqual((budget.state, budget.round_kind), ('admit', 'closure-check'))
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), (['att-test-2'], []))
+
+    def test_a_fix_for_a_check_that_used_its_closure_check_makes_no_round(self):
+        import route_authority as RA
+        self._failed_owner(test_fails=3)                                  # cap 2 + its one closure-check
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs),
+                         ([], ['test:exhausted']))
+        self.assertTrue(self._answer(text='another fix', request_id='fix-2')['retained'])
+        result, commands = self._launch()
+        self.assertEqual(commands, [])
+        self.assertEqual(result.get('reason'), 'replacement-fix-round-spent', result)
+        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
+
+    def test_a_fix_does_not_answer_a_check_bound_by_blocked_rounds(self):
+        # RA-5: a FAIL followed by two BLOCKED rounds without progress binds the node; the
+        # closure-check admission would not run, so the fix answers nothing there.
+        import route_authority as RA
+        self._failed_owner(test_fails=1)
+        for index in (1, 2):
+            self.write({'attempt_schema_version': '2', 'attempt_id': f'att-test-blocked-{index}',
+                        'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'test',
+                        'worker_type': 'stage', 'dispatch_depth': '2', 'note': 'dead-worker-blocked',
+                        'failure_class': 'blocked', 'parent_attempt_id': 'att-source'}, append=True)
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs),
+                         ([], ['test:verdictless-bound']))
+
+    def test_an_owner_whose_fail_is_not_readable_keeps_no_answer(self):
+        import dispatch_owner_input as I
+        import route_authority as RA
+        for meta, expected in (({'note': 'dead-worker-fail', 'failure_class': 'fail'}, 'FAIL'),
+                               ({'note': 'dead-worker-blocked', 'failure_class': 'blocked'}, 'BLOCKED'),
+                               ({'note': 'dead-worker-fail'}, ''), ({'note': 'dead-exact-pid'}, ''),
+                               ({'note': 'dead-worker-fail', 'failure_class': 'fail', 'worker_type': 'review'}, '')):
+            with self.subTest(meta=meta):
+                self.assertEqual(RA.answerable_owner_end('done', meta), expected)
+        self.assertEqual(RA.answerable_owner_end('open', {'note': 'dead-worker-fail', 'failure_class': 'fail'}), '')
+        meta = {**self.meta, 'worker_type': 'owner', 'note': 'dead-exact-pid'}
+        self.write(meta, 'open')
+        I.initialize_owner_input(self.jobs, meta['attempt_id'], 'claude-next-turn')
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
+        with self.assertRaises(I.InputError) as refused:
+            self._answer()
+        self.assertEqual(str(refused.exception), "owner-input-unavailable-retain-correction")
+
     def _move_owner(self, harness='claude'):
         import route_authority as RA
         return RA.record_pin_change(self.route, target='owner', pin={'harness': harness}, by={'harness': 'codex',
