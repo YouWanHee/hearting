@@ -243,8 +243,13 @@ def _project_of(cwd):
     return os.path.basename(str(cwd).rstrip("/"))
 
 
+def _caller_is_claude():
+    from session_identity import identity
+    return identity().harness == "claude"
+
+
 def _fallback():
-    return "claude-native-notify-idle" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "poll-fallback"
+    return "claude-native-notify-idle" if _caller_is_claude() else "poll-fallback"
 
 
 def _default_permission_mode():
@@ -1757,7 +1762,7 @@ def cmd_watch(args):
     until = list(args.until or [])
     wake = args.wake
     if wake == "auto":
-        wake = "hook" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "none"
+        wake = "hook" if _caller_is_claude() else "none"
 
     # Dedupe is its own serialization point, entered BEFORE the herdr pre-checks
     # and held until the winning watch_id is published. A bare `O_EXCL` create

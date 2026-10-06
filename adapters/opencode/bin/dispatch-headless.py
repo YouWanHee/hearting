@@ -156,6 +156,7 @@ from execution_access import (  # noqa: E402
 )
 from route_authority import (  # noqa: E402
     bind_access_request as bind_execution_access_request,
+    bind_runtime_parent,
 )
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity via resolve_qa
@@ -1796,6 +1797,7 @@ def main(argv: list[str]) -> int:
     args.command_attempt_id = args.attempt_id
     if action == "dry-run":
         args.attempt_id = None
+    bind_runtime_parent(args)
     if args.broker_request_id or args.launch_authority == "ancestor-broker":
         return fail("launch-broker-retired", 76, child_spawned="0")
     args.agent_home = resolve_agent_home()
