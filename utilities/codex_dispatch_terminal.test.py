@@ -164,7 +164,7 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         # missing everywhere
         result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="plans/absent.md", sandbox=False))
         self.assertEqual((result["state"], result["reason"], result["artifact_state"]),
-                         ("invalid", "artifact-missing", "missing"))
+                         ("invalid", "artifact-outside-root", "missing"))
         self.assertEqual(self._path(result["artifact_base_root_b64"]), self.root)
         self.assertEqual(str(self._path(result["artifact_candidates_b64"])).split("\n"),
                          [str(self.root / "plans/absent.md"), str(self.worktree / "plans/absent.md")])
@@ -177,7 +177,7 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         (self.worktree / "twice.md").symlink_to(self.root / "campaigns")
         (self.root / "campaigns").mkdir(exist_ok=True)
         result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="twice.md", sandbox=False))
-        self.assertEqual(result["reason"], "artifact-relative-ambiguous")
+        self.assertEqual((result["reason"], result["artifact_state"]), ("artifact-outside-root", "unchecked"))
         self.assertEqual(len(str(self._path(result["artifact_candidates_b64"])).split("\n")), 2)
         # parent steps never leave through a relative path
         result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact="../x.md", sandbox=False))

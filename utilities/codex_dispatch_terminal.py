@@ -655,9 +655,12 @@ def relative_artifact(artifact: str, root: Path, worktree: str | Path | None) ->
     """Where a relative ``artifact:`` value points: the artifact root first, then the worktree.
 
     Returns ``{"path": <resolved in-root path> | None, "reason", "tried", "artifact_state"}``.
-    One existing in-root target is the artifact. None existing, a target outside the
-    root, or two different targets leave the envelope invalid, and ``tried`` names
-    every path that was looked at so the next attempt can report the right one.
+    One existing in-root target is the artifact. None existing (`missing`), a
+    target outside the root (`outside-root`), or two different targets
+    (`unchecked`) leave the envelope invalid with the same
+    `artifact-outside-root` reason a relative path always had, so every reader
+    that holds or refuses on it keeps doing so; ``tried`` names every path that
+    was looked at so the next attempt can report the right one.
     """
     relative = Path(artifact)
     tried = [root / relative] + ([Path(worktree) / relative] if worktree else [])
@@ -679,10 +682,10 @@ def relative_artifact(artifact: str, root: Path, worktree: str | Path | None) ->
     if len(found) == 1:
         return {"path": found[0], "reason": "none", "tried": tried, "artifact_state": "readable"}
     if found:
-        return {"path": None, "reason": "artifact-relative-ambiguous", "tried": found, "artifact_state": "unchecked"}
+        return {"path": None, "reason": "artifact-outside-root", "tried": found, "artifact_state": "unchecked"}
     if outside:
         return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "outside-root"}
-    return {"path": None, "reason": "artifact-missing", "tried": tried, "artifact_state": "missing"}
+    return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "missing"}
 
 
 ARTIFACT_HINT_KEYS = ("artifact_base_root_b64", "artifact_candidates_b64")
