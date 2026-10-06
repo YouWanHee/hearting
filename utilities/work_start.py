@@ -29,7 +29,7 @@ from dispatch_completion_join import (
 from route_authority import caller_identity as interactive_parent_identity, default_parent_session_id
 import route_authority
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
-from parent_next_directive import parent_next
+from parent_next_directive import correction_command, entrypoint, parent_next, resume_command
 from execution_access import ExecutionAccessError, prepare_task_request
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import route_plan as RP
@@ -679,9 +679,7 @@ def _outcome(jobs, aid):
         # No log or result exists to harvest; the way on is to start the same work again.
         route_file = row[1].get("owner_route_file") or row[1].get("route_file")
         if route_file:
-            result["recovery_command"] = shlex.join([
-                sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
-                "--route", route_file, "--jobs", str(jobs)])
+            result["recovery_command"] = resume_command(route_file, jobs, agent_home=ROOT)
     if action == "advance-completed":
         if row and row[1].get("workflow_completion") == "runtime-v1":
             from dispatch_terminal_commit import completed_owner_handoff, completed_owner_publication
@@ -1060,8 +1058,7 @@ def _first_leg_state(root, decision_record, jobs, receipt):
     row = _rows(jobs).get(aid) if aid else None
     if row is None or row[0] != "done":
         return receipt
-    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                         "start", "--route", str(leg_path), "--jobs", str(Path(jobs).resolve())])
+    resume = resume_command(leg_path, Path(jobs).resolve(), agent_home=ROOT)
     result = {**receipt, "resume_command": resume}
     for key in ("parent_next", "parent_next_reason", "parent_next_command"):
         result.pop(key, None)
@@ -1242,7 +1239,7 @@ def _owner_parked_response(result, jobs, aid):
     after_proceed = ("A proceed settles the owner's finished work automatically."
                      if verdict_pass(owner_meta) else "A proceed starts the continuation automatically.")
     extra = {"owner_report": report} if report else {}
-    release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
+    release = shlex.join([sys.executable, entrypoint(ROOT, "utilities/workflow-supervisor.py"), "release",
                           "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
                           "--decision", "proceed"])
     if parked["status"] == "blocked":
@@ -1291,8 +1288,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     """Advance preparation once; repeating this call creates no duplicate job."""
     request = validate_request(route.get("work_request"))
     path, jobs = Path(path).resolve(), Path(jobs).resolve()
-    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                         "start", "--route", str(path), "--jobs", str(jobs)])
+    resume = resume_command(path, jobs, agent_home=ROOT)
     result["resume_command"] = resume
     from dispatch_notice_state import closed_outcome
     import inline_finish
@@ -1375,7 +1371,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             supervised = RESOURCE_RESUME.supervisor_alive(resource.get("supervision"))
             artifacts = prepare_route_artifact_env(path, start=True, jobs=jobs)
             output = Path(artifacts["AGENT_ARTIFACT_OUTPUT_DIR"])
-            runner_command = shlex.join([sys.executable, str(ROOT / "utilities/resource-runner.py"),
+            runner_command = shlex.join([sys.executable, entrypoint(ROOT, "utilities/resource-runner.py"),
                 "--registry", str(output / "resource-runs.json"), "start", "--run-id", route["route_id"],
                 "--cwd", route["cwd"], "--log", str(output / "logs/resume-run.log"),
                 "--route", str(path), "--node", "resume-run", "--jobs", str(jobs), "--"])
@@ -1555,10 +1551,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "Run resume_command again later (for a busy admission lock, after about a minute); "
                     "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
-    result["correction_command"] = shlex.join([
-        sys.executable, str(ROOT / "utilities/capability-route.py"), "correct",
-        "--jobs", str(jobs), "--attempt-id", aid,
-    ])
+    result["correction_command"] = correction_command(aid, jobs, agent_home=ROOT)
     if status == "done":
         gate_response = _owner_gate_response(route, path, jobs, aid, metadata, result)
         if gate_response is not None:
@@ -1650,7 +1643,7 @@ def _compose_again(route) -> str:
     # A framed compose names no capability: the shape is the route.
     named = [] if shape == "framed" else ["--capability", route["capability"],
                                           "--capability-mode", str(route.get("capability_mode") or "default")]
-    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
+    argv = [sys.executable, entrypoint(ROOT, "utilities/capability-route.py"), "compose",
             "--slug", str(route.get("slug") or route["route_id"]), *named, "--shape", shape,
             "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
             "--prompt-file", str(task), "--start"]
@@ -1670,8 +1663,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
     result = {"route_file": str(Path(path).resolve()), "route_id": route["route_id"],
               "launches": [], "owner_started": False,
               "advisories": OWNER_WRITE_ADVISORY.advisories(route),
-              "resume_command": shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                  "start", "--route", str(Path(path).resolve()), "--jobs", str(Path(jobs).resolve())])}
+              "resume_command": resume_command(Path(path).resolve(), Path(jobs).resolve(), agent_home=ROOT)}
     try:
         result = _advance(route, path, jobs, result, wait=wait, interview=interview,
                           answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
@@ -1694,8 +1686,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
             result["observation_error"] = str(observation_error)
     if result["state"] == "needs-attention":
         result.setdefault("required_action", "inspect-preparation")
-        result["resume_command"] = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                                                "start", "--route", str(path), "--jobs", str(jobs)])
+        result["resume_command"] = resume_command(path, jobs, agent_home=ROOT)
         result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
             "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
             "failure, then use resume_command; a usage-limit stop resumes after the limit resets, and a silent death "

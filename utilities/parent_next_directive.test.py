@@ -4,6 +4,7 @@ import ast
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -277,6 +278,54 @@ class StewardNextTest(unittest.TestCase):
             "parent_next=end-turn parent_next_reason=carrier-steward-watch "
             "parent_next_command=-",
         )
+
+
+class PrintedCommandHomeTest(unittest.TestCase):
+    """A printed command names the installed-release pointer, never the release that printed it."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        data = Path(self._tmp.name) / "share" / "hearting"
+        for version in ("v1.0.1", "v1.0.2"):
+            (data / "releases" / version / "core").mkdir(parents=True)
+            (data / "releases" / version / "core" / "CORE.md").write_text("x\n")
+        self.pointer = data / "current"
+        self.pointer.symlink_to(data / "releases" / "v1.0.2")
+        self.old = data / "releases" / "v1.0.1"
+        self.projection = Path(self._tmp.name) / "projection"
+        self.projection.symlink_to(data / "releases" / "v1.0.1")
+
+    def test_a_managed_release_prints_as_the_current_pointer(self):
+        for root in (self.old, self.old.resolve(), self.projection, self.pointer):
+            with self.subTest(root=str(root)):
+                self.assertEqual(pnd.command_home(root), str(self.pointer))
+        self.assertEqual(pnd.entrypoint(self.old, "utilities/x.py"), f"{self.pointer}/utilities/x.py")
+        self.assertIn(f"{self.pointer}/utilities/dispatch-wait.sh",
+                      pnd.wait_command(ATTEMPT, agent_home=self.old))
+
+    def test_a_checkout_or_unknown_root_prints_as_given(self):
+        self.assertEqual(pnd.command_home(ROOT), str(ROOT))
+        self.assertEqual(pnd.command_home(""), "")
+        self.pointer.unlink()  # a release whose pointer is gone has nothing better to name
+        self.assertEqual(pnd.command_home(self.old), str(self.old))
+
+    def test_resume_and_correction_name_the_registry_only_when_it_is_not_the_default(self):
+        state = Path(self._tmp.name) / "state"
+        default = state / "dispatch" / "jobs.log"
+        other = Path(self._tmp.name) / "other" / "jobs.log"
+        route = Path(self._tmp.name) / "route.json"
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state)}):
+            resume = pnd.resume_command(route, default, agent_home=self.old)
+            self.assertEqual(resume.split()[1:], [f"{self.pointer}/utilities/capability-route.py",
+                                                  "start", "--route", str(route)])
+            self.assertIn(f"--jobs {other}", pnd.resume_command(route, other, agent_home=self.old))
+            correction = pnd.correction_command("att-1", default, agent_home=self.old)
+            self.assertEqual(correction.split()[1:], [f"{self.pointer}/utilities/capability-route.py",
+                                                      "correct", "--attempt-id", "att-1"])
+            self.assertIn(f"correct --jobs {other} --attempt-id att-1",
+                          pnd.correction_command("att-1", other, agent_home=self.old))
 
 
 if __name__ == "__main__":

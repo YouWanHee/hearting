@@ -1732,7 +1732,9 @@ def inspect_owner_completion(jobs, status, metadata):
             publication = _publication_observation(request, route, binding)
             if publication is not None:
                 result["shared_publication"] = publication
-        result["recovery_command"] = shlex.join([sys.executable, str(Path(__file__).resolve()), "finish",
+        from parent_next_directive import entrypoint
+        result["recovery_command"] = shlex.join([sys.executable, entrypoint(
+            Path(__file__).resolve().parents[1], "utilities/dispatch_terminal_commit.py"), "finish",
             "--jobs", str(Path(jobs).resolve()), "--attempt", metadata["attempt_id"]])
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
         result.update(reason=getattr(exc, "code", "recovery-unavailable"), detail=str(exc))

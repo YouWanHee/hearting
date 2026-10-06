@@ -511,7 +511,8 @@ def render_context(
     normalized = _validate_shape(receipt)
     if delivery_id != gateway_delivery_id(normalized):
         raise HumanGateReceiptError("gateway-delivery-id-mismatch")
-    supervisor = shlex.quote(str(agent_home / "utilities" / "workflow-supervisor.py"))
+    from parent_next_directive import entrypoint
+    supervisor = shlex.quote(entrypoint(agent_home, "utilities/workflow-supervisor.py"))
     route = shlex.quote(normalized["route_file"])
     gate = shlex.quote(normalized["gate"])
     jobs = shlex.quote(normalized["job_registry"])

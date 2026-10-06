@@ -540,6 +540,7 @@ def display_plan(legs) -> list:
 
 
 from route_authority import PIN_TARGETS as _PIN_TARGETS  # noqa: E402
+from parent_next_directive import entrypoint  # noqa: E402
 
 
 def pin_tokens(pins) -> list:
@@ -585,7 +586,7 @@ def frame_selection_pins(decision, artifact_root) -> dict:
 
 def compose_argv(leg, *, context, route_plan_arg, parent_cycle, slug, pins=None) -> list:
     """The `capability-route.py compose --start` argv for one leg: run as printed, it seals and starts."""
-    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose", "--start", "--slug", slug,
+    argv = [sys.executable, entrypoint(ROOT, "utilities/capability-route.py"), "compose", "--start", "--slug", slug,
             "--shape", leg["shape"], "--capability", leg["capability"]]
     if leg.get("mode"):
         argv += ["--capability-mode", leg["mode"]]

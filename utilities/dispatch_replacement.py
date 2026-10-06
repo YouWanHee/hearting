@@ -1650,7 +1650,8 @@ def recovery_instructions(args):
             'Preserve the original failure and report any second failure as needs-attention.\n')
     gate = (record.get('proof') or {}).get('parked_gate')
     if gate:
-        read = shlex.join([sys.executable, str(ROOT/'utilities/workflow-supervisor.py'), 'await-release',
+        from parent_next_directive import entrypoint
+        read = shlex.join([sys.executable, entrypoint(ROOT, 'utilities/workflow-supervisor.py'), 'await-release',
                            '--route', record['route_file'], '--gate', gate, '--jobs', str(jobs),
                            '--max', '0', '--answers-out']) + ' <file>'
         text += (f'The original owner stopped at human gate {gate} (raise epoch {record["proof"].get("gate_epoch")}); '

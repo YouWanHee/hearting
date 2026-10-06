@@ -38,6 +38,7 @@ from dispatch_completion_join import (  # noqa: E402
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
+from parent_next_directive import entrypoint, resume_command  # noqa: E402
 from dispatch_session_sweep import (  # noqa: E402
     HUMAN_GATE_PREFIX,
     _bounded_receipt_text,
@@ -968,7 +969,7 @@ def classified_receipt(
             required_action = HUMAN_GATE_PREFIX + gate
             reason = "owner-parked-at-human-gate"
             release = shlex.join([
-                sys.executable, str(home / "utilities" / "workflow-supervisor.py"), "release",
+                sys.executable, entrypoint(home, "utilities/workflow-supervisor.py"), "release",
                 "--route", parked["route_file"], "--jobs", str(launch.jobs), "--gate", gate,
                 "--decision", "proceed"])
             instruction = (
@@ -981,8 +982,7 @@ def classified_receipt(
             reason = "owner-parked-gate-released"
             instruction = (
                 f"Human gate {parked['gate']} is already released. Continue the work with:\n"
-                + shlex.join([sys.executable, str(home / "utilities" / "capability-route.py"), "start",
-                              "--route", parked["route_file"], "--jobs", str(launch.jobs)])
+                + resume_command(parked["route_file"], launch.jobs, agent_home=home)
             )
         elif required_action in {"complete-open", "inspect-done-failure"}:
             instruction = (

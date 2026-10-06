@@ -416,8 +416,8 @@ def resume_line(seat, harness: str, sid: str) -> str:
         parts = []
         for (jobs, route), route_file in list(shown.items())[:2]:
             if route_file:
-                command = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                                      "start", "--route", route_file, "--jobs", jobs])
+                from parent_next_directive import resume_command
+                command = resume_command(route_file, jobs, agent_home=ROOT)
                 parts.append(f"route={route} 이어서: {command}")
         if not parts:
             return ""
