@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """SD-122 steward surfaces over herdr: (9) wait/start, (10) watch/join/status/rearm/ack.
 
-Checked wrapper around `herdr agent wait|get|start` — no self-written sleep or
-poll loop, event-driven only. Ledger writes go through
+Checked wrapper around `herdr agent wait|get|start` — completion watching is
+event-driven with no self-written sleep/poll loop. Foreground launch/retire
+bookkeeping uses fixed monotonic deadlines. Ledger writes go through
 `utilities/peer-message.py`'s own `cmd_record`, so the ledger root is always
 resolved via `dispatch_contract.resolve_dispatch_state_root` exactly as the
 writer of every other peer_message_v1 record resolves it — never a

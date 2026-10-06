@@ -1143,7 +1143,9 @@ wait` exactly once and leaves a disk receipt; no self-written sleep/poll loop), 
 foreground `utilities/peer-steward.py wait`, a one-shot idle-notify subscription (Claude
 `notify_when_idle`, secondary), or a registered continuation supervisor/monitor.
 `ListAgents` loops, "is it done yet?" messages, sleep loops, and periodic recaps are
-forbidden. A wait, watch, or subscription is observation, not a §0.6 continuation; a
+forbidden for completion watching. Foreground launch and retirement observations
+use a fixed monotonic deadline without renewing it or retrying a launch. A wait,
+watch, or subscription is observation, not a §0.6 continuation; a
 tracked workflow's obligation is unchanged.
 
 **Backgrounding `wait` is not a completion-detection path** (v56 correction). A background

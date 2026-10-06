@@ -760,22 +760,32 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("started=false", line)
 
     def test_start_failure_explains_name_collision_and_bounded_fallbacks(self):
-        for error, rc, reason in (
-            ({"code": "agent_name_taken"}, 0, "agent_name_taken"),
-            ({"code": "bad code\nwith details"}, 0, "herdr-start-error"),
-            ("unstructured error", 0, "herdr-start-error"),
-            (None, 2, "herdr-start-failed"),
+        for error, rc, stderr, reason in (
+            ({"code": "agent_name_taken"}, 0, "private detail", "agent_name_taken"),
+            ({"code": "bad code\nwith details"}, 0, "private detail", "herdr-start-error"),
+            ("unstructured error", 0, "private detail", "herdr-start-error"),
+            (None, 2, "private detail", "herdr-stderr-private-detail"),
+            (None, 2, "", "herdr-start-failed"),
+            (None, 2, "\x1b[31mName too long\x1b[0m\nprivate second line",
+             "herdr-stderr-name-too-long"),
+            (None, 2, "A" * 120 + "\nprivate second line", "herdr-stderr-" + "a" * 80),
         ):
             with self.subTest(error=error), mock.patch("builtins.print") as output, \
                  mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                  mock.patch.object(peer_steward.subprocess, "run", return_value=subprocess.CompletedProcess(
-                     [], rc, stdout=json.dumps({"error": error}), stderr="private detail")):
+                     [], rc, stdout=json.dumps({"error": error}), stderr=stderr)):
                 self._start()
                 line = output.call_args[0][0]
                 self.assertIn("started=false", line)
                 self.assertIn(f"reason={reason} herdr_rc={rc}", line)
                 self.assertNotIn("private detail", line)
+                self.assertNotIn("private second line", line)
                 self.assertNotIn("\n", line)
+                self.assertFalse(any(ord(char) < 32 or ord(char) == 127 for char in line))
+                diagnostic = re.search(r"\breason=([^ ]+)", line).group(1)
+                self.assertRegex(diagnostic, r"^[a-z0-9_-]+$")
+                if diagnostic.startswith("herdr-stderr-"):
+                    self.assertLessEqual(len(diagnostic.removeprefix("herdr-stderr-")), 80)
 
     def test_agent_args_pass_through_after_prefix_flags(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
@@ -1503,31 +1513,80 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         """
         import ast
 
+        def violations(source, *, bounded_ui):
+            tree = ast.parse(source)
+            parents = {child: parent for parent in ast.walk(tree)
+                       for child in ast.iter_child_nodes(parent)}
+            found = []
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.While) and isinstance(node.test, ast.Constant)
+                        and node.test.value is True):
+                    found.append((node.lineno, "unbounded while"))
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                sleeping = (isinstance(func, ast.Attribute) and func.attr == "sleep"
+                            or isinstance(func, ast.Name) and func.id == "sleep")
+                if not sleeping:
+                    continue
+                branch, parent = node, parents.get(node)
+                bounded = False
+                while parent is not None:
+                    if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                           ast.Lambda, ast.ClassDef, ast.For, ast.AsyncFor)):
+                        break
+                    if isinstance(parent, ast.While):
+                        test = parent.test
+                        if (bounded_ui and branch in parent.body
+                                and isinstance(test, ast.Compare)
+                                and len(test.ops) == len(test.comparators) == 1
+                                and isinstance(test.ops[0], ast.Lt)
+                                and isinstance(test.left, ast.Call)
+                                and not test.left.args and not test.left.keywords
+                                and isinstance(test.left.func, ast.Attribute)
+                                and test.left.func.attr == "monotonic"
+                                and isinstance(test.left.func.value, ast.Name)
+                                and test.left.func.value.id == "time"
+                                and isinstance(test.comparators[0], ast.Name)):
+                            deadline = test.comparators[0].id
+                            bounded = not any(
+                                isinstance(inner, ast.Name) and inner.id == deadline
+                                and isinstance(inner.ctx, (ast.Store, ast.Del))
+                                for statement in parent.body for inner in ast.walk(statement)
+                            )
+                        break
+                    branch, parent = parent, parents.get(parent)
+                if not bounded:
+                    found.append((node.lineno, "sleep outside fixed monotonic deadline body"))
+            return found
+
+        # Structural examples exercise the guard itself; function names grant
+        # nothing, and a deadline cannot be refreshed inside its observed loop.
+        bounded = "while time.monotonic() < deadline:\n    time.sleep(.05)\n"
+        self.assertEqual(violations(bounded, bounded_ui=True), [])
+        self.assertTrue(violations(bounded, bounded_ui=False))  # wake hook never sleeps
+        self.assertEqual(violations("text = 'time.sleep(1)'  # while True\n", bounded_ui=True), [])
+        for forbidden in (
+            "time.sleep(1)\n",
+            "while True:\n    pass\n",
+            "while ready():\n    time.sleep(1)\n",
+            "while time.time() < deadline:\n    time.sleep(1)\n",
+            "while time.monotonic() <= deadline:\n    time.sleep(1)\n",
+            "while time.monotonic() < deadline:\n    pass\nelse:\n    time.sleep(1)\n",
+            "while time.monotonic() < deadline:\n    deadline = time.monotonic() + 1\n    time.sleep(1)\n",
+            "while time.monotonic() < deadline:\n    def later():\n        time.sleep(1)\n",
+            "while time.monotonic() < deadline:\n    for event in events():\n        time.sleep(1)\n",
+            "while time.monotonic() < deadline:\n    while ready():\n        time.sleep(1)\n",
+            "def _bind_codex_session():\n    time.sleep(1)\n",
+        ):
+            with self.subTest(source=forbidden):
+                self.assertTrue(violations(forbidden, bounded_ui=True))
+
         for name in ("peer-steward.py", "../hooks/peer-steward-rewake.py"):
             path = (_HERE / name).resolve()
             self.assertTrue(path.exists(), f"{name} missing")
-            tree = ast.parse(path.read_text())
-            # The one bounded wait: `start` looks for the launched Codex thread's rollout for
-            # at most `_BIND_SECONDS`. It is launch bookkeeping, not a watch.
-            bounded_launch_bind = {
-                inner
-                for fn in ast.walk(tree)
-                if isinstance(fn, ast.FunctionDef) and fn.name == "_bind_codex_session"
-                for inner in ast.walk(fn)
-            }
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call):
-                    func = node.func
-                    dotted = (
-                        isinstance(func, ast.Attribute) and func.attr == "sleep"
-                    ) or (isinstance(func, ast.Name) and func.id == "sleep")
-                    if dotted and node in bounded_launch_bind:
-                        continue
-                    self.assertFalse(dotted, f"{path.name} must not sleep")
-                if isinstance(node, ast.While):
-                    test = node.test
-                    unbounded = isinstance(test, ast.Constant) and test.value is True
-                    self.assertFalse(unbounded, f"{path.name} must not poll-loop")
+            self.assertEqual(violations(path.read_text(), bounded_ui=name == "peer-steward.py"),
+                             [], f"{path.name}: only fixed-deadline foreground observation may sleep")
 
 
 class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
