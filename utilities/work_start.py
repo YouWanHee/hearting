@@ -1777,4 +1777,20 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
         for advisory in OWNER_WRITE_ADVISORY.receipt_advisories(launch.get("receipt", "")):
             if advisory not in result["advisories"]:
                 result["advisories"].append(advisory)
-    return result
+    return _arm_capacity_resume(result, path, jobs)
+
+
+def _arm_capacity_resume(result, path, jobs):
+    """A usage-limit pause with a known reset time resumes itself once (audit §4 #17)."""
+    import capacity_auto_resume as capacity_resume
+    try:
+        armed = capacity_resume.arm(result, path, jobs)
+    except (OSError, ValueError):
+        armed = None
+    if not armed:
+        return result
+    return {**result, "auto_resume": armed, "required_action": "wait-for-auto-resume",
+            "parent_next": "end-turn", "parent_next_reason": "capacity-auto-resume",
+            "next_step": f"The runtime runs resume_command once at {armed['resume_at']} and then leaves "
+                "this session one notice of the result; tell the user the work is paused until then. "
+                "Nothing failed. resume_command stays valid if the user wants to resume earlier."}

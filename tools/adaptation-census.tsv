@@ -196,6 +196,7 @@ utility-deferred	route_lineage.py
 utility-deferred	route_lineage.test.py
 utility-deferred	session_summary_trigger.py
 utility-deferred	session_identity.py
+utility-deferred	capacity_auto_resume.py
 utility-deferred	session_notice.py
 utility-deferred	session_tidy.py
 utility-deferred	session_tidy_clear.py
