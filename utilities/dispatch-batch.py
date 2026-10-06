@@ -2154,12 +2154,14 @@ def node_launch_command(*, route_path, leg, parent, prompt_text, reviewed_eviden
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--route", type=Path, required=True)
+    parser.add_argument("--route", type=Path, help="default: this owner's route (AGENT_OWNER_ROUTE_FILE)")
     parser.add_argument("--parallel-group")
     parser.add_argument("--replica-group")
     parser.add_argument("--action", choices=("dry-run", "start"), default="dry-run")
-    parser.add_argument("--slug-prefix", required=True)
-    parser.add_argument("--parent", required=True)
+    parser.add_argument("--start", dest="action", action="store_const", const="start",
+                        help="same as --action start")
+    parser.add_argument("--slug-prefix", help="default: the parent")
+    parser.add_argument("--parent", help="default: this session's own name (AGENT_DISPATCH_SELF_SLUG)")
     parser.add_argument("--qa", default=None)
     parser.add_argument("--jobs", type=Path)
     parser.add_argument("--log-dir", type=Path)
@@ -2194,6 +2196,12 @@ def main(argv: list[str] | None = None) -> int:
     from review_input import add_arguments, resolve_input, is_review_node
     add_arguments(parser)
     args = parser.parse_args(argv)
+    if args.route is None:
+        if not os.environ.get("AGENT_OWNER_ROUTE_FILE"):
+            parser.error("--route is required outside a route owner (AGENT_OWNER_ROUTE_FILE is unset)")
+        args.route = Path(os.environ["AGENT_OWNER_ROUTE_FILE"])
+    args.parent = args.parent or os.environ.get("AGENT_DISPATCH_SELF_SLUG") or ""
+    args.slug_prefix = args.slug_prefix or args.parent
     if args.parallel_group and args.replica_group and args.parallel_group != args.replica_group:
         parser.error("--parallel-group and --replica-group aliases must match")
     args.parallel_group = args.parallel_group or args.replica_group

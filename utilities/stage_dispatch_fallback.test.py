@@ -1239,6 +1239,33 @@ class FallbackTest(unittest.TestCase):
    F.legacy_parent_generation_conflict(self.jobs,legacy,"att-parent-new"),
    "attempt-identity-parent-generation-conflict",
   )
+ def test_an_owner_names_only_the_node_and_the_action(self):
+  path=self.route(same_status="supported")
+  explicit=self.run_chain(path)
+  self.seed_predecessor_markers(path,"plan")
+  cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--node","plan","--capability-mode","dev",
+       "--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--action","dry-run"]
+  clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
+  env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
+       "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),
+       "AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent","AGENT_OWNER_ROUTE_FILE":str(path)}
+  implied=subprocess.run(cmd,text=True,capture_output=True,env=env)
+  self.assertEqual((implied.returncode,explicit.returncode),(0,0),implied.stdout+implied.stderr)
+  self.assertIn("selected_hop=",implied.stdout)
+  self.assertEqual([l for l in implied.stdout.splitlines() if l.startswith("selected_hop=")],
+                   [l for l in explicit.stdout.splitlines() if l.startswith("selected_hop=")])
+  env.pop("AGENT_OWNER_ROUTE_FILE")
+  outside=subprocess.run(cmd,text=True,capture_output=True,env=env)
+  self.assertEqual(outside.returncode,2); self.assertIn("AGENT_OWNER_ROUTE_FILE",outside.stderr)
+ def test_a_group_member_start_is_its_group_batch(self):
+  seen=[]
+  args=SimpleNamespace(route=Path("/r/route.json"),node="test-a",parent="owner",qa="standard",jobs=None,
+                       prompt_file=None,reviewed_evidence=None)
+  with mock.patch.object(F.subprocess,"run",side_effect=lambda argv,check: seen.append(argv) or SimpleNamespace(returncode=0)), \
+       contextlib.redirect_stderr(io.StringIO()):
+   self.assertEqual(F.start_parallel_group(args,"verify-pair"),0)
+  self.assertEqual(seen[0][1:],[str(ROOT/"utilities/dispatch-batch.py"),"--route","/r/route.json","--parallel-group","verify-pair",
+                                "--action","start","--parent","owner","--qa","standard"])
  def test_parallel_register_is_rejected_without_creating_a_row(self):
   path=self.route(); first=self.run_register(path); second=self.run_register(path)
   self.assertEqual(first.returncode,65,first.stdout+first.stderr)

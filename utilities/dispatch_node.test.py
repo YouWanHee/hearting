@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """SD-66 fix-forward: dispatch-node.py record -> wrapper-argument binding."""
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -676,6 +678,27 @@ class MainMaterializationTest(unittest.TestCase):
                     N.main()
         self.assertEqual(ctx.exception.code, 65)
         self.assertEqual(run.call_count, 1)
+
+    def test_an_owner_route_and_start_need_no_route_or_slug_argument(self):
+        first = make_node()
+        first["replica_group"] = "execute"
+        second = {**make_node(), "id": "execute-replica", "replica_group": "execute"}
+        route = make_route(first)
+        route["nodes"].append(second)
+        with tempfile.TemporaryDirectory() as td:
+            route_path = Path(td) / "route.json"
+            route_path.write_text(json.dumps(route))
+            out = io.StringIO()
+            argv = ["dispatch-node.py", "--node", "execute", "--adapter", "claude", "--start"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.dict(N.os.environ, {"AGENT_OWNER_ROUTE_FILE": str(route_path)}, clear=True), \
+                 mock.patch.object(N.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                 contextlib.redirect_stdout(out):
+                with self.assertRaises(SystemExit) as ctx:
+                    N.main()
+        # The route came from the owner's environment and --start meant start.
+        self.assertEqual(ctx.exception.code, 65)
+        self.assertIn("reason=parallel-group-batch-required", out.getvalue())
 
     def test_replica_register_is_forbidden_even_with_batch_token(self):
         node = make_node()

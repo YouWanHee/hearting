@@ -1639,11 +1639,33 @@ def capacity_retry(
     return "descend", retry_fields, retry_output
 
 
+def start_parallel_group(args: argparse.Namespace, group: str) -> int:
+    """A member of a sealed parallel group starts its whole group in one batch.
+
+    The batch is the group's one admission transaction, so starting a member
+    is that batch start; a member whose group already started gets the
+    batch's idempotent receipt for the legs that exist.
+    """
+    argv = [sys.executable, str(ROOT / "utilities/dispatch-batch.py"), "--route", str(args.route),
+            "--parallel-group", group, "--action", "start", "--parent", args.parent]
+    if args.qa:
+        argv += ["--qa", args.qa]
+    if args.jobs:
+        argv += ["--jobs", str(args.jobs)]
+    if args.prompt_file is not None:
+        argv += ["--prompt-text", args.prompt_file.read_text(encoding="utf-8")]
+    if args.reviewed_evidence:
+        argv += ["--reviewed-evidence", str(args.reviewed_evidence)]
+    print(f"notice: node {args.node} belongs to parallel group {group}; "
+          "starting the group in one dispatch-batch call.", file=sys.stderr, flush=True)
+    return subprocess.run(argv, check=False).returncode
+
+
 def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--route", type=Path, required=True)
+    p.add_argument("--route", type=Path, help="default: this owner's route (AGENT_OWNER_ROUTE_FILE)")
     p.add_argument("--node", required=True)
-    p.add_argument("--slug", required=True)
+    p.add_argument("--slug", help="default: <parent>-<node>")
     p.add_argument("--parent")
     p.add_argument("--capability-mode")
     p.add_argument("--worker-mode")
@@ -1672,7 +1694,12 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     action.add_argument("--dry-run", dest="action", action="store_const", const="dry-run")
     action.add_argument("--register", dest="action", action="store_const", const="register")
     action.add_argument("--start", dest="action", action="store_const", const="start")
+    action.add_argument("--action", dest="action", choices=("dry-run", "register", "start"))
     args = p.parse_args()
+    if args.route is None:
+        if not os.environ.get("AGENT_OWNER_ROUTE_FILE"):
+            p.error("--route is required outside a route owner (AGENT_OWNER_ROUTE_FILE is unset)")
+        args.route = Path(os.environ["AGENT_OWNER_ROUTE_FILE"])
     # The wrappers run with cwd=ROOT, so a relative prompt path would be read
     # against the harness tree instead of the caller's directory (home-os,
     # 2026-09-27: three launches fell through to "inline, runtime-unavailable").
@@ -1695,6 +1722,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     args.parent = args.parent or self_slug
     if not args.parent:
         return fail("parent-identity-missing", 73, child_spawned="0")
+    args.slug = args.slug or f"{args.parent}-{args.node}"
 
     try:
         args.route = args.route.resolve()
@@ -1755,7 +1783,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     if args.broker_root is not None or args.broker_timeout is not None:
         return fail("retired-broker-option", 64, child_spawned="0")
     group = node.get("parallel_group") or node.get("replica_group")
-    if group and args.action in {"register", "start"}:
+    if group and args.action == "start":
+        return start_parallel_group(args, str(group))
+    if group and args.action == "register":
         return fail(
             "parallel-group-batch-required",
             65,
