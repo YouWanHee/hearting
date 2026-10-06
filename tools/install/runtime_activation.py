@@ -3628,7 +3628,7 @@ def _bundle_process_holders(bundles: Path, projections: Optional[dict] = None) -
 # for any runtime and in any version: a surface one runtime has retired
 # (Claude's `agent-modes`) keeps its links on disk. An entry sits directly in
 # one of these or one level down (`agent-modes/<group>/<mode>.md`).
-_DISCOVERY_DIRECTORIES = ("agent-modes", "agents", "commands", "hooks", "plugins", "skills")
+_DISCOVERY_DIRECTORIES = ("agent-modes", "agents", "commands", "hooks", "plugins", "skills", "tui")
 
 
 # What `_build_bundle` puts in a bundle directory. Anything beside these was
