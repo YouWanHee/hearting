@@ -1027,6 +1027,55 @@ class DerivedAccessTest(unittest.TestCase):
                     self.assertTrue(row["why"])
         rows = EA.derive_task_access({"work_request": {"text": f"범위: {X}/out에 결과 저장"}}, context)
         self.assertIn("writes:저장", rows.justification[0][1])
+    def handed(self, route, roots):
+        import route_authority as RA
+        given = self.root / "given.json"
+        given.write_text(json.dumps({"schema_version": 1, "writable_roots": [str(r) for r in roots],
+                                     "read_roots": [], "network": {"required": False}}), encoding="utf-8")
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=Path(EA.__file__).resolve().parents[1])
+        request = load_request(given, context=context)
+        RA.record_access_change(route, request=EA.normalized_request(request), request_sha256=request.request_sha256,
+                                by={"harness": "opencode", "session_id": "oc-sid"}, source="unattributed")
+        return request
+
+    def test_the_request_the_parent_handed_over_is_the_explicit_one_for_the_next_owner(self):
+        route = self.route(self.task())
+        first = prepare_task_request(route, self.jobs)          # derived at the first owner launch
+        import route_authority as RA
+        (derived,) = RA.access_changes(route)
+        self.assertEqual(derived["source"], "derived")
+        self.assertEqual(derived["request_sha256"], load_request(first, context=AccessContext.build(
+            worktree=self.worktree, artifact_root=self.artifact, dispatch_state_root=self.state,
+            agent_home=Path(EA.__file__).resolve().parents[1])).request_sha256)
+        request = self.handed(route, [self.elsewhere])
+        given = prepare_task_request(route, self.jobs)
+        self.assertNotEqual(given, first)
+        self.assertEqual(json.loads(given.read_text(encoding="utf-8"))["writable_roots"], [str(self.elsewhere)])
+        self.assertEqual(prepare_task_request(route, self.jobs, node="frame"), given)
+        # A lab owner still adds its run storage, in a file of that request's own.
+        run_root = self.root / "runs"
+        lab = self.route(self.task(), capability="autopilot-lab")
+        self.handed(lab, [self.elsewhere])
+        with mock.patch.object(EA, "_lab_run_root", return_value=run_root):
+            merged = prepare_task_request(lab, self.jobs)
+        self.assertEqual(merged.parent.parent.name, "access")
+        self.assertEqual(json.loads(merged.read_text(encoding="utf-8"))["writable_roots"],
+                         sorted([str(self.elsewhere), str(run_root)]))
+        # An explicit file in the caller's environment still wins, unless the caller asks for the route's own.
+        manual = self.root / "manual.json"
+        manual.write_text(json.dumps({"schema_version": 1, "writable_roots": [], "read_roots": [],
+                                      "network": {"required": False}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(manual)}):
+            self.assertIsNone(prepare_task_request(route, self.jobs))
+            self.assertEqual(prepare_task_request(route, self.jobs, environment=False), given)
+        self.assertEqual(request.writable_roots, (self.elsewhere,))
+
+    def test_a_frame_s_derivation_adds_no_access_row(self):
+        import route_authority as RA
+        route = self.route(self.task())
+        prepare_task_request(route, self.jobs, node="frame")
+        self.assertEqual(RA.access_changes(route), [])
 
     def test_the_task_text_reader(self):
         rows = EA._task_paths(

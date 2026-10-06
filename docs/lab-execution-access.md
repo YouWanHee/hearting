@@ -55,8 +55,13 @@ export AGENT_DISPATCH_EXECUTION_ACCESS_FILE=/absolute/path/lab-access.json
 
 Lab 준비는 `load_request`로 이 파일을 검증하고 inventory의 `run_root`만 더한 사본을
 기존 dispatch state의 route별 `execution-access` 폴더에 저장한다. 원본 파일은 수정하지
-않는다. 시작·재개에 같은 입력을 유지하면 같은 준비 파일을 재사용한다. 승인 입력이
-바뀌면 기존 route binding 검사가 변경을 알린다. 명시적 JSON은 preview ROOTS 입력보다
+않는다. 시작·재개에 같은 입력을 유지하면 같은 준비 파일을 재사용한다.
+
+열린 route에서 부모가 요청을 바꾸려면 새 파일을 같은 환경 변수로 주고 그 route의
+`start`(또는 `correct`)를 실행한다. route의 현 부모일 때만 route 옆 변경 기록에 `access`
+1행이 남고(누가 줬는지와 출처 포함, 첫 도출 요청은 `derived` 행), 다음 owner·교체 owner와
+그 자식은 가장 최근 행의 요청으로 시작한다. lab owner는 그 요청에 `run_root`를 더한 별도
+준비 파일을 쓴다. 다른 세션의 요청은 기록되지 않는다. 명시적 JSON은 preview ROOTS 입력보다
 우선한다. 낮은 수준의 직접 dispatch에서도 기존 `--execution-access-file <JSON>`을
 쓸 수 있다. 이 직접 경로에서는 필요한 모든 root를 해당 JSON에 명시한다.
 

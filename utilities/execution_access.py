@@ -738,22 +738,55 @@ def _prepared_binding(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _given_access(route: Mapping[str, object], jobs: str | Path) -> Path | None:
+    """The request the route's parent handed its next owner (`route_authority.access_in_force`),
+    as a write-once file named by its digest; None while the first prepared request stands."""
+
+    import route_authority
+
+    change = route_authority.access_in_force(route)
+    identity = _route_identity(route)
+    if change is None or change.get("source") == "derived" or identity is None:
+        return None
+    state_root = Path(jobs).expanduser().resolve(strict=False).parent
+    path = (state_root / "execution-access" / "routes" / identity[0] / "access"
+            / change["request_sha256"][:16] / "given.json")
+    data = _canonical_json_bytes(change["request"])
+    try:
+        existing = _read_bounded_regular_file(path, MAX_REQUEST_BYTES) if path.exists() else None
+    except OSError as exc:
+        raise ExecutionAccessError("execution-access-cache-conflict", "given request is unreadable") from exc
+    if existing is None:
+        _atomic_write(path, data)
+    elif existing != data:
+        raise ExecutionAccessError("execution-access-cache-conflict", "given request changed after it was recorded")
+    return path
+
+
 def prepare_task_request(
-    route: Mapping[str, object], jobs: str | Path, *, node: str = "owner"
+    route: Mapping[str, object], jobs: str | Path, *, node: str = "owner", environment: bool = True,
 ) -> Path | None:
     """Prepare named targets, lab run storage and the access the task text names
     (`derive_task_access`) with the existing request schema.
 
     An explicit request file wins over derivation; a lab owner still adds its run
-    storage to it. Each route node keeps its own prepared file, and a node derives
-    once, at its first preparation: a later start or resume reuses that result, and
-    a node prepared before derivation existed keeps deriving nothing."""
+    storage to it. Without one in the environment (or with `environment=False`), the
+    request the route's parent last handed its next owner is that explicit request
+    (`route_authority.access_in_force`). Each route node keeps its own prepared file, and a
+    node derives once, at its first preparation: a later start or resume reuses that
+    result, and a node prepared before derivation existed keeps deriving nothing."""
 
     # The explicit typed request keeps precedence over preview-table input.
-    explicit = request_path(None)
     lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
+    explicit = request_path(None) if environment else None
+    given = _given_access(route, jobs) if explicit is None else None
+    if given is not None and not lab_owner:
+        return given
+    explicit = explicit if given is None else given
     targets = None if lab_owner and explicit is not None else resolve_task_targets(route)
     run_root = _lab_run_root(route, node)
+    if given is not None and run_root is None:
+        return given
     if targets is None and run_root is None and (
             explicit is not None or _route_identity(route) is None
             or not re.fullmatch(r"[A-Za-z0-9._-]+", node)):
@@ -766,6 +799,8 @@ def prepare_task_request(
         raise ExecutionAccessError("execution-access-route-invalid", "route hash is missing or invalid")
     state_root = Path(jobs).expanduser().resolve(strict=False).parent
     directory = state_root / "execution-access" / "routes" / route_id
+    if given is not None:
+        directory = given.parent
     if node != "owner" and re.fullmatch(r"[A-Za-z0-9._-]+", node):
         directory = directory / "nodes" / node
     request_path_value = directory / "request.json"
@@ -860,6 +895,16 @@ def prepare_task_request(
         return request_path_value
     _atomic_write(request_path_value, request_bytes)
     _atomic_write(binding_path, binding_bytes)
+    if node == "owner" and derived is not None and derived.record.get("granted"):
+        # The same record a parent's later request joins, with where these roots came from.
+        import route_authority
+        try:
+            harness, session = route_authority.caller_identity()
+            route_authority.record_access_change(
+                route, request=normalized_request(validated), request_sha256=request_digest,
+                by={"harness": harness, "session_id": session}, source="derived")
+        except (OSError, ValueError):
+            pass   # the prepared binding keeps the evidence either way
     return request_path_value
 
 
@@ -1170,6 +1215,20 @@ def load_request(path: str | Path, *, context: AccessContext) -> ExecutionAccess
     source = Path(path)
     data = _read_request(source)
     return _validate_request(data, source=source, context=context)
+
+
+def normalized_request(request: ExecutionAccessRequest) -> dict:
+    """The canonical request a validated one digests to (`request_sha256`)."""
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "writable_roots": [str(path) for path in request.writable_roots],
+        "read_roots": [str(path) for path in request.read_roots],
+        "network": {"required": request.network_required, "reason": request.network_reason,
+                    "hosts": list(request.network_hosts)},
+        "enforcement_required": request.enforcement_required,
+        "justification": dict(request.justification),
+    }
 
 
 def _validate_request(

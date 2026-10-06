@@ -1374,6 +1374,75 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual((refused.exception.reason, refused.exception.detail),
                          ('replacement-input-tuple-mismatch', 'harness'))
 
+    def test_a_replacement_owner_runs_with_the_access_request_its_parent_handed_over(self):
+        # BC rt-839dbd48: the parent handed a new request and answered; the replacement replayed the first one.
+        import execution_access as EA
+        self._blocked_owner()
+        self._answer()
+        access = {'request_path': str(self.root / 'given.json'), 'request_sha256': 'b' * 64,
+                  'source': 'unattributed', 'at': '2026-10-07T00:00:00Z'}
+        with mock.patch.object(R, '_access_in_force', return_value=access):
+            result, commands = self._launch()
+        record = result['record']
+        self.assertEqual(record['execution_access'], access)
+        (command,) = commands
+        self.assertEqual(command.count('--execution-access-file'), 1)
+        self.assertEqual(command[command.index('--execution-access-file') + 1], access['request_path'])
+        def grant(sha):
+            return EA.ExecutionAccessGrant(request_sha256=sha, writable_roots=(), read_roots=(Path('/data'),),
+                                           additional_writable_roots=(), absorbed_writable_roots=(),
+                                           network='not-requested', file_enforcement='os-sandbox',
+                                           network_enforcement='os-sandbox', unmet=())
+        self.args.execution_access_grant = grant('b' * 64)
+        successor = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
+        lines = self.jobs.read_text().splitlines()
+        self.assertEqual(R.admission(self.jobs, lines, successor)['execution_access'], access)
+        # A replacement that still carries the first request is not the claimed one.
+        sealed = json.loads((R._directory(self.jobs) / 'inputs' / (successor['attempt_id'] + '.json')).read_text())
+        sealed['applied_permissions']['execution_access']['request_sha256'] = 'c' * 64
+        with mock.patch.object(R, 'launch_input', side_effect=lambda jobs, aid, meta: sealed
+                               if aid == successor['attempt_id'] else json.loads(
+                                   (R._directory(self.jobs) / 'inputs' / (aid + '.json')).read_text())):
+            with self.assertRaises(D.DispatchContractError) as refused:
+                R.admission(self.jobs, lines, successor)
+        self.assertEqual((refused.exception.reason, refused.exception.detail),
+                         ('replacement-input-tuple-mismatch', 'execution_access'))
+
+    def test_the_access_in_force_is_prepared_from_the_route_s_record(self):
+        import execution_access as EA
+        import route_authority as RA
+        route = {'route_id': 'rt-access', 'route_hash': 'sha256:' + 'e' * 64, 'artifact_root': str(self.root),
+                 'cwd': str(self.root / 'wt'), 'capability': 'autopilot-code', 'work_request': {'text': 'task'}}
+        (self.root / 'wt').mkdir()
+        data = self.root / 'data'
+        data.mkdir()
+        self.assertIsNone(R._access_in_force(self.jobs, route))
+        given = self.root / 'given-input.json'
+        given.write_text(json.dumps({'schema_version': 1, 'writable_roots': [], 'read_roots': [str(data)],
+                                     'network': {'required': False}}))
+        context = EA.AccessContext.build(worktree=route['cwd'], artifact_root=self.root,
+                                         dispatch_state_root=self.jobs.parent, agent_home=R.ROOT)
+        request = EA.load_request(given, context=context)
+        RA.record_access_change(route, request=EA.normalized_request(request), request_sha256=request.request_sha256,
+                                by={}, source='derived')
+        self.assertIsNone(R._access_in_force(self.jobs, route))     # a derived row is the first request itself
+        RA.record_access_change(route, request=EA.normalized_request(request), request_sha256='f' * 64,
+                                by={}, source='unattributed')
+        self.assertIsNone(R._access_in_force(self.jobs, route))     # a row that does not digest to its request
+        self.assertIsNone(RA.record_access_change(route, request=EA.normalized_request(request),
+                                                  request_sha256=request.request_sha256, by={},
+                                                  source='unattributed'))  # the same request is already in force
+        (self.root / 'more').mkdir()
+        given.write_text(json.dumps({'schema_version': 1, 'writable_roots': [], 'network': {'required': False},
+                                     'read_roots': [str(data), str(self.root / 'more')]}))
+        handed = EA.load_request(given, context=context)
+        RA.record_access_change(route, request=EA.normalized_request(handed), request_sha256=handed.request_sha256,
+                                by={}, source='unattributed')
+        access = R._access_in_force(self.jobs, route)
+        self.assertEqual((access['request_sha256'], access['source']), (handed.request_sha256, 'unattributed'))
+        self.assertEqual(json.loads(Path(access['request_path']).read_text())['read_roots'],
+                         [str(data), str(self.root / 'more')])
+
     def test_a_pin_moved_after_the_claim_leaves_that_replacement_on_its_harness(self):
         self._blocked_owner()
         self._answer()
