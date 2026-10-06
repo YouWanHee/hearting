@@ -658,7 +658,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
                 self.assertEqual("deny", with_read["agent"]["build"]["permission"]["edit"][pattern])
         self.assertEqual("allow", with_read["agent"]["build"]["permission"]["external_directory"][str(readonly)])
         self.assertEqual("deny", with_read["agent"]["build"]["permission"]["edit"][str(readonly)])
-        self.assertEqual("deny", with_read["agent"]["build"]["permission"]["external_directory"]["*"])
+        self.assertEqual("deny", with_read["permission"]["external_directory"]["*"])
 
     def test_receipt_matches_projection_and_is_absent_without_request(self) -> None:
         self.assertEqual("", receipt_fragment(None))
