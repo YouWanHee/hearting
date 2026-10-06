@@ -69,6 +69,9 @@ Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallb
 --node <node> --start`: route, slug, parent and harness come from the owner's
 current route and environment, and a member of a sealed parallel group starts
 its whole group in one batch. Dispatch depth 3 is forbidden.
+
+Message another session only with `hearting run peer-steward prompt
+<name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.
 <!-- END generated from core/fragments/bootstrap-dispatch.md -->
 
 Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the

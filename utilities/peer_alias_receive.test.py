@@ -74,6 +74,18 @@ class AliasReceive(unittest.TestCase):
         self.assertEqual(record["to"], self.recipient)
         self.assertNotIn("검증할", json.dumps(record, ensure_ascii=False))
 
+    def test_whitespace_a_runtime_adds_around_the_prompt_keeps_the_attribution(self):
+        # OpenCode delivers the typed prompt with a trailing space; every OpenCode receipt was
+        # unattributed (2026-10-06: 0 of 299) until the arrival was compared without it.
+        text, ref = self.prepare()
+        for arrived in (text + " ", text + "\n", "\n" + text + "  \n"):
+            with self.subTest(arrived=arrived[-3:]):
+                self.assertEqual(self.parse(arrived), self.sender["session_id"])
+                trailer = pm.parse_peer_trailer(arrived, self.recipient, include_ref=True)
+                self.assertEqual(trailer["transfer_ref"], ref)
+        self.assertIsNone(self.parse(text + " 변조"))
+        self.assertIsNone(self.parse(text.replace("실제 본문", "실제  본문")))
+
     def test_collision_same_name_and_swapped_refs(self):
         # A real 8-bit collision, not a mock alias resolver.
         tag = pm.peer_alias("codex", self.sender["session_id"])
