@@ -9433,6 +9433,44 @@ def prepare_isolated_worktree(cwd, slug):
     return {"state": "created", "path": str(path), "cwd": inside(path), "branch": slug, "base": base}
 
 
+ROUTE_ID_FORM = re.compile(r"rt-[0-9a-f]{16}")
+
+
+def resolve_route_argument(value, jobs=None):
+    """`--route` as given: a route file, or a route ID (`rt-<16 hex>`, the form `resume_command`
+    prints) looked up as the canonical record under the cwd's artifact root, then under
+    `AGENT_ARTIFACT_ROOT`, then by the file the jobs registry or a session's route-chain ledger
+    names for it. An ID that names no route file is refused (`route-id-unresolved:<id>`)."""
+    text = str(value)
+    if not ROUTE_ID_FORM.fullmatch(text) or Path(text).is_file():
+        return Path(text)
+    roots = [os.environ.get("AGENT_ARTIFACT_ROOT")]
+    try:
+        roots.insert(0, _compose_artifact_root(os.getcwd()))
+    except ValueError:
+        pass
+    named = [canonical_route_path(root, text) for root in roots if root]
+    try:
+        for line in Path(jobs or _compose_default_jobs()).read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if len(fields) == 6:
+                meta = parse_registry_metadata(fields[5])
+                for key in ("owner_route", "route"):
+                    if meta.get(f"{key}_id") == text and meta.get(f"{key}_file"):
+                        named.append(meta[f"{key}_file"])
+    except OSError:
+        pass
+    rc = _route_chain_module()
+    if rc is not None:
+        anchor = rc.writer_identity() or rc.composing_anchor(text)
+        named += [line["route_file"] for line in (rc.read_tail(*anchor) if anchor else [])
+                  if line.get("route_id") == text]
+    for path in named:
+        if Path(path).is_file():
+            return Path(path)
+    raise ValueError(f"route-id-unresolved:{text} (pass the route file, or run from the route's checkout)")
+
+
 def caller_open_route(cwd):
     """`(route_file | None, source, rows)`: the open route a bare `start` continues.
 
@@ -10166,6 +10204,7 @@ def main():
                 return 2
             a.route=Path(found)
             print(f"route_default={found} source={source}",file=sys.stderr)
+        a.route=resolve_route_argument(a.route,a.jobs)
         route=verify_route(json.loads(a.route.read_text()))
         jobs=Path(a.jobs or _compose_default_jobs())
         pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None

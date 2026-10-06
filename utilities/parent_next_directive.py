@@ -28,6 +28,7 @@ bounded wait only costs time.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -119,10 +120,22 @@ def registry_args(jobs) -> list[str]:
     return ["--jobs", str(jobs)]
 
 
+def route_reference(route_file) -> str:
+    """A canonical route record (`.runtime/routes/rt-<16 hex>.json`) by its ID, any other by its path.
+
+    `start --route <id>` finds the record again from the route's checkout, the registry or the
+    session's route-chain ledger (`capability-route.resolve_route_argument`)."""
+    path = Path(route_file)
+    if (re.fullmatch(r"rt-[0-9a-f]{16}\.json", path.name) and path.parent.name == "routes"
+            and path.parent.parent.name == ".runtime"):
+        return path.stem
+    return str(route_file)
+
+
 def resume_command(route_file, jobs=None, *, agent_home) -> str:
-    """The command that continues one sealed route; its route file is the whole handle."""
+    """The command that continues one sealed route; the route is its whole handle."""
     return shlex.join([sys.executable, entrypoint(agent_home, "utilities/capability-route.py"),
-                       "start", "--route", str(route_file), *registry_args(jobs)])
+                       "start", "--route", route_reference(route_file), *registry_args(jobs)])
 
 
 def correction_command(attempt_id, jobs=None, *, agent_home) -> str:
