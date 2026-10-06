@@ -324,9 +324,23 @@ HANDOFF_RE = re.compile(
 )
 
 
+_PASS_NOTE_RE = re.compile(r"none\s*\((?P<note>.+)\)\s*")
+
+
+def pass_blocker_note(blocker) -> str | None:
+    """What a PASS envelope's `blocker: none (...)` adds: "" for a bare `none`, the
+    parenthesized note for `none (...)`, None for any other blocker text. The note
+    is kept as a remark; it never changes the verdict (RA-8)."""
+    if blocker == "none":
+        return ""
+    match = _PASS_NOTE_RE.fullmatch(blocker) if isinstance(blocker, str) else None
+    return match.group("note").strip() if match else None
+
+
 def pass_blocker_violation(verdict, blocker) -> str | None:
-    """A PASS envelope carries exactly `blocker: none`; anything else breaks the contract."""
-    if verdict == "PASS" and blocker != "none":
+    """A PASS envelope's blocker is `none`, optionally with a note in parentheses;
+    any other blocker text breaks the contract."""
+    if verdict == "PASS" and pass_blocker_note(blocker) is None:
         return "pass-blocker-not-none"
     return None
 
