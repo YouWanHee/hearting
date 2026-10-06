@@ -1283,6 +1283,11 @@ def _capacity_hold(jobs, source, model=None):
     if hold:
         return hold
     _, route = _route(jobs, source.get('attempt_id'), source)
+    from model_profile import sealed_pin_harness
+    if sealed_pin_harness(route, worker_type=source.get('worker_type')) == harness:
+        # A sealed pin moves only for a real usage limit (harness_hold above), as at its
+        # first launch and on the stage path; the soft allocation gate does not move it.
+        return None
     allocation = route.get('dispatch_allocation') or {}
     if allocation.get('strategy') not in {'balanced', 'capacity-aware'}:
         return None  # legacy routes keep their existing hard-quota contract
@@ -1315,9 +1320,12 @@ def _capacity_hold(jobs, source, model=None):
     )
     if selected == harness:
         return None  # original all-gated recovery, quality bands and relief remain intact
-    return {'label': 'allocation-usage-gate', 'until_epoch': None,
+    source_of_score = report['sources'].get(harness)
+    return {'label': 'allocation-usage-gate',
+            'until_epoch': capacity.gate_release_epoch(
+                harness, source_of_score, usage_gate_used_percent=gate),
             'headroom': score, 'usage_gate_used_percent': gate,
-            'capacity_source': report['sources'].get(harness)}
+            'capacity_source': source_of_score}
 
 
 def _launcher_budget(command, source):

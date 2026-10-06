@@ -732,6 +732,20 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn('from the session that owns the route',result['next_step'])
         self.assertEqual(len(self.calls),launches)
 
+    def test_a_soft_allocation_gate_says_exactly_when_it_lifts(self):
+        gate={'state':'needs-attention','reason':'replacement-capacity-wait','source_attempt_id':'att-owner',
+              'node':'__owner__','harness':'codex','usage_state':'allocation-usage-gate',
+              'headroom':10.0,'usage_gate_used_percent':85,'capacity_source':'live'}
+        unknown=W._capacity_pause({},gate,'resume')
+        self.assertEqual((unknown['state'],unknown['reason']),('waiting-capacity','owner-capacity-wait'))
+        self.assertNotIn('retry_at',unknown)                  # no reset time is invented
+        self.assertIn('not at a usage limit',unknown['next_step'])
+        self.assertIn('after codex usage drops below the 85% gate',unknown['next_step'])
+        known=W._capacity_pause({},{**gate,'retry_at':'2026-10-09T22:58:00Z'},'resume')
+        self.assertEqual(known['retry_at'],'2026-10-09T22:58:00Z')
+        self.assertIn('After retry_at, when the last usage window at the gate resets',known['next_step'])
+        self.assertIn('from the session that owns the route',known['next_step'])
+
     def test_frame_replacement_held_by_a_usage_limit_waits_instead_of_failing(self):
         self.start();self.ready=True
         frame=W.attempt_id(self.route,'frame')

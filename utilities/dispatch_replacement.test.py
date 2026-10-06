@@ -433,6 +433,47 @@ class ReplacementTest(unittest.TestCase):
             with mock.patch.object(capacity,'capacity_report',return_value=report(1,80)):
                 self.assertIsNone(R._capacity_hold(self.jobs,source))
 
+    def test_a_sealed_pin_moves_only_for_a_real_limit_and_an_unpinned_gate_says_when_it_lifts(self):
+        # BC rt-96bab699 (`--pin owner=codex --pin worker=codex`): an owner replacement after
+        # `correct` was held by the soft allocation gate, although the route's first launch
+        # started on the pin with the same headroom.
+        capacity=R._capacity_reader()
+        policy={'primary':['claude','codex'],'relief':[],'last_resort':[],'promote_relief_below':0}
+        self.route['dispatch_allocation']={'strategy':'balanced','window':30,'usage_gate_used_percent':85,
+                                          'harness_order':['claude','codex','opencode']}
+        self.route['owner_harness_policy']=policy
+        self.route['nodes']=[{'id':'test','harness_policy':policy}]
+        owner={**self.meta,'worker_type':'owner','route_node':'','harness':'codex'}
+        stage={**self.meta,'worker_type':'stage','route_node':'test','dispatch_depth':'2','harness':'codex'}
+        report={'scores':{'claude':80,'codex':10,'opencode':None},
+                'sources':{'claude':'taps','codex':'live','opencode':'unknown'}}
+        limited={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch.object(R,'_capacity_reader',return_value=capacity), \
+             mock.patch('dispatch_capacity_evidence.usage_states',return_value=dict.fromkeys(['claude','codex','opencode'],'ok')), \
+             mock.patch.object(capacity,'capacity_report',return_value=report), \
+             mock.patch.object(capacity,'gate_release_epoch',return_value=None):
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None):
+                for source in (owner,stage):
+                    hold=R._capacity_hold(self.jobs,source)
+                    self.assertEqual((hold['label'],hold['until_epoch'],hold['usage_gate_used_percent']),
+                                     ('allocation-usage-gate',None,85))
+                    self.assertNotIn('retry_at',R._capacity_wait(self.jobs,'att-source',source))
+                self.route['selection_pins']={'owner':{'harness':'codex'},'worker':{'harness':'codex'}}
+                for source in (owner,stage):                 # the pin starts despite the soft gate
+                    self.assertIsNone(R._capacity_hold(self.jobs,source))
+                self.route['selection_pins']={'owner':{'harness':'claude'}}
+                self.assertEqual(R._capacity_hold(self.jobs,owner)['label'],'allocation-usage-gate')
+            self.route['selection_pins']={'owner':{'harness':'codex'},'worker':{'harness':'codex'}}
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=limited):
+                for source in (owner,stage):                 # a real usage limit still holds the pin
+                    self.assertEqual(R._capacity_hold(self.jobs,source),limited)
+            del self.route['selection_pins']
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
+                 mock.patch.object(capacity,'gate_release_epoch',return_value=4102444800) as release:
+                self.assertEqual(R._capacity_hold(self.jobs,owner)['until_epoch'],4102444800)
+                release.assert_called_with('codex','live',usage_gate_used_percent=85)
+                self.assertEqual(R._capacity_wait(self.jobs,'att-source',owner)['retry_at'],'2100-01-01T00:00:00Z')
+
     def test_an_io_failure_keeps_its_cause(self):
         with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
             result=R.advance(self.jobs,'att-source',run=mock.Mock())
