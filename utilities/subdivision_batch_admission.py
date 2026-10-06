@@ -313,6 +313,7 @@ def dispatch_command(
         "--subsession-index", str(session["index"]),
         "--subsession-count", str(session["count"]),
         "--subsession-mode", manifest["mode"],
+        "--subsession-purpose", session.get("subsession_purpose") or "planned",
         "--session-chain-id", manifest["chain_id"],
         "--phase-brief", session["phase_brief"],
         "--stage-authority", "0",

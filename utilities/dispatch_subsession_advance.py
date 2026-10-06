@@ -41,6 +41,7 @@ import dispatch_subsession_handoff as HANDOFF  # noqa: E402
 import dispatch_subsession_resume_record as RESUME_RECORD  # noqa: E402
 from stage_session_contract import (
     ADAPTERS,
+    GAP_RETRY_PURPOSE,
     load_manifest,
     sealed_pointer_bytes,
     slice_files_sha256,
@@ -474,9 +475,14 @@ def prove_serial_chain(
             "narrow_verify_sha256": slice_text_sha256(session["narrow_verify"]),
             "expected_round_trips": str(session["expected_round_trips"]),
             "harness": session["adapter"],
-            "subsession_purpose": session.get("subsession_purpose", "planned"),
         }
-        if any(meta.get(key) != value for key, value in expected.items()):
+        # dispatch-node.py records a planned declaration that follows a gate
+        # failure as the gap retry it is (OPERATIONS §5.10); a declared gap
+        # retry is never relabeled planned.
+        declared_purpose = session.get("subsession_purpose") or "planned"
+        purposes = {declared_purpose, GAP_RETRY_PURPOSE} if declared_purpose == "planned" else {declared_purpose}
+        if (any(meta.get(key) != value for key, value in expected.items())
+                or meta.get("subsession_purpose") not in purposes):
             return _proof_refusal("serial-chain-row-metadata-mismatch")
         by_index[index] = row
     return ProvenSerialChain(

@@ -314,6 +314,32 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
   prior.append((cols,meta))
  return prior
 
+def subsession_purpose(jobs, route, node, chain_id, declared):
+ """OPERATIONS §5.10: after a gate failure a sub-session is the gap retry of
+ the unfinished items, never retroactive planned subdivision.
+
+ Reads the full-stage census admission reads (sub-session rows are not in
+ it), cut at this chain's first row, so register, start and the supervisor's
+ later start of one chain all derive the same purpose. A declared gap retry
+ stays one; the runtime never relabels a session planned.
+ """
+ if declared!="planned":
+  return declared
+ try:
+  lines=Path(jobs).read_text(encoding="utf-8",errors="replace").splitlines()
+ except OSError:
+  return declared
+ for index,line in enumerate(lines):
+  fields=line.split("\t")
+  if len(fields)==6 and parse_registry_metadata(fields[5]).get("session_chain_id")==chain_id:
+   lines=lines[:index]
+   break
+ route_ids=({r["route_id"] for r in ROUTE.review_lineage_routes(route,node["id"])}
+            if node.get("kind")=="review-worker" else {route["route_id"]})
+ rows=[(cols[1],meta) for cols,meta in ROUTE.review_round_records(lines,route_ids,node["id"],jobs=jobs)]
+ worker_type=node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")
+ return "gap-retry" if REVIEW_ROUND_CAP.last_verdict_blocking(rows,worker_type) else declared
+
 # C-14: only the plan-check/impl-review/test QA anchors carry a review/correction
 # budget under CONVENTIONS §1.1. `execute`/`report` are outside that budget (P2-27
 # review): execute's own retry mechanism is HEAD-lineage based, not round-counted,
@@ -825,6 +851,8 @@ def main():
  except DispatchContractError as exc:
   print("check=failed"); print(f"reason={exc.reason}"); print("child_spawned=0")
   raise SystemExit(65)
+ if a.subsession_id:
+  a.subsession_purpose=subsession_purpose(registry.path,route,node,a.session_chain_id,a.subsession_purpose)
  prior_rounds=prior_round_attempts(registry.path,route["route_id"],node["id"],exclude_slug=a.slug,exclude_attempt=a.attempt_id,
                                   route=route if node.get("kind")=="review-worker" else None) if not a.subsession_id and original_task is None else []
  # SD-153/SD-154: `admit_round` (budget + rule-8 auto-revision) is the one
