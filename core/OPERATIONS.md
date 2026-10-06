@@ -1132,7 +1132,11 @@ its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
 Retirement refuses busy sessions, open forms, drafts, unknown process identity
 or an unconfirmed shell return; it has no retry, forced kill or forced close.
-Cards, notices and registered parent, route and worker identities are not moved.
+When the retire succeeds from the pane started beside the predecessor, the
+predecessor's open depth-1 routes pass to the successor, on any harness: it may
+`start` and `correct` them, and their stored completion records reach it
+(`retire ... handover=<n>`). Registry rows, their registered parent and worker
+identities stay as they are; cards and notices are not moved.
 
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused

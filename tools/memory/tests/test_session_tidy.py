@@ -35,6 +35,7 @@ from test_tidy_isolation import FIXTURES, FIXTURE_NOW, load_opencode_fixture  # 
 TIDY = ROOT / "utilities" / "session_tidy.py"
 DAY = 86400
 PANE = "test:pane-a"
+PANE_BESIDE = "test:pane-beside"
 
 
 class TidyCase(unittest.TestCase):
@@ -1880,6 +1881,46 @@ class SeatHandoverTest(TidyCase):
             self.assertEqual([(r["from"], r["sid"]) for r in self.handover.handover_rows(seat)], [("sid-A", "sid-B")])
             self.assertTrue(st.latest_session(seat)["sid"].startswith("sid-n"))     # the rows are not sessions
         self.assertEqual(self.effective(meta), "sid-B")
+
+    def retire(self, old, old_harness, new, new_harness, pane=PANE_BESIDE):
+        with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
+            return self.handover.record_retire_handover(old, old_harness, new, new_harness,
+                                                        env={"HERDR_PANE_ID": pane}, jobs=self.jobs)
+
+    def test_a_retire_from_the_pane_beside_hands_a_codex_route_to_a_claude_successor(self):
+        # RA-2 (decision 5f0f10): BC [62] codex -> Claude successor; the registry row stays as it is.
+        meta = self.row("att-1", parent="sid-A", harness="codex")
+        self.row("att-depth2", parent="sid-A", harness="codex", depth="2")
+        row = self.retire("sid-A", "codex", "sid-B", "claude")
+        self.assertEqual((row["from"], row["sid"], row["harness"], row["source"]), ("sid-A", "sid-B", "claude", "retire"))
+        self.assertEqual([(b["attempt"], b["parent"]) for b in row["bindings"]], [("att-1", "sid-A")])
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            self.assertEqual(self.handover.effective_parent(meta, self.jobs), "sid-B")
+            self.assertEqual(self.handover.effective_parent_harness(meta, self.jobs), "claude")
+            self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
+            self.assertEqual(self.handover.storage_recipients("sid-B", {"HERDR_PANE_ID": PANE_BESIDE}),
+                             [("sid-B", None), ("sid-A", frozenset({"att-1"}))])
+            self.assertEqual(self.handover.read_snapshot(self.seat(PANE_BESIDE).key)["from"],
+                             {"harness": "claude", "sid": "sid-B"})        # the seat now names the successor
+        self.assertEqual(meta["parent_sid"], "sid-A")
+        self.assertEqual(self.retire("sid-A", "codex", "sid-B", "claude"), row)    # repeated: the same row
+        self.assertIsNone(self.retire("sid-A", "codex", "sid-C", "claude", pane="test:pane-c"))  # A answers for nothing now
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_a_retire_after_a_clear_carries_the_whole_chain_across_panes(self):
+        meta = self.row("att-1")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")                                              # A -> B by /clear at PANE
+        self.retire("sid-B", "claude", "sid-C", "codex")                 # B -> C by retire at PANE_BESIDE
+        self.assertEqual(self.effective(meta), "sid-C")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            recipients = dict(self.handover.storage_recipients("sid-C", {"HERDR_PANE_ID": PANE_BESIDE}))
+        self.assertEqual(recipients["sid-A"], frozenset({"att-1"}))      # records stay under the registered parent
+
+    def test_a_retire_with_nothing_live_hands_nothing(self):
+        self.row("att-done", parent="sid-A", status="done")
+        self.assertIsNone(self.retire("sid-A", "codex", "sid-B", "claude"))
+        self.assertIsNone(self.retire("sid-A", "codex", "sid-A", "codex"))
 
     def test_a_broken_state_answers_the_registered_parent(self):
         meta = self.row("att-1")

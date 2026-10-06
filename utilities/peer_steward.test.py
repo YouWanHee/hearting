@@ -3578,6 +3578,28 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                 self.assertEqual((row["kind"], row["to"]["pane"], row["delivery"]["receipt"]),
                                  ("notice", "w1:pOld", "normal-exit"))
 
+    def test_a_retire_from_the_pane_started_beside_hands_the_routes_on(self):
+        # RA-2 (decision 5f0f10): beside -> ACK -> retire moves the parent role, across harnesses.
+        handed_line = "retired=true reason=normal-exit agent=codex name=old pane=w1:pOld"
+        def run(mark_beside, mark_sid):
+            peer_steward._mark_seat_successor("w1:pNew", mark_beside, "claude", mark_sid)
+            with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pNew"}), \
+                 mock.patch.object(peer_steward, "_current_session_identity", return_value=("new-sid", "claude")), \
+                 mock.patch("dispatch_seat_handover.record_retire_handover",
+                            return_value={"bindings": [{}, {}]}) as handed:
+                rc, line = self.retire(_RetireWorld(harness="codex"))
+            return rc, line, handed
+        rc, line, handed = run("w1:pOld", "new-sid")
+        self.assertEqual((rc, line), (0, handed_line + " handover=2"))
+        handed.assert_called_once_with("old-sid", "codex", "new-sid", "claude", env=mock.ANY)
+        self.assertFalse(peer_steward._seat_successor_path("w1:pNew").exists())      # used once
+        rc, line, handed = run("w1:pElse", "new-sid")                               # not beside this one
+        self.assertEqual((rc, line), (0, handed_line))
+        handed.assert_not_called()
+        rc, line, handed = run("w1:pOld", "someone-else")                           # another session's pane
+        self.assertEqual((rc, line), (0, handed_line + " handover=skipped:successor-unverified"))
+        handed.assert_not_called()
+
     def test_busy_form_draft_unknown_self_or_changed_target_receives_no_exit(self):
         cases = [(_RetireWorld(status=s), "agent-" + s) for s in ("working", "blocked", "unknown")]
         cases += [(_RetireWorld(screen=s), reason) for s, reason in

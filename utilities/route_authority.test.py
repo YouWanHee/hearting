@@ -51,7 +51,7 @@ class Case1ParentSessionTest(unittest.TestCase):
             jobs = Path(td) / "jobs.log"
             handover = {"from": "codex-sid", "sid": successor_sid, "harness": successor_harness,
                         "bindings": [HANDOVER.binding_of(jobs, self.OWNER)], "ts": 1}
-            with mock.patch.object(HANDOVER, "_seat_for_binding", return_value=object()), \
+            with mock.patch.object(HANDOVER, "_seats_for_binding", return_value=[object()]), \
                  mock.patch.object(HANDOVER, "handover_rows", return_value=[handover]):
                 return RA.owns(self.OWNER, successor_sid, jobs)
 
@@ -59,10 +59,10 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertTrue(RA.owns(self.OWNER, "codex-sid", None))
         self.assertFalse(RA.owns(self.OWNER, "", None))
 
-    def test_a_same_harness_successor_inherits_but_another_harness_does_not(self):
+    def test_a_recorded_successor_inherits_on_any_harness(self):
+        # RA-2 (stage 2): a recorded handover row moves the parent role across harnesses.
         self.assertTrue(self._owns_after("codex-sid-after-clear", "codex"))
-        # Today: the handover row is ignored when the harness differs (RA-2 changes this).
-        self.assertFalse(self._owns_after("claude-sid", "claude"))
+        self.assertTrue(self._owns_after("claude-sid", "claude"))
 
     def test_a_non_owner_cannot_start_the_replacement_owner(self):
         with self.assertRaises(DC.DispatchContractError) as refused:
