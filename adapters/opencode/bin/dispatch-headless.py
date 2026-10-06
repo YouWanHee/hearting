@@ -149,11 +149,13 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    bind_request as bind_execution_access_request,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
+)
+from route_authority import (  # noqa: E402
+    bind_access_request as bind_execution_access_request,
 )
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity via resolve_qa

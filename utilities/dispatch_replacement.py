@@ -23,6 +23,7 @@ from typing import Callable
 
 import dispatch_contract as DC
 from artifact_receipt import _write_once
+import route_authority
 
 ROOT = Path(__file__).resolve().parents[1]
 DEATH_NOTES = frozenset({
@@ -1111,7 +1112,7 @@ PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolv
 def _check_tuple(candidate, replay, transition=None):
     """The candidate must match the sealed input; only runtime-derived values may follow a new release,
     and only the profile-derived ones may follow a verified profile transition."""
-    for key in ('harness', 'jobs', 'worktree'):
+    for key in route_authority.REPLACEMENT_FIXED_KEYS:
         if candidate.get(key) != replay.get(key):
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
     drift = candidate.get('launch_home') != replay.get('launch_home')
@@ -1191,18 +1192,10 @@ def _canonical_argv(argv):
 
 
 def _authorized(jobs, rows, meta):
-    if meta.get('dispatch_depth') == '2':
-        parent = meta.get('parent_attempt_id')
-        if not parent or os.environ.get('AGENT_DISPATCH_ATTEMPT_ID') != parent or parent not in rows:
-            raise DC.DispatchContractError('replacement-parent-identity-unproven')
-        fields, parent_meta = rows[parent]
-        if fields[1] not in {'open','running'} or not DC._parent_liveness_evidence(Path(jobs), parent_meta)[0]:
-            raise DC.DispatchContractError('replacement-parent-not-live')
-    else:
-        from work_start import _current_parent_session_id, _owns
-        # The launching session, or its confirmed same-seat successor after a /clear.
-        if not meta.get('parent_sid') or not _owns(meta, _current_parent_session_id(), jobs):
-            raise DC.DispatchContractError('replacement-parent-identity-unproven')
+    def current_session():
+        from work_start import _current_parent_session_id
+        return _current_parent_session_id()
+    route_authority.require_replacement_parent(jobs, rows, meta, current_session=current_session)
 
 
 def _replacement_task(record, source, replay):

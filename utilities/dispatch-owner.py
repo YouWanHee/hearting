@@ -15,7 +15,7 @@ from owner_route_binding import OwnerRouteBindingError, validate_owner_route_bin
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
                                parse_registry_metadata)
-from model_profile import pinned_launch_harness, sealed_pin_harness
+from route_authority import pinned_launch_harness, sealed_pin_harness
 from dispatch_lifecycle import (
     FOREGROUND_NOTICE,
     FOREGROUND_SCOPED,

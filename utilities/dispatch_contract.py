@@ -39,11 +39,8 @@ from dispatch_receipt_identity import receipt_digest as shared_receipt_digest, u
 _GOVERNOR_WITNESS_HANDLES: dict[tuple[str, str], object] = {}
 
 
-def is_linked_worktree_slice(metadata: Mapping[str, object]) -> bool:
-    """A sub-session slice (`stage_authority=0`) runs in a linked worktree while its
-    owner row keeps the route cwd, so only a slice may differ from its parent's
-    worktree; every other identity comparison stays exact."""
-    return bool(metadata.get("subsession_id")) and str(metadata.get("stage_authority", "")) == "0"
+# Sub-session standing is a route authority judgment; the name stays for its readers.
+from route_authority import linked_worktree_slice as is_linked_worktree_slice  # noqa: E402
 
 
 def _governor_witness_key(root: Path, token: str) -> tuple[str, str]:

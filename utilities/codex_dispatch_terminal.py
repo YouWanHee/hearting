@@ -26,6 +26,7 @@ from dispatch_supervisor_terminal import classify_session_result, opencode_termi
 # (`failure_class=fail`) is unchanged. Only a `worker_type=review` row with a
 # readable artifact earns it; every other FAIL keeps the dead-worker note.
 from dispatch_attempt_policy import REVIEW_BLOCKING_NOTE
+from route_authority import HANDOFF_RE, pass_blocker_violation
 REVIEW_WORKER_TYPE = "review"
 
 
@@ -37,11 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # a prompt cannot prevent: a worker that prepends a summary sentence to an
 # otherwise exact handoff. Two 2026-07-28 pipelines died that way, each with a
 # correct artifact already on disk (plans/2026-07-29_handoff-tail-anchor).
-_HANDOFF_RE = re.compile(
-    r"(?:\A|\n)artifact: (?P<artifact>[^\n]+)\n"
-    r"verdict: (?P<verdict>PASS|FAIL|BLOCKED)\n"
-    r"blocker: (?P<blocker>[^\n]+)\Z"
-)
+_HANDOFF_RE = HANDOFF_RE  # the one envelope pattern (route_authority)
 _SANDBOX_INIT_RE = re.compile(
     r"bwrap: Can't bind mount [^\n]+ on [^\n]+/\.codex:"
     r"[^\n]*Unable to mount source on destination: No such file or directory",
@@ -344,7 +341,7 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
         )
 
     handoff = match.groupdict()
-    if handoff["verdict"] == "PASS" and handoff["blocker"] != "none":
+    if pass_blocker_violation(handoff["verdict"], handoff["blocker"]):
         return _result(
             3,
             "invalid",

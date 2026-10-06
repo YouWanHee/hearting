@@ -19,8 +19,8 @@ from dispatch_lifecycle import (
     run_forwarding_termination,
     select_launch_lifecycle,
 )
-import model_profile as MODEL_PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
+import route_authority as ROUTE_AUTHORITY
 import dispatch_subsession_advance as SUBSESSION
 
 _route_spec = importlib.util.spec_from_file_location(
@@ -840,7 +840,7 @@ def main():
  overridden_adapter=None
  replaying=any(t=="--automatic-retry-of" or t.startswith("--automatic-retry-of=") for t in strip_leading_separator(a.adapter_args))
  if worker_type not in {"owner","frame"} and not a.subsession_id and not replaying:
-  a.adapter,overridden_adapter=MODEL_PROFILE.pinned_launch_harness(
+  a.adapter,overridden_adapter=ROUTE_AUTHORITY.pinned_launch_harness(
    route,worker_type=worker_type,requested=a.adapter,
    available=lambda harness:pin_harness_available(route,node,harness,registry.path))
  wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"

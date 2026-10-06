@@ -63,7 +63,7 @@ from dispatch_allocation import (  # noqa: E402
     attempt_counts,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
-from model_profile import sealed_pin_harness  # noqa: E402
+from route_authority import sealed_pin_harness  # noqa: E402
 
 CAPACITY_SPEC = importlib.util.spec_from_file_location(
     "harness_capacity", ROOT / "utilities" / "harness-capacity.py"

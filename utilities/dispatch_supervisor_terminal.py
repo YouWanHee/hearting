@@ -12,6 +12,7 @@ from typing import Any
 
 import opencode_server_log
 from dispatch_contract import reconcile_attempt_terminal
+from route_authority import HANDOFF_RE, pass_blocker_violation
 
 
 CLASSIFIER_SOURCE = "supervisor-terminal-v1"
@@ -22,14 +23,10 @@ CLASSIFIER_SOURCE = "supervisor-terminal-v1"
 _CODEX_CAPACITY_STRUCTURED_CODES = frozenset({"usageLimitExceeded", "rateLimitExceeded"})
 _CODEX_AUTH_STRUCTURED_CODE = "unauthorized"
 _MAX_TAIL_BYTES = 1024 * 1024
-# Trailing-block anchor, kept in step with codex_dispatch_terminal._HANDOFF_RE —
-# the two must accept the same envelopes, or one surface reads a child as
-# finished while the other calls it malformed.
-_HANDOFF_RE = re.compile(
-    r"(?:\A|\n)artifact: [^\n]+\n"
-    r"verdict: (?P<verdict>PASS|FAIL|BLOCKED)\n"
-    r"blocker: (?P<blocker>[^\n]+)\Z"
-)
+# Trailing-block anchor: the one envelope pattern every terminal reader shares
+# (route_authority.HANDOFF_RE), so no surface reads a child as finished while
+# another calls it malformed.
+_HANDOFF_RE = HANDOFF_RE
 _CAPACITY_RE = re.compile(
     r"(?:reached|hit) your .{0,80}limit|"
     r"session limit|usage limit|weekly limit|rate limit(?:ed)?|"
@@ -137,12 +134,13 @@ def _handoff_terminal(text: object, *, event: str, process_exit: int) -> Supervi
         )
     verdict = match.group("verdict")
     blocker = match.group("blocker")
-    if verdict == "PASS" and blocker != "none":
+    violation = pass_blocker_violation(verdict, blocker)
+    if violation:
         return SupervisorTerminal(
             "dead-contract",
             "contract",
             event,
-            "pass-blocker-not-none",
+            violation,
             str(process_exit),
         )
     if verdict == "PASS":

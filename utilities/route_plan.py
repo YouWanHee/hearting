@@ -539,7 +539,7 @@ def display_plan(legs) -> list:
     return names
 
 
-_PIN_TARGETS = ("owner", "frame", "worker")
+from route_authority import PIN_TARGETS as _PIN_TARGETS  # noqa: E402
 
 
 def pin_tokens(pins) -> list:

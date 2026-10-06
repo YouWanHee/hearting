@@ -139,7 +139,6 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
-    pin_target,
     require_top_route,
     resolve_runtime_profile,
     route_selection_pin,
@@ -159,11 +158,15 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    bind_request as bind_execution_access_request,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
+)
+import route_authority  # noqa: E402
+from route_authority import (  # noqa: E402
+    bind_access_request as bind_execution_access_request,
+    pin_target,
 )
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity via resolve_qa
@@ -832,24 +835,7 @@ _STANDARD_PLUS_INTENSITY = {"standard", "strong", "thorough", "adversarial"}
 def _bind_runtime_parent(args: argparse.Namespace) -> None:
     """Bind a cross-harness direct child to the actual Codex caller runtime."""
 
-    current_thread = os.environ.get("CODEX_THREAD_ID") or os.environ.get(
-        "CODEX_SESSION_ID"
-    )
-    claude_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    caller_harness = (
-        os.environ.get("AGENT_DISPATCH_CALLER_HARNESS")
-        or ("codex" if current_thread and not claude_session else None)
-        or ("claude" if claude_session and not current_thread else None)
-    )
-    if args.dispatch_depth == 1:
-        if current_thread and caller_harness == "codex":
-            args.parent_session_id = current_thread
-            args.parent_slug = None
-            args.parent_harness = "codex"
-        elif claude_session and caller_harness == "claude":
-            args.parent_session_id = claude_session
-            args.parent_slug = None
-            args.parent_harness = "claude"
+    route_authority.bind_runtime_parent(args, honor_force=False)
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:

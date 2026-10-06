@@ -26,7 +26,8 @@ from dispatch_completion_join import (
     join_selected_attempts, current_delivery_state, delivery_classification,
     delivery_required_action, completion_harvest_command,
 )
-from dispatch_parent_completion import default_parent_session_id, interactive_parent_identity
+from route_authority import caller_identity as interactive_parent_identity, default_parent_session_id
+import route_authority
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
 from parent_next_directive import parent_next
 from execution_access import ExecutionAccessError, prepare_task_request
@@ -387,12 +388,7 @@ def _current_parent_session_id():
 
 def _owns(meta, parent, jobs):
     """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
-    if parent and meta.get("parent_sid") == parent:
-        return True
-    if not parent or jobs is None:
-        return False
-    from dispatch_seat_handover import owns
-    return owns(meta, parent, jobs)
+    return route_authority.owns(meta, parent, jobs)
 
 
 def _slot(route, node, rows, jobs=None):
