@@ -2,6 +2,7 @@
 import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -482,6 +483,57 @@ class AdapterV11Test(unittest.TestCase):
    self.assertEqual(
     sorted(p.name for p in source.iterdir()),["auth.json","config.toml"])
    self.assertEqual(sorted(p.name for p in fixture_home.iterdir()),[])
+ def test_a_release_switch_during_an_owner_leaves_its_children_on_its_release(self):
+  # BC 2026-10-07: the owner-only home was linked to release R1 while the owner tree carried the
+  # moving pointer; after the pointer moved to R2, every child start failed the projection check.
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); source=root/"source"; source.mkdir(); worktree=root/"worktree"; worktree.mkdir()
+   (source/"auth.json").write_text("{}\n",encoding="utf-8")
+   fixture_home=root/"home"; fixture_home.mkdir()
+   state=root/"dispatch"; state.mkdir(); jobs=state/"jobs.log"; jobs.write_text("")
+   later=root/"release-2"; (later/"core").mkdir(parents=True); (later/"core"/"CORE.md").write_text("fixture\n")
+   pointer=root/"pointer"; pointer.symlink_to(ROOT)
+   spec=importlib.util.spec_from_file_location("codex_dispatch_switch",ROOT/"adapters/codex/bin/dispatch-headless.py")
+   wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
+   env={"PATH":os.environ.get("PATH",""),"HOME":str(fixture_home),
+        "AGENT_HOME":str(pointer),"CODEX_HOME":str(source),"AGENT_DISPATCH_JOBS":str(jobs),
+        "PYTHONDONTWRITEBYTECODE":"1"}
+   with mock.patch.dict(os.environ,env,clear=True):
+    args=SimpleNamespace(agent_home=wrapper.resolve_agent_home())
+    self.assertEqual(args.agent_home,pointer)
+    args.nested_codex_root=wrapper.sealed_launch_home(args.agent_home)
+    args.nested_codex_home=wrapper.prepare_nested_codex_home(
+     worktree,source,jobs=jobs,projection_root=args.nested_codex_root)
+   pointer.unlink(); pointer.symlink_to(later)            # the release switch
+   child=wrapper.child_runtime_homes(args,None)
+   self.assertEqual(child,{"CODEX_HOME":str(args.nested_codex_home),"AGENT_HOME":str(ROOT.resolve())})
+   self.assertEqual(wrapper.child_runtime_homes(SimpleNamespace(nested_codex_home=None),root/"profile"),
+                    {"CODEX_HOME":str(root/"profile")})
+   self.assertEqual(wrapper.child_runtime_homes(SimpleNamespace(nested_codex_home=None),None),{})
+   def check(agent_home):
+    return subprocess.run([str(ROOT/"adapters/codex/bin/check-runtime-projection.sh")],
+     env={**env,"AGENT_HOME":agent_home,"CODEX_HOME":child["CODEX_HOME"],
+          "CODEX_RUNTIME_PROJECTION_FAST":"1","CODEX_RUNTIME_PROJECTION_SKIP_CLI_DISCOVERY":"1"},
+     capture_output=True,text=True,check=False)
+   kept=check(child["AGENT_HOME"])
+   self.assertEqual(kept.returncode,0,kept.stdout+kept.stderr)
+   moved=check(str(pointer))                              # what the child used to get
+   self.assertNotEqual(moved.returncode,0,moved.stdout)
+   self.assertIn("check=hearting:failed",moved.stdout)
+   # A projection failure now names its reason for the launcher's receipt.
+   out=io.StringIO()
+   with mock.patch.object(wrapper.subprocess,"run",return_value=subprocess.CompletedProcess(
+     [],1,moved.stdout,"")),contextlib.redirect_stdout(out):
+    rc=wrapper.check_runtime_projection(str(worktree),False)
+   self.assertEqual(rc,1)
+   lines=out.getvalue().splitlines()
+   self.assertIn("reason=codex-runtime-projection-mismatch",lines)
+   self.assertTrue(any(line.startswith("detail=check=hearting:failed") for line in lines))
+   named=io.StringIO()
+   with mock.patch.object(wrapper.subprocess,"run",return_value=subprocess.CompletedProcess(
+     [],69,"check=failed\nreason=codex-home-unset\n","")),contextlib.redirect_stdout(named):
+    self.assertEqual(wrapper.check_runtime_projection(str(worktree),False),69)
+   self.assertEqual([l for l in named.getvalue().splitlines() if l.startswith("reason=")],["reason=codex-home-unset"])
  def test_nested_codex_home_foreign_worktree_uses_existing_state_scope(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); source=root/"source"; source.mkdir(); worktree=root/"nas"; worktree.mkdir()

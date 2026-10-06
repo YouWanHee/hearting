@@ -605,7 +605,11 @@ Standard+ dispatch-depth-1 Codex owners run with
 `homes/codex/<worktree-key>` beneath the canonical dispatch state root,
 outside the source worktree. These homes
 link existing auth/config without copying or mutating credentials and keep
-nested session/app-server state inside the owner sandbox. Dispatch-depth-2 workers
+nested session/app-server state inside the owner sandbox. The home is linked to
+the release the launch resolved, and the owner tree gets that same release as
+its `AGENT_HOME` (not the moving pointer), so a release activated while the
+owner runs changes neither; a projection check failure names
+`reason=codex-runtime-projection-mismatch`. Dispatch-depth-2 workers
 do not inherit the network widening. The outer Codex sandbox also admits only
 the existing harness `.core-grounding` directory and Claude `session-env`
 directory as downstream runtime scratch roots. This keeps adapter write guards
