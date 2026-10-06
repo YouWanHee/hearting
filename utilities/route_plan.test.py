@@ -59,6 +59,26 @@ class ExtractionTest(unittest.TestCase):
         self.assertEqual(proposal["legs"][1]["graph"], ["plan", "execute", "test", "report"])
         self.assertEqual(proposal["entry_approvals"], [{"key": "full-run", "leg": 1, "question": "run-ok"}])
 
+    def test_plan_fields_are_sealed_with_stable_ids_and_a_malformed_one_is_left_out(self):
+        leg = {**DIRECT, "done_when": ["tests pass", {"text": "report written", "check": "test -f report.md"}],
+               "verify": "run the abort tests", "hands_over": ["reports/latency.md"],
+               "parallel": ["slice a", "slice b"], "extra_stages": [{"id": "measure", "unit": "qa/test", "after": "test"}]}
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([leg]))
+        sealed = proposal["legs"][0]
+        self.assertEqual(sealed["done_when"], [{"id": "d1", "text": "tests pass"},
+                                               {"id": "d2", "text": "report written", "check": "test -f report.md"}])
+        self.assertEqual((sealed["verify"], sealed["hands_over"], sealed["parallel"]),
+                         ("run the abort tests", ["reports/latency.md"], ["slice a", "slice b"]))
+        self.assertEqual(sealed["extra_stages"], [{"id": "measure", "unit": "qa/test", "after": "test"}])
+        self.assertEqual(notes, [])
+        bad = {**DIRECT, "done_when": [], "verify": "", "hands_over": [{"x": 1}], "extra_stages": [{"unit": "qa/test"}]}
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([bad]))
+        self.assertEqual(set(proposal["legs"][0]), {"capability", "mode", "shape", "graph", "intensity", "why"})
+        self.assertEqual(sorted(notes), ["ignored:legs[0].done_when", "ignored:legs[0].extra_stages",
+                                         "ignored:legs[0].hands_over", "ignored:legs[0].verify"])
+        self.assertEqual(RP.parse_proposal_with_notes(brief([{**DIRECT, "done_when": "one line"}]))[0]
+                         ["legs"][0]["done_when"], [{"id": "d1", "text": "one line"}])
+
     def approvals_of(self, *questions, key="full-run"):
         rows = "".join(f"    - {{key: {key}, leg: 0, question: {q}}}\n" for q in questions)
         text = ("route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
@@ -176,11 +196,11 @@ class ExtractionTest(unittest.TestCase):
 
     def test_unknown_fields_are_ignored_and_named(self):
         text = fenced("route_proposal_v1:\n  summary: s\n  done_when: [tests pass]\n  legs:\n"
-                      "    - {capability: autopilot-code, shape: direct, verify: pytest}\nnote: x\n")
+                      "    - {capability: autopilot-code, shape: direct, budget: 2h}\nnote: x\n")
         proposal, _, notes = RP.parse_proposal_with_notes(text)
         self.assertEqual(proposal["legs"][0]["capability"], "autopilot-code")
-        self.assertNotIn("verify", proposal["legs"][0])
-        self.assertEqual(notes, ["ignored:note", "ignored:done_when", "ignored:legs[0]:verify"])
+        self.assertNotIn("budget", proposal["legs"][0])
+        self.assertEqual(notes, ["ignored:note", "ignored:done_when", "ignored:legs[0]:budget"])
 
     def test_an_indented_fence_under_a_list_item_is_read(self):
         body = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
@@ -857,10 +877,12 @@ class PinnedFourReceiptSurfacesTest(PinnedPlanFixture):
         self.finish_leg(route, leg_path)
         read = RP.next_leg_for_route(route)
         self.assertIsNotNone(read)
-        resumed = S.W.start_work(route, leg_path, self.jobs)
-        self.assertEqual(resumed["state"], "completed")
-        self.assertEqual(resumed["next_leg"], read)
         self.assertEqual(set(self.pin_values(shlex.split(read["compose_command"]))), SelectionPinContinuationTest.FRAME_PINS)
+        # The resume starts that next leg itself (plan cursor), sealed with the same pins the command prints.
+        resumed = S.W.start_work(route, leg_path, self.jobs)
+        self.assertEqual((resumed["state"], resumed["plan_advanced"]["leg"]), ("inline", read["index"]), resumed)
+        started = json.loads(Path(resumed["plan_advanced"]["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(set(RP.pin_tokens(started["selection_pins"])), SelectionPinContinuationTest.FRAME_PINS)
 
     def test_the_other_receipt_surfaces_read_through_the_same_projection(self):
         for name in ("capability-route.py", "dispatch_completion_join.py", "inline_finish.py", "work_start.py"):

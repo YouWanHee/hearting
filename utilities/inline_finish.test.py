@@ -885,11 +885,18 @@ class NextLegFinishTest(PublicInlineFinishTest):
                                  cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
         self.assertEqual(started.returncode, 0, started.stderr)
         receipt = json.loads(started.stdout)
-        self.assertEqual((receipt["state"], receipt["required_action"]), ("completed", "advance-completed"))
-        self.assertEqual(receipt["next_leg"], next_leg)
-        for control in ("parent_next", "parent_next_command"):
-            self.assertNotIn(control, receipt)
-        self.assertNotIn("next_leg", receipt["required_action"])
+        # The start of a finished leg starts the plan's next leg (plan cursor). In a HOME with no
+        # supported harness the leg cannot be prepared: the finished leg's receipt then says why,
+        # beside the same next_leg. Either way the plan's next leg was taken up, never dropped.
+        if "plan_advanced" in receipt:
+            self.assertEqual(receipt["plan_advanced"]["leg"], next_leg["index"], receipt)
+            started_leg = json.loads(Path(receipt["plan_advanced"]["route_file"]).read_text(encoding="utf-8"))
+            self.assertEqual(started_leg["route_plan"]["index"], next_leg["index"])
+        else:
+            self.assertEqual((receipt["state"], receipt["next_leg"]), ("completed", next_leg), receipt)
+            self.assertEqual((receipt["plan_advance"]["state"], receipt["plan_advance"]["leg"]),
+                             ("not-started", next_leg["index"]), receipt)
+        self.assertNotIn("next_leg", receipt.get("required_action") or "")
         status = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "status",
                                  "--artifact-root", str(self.root)], cwd=self.repo, env=os.environ.copy(),
                                 capture_output=True, text=True)

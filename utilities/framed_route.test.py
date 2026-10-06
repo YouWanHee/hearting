@@ -1051,6 +1051,7 @@ class FramedStartTest(FramedBase):
     def test_an_autoclosed_framed_route_composes_again_as_a_framed_route(self):
         command = W._compose_again(self.route)
         self.assertIn("--shape framed", command)
+        self.assertIn("--intensity strong", command)          # both frame legs again
         self.assertNotIn("--capability", command)
         self.assertNotIn("route-frame", command)
 

@@ -109,6 +109,12 @@ created: {YYYY-MM-DD}
          graph: [eval-run, metrics, report]   # staged only; stage ids or capability:stage[:unit] from the catalogue; never a frame stage
          intensity: standard     # optional
          why: "one sentence"
+         done_when:              # optional, 1-5: what shows this leg is finished (a sentence or {text, check})
+           - "the abort tests pass"
+           - {text: "latency report written", check: "test -f reports/latency.md"}
+         verify: "one line: what verification looks at"   # optional
+         hands_over: [reports/latency.md]                   # optional: what the next leg reads
+         # optional notes for the owner, not compiled into stages: parallel: [...], extra_stages: [{id, unit, after, verify}]
      execution_scope: complete   # optional: complete (default) | report
    ```
 

@@ -413,11 +413,17 @@ class LooseOutputLegClosureTest(OwnerRefineBase):
                     fixture.close_owner()
                     settled = fixture.settle()
                     self.assertEqual(settled.result, "completed", settled)
-                    receipt = fixture.start()
-                    self.assertEqual(receipt["state"], "completed", receipt)
-                    self.assertEqual(receipt["next_leg"]["index"], 2, receipt)
-                    self.assertIn("--route-plan", receipt["next_leg"]["compose_command"])
-                    self.assertIn("#2", receipt["next_leg"]["compose_command"])
+                    # The finished leg starts the plan's next leg itself (plan cursor). Readiness is the
+                    # route's own sealed evidence and nothing is launched, on any HOME.
+                    import work_start as W
+                    evidence = {"tuples": (fixture.route.get("dispatch_evidence") or {}).get("tuples") or [],
+                                "candidates": fixture.route.get("registered_headless_candidates") or []}
+                    with mock.patch.object(W._route_module(), "proposal_readiness", return_value=evidence):
+                        receipt = fixture.start(
+                            run=lambda command, **kw: subprocess.CompletedProcess(command, 1, "", ""))
+                    self.assertEqual(receipt["plan_advanced"]["leg"], 2, receipt)
+                    third = json.loads(Path(receipt["plan_advanced"]["route_file"]).read_text(encoding="utf-8"))
+                    self.assertEqual((receipt["route_id"], third["route_plan"]["index"]), (third["route_id"], 2))
                     self.assertEqual(P.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])["state"], "sealed")
                     self.assertTrue(preview.is_file())
                     self.assertEqual(hashlib.sha256(preview.read_bytes()).hexdigest(),

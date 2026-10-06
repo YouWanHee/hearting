@@ -3845,15 +3845,16 @@ def _leg_evidence(leg, readiness):
             "registered_headless_evidence": {"candidates": probe["candidates"]}}
 
 
-def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness):
-    """The approved first leg, compiled in memory with its route-plan reference sealed.
+def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness, index=0):
+    """An approved leg, compiled in memory with its route-plan reference sealed.
 
     Same arguments the printed compose command carries: the leg's shape, graph, capability, mode and
-    intensity, `--route-plan <record>#0`, the frame cycle as parent and the same campaign.
+    intensity, `--route-plan <record>#<index>`, the previous cycle as parent and the same campaign.
+    The first leg compiles from the frame route; a later leg from the leg before it.
     """
     import route_plan as RP
     kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
-                                 slug=f"{context['slug']}-leg0")
+                                 slug=f"{context['slug']}-leg{index}")
     owner = context.get("owner") or ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness")
     if work_request is not None:
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}

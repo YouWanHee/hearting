@@ -282,12 +282,22 @@ With no valid, chosen and approved proposal it records `selected: none` and
 ends with `required_action=compose-route`; the session then picks the route as
 as before. When a route made from a proposal closes, its completion receipt,
 a replayed `start`, a direct `finish` receipt and route status carry `next_leg`
-(`index`, the leg, a `compose_command` that includes `--start`). It is information: the
-runtime starts nothing from it and leaves it out of `parent_next`. The main session runs
-the command as printed, changes the plan, or stops; §0.4 says when a card comes first.
+(`index`, the leg, a `compose_command` that includes `--start`). The person
+approved every leg in the one interview, so a `start` that reads a finished leg
+starts the next one itself and returns that leg's receipt with `plan_advanced`;
+each started leg is one row of the plan cursor
+(`.runtime/framed-decision/<frame route>.plan-cursor.jsonl`), so a replay or a
+successor session on the same resume line reuses it. A plan approved with
+`execution_scope: report` stops after its leg with `next_leg` as information, and
+a next leg that could not be prepared is named in `plan_advance` beside it. The
+main session may still change the plan or stop; §0.4 says when a card comes first.
 A replayed `start` of the closed frame route answers for the furthest leg already
 started from its decision, so after the last leg it reports that leg's completion
-and no `next_leg`.
+and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`
+and `hands_over`, and the brief whose route the person chose, reach the owner and
+every stage worker of that leg from the sealed decision; a `qa/*` stage records
+each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
+`route_plan.read_leg_items`).
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
 <task>` with the selected shape/graph. The slug comes from the task; the

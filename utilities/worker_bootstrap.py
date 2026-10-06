@@ -514,6 +514,42 @@ def owner_inline_marker_prompt(args) -> str:
             f"still publishes its completion marker: `{command}` (no --jobs). Without it the route never settles.\n\n")
 
 
+def plan_leg_prompt(route, node_id=None) -> str:
+    """The approved plan for this leg, read from the sealed decision: what finishes it, what
+    verification looks at, what it hands over, and the direction the person chose. Empty for a
+    route made from no plan. A verification stage is also told where to record each item."""
+    import route_plan as RP
+    plan = RP.leg_plan(route)
+    leg = (plan or {}).get("leg") or {}
+    lines = []
+    if leg.get("done_when"):
+        lines.append("Done when (sealed ids, in this order):")
+        lines += [f"- {item['id']}: {item['text']}" + (f" (check: `{item['check']}`)" if item.get("check") else "")
+                  for item in leg["done_when"]]
+    if leg.get("verify"):
+        lines.append(f"Verify: {leg['verify']}")
+    if leg.get("hands_over"):
+        lines.append("Hands over to the next leg: " + "; ".join(leg["hands_over"]))
+    for row in (plan or {}).get("handed_over") or []:
+        lines.append(f"Handed over by leg {row['leg']}: " + "; ".join(row["items"]))
+    if leg.get("parallel"):
+        lines.append("Parallel slices the plan suggests: " + "; ".join(leg["parallel"]))
+    for stage in leg.get("extra_stages") or []:
+        lines.append("Extra stage the plan suggests: " + ", ".join(f"{k} {v}" for k, v in stage.items()))
+    if plan and plan.get("adopted_brief"):
+        lines.append(f"Adopted direction: the brief {plan['adopted_brief']} (the person chose its route).")
+    if not lines:
+        return ""
+    node = next((n for n in route.get("nodes") or [] if n.get("id") == node_id), {}) if node_id else {}
+    if leg.get("done_when") and str(node.get("unit") or "").startswith("qa/"):
+        lines.append(
+            "Record each done-when item beside your artifact as `<artifact>.items.json`: "
+            '{"schema": "leg_items_v1", "route_id": "' + str(route.get("route_id")) + '", "node": "'
+            + str(node_id) + '", "attempt_id": "<your attempt id>", "items": [{"id": "d1", "state": '
+            '"met|unmet|unknown", "note": "one line"}]} -- every sealed id once, no other id.')
+    return "Plan for this leg (approved in the frame interview; base the verdict on it):\n" + "\n".join(lines) + "\n\n"
+
+
 def assignment_prompt(args, task: str, environ) -> str:
     """Project the route's input/output boundary, rather than ask a caller to copy it.
 
@@ -530,7 +566,8 @@ def assignment_prompt(args, task: str, environ) -> str:
             route, getattr(args, "route_node", None), environ,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
         )
-        return (f"Assignment:\n{task.rstrip()}\n\n{node_scope_prompt(scope)}\n"
+        return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
+                f"{node_scope_prompt(scope)}\n"
                 f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}")
     outputs = []
     route_file = getattr(args, "route_file", None)
