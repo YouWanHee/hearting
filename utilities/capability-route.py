@@ -9368,6 +9368,42 @@ def stages_block(registry, recipe):
             "frame_brief_inputs":TOPO.frame_brief_inputs(registry,capability)}
 
 
+def caller_open_route(cwd):
+    """`(route_file | None, source, rows)`: the open route a bare `start` continues.
+
+    This session's own newest open route first (its route-chain ledger, which every
+    compose and start writes); otherwise the one open route sealed for this cwd under
+    the cwd's artifact root. `rows` are the open routes that were looked at, each with
+    its `resume_command`, so a caller that finds none or several sees what is there."""
+    from parent_next_directive import resume_command
+    rc = _route_chain_module()
+    anchor = rc.writer_identity() if rc is not None else None
+    for line in reversed(rc.read_tail(*anchor) if anchor else []):
+        path = Path(line["route_file"])
+        if path.is_file() and not outcome_path(path).is_file():
+            return str(path), "this-session", []
+    try:
+        artifact_root = _compose_artifact_root(cwd)
+    except ValueError:
+        return None, "none", []
+    here = os.path.realpath(cwd)
+    rows = []
+    for row in route_status(artifact_root):
+        if row["closed"] or row.get("read_only"):
+            continue
+        try:
+            sealed_cwd = json.loads(Path(row["route_file"]).read_text(encoding="utf-8")).get("cwd")
+        except (OSError, ValueError):
+            continue
+        if isinstance(sealed_cwd, str) and os.path.realpath(sealed_cwd) == here:
+            rows.append({"route_id": row["route_id"], "capability": row["capability"],
+                         "route_file": row["route_file"],
+                         "resume_command": resume_command(row["route_file"], agent_home=ROOT)})
+    if len(rows) == 1:
+        return rows[0]["route_file"], "cwd", rows
+    return None, "ambiguous" if rows else "none", rows
+
+
 def _compose_artifact_root(cwd):
     script=ROOT/"utilities"/"artifact-root.sh"
     result=subprocess.run(["sh",str(script),str(cwd)],text=True,capture_output=True,check=False)
@@ -9794,7 +9830,8 @@ def main():
             if option.dest in advanced:
                 option.help = argparse.SUPPRESS
     start=sub.add_parser("start",help="continue one sealed work request; existing attempts are reused")
-    start.add_argument("--route",required=True,type=Path)
+    start.add_argument("--route",type=Path,default=None,
+                       help="default: this session's newest open route, else the one open route of this cwd")
     start.add_argument("--jobs",type=Path,default=None)
     start.add_argument("--wait",action="store_true",help="the receipt's bounded wait for a parent without an automatic carrier")
     start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
@@ -9877,7 +9914,7 @@ def main():
     cl.add_argument("--allow-unproven",action="store_true",
                      help="accepted for compatibility; close always records terminal_gate_proven=false with a "
                           "terminal-gate-unproven warning when the terminal node has not completed")
-    st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
+    st=sub.add_parser("status"); st.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     sg=sub.add_parser("stages",help="list a capability's (or every capability's) stage ids, in recipe order, for --graph")
     sg.add_argument("--capability",default=None,help="default: every capability")
@@ -10031,6 +10068,17 @@ def main():
         return 0
     if a.command=="start":
         from work_start import start_work
+        if a.route is None:
+            found,source,rows=caller_open_route(os.getcwd())
+            if found is None:
+                print(json.dumps({"state":"no-open-route" if source=="none" else "open-route-ambiguous",
+                                  "cwd":os.getcwd(),"open_routes":rows,
+                                  "next_step":("Run the resume_command of the route to continue."
+                                               if rows else "No open route belongs to this session or cwd.")},
+                                 ensure_ascii=False))
+                return 2
+            a.route=Path(found)
+            print(f"route_default={found} source={source}",file=sys.stderr)
         route=verify_route(json.loads(a.route.read_text()))
         jobs=Path(a.jobs or _compose_default_jobs())
         pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None
@@ -10200,8 +10248,12 @@ def main():
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
-        rows=route_status(a.artifact_root)
+        rows=route_status(a.artifact_root or _compose_artifact_root(os.getcwd()))
         if a.open_only: rows=[row for row in rows if not row["closed"]]
+        from parent_next_directive import resume_command
+        for row in rows:
+            if not row["closed"] and not row.get("read_only"):
+                row["resume_command"]=resume_command(row["route_file"],agent_home=ROOT)
         print(json.dumps(rows,sort_keys=True,indent=2))
     elif a.command=="finish":
         raw=json.loads(a.route.read_text(encoding="utf-8"))

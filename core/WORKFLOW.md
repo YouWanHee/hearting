@@ -703,8 +703,13 @@ completion and close steps; use their recorded route and producer evidence:
 
 ```text
 python3 utilities/capability-route.py close --route <route.json> [--commit <sha>] [--summary <line>]
-python3 utilities/capability-route.py status --artifact-root <dir> --open-only
+python3 utilities/capability-route.py status [--artifact-root <dir>] --open-only
 ```
+
+`status` defaults the artifact root from the cwd, and each open row carries its
+`resume_command`. A `start` without `--route` continues this session's newest
+open route (its route-chain ledger), or else the one open route sealed for the
+cwd; with none or several it lists them and starts nothing.
 
 `close` may preserve `terminal_gate_proven=false`; later exact completion on the
 same route is consumed by complete/finish/close/finalize (artifact-path-contract

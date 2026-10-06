@@ -7558,6 +7558,30 @@ class ComposeRouteTest(TestRoute):
    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
    self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
    self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_a_bare_start_finds_this_sessions_open_route_else_the_one_open_route_of_the_cwd(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)/"reports"; routes=R.canonical_routes_dir(root); routes.mkdir(parents=True)
+   here=Path(tmp)/"wt"; other=Path(tmp)/"other"; here.mkdir(); other.mkdir()
+   def route(name,cwd,closed=False):
+    path=routes/f"rt-{name*16}.json"
+    path.write_text(json.dumps({"route_id":f"rt-{name*16}","nodes":[],"cwd":str(cwd),"artifact_root":str(root)}),encoding="utf-8")
+    if closed: R.outcome_path(path).write_text("{}",encoding="utf-8")
+    return str(path)
+   mine_old,mine_new,mine_closed=route("a",other),route("b",other),route("c",other,closed=True)
+   ledger=[{"route_file":mine_old},{"route_file":mine_new},{"route_file":mine_closed}]
+   chain=mock.Mock(writer_identity=lambda: ("claude","sess"),read_tail=lambda harness,sid: ledger)
+   with mock.patch.object(R,"_route_chain_module",return_value=chain), \
+        mock.patch.object(R,"_compose_artifact_root",return_value=str(root)):
+    self.assertEqual(R.caller_open_route(here)[:2],(mine_new,"this-session"))   # newest open, closed skipped
+    ledger.clear()                                                               # a new session: no ledger
+    self.assertEqual(R.caller_open_route(here)[:2],(None,"none"))
+    only=route("d",here)
+    found,source,rows=R.caller_open_route(here)
+    self.assertEqual((found,source),(only,"cwd"))
+    self.assertIn(f"start --route {only}",rows[0]["resume_command"])
+    route("e",here)
+    found,source,rows=R.caller_open_route(here)
+    self.assertEqual((found,source,len(rows)),(None,"ambiguous",2))
  def test_spec_read_auto_accepts_this_sessions_recorded_read_of_the_unchanged_spec(self):
   with tempfile.TemporaryDirectory() as tmp:
    repo=Path(tmp)/"repo"; reports=repo/".agent_reports"; home=Path(tmp)/"home"
