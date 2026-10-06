@@ -63,7 +63,7 @@ from dispatch_allocation import (  # noqa: E402
     attempt_counts,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
-from route_authority import sealed_pin_harness  # noqa: E402
+from route_authority import route_in_force, sealed_pin_harness  # noqa: E402
 
 CAPACITY_SPEC = importlib.util.spec_from_file_location(
     "harness_capacity", ROOT / "utilities" / "harness-capacity.py"
@@ -178,7 +178,7 @@ def load_route(route_path: Path, launch_phase: str = "dry-run") -> dict[str, obj
         if "launch-compatibility-tuple-required" in detail:
             raise BatchError("launch-compatibility-tuple-required", detail)
         raise BatchError("route-record-invalid", detail)
-    return route
+    return route_in_force(route)  # the verified sealed route, with its parent's pin changes
 
 
 PARTIAL_PEER_KEYS = (

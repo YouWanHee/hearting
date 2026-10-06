@@ -15,7 +15,7 @@ from owner_route_binding import OwnerRouteBindingError, validate_owner_route_bin
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
                                parse_registry_metadata)
-from route_authority import pinned_launch_harness, sealed_pin_harness
+from route_authority import pinned_launch_harness, route_in_force, sealed_pin_harness
 from dispatch_lifecycle import (
     FOREGROUND_NOTICE,
     FOREGROUND_SCOPED,
@@ -221,7 +221,9 @@ def _sealed_owner_context(path, *, worker_type="owner", route_node=None):
     """
 
     try:
-        route = json.loads(Path(path).read_text(encoding="utf-8"))
+        # The sealed route with its parent's pin changes: a changed owner pin brings the
+        # checked tuples probed for that owner harness (`route_authority.route_in_force`).
+        route = route_in_force(json.loads(Path(path).read_text(encoding="utf-8")))
     except (OSError, ValueError) as exc:
         raise OwnerError(f"route-evidence-unreadable:{exc}") from exc
     intensity = route.get("effective_intensity")
@@ -833,7 +835,7 @@ def main(argv):
         # only below, where a limited pin gives the request back to the checks it always had.
         requested, pin_doc = explicit, None
         if route_evidence and values["--worker-type"] == "owner":
-            pin_doc = json.loads(Path(route_evidence).read_text(encoding="utf-8"))
+            pin_doc = route_in_force(json.loads(Path(route_evidence).read_text(encoding="utf-8")))
             pinned = sealed_pin_harness(pin_doc, worker_type="owner")
             if pinned and pinned != explicit and (sealed is None or pinned in sealed):
                 explicit = pinned

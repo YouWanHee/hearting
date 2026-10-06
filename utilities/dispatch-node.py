@@ -725,6 +725,7 @@ def main():
   print("check=failed"); print(f"reason={reason}"); print(f"detail={detail}")
   print("registered=0"); print("started=0"); print("child_spawned=0")
   raise SystemExit(65)
+ route=ROUTE_AUTHORITY.route_in_force(route)  # the verified sealed route, with its parent's pin changes
  node=next((x for x in route["nodes"] if x["id"]==a.node),None)
  if not node: raise SystemExit("unknown route node")
  a.reviewed_evidence=drop_inapplicable(node,a.reviewed_evidence)
