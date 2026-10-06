@@ -150,11 +150,18 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
                 self.assertIn("미등록", text[row])
 
     def test_row_never_overflows_and_keeps_identity(self):
-        entry = compute_hosts.unregistered_gpu(_snapshot((0, [_process()])))[0]
+        entry = compute_hosts.unregistered_gpu(_snapshot((0, [_process(
+            command="/home/test/envs/xxx/bin/python run.py  --flag '/keep/full path'"
+        )])))[0]
+        original = json.dumps(entry, sort_keys=True)
         for width in (168, 100, 60, 40):
             row = render._plain(render._gpu_work_row(entry, width))
             self.assertLessEqual(render._dw(row), width, row)
             self.assertIn("GPU moving4:0", row)
+            self.assertNotIn("/home/test/envs/xxx/bin/python", row)
+            if width == 168:
+                self.assertIn("python run.py  --flag '/keep/full path'", row)
+            self.assertEqual(json.dumps(entry, sort_keys=True), original)
 
     def test_multi_gpu_process_is_one_row_and_dispatch_section_only(self):
         shared = _process(used_memory_mib=9604)
