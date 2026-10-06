@@ -265,14 +265,18 @@ The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향�
 `route_proposal_review`: each brief's validated proposal or
 `proposal:none(<reason>)`, whether the two are `equal`, the start-approval parts
 each leg would carry, and `frame_downgrade` (node, original and actual profile,
-cause, attempt) when a leg ran one profile lower. Depth-0 writes the one
-interview (§0.4): one route question in the person's words — yes-no when the
-two proposals are equal, choice when they differ, "다르게" being the existing
-off-menu answer — plus a `route_proposals` field `{question, by_option}` that
-maps each option label to the proposal it selects; a start-approval question for
-each approval part, yes-no with the approving option marked `"approves": true`
-and an id equal to the brief's section 7 id (a non-ASCII id is converted to an ASCII slug; use the id the review shows). Together with the direction questions they stay inside
-`QUESTION_CAP`; offer only routes a brief proposed. After the answers, the
+cause, attempt) when a leg ran one profile lower. Its `interview_template`
+already holds the route question (`route-choice`: yes-no when the two proposals
+are equal or only one is valid, choice when they differ, each option marked with
+`"proposal": <frame node>`; "다르게" is the existing off-menu answer) and one
+yes-no question per start-approval part (`<key>-leg<leg>`, the approving option
+marked `"approves": true`). Depth-0 words them in the person's language (§0.4)
+and adds the direction questions beside them, all inside `QUESTION_CAP`; a later
+leg's approval question may be left out, and that leg then keeps its gate. When
+the interview is submitted the runtime builds `route_proposals`
+`{question, by_option}` from the marks and the validated proposals and records
+it with the question. An interview that writes `route_proposals` itself is read
+as written and offers only routes a brief proposed. After the answers, the
 same `start` records the decision, compiles and starts the first leg only
 (`--route-plan <record>#0`, `--parent-cycle <frame cycle>`), and closes the frame
 route once that start receipt exists; its receipt is the first leg's own.

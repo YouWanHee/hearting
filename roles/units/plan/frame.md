@@ -91,11 +91,9 @@ created: {YYYY-MM-DD}
    line on why you cannot decide it yourself. Facts you could establish by
    reading code or running a tool do not belong here; establish them. The
    dispatching depth-0 session turns this list into the frame interview (SD-129).
-   When the route you propose in section 8 contains a part whose catalogue row
-   carries `start_approval`, add one yes/no question asking whether those steps
-   may start now: give it a short ASCII slug id (a-z, 0-9, -; a non-ASCII id is converted
-   automatically; the same id as `entry_approvals.question` in section 8), say
-   in plain words which steps it would start, and recommend an answer.
+   The runtime adds the route question and one yes/no start question for each
+   part of your route whose catalogue row carries `start_approval`; do not
+   repeat them here.
 8. **Route proposal** ("경로 조립 제안"): exactly one fenced `yaml` block holding
    one `route_proposal_v1`, the smallest route that does the job. Pick only the
    parts and legs the work needs; do not choose a full preset out of habit. One
@@ -111,10 +109,6 @@ created: {YYYY-MM-DD}
          graph: [eval-run, metrics, report]   # staged only; stage ids or capability:stage[:unit] from the catalogue; never a frame stage
          intensity: standard     # optional
          why: "one sentence"
-     entry_approvals:            # optional; only for parts that carry start_approval
-       - key: full-run           # full-run | deploy | handback | preview
-         leg: 1                  # 0-based leg holding that part
-         question: route-choice  # reuse the existing route question
      execution_scope: complete   # optional: complete (default) | report
    ```
 

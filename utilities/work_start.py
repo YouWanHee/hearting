@@ -190,6 +190,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         # reopen the producer or write into a completed cycle on a lost reply.
         recorded_path = Path(resolution["artifact"])
         recorded = json.loads(recorded_path.read_text())
+        if "route_proposals" in recorded and "route_proposals" not in supplied:
+            # The recorded question carries the mapping the runtime built from these marks.
+            supplied = {**supplied, "route_proposals": recorded["route_proposals"]}
         normalized = {**supplied, **{key: recorded[key] for key in
             ("schema", "route_id", "self_path", "summary", "created")},
             "round": supplied.get("round", recorded["round"])}
@@ -218,10 +221,11 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         raise ValueError("frame-output-outside-cycle")
     question_path, answer_path = directory / "interview.json", directory / "answers.json"
     original = json.loads(question_path.read_text()) if question_path.exists() else {}
+    supplied, mark_errors = _marked_route_proposals(route, jobs, supplied)
     question = {**supplied, "schema": FI.SCHEMA, "route_id": route["route_id"], "round": round_no,
                 "self_path": str(question_path), "summary": str(directory / "frame-summary.json"),
                 "created": original.get("created") or datetime.now(timezone.utc).strftime("%Y-%m-%d")}
-    errors = FI.validate(question, intensity=route["effective_intensity"])
+    errors = mark_errors + FI.validate(question, intensity=route["effective_intensity"])
     response = json.loads(Path(answers).read_text()) if answers else None
     # A native timeout/acknowledgement is not an answer file. Keep the same
     # registered question available for a later ordinary conversation reply.
@@ -789,12 +793,77 @@ def _frame_downgrade_summary(route, jobs):
     return found or None
 
 
-def _proposal_review(route, path, jobs):
+def _start_approval_keys(row):
+    """The sorted `(leg, key)` start approvals a validated proposal row carries."""
+    return sorted({(item["leg"], item["start_approval"]) for item in row["facts"]["start_approvals"]})
+
+
+def _interview_questions(rows):
+    """The route question and one yes/no question per start approval, built from the validated
+    proposals. Ids, kinds and marks are filled; the wording is left to the session that asks the
+    person, in their language."""
+    import frame_interview as FI
+    valid = [row for row in rows if row["proposal"] is not None]
+    if not valid:
+        return []
+
+    def blank(qid, kind, options):
+        return {"id": qid, "topic": "", "question": "", "kind": kind, "options": options,
+                "recommended": 0, "why": ""}
+    option = {"label": "", "means": ""}
+    if len(valid) == 1 or RP.proposals_equal(rows):
+        choice = blank(FI.ROUTE_QUESTION_ID, "yes-no", [{**option, FI.PROPOSAL_MARK: valid[0]["node"]}, dict(option)])
+    else:
+        choice = blank(FI.ROUTE_QUESTION_ID, "choice", [{**option, FI.PROPOSAL_MARK: row["node"]} for row in valid])
+    approvals = sorted({pair for row in valid for pair in _start_approval_keys(row)})
+    return [choice] + [blank(FI.approval_question_id(leg, key), "yes-no", [{**option, "approves": True}, dict(option)])
+                      for leg, key in approvals]
+
+
+def _marked_route_proposals(route, jobs, interview):
+    """`(interview, errors)`: a framed interview's `route_proposals`, built from its `proposal` marks.
+
+    Each marked option selects the validated proposal of the frame brief it names, with one start
+    approval row per approval question of that proposal (a later leg's row only when its question is
+    asked; an unasked one keeps that leg's gate). An interview that carries `route_proposals` itself,
+    carries no marks, or belongs to another route shape is returned unchanged."""
+    import frame_interview as FI
+    if not RP.is_framed_route(route) or not isinstance(interview, dict) or "route_proposals" in interview:
+        return interview, []
+    questions = [q for q in interview.get("questions") or [] if isinstance(q, dict)]
+    marked = [q for q in questions if any(isinstance(o, dict) and FI.PROPOSAL_MARK in o for o in q.get("options") or [])]
+    if not marked:
+        return interview, []
+    if len(marked) > 1:
+        return interview, ["questions: proposal marks belong to one route question"]
+    root, record, output = _framed_cycle(route)
+    rows = {row["node"]: row for row in _proposal_rows(route, jobs, root, record, output) if row["proposal"] is not None}
+    asked = {q.get("id") for q in questions}
+    question, by_option, errors = marked[0], {}, []
+    for index, option in enumerate(question.get("options") or []):
+        if not isinstance(option, dict) or FI.PROPOSAL_MARK not in option:
+            continue
+        row = rows.get(option[FI.PROPOSAL_MARK])
+        if row is None:
+            errors.append(f"{question.get('id')}.options[{index}].{FI.PROPOSAL_MARK}: "
+                          f"no valid proposal from {option[FI.PROPOSAL_MARK]!r}")
+            continue
+        approvals = [{"key": key, "leg": leg, "question": FI.approval_question_id(leg, key)}
+                     for leg, key in _start_approval_keys(row)
+                     if leg == 0 or FI.approval_question_id(leg, key) in asked]
+        by_option[str(option.get("label") or "")] = {**row["proposal"], "entry_approvals": approvals}
+    if errors:
+        return interview, errors
+    return {**interview, "route_proposals": {"question": question.get("id"), "by_option": by_option}}, []
+
+
+def _proposal_review(route, path, jobs, rows=None):
     """Information for the session that writes the interview: both validated proposals (or none with
     the reason), whether they are equal, the start-approval parts each leg would carry, and the
     frame downgrade summary. Nothing here is a decision."""
-    root, record, output = _framed_cycle(route)
-    rows = _proposal_rows(route, jobs, root, record, output)
+    if rows is None:
+        root, record, output = _framed_cycle(route)
+        rows = _proposal_rows(route, jobs, root, record, output)
     return {
         "proposals": [{
             **{key: row[key] for key in ("node", "proposal", "reason", "brief_path", "sha256")},
@@ -1507,13 +1576,18 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         if gate_pending or interview or answers:
             step = frame_interview_step(route, path, jobs, interview=interview, answers=answers, decision=decision)
             if RP.is_framed_route(route) and step["state"] == "needs-interview":
-                step = {**step, "route_proposal_review": _proposal_review(route, path, jobs),
+                root, record, output = _framed_cycle(route)
+                rows = _proposal_rows(route, jobs, root, record, output)
+                template = {**(step.get("interview_template") or {}), "questions": _interview_questions(rows)}
+                step = {**step, "interview_template": template,
+                        "route_proposal_review": _proposal_review(route, path, jobs, rows),
                         "next_step": step.get("next_step", "") + " route_proposal_review holds each brief's validated route "
                             "proposal (or proposal:none(reason)), whether the two are equal, and the start-approval parts "
-                            "in scope (question_renames, when present, lists approval question ids converted to ASCII; use the "
-                            "id shown). Write one route question and map its option labels to proposals in "
-                            "route_proposals {question, by_option}; put each start-approval question beside it "
-                            "(mark its approving option \"approves\": true). Do not invent a route no brief proposed."}
+                            "in scope. interview_template already holds the route question and one yes/no question per "
+                            "start approval: keep their ids, kinds and the \"proposal\" and \"approves\" marks, and write "
+                            "topic, question, option label and means, and why in the person's language. The runtime maps "
+                            "each marked option to its proposal when the interview is submitted; add the questions only "
+                            "the person can answer beside them. An answer outside the options selects no route."}
             result.update(frame_interview=step, gate="frame-review", task=request["text"])
             if step["state"] != "released":
                 return {**result, **step}

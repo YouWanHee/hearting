@@ -1498,6 +1498,33 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.calls, ["gate"])
         self.assertEqual(self.resolution()["status"], "blocked")
 
+    def test_the_runtime_mapping_is_stored_with_the_question_and_the_marked_file_replays(self):
+        mapped = {"question": "go", "by_option": {"Run": {
+            "summary": "Run both commands.", "legs": [{"capability": "autopilot-code", "shape": "direct"}],
+            "entry_approvals": [], "execution_scope": "complete"}}}
+
+        def mark(route, jobs, interview):
+            marks = any("proposal" in option for item in interview.get("questions", []) for option in item["options"])
+            return (interview if "route_proposals" in interview or not marks
+                    else {**interview, "route_proposals": mapped}), []
+        marked = {**self.question, "questions": [{
+            "id": "go", "topic": "Run it", "question": "Run both commands now?", "kind": "yes-no",
+            "options": [{"label": "Run", "means": "Run them now.", "proposal": "frame"},
+                        {"label": "Wait", "means": "Do nothing yet."}],
+            "recommended": 0, "why": "Only you can say when."}]}
+        self.question_file.write_text(json.dumps(marked))
+        answer = self.base / "go.json"
+        answer.write_text(json.dumps({"actor_kind": "user", "understanding_confirmed": True,
+                                      "answers": {"go": {"choice": 0}}}))
+        with mock.patch.object(W, "_marked_route_proposals", side_effect=mark):
+            asked = self.step(interview=self.question_file)
+            self.assertEqual(json.loads(Path(asked["interview_file"]).read_text())["route_proposals"], mapped)
+            released = self.step(interview=self.question_file, answers=answer)
+            self.assertEqual(released["state"], "released")
+            self.assertEqual(self.step(interview=self.question_file, answers=answer), released)
+        self.assertIn("Selected route: Run both commands.", Path(released["intent_file"]).read_text())
+        self.assertEqual(self.calls, ["gate", "release"])
+
     def test_every_interview_error_is_reported_at_once(self):
         needs = self.step()
         import frame_interview as FI

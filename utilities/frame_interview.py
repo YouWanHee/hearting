@@ -148,6 +148,16 @@ QUESTION_EXAMPLE = {
 # An approval question marks its approving option with `"approves": true` (exactly one of its two
 # options); choosing the other option declines. Position carries no meaning.
 ROUTE_PROPOSAL_KEYS = frozenset({"question", "by_option"})
+# The runtime builds a framed interview's route question and its start-approval questions.
+# A route option names the frame brief whose proposal it selects with `"proposal": <frame node>`;
+# the runtime turns those marks into `route_proposals` when the interview is submitted.
+ROUTE_QUESTION_ID = "route-choice"
+PROPOSAL_MARK = "proposal"
+
+
+def approval_question_id(leg, key) -> str:
+    """The id of the yes/no question that approves the `key` parts of leg `leg`."""
+    return f"{key}-leg{leg}"
 APPROVAL_FIELDS = frozenset({"key", "leg", "question"})
 
 
