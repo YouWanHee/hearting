@@ -653,10 +653,9 @@ def cmd_watch(args):
 def cmd_gate(args):
     route = load_route(args.route)
     if args.block and not getattr(args, "jobs", None) \
-            and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1" \
-            and os.environ.get("AGENT_HARNESS", "codex").lower() == "codex":
+            and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1":
         raise SupervisorError(
-            "human-gate-jobs-required: Codex strict gate --block requires explicit --jobs"
+            "human-gate-jobs-required: a registered worker's gate --block requires explicit --jobs"
         )
     ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}

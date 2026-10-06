@@ -867,10 +867,10 @@ class FallbackTest(unittest.TestCase):
   self.assertIn(row["preferred_honored"],(True,False))
   self.assertEqual(row["preferred_honored"],row["child_harness"]=="codex")
   for harness in ("claude","codex"): self.assertIn(harness,row["counts"])
- def test_wrapper_command_projects_selected_lifecycle_to_codex_and_claude(self):
+ def test_wrapper_command_projects_selected_lifecycle_to_every_harness(self):
   path=self.route(same_status="supported"); route=json.loads(path.read_text()); node=next(n for n in route["nodes"] if n["id"]=="plan")
   args=SimpleNamespace(action="dry-run",slug="stage",parent="owner",mode="dev/refactor",qa="standard",worker_role=None,model_role="deep maker",prompt_file=None,jobs=self.jobs,route=path,launch_lifecycle="foreground-scoped",foreground_timeout=123.0)
-  for ordinal,harness in ((1,"codex"),(2,"claude")):
+  for ordinal,harness in ((1,"codex"),(2,"claude"),(2,"opencode")):
    row=self.tuple(harness,"supported")
    command=F.wrapper_command(args,route,node,row,ordinal,"att-test")
    self.assertEqual(command[command.index("--worker-type")+1],"stage")
@@ -883,7 +883,8 @@ class FallbackTest(unittest.TestCase):
   command=F.wrapper_command(args,route,node,self.tuple("codex","supported"),1,"att-test")
   self.assertNotIn("--foreground-timeout",command)
   command=F.wrapper_command(args,route,node,self.tuple("opencode","supported"),1,"att-test")
-  self.assertNotIn("--launch-lifecycle",command)
+  self.assertEqual(command[command.index("--launch-lifecycle")+1],"detached")
+  self.assertNotIn("--foreground-timeout",command)
   frame=next(n for n in route["nodes"] if n["id"]=="frame")
   command=F.wrapper_command(args,route,frame,self.tuple("codex","supported"),1,"att-test")
   self.assertEqual(command[command.index("--worker-type")+1],"support")
