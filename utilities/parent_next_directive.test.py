@@ -326,6 +326,19 @@ class PrintedCommandHomeTest(unittest.TestCase):
                                                       "correct", "--attempt-id", "att-1"])
             self.assertIn(f"correct --jobs {other} --attempt-id att-1",
                           pnd.correction_command("att-1", other, agent_home=self.old))
+        # A bare start reads AGENT_DISPATCH_JOBS first: a different one keeps --jobs named.
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state),
+                                                   "AGENT_DISPATCH_JOBS": str(other)}):
+            self.assertIn(f"--jobs {default}", pnd.resume_command(route, default, agent_home=self.old))
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state),
+                                                   "AGENT_DISPATCH_JOBS": str(default)}):
+            self.assertNotIn("--jobs", pnd.resume_command(route, default, agent_home=self.old))
+
+    def test_completion_notices_name_the_installed_release(self):
+        import dispatch_completion_join as join
+        with unittest.mock.patch("parent_next_directive.command_home", return_value=str(self.pointer)):
+            finish = join.completion_harvest_command("att-x", "finish-workflow", jobs="/j/jobs.log", surface="-")
+        self.assertIn(f"{self.pointer}/utilities/dispatch_terminal_commit.py finish", finish)
 
 
 if __name__ == "__main__":

@@ -100,12 +100,19 @@ def entrypoint(agent_home, relative: str) -> str:
 
 
 def registry_args(jobs) -> list[str]:
-    """`--jobs <registry>` only when it is not the registry a bare call already uses."""
+    """`--jobs <registry>` unless it is the stable default a bare call uses here and in a new session.
+
+    A bare `start` reads `AGENT_DISPATCH_JOBS` first, so the registry is left
+    out only when that variable is unset or names this same registry.
+    """
     if not jobs:
         return []
     try:
         from dispatch_contract import stable_state_root
-        if Path(jobs).resolve() == (stable_state_root(os.environ) / "jobs.log").resolve():
+        named = Path(jobs).resolve()
+        inherited = os.environ.get("AGENT_DISPATCH_JOBS")
+        if (named == (stable_state_root(os.environ) / "jobs.log").resolve()
+                and (not inherited or Path(inherited).resolve() == named)):
             return []
     except (ImportError, OSError, ValueError, RuntimeError):
         pass
