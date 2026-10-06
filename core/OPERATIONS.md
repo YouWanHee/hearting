@@ -812,6 +812,12 @@ join retains every owned attempt, including `done` rows, until the exact process
 group and tagged descendants are settled. `dispatch-reconcile --attempt <id>
 --apply` uses the same bounded cleanup proof authority on terminal rows; it
 preserves the result, marker, and delivery receipt and grants no retry credit.
+An exact authenticated portable cleanup receipt remains settled when a later
+same-namespace tag scan cannot read an unrelated process and the current owned
+group is empty; any visible live leader, group member or tagged
+descendant takes precedence. Missing or mismatched proof remains pending. A
+terminal frame batch whose cleanup stays unverifiable reports needs-attention
+instead of promising automatic delivery from already completed workers.
 For the exact route-free registered dispatch-depth-1 support tuple
 `ops/session-tidy-memory` / `session-tidy-memory`, the post-exit join, reaper,
 and normal reconcile consumer settle the existing semantic terminal result

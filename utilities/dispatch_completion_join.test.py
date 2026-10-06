@@ -232,6 +232,41 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(record["children"][0]["reason"], "process-alive")
         self.assertEqual(record["children"][0]["residue_pids"], [4242])
 
+    def test_sealed_portable_cleanup_joins_without_repeated_registry_writes(self):
+        namespace = D.process_namespace_identity()
+        metadata = {
+            "harness": "codex", "fallback_hop": "same-harness-headless", "worker_type": "stage",
+            "pid": "99999996", "pgid": "99999996",
+            "pid_start": D.process_start_ticks(os.getpid()), "pid_ns": namespace,
+            "pid_observer_ns": namespace, "launch_lifecycle": "detached",
+            "launch_outcome": "governed-process-group-drained",
+            "group_reap_proof": D.GROUP_REAP_PROOF, "group_reap_pgid": "99999996",
+            "attempt_descendant_proof": D.ATTEMPT_DESCENDANT_PROOF,
+            "attempt_descendant_observer_ns": namespace,
+            "delivery_receipt_b64": "original-delivery",
+        }
+        self.jobs.write_text(row("done", "att-portable-ready", "att-parent", "a",
+                                 "completed-subsession", process_metadata=metadata))
+        denied = D.ProcessGroupObservation(
+            "unverifiable", reason="procfs-environ:997325:same-uid-unobservable")
+        with mock.patch.object(D, "process_group_observation", return_value=D.ProcessGroupObservation("empty")), \
+             mock.patch.object(D, "attempt_tagged_descendants", return_value=denied):
+            sealed = D.resolve_attempt_cleanup(self.jobs, "att-portable-ready", apply=True)
+            self.assertTrue(sealed["changed"], sealed)
+            original = self.jobs.read_bytes()
+            for _ in range(2):
+                recovery = JOIN.recover_receiptless_attempt(
+                    self.jobs, JOIN.current_attempt_row(self.jobs, "att-portable-ready"))
+                self.assertTrue(recovery["settled"], recovery)
+                self.assertFalse(recovery["changed"], recovery)
+                receipt = JOIN.join_batch(jobs=self.jobs, parent_attempt_id="att-parent",
+                                          timeout=0, recover_receiptless=True)
+                self.assertEqual(receipt["state"], "ready", receipt)
+                self.assertEqual(receipt["children"][0]["status"], "done")
+                self.assertEqual(self.jobs.read_bytes(), original)
+        self.assertNotIn("retry_attempt_id", JOIN.current_attempt_row(
+            self.jobs, "att-portable-ready").metadata)
+
     def test_join_settles_exact_dead_stage_and_cleanup_in_shared_dirty_worktree(self):
         shared=self.root / "shared"; shared.mkdir()
         def git(*args):
