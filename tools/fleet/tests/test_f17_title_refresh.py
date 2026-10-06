@@ -1505,13 +1505,15 @@ class AnsweringProviderSourceTest(_ConfigHomeMixin, unittest.TestCase):
             commands = [(["claude", "-p"], None, None),
                         (["codex", "exec"], None, None)]
             with mock.patch.object(rt, "_resolve_commands", return_value=commands), \
+                 mock.patch.object(rt, "selected_providers",
+                                   return_value=("claude", "codex")), \
                  mock.patch.object(subprocess, "run", side_effect=[
                      self._Completed("   "),
-                     self._Completed("TITLE: Answered Title\nNOW: 답변 요약"),
+                     self._Completed("TITLE: Answered Report Title\nNOW: 답변 요약"),
                  ]):
                 rt.main(["--sid", "sidProv", "--transcript", path])
             d = titles.read("sidProv")
-            self.assertEqual(d["title"], "Answered Title")
+            self.assertEqual(d["title"], "Answered Report Title")
             self.assertEqual(d["summary"], "답변 요약")
             self.assertEqual(d["source"], "refresher:codex")
 
