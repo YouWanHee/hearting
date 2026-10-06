@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from hearting_gates import gates_on, same_work_or_refuse
+from session_identity import session_label
 
 import base64
 from contextlib import contextmanager
@@ -7687,9 +7688,7 @@ def record_evidence_change(
                 "evidence_changed_at": changed_at,
                 "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "observed_by": (os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
-                                or os.environ.get("CLAUDE_SESSION_ID")
-                                or os.environ.get("CODEX_THREAD_ID")
-                                or os.environ.get("OPENCODE_SESSION_ID") or "operator"),
+                                or session_label()),
                 "observed_in": " ".join(command) or None,
             }
             handle.seek(0, os.SEEK_END)

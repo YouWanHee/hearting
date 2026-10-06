@@ -26,6 +26,7 @@ import re
 
 from dispatch_attempt_policy import committed_outcome, readable_result
 import review_round_cap as _ROUND
+from session_identity import identity as session_identity, session_label
 
 
 def _contract_error(reason, detail=""):
@@ -38,22 +39,16 @@ def _contract_error(reason, detail=""):
 # ---------------------------------------------------------------------------
 
 def caller_identity(environ=None) -> tuple[str, str]:
-    """Resolve the caller's native identity, independently of the child adapter."""
-    env = os.environ if environ is None else environ
-    sessions = {
-        "codex": env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID") or "",
-        "claude": env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_SESSION_ID") or "",
-        "opencode": env.get("OPENCODE_SESSION_ID") or "",
-    }
-    explicit = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
-    if explicit:
-        if explicit not in sessions:
-            raise _contract_error("caller-harness-invalid")
-        return explicit, sessions[explicit]
-    detected = [(harness, session) for harness, session in sessions.items() if session]
-    if len(detected) > 1:
+    """Resolve the caller's native identity, independently of the child adapter.
+
+    `session_identity.identity()` reads it; a launch refuses a caller it cannot name.
+    """
+    found = session_identity(environ)
+    if found.confidence == "invalid":
+        raise _contract_error("caller-harness-invalid")
+    if found.confidence == "ambiguous":
         raise _contract_error("caller-harness-ambiguous")
-    return detected[0] if detected else ("", "")
+    return found.harness, found.session_id
 
 
 def default_parent_session_id(environ=None) -> str | None:
@@ -110,9 +105,7 @@ def bind_runtime_parent(args, *, honor_force: bool = False, environ=None) -> Non
 
 def correction_source_session(environ=None) -> str:
     """The session recorded as the sender of an owner correction (a label, not a check)."""
-    env = os.environ if environ is None else environ
-    return (env.get("CODEX_THREAD_ID") or env.get("CLAUDE_SESSION_ID")
-            or env.get("OPENCODE_SESSION_ID") or "operator")
+    return session_label(environ)
 
 
 def owns(meta, session, jobs) -> bool:
