@@ -829,8 +829,8 @@ class DerivedAccessTest(unittest.TestCase):
         o = self.other
         self.assertEqual(request["writable_roots"], [str(o / "out")])
         self.assertEqual(request["read_roots"], sorted([str(o / "docs"), str(o / "ref"), str(self.elsewhere)]))
-        self.assertIn("approved scope field (line 2)", request["justification"][str(o / "out")])
-        self.assertIn("task text (line 3)", request["justification"][str(self.elsewhere)])
+        self.assertIn("approved scope field (line 2, writes:저장)", request["justification"][str(o / "out")])
+        self.assertIn("task text (line 3, task text)", request["justification"][str(self.elsewhere)])
         skipped = {row["path"]: row["reason"] for row in binding["derivation"]["skipped"]}
         self.assertEqual(skipped[str(o / "data" / "raw")], "excluded-by-scope")
         self.assertEqual(skipped[str(o / "data")], "holds-excluded-path")
@@ -907,21 +907,80 @@ class DerivedAccessTest(unittest.TestCase):
         self.assertTrue(binding["derivation"]["dropped"].startswith("execution-access-root-too-broad"))
 
     def test_a_qualifier_after_a_scope_path_belongs_to_that_path(self):
-        # The start card's scope holds what is included and what is excluded (WORKFLOW §0.4).
+        # The start card's scope holds what is included and what is excluded (WORKFLOW §0.4);
+        # a path is written only where its clause says so and nothing else.
         cases = {
-            "범위: /x/out, /x/raw(제외)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out, /x/raw(제외)": {"/x/out": "read", "/x/raw": "excluded"},
             "범위: /x/out 쓰기, /x/raw (읽기 전용)": {"/x/out": "write", "/x/raw": "read"},
             "Scope: /x/out (write), /x/raw (read-only)": {"/x/out": "write", "/x/raw": "read"},
-            "범위: /x/out, /x/raw (손대지 않음)": {"/x/out": "write", "/x/raw": "excluded"},
-            "범위: /x/out, /x/raw, 읽기만": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out에 저장, /x/raw (손대지 않음)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out 저장, /x/raw, 읽기만": {"/x/out": "write", "/x/raw": "read"},
             "범위: /x/out 쓰기 (원본 /x/raw 제외)": {"/x/out": "write", "/x/raw": "excluded"},
-            "범위: /x/out, 원본 /x/raw 유지": {"/x/out": "write", "/x/raw": "read"},
-            "Scope: /x/out, /x/raw is off-limits": {"/x/out": "write", "/x/raw": "excluded"},
-            "> 범위: /x/quoted": {"/x/quoted": "read"},
+            "범위: /x/out 수정, 원본 /x/raw 유지": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw is off-limits": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out 저장, /x/ro (write-protected)": {"/x/out": "write", "/x/ro": "excluded"},
+            "범위: /x/out에 쓰지 마": {"/x/out": "excluded"},
+            "범위: /x/a 읽고 결과 저장": {"/x/a": "read"},
+            "범위: /x/db 기록조사": {"/x/db": "read"},
+            "범위: /x/plain": {"/x/plain": "read"},
+            "> 범위: /x/quoted 저장": {"/x/quoted": "read"},
+            "범위: /data/outputs, /data/write_here": {"/data/outputs": "read", "/data/write_here": "read"},
+            "범위: /data/input 저장": {"/data/input": "write"},
+            "범위: 읽기만, /x/a 저장": {"/x/a": "read"},
+            "범위: 다음은 제외, /x/a 저장, /x/b 저장": {"/x/a": "excluded", "/x/b": "excluded"},
         }
         for line, expected in cases.items():
             with self.subTest(line=line):
-                self.assertEqual({path: access for _, path, access, _, _ in EA._task_paths(line)}, expected)
+                self.assertEqual({row[1]: row[2] for row in EA._task_paths(line)}, expected)
+
+    def test_the_verifier_probe_never_widens_to_write(self):
+        # ACCESS-DERIVATION-PROBE.py (hearting-verify-cc [28]), as a regression.
+        X = self.root / "X"
+        for name in ("out", "raw", "keep", "other", "secret_stuff"):
+            (X / name).mkdir(parents=True)
+        (X / "out" / "f.txt").write_text("x", encoding="utf-8")
+        (self.home / "docs").mkdir()
+        (X / "lnk_ssh").symlink_to(self.home / ".ssh")
+        (X / "lnk_home").symlink_to(self.home)
+        (X / "lnk_etc").symlink_to("/etc")
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / "install",
+                                      environ={"HOME": str(self.home)})
+        cases = [
+            ("범위: $X/out (write), $X/raw (read-only)", True, {"$X/out": "write", "$X/raw": "read"}, {}),
+            ("범위: $X/out, $X/raw(제외)", True, {"$X/out": "read"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $X/out 쓰기, $X/raw (읽기 전용)", True, {"$X/out": "write", "$X/raw": "read"}, {}),
+            ("범위: $X/out, $X/raw (손대지 않음)", True, {"$X/out": "read"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $X/out 쓰기 (원본 $X/raw 제외)", True, {"$X/out": "write"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $X/out, $X/raw, 읽기만", True, {"$X/out": "read", "$X/raw": "read"}, {}),
+            ("범위: $X/out, $X/raw 원본 유지, $X/keep is off-limits", True,
+             {"$X/out": "read", "$X/raw": "read"}, {"$X/keep": "excluded-by-scope"}),
+            ("범위: $X/lnk_ssh 저장", True, {}, {"$X/lnk_ssh": "sensitive"}),
+            ("범위: $X/lnk_home 저장", True, {}, {"$X/lnk_home": "too-broad"}),
+            ("범위: $X/lnk_etc 저장", True, {}, {"$X/lnk_etc": "sensitive"}),
+            ("범위: /, $H 저장", True, {}, {"$H": "too-broad"}),
+            ("범위: $X/out/../../home/.ssh 저장", True, {}, {"$X/out/../../home/.ssh": "not-a-path"}),
+            ("범위: $X/out 저장", False, {"$X/out": "read"}, {}),
+            ("결과는 $X/out 에 쓰고 $X/raw 를 읽는다", True, {"$X/out": "read", "$X/raw": "read"}, {}),
+            ("> 범위: $X/other 저장\n참고 문서 인용", True, {"$X/other": "read"}, {}),
+            ("범위: $X/secret_stuff 저장", True, {}, {"$X/secret_stuff": "sensitive"}),
+            ("범위: $X/out/f.txt 저장", True, {"$X/out": "read"}, {}),
+            ("Scope: write $X/out; not $X/raw", True, {"$X/out": "write"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $H/docs 저장", True, {"$H/docs": "write"}, {}),
+        ]
+        def short(path):
+            return path.replace(str(X), "$X").replace(str(self.home), "$H")
+        for text, write, granted, skipped in cases:
+            with self.subTest(text=text):
+                derived = EA.derive_task_access(
+                    {"work_request": {"text": text.replace("$X", str(X)).replace("$H", str(self.home))}},
+                    context, write=write)
+                self.assertEqual({short(r["path"]): r["access"] for r in derived.record["granted"]}, granted)
+                self.assertEqual({short(r["path"]): r["reason"] for r in derived.record["skipped"]}, skipped)
+                for row in derived.record["granted"]:
+                    self.assertTrue(row["why"])
+        rows = EA.derive_task_access({"work_request": {"text": f"범위: {X}/out에 결과 저장"}}, context)
+        self.assertIn("writes:저장", rows.justification[0][1])
 
     def test_the_task_text_reader(self):
         rows = EA._task_paths(
@@ -930,10 +989,10 @@ class DerivedAccessTest(unittest.TestCase):
             "scope: {writes: [\"/c/w\"], reads: [\"/c/r\"]}\n"
             "see https://example.com/d/e and 경로:/f/g. and /h/보고서_v2초안\n"
             "범위 변경: /i/j\n")
-        found = {(path, access, source) for _, path, access, source, _ in rows}
+        found = {(path, access, source) for _, path, access, source, _, _ in rows}
         self.assertEqual(found, {
             ("/a/out", "write", "scope"), ("/a/ref", "read", "scope"), ("/a/raw", "excluded", "scope"),
-            ("/a/after", "excluded", "scope"), ("/b/x", "write", "scope"), ("/b/y", "read", "scope"),
+            ("/a/after", "excluded", "scope"), ("/b/x", "read", "scope"), ("/b/y", "read", "scope"),
             ("/c/w", "write", "scope"), ("/c/r", "read", "scope"), ("/f/g", "read", "task"),
             ("/h/보고서_v2초안", "read", "task"), ("/i/j", "read", "task")})
 

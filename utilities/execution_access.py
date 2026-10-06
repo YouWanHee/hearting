@@ -370,11 +370,17 @@ _SCOPE_FIELD = re.compile(r"^[\s*-]*(?:\*\*)?(?:범위|[Ss]cope)(?:\*\*)?\s*[:�
 _TASK_PATH = re.compile(r"(?<![\w.~/\\-])/[^\s`'\"<>()\[\]{}|,;*?=]+")
 _SCOPE_CLAUSE = re.compile(r"[^,;·、，()]+")
 _SCOPE_EXCLUDED = re.compile(
-    r"제외|금지|않|말고|빼고|건드리지|손대지"
-    r"|\b(?:exclud\w*|except|never|not|without|untouched|off[- ]limits)\b", re.I)
+    r"제외|금지|않|말고|빼고|건드리지|손대지|보호|지\s*말|지\s*마(?:라|세요|십시오|$|[\s.,)])"
+    r"|\b(?:exclud\w*|except|never|not|without|untouched|off[- ]limits|protect\w*)\b", re.I)
 _SCOPE_READ_ONLY = re.compile(
-    r"읽|참조|참고|조회|입력|보기|확인|보존|불변|유지|그대로"
-    r"|\b(?:read\w*|referenc\w*|input\w*|inspect\w*|view\w*|preserv\w*|keep)\b", re.I)
+    r"읽|참조|참고|조회|입력|보기|확인|보존|불변|유지|그대로|조사|분석|검토|비교"
+    r"|\b(?:read\w*|referenc\w*|input\w*|inspect\w*|view\w*|preserv\w*|keep|analy[sz]\w*|review\w*)\b",
+    re.I)
+# Only a clause that says it writes there, and nothing else, makes a write root.
+_SCOPE_WRITES = re.compile(
+    r"쓰기|쓴다|써서|저장|수정|생성|작성|갱신|적용|만들|추가|변경|편집|삭제|이동|복사|옮기|출력|기록"
+    r"|\b(?:writ\w*|save\w*|updat\w*|modif\w*|creat\w*|appl(?:y|ies)|edit\w*|generat\w*|stor(?:e|es)"
+    r"|append\w*|delet\w*|output\w*|copy|move)\b", re.I)
 _PATH_PARTICLES = ("에서는", "에서도", "으로는", "에서", "에게", "에는", "에도", "으로", "까지", "부터",
                    "처럼", "이나", "안에", "아래", "폴더", "경로", "로", "에", "의", "을", "를", "은",
                    "는", "이", "가", "와", "과", "도", "만", "나", "안")
@@ -411,48 +417,67 @@ def _strip_particles(token: str) -> str:
     return token
 
 
-def _scope_access(clauses: list[str]) -> list[str]:
-    """`write`, `read` or `excluded` for each clause of the scope field. A clause
-    that names no path qualifies the nearest clause before it that does (`…/raw
-    (제외)`, `…/raw, 읽기만`); everything from the first excluded clause on is excluded."""
+def _scope_access(clauses: list[str]) -> list[tuple[str, str]]:
+    """`(access, why)` for each clause of the scope field: `write` only where the
+    clause says it writes there and says nothing that reads or excludes, `excluded`
+    from the first excluding clause on, otherwise `read`. A clause that names no
+    path qualifies the nearest clause before it that does (`…/raw (제외)`, `…/raw,
+    읽기만`). Any doubt falls toward less access, never toward write."""
 
-    access = ["write"] * len(clauses)
+    marks: list[dict[str, str]] = [{} for _ in clauses]
     owner = None
+    leading: dict[str, str] = {}
     excluded_from = None
     for index, clause in enumerate(clauses):
         if _TASK_PATH.search(clause):
             owner = index
-        target = index if owner is None else owner
-        if excluded_from is None and _SCOPE_EXCLUDED.search(clause):
-            excluded_from = target
-        if _SCOPE_READ_ONLY.search(clause):
-            access[target] = "read"
-    if excluded_from is not None:
-        access[excluded_from:] = ["excluded"] * (len(clauses) - excluded_from)
-    return access
+            for kind, word in leading.items():   # a path-less clause before the first path
+                marks[owner].setdefault(kind, word)
+            leading = {}
+        words = _TASK_PATH.sub(" ", clause)        # a path's own letters say nothing
+        for kind, pattern in (("exclude", _SCOPE_EXCLUDED), ("read", _SCOPE_READ_ONLY), ("write", _SCOPE_WRITES)):
+            found = pattern.search(words)
+            if found:
+                (marks[owner] if owner is not None else leading).setdefault(kind, found.group(0))
+        if excluded_from is None and owner is not None and "exclude" in marks[owner]:
+            excluded_from = owner
+    result = []
+    for index, mark in enumerate(marks):
+        if excluded_from is not None and index >= excluded_from:
+            word = mark.get("exclude") or marks[excluded_from].get("exclude", "")
+            result.append(("excluded", f"excluded:{word}"))
+        elif "write" in mark and "read" not in mark:
+            result.append(("write", f"writes:{mark['write']}"))
+        elif "write" in mark:
+            result.append(("read", f"both read and write:{mark['read']}/{mark['write']}"))
+        elif "read" in mark:
+            result.append(("read", f"reads:{mark['read']}"))
+        else:
+            result.append(("read", "no write word"))
+    return result
 
 
-def _task_paths(text: str) -> list[tuple[int, str, str, str, str]]:
-    """`(line, path, access, source, quote)` for each absolute path the task
+def _task_paths(text: str) -> list[tuple[int, str, str, str, str, str]]:
+    """`(line, path, access, source, quote, why)` for each absolute path the task
     names: `source` is `scope` on the approved scope field, else `task`; `access`
-    is `write`, `read` or `excluded` (`_scope_access`); `quote` is the scope clause
-    or the words around the path."""
+    is `write`, `read` or `excluded` and `why` the words that decided it
+    (`_scope_access`); `quote` is the scope clause or the words around the path."""
 
-    found: list[tuple[int, str, str, str, str]] = []
+    found: list[tuple[int, str, str, str, str, str]] = []
     for number, line in enumerate(text.splitlines(), 1):
         scope = _SCOPE_FIELD.match(line)
         if scope is None:
-            clauses = [(line, "read")]
+            clauses = [(line, ("read", "task text"))]
         else:
             parts = [m.group(0) for m in _SCOPE_CLAUSE.finditer(scope.group(1))]
             clauses = list(zip(parts, _scope_access(parts)))
-        for clause, access in clauses:
+        for clause, (access, why) in clauses:
             for match in _TASK_PATH.finditer(clause):
                 if not match.group(0).startswith("//"):
                     quote = (clause if scope is not None
                              else clause[max(0, match.start() - 60):match.end() + 40])
                     found.append((number, _strip_particles(match.group(0)), access,
-                                  "task" if scope is None else "scope", quote))
+                                  "task" if scope is None else "scope", quote, why))
     return found
 
 
@@ -526,7 +551,7 @@ def derive_task_access(
     if not isinstance(text, str):
         return DerivedAccess((), (), (), {"granted": granted, "skipped": skipped})
     occurrences = []
-    for number, token, access, source, quote in _task_paths(text):
+    for number, token, access, source, quote, why in _task_paths(text):
         try:
             _validate_path_text(token)
             literal = Path(token)
@@ -534,15 +559,15 @@ def derive_task_access(
         except (ExecutionAccessError, OSError, RuntimeError, ValueError):
             skipped.append({"path": token[:200], "line": number, "source": source, "reason": "not-a-path"})
             continue
-        occurrences.append((number, literal, resolved, access, source, quote))
-    excluded = [resolved for _, _, resolved, access, _, _ in occurrences if access == "excluded"]
-    kept_read_only = [resolved for _, _, resolved, access, source, _ in occurrences
+        occurrences.append((number, literal, resolved, access, source, quote, why))
+    excluded = [resolved for _, _, resolved, access, _, _, _ in occurrences if access == "excluded"]
+    kept_read_only = [resolved for _, _, resolved, access, source, _, _ in occurrences
                       if access == "read" and source == "scope"]
     defaults = (context.worktree, context.artifact_root,
                 *(Path(p).resolve(strict=False) for p in writable))
     candidates: list[tuple[Path, str, dict]] = []
-    for number, literal, resolved, access, source, quote in occurrences:
-        entry = {"line": number, "source": source, "text": _excerpt(quote)}
+    for number, literal, resolved, access, source, quote, why in occurrences:
+        entry = {"line": number, "source": source, "text": _excerpt(quote), "why": why}
         try:
             reason, literal, resolved, access = _derivable(
                 literal, resolved, access, entry, context, defaults, excluded)
@@ -587,7 +612,8 @@ def _derived_from_record(record: object) -> DerivedAccess | None:
     justification = tuple(
         (str(row.get("path")), (f"Derived {row.get('access')} root from the "
                                 f"{'approved scope field' if row.get('source') == 'scope' else 'task text'} "
-                                f"(line {row.get('line')}): {row.get('text')}")[:MAX_TEXT_LENGTH])
+                                f"(line {row.get('line')}, {row.get('why') or 'task text'}): "
+                                f"{row.get('text')}")[:MAX_TEXT_LENGTH])
         for row in granted)
     return DerivedAccess(
         writable_roots=tuple(Path(str(row.get("path"))) for row in granted if row.get("access") == "write"),
