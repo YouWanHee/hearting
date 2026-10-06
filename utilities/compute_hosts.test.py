@@ -826,6 +826,19 @@ class ComputeHostsTest(unittest.TestCase):
             claim = json.loads(claimed.stdout)
             self.assertEqual(claim["root_pid"], process.pid)
             self.assertEqual(claim["owner"]["label"], "codex:f11a0486")
+            # Without --harness/--session the launcher's own session is the owner.
+            keys = {key for key, _harness in load_module().SESSION_ENV_KEYS}
+            bare = {k: v for k, v in self.env.items() if k not in keys}
+
+            def claim_with(env):
+                return subprocess.run([sys.executable, str(TOOL), "claim", "here", str(process.pid), "--json"],
+                                      text=True, capture_output=True, env=env)
+            defaulted = claim_with({**bare, "CODEX_THREAD_ID": "f11a0486-c090-4098-aeb0-0fd6d79f8d0c"})
+            self.assertEqual(defaulted.returncode, 0, defaulted.stderr)
+            self.assertEqual(json.loads(defaulted.stdout)["owner"]["label"], "codex:f11a0486")
+            alone = claim_with(bare)
+            self.assertNotEqual(alone.returncode, 0)
+            self.assertIn("--session", alone.stderr)
 
             env = {
                 **clean,
@@ -1183,13 +1196,13 @@ class LauncherProvenanceTest(unittest.TestCase):
                        "SSH_AUTH_SOCK", "AGENT_DISPATCH_JOBS", "MY_ARBITRARY"):
             self.assertNotIn(canary, result.stdout)
 
-    def test_unknown_provenance_is_omitted_and_launch_stays_whole(self):
+    def test_unknown_provenance_is_empty_and_launch_stays_whole(self):
         env = self.scrubbed_env()
         dry = self.run_tool("run", "here", "--name", "bare", "--dry-run",
                             "--", "bash", "-c", "echo hi", env=env)
         self.assertEqual(dry.returncode, 0, dry.stderr)
-        self.assertNotIn("export AGENT_HOME", dry.stdout)
-        self.assertNotIn("export AGENT_DISPATCH_ATTEMPT_ID", dry.stdout)
+        self.assertIn("export AGENT_HOME=''", dry.stdout)
+        self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=''", dry.stdout)
         self.assertIn("export HEARTING_COMPUTE_RUN_ID=", dry.stdout)
         result = self.run_tool("run", "here", "--name", "bare", "--",
                                "bash", "-c", "echo survived", env=env)
@@ -1202,7 +1215,7 @@ class LauncherProvenanceTest(unittest.TestCase):
         meta = json.loads(
             (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["provenance"],
-                         {"agent_home": None, "attempt_id": None})
+                         {"agent_home": None, "attempt_id": None, "session": None})
         # The conda-selection field keeps its own meaning beside provenance.
         self.assertIsNone(meta["env"])
 
@@ -1239,7 +1252,7 @@ class LauncherProvenanceTest(unittest.TestCase):
             (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["provenance"],
                          {"agent_home": str(home.resolve()),
-                          "attempt_id": attempt})
+                          "attempt_id": attempt, "session": None})
 
     def test_invalid_attempt_never_reaches_the_payload(self):
         home = self.make_home()
@@ -1250,10 +1263,10 @@ class LauncherProvenanceTest(unittest.TestCase):
                             "--", "bash", "-c", "echo hi", env=env)
         self.assertEqual(dry.returncode, 0, dry.stderr)
         self.assertIn("export AGENT_HOME=", dry.stdout)
-        self.assertNotIn("export AGENT_DISPATCH_ATTEMPT_ID", dry.stdout)
+        self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=''", dry.stdout)
         self.assertNotIn("prov-pwned", dry.stdout)
 
-    def test_provenance_unset_precedes_validated_exports(self):
+    def test_provenance_keys_are_always_exported(self):
         home = self.make_home()
         env = self.scrubbed_env(
             AGENT_HOME=str(home),
@@ -1262,10 +1275,12 @@ class LauncherProvenanceTest(unittest.TestCase):
                             "--dry-run", "--", "bash", "-c", "echo hi", env=env)
         self.assertEqual(dry.returncode, 0, dry.stderr)
         setup = dry.stdout.split("setup: ", 1)[1]
-        unset_at = setup.index("unset AGENT_HOME AGENT_DISPATCH_ATTEMPT_ID")
-        self.assertLess(unset_at, setup.index("export AGENT_HOME="))
-        self.assertLess(
-            unset_at, setup.index("export AGENT_DISPATCH_ATTEMPT_ID="))
+        self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=att-9f2c4b1ad34e", setup)
+        self.assertIn("export AGENT_HOME=", setup)
+        # Unknown here is the empty string, never an absent key a strict read dies on.
+        unknown = self.run_tool("run", "here", "--name", "prov-unknown", "--dry-run", "--",
+                                "bash", "-c", "echo hi", env=self.scrubbed_env(AGENT_HOME=str(home)))
+        self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=''", unknown.stdout.split("setup: ", 1)[1])
 
     def run_with_foreign_transport(self, name, env):
         """Launch through a tmux server that retains unrelated old values.
@@ -1305,7 +1320,7 @@ class LauncherProvenanceTest(unittest.TestCase):
         meta = json.loads(
             (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["provenance"],
-                         {"agent_home": None, "attempt_id": None})
+                         {"agent_home": None, "attempt_id": None, "session": None})
 
     def test_invalid_attempt_clears_foreign_attempt_only(self):
         home = self.make_home()
