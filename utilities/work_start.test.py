@@ -1219,6 +1219,85 @@ class WorkStartTest(unittest.TestCase):
         self.path.with_suffix(".outcome.json").write_text(json.dumps(outcome))
         self.assertEqual(self.start()["reason"], "route-closed-unproven")
 
+    def test_closed_spec_publication_gap_retries_without_preparing_or_restarting_work(self):
+        import artifact_producer
+        self.route["capability"] = "autopilot-spec"
+        artifact_root = Path(self.tmp.name) / "artifacts"
+        artifact_root.mkdir()
+        self.route["artifact_root"] = str(artifact_root.resolve())
+        self.path.write_text(json.dumps(self.route))
+        outcome = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                   "terminal_gate_proven": True}
+        outcome_path = self.path.with_suffix(".outcome.json")
+        outcome_path.write_text(json.dumps(outcome))
+        original = outcome_path.read_bytes()
+        pending = {"cycle_id": "cyc-original", "status": "pending", "reason": "shared-spec-conflict"}
+        admitted = {"cycle_id": "cyc-original", "status": "admitted", "shared_reference_revision_id": "rrev-original"}
+        with mock.patch.object(artifact_producer, "prepare_route_artifact_env", side_effect=AssertionError("reopen")), \
+             mock.patch.object(artifact_producer, "route_cycle_for", return_value={"cycle_id": "cyc-original"}), \
+             mock.patch.object(artifact_producer, "completed_spec_publication", side_effect=[pending, admitted]) as publish:
+            first = self.start()
+            self.assertEqual((first["state"], first["reason"]), ("needs-attention", "shared-spec-publication-pending"))
+            self.assertEqual(first["shared_publication"], pending)
+            second = self.start()
+            self.assertEqual(second["state"], "completed")
+            self.assertEqual(second["shared_publication"], admitted)
+            self.assertEqual(first["resume_command"], second["resume_command"])
+            self.assertEqual(publish.call_count, 2)
+            self.assertTrue(all(call.kwargs == {"cycle_id": "cyc-original", "settle": True}
+                                for call in publish.call_args_list))
+        self.assertEqual(outcome_path.read_bytes(), original)
+        self.assertEqual(self.calls, [])
+
+    def test_closed_spec_missing_artifact_root_is_typed_pending_without_guessing_or_restarting(self):
+        import artifact_producer
+        self.route["capability"] = "autopilot-spec"
+        outcome_path = self.path.with_suffix(".outcome.json")
+        outcome_path.write_text(json.dumps({"route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"], "terminal_gate_proven": True}))
+        original = outcome_path.read_bytes()
+        with mock.patch.object(artifact_producer, "prepare_route_artifact_env", side_effect=AssertionError("reopen")), \
+             mock.patch.object(artifact_producer, "route_cycle_for", side_effect=AssertionError("guessed root")), \
+             mock.patch.object(artifact_producer, "completed_spec_publication", side_effect=AssertionError("no root")):
+            for root in (None, "", " "):
+                if root is None:
+                    self.route.pop("artifact_root", None)
+                else:
+                    self.route["artifact_root"] = root
+                self.path.write_text(json.dumps(self.route))
+                receipt = self.start()
+                self.assertEqual((receipt["state"], receipt["reason"]),
+                                 ("needs-attention", "shared-spec-publication-pending"))
+                self.assertEqual(receipt["shared_publication"],
+                                 {"status": "pending", "reason": "spec-artifact-root-unavailable"})
+                self.assertEqual(receipt["launches"], [])
+                self.assertFalse(receipt["owner_started"])
+                self.assertEqual(outcome_path.read_bytes(), original)
+        self.assertEqual(self.calls, [])
+
+    def test_closed_runtime_owner_retries_only_post_seal_publication_and_keeps_the_returned_revision(self):
+        import artifact_producer
+        import dispatch_terminal_commit as terminal
+        self.route["capability"] = "autopilot-spec"
+        self.path.with_suffix(".outcome.json").write_text(json.dumps({
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+            "terminal_gate_proven": True, "terminal_owner_attempt_id": "att-original"}))
+        meta = {"workflow_completion": "runtime-v1", "owner_route_id": self.route["route_id"]}
+        publication = {"status": "admitted", "shared_reference_revision_id": "rrev-original"}
+        with mock.patch.object(W, "_rows", return_value={"att-original": ("done", meta)}), \
+             mock.patch.object(terminal, "owner_completion_state", side_effect=[
+                 terminal.CompletionState("pending", "shared-spec-publication-pending"), terminal.CompletionState("complete")]), \
+             mock.patch.object(terminal, "settle_owner_completion", return_value=terminal.TerminalCommitResult(
+                 "completed", shared_publication=publication)) as settle, \
+             mock.patch.object(artifact_producer, "completed_spec_publication") as duplicate, \
+             mock.patch.object(artifact_producer, "prepare_route_artifact_env", side_effect=AssertionError("reopen")):
+            result = self.start()
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["shared_publication"], publication)
+        settle.assert_called_once_with(self.jobs, "done", meta)
+        duplicate.assert_not_called()
+        self.assertEqual(self.calls, [])
+
     def test_direct_start_replay_is_fenced_while_inline_finish_is_pending(self):
         import artifact_producer
         import inline_finish

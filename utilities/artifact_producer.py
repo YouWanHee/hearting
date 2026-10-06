@@ -1458,6 +1458,23 @@ def status(root: Path) -> Dict[str, Any]:
     pending = sorted(p.stem for p in journal_dir.glob("*.json")) if journal_dir.is_dir() else []
     klass = classify_root(root)
     fallback = legacy_fallback_state(root, classification=klass)
+    specs = [r for r in records if r.get("capability") == "autopilot-spec" and r.get("state") == "sealed"]
+    references = list_references(root, "spec") if specs else []
+    # Read shared revision metadata once per status call, not once per cycle.
+    # This is an in-call projection, never a cache or publication authority.
+    lineage: Dict[str, Any] = {}
+    for reference in references:
+        ref_id = reference["shared_reference_id"]
+        for revision_id in reversed(reference.get("revisions", [])):
+            revision = _read_json(root / "shared/spec" / ref_id / "revisions" / revision_id / REVISION_RECORD_NAME)
+            if revision is not None:
+                source = revision.get("source")
+                source_cycle = source.get("cycle_id") if isinstance(source, Mapping) else None
+                if isinstance(source_cycle, str):
+                    lineage.setdefault(source_cycle, {}).setdefault(ref_id, []).append((revision_id, revision))
+    publications = [completed_spec_publication(root, cycle_id=r["cycle_id"], references=references,
+                                              known_publications=lineage.get(r["cycle_id"], {}))
+                    for r in specs]
     return {
         "artifact_root": str(root),
         "cutover": read_cutover(root),
@@ -1465,6 +1482,7 @@ def status(root: Path) -> Dict[str, Any]:
         "cycle_counts": counts,
         "open_cycles": [r["cycle_id"] for r in records if r.get("state") == "open"],
         "pending_journals": pending,
+        "shared_spec_publications": [p for p in publications if p["status"] != "not-applicable"],
         "root_classification": klass["state"],
         "activation_kind": read_cutover(root).get("activation_kind", "approval") if klass["state"] == "active" else None,
         "legacy_fallback": fallback,
@@ -2861,8 +2879,62 @@ def _placed_locator(locator: Optional[str], moved: Sequence[Mapping[str, str]]) 
     return locator
 
 
+def official_spec_primary(route: Mapping[str, Any], names: Sequence[str],
+                          preferred: Optional[str] = None) -> Optional[str]:
+    """An actual root/scoped component PRD, never a snapshot or terminal report."""
+    if route.get("capability") != "autopilot-spec":
+        return None
+    components = spec_scope_components(
+        scope for node in route.get("nodes", []) for scope in node.get("write_scope", []))
+    available = set(names)
+    candidates = []
+    if not components:
+        candidates.append("artifacts/spec/prd.md")
+    if components is None:
+        components = tuple(sorted({Path(name).parts[2] for name in names
+            if len(Path(name).parts) == 4 and name.startswith("artifacts/spec/")
+            and name.endswith("/prd.md") and Path(name).parts[2] != "_internal"}))
+    candidates.extend(f"artifacts/spec/{component}/prd.md" for component in components)
+    actual = [name for name in candidates if name in available]
+    return preferred if preferred in actual else next(iter(actual), None)
+
+
+def official_spec_primary_path(root: Path, record: Mapping[str, Any], route: Mapping[str, Any],
+                               preferred: Optional[Path] = None) -> Optional[Path]:
+    """Read the known canonical paths in this exact cycle; no recursive report search."""
+    if route.get("capability") != "autopilot-spec":
+        return None
+    directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record).resolve()
+    directory.relative_to(Path(root).resolve())
+    spec = directory / "artifacts/spec"
+    components = spec_scope_components(
+        scope for node in route.get("nodes", []) for scope in node.get("write_scope", []))
+    paths = [spec / "prd.md"]
+    if components is None:
+        if spec.is_dir() and not spec.is_symlink():
+            paths.extend(p / "prd.md" for p in spec.iterdir() if p.is_dir() and not p.is_symlink()
+                         and p.name != "_internal")
+    else:
+        paths.extend(spec / component / "prd.md" for component in components)
+    names = []
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or not path.stat().st_size:
+                continue
+            path.resolve(strict=True).relative_to(directory / "artifacts")
+            names.append(path.relative_to(directory).as_posix())
+        except (OSError, ValueError):
+            continue
+    try:
+        wanted = preferred.relative_to(directory).as_posix() if preferred is not None else None
+    except ValueError:
+        wanted = None
+    selected = official_spec_primary(route, names, wanted)
+    return directory / selected if selected is not None else None
+
+
 def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
-                    support: Sequence[str] = ()) -> Optional[str]:
+                    support: Sequence[str] = (), route: Optional[Mapping[str, Any]] = None) -> Optional[str]:
     # A `support` row is attached evidence, not this cycle's output, so it is never
     # auto-nominated as the primary artifact -- an explicit `primary` still wins.
     # Support-material paths are skipped the same way while any durable output
@@ -2880,6 +2952,9 @@ def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
             )
         return candidate
     durable = [rel for rel in names if not _is_support_locator(rel)] or names
+    official = official_spec_primary(route or {}, durable)
+    if official is not None:
+        return official
     for wanted in PRIMARY_CANDIDATES:
         for rel in durable:
             if rel.endswith("/" + wanted) or rel == "artifacts/" + wanted:
@@ -3017,7 +3092,8 @@ def build_manifest(
     # loose files into a cycle this way). Empty by default, so an ordinary cycle's
     # manifest bytes are unchanged.
     support_rels = {"artifacts/" + rel.lstrip("/") for rel in support_locators}
-    primary_rel = _choose_primary([(rel, None) for rel, _d, _s in facts], primary, support=support_rels)
+    primary_rel = _choose_primary([(rel, None) for rel, _d, _s in facts], primary,
+                                  support=support_rels, route=route)
 
     def provenance(digest: str, recorded_in: Optional[str] = None) -> Dict[str, Any]:
         return {
@@ -7556,7 +7632,7 @@ _UNKNOWN_BASE = object()
 
 def _finished_spec_publication(root: Path, reference: Mapping[str, Any], cycle_id: str, source_rel: str,
                                record: Mapping[str, Any], source_path: Path,
-                               base_revision: Optional[str]):
+                               base_revision: Optional[str], known_publications=None):
     """The earlier publication this `admit-shared` call repeats, if any.
 
     It is a retry when a revision of this reference was published from this
@@ -7575,9 +7651,11 @@ def _finished_spec_publication(root: Path, reference: Mapping[str, Any], cycle_i
         receipt = _read_json(source_path / SPEC_BASE_RECEIPT) if source_path.is_dir() else None
         caller_base = receipt.get("revision_id") if isinstance(receipt, dict) and "revision_id" in receipt \
             else _UNKNOWN_BASE
-    for prior_id in reversed(list(reference.get("revisions", []))):
-        prior = _read_json(root / "shared" / "spec" / reference["shared_reference_id"] / "revisions" / prior_id
-                           / REVISION_RECORD_NAME) or {}
+    publications = (known_publications if known_publications is not None else (
+        (prior_id, _read_json(root / "shared/spec" / reference["shared_reference_id"] / "revisions" / prior_id
+                             / REVISION_RECORD_NAME) or {})
+        for prior_id in reversed(list(reference.get("revisions", [])))))
+    for prior_id, prior in publications:
         provenance = prior.get("source", {})
         if (provenance.get("cycle_id") != cycle_id or provenance.get("path") != source_rel
                 or provenance.get("manifest_digest") not in digests):
@@ -7588,6 +7666,89 @@ def _finished_spec_publication(root: Path, reference: Mapping[str, Any], cycle_i
             continue
         return prior_id, prior
     return None, None
+
+
+def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = False,
+                               references: Optional[Sequence[Mapping[str, Any]]] = None,
+                               known_publications: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Finish publication after the work is complete, without changing its outcome.
+
+    Status reads actual source lineage. Normal completion retries the existing
+    admission transaction, with its seed/base/CAS and immutable-revision recovery.
+    No extra completion gate, mutable completion flag, or model rerun is involved.
+    """
+    root = Path(root).resolve()
+    result = {"cycle_id": cycle_id, "status": "not-applicable"}
+    try:
+        record = read_cycle_record(root, cycle_id)
+        if record is None:
+            return {**result, "status": "pending", "reason": "cycle-unknown"}
+        if record.get("capability") != "autopilot-spec":
+            return result
+        if record.get("state") != "sealed" or _published_cycle_state(root, record) != "completed":
+            return {**result, "reason": "spec-work-not-completed"}
+        result.update(status="pending", reason="shared-publication-required")
+        directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
+        source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
+        source_path = directory / source_rel
+        seed_path = source_path / SPEC_BASE_RECEIPT
+        seed = _read_json(seed_path)
+        if _path_entry_present(seed_path) and seed is None:
+            raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+        reference_id = seed.get("reference_id") if seed is not None else None
+        if reference_id is not None and not artifact_identity.is_well_formed(reference_id, "shared_reference"):
+            raise ProducerError("shared-base-invalid", "reference identity")
+        refs = list(references) if references is not None else list_references(root, "spec")
+        if reference_id is not None:
+            refs = [r for r in refs if r.get("shared_reference_id") == reference_id]
+            if len(refs) != 1:
+                raise ProducerError("reference-unknown", reference_id)
+        # An already admitted source remains finished even after edits/deletion
+        # or a newer latest. Its original seed base never becomes today's base.
+        finished = []
+        for reference in refs:
+            revision_id, revision = _finished_spec_publication(
+                root, reference, cycle_id, source_rel, record, source_path, None,
+                known_publications=(known_publications.get(reference["shared_reference_id"], [])
+                                    if known_publications is not None and not settle else None))
+            if revision is not None:
+                finished.append((reference, revision_id, revision))
+        if len(finished) > 1:
+            raise ProducerError("shared-reference-ambiguous", cycle_id)
+        if finished:
+            reference, revision_id, revision = finished[0]
+            reference_id = reference["shared_reference_id"]
+            result.update(status="admitted", shared_reference_id=reference_id,
+                          shared_reference_revision_id=revision_id,
+                          content_digest=revision.get("content_digest"))
+            result.pop("reason", None)
+            if not settle:
+                return result
+        elif len(refs) > 1:
+            raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
+        else:
+            # Reuse the sealed manifest's canonical route admission, including
+            # verified continuations of the cycle's original begin identity.
+            document = _read_json(directory / "manifest.json") or {}
+            _route_file, route = resolve_cycle_manifest_route(root, record, document)
+            primary = official_spec_primary_path(root, record, route)
+            if primary is None:
+                return {**result, "reason": "official-spec-prd-missing"}
+            result["primary_path"] = str(primary)
+            if not settle:
+                return result
+        admission = admit_shared(root, cycle_id=cycle_id, kind="spec", source="spec",
+                                 reference_id=reference_id)
+        # The existing API validates and commits, or reuses the exact earlier
+        # revision. Only its actual return makes publication successful.
+        return {**result, "status": "admitted", "admission": admission,
+                "shared_reference_id": admission["shared_reference_id"],
+                "shared_reference_revision_id": admission["shared_reference_revision_id"],
+                "content_digest": admission.get("content_digest"), "reason": None}
+    except (ProducerError, artifact_admission.AdmissionBusy, artifact_admission.AdmissionRecoveryRequired,
+            OSError, ValueError, KeyError, TypeError) as exc:
+        return {**result, "status": "pending", "reason": getattr(exc, "code", type(exc).__name__),
+                "detail": str(exc)}
 
 
 def admit_shared(
@@ -9963,6 +10124,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               force_abandon_ignoring_lease=args.force_abandon_ignoring_lease)
             if result.get("warning"):
                 print(result["warning"], file=sys.stderr)
+            record = read_cycle_record(root, args.cycle)
+            if record is not None and record.get("capability") == "autopilot-spec":
+                # Legacy normal completion/recovery has no owner envelope.
+                # Finalize has released its lock before existing admission runs.
+                result["shared_publication"] = completed_spec_publication(root, cycle_id=args.cycle, settle=True)
         elif args.command == "review-lease":
             if args.operation == "acquire":
                 if not args.attempt:

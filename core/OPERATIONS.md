@@ -601,7 +601,14 @@ wait, poll, re-arm, or recap) or `parent_next=bounded-wait` with the exact bound
 `parent_next_command` to run once. An absent directive is not `end-turn`; never
 filter launch stdout. Completion names the next authorized action; normal success
 requires no harvest. For new registered owners, the completion controller also
-closes the workflow and route and finalizes the exact cycle (its completion record). Pending closure preserves
+closes the workflow and route and finalizes the exact cycle (its completion record).
+For completed official specs, that path invokes checked shared admission with
+the actual seed/reference/base and existing CAS; normal completion retry recovers
+interrupted admission. Missing/conflicting publication remains separately retryable
+and observable; sealed PASS stays intact, with no new model execution.
+The completion receipt reports shared revision identity
+when admitted. Its representative is the official root/component PRD rather
+than the REPORT used to prove terminal PASS. Pending closure preserves
 PASS and carries a supervision notice with exact transaction recovery. Carrier mechanics — the Claude `asyncRewake` hook, the Codex native
 queue and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
 and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
