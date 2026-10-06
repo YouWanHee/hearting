@@ -7,6 +7,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -34,7 +35,8 @@ class DeclarationTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 declared = HC.capabilities(harness)
                 self.assertEqual(declared["harness"], harness)
-                shapes.add((tuple(sorted(declared)), tuple(sorted(declared["parent_completion"]))))
+                shapes.add((tuple(sorted(declared)), tuple(sorted(declared["parent_completion"])),
+                            tuple(sorted(declared["session_identity"]))))
         self.assertEqual(len(shapes), 1, shapes)
 
     def test_every_declared_carrier_is_a_delivery_the_runtime_knows(self):
@@ -54,6 +56,11 @@ class DeclarationTest(unittest.TestCase):
             {**good, "parent_completion": {**good["parent_completion"], "carrier": None}},
             {**good, "parent_completion": {k: v for k, v in good["parent_completion"].items()
                                            if k != "reason"}},
+            {**good, "session_identity": {**good["session_identity"], "env": []}},
+            {**good, "session_identity": {**good["session_identity"], "env": ["NOT A NAME"]}},
+            {**good, "session_identity": {**good["session_identity"], "process_proof": "guess"}},
+            {**good, "session_identity": {**good["session_identity"], "herdr_session_id": "maybe"}},
+            {k: v for k, v in good.items() if k != "session_identity"},
         )
         for value in broken:
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
@@ -65,6 +72,28 @@ class DeclarationTest(unittest.TestCase):
         with self.assertRaises(HC.HarnessCapabilityError):
             HC.capabilities("other")
         self.assertIsNone(HC.parent_completion("other")["carrier"])
+
+
+class SessionIdentityDeclarationTest(unittest.TestCase):
+    def test_the_identity_readers_follow_the_declarations(self):
+        import session_identity
+        sys.path.insert(0, str(HC.ROOT / "tools"))
+        from fleet.collectors import herdr
+        env = HC.session_env()
+        self.assertEqual(session_identity.SESSION_ENV, env)
+        self.assertEqual(set(env), set(HC.HARNESSES))
+        self.assertEqual(herdr.verified_id_harnesses(), HC.herdr_verified_harnesses())
+        names = [name for names in env.values() for name in names]
+        # One unreadable or invalid declaration leaves only that harness unknown.
+        real = HC.capabilities
+        def missing_opencode(harness, root=HC.ROOT):
+            if harness == "opencode":
+                raise HC.HarnessCapabilityError("harness-capabilities-unreadable:opencode")
+            return real(harness, root)
+        with unittest.mock.patch.object(HC, "capabilities", side_effect=missing_opencode):
+            self.assertEqual(set(HC.session_env()), {"claude", "codex"})
+            self.assertEqual(HC.herdr_verified_harnesses(), {"claude", "codex"})
+        self.assertEqual(len(names), len(set(names)), "a session variable belongs to one harness")
 
 
 class ParentCompletionDecisionTest(unittest.TestCase):

@@ -58,12 +58,19 @@ SSH_BRIDGE_MAX_SOCKET_ROWS = 32768
 SSH_BRIDGE_MAX_FDS = 256
 SSH_BRIDGE_MAX_CONNECTIONS = 256
 SSH_BRIDGE_ENV_BYTES = 1024 * 1024
-SESSION_ENV_KEYS = (
-    ("CLAUDE_CODE_SESSION_ID", "claude"),
-    ("CODEX_THREAD_ID", "codex"),
-    ("CODEX_SESSION_ID", "codex"),
-    ("OPENCODE_SESSION_ID", "opencode"),
-)
+def _declared_session_env():
+    """`{harness: (variable, ...)}` as the readable adapters declare it (`session_identity`)."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from session_identity import session_env
+    return session_env()
+
+
+# Every declared session-id variable with its harness; the first per harness is canonical.
+SESSION_ENV_KEYS = tuple((key, harness) for harness, keys in _declared_session_env().items()
+                         for key in keys)
+CANONICAL_SESSION_KEY = {harness: keys[0] for harness, keys in _declared_session_env().items()}
 
 
 def _parser_module():
@@ -429,11 +436,7 @@ def _launcher_session_setup(values=None):
     owner = _unique_session_owner(values)
     if owner is None:
         return setup
-    canonical_key = {
-        "claude": "CLAUDE_CODE_SESSION_ID",
-        "codex": "CODEX_THREAD_ID",
-        "opencode": "OPENCODE_SESSION_ID",
-    }[owner["harness"]]
+    canonical_key = CANONICAL_SESSION_KEY[owner["harness"]]
     setup.append("export %s=%s" % (canonical_key, shlex.quote(owner["id"])))
     return setup
 

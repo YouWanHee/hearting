@@ -27,6 +27,21 @@ direct registered dispatch-depth-1 child finished:
     parent: ``poll`` -- the receipt discloses a bounded wait; ``refuse`` -- the
     launch stops before spawn, unless an operator authorizes the bounded wait.
 
+``session_identity`` says how a session of that harness is identified:
+
+``env``
+    The variables, current name first, that carry the native session id the
+    runtime exports to the commands it runs (`session_identity` reads them).
+``process_proof``
+    The native source that proves which session a running process is on:
+    ``session-registry`` (Claude ``sessions/<pid>.json``), ``open-rollout``
+    (the Codex rollout a process holds), ``tui-selection`` (the OpenCode TUI's
+    own selection record). A process without it proves only its harness.
+``herdr_session_id``
+    How far herdr's reported ``agent_session`` value may be taken as the
+    session id: ``verified`` -- the publisher proved it from the process;
+    ``claim`` -- a reported value that is not taken as proof.
+
 A declaration is data, never an approval step: reading it adds no gate.
 """
 from __future__ import annotations
@@ -42,6 +57,9 @@ PARENT_PROOFS = frozenset({"native-session", "runtime-hook", "carrier-env"})
 CARRIER_ENV = "AGENT_PARENT_COMPLETION_CARRIER"
 WITHOUT_CARRIER = frozenset({"poll", "refuse"})
 PARENT_COMPLETION_KEYS = ("carrier", "reason", "parent_proof", "without_carrier")
+SESSION_IDENTITY_KEYS = ("env", "process_proof", "herdr_session_id")
+PROCESS_PROOFS = frozenset({"session-registry", "open-rollout", "tui-selection"})
+HERDR_SESSION_IDS = frozenset({"verified", "claim"})
 # A parent named by no adapter has no runtime that could carry its completion.
 NO_PARENT_CARRIER = {"carrier": None, "reason": None, "parent_proof": None,
                      "without_carrier": "poll"}
@@ -77,6 +95,17 @@ def _validate(harness: str, value: object) -> dict:
               and isinstance(completion["reason"], str) and completion["reason"]
               and completion["parent_proof"] in PARENT_PROOFS):
         refuse("parent_completion.carrier")
+    identity = value.get("session_identity")
+    if not isinstance(identity, dict) or sorted(identity) != sorted(SESSION_IDENTITY_KEYS):
+        refuse("session_identity")
+    names = identity["env"]
+    if (not isinstance(names, list) or not names
+            or not all(isinstance(name, str) and name.isidentifier() for name in names)):
+        refuse("session_identity.env")
+    if identity["process_proof"] not in PROCESS_PROOFS:
+        refuse("session_identity.process_proof")
+    if identity["herdr_session_id"] not in HERDR_SESSION_IDS:
+        refuse("session_identity.herdr_session_id")
     return value
 
 
@@ -106,3 +135,35 @@ def declared_carriers() -> frozenset[str]:
         carrier for harness in HARNESSES
         if (carrier := capabilities(harness)["parent_completion"]["carrier"])
     )
+
+
+def session_identity(harness: str) -> dict:
+    """How a session of ``harness`` is identified (see the module doc)."""
+    return dict(capabilities(harness)["session_identity"])
+
+
+def _readable_identities() -> dict[str, dict]:
+    """The session-identity declaration of every harness whose adapter is readable.
+
+    Identity is read on every launch, label and probe, so one unreadable or invalid
+    declaration (a packaged tree without that adapter) leaves only that harness
+    unknown instead of failing everything that asks who a session is.
+    """
+    found = {}
+    for harness in HARNESSES:
+        try:
+            found[harness] = capabilities(harness)["session_identity"]
+        except HarnessCapabilityError:
+            continue
+    return found
+
+
+def session_env() -> dict[str, tuple[str, ...]]:
+    """``{harness: (variable, ...)}`` -- the session id variables the readable adapters declare."""
+    return {harness: tuple(declared["env"]) for harness, declared in _readable_identities().items()}
+
+
+def herdr_verified_harnesses() -> frozenset[str]:
+    """Harnesses whose herdr ``agent_session`` value is a proven session id."""
+    return frozenset(harness for harness, declared in _readable_identities().items()
+                     if declared["herdr_session_id"] == "verified")

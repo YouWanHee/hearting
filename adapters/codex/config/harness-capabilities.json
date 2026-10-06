@@ -6,5 +6,13 @@
     "reason": "native-thread-queue",
     "parent_proof": "native-session",
     "without_carrier": "refuse"
+  },
+  "session_identity": {
+    "env": [
+      "CODEX_THREAD_ID",
+      "CODEX_SESSION_ID"
+    ],
+    "process_proof": "open-rollout",
+    "herdr_session_id": "verified"
   }
 }

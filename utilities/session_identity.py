@@ -25,14 +25,25 @@ and reports how sure the answer is; callers keep only their own policy on top
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import os
 
-# Per harness, the variables that carry its native session id, current name first.
-SESSION_ENV: dict[str, tuple[str, ...]] = {
-    "claude": ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"),
-    "codex": ("CODEX_THREAD_ID", "CODEX_SESSION_ID"),
-    "opencode": ("OPENCODE_SESSION_ID",),
-}
+
+@functools.lru_cache(maxsize=1)
+def session_env() -> dict[str, tuple[str, ...]]:
+    """Per harness, the variables that carry its native session id, current name first.
+
+    Each adapter declares them (`harness-capabilities.json` `session_identity.env`);
+    read on first use, so importing this module never depends on the declarations.
+    """
+    from harness_capabilities import session_env as declared
+    return declared()
+
+
+def __getattr__(name):
+    if name == "SESSION_ENV":
+        return session_env()
+    raise AttributeError(name)
 # Variables that name the harness a command runs under, strongest first.
 HARNESS_ENV = ("AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS")
 KNOWN = frozenset(("named", "sole"))
@@ -54,7 +65,7 @@ def session_ids(environ=None) -> dict[str, tuple[str, str]]:
     """`{harness: (session_id, variable)}` for every harness whose id is set."""
     env = os.environ if environ is None else environ
     found = {}
-    for harness, names in SESSION_ENV.items():
+    for harness, names in session_env().items():
         for name in names:
             value = env.get(name)
             if value:
@@ -70,7 +81,7 @@ def identity(environ=None) -> SessionIdentity:
         named = env.get(name)
         if not named:
             continue
-        if named not in SESSION_ENV:
+        if named not in session_env():
             return SessionIdentity(source=name, confidence="invalid")
         session_id, variable = sessions.get(named, ("", ""))
         return SessionIdentity(named, session_id, variable or name, "named")

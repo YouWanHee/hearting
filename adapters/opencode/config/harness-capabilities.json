@@ -6,5 +6,12 @@
     "reason": "opencode-plugin-turn",
     "parent_proof": "carrier-env",
     "without_carrier": "poll"
+  },
+  "session_identity": {
+    "env": [
+      "OPENCODE_SESSION_ID"
+    ],
+    "process_proof": "tui-selection",
+    "herdr_session_id": "claim"
   }
 }
