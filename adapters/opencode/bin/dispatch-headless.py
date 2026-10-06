@@ -656,6 +656,7 @@ def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
     execution_access_roots: tuple[Path, ...] = (),
+    execution_access_read_roots: tuple[Path, ...] = (),
     *,
     agent_home: Path | None = None,
     worktree: str | None = None,
@@ -741,10 +742,49 @@ def scoped_external_directory_config(
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
             rules[pattern] = "allow"
+    # Requested read-only roots (OpenCode grant only): same read visibility
+    # as the writable roots above, but edits stay denied. A root the write
+    # side already covers keeps its writable rule (write wins); a broader
+    # read root re-asserts the covered writable paths afterwards so the deny
+    # cannot swallow them. Native last-match order applies throughout, and
+    # the default deny outside every listed root (SD-15) is unchanged.
+    def _path_forms(value) -> set[str]:
+        text = os.path.normpath(str(value))
+        forms = {text}
+        try:
+            forms.add(os.path.normpath(os.path.realpath(text)))
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return forms
+
+    def _covers(outer, inner) -> bool:
+        for left in _path_forms(outer):
+            for right in _path_forms(inner):
+                if right == left or right.startswith(left + os.sep):
+                    return True
+        return False
+
+    def _strictly_under(outer, inner) -> bool:
+        for left in _path_forms(outer):
+            for right in _path_forms(inner):
+                if right != left and right.startswith(left + os.sep):
+                    return True
+        return False
+
+    write_side = [root for root in (artifact_root, report_bundle_root, *execution_access_roots) if root]
+    covered_roots = [str(root) for root in write_side] + list(contract_roots)
+    read_deny_roots = [str(root) for root in execution_access_read_roots
+                       if root and not any(_covers(cover, root) for cover in covered_roots)]
+    write_keep_roots = [str(root) for root in write_side
+                        if any(_strictly_under(read, root) for read in read_deny_roots)]
+    for root in read_deny_roots:
+        for pattern in (root, f"{root}/**"):
+            rules.pop(pattern, None)
+            rules[pattern] = "allow"
     if contract_roots:
         permission.pop("external_directory", None)
     permission["external_directory"] = rules
-    if contract_roots:
+    if contract_roots or read_deny_roots:
         edit = effective_tool(original_permission, "edit", "allow")
         if isinstance(edit, str):
             edit_rules = {"*": edit}
@@ -752,7 +792,7 @@ def scoped_external_directory_config(
             edit_rules = dict(edit)
         else:
             raise ValueError("OpenCode edit permission must be a string or object")
-        for root in contract_roots:
+        for root in (*contract_roots, *read_deny_roots):
             # v1 native edit/write/patch ask against paths relative to the
             # worktree, unlike external_directory's absolute directory glob.
             edit_paths = (root,) if worktree is None else (
@@ -762,10 +802,18 @@ def scoped_external_directory_config(
                             for pattern in (directory, f"{directory}/**")):
                 edit_rules.pop(pattern, None)
                 edit_rules[pattern] = "deny"
+        for root in write_keep_roots:
+            edit_paths = (root,) if worktree is None else (
+                root, os.path.relpath(root, worktree),
+            )
+            for pattern in (pattern for directory in edit_paths
+                            for pattern in (directory, f"{directory}/**")):
+                edit_rules.pop(pattern, None)
+                edit_rules[pattern] = "allow"
         permission.pop("edit", None)
         permission["edit"] = edit_rules
     config["permission"] = permission
-    if contract_roots and selected_agent:
+    if (contract_roots or read_deny_roots) and selected_agent:
         # Native agent permissions merge after global permissions. Overlay only
         # the selected agent, without giving its other tools a new default.
         agents = config.get("agent", {})
@@ -784,17 +832,28 @@ def scoped_external_directory_config(
         else:
             raise ValueError("OpenCode agent permission must be a string or object")
         original_local = dict(local)
-        for tool, action in (("external_directory", "allow"), ("edit", "deny")):
-            old = effective_tool(original_local, tool)
-            if old is None:
-                overlay = {}
-            elif isinstance(old, str):
-                overlay = {"*": old}
-            elif isinstance(old, dict):
-                overlay = dict(old)
-            else:
-                raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
-            for root in contract_roots:
+        # Triples accumulate into one overlay per tool in listed order, so a
+        # later triple wins on overlap (native last-match) without wiping an
+        # earlier triple's unrelated patterns.
+        overlaid: dict[str, dict] = {}
+        for tool, action, roots in (("external_directory", "allow", contract_roots),
+                                    ("edit", "deny", contract_roots),
+                                    ("external_directory", "allow", read_deny_roots),
+                                    ("edit", "deny", read_deny_roots)):
+            if not roots:
+                continue
+            if tool not in overlaid:
+                old = effective_tool(original_local, tool)
+                if old is None:
+                    overlaid[tool] = {}
+                elif isinstance(old, str):
+                    overlaid[tool] = {"*": old}
+                elif isinstance(old, dict):
+                    overlaid[tool] = dict(old)
+                else:
+                    raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
+            overlay = overlaid[tool]
+            for root in roots:
                 directories = (root,)
                 if tool == "edit" and worktree is not None:
                     directories += (os.path.relpath(root, worktree),)
@@ -802,8 +861,36 @@ def scoped_external_directory_config(
                     for pattern in (directory, f"{directory}/**"):
                         overlay.pop(pattern, None)
                         overlay[pattern] = action
+        for tool, overlay in overlaid.items():
             local.pop(tool, None)
             local[tool] = overlay
+        if write_keep_roots:
+            # Write wins inside the selected agent too: explicit edit allow
+            # chained after the read deny above, from whatever edit overlay
+            # the read roots just produced.
+            current = local.get("edit")
+            if isinstance(current, dict):
+                overlay = dict(current)
+            else:
+                old = effective_tool(original_local, "edit")
+                if old is None:
+                    overlay = {}
+                elif isinstance(old, str):
+                    overlay = {"*": old}
+                elif isinstance(old, dict):
+                    overlay = dict(old)
+                else:
+                    raise ValueError("OpenCode agent edit permission must be a string or object")
+            for root in write_keep_roots:
+                directories = (root,) if worktree is None else (
+                    root, os.path.relpath(root, worktree),
+                )
+                for directory in directories:
+                    for pattern in (directory, f"{directory}/**"):
+                        overlay.pop(pattern, None)
+                        overlay[pattern] = "allow"
+            local.pop("edit", None)
+            local["edit"] = overlay
         selected["permission"] = local
         agents[selected_agent] = selected
         config["agent"] = agents
@@ -1973,6 +2060,7 @@ def main(argv: list[str]) -> int:
                 if args.report_bundle_root is not None
                 else None,
                 args.execution_access_grant.additional_writable_roots,
+                args.execution_access_grant.read_roots,
                 agent_home=args.agent_home,
                 worktree=args.worktree,
                 selected_agent=args.agent,

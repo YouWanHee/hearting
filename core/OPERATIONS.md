@@ -395,8 +395,10 @@ A legacy hash collision is diagnostic
    - **Source-only worktree:** immediately resolve the primary checkout's
      canonical artifact root. Dispatch wrappers inject it as
      `AGENT_ARTIFACT_ROOT`, include it in prompt/registry metadata, and open
-     only that external path through runtime-native scoped access (Claude/Codex
-     `--add-dir`; OpenCode exact `permission.external_directory` rule).
+      only that external path through runtime-native scoped access (Claude/Codex
+      `--add-dir`; OpenCode exact `permission.external_directory` rule).
+      A granted read-only root opens the same way with edits denied on OpenCode;
+      an overlapping writable root keeps its write rule.
      Task output belongs in that canonical root.
      Only the topology-sealed `autopilot-lab` `publish` node (`lab-publish`)
      resolves the create-once Hearting `REPORT_BUNDLE_ROOT` setting and projects
