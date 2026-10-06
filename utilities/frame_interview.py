@@ -155,6 +155,41 @@ ROUTE_QUESTION_ID = "route-choice"
 PROPOSAL_MARK = "proposal"
 
 
+# The numbered sections of a frame's direction brief (roles/units/plan/frame.md, Direction-Brief
+# Schema) that draft the interview brief. The owner rewrites the draft in the person's words.
+BRIEF_DRAFT_SECTIONS = {"problem": 1, "outcome": 4, "constraints": 5, "open": 6}
+_HEADING = r"^[ \t]{{0,3}}#{{1,6}}[ \t]*(?:\*\*)?[ \t]*{}(?![0-9])[^\n]*$"
+
+
+def _first_paragraph(text: str, limit: int) -> str:
+    paragraph = " ".join(next((block for block in re.split(r"\n[ \t]*\n", text.strip()) if block.strip()), "").split())
+    if len(paragraph) <= limit:
+        return paragraph
+    cut = paragraph[:limit]
+    end = max(cut.rfind(". "), cut.rfind("다. "))
+    return cut[:end + 1] if end > 0 else cut[:limit - 1].rstrip() + "…"
+
+
+def brief_draft(text: str) -> dict:
+    """The interview brief drafted from a frame's direction brief: each field the first paragraph
+    of its numbered section, within the field's length; "" where the brief has no such section."""
+    draft = {field: "" for field in BRIEF_FIELDS}
+    for field, number in BRIEF_DRAFT_SECTIONS.items():
+        head = re.search(_HEADING.format(number), text, re.M)
+        if head is None:
+            continue
+        rest = text[head.end():]
+        tail = re.search(_HEADING.format(r"[0-9]{1,2}"), rest, re.M)
+        draft[field] = _first_paragraph(rest[:tail.start()] if tail else rest, MAX_BRIEF_FIELD_CHARS)
+    return draft
+
+
+def understanding_draft(request: str) -> str:
+    """The restatement drafted from the work request's first sentence, within its length."""
+    first = re.split(r"(?<=[.!?。])\s|\n", (request or "").strip(), maxsplit=1)[0]
+    return _first_paragraph(first, MAX_UNDERSTANDING_CHARS)
+
+
 def approval_question_id(leg, key) -> str:
     """The id of the yes/no question that approves the `key` parts of leg `leg`."""
     return f"{key}-leg{leg}"

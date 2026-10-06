@@ -831,5 +831,23 @@ class RouteProposalsTest(unittest.TestCase):
         self.assertEqual(FI.render_intent(interview, answers, now="2026-10-01"),
                          FI.render_intent(interview, answers, now="2026-10-01", approval_scope={}))
 
+class DraftTest(unittest.TestCase):
+    def test_a_brief_draft_takes_each_numbered_sections_first_paragraph_within_the_field_length(self):
+        text = ("---\nstatus: framed\n---\n\n## 1. 문제\n\n첫 문단이다. " + "긴 설명. " * 200 + "\n\n둘째 문단\n\n"
+                "### 4) Verdict\n\nKeep the guard.\n\n1. a numbered item stays inside\n\n## 8. Route\n\nx\n")
+        draft = FI.brief_draft(text)
+        self.assertTrue(draft["problem"].startswith("첫 문단이다."))
+        self.assertLessEqual(len(draft["problem"]), FI.MAX_BRIEF_FIELD_CHARS)
+        self.assertEqual(draft["outcome"], "Keep the guard.")
+        self.assertEqual((draft["affected"], draft["constraints"], draft["open"]), ("", "", ""))
+        self.assertEqual(FI.brief_draft("no sections"), {field: "" for field in FI.BRIEF_FIELDS})
+
+    def test_an_understanding_draft_is_the_requests_first_sentence(self):
+        self.assertEqual(FI.understanding_draft("Fix the leak. Then report."), "Fix the leak.")
+        self.assertEqual(FI.understanding_draft("첫 줄\n둘째 줄"), "첫 줄")
+        self.assertLessEqual(len(FI.understanding_draft("word " * 200)), FI.MAX_UNDERSTANDING_CHARS)
+        self.assertEqual(FI.understanding_draft(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1557,6 +1557,22 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(str(caught.exception), "frame-input-invalid: " + "; ".join(expected))
         self.assertEqual(self.calls, [])
 
+    def test_the_interview_template_is_drafted_from_the_request_and_the_frame_brief(self):
+        brief = self.output / "shards/frame/direction-brief.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("## 1. Problem Statement\n\nThe report loses the second result.\n\n"
+                         "## 4. Direction Verdict\n\nKeep both results in one report.\n\n"
+                         "## 6. Open Risks\n\nNone known.\n", encoding="utf-8")
+        route = {**self.route, "work_request": {"text": "Run the two commands and keep both results. Then report."}}
+        template = W.frame_interview_step(route, self.path, self.jobs, run=self.run_command)["interview_template"]
+        self.assertEqual(template["understanding"], "Run the two commands and keep both results.")
+        self.assertEqual(template["brief"], {"problem": "The report loses the second result.",
+                                             "outcome": "Keep both results in one report.", "affected": "",
+                                             "constraints": "", "open": "None known."})
+        brief.unlink()                                       # no brief yet: empty fields, as before
+        self.assertEqual(self.step()["interview_template"]["brief"]["problem"], "")
+        self.assertEqual(self.calls, [])                     # a draft registers nothing
+
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
         asked = self.step(interview=self.question_file)

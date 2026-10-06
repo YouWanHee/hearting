@@ -154,7 +154,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
     """
     import frame_interview as FI
     import workflow_state as WS
-    from artifact_producer import prepare_route_artifact_env
+    from artifact_producer import ProducerError, prepare_route_artifact_env
     ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
     resolution = WS.human_gate_resolution(ledger.journal(), "frame-review")
     supplied = json.loads(Path(interview).read_text()) if interview else None
@@ -163,12 +163,21 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
     if supplied is None:
         if answers:
             raise ValueError("frame-question-required: pass the question already answered with --interview")
+        understanding, brief = "", {field: "" for field in FI.BRIEF_FIELDS}
+        try:
+            # A draft from the request and the anchor frame's brief; the owner rewrites it for the person.
+            understanding = FI.understanding_draft((route.get("work_request") or {}).get("text") or "")
+            output = prepare_route_artifact_env(Path(path), start=False, jobs=Path(jobs)).get("AGENT_ARTIFACT_OUTPUT_DIR")
+            if output:
+                brief = FI.brief_draft((Path(output) / "shards/frame/direction-brief.md").read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError, ProducerError):
+            pass
         return {"state": "needs-interview", "required_action": "prepare-frame-question",
-                "interview_template": {"understanding": "", "brief": {
-                    "problem": "", "outcome": "", "affected": "", "constraints": "", "open": ""},
-                    "questions": []},
+                "interview_template": {"understanding": understanding, "brief": brief, "questions": []},
                 "question_example": FI.QUESTION_EXAMPLE,
-                "next_step": "Compare these exact frame results; fill this semantic interview template and "
+                "next_step": "Compare these exact frame results; fill this semantic interview template (its "
+                    "understanding and brief are drafts from the request and the frame brief: rewrite them in the "
+                    "person's words) and "
                     "rerun resume_command with --interview <file> before displaying the native question. "
                     "question_example shows one complete question; write yours in the person's language "
                     "(code names in backticks are fine). "
