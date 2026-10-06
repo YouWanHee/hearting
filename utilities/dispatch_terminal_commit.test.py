@@ -1582,12 +1582,14 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     state_path = terminal._commit_state_path(request)
                     stored = json.loads(state_path.read_text())
                     envelope = json.loads((state_path.parent / "owner-envelope.json").read_text())
-                    self.assertEqual(envelope["primary_path"], str(report.resolve()))
                     producer_binding = terminal.load_producer_binding(
                         artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
                     cycle_record = artifact_producer.read_cycle_record(fixture.root, producer_binding["cycle_id"])
                     cycle_dir = artifact_producer.cycle_dir(fixture.root, cycle_record["campaign_id"],
                                                             producer_binding["cycle_id"], cycle_record)
+                    official = cycle_dir / "artifacts/spec/prd.md"
+                    self.assertEqual(envelope["primary_path"], str(official.resolve()))
+                    self.assertEqual(first.shared_publication["status"], "admitted", first)
                     manifest = json.loads((cycle_dir / "manifest.json").read_text())
                     primary_rows = [row for row in manifest["artifacts"] if row.get("role") == "primary"]
                     self.assertEqual(len(primary_rows), 1)
@@ -1595,13 +1597,15 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     primary_revision = next(row for row in manifest["artifact_revisions"]
                                             if row["artifact_id"] == primary_id)
                     self.assertEqual(primary_revision["locator"]["path"],
-                                     "artifacts/" + report.relative_to(cycle_dir / "artifacts").as_posix())
+                                     "artifacts/spec/prd.md")
                     handoff = terminal.completed_owner_handoff(jobs, "done", meta)
-                    self.assertIn(f"artifact: {report.resolve()}", handoff)
+                    self.assertIn(f"artifact: {official.resolve()}", handoff)
                     import work_start
                     consumed = work_start._outcome(jobs, owner)
                     self.assertIn("handoff", consumed)
-                    self.assertIn(f"artifact: {report.resolve()}", consumed["handoff"])
+                    self.assertIn(f"artifact: {official.resolve()}", consumed["handoff"])
+                    self.assertEqual(consumed["shared_publication"]["shared_reference_revision_id"],
+                                     first.shared_publication["shared_reference_revision_id"])
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                     second = terminal.settle_owner_completion(jobs, "done", meta)
                     self.assertEqual(second.result, "completed", second)
@@ -1716,11 +1720,12 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             self.assertEqual((interrupted.result, interrupted.reason), ("recoverable", "recovery-unavailable"))
             binding = terminal.load_producer_binding(
                 artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
-            self.assertEqual(binding["primary"], str(report.resolve()))
+            official = Path(report).parent / "spec/prd.md"
+            self.assertEqual(binding["primary"], str(official.resolve()))
             replay = terminal.settle_terminal_commit(request)
             self.assertEqual(replay.result, "completed", replay)
             handoff = terminal.completed_owner_handoff(jobs, "done", meta)
-            placed = next(Path(fixture.root).rglob("owner-report.md"))
+            placed = next(Path(fixture.root).rglob("prd.md"))
         self.assertIn(f"artifact: {placed.resolve()}", handoff)
 
     def test_a_changed_or_missing_report_is_history_after_settlement(self):
@@ -1737,6 +1742,73 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                         self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                         replay = terminal.settle_owner_completion(jobs, "done", meta)
                         self.assertEqual(replay.result, "completed", replay)
+
+    def test_finalize_and_admission_crash_replay_keep_one_primary_envelope_and_revision(self):
+        for checkpoint in ("finalize-after", "admission-after"):
+            with self.subTest(checkpoint=checkpoint):
+                fixture, terminal, route, path, jobs, owner, report, meta = self._settled("codex", "spec/REPORT.md")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                    request = terminal._completion_request(jobs, "done", meta)
+                    first = terminal.settle_terminal_commit(request, terminal.TerminalCommitServices(crash_after=checkpoint))
+                    self.assertEqual(first.result, "recoverable", first)
+                    outcome = ROUTE.outcome_path(path).read_bytes()
+                    state = json.loads(terminal._commit_state_path(request).read_text())
+                    commit_id = state["terminal_commit_id"]
+                    binding = terminal.load_producer_binding(
+                        artifact_root=fixture.root, route_id=route["route_id"], owner_attempt_id=owner).binding
+                    cycle = artifact_producer.read_cycle_record(fixture.root, binding["cycle_id"])
+                    directory = artifact_producer.cycle_dir(fixture.root, cycle["campaign_id"], cycle["cycle_id"], cycle)
+                    manifest = (directory / "manifest.json").read_bytes()
+                    source = {p: p.read_bytes() for p in (directory / "artifacts").rglob("*") if p.is_file()}
+                    recovered = terminal.settle_owner_completion(jobs, "done", meta)
+                    self.assertEqual(recovered.result, "completed", recovered)
+                    self.assertEqual(recovered.shared_publication["status"], "admitted", recovered)
+                    envelope_path = terminal._commit_state_path(request).parent / "owner-envelope.txt"
+                    envelope = envelope_path.read_bytes()
+                    retry = terminal.settle_owner_completion(jobs, "done", meta)
+                    self.assertEqual(retry.shared_publication["shared_reference_revision_id"],
+                                     recovered.shared_publication["shared_reference_revision_id"])
+                    self.assertEqual(artifact_producer.list_references(fixture.root, "spec")[0]["revisions"],
+                                     [recovered.shared_publication["shared_reference_revision_id"]])
+                    self.assertEqual(json.loads(terminal._commit_state_path(request).read_text())["terminal_commit_id"], commit_id)
+                    self.assertEqual(ROUTE.outcome_path(path).read_bytes(), outcome)
+                    self.assertEqual((directory / "manifest.json").read_bytes(), manifest)
+                    self.assertEqual(envelope_path.read_bytes(), envelope)
+                    self.assertEqual(source, {p: p.read_bytes() for p in source})
+
+    def test_admission_failure_is_visible_without_reopening_pass_or_overwriting_primary(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("opencode", "spec/REPORT.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            with mock.patch.object(artifact_producer, "admit_shared",
+                                   side_effect=artifact_producer.ProducerError("shared-spec-conflict", "policy")):
+                completed = terminal.settle_owner_completion(jobs, "done", meta)
+            self.assertEqual(completed.result, "completed", completed)
+            self.assertEqual(completed.shared_publication["status"], "pending")
+            request = terminal._completion_request(jobs, "done", meta)
+            outcome = ROUTE.outcome_path(path).read_bytes()
+            envelope = (terminal._commit_state_path(request).parent / "owner-envelope.txt").read_bytes()
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "pending")
+            diagnosis = terminal.inspect_owner_completion(jobs, "done", meta)
+            self.assertEqual(diagnosis["shared_publication"]["status"], "pending")
+            self.assertIn("--attempt", diagnosis["recovery_command"])
+            import workflow_state
+            self.assertEqual(workflow_state.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).state()["workflow_state"], "COMPLETE")
+            recovered = terminal.settle_owner_completion(jobs, "done", meta)
+            self.assertEqual(recovered.shared_publication["status"], "admitted", recovered)
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            self.assertEqual(ROUTE.outcome_path(path).read_bytes(), outcome)
+            self.assertEqual((terminal._commit_state_path(request).parent / "owner-envelope.txt").read_bytes(), envelope)
+
+    def test_missing_official_prd_keeps_report_fallback_and_publication_pending_without_synthesis(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "spec/REPORT.md")
+        (report.parent / "prd.md").unlink()
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            completed = terminal.settle_owner_completion(jobs, "done", meta)
+            self.assertEqual(completed.result, "completed", completed)
+            self.assertEqual(completed.shared_publication["reason"], "official-spec-prd-missing")
+            self.assertIn(f"artifact: {report}", completed.envelope_text)
+            self.assertFalse((report.parent / "prd.md").exists())
+            self.assertEqual(artifact_producer.list_references(fixture.root, "spec"), [])
 
 
 class OwnerFinishPrimaryRegressionTest(_TerminalCommitFixture):

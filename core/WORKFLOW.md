@@ -691,8 +691,21 @@ abandoned/autoclose outcomes remain unpromoted. `--allow-unproven` keeps its mea
 For producer-backed work, the controller's transaction is **terminal proof →
 route close → cycle finalize (the completion record) → workflow COMPLETE**. Eligible direct inline
 work uses `finish`; legacy recovery uses complete, close and finalize in that
-order. Shared admission applies only to
-shared kinds after finalize; it is never a prerequisite for the terminal marker.
+order. For completed `autopilot-spec`, the same runtime completion/retry path
+admits the official spec through the producer's existing shared-admission API
+after finalize. Admission is not a terminal gate: publication failure preserves
+the closed route, sealed cycle and PASS, and is reported as publication pending
+until the existing completion retry succeeds. Status derives missing publication
+from cycle-to-shared revision lineage, including cycles completed before this
+integration. Research promotion remains explicit; abandoned/open work is not
+published automatically.
+The spec's user-facing representative is its actual canonical PRD (root or
+declared component), while a terminal REPORT remains completion evidence.
+Explicit valid primary choices retain their authority; a terminal artifact
+pointer alone is not a user primary choice. With no official PRD, retain the
+honest existing artifact fallback and expose the missing spec publication.
+Shared admission applies only to shared kinds after finalize; it is never a
+prerequisite for the terminal marker.
 Finalize records the cycle's completion as of that moment and does not lock the
 cycle: its files stay editable, movable and deletable afterwards (artifact-path-contract §45).
 Open-route finalize is provisionally `active`; exact completion and cleanup let

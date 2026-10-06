@@ -679,8 +679,11 @@ def _outcome(jobs, aid):
                 "--route", route_file, "--jobs", str(jobs)])
     if action == "advance-completed":
         if row and row[1].get("workflow_completion") == "runtime-v1":
-            from dispatch_terminal_commit import completed_owner_handoff
+            from dispatch_terminal_commit import completed_owner_handoff, completed_owner_publication
             result["handoff"] = completed_owner_handoff(jobs, *row)
+            publication = completed_owner_publication(jobs, *row)
+            if publication is not None:
+                result["shared_publication"] = publication
     return result
 
 
@@ -1318,17 +1321,48 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         rows = _rows(jobs)
         if owner and owner not in rows:
             raise ValueError("closed-route-owner-missing")
+        publication = None
         for aid, (status, meta) in rows.items():
             if meta.get("workflow_completion") == "runtime-v1" and (
                     aid == owner or route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}):
                 # An owner with nothing to settle (`not-applicable`: replaced, stopped at a gate or not
                 # passed) does not hold the closed route back; every other unfinished settlement does.
-                from dispatch_terminal_commit import owner_completion_state
-                if owner_completion_state(jobs, status, meta).state not in {"complete", "not-applicable"}:
+                from dispatch_terminal_commit import owner_completion_state, settle_owner_completion
+                completion = owner_completion_state(jobs, status, meta)
+                if completion.reason == "shared-spec-publication-pending":
+                    # Only the post-seal publication obligation uses this normal
+                    # retry. All earlier identity/gate/closure refusals stay put.
+                    retry = settle_owner_completion(jobs, status, meta)
+                    publication = retry.shared_publication if retry is not None else None
+                    completion = owner_completion_state(jobs, status, meta)
+                if completion.state not in {"complete", "not-applicable"}:
                     return {**result, "state": "needs-attention", "reason": "workflow-completion-pending",
-                            "required_action": "inspect-recovery", "outcome": closed}
+                            "required_action": "inspect-recovery", "outcome": closed,
+                            **({"shared_publication": publication} if publication is not None else {})}
+                if route.get("capability") == "autopilot-spec" and completion.state == "complete" and publication is None:
+                    from dispatch_terminal_commit import completed_owner_publication
+                    publication = completed_owner_publication(jobs, status, meta)
+        if route.get("capability") == "autopilot-spec" and publication is None:
+            import artifact_producer
+            root_value = route.get("artifact_root")
+            if not isinstance(root_value, str) or not root_value.strip():
+                # A historical closed route may lack the compiled root. Keep
+                # its sealed result and report the publication gap without
+                # guessing a root from the caller's cwd or preparing new work.
+                publication = {"status": "pending", "reason": "spec-artifact-root-unavailable"}
+            else:
+                root = Path(root_value).resolve()
+                cycle = artifact_producer.route_cycle_for(root, route)
+                publication = (artifact_producer.completed_spec_publication(root, cycle_id=cycle["cycle_id"], settle=True)
+                               if cycle is not None else {"status": "pending", "reason": "spec-cycle-unavailable"})
+            if publication["status"] == "pending":
+                return {**result, "state": "needs-attention", "reason": "shared-spec-publication-pending",
+                        "required_action": "inspect-recovery", "outcome": closed, "shared_publication": publication,
+                        "next_step": "Preserve the completed work and inspect the publication reason. "
+                                     "The same normal completion retry keeps the original source/base; no model restarts."}
         return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
-                                      "outcome": closed})
+                                      "outcome": closed,
+                                      **({"shared_publication": publication} if publication is not None else {})})
     if RESOURCE_RESUME.route_selected(route):
         resource = RESOURCE_RESUME.observation(route, jobs)
         if resource["state"] != "resource-succeeded":
