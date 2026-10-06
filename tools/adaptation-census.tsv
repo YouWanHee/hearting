@@ -162,6 +162,8 @@ utility-deferred	extract_web_figures.py
 utility-deferred	fleet_cutover_gate.py
 utility-deferred	frame_interview.py
 utility-deferred	harness-capacity.py
+utility-deferred	harness_capabilities.py
+utility-deferred	harness_capabilities.test.py
 utility-deferred	human_gate_receipt.py
 utility-deferred	inline_finish.py
 utility-deferred	launch-fence.py
@@ -186,11 +188,14 @@ utility-deferred	resource_runner.test.py
 utility-deferred	review_round_cap.py
 utility-deferred	review_round_cap.test.py
 utility-deferred	ripple-map.py
+utility-deferred	route_authority.py
+utility-deferred	route_authority.test.py
 utility-deferred	route_autoclose.py
 utility-deferred	route_identity.py
 utility-deferred	route_lineage.py
 utility-deferred	route_lineage.test.py
 utility-deferred	session_summary_trigger.py
+utility-deferred	session_identity.py
 utility-deferred	session_tidy.py
 utility-deferred	session_tidy_clear.py
 utility-deferred	session_tidy_runner.py
@@ -298,6 +303,8 @@ tool-deferred	smoke_attestation.test.py
 tool-deferred	stage-advance-census.py
 tool-deferred	stage_advance_census.test.py
 tool-deferred	surface-budget.json
+tool-deferred	sync-bootstrap-dispatch.py
+tool-deferred	sync_bootstrap_dispatch.test.py
 tool-deferred	sync-entry-skill-layer.py
 tool-deferred	sync-missing-projections.py
 tool-deferred	sync-missing-projections.sh

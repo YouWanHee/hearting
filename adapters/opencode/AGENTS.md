@@ -73,25 +73,52 @@ partial. OpenCode native UI/config owns model and context fields.
 
 ## Dispatch
 
-For ordinary execution use `preflight.sh compose --campaign-key <stream> --start
---prompt-file <task>` (the stream key is required; `--unassigned` is the only
-keyless form).
-Runtime prepares the cycle, starts declared frames and reuses exact attempts.
-Follow `parent_next`; reuse `resume_command` after wakes or corrections. At
-`needs-question`, compare the completed frames and ask the native interview.
-Actual release precedes owner execution; runtime closes route/cycle at success or once idle.
+<!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
+Ordinary execution is one command, the same in every harness:
+
+```
+hearting run capability-route compose --start --prompt-file <task> \
+  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+```
+
+`hearting` is on PATH. `hearting run <utility>` runs that harness utility from
+`AGENT_HOME` when it is set (dev activation: that checkout), else from the
+installed release. The slug comes from the task. The stream defaults to this
+session's latest stream in the same artifact root; the first compose names one
+with `--campaign-key` (a folder name or close spelling joins the matching active
+stream, and a refusal lists the active keys) or opts out with `--unassigned`.
+The runtime prepares the cycle, picks each leg's harness from live usage within
+the sealed candidates, starts frames and the owner, reuses exact attempts, and
+closes the route and cycle at success or once idle.
+
+Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
+end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
+`parent_next_command` once. An absent directive is not `end-turn`, so never
+filter the command's stdout. After a wake or a correction, run
+`resume_command`; answer a BLOCKED owner with `correction_command
+--message-file <file>`. At `needs-question`, compare the two frame briefs and
+follow the receipt's `next_step`: `resume_command --interview <file>` registers
+the question, the person answers it once in the native question surface, and
+`resume_command --answers <file>` records the intent, releases the gate and
+starts the owner.
+
+Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallback.py"
+--node <node> --start`: route, slug, parent and harness come from the owner's
+current route and environment, and a member of a sealed parallel group starts
+its whole group in one batch. Dispatch depth 3 is forbidden.
+<!-- END generated from core/fragments/bootstrap-dispatch.md -->
 
 Route by `core/WORKFLOW.md §0.2`: precedence names the capability that owns
 the artifacts; §0.2.1 then picks the work **shape** before any preset:
 new non-direct work defaults to `framed` (exceptions there).
-`direct`/`solo`/`staged`/`framed` go through `preflight.sh compose` (portable
-`capability-route.py compose`; flags, spec-read gate and probes default from
+`direct`/`solo`/`staged`/`framed` go through `hearting run capability-route compose`
+(flags, spec-read gate and probes default from
 the checkout; a staged `--graph execute,test,report` is your own stage
 subgraph). Use the preset recipe (`preflight.sh route --capability …`) only
 when the request names the entry's full loop or a promotion signal or
 spec-backed flow requires it. Apply §0.3. `direct`/`solo` routes carry the
-sealed `small_work_confirmation` (`notice` default): one `[경로]` line plus a
-scope clause instead of the blocking card, unless the work is destructive or
+§0.4 card through `question` on user-authored turns; received peer envelopes
+use one `[경로]` line plus a scope clause, unless the work is destructive or
 external-facing; otherwise present the §0.4 five-field card before material
 work unless already approved, and close with the §0.5 card. Load full
 capability detail only in the acting owner or worker.
@@ -102,62 +129,22 @@ tuple in `core/OPERATIONS.md`. Keep `capability_mode` separate from a non-owner
 `worker_mode`, which must equal its portable `unit`; a dispatch-depth-1 owner is
 `_kernel/owner` with no worker mode. `worker_role` and legacy `mode` are
 read-only metadata, not bootstrap identity. Monitor
-`preflight.sh liveness [jobs.log]`; harvest via `preflight.sh harvest`.
-For an attempt you launched, the receipt outranks that general monitoring:
-`parent_next=end-turn` yields with no wait, poll, or liveness loop for it, and
-`parent_next=bounded-wait` runs its printed `parent_next_command` once. An
-absent directive is not `end-turn`: never filter launch stdout.
-Conductors use `dispatch-chain` for ordinary checked dispatch-depth-2 nodes. A sealed
-2–4-way `parallel_group` uses one `dispatch-batch --parallel-group` call;
-OpenCode is eligible for that registered standard+ dispatch-depth-2 path —
+`preflight.sh liveness [jobs.log]`; harvest via `preflight.sh harvest`. For an
+attempt you launched, its receipt outranks that general monitoring.
+OpenCode is eligible for the registered standard+ dispatch-depth-2 path —
 exact parent binding, foreground lifecycle, and supervisor parity are implemented.
 Dispatch contract v3 atomically claims one stable
 attempt row before spawn and starts no child for a duplicate claim. Broker v1/v2
 routes are read-only migration inputs; the retired broker exposes only legacy
 `status`/`stop`.
 
-A depth-0 frame leg has no `preflight.sh` subcommand here; call the portable
-selector directly, one Bash call per leg: `python3
-"$AGENT_HOME/utilities/dispatch-owner.py" --adapter <harness> --start
---route-evidence <route.json> --route-node frame|frame-alternative
---dispatch-depth 1 --worker-type frame --unit plan/frame --prompt-file
-<shard>/prompt.txt`. Never two legs in one call: one waiter arms per call, so
-the second leg's direction question would otherwise silently never reach the
-user. Export `AGENT_ARTIFACT_ROOT`, `AGENT_ARTIFACT_CAMPAIGN_ID`,
-`AGENT_ARTIFACT_CYCLE_ID` and `AGENT_ARTIFACT_CYCLE_DIR` before every launch
-call, never a subset, or both briefs land in an unrelated, possibly closed,
-campaign/cycle directory.
-
 **OpenCode has no automatic wake carrier, and this is not carrier parity with
-Claude.** For `compose --start` / `start`, follow the top-level receipt's
-`parent_next` and run its `parent_next_command` once only when it says
-`bounded-wait`; reuse its `resume_command` after a wake or correction. Nested
-leg receipts remain evidence and do not add child waits. `end-turn` requires
-no wait, and `needs-attention` after an expired wait grants no repeat wait.
-For independent low-level leg launches only, follow each actual leg receipt;
-two legs do not by themselves require two waits. Nothing wakes this session
-on its own. Do not describe or rely on a
-Claude-style carrier here; that gap is a deliberate scope boundary, not a
-defect to work around.
-
-A frame node declares no `fallback_hops` — an unavailable (not merely late)
-harness means depth-0 explicitly re-launches that one leg on another sealed
-candidate harness and records that it did so. A `top` anchor refused with a
-rate-limit-shaped typed refusal, or exiting early with zero artifacts, is
-re-launched at `deep` exactly once, never attempting `top` again, with
-`frame_profile_degraded=top→deep` recorded in both the route/attempt record
-and the user-facing card or notice; decide that from the observed launch
-outcome, never from a usage query.
-
-Depth-0 always waits for both legs; past the hard limit it stops and asks, and
-no path proceeds on one leg. Two differing direction verdicts go side by side
-and nothing downstream starts until the user picks one. The one-sentence
-restatement gets an explicit yes/no even when the interview carries zero
-questions, recorded in `understanding_confirmed`. Then
-`workflow-supervisor.py release --route <route> --gate frame-review --decision
-proceed --answers <file>` — the one machine event that authorizes the owner's
-launch — and the owner is launched with `intent.md`'s absolute path in its
-prompt as `Intent:`. `core/OPERATIONS.md §5.10b` is the contract.
+Claude.** Nothing wakes this session on its own: follow the top-level
+receipt's `parent_next` and run `parent_next_command` once only when it says
+`bounded-wait`. Nested leg receipts remain evidence and add no child
+waits, and `needs-attention` after an expired wait grants no repeat wait. Do not
+describe or rely on a Claude-style carrier here; that gap is a deliberate scope
+boundary, not a defect to work around.
 
 `standard+` uses a dispatch-depth-1 capability owner and separable dispatch-depth-2
 `code-plan -> code-execute -> code-test -> code-report` workers. `direct` is
@@ -215,7 +202,7 @@ Portable behavior contract = `roles/response-policy.md`.
 - Keep responses concise, match promises with same-turn action, verify before asserting, and follow current conventions; expose a convention change before committing it.
 - **Local evidence before recall** — answer a domain question from the repository's research/analysis/briefing artifacts first; model memory is the fallback, a memory-only answer says so and flags its risky specifics, and the §0.4 card exemption never waives this evidence check.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.
-- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms.
+- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms. Other sessions use Fleet tag and pane (SID if needed), role in parentheses; without a tag, herdr name and pane, rather than internal abbreviations.
 - Ask only for genuinely non-obvious or destructive choices. Continue reversible in-flow work and its implied validation, records, commit, and push. Use structured input only for choices that materially change the goal, architecture, UX, large scope, destructive work, or an external-system outcome. Continue low-risk reversible work autonomously. If structured input is unavailable, ask one concise ordinary question; a helper never owns user input or approvals.
 - Under `core/OPERATIONS.md §5.11`, commit and push validated `<agent-home>` instruction, rule, hook, preflight, or status-surface changes in the same turn without a separate user signal.
 

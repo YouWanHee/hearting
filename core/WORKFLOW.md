@@ -235,7 +235,7 @@ shape and explicit choices determine the route; defaults only fill omissions:
 
 | Shape | When | Route |
 |---|---|---|
-| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --campaign-key <stream> --slug <slug>` — the inline node, dispatch depth 0 |
+| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
 | `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's parts (stage ids, summaries, inputs/outputs, units, human gates, `shareable`, `start_approval`, optional and borrowable parts) with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
 | `framed` | **the default for new non-direct work**; capability and stages are not yet chosen | `compose --shape framed` — two `top` frame legs propose the smallest route, one interview confirms it, and the runtime starts its first leg only (SD-164) |
@@ -288,9 +288,11 @@ started from its decision, so after the last leg it reports that leg's completio
 and no `next_leg`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
-<task>` with the selected shape/graph (the campaign choice is required:
-an existing or new stream key, `--parent-cycle`, or an explicit
-`--unassigned`; the refusal lists the root's active keys); `--profile light` or `--owner <harness>` is an explicit choice.
+<task>` with the selected shape/graph. The slug comes from the task; the
+campaign defaults to this session's latest stream in the same artifact root,
+and otherwise is an existing or new stream key, `--parent-cycle`, or an explicit
+`--unassigned` (the refusal lists the root's active keys; a folder name or close
+spelling of one active key joins it); `--profile light` or `--owner <harness>` is an explicit choice.
 The task file contains the requested work, not instructions for running the
 parent. The runtime seals it, prepares its cycle, starts the frame pair when
 declared, and returns one receipt. Reuse that receipt's `resume_command` after
@@ -414,7 +416,7 @@ fields and this order. In Korean, the canonical card is:
 ```
 
 When the runtime exposes a native structured-question surface (Claude
-`AskUserQuestion`, Codex `request_user_input`), deliver this confirmation
+`AskUserQuestion`, Codex `request_user_input`, OpenCode `question`), deliver this confirmation
 through it: the five confirmation fields form the question body; the optional
 start-approval line is scope metadata, and the options are exactly
 진행 (recommended) / 수정 / 중단. The plain-text card above is the fallback when
@@ -454,15 +456,16 @@ intent, decision record, or work request; no owner asks for another entry
 approval mid-run. New compiles finish their chosen scope without an intermediate
 approval wait. Existing sealed routes retain their gates and continuation.
 
-**Small-work notice (SD-136).** When the compiled route is `direct` or `solo`
-(`quick`) and its sealed `small_work_confirmation` is `notice` — the shipped
-default, `profiles/dispatch-defaults.yaml` `confirmation.small_work` — the
-blocking card above is replaced by one non-blocking line: the `[경로]` line
+**Small-work confirmation (SD-136).** User-authored turns receive the card even
+for `direct` or `solo` (`quick`). A received peer envelope (the existing
+`(peer-from: …)` trailer or notice path) uses one non-blocking `[경로]` line
 `compose` prints (capability · shape · route id · human gates) plus one clause
-of scope, and the work proceeds in the same turn. The card stays blocking,
+of scope and proceeds in the same turn; a steward cannot approve for the user.
+`confirmation.small_work` and its sealed value retain their existing route
+metadata meaning, without changing this distinction. The card stays blocking,
 whatever the sealed value, when the work is destructive (data, history, or
 worktree loss), mutates an external system, deploys, or the user asked to be
-asked. `card` restores the blocking card for every small route. The
+asked. The
 route-participation invariant below is unchanged: notice or card, source work
 still needs the bound route, and the 0–1 / 1–3 inline questions of the frame
 interview (below) are asked only when they exist. A current or immediately preceding user
@@ -524,7 +527,8 @@ card and the interview. User approval precedes the owner and the §0.4 notice:
 → 진행(권장) / 수정: <틀린 부분> / 중단
 ```
 
-Deliver this card through a native structured-question surface when one is
+Deliver this card through the native question tool (Claude `AskUserQuestion`,
+Codex `request_user_input`, OpenCode `question`) when one is
 available, the plain-text form otherwise — the same fallback rule as the §0.4
 card. Only once the direction is confirmed does the owner start, and the §0.4
 gate then arrives as a non-blocking `[실행 통지]` — the same five fields, in
@@ -547,7 +551,8 @@ itself, in this order, and never leaves it to a helper:
 1. Ask first whether the restatement is right — that sentence, verbatim,
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
-3. Ask each interview question through the native question tool, one topic
+3. Ask each interview question through the native question tool (Claude
+   `AskUserQuestion`, Codex `request_user_input`, OpenCode `question`), one topic
    per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
    into harness vocabulary, and never add questions the interview does not
@@ -555,8 +560,7 @@ itself, in this order, and never leaves it to a helper:
 4. Put the actual responses in the returned `answers_template` and submit
    `start --route <file> --answers <file>`. The runtime renders intent and
    records the release that authorizes owner launch. A repeated submission
-   reuses it. Legacy recovery: `workflow-supervisor.py
-   release --route <route file> --gate frame-review --decision proceed --answers <file>`.
+   reuses it.
 
 `OPERATIONS §5.10b` owns selector mechanics and the one-time `top`→`deep`
 demotion; the public work entry owns launch calls and artifact context. Both legs
@@ -691,8 +695,21 @@ abandoned/autoclose outcomes remain unpromoted. `--allow-unproven` keeps its mea
 For producer-backed work, the controller's transaction is **terminal proof →
 route close → cycle finalize (the completion record) → workflow COMPLETE**. Eligible direct inline
 work uses `finish`; legacy recovery uses complete, close and finalize in that
-order. Shared admission applies only to
-shared kinds after finalize; it is never a prerequisite for the terminal marker.
+order. For completed `autopilot-spec`, the same runtime completion/retry path
+admits the official spec through the producer's existing shared-admission API
+after finalize. Admission is not a terminal gate: publication failure preserves
+the closed route, sealed cycle and PASS, and is reported as publication pending
+until the existing completion retry succeeds. Status derives missing publication
+from cycle-to-shared revision lineage, including cycles completed before this
+integration. Research promotion remains explicit; abandoned/open work is not
+published automatically.
+The spec's user-facing representative is its actual canonical PRD (root or
+declared component), while a terminal REPORT remains completion evidence.
+Explicit valid primary choices retain their authority; a terminal artifact
+pointer alone is not a user primary choice. With no official PRD, retain the
+honest existing artifact fallback and expose the missing spec publication.
+Shared admission applies only to shared kinds after finalize; it is never a
+prerequisite for the terminal marker.
 Finalize records the cycle's completion as of that moment and does not lock the
 cycle: its files stay editable, movable and deletable afterwards (artifact-path-contract §45).
 Open-route finalize is provisionally `active`; exact completion and cleanup let

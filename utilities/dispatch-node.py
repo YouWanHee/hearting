@@ -19,8 +19,8 @@ from dispatch_lifecycle import (
     run_forwarding_termination,
     select_launch_lifecycle,
 )
-import model_profile as MODEL_PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
+import route_authority as ROUTE_AUTHORITY
 import dispatch_subsession_advance as SUBSESSION
 
 _route_spec = importlib.util.spec_from_file_location(
@@ -313,6 +313,33 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
   if exclude_attempt and meta.get("attempt_id")==exclude_attempt: continue
   prior.append((cols,meta))
  return prior
+
+def subsession_purpose(jobs, route, node, chain_id, declared):
+ """OPERATIONS §5.10: after a gate failure or a BLOCKED (unfinished) round a
+ sub-session is the gap retry of the unfinished items, never retroactive
+ planned subdivision.
+
+ Reads the full-stage census admission reads (sub-session rows are not in
+ it), cut at this chain's first row, so register, start and the supervisor's
+ later start of one chain all derive the same purpose. A declared gap retry
+ stays one; the runtime never relabels a session planned.
+ """
+ if declared!="planned":
+  return declared
+ try:
+  lines=Path(jobs).read_text(encoding="utf-8",errors="replace").splitlines()
+ except OSError:
+  return declared
+ for index,line in enumerate(lines):
+  fields=line.split("\t")
+  if len(fields)==6 and parse_registry_metadata(fields[5]).get("session_chain_id")==chain_id:
+   lines=lines[:index]
+   break
+ route_ids=({r["route_id"] for r in ROUTE.review_lineage_routes(route,node["id"])}
+            if node.get("kind")=="review-worker" else {route["route_id"]})
+ rows=[(cols[1],meta) for cols,meta in ROUTE.review_round_records(lines,route_ids,node["id"],jobs=jobs)]
+ worker_type=node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")
+ return "gap-retry" if ROUTE_AUTHORITY.gate_unmet(rows,worker_type) else declared
 
 # C-14: only the plan-check/impl-review/test QA anchors carry a review/correction
 # budget under CONVENTIONS §1.1. `execute`/`report` are outside that budget (P2-27
@@ -671,10 +698,17 @@ def replacement_task(args, route, node, jobs):
 
 
 def main():
- p=argparse.ArgumentParser(); p.add_argument("--route",required=True); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--slug",required=True); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
+ p=argparse.ArgumentParser(); p.add_argument("--route",help="default: this owner's current route"); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--start",dest="action",action="store_const",const="start",help="same as --action start"); p.add_argument("--slug",help="default: <parent>-<node>"); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
  from review_input import add_arguments, drop_inapplicable, resolve_input
  add_arguments(p)
  a=p.parse_args()
+ if a.route is None:
+  from owner_route_binding import OwnerRouteBindingError, default_owner_route_file
+  try:
+   a.route=default_owner_route_file(a.jobs)
+  except OwnerRouteBindingError as exc:
+   print(f"check=failed\nreason={exc}\ndetail=name the route with --route\nchild_spawned=0"); raise SystemExit(64)
+ a.slug=a.slug or f"{a.parent or os.environ.get('AGENT_DISPATCH_SELF_SLUG') or 'stage'}-{a.node}"
  lifecycle=requested_launch_lifecycle(a.adapter_args)
  if a.action=="start" and lifecycle==FOREGROUND_SCOPED:
   print(FOREGROUND_NOTICE,file=sys.stderr,flush=True)
@@ -814,7 +848,7 @@ def main():
  overridden_adapter=None
  replaying=any(t=="--automatic-retry-of" or t.startswith("--automatic-retry-of=") for t in strip_leading_separator(a.adapter_args))
  if worker_type not in {"owner","frame"} and not a.subsession_id and not replaying:
-  a.adapter,overridden_adapter=MODEL_PROFILE.pinned_launch_harness(
+  a.adapter,overridden_adapter=ROUTE_AUTHORITY.pinned_launch_harness(
    route,worker_type=worker_type,requested=a.adapter,
    available=lambda harness:pin_harness_available(route,node,harness,registry.path))
  wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"
@@ -825,6 +859,8 @@ def main():
  except DispatchContractError as exc:
   print("check=failed"); print(f"reason={exc.reason}"); print("child_spawned=0")
   raise SystemExit(65)
+ if a.subsession_id:
+  a.subsession_purpose=subsession_purpose(registry.path,route,node,a.session_chain_id,a.subsession_purpose)
  prior_rounds=prior_round_attempts(registry.path,route["route_id"],node["id"],exclude_slug=a.slug,exclude_attempt=a.attempt_id,
                                   route=route if node.get("kind")=="review-worker" else None) if not a.subsession_id and original_task is None else []
  # SD-153/SD-154: `admit_round` (budget + rule-8 auto-revision) is the one

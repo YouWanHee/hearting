@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """SD-66 fix-forward: dispatch-node.py record -> wrapper-argument binding."""
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -677,6 +679,28 @@ class MainMaterializationTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 65)
         self.assertEqual(run.call_count, 1)
 
+    def test_an_owner_route_and_start_need_no_route_or_slug_argument(self):
+        first = make_node()
+        first["replica_group"] = "execute"
+        second = {**make_node(), "id": "execute-replica", "replica_group": "execute"}
+        route = make_route(first)
+        route["nodes"].append(second)
+        with tempfile.TemporaryDirectory() as td:
+            route_path = Path(td) / "route.json"
+            route_path.write_text(json.dumps(route))
+            out = io.StringIO()
+            argv = ["dispatch-node.py", "--node", "execute", "--adapter", "claude", "--start"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.dict(N.os.environ, {}, clear=True), \
+                 mock.patch("owner_route_binding.default_owner_route_file", return_value=str(route_path)), \
+                 mock.patch.object(N.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                 contextlib.redirect_stdout(out):
+                with self.assertRaises(SystemExit) as ctx:
+                    N.main()
+        # The route came from the owner's current route and --start meant start.
+        self.assertEqual(ctx.exception.code, 65)
+        self.assertIn("reason=parallel-group-batch-required", out.getvalue())
+
     def test_replica_register_is_forbidden_even_with_batch_token(self):
         node = make_node()
         node["replica_group"] = "execute"
@@ -1023,6 +1047,80 @@ class ReviewRoundCapTest(unittest.TestCase):
                     code = exc.code
         self.assertEqual(code, 0)
         self.assertFalse([l for l in printed if l.startswith("reason=review-round-budget-exhausted")])
+
+    def _subsession_purpose(self, rows):
+        """One `test` phase dry-run over `rows`; returns (exit, forwarded purpose)."""
+        node = dict(make_node(depth=1, dispatch_fallback=[]), id="test",
+                    kind="pipeline-stage", unit="qa/test", completion_gate="code-test")
+        route = make_route(node, tuples=[])
+        launched = []
+        code = None
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / ".dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text(rows)
+            route_path = Path(td) / "route.json"
+            route_path.write_text(json.dumps(route))
+            argv = ["dispatch-node.py", "--route", str(route_path), "--node", "test",
+                    "--adapter", "claude", "--slug", "test-gap-g1", "--action", "dry-run",
+                    "--prompt-text", "Finish only the unfinished gate items.",
+                    "--subsession-id", "ss-gap-1", "--subsession-index", "1",
+                    "--subsession-count", "2", "--subsession-mode", "serial",
+                    "--session-chain-id", "ssc-gap-1", "--phase-brief", "brief",
+                    "--narrow-verify", "true", "--expected-round-trips", "1",
+                    "--stage-authority", "0", "--attempt-id", "att-gap-1"]
+
+            def fake_run(cmd, **kwargs):
+                launched.append(cmd)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.dict(N.os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}, clear=True), \
+                 mock.patch.object(N.subprocess, "run", side_effect=fake_run), \
+                 mock.patch("builtins.print"):
+                try:
+                    N.main()
+                except SystemExit as exc:
+                    code = exc.code
+        wrapper = [cmd for cmd in launched if any("dispatch-headless.py" in str(part) for part in cmd)]
+        self.assertEqual(len(wrapper), 1, launched)
+        return code, wrapper[0][wrapper[0].index("--subsession-purpose") + 1]
+
+    def test_subsession_after_a_gate_failure_is_a_gap_retry_and_the_full_stage_stays_exhausted(self):
+        # BC rt-96bab699: two settled test FAILs spent the standard cap. A
+        # stage_authority=0 phase that finishes the unfinished items is still
+        # admitted and recorded as the gap retry it is; a new full-stage round
+        # on the same node stays exhausted.
+        failed = self._rows("test", 2)
+        self.assertEqual(self._subsession_purpose(failed), (0, "gap-retry"))
+        code, printed = self._run("test", 2)
+        self.assertEqual(code, 65)
+        self.assertIn("reason=review-round-budget-exhausted", printed)
+        # No gate failure yet, or a later verdict answered it: planned.
+        self.assertEqual(self._subsession_purpose(""), (0, "planned"))
+        passed = failed + failed.splitlines(True)[-1].replace(
+            "note=dead-worker-fail,failure_class=fail", "note=completed-marker").replace("att-test-2", "att-test-3")
+        self.assertEqual(self._subsession_purpose(passed), (0, "planned"))
+        # A chain keeps the purpose it was admitted with: a FAIL recorded after
+        # its first row does not relabel its later starts.
+        chain_row = ("2026-08-24T00:00:00Z\topen\t/repo\t/wt\ttest-gap-g0\troute_id=rt-fixture,route_node=test,"
+                     "stage_authority=0,session_chain_id=ssc-gap-1,attempt_id=att-gap-0\n")
+        self.assertEqual(self._subsession_purpose(chain_row + failed), (0, "planned"))
+
+    def test_subsession_after_a_blocked_round_is_a_gap_retry_too(self):
+        # A BLOCKED (unfinished) round spends no round, yet the phases that finish its
+        # remaining items are the gap retry of that round, not planned subdivision.
+        blocked = self._rows("test", 1).replace("note=dead-worker-fail,failure_class=fail",
+                                                "note=dead-worker-blocked,failure_class=blocked")
+        self.assertEqual(self._subsession_purpose(blocked), (0, "gap-retry"))
+        crash = blocked.splitlines(True)[-1].replace(
+            "note=dead-worker-blocked,failure_class=blocked", "note=dead-exact-pid,failure_class=contract"
+        ).replace("att-test-1", "att-test-crash")
+        self.assertEqual(self._subsession_purpose(blocked + crash), (0, "gap-retry"))   # a death answers nothing
+        passed = blocked.splitlines(True)[-1].replace(
+            "note=dead-worker-blocked,failure_class=blocked", "note=completed-marker"
+        ).replace("att-test-1", "att-test-pass")
+        self.assertEqual(self._subsession_purpose(blocked + passed), (0, "planned"))
 
     def test_a_sd154_10_admit_round_is_the_one_admission_entry_on_every_surface(self):
         """A-SD154-10 parity: `dispatch-node.py`'s own `main()`, `dispatch-

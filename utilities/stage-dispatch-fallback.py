@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from model_config import ModelConfigError, resolve_config  # noqa: E402
-from model_profile import sealed_pin_harness  # noqa: E402
+from route_authority import retry_predecessor, sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -79,7 +79,7 @@ from dispatch_mode_contract import (  # noqa: E402
     validate_route_mode_axes,
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind  # noqa: E402
-from dispatch_attempt_policy import decide_attempt, committed_outcome
+from dispatch_attempt_policy import decide_attempt, committed_outcome, readable_result
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE  # noqa: E402
 from review_round_cap import classify_round_row  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
@@ -797,7 +797,8 @@ def finished_verdict_row(jobs: Path, route_id: str, node_id: str, attempt_id: st
         if row.get("attempt_id") != attempt_id or row.get("_status") != "done":
             continue
         worker_type = row.get("worker_type", "")
-        return row if classify_round_row("done", row, worker_type=worker_type) == "verdict" else None
+        verdict = classify_round_row("done", row, worker_type=worker_type) == "verdict"
+        return row if verdict or readable_result(row) else None
     return None
 
 
@@ -835,6 +836,9 @@ def terminal_attempt_state(
         return "terminal", fields
     if decision.action == "review":
         return "terminal", {**fields, "review_verdict": "FAIL"}
+    if readable_result(row):
+        # The worker's own FAIL/BLOCKED is this launch's result, never a fallback.
+        return "terminal", {**fields, "review_verdict": readable_result(row)}
     if decision.retry_kind == "capacity":
         return "capacity", {**fields, "failure_class": "capacity"}
     if decision.retry_allowed:
@@ -1260,10 +1264,9 @@ def wrapper_command(
     # never synthesizes a worker_role from topology kind, node, or model role.
     if args.worker_role:
         command += ["--worker-role", args.worker_role]
-    if harness in {"codex", "claude"}:
-        command += ["--launch-lifecycle", lifecycle]
-        if lifecycle == FOREGROUND_SCOPED:
-            command += ["--foreground-timeout", str(args.foreground_timeout)]
+    command += ["--launch-lifecycle", lifecycle]
+    if lifecycle == FOREGROUND_SCOPED:
+        command += ["--foreground-timeout", str(args.foreground_timeout)]
     command += ["--model-role", _unit_role(node.get("unit")) or node.get("role", "fast implementer")]
     command += ["--model-profile", node["model_profile"]]
     if capacity_settings:
@@ -1639,11 +1642,33 @@ def capacity_retry(
     return "descend", retry_fields, retry_output
 
 
+def start_parallel_group(args: argparse.Namespace, group: str) -> int:
+    """A member of a sealed parallel group starts its whole group in one batch.
+
+    The batch is the group's one admission transaction, so starting a member
+    is that batch start; a member whose group already started gets the
+    batch's idempotent receipt for the legs that exist.
+    """
+    argv = [sys.executable, str(ROOT / "utilities/dispatch-batch.py"), "--route", str(args.route),
+            "--parallel-group", group, "--action", "start", "--parent", args.parent]
+    if args.qa:
+        argv += ["--qa", args.qa]
+    if args.jobs:
+        argv += ["--jobs", str(args.jobs)]
+    if args.prompt_file is not None:
+        argv += ["--prompt-text", args.prompt_file.read_text(encoding="utf-8")]
+    if args.reviewed_evidence:
+        argv += ["--reviewed-evidence", str(args.reviewed_evidence)]
+    print(f"notice: node {args.node} belongs to parallel group {group}; "
+          "starting the group in one dispatch-batch call.", file=sys.stderr, flush=True)
+    return subprocess.run(argv, check=False).returncode
+
+
 def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--route", type=Path, required=True)
+    p.add_argument("--route", type=Path, help="default: this owner's current route")
     p.add_argument("--node", required=True)
-    p.add_argument("--slug", required=True)
+    p.add_argument("--slug", help="default: <parent>-<node>")
     p.add_argument("--parent")
     p.add_argument("--capability-mode")
     p.add_argument("--worker-mode")
@@ -1672,7 +1697,14 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     action.add_argument("--dry-run", dest="action", action="store_const", const="dry-run")
     action.add_argument("--register", dest="action", action="store_const", const="register")
     action.add_argument("--start", dest="action", action="store_const", const="start")
+    action.add_argument("--action", dest="action", choices=("dry-run", "register", "start"))
     args = p.parse_args()
+    if args.route is None:
+        from owner_route_binding import OwnerRouteBindingError, default_owner_route_file
+        try:
+            args.route = Path(default_owner_route_file(args.jobs))
+        except OwnerRouteBindingError as exc:
+            return fail(str(exc), 64, detail="name the route with --route", child_spawned="0")
     # The wrappers run with cwd=ROOT, so a relative prompt path would be read
     # against the harness tree instead of the caller's directory (home-os,
     # 2026-09-27: three launches fell through to "inline, runtime-unavailable").
@@ -1695,6 +1727,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     args.parent = args.parent or self_slug
     if not args.parent:
         return fail("parent-identity-missing", 73, child_spawned="0")
+    args.slug = args.slug or f"{args.parent}-{args.node}"
 
     try:
         args.route = args.route.resolve()
@@ -1755,7 +1788,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     if args.broker_root is not None or args.broker_timeout is not None:
         return fail("retired-broker-option", 64, child_spawned="0")
     group = node.get("parallel_group") or node.get("replica_group")
-    if group and args.action in {"register", "start"}:
+    if group and args.action == "start":
+        return start_parallel_group(args, str(group))
+    if group and args.action == "register":
         return fail(
             "parallel-group-batch-required",
             65,
@@ -1874,16 +1909,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
 
     prior_failures = registry_failures(args.jobs, route["route_id"], node["id"])
     prior_rows = registry_rows(args.jobs, route["route_id"], node["id"])
-    args.automatic_retry_of = (
-        prior_rows[-1].get("attempt_id", "") if prior_rows
-        and committed_outcome(prior_rows[-1]["_status"], prior_rows[-1]) == "failed" else ""
-    )
-    if (not args.automatic_retry_of and prior_rows
-            and prior_rows[-1]["_status"] == "open"
-            and prior_rows[-1].get("launch_claimed") == "0"):
-        # A retry `--register`ed but not yet started keeps its predecessor, so
-        # its `--start` names the same successor attempt.
-        args.automatic_retry_of = prior_rows[-1].get("automatic_retry_of", "")
+    args.automatic_retry_of = retry_predecessor(prior_rows)
     failed_tuples = set(args.failed_tuple) | set(prior_failures)
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
@@ -2091,8 +2117,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             args, route, node, allocation_context, row, hop, ordinal, attempt_id,
                             attempts, prior_failures, output,
                             terminal_note=note,
-                            review_verdict=("PASS" if note not in (REVIEW_BLOCKING_NOTE, "dead-worker-fail")
-                                            else "FAIL"),
+                            review_verdict=(readable_result(verdict_row)
+                                            or ("FAIL" if note == REVIEW_BLOCKING_NOTE else "PASS")),
                         )
                     if (result.returncode != 0 or fields.get("check") == "failed"
                             or worker_failure != "-"):

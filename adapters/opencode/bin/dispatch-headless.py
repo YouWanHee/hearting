@@ -149,11 +149,14 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    bind_request as bind_execution_access_request,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
+)
+from route_authority import (  # noqa: E402
+    bind_access_request as bind_execution_access_request,
+    bind_runtime_parent,
 )
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity via resolve_qa
@@ -162,62 +165,10 @@ INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "advers
 # when omitted. The jobs.log `qa=` field is retained (derived value) for
 # fleet-collector compatibility.
 
-# SD-15 (OPERATIONS §5.10 ⑨): immediate limit/auth failure patterns — homomorphic port of the Claude
-# wrapper's DEATH_PATTERNS. `opencode run --format json` surfaces provider limit/auth
-# failures as text/JSON in the log; a raw tail substring scan matches either. Runtime-
-# currentness (2026-07, anomalyco/opencode#8203·#11104·#34886·#15890): OpenCode prints
-# "Provider Rate Limit exceeded [retrying in Ns attempt #N]", "API rate limited (429)",
-# and "Rate limited. Quick retry in 1s…". ⚠️ ADAPTATION CONSTRAINT: `opencode run` has a
-# known bug (#8203) where it *hangs* on API errors instead of exiting — the launch
-# early-exit watch proactively interrupts only the distinct anchored capacity class;
-# other hang-on-limit cases are caught later by dispatch-liveness.py's log scan.
-DEATH_PATTERNS = [
-    ("capacity", r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b"),
-    ("network-operation-not-permitted", r"operation not permitted|network is unreachable|network access denied"),
-    ("session-limit", r"hit your (?:session|usage) limit|session limit reached"),
-    ("usage-limit", r"usage[_ ]limit[_ ]reached|usage limit reached|weekly limit|"
-     r"rate limit(?:ed)?|provider rate limit|exceeded retry limit|\b429\b"),
-    ("auth", r"invalid api key|authentication_error|not logged in|please run /login|unauthorized|\b401\b"),
-    ("credit", r"credit balance is too low|insufficient (?:credit|quota|funds)"),
-    ("permission-reject", r"permission requested:.*auto-rejecting"),
-]
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_RESET_RE = re.compile(
-    r"resets?(?:\s+at)?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{1,2}\s*(?:am|pm))",
-    re.I,
-)
-
-
-def scan_death(text: str) -> tuple[str, str] | None:
-    """Return (reason, reset) if the log text shows a limit/auth death, else None.
-
-    reset is a best-effort human string ('3pm', '15:45', ...) or '' when absent.
-    Homomorphic with the Claude wrapper's scan_death and dispatch-liveness.py LIMIT_RE.
-    """
-    low = text.lower()
-    reason = ""
-    for name, pat in DEATH_PATTERNS:
-        if re.search(pat, low):
-            reason = name
-            break
-    if not reason:
-        return None
-    m = _RESET_RE.search(text)
-    reset = re.sub(r"\s+", "", m.group(1)) if m else ""
-    return reason, reset
-
-
-def scan_anchored_death(text: str) -> tuple[str, str] | None:
-    """Inspect only terse terminal CLI lines, never completion-report prose."""
-    for line in [line.strip() for line in text.splitlines() if line.strip()][-3:]:
-        if len(_ANSI_RE.sub("", line)) > 200:
-            continue
-        death = scan_death(line)
-        if death:
-            if death[0] == "capacity" and not anchored_capacity_failure(line):
-                continue
-            return death
-    return None
+# SD-15 (OPERATIONS §5.10 ⑨): limit/auth/capacity deaths are classified by the one shared
+# table (route_authority), the same at launch and in liveness for every harness.
+from route_authority import DEATH_PATTERNS, scan_anchored_death, scan_death  # noqa: E402,F401
+from route_authority import ANSI_RE as _ANSI_RE  # noqa: E402,F401
 
 
 @contextmanager
@@ -706,6 +657,7 @@ def scoped_external_directory_config(
     artifact_root: str,
     report_bundle_root: str | None = None,
     execution_access_roots: tuple[Path, ...] = (),
+    execution_access_read_roots: tuple[Path, ...] = (),
     *,
     agent_home: Path | None = None,
     worktree: str | None = None,
@@ -791,10 +743,49 @@ def scoped_external_directory_config(
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
             rules[pattern] = "allow"
+    # Requested read-only roots (OpenCode grant only): same read visibility
+    # as the writable roots above, but edits stay denied. A root the write
+    # side already covers keeps its writable rule (write wins); a broader
+    # read root re-asserts the covered writable paths afterwards so the deny
+    # cannot swallow them. Native last-match order applies throughout, and
+    # the default deny outside every listed root (SD-15) is unchanged.
+    def _path_forms(value) -> set[str]:
+        text = os.path.normpath(str(value))
+        forms = {text}
+        try:
+            forms.add(os.path.normpath(os.path.realpath(text)))
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return forms
+
+    def _covers(outer, inner) -> bool:
+        for left in _path_forms(outer):
+            for right in _path_forms(inner):
+                if right == left or right.startswith(left + os.sep):
+                    return True
+        return False
+
+    def _strictly_under(outer, inner) -> bool:
+        for left in _path_forms(outer):
+            for right in _path_forms(inner):
+                if right != left and right.startswith(left + os.sep):
+                    return True
+        return False
+
+    write_side = [root for root in (artifact_root, report_bundle_root, *execution_access_roots) if root]
+    covered_roots = [str(root) for root in write_side] + list(contract_roots)
+    read_deny_roots = [str(root) for root in execution_access_read_roots
+                       if root and not any(_covers(cover, root) for cover in covered_roots)]
+    write_keep_roots = [str(root) for root in write_side
+                        if any(_strictly_under(read, root) for read in read_deny_roots)]
+    for root in read_deny_roots:
+        for pattern in (root, f"{root}/**"):
+            rules.pop(pattern, None)
+            rules[pattern] = "allow"
     if contract_roots:
         permission.pop("external_directory", None)
     permission["external_directory"] = rules
-    if contract_roots:
+    if contract_roots or read_deny_roots:
         edit = effective_tool(original_permission, "edit", "allow")
         if isinstance(edit, str):
             edit_rules = {"*": edit}
@@ -802,7 +793,7 @@ def scoped_external_directory_config(
             edit_rules = dict(edit)
         else:
             raise ValueError("OpenCode edit permission must be a string or object")
-        for root in contract_roots:
+        for root in (*contract_roots, *read_deny_roots):
             # v1 native edit/write/patch ask against paths relative to the
             # worktree, unlike external_directory's absolute directory glob.
             edit_paths = (root,) if worktree is None else (
@@ -812,10 +803,18 @@ def scoped_external_directory_config(
                             for pattern in (directory, f"{directory}/**")):
                 edit_rules.pop(pattern, None)
                 edit_rules[pattern] = "deny"
+        for root in write_keep_roots:
+            edit_paths = (root,) if worktree is None else (
+                root, os.path.relpath(root, worktree),
+            )
+            for pattern in (pattern for directory in edit_paths
+                            for pattern in (directory, f"{directory}/**")):
+                edit_rules.pop(pattern, None)
+                edit_rules[pattern] = "allow"
         permission.pop("edit", None)
         permission["edit"] = edit_rules
     config["permission"] = permission
-    if contract_roots and selected_agent:
+    if (contract_roots or read_deny_roots) and selected_agent:
         # Native agent permissions merge after global permissions. Overlay only
         # the selected agent, without giving its other tools a new default.
         agents = config.get("agent", {})
@@ -834,17 +833,28 @@ def scoped_external_directory_config(
         else:
             raise ValueError("OpenCode agent permission must be a string or object")
         original_local = dict(local)
-        for tool, action in (("external_directory", "allow"), ("edit", "deny")):
-            old = effective_tool(original_local, tool)
-            if old is None:
-                overlay = {}
-            elif isinstance(old, str):
-                overlay = {"*": old}
-            elif isinstance(old, dict):
-                overlay = dict(old)
-            else:
-                raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
-            for root in contract_roots:
+        # Triples accumulate into one overlay per tool in listed order, so a
+        # later triple wins on overlap (native last-match) without wiping an
+        # earlier triple's unrelated patterns.
+        overlaid: dict[str, dict] = {}
+        for tool, action, roots in (("external_directory", "allow", contract_roots),
+                                    ("edit", "deny", contract_roots),
+                                    ("external_directory", "allow", read_deny_roots),
+                                    ("edit", "deny", read_deny_roots)):
+            if not roots:
+                continue
+            if tool not in overlaid:
+                old = effective_tool(original_local, tool)
+                if old is None:
+                    overlaid[tool] = {}
+                elif isinstance(old, str):
+                    overlaid[tool] = {"*": old}
+                elif isinstance(old, dict):
+                    overlaid[tool] = dict(old)
+                else:
+                    raise ValueError(f"OpenCode agent {tool} permission must be a string or object")
+            overlay = overlaid[tool]
+            for root in roots:
                 directories = (root,)
                 if tool == "edit" and worktree is not None:
                     directories += (os.path.relpath(root, worktree),)
@@ -852,8 +862,36 @@ def scoped_external_directory_config(
                     for pattern in (directory, f"{directory}/**"):
                         overlay.pop(pattern, None)
                         overlay[pattern] = action
+        for tool, overlay in overlaid.items():
             local.pop(tool, None)
             local[tool] = overlay
+        if write_keep_roots:
+            # Write wins inside the selected agent too: explicit edit allow
+            # chained after the read deny above, from whatever edit overlay
+            # the read roots just produced.
+            current = local.get("edit")
+            if isinstance(current, dict):
+                overlay = dict(current)
+            else:
+                old = effective_tool(original_local, "edit")
+                if old is None:
+                    overlay = {}
+                elif isinstance(old, str):
+                    overlay = {"*": old}
+                elif isinstance(old, dict):
+                    overlay = dict(old)
+                else:
+                    raise ValueError("OpenCode agent edit permission must be a string or object")
+            for root in write_keep_roots:
+                directories = (root,) if worktree is None else (
+                    root, os.path.relpath(root, worktree),
+                )
+                for directory in directories:
+                    for pattern in (directory, f"{directory}/**"):
+                        overlay.pop(pattern, None)
+                        overlay[pattern] = "allow"
+            local.pop("edit", None)
+            local["edit"] = overlay
         selected["permission"] = local
         agents[selected_agent] = selected
         config["agent"] = agents
@@ -1759,6 +1797,7 @@ def main(argv: list[str]) -> int:
     args.command_attempt_id = args.attempt_id
     if action == "dry-run":
         args.attempt_id = None
+    bind_runtime_parent(args)
     if args.broker_request_id or args.launch_authority == "ancestor-broker":
         return fail("launch-broker-retired", 76, child_spawned="0")
     args.agent_home = resolve_agent_home()
@@ -2023,6 +2062,7 @@ def main(argv: list[str]) -> int:
                 if args.report_bundle_root is not None
                 else None,
                 args.execution_access_grant.additional_writable_roots,
+                args.execution_access_grant.read_roots,
                 agent_home=args.agent_home,
                 worktree=args.worktree,
                 selected_agent=args.agent,

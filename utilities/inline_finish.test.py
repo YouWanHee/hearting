@@ -31,6 +31,9 @@ GATES = ["atomic-outcome", "known-scope", "no-shared-contract", "no-resource-run
 
 
 class PublicInlineFinishTest(unittest.TestCase):
+    CAPABILITY = "autopilot-code"
+    CAPABILITY_MODE = "dev"
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="inline-finish-test-")
         self.base = Path(self.temp.name)
@@ -55,11 +58,18 @@ class PublicInlineFinishTest(unittest.TestCase):
             "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_ROUTE_FILE", "AGENT_ROUTE_ID",
             "AGENT_ROUTE_NODE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
             "OPENCODE_SESSION_ID", "AGENT_DISPATCH_CALLER_HARNESS", "XDG_STATE_HOME",
-            "HEARTING_INLINE_FINISH_CRASH_AT")}
+            "HEARTING_INLINE_FINISH_CRASH_AT", "AGENT_ARTIFACT_CHECKPOINT",
+            "HEARTING_WORKFLOW_GROUP_REVIEW")}
         os.environ.update({
             "AGENT_HOME": str(self.home), "AGENT_DISPATCH_JOBS": str(self.jobs),
             "AGENT_DISPATCH_DEPTH": "0", "CODEX_THREAD_ID": "inline-finish-test-session",
             "XDG_STATE_HOME": str(self.base / "state"),
+            # Isolate compose/start as well as finish: automatic detached
+            # checkpoints must not outlive this fixture's temporary root.
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+            # Sealing also owns a separate detached group-review sweep. This
+            # fixture tests finish/admission, not that background lifecycle.
+            "HEARTING_WORKFLOW_GROUP_REVIEW": "off",
         })
         for key in ("AGENT_DISPATCH_ATTEMPT_ID", "AGENT_ROUTE_FILE", "AGENT_ROUTE_ID",
                     "AGENT_ROUTE_NODE", "CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID",
@@ -80,7 +90,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.prompt.write_text("Exercise the direct inline finish transaction.\n", encoding="utf-8")
         compose = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
                    "--slug", "inline-finish-test", "--campaign-key", "inline-finish-test",
-                   "--shape", "direct", "--capability", "autopilot-code", "--capability-mode", "dev",
+                   "--shape", "direct", "--capability", self.CAPABILITY, "--capability-mode", self.CAPABILITY_MODE,
                    "--intensity", "direct", "--cwd", str(self.repo),
                    "--artifact-root", str(self.root), "--tracking", "tracked",
                    "--prompt-file", str(self.prompt),
@@ -762,6 +772,60 @@ class PublicInlineFinishTest(unittest.TestCase):
         refused = self.finish()
         self.assertNotEqual(refused.returncode, 0)
         self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
+
+
+class SpecInlinePublicationTest(unittest.TestCase):
+    def _fixture(self):
+        fixture = PublicInlineFinishTest()
+        fixture.CAPABILITY, fixture.CAPABILITY_MODE = "autopilot-spec", "update"
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        prd = fixture.cycle_dir / "artifacts/spec/prd.md"
+        prd.parent.mkdir(parents=True, exist_ok=True)
+        prd.write_bytes(b"# Official user PRD\n")
+        return fixture, prd
+
+    def test_inline_finish_publishes_after_seal_and_replays_without_changing_finish_receipt(self):
+        fixture, prd = self._fixture()
+        source = prd.read_bytes()
+        for fault in ("after-finalize", "after-admission"):
+            failed = fixture.finish(fault)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("fault-injected-" + fault, failed.stderr)
+        first = fixture.finish()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        self.assertEqual(receipt["shared_publication"]["status"], "admitted", receipt)
+        state_path = fixture.root / ".runtime/inline-finish/v1" / fixture.route["route_id"] / "finish.json"
+        state = state_path.read_bytes()
+        outcome = CAP.outcome_path(fixture.route_file).read_bytes()
+        manifest = (fixture.cycle_dir / "manifest.json").read_bytes()
+        again = fixture.finish()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout)["shared_publication"]["shared_reference_revision_id"],
+                         receipt["shared_publication"]["shared_reference_revision_id"])
+        self.assertEqual(artifact_producer.list_references(fixture.root, "spec")[0]["revisions"],
+                         [receipt["shared_publication"]["shared_reference_revision_id"]])
+        self.assertEqual(state_path.read_bytes(), state)
+        self.assertEqual(CAP.outcome_path(fixture.route_file).read_bytes(), outcome)
+        self.assertEqual((fixture.cycle_dir / "manifest.json").read_bytes(), manifest)
+        self.assertEqual(prd.read_bytes(), source)
+        document = json.loads(manifest)
+        primary = next(a["artifact_id"] for a in document["artifacts"] if a["role"] == "primary")
+        self.assertEqual(next(r["locator"]["path"] for r in document["artifact_revisions"]
+                              if r["artifact_id"] == primary), "artifacts/spec/prd.md")
+
+    def test_inline_missing_prd_reports_publication_pending_without_reopening_finished_work(self):
+        fixture, prd = self._fixture()
+        prd.unlink()
+        done = fixture.finish()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        receipt = json.loads(done.stdout)
+        self.assertEqual(receipt["shared_publication"]["reason"], "official-spec-prd-missing")
+        self.assertFalse(prd.exists())
+        self.assertEqual(artifact_producer.list_references(fixture.root, "spec"), [])
+        outcome = json.loads(CAP.outcome_path(fixture.route_file).read_text())
+        self.assertTrue(outcome["terminal_gate_proven"])
 
 
 class NextLegFinishTest(PublicInlineFinishTest):

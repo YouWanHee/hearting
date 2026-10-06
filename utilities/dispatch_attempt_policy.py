@@ -97,6 +97,23 @@ def verdict_pass(metadata: Mapping[str, str]) -> bool:
     return metadata.get("failure_class") == "pass"
 
 
+def readable_result(metadata: Mapping[str, str]) -> str:
+    """``"FAIL"`` or ``"BLOCKED"`` when the worker's own final envelope said so, else ``""``.
+
+    That is the worker's result for its owner to act on, never a transport
+    death: only a death, a capacity stop or a runtime error is retried
+    automatically (ROUTE-AUTHORITY RA-4). A reviewer's finished FAIL is
+    `completed-review-blocking` (its readable review artifact); a bare
+    `dead-worker-fail` on a review row stays a death, as the round census reads it.
+    """
+    note, failure_class = metadata.get("note", ""), metadata.get("failure_class")
+    if note == "dead-worker-fail" and failure_class == "fail" and metadata.get("worker_type") != "review":
+        return "FAIL"
+    if note == "dead-worker-blocked" and failure_class == "blocked":
+        return "BLOCKED"
+    return ""
+
+
 def success_note(metadata: Mapping[str, str]) -> bool:
     """The one place a caller asks "does this row's note read as success"."""
     state = deferred_completion(metadata)
@@ -173,8 +190,11 @@ def decide_attempt(
         # Cancellation is an explicit disposition, not automatic permission
         # to resurrect the cancelled work. Its recovery claim has a separate
         # user/route-authorized admission boundary.
+        # A worker's readable FAIL or BLOCKED is its result, not a death to retry.
         retry = ("" if status == "cancelled" or metadata.get("failure_class") == "cancelled" else
-                 "capacity" if note == "dead-capacity" else "fallback" if note.startswith("dead-") else "")
+                 "capacity" if note == "dead-capacity" else
+                 "" if readable_result(metadata) else
+                 "fallback" if note.startswith("dead-") else "")
         return AttemptDecision(outcome, "inspect-failure", "workflow-owner", note or status, retry)
     return AttemptDecision(outcome, "inspect-failure", "workflow-owner", "terminal-outcome-unclassified")
 

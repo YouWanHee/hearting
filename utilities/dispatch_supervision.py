@@ -267,17 +267,22 @@ def _residue_text(receipt: dict) -> str:
             "stop it if it is no longer needed. Nothing is signalled automatically.")
 
 
+def _printed(name: str) -> str:
+    from parent_next_directive import entrypoint
+    return entrypoint(Path(__file__).resolve().parents[1], f"utilities/{name}")
+
+
 def render_text(receipt: dict) -> str:
     receipt = validate(receipt)
     if receipt["reason"] == "owner-input-undelivered":
-        command = shlex.join(["python3", str(Path(__file__).with_name("capability-route.py")),
+        command = shlex.join(["python3", _printed("capability-route.py"),
                               "correct", "--jobs", receipt["job_registry"],
                               "--attempt-id", receipt["owner_attempt_id"]])
         return ("A user correction was not delivered, or its delivery is unknown. "
                 "The execution result is unchanged. Read the exact input receipts, tell the user "
                 "what remains unconfirmed, and do not resend an unknown input automatically. " + command)
     if receipt["reason"] == "workflow-completion-pending":
-        utility = Path(__file__).with_name("dispatch_terminal_commit.py")
+        utility = _printed("dispatch_terminal_commit.py")
         command = (f"python3 {shlex.quote(str(utility))} finish --jobs {shlex.quote(receipt['job_registry'])} "
                    f"--attempt {shlex.quote(receipt['owner_attempt_id'])}")
         return ("The owner result remains PASS, but workflow/route/report closure is pending. "
@@ -286,7 +291,7 @@ def render_text(receipt: dict) -> str:
                 "Use inspect instead of finish to read the exact gates, cleanup state and checkpoint. "
                 "Existing transaction recovery: " + command)
     if receipt["reason"] == "closure-blocked":
-        utility = Path(__file__).with_name("dispatch_terminal_commit.py")
+        utility = _printed("dispatch_terminal_commit.py")
         command = (f"python3 {shlex.quote(str(utility))} inspect --jobs {shlex.quote(receipt['job_registry'])} "
                    f"--attempt {shlex.quote(receipt['owner_attempt_id'])}")
         return ("The owner result remains PASS, but its own workflow/route closure can never complete from "
@@ -296,7 +301,7 @@ def render_text(receipt: dict) -> str:
                 "user and inspect the exact gate reason before deciding a recovery path (a fresh dispatch of "
                 "the same route node, or manual repair of the marker/evidence). Read-only diagnosis: " + command)
     if receipt["reason"] in {"watch-deadline", "receiver-unavailable"}:
-        utility = Path(__file__).with_name("dispatch_terminal_commit.py")
+        utility = _printed("dispatch_terminal_commit.py")
         command = (f"python3 {shlex.quote(str(utility))} finish --jobs {shlex.quote(receipt['job_registry'])} "
                    f"--attempt {shlex.quote(receipt['owner_attempt_id'])}")
         detail = ("The completion watch reached its own deadline (about a day) without the batch settling"
@@ -307,7 +312,7 @@ def render_text(receipt: dict) -> str:
                 "result and workflow/route closure state are unchanged -- nothing was retried or discarded. "
                 "A human or the next launch must resume the completion watch; this notice alone does not. "
                 "Existing transaction recovery: " + command)
-    utility = Path(__file__).resolve().with_name("dispatch-registry.py")
+    utility = _printed("dispatch-registry.py")
     operation = "resolve-terminal-conflict" if receipt["reason"] == "terminal-evidence-conflict" else "reconcile"
     commands = [f"python3 {shlex.quote(str(utility))} {operation} --jobs "
                 f"{shlex.quote(receipt['job_registry'])} --attempt {shlex.quote(aid)}"

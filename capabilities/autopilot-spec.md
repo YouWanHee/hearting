@@ -127,13 +127,30 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
    from the owner (dispatch env pass-through) and call `begin --node <id>`
    on the same route, which resumes the owner's open cycle.
-4. **terminal evidence before shared admission.** The terminal node uses the
-   verified cycle-local PRD as evidence, independent of any shared revision.
-   For new registered owners the shared completion controller then completes
-   the workflow, closes the route and finalizes the exact cycle (its completion record). Inline work and
+4. **terminal evidence before shared admission.** The terminal node records
+   verified cycle-local completion evidence, independent of any shared revision.
+   A REPORT may carry that PASS evidence; it does not select the user-facing PRD.
+   For new registered owners the shared completion controller closes the route,
+   finalizes the exact cycle and records workflow completion. Inline work and
    legacy recovery retain explicit complete/close/finalize. Shared admission
    follows the finalized cycle; it cannot stand in for terminal evidence.
-5. **shared admission.** `spec` output is admitted to `shared/spec/` by `admit-shared --kind spec` after the cycle is finalized (canonical shared kind). Seed selects the unique reference keyed `spec` when older references coexist; an existing seed receipt keeps its original reference and revision. An ambiguous selection is refused without writing, and an older reference remains available through the existing reference selector. Shared admission retains its own selector and base-receipt checks; a `--key` that matches none of the existing references is refused (`shared-reference-exists`) and a second reference is only ever created with `--new-reference`.
+5. **shared admission.** After verified cycle completion and finalize, the
+   common completion controller (including normal finish/recovery) calls the
+   existing `admit-shared --kind spec` implementation automatically and reports
+   its revision to the caller. Admission failure/conflict remains a retryable
+   publication gap; it does not undo terminal PASS, route closure or the sealed
+   cycle, and never becomes a gate before those steps. Status detects missing
+   cycle-to-shared lineage from the actual records. Seed selects the unique
+   reference keyed `spec` when older references coexist; an existing seed
+   receipt keeps its original reference and revision. Ambiguity, base/latest
+   CAS, component preservation and publication recovery remain the producer's
+   responsibility. A second reference still requires explicit `--new-reference`.
+   The normal representative is the actual canonical `prd.md` at the root or
+   in the declared component scope; a terminal `REPORT.md` is evidence/output.
+   Respect explicit valid primary choices, but do not interpret a terminal
+   artifact pointer as a user primary override. Missing official PRD is exposed
+   without inventing a document or adding a required primary flag. Draft/open
+   or abandoned cycles and research are not promoted by this completion path.
 
 ## Role Requirements
 

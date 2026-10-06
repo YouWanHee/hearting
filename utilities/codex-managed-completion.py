@@ -655,9 +655,13 @@ def queue_target(jobs: Path, attempts: set[str], registered: str) -> str:
     try:
         import dispatch_seat_handover as handover
         rows = handover.latest_rows(jobs)
-        owners = {handover.effective_parent(rows[a][1], jobs) for a in attempts if a in rows}
+        owners = {(handover.effective_parent(rows[a][1], jobs), handover.effective_parent_harness(rows[a][1], jobs))
+                  for a in attempts if a in rows}
         if len(owners) == 1:
-            return owners.pop() or registered
+            owner, harness = owners.pop()
+            # Only a Codex thread has a Codex queue. A route handed to a successor on another
+            # harness keeps its record stored here, and that successor reads it as its own.
+            return (owner or registered) if harness == "codex" else registered
     except Exception:  # noqa: BLE001 - the registered parent is always a valid target
         pass
     return registered

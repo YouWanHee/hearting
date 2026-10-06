@@ -3496,9 +3496,8 @@ out=$(CLAUDE_CODE_CHILD_SESSION=1 AGENT_DISPATCH_SELF_SLUG=cyc "$SDR" --skill co
 if [ "$rc" -eq 0 ] \
   && printf '%s' "$out" | grep -q '"additionalContext"' \
   && ! printf '%s' "$out" | grep -q 'permissionDecision' \
-  && printf '%s' "$out" | grep -q 'dispatch-node.py' \
-  && printf '%s' "$out" | grep -q -- '--route <route-file>' \
-  && printf '%s' "$out" | grep -q -- '--jobs <canonical-jobs.log>' \
+  && printf '%s' "$out" | grep -q 'stage-dispatch-fallback.py' \
+  && printf '%s' "$out" | grep -q -- '--node plan --start' \
   && printf '%s' "$out" | grep -q 'attempt_id'; then
   ok "SDR reminds (no deny) for conductor+standard+code-plan"
 else bad "SDR should only remind for conductor+standard+code-plan (rc=$rc) [$out]"; fi

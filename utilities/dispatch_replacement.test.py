@@ -212,6 +212,62 @@ class ReplacementTest(unittest.TestCase):
                 R.seal_launch_input(args,'codex','the raw task')
         self.assertEqual(caught.exception.reason,'replacement-record-conflict')
 
+    def test_a_launcher_elsewhere_reseals_never_started_work_but_not_other_permissions(self):
+        # BC rt-96bab699 (DIAG-1007): a Codex owner's tool shell sealed serial-chain phase G2 as
+        # foreground-scoped / danger-full-access inside its own sandbox; the host-side session
+        # supervisor advancing the chain seals the same work detached / workspace-write.
+        args=SimpleNamespace(**vars(self.args));args.attempt_id='att-g2'
+        args.replacement_input_argv=['--start','--attempt-id','att-g2','--sandbox','workspace-write',
+                                     '--prompt-text','phase g2']
+        args.launch_lifecycle='foreground-scoped';args.nested_headless_network=False
+        args.replacement_runtime_sandbox='danger-full-access'
+        first=R.seal_launch_input(args,'codex','phase g2')
+        self.write({**self.meta,'attempt_id':'att-g2','launch_claimed':'0',
+                    **D.parse_registry_metadata(first)},'open',append=True)
+        host=SimpleNamespace(**vars(args));host.launch_lifecycle='detached'
+        host.replacement_runtime_sandbox='workspace-write'
+        second=R.seal_launch_input(host,'codex','phase g2')
+        saved=json.loads((R._directory(self.jobs)/'inputs'/'att-g2.json').read_text())
+        self.assertEqual((saved['applied_permissions']['launch_lifecycle'],saved['applied_permissions']['runtime_sandbox']),
+                         ('detached','workspace-write'))
+        self.assertEqual(',replacement_input_digest='+R._digest(saved),second)
+        # A granted permission, the work or the sandbox it asks for still conflicts.
+        for changes in ({'nested_headless_network':True},
+                        {'resolved_permission_posture':{'mode':'bypass','mode_flag':'bypassPermissions',
+                                                        'allowed_tools':('Read',),'inherited_default_mode':'default'}},
+                        {'replacement_input_argv':['--start','--attempt-id','att-g2','--sandbox','danger-full-access',
+                                                   '--prompt-text','phase g2']}):
+            with self.subTest(changed=sorted(changes)):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.seal_launch_input(SimpleNamespace(**{**vars(host),**changes}),'codex','phase g2')
+                self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+        with self.assertRaises(D.DispatchContractError):R.seal_launch_input(host,'codex','another phase')
+        # Once claimed, even the launcher's location may not reseal it.
+        self.write({**self.meta,'attempt_id':'att-g2','launch_claimed':'1'},'open',append=True)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.seal_launch_input(args,'codex','phase g2')
+        self.assertEqual(caught.exception.reason,'replacement-record-conflict')
+
+    def test_the_registry_and_the_replacement_tuple_read_the_same_definition(self):
+        import route_authority
+        self.assertIs(D._RELAUNCH_STABLE_KEYS,route_authority.RELAUNCH_STABLE_KEYS)
+        self.assertIs(R._RESEAL_STABLE_KEYS,route_authority.RESEAL_STABLE_KEYS)
+        base=['2026-10-07T00:00:00Z','open','/repo','/wt','phase-g2']
+        row={'attempt_id':'att-g2','parent_attempt_id':'att-owner','route_id':'rt-1','route_node':'test',
+             'launch_claimed':'0','launch_lifecycle':'foreground-scoped','replacement_input_digest':'a'*64}
+        relaunch={**row,'launch_lifecycle':'detached','replacement_input_digest':'b'*64,'launch_home':'/host'}
+        self.assertTrue(D._never_launched_same_work(base,row,base,relaunch))
+        self.assertFalse(D._never_launched_same_work(base,row,base,{**relaunch,'parent_attempt_id':'att-other'}))
+        replay=R.launch_input(self.jobs,'att-source',R._rows(self.jobs.read_text().splitlines())['att-source'][1])
+        shell={**replay,'applied_permissions':{'launch_lifecycle':'foreground-scoped','runtime_sandbox':'danger-full-access',
+                                               'nested_headless_network':False}}
+        R._check_tuple({**shell,'applied_permissions':{'launch_lifecycle':'detached','runtime_sandbox':'workspace-write',
+                                                        'nested_headless_network':False}},shell)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R._check_tuple({**shell,'applied_permissions':{**shell['applied_permissions'],'nested_headless_network':True}},shell)
+        self.assertEqual((caught.exception.reason,caught.exception.detail),
+                         ('replacement-input-tuple-mismatch','applied_permissions'))
+
     def test_claim_publication_crash_blocks_legacy_retry(self):
         for fail_before_record in [True,False]:
             with self.subTest(before_record=fail_before_record):
@@ -432,6 +488,47 @@ class ReplacementTest(unittest.TestCase):
             self.route['nodes'][0]['harness_policy']['primary']=['claude']
             with mock.patch.object(capacity,'capacity_report',return_value=report(1,80)):
                 self.assertIsNone(R._capacity_hold(self.jobs,source))
+
+    def test_a_sealed_pin_moves_only_for_a_real_limit_and_an_unpinned_gate_says_when_it_lifts(self):
+        # BC rt-96bab699 (`--pin owner=codex --pin worker=codex`): an owner replacement after
+        # `correct` was held by the soft allocation gate, although the route's first launch
+        # started on the pin with the same headroom.
+        capacity=R._capacity_reader()
+        policy={'primary':['claude','codex'],'relief':[],'last_resort':[],'promote_relief_below':0}
+        self.route['dispatch_allocation']={'strategy':'balanced','window':30,'usage_gate_used_percent':85,
+                                          'harness_order':['claude','codex','opencode']}
+        self.route['owner_harness_policy']=policy
+        self.route['nodes']=[{'id':'test','harness_policy':policy}]
+        owner={**self.meta,'worker_type':'owner','route_node':'','harness':'codex'}
+        stage={**self.meta,'worker_type':'stage','route_node':'test','dispatch_depth':'2','harness':'codex'}
+        report={'scores':{'claude':80,'codex':10,'opencode':None},
+                'sources':{'claude':'taps','codex':'live','opencode':'unknown'}}
+        limited={'until_epoch':4102444800,'label':'2100-01-01T00:00:00Z'}
+        with mock.patch.object(R,'_capacity_reader',return_value=capacity), \
+             mock.patch('dispatch_capacity_evidence.usage_states',return_value=dict.fromkeys(['claude','codex','opencode'],'ok')), \
+             mock.patch.object(capacity,'capacity_report',return_value=report), \
+             mock.patch.object(capacity,'gate_release_epoch',return_value=None):
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None):
+                for source in (owner,stage):
+                    hold=R._capacity_hold(self.jobs,source)
+                    self.assertEqual((hold['label'],hold['until_epoch'],hold['usage_gate_used_percent']),
+                                     ('allocation-usage-gate',None,85))
+                    self.assertNotIn('retry_at',R._capacity_wait(self.jobs,'att-source',source))
+                self.route['selection_pins']={'owner':{'harness':'codex'},'worker':{'harness':'codex'}}
+                for source in (owner,stage):                 # the pin starts despite the soft gate
+                    self.assertIsNone(R._capacity_hold(self.jobs,source))
+                self.route['selection_pins']={'owner':{'harness':'claude'}}
+                self.assertEqual(R._capacity_hold(self.jobs,owner)['label'],'allocation-usage-gate')
+            self.route['selection_pins']={'owner':{'harness':'codex'},'worker':{'harness':'codex'}}
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=limited):
+                for source in (owner,stage):                 # a real usage limit still holds the pin
+                    self.assertEqual(R._capacity_hold(self.jobs,source),limited)
+            del self.route['selection_pins']
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
+                 mock.patch.object(capacity,'gate_release_epoch',return_value=4102444800) as release:
+                self.assertEqual(R._capacity_hold(self.jobs,owner)['until_epoch'],4102444800)
+                release.assert_called_with('codex','live',usage_gate_used_percent=85)
+                self.assertEqual(R._capacity_wait(self.jobs,'att-source',owner)['retry_at'],'2100-01-01T00:00:00Z')
 
     def test_an_io_failure_keeps_its_cause(self):
         with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):

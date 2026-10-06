@@ -68,12 +68,19 @@ class CampaignTest(F.ProducerTestBase):
              "codex", "codex-thread"),
             ({"CODEX_SESSION_ID": "codex-session"}, "codex", "codex-session"),
             ({"OPENCODE_SESSION_ID": "opencode-session"}, "opencode", "opencode-session"),
+            # A registered worker's marker names its own runtime, and a mixed
+            # unnamed environment is an unknown actor rather than a guess.
+            ({"AGENT_DISPATCH_CURRENT_HARNESS": "opencode", "CLAUDE_CODE_SESSION_ID": "stale-claude",
+              "OPENCODE_SESSION_ID": "opencode-worker"}, "opencode", "opencode-worker"),
+            ({"CLAUDE_CODE_SESSION_ID": "claude-session", "OPENCODE_SESSION_ID": "opencode-session"},
+             None, None),
             ({}, None, None),
         )
-        keys = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID")
+        keys = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+                "OPENCODE_SESSION_ID", "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS")
         for index, (values, harness, session) in enumerate(cases):
-            with self.subTest(values=values), mock.patch.dict(os.environ, {"AGENT_HARNESS": ""}):
-                # Ensure the four runtime identity sources are cleared before each case.
+            with self.subTest(values=values), mock.patch.dict(os.environ, {}):
+                # Ensure the runtime identity sources are cleared before each case.
                 for key in keys:
                     os.environ.pop(key, None)
                 os.environ.update(values)
@@ -89,7 +96,9 @@ class CampaignTest(F.ProducerTestBase):
                 self.assertEqual(event["payload"]["closure"]["closed_by"],
                                  {"harness": harness, "session_id": session})
         # Explicit reopen uses the same derived actor and appends its own event.
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS": ""}):
+        with mock.patch.dict(os.environ, {}):
+            for key in keys:
+                os.environ.pop(key, None)
             os.environ["CLAUDE_CODE_SESSION_ID"] = "explicit-reopen-session"
             C.reopen(self.root, self.path, reason="explicit campaign-reopen")
             event = json.loads((self.path.parent / C.EVENTS_DIR /

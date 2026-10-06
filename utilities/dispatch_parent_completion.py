@@ -14,51 +14,17 @@ from codex_managed_dispatch import (
 )
 from dispatch_contract import (DispatchContractError, annotate_attempt_row,
                                parse_registry_metadata, supervisor_lease_is_held)
-
-
-def interactive_parent_identity(environ=None) -> tuple[str, str]:
-    """Resolve the caller's native identity, independently of the child adapter."""
-    env = os.environ if environ is None else environ
-    sessions = {
-        "codex": env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID") or "",
-        "claude": env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_SESSION_ID") or "",
-        "opencode": env.get("OPENCODE_SESSION_ID") or "",
-    }
-    explicit = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
-    if explicit:
-        if explicit not in sessions:
-            raise DispatchContractError("caller-harness-invalid")
-        return explicit, sessions[explicit]
-    detected = [(harness, session) for harness, session in sessions.items() if session]
-    if len(detected) > 1:
-        raise DispatchContractError("caller-harness-ambiguous")
-    return detected[0] if detected else ("", "")
-
-
-def default_parent_session_id(environ=None) -> str | None:
-    env = os.environ if environ is None else environ
-    # A directly running interactive host is the authority for its own TUI
-    # thread. Managed entry used to export a second parent id after observing
-    # an App Server sibling, which could override the real Codex thread and
-    # strand every completion. Preserve the explicit binding only for nested
-    # workers, whose environment marks that dispatch boundary.
-    if env.get("AGENT_DISPATCH_CHILD") != "1":
-        native_session = interactive_parent_identity(env)[1]
-        if native_session:
-            return native_session
-    return env.get("AGENT_DISPATCH_PARENT_SESSION_ID") or interactive_parent_identity(env)[1] or None
+# Who the caller is, and which session a new attempt reports to, is a route
+# authority judgment (`route_authority`); these names remain for importers.
+from route_authority import (caller_identity as interactive_parent_identity,  # noqa: F401
+                             default_parent_harness, default_parent_session_id)
+from harness_capabilities import parent_completion as declared_parent_completion
 
 
 def worker_runtime_identity(harness: str) -> dict[str, str]:
     """The launched worker becomes the caller of its own subsequent children."""
     return {"AGENT_DISPATCH_CURRENT_HARNESS": harness,
             "AGENT_DISPATCH_CALLER_HARNESS": harness}
-
-
-def default_parent_harness(fallback: str, environ=None) -> str:
-    """A selected child's runtime never replaces its caller's identity."""
-    env = os.environ if environ is None else environ
-    return interactive_parent_identity(env)[0] or env.get("AGENT_DISPATCH_OWNER_HARNESS") or fallback
 
 
 _CODEX_THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
@@ -165,25 +131,29 @@ def parent_supervisor_is_live(args) -> bool:
         return False
 
 
+def _parent_reachable(args, declared: dict) -> bool:
+    """The declared carrier reaches this parent (`harness_capabilities` parent_proof)."""
+    if declared["parent_proof"] == "runtime-hook":
+        return True
+    try:
+        harness, session = interactive_parent_identity()
+    except DispatchContractError:
+        return False
+    return bool(session) and (harness, session) == (args.parent_harness, args.parent_session_id)
+
+
 def resolve_parent_completion_delivery(args, *, probe=probe_managed_codex_parent) -> str:
-    """Select completion from the native parent runtime, not the child."""
+    """Select completion from the native parent runtime, not the child.
+
+    What each parent runtime carries is its adapter's declaration
+    (`harness_capabilities`); this is the one place that decides from it.
+    """
     args.managed_gateway_binding = None
-    current_thread = os.environ.get("CODEX_THREAD_ID") or os.environ.get(
-        "CODEX_SESSION_ID"
-    )
-    direct_registered = _direct_registered_parent(args)
-    if (
-        direct_registered
-        and args.parent_harness == "codex"
-        and bool(current_thread)
-        and args.parent_session_id == current_thread
-    ):
-        args.parent_completion_reason = "native-thread-queue"
-        return "codex-native-queue"
-    if direct_registered and args.parent_harness == "claude":
-        args.parent_completion_reason = "claude-async-rewake-resume"
-        return "claude-parent-runtime"
-    if direct_registered:
+    if _direct_registered_parent(args):
+        declared = declared_parent_completion(args.parent_harness)
+        if declared["carrier"] and _parent_reachable(args, declared):
+            args.parent_completion_reason = declared["reason"]
+            return declared["carrier"]
         args.parent_completion_reason = "parent-identity-unmatched"
         return "poll-fallback"
     if parent_supervisor_is_live(args):
@@ -194,12 +164,12 @@ def resolve_parent_completion_delivery(args, *, probe=probe_managed_codex_parent
 
 
 def validate_interactive_parent_launch(args) -> None:
-    """Never let an ordinary Codex parent enter a model-owned wait loop."""
+    """A parent whose runtime refuses a model-owned wait never silently gets one."""
 
     if not (
         _direct_registered_parent(args)
-        and args.parent_harness == "codex"
         and args.parent_completion_delivery == "poll-fallback"
+        and declared_parent_completion(args.parent_harness)["without_carrier"] == "refuse"
     ):
         return
     if getattr(args, "allow_unmanaged_parent_poll", False):
@@ -207,7 +177,8 @@ def validate_interactive_parent_launch(args) -> None:
         return
     raise DispatchContractError(
         "native-parent-identity-unproven",
-        "Codex delivery requires the calling CODEX_THREAD_ID; inspect the native session identity",
+        f"{args.parent_harness} completion delivery requires the calling session to be the "
+        f"registered parent {args.parent_session_id}; inspect the native session identity",
     )
 
 

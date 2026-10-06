@@ -117,6 +117,22 @@ class SharedCacheFallbackTests(unittest.TestCase):
         self.assertEqual(score, 0.0)
         self.assertEqual(source, "cache:300s;live=http-503")
 
+    def test_gate_release_is_the_last_reset_of_the_windows_at_the_gate(self):
+        cache = self._cache()
+        cache.record("codex", {"windows": [["5h", 40, 2000.0], ["7d", 90, 5000.0]]}, now=900.0)
+        self.assertEqual(C.gate_release_epoch("codex", "live", usage_gate_used_percent=85, now=1000.0), 5000.0)
+        self.assertEqual(C.gate_release_epoch("codex", "cache:100s;live=http-503",
+                                              usage_gate_used_percent=30, now=1000.0), 5000.0)
+        # A score not read from the cache, or a window at the gate without a future reset: unknown.
+        self.assertIsNone(C.gate_release_epoch("codex", "rollout;live=timeout", usage_gate_used_percent=85, now=1000.0))
+        self.assertIsNone(C.gate_release_epoch("codex", "manual", usage_gate_used_percent=85, now=1000.0))
+        self.assertIsNone(C.gate_release_epoch("codex", "live", usage_gate_used_percent=85, now=6000.0))
+        cache.record("codex", {"windows": [["7d", 90, None]]}, now=900.0)
+        self.assertIsNone(C.gate_release_epoch("codex", "live", usage_gate_used_percent=85, now=1000.0))
+        cache.record("opencode", {"rl_windows": [["wk", 88, 7000.0]]}, now=900.0)
+        self.assertEqual(C.gate_release_epoch("opencode", "live", usage_gate_used_percent=85, now=1000.0), 7000.0)
+        self.assertIsNone(C.gate_release_epoch("opencode", "live", usage_gate_used_percent=95, now=1000.0))
+
     def test_stale_cache_is_not_reused_beyond_stale_after(self):
         cache = self._cache()
         cache.record("codex", {"windows": [["7d", 10, None]]}, now=0.0)

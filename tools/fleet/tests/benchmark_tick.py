@@ -302,11 +302,11 @@ def _instrument(counters):
         counters.current["lifecycle_calls"] += 1
         return lifecycle(*args, **kwargs)
 
-    def counted_edges(db_path):
+    def counted_edges(db_path, parent_ids=None):
         home = _normalize(os.path.dirname(db_path), counters.fixture_root)
         homes = counters.current["raw_edge_builds_by_home"]
         homes[home] = homes.get(home, 0) + 1
-        return raw_edges(db_path)
+        return raw_edges(db_path, parent_ids=parent_ids)
 
     def counted_cwd(path):
         counters.current["cwd_parses"] += 1

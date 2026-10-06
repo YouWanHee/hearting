@@ -1,7 +1,7 @@
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync, spawn } from "node:child_process"
-import { existsSync, mkdirSync, writeFileSync, utimesSync, openSync, readSync, closeSync, realpathSync } from "node:fs"
+import { existsSync, mkdirSync, writeFileSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync } from "node:fs"
 
 const pluginDir = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.resolve(pluginDir, "../../..")
@@ -283,12 +283,19 @@ function ownNativePaneOrigin() {
     if (!command.length || command.at(-1) !== 0) return null
     const argv = command.toString("utf8").slice(0, -1).split("\0")
     const sid = nativePaneSelector(argv)
-    if (!sid) return null
+    // A fresh bare TUI launch carries no session selector at all (and is not
+    // a resume/attach/mini invocation): it owns no argv identity, but its
+    // lifecycle can still carry the TUI entry's own selection record below.
+    const bare = !sid && argv.length > 0 && path.basename(argv[0]) === "opencode"
+      && !argv.some(arg => typeof arg === "string" && (arg === "--session" || arg === "-s"
+        || arg.startsWith("--session=") || arg === "--continue" || arg === "-c"
+        || arg === "--fork" || arg === "--mini"))
+    if (!sid && !bare) return null
     const stat = readPaneProc("/proc/self/stat", 4096).toString("utf8")
     const split = stat.lastIndexOf(") ")
     const start = stat.slice(split + 2).trim().split(/\s+/)[19]
     if (split < 0 || Number(stat.slice(0, stat.indexOf(" ("))) !== process.pid || !/^\d+$/.test(start)) return null
-    return { pid: process.pid, start, sid, directory: realpathSync("/proc/self/cwd"), state: "pending" }
+    return { pid: process.pid, start, sid, bare, directory: realpathSync("/proc/self/cwd"), state: "pending" }
   } catch { return null }
 }
 
@@ -499,6 +506,32 @@ function resolvePublisherTarget() {
   return { root, helper: herdrProjection }
 }
 
+// TUI current-selection provenance (core/ADAPTATION.md): the TUI-only entry
+// records its native route selection for its own process lifecycle. Returns
+// the exact record bytes when they name this session for the same pid and
+// start time, else null. This is estimation of nothing: no callback/SDK-first
+// root, timing, pane, or daemon value becomes an identity, and a blank home
+// (no record) stays unverified. Publication itself stays single-owned: the
+// existing publisher path below is the only herdr writer.
+function tuiSelectionRead(sid) {
+  try {
+    const origin = paneNativeOrigin
+    if (!origin || !origin.bare || origin.state === "invalidated") return null
+    if (typeof sid !== "string" || !sid) return null
+    if (!Number.isInteger(origin.pid) || origin.pid <= 1 || !/^\d+$/.test(origin.start || "")) return null
+    const env = (process && process.env) || {}
+    const home = env.HOME || ""
+    const base = env.XDG_STATE_HOME || (home ? path.join(home, ".local", "state") : "")
+    if (!base) return null
+    const raw = readFileSync(path.join(base, "hearting", "tui-identity", origin.pid + "-" + origin.start + ".json"), "utf8")
+    if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 1024) return null
+    const row = JSON.parse(raw)
+    if (!row || row.schema !== "hearting-tui-selection-v1" || row.sessionID !== sid
+      || row.pid !== origin.pid || String(row.start) !== String(origin.start)) return null
+    return raw
+  } catch { return null }
+}
+
 const paneProjectionBusy = new Map()
 const paneProjectionRetryAt = new Map()
 let paneProjectionGeneration = 0
@@ -506,7 +539,17 @@ async function projectPane(sid, ctx, retry = false) {
   if (!sid || isWorkerSession() || !process.env.HERDR_PANE_ID) return
   const binding = registerPaneContext(ctx)
   if (!binding.active) return
-  const ownsSession = binding.ownsOrigin && paneNativeOrigin?.sid === sid
+  let ownsSession = binding.ownsOrigin && paneNativeOrigin?.sid === sid
+  // A fresh-bare TUI carries no argv identity; the TUI entry's own
+  // lifecycle-bound selection record is the only other provenance this
+  // publisher accepts, and only before the exact SDK check below. The
+  // record bytes are kept so the selection is re-verified after the SDK
+  // call: a swap mid-verification must not publish the late success.
+  let tuiRecord = null
+  if (!ownsSession && binding.ownsOrigin) {
+    tuiRecord = tuiSelectionRead(sid)
+    if (tuiRecord) ownsSession = true
+  }
   // Directory events may contain another parentless root. Neither SDK root
   // verification nor first arrival selects the native owner or a peer recipient.
   if (!ownsSession) {
@@ -558,6 +601,12 @@ async function projectPane(sid, ctx, retry = false) {
   try {
     if (!binding.active || generation !== paneProjectionGeneration) return
     if (panePublisherSlot) { binding.refreshPending = true; return }
+    // The SDK wait is not atomic with the selection: re-verify the exact
+    // record bytes before publication so a late swap never publishes.
+    if (tuiRecord && tuiSelectionRead(sid) !== tuiRecord) {
+      peerIdentityLog(ctx, "publisher", "publisher-stale-selection", { sessionID: sid })
+      return
+    }
     const reportSession = verified && paneNativeOrigin.state !== "invalidated"
     const startup = reportSession && paneNativeOrigin.state === "pending"
     // A pruned import-time release must not take both publisher paths down:

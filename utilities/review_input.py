@@ -294,6 +294,12 @@ def preview_request_admission(args, jobs):
         # SD157 reuses the source round and its exact input. It receives no
         # revision-preview exception; predecessor and normal gates still apply.
         return None
+    from route_authority import declared_subsession
+    if declared_subsession(args):
+        # A declared sub-session holds no stage-gate authority: its launch
+        # (dispatch-node.py) and the round census leave it out of the
+        # full-stage verdict rounds, so its preview is not one either.
+        return None
     metadata = {key: getattr(args, key, None) for key in
                 ("attempt_id", "route_file", "route_id", "route_hash", "route_node")}
     route, node = _route_node(metadata)

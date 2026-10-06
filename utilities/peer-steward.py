@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """SD-122 steward surfaces over herdr: (9) wait/start, (10) watch/join/status/rearm/ack.
 
-Checked wrapper around `herdr agent wait|get|start` — no self-written sleep or
-poll loop, event-driven only. Ledger writes go through
+Checked wrapper around `herdr agent wait|get|start` — completion watching is
+event-driven with no self-written sleep/poll loop. Foreground launch/retire
+bookkeeping uses fixed monotonic deadlines. Ledger writes go through
 `utilities/peer-message.py`'s own `cmd_record`, so the ledger root is always
 resolved via `dispatch_contract.resolve_dispatch_state_root` exactly as the
 writer of every other peer_message_v1 record resolves it — never a
@@ -242,8 +243,13 @@ def _project_of(cwd):
     return os.path.basename(str(cwd).rstrip("/"))
 
 
+def _caller_is_claude():
+    from session_identity import identity
+    return identity().harness == "claude"
+
+
 def _fallback():
-    return "claude-native-notify-idle" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "poll-fallback"
+    return "claude-native-notify-idle" if _caller_is_claude() else "poll-fallback"
 
 
 def _default_permission_mode():
@@ -864,6 +870,245 @@ def _write_bound_registry(pid, session_id, cwd, name):
 _CWD_FLAG = {"codex": "--cd"}
 
 
+def _start_stderr_code(stderr):
+    """A bounded single-line native diagnostic, never raw terminal controls."""
+    raw = (stderr or "").encode("utf-8", "replace")[:1024].decode("utf-8", "replace")
+    lines = [_plain(line).strip() for line in _screen_lines(raw)]
+    first = next((line for line in lines if line), "")
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", first).strip("-")[:80].lower()
+
+
+def _start_shell_identity(pane):
+    info = _retire_pane_info(pane)
+    if (info is None or info["foreground_process_group_id"] != info["shell_pid"]
+            or len(info["foreground_processes"]) != 1
+            or not isinstance(info["foreground_processes"][0], dict)
+            or type(info["foreground_processes"][0].get("pid")) is not int
+            or info["foreground_processes"][0]["pid"] != info["shell_pid"]):
+        return None
+    start = _proc_start_ticks(info["shell_pid"])
+    return (info["shell_pid"], start) if start else None
+
+
+def _close_pane(pane):
+    try:
+        proc = subprocess.run(["herdr", "pane", "close", pane],
+                              capture_output=True, text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+        result = payload.get("result") if isinstance(payload, dict) else None
+        return (proc.returncode == 0 and isinstance(payload, dict) and not payload.get("error")
+                and isinstance(result, dict) and result.get("type") == "ok")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def _start_pane_screen(pane):
+    """Return the visible screen verbatim; never interpret it as a prompt."""
+    try:
+        proc = subprocess.run(["herdr", "pane", "read", pane, "--source", "visible",
+                               "--format", "ansi"],
+                              capture_output=True, text=True, timeout=5)
+        if (proc.returncode or not isinstance(proc.stdout, str)
+                or len(proc.stdout.encode("utf-8")) > 65536):
+            return None
+        try:
+            payload = json.loads(proc.stdout)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("error"):
+            return None
+        return proc.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _start_shell_snapshot(pane, original_shell):
+    """Two equal observations before native start, within one second."""
+    if original_shell is None:
+        return None
+    previous = None
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if (_pane_has_agent(pane) is not None
+                or _start_shell_identity(pane) != original_shell):
+            return None
+        screen = _start_pane_screen(pane)
+        if screen is None:
+            return None
+        if (screen.strip() and screen == previous
+                and _start_shell_identity(pane) == original_shell
+                and _pane_has_agent(pane) is None):
+            return screen
+        previous = screen
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    return None
+
+
+_BESIDE_READY_SECONDS = 15
+
+
+def _wait_for_created_shell(pane, cwd, original_shell, deadline):
+    """Finish this split's cwd/bootstrap before snapshot and the one start request."""
+    while time.monotonic() < deadline:
+        occupied = _pane_has_agent(pane)
+        if occupied:
+            return occupied, original_shell
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        info = _retire_pane_info(pane, timeout=min(5, remaining))
+        if info is None:
+            return "beside-shell-unverified", original_shell
+        start = _proc_start_ticks(info["shell_pid"])
+        if not start:
+            return "beside-shell-unverified", original_shell
+        current = (info["shell_pid"], start)
+        if original_shell is None:
+            original_shell = current
+        if current != original_shell:
+            return "beside-shell-changed", original_shell
+        remaining = deadline - time.monotonic()
+        if (remaining > 0 and _start_shell_identity(pane) == original_shell
+                and (cwd is None or _proc_cwd(original_shell[0]) == cwd)
+                and _wait_for_shell_prompt(pane, timeout_ms=max(1, min(200, int(remaining * 1000))))
+                and time.monotonic() < deadline
+                and _start_shell_identity(pane) == original_shell
+                and _pane_has_agent(pane) is None):
+            return None, original_shell
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    return "beside-shell-readiness-timeout", original_shell
+
+
+def _failed_start_cleanup(pane, original_shell, original_screen):
+    # Never close a caller-provided pane, a replaced shell or a late-starting
+    # agent. The fresh split is the only pane owned by this failed invocation.
+    if original_shell is None or original_screen is None:
+        return "retained"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if (_pane_has_agent(pane) is not None
+                or _proc_start_ticks(original_shell[0]) != original_shell[1]):
+            return "retained"
+        info = _retire_pane_info(pane)
+        if info is None or info["shell_pid"] != original_shell[0]:
+            return "retained"
+        if _start_shell_identity(pane) == original_shell:
+            if _start_pane_screen(pane) != original_screen:
+                return "retained"
+            if (_start_shell_identity(pane) != original_shell
+                    or _pane_has_agent(pane) is not None
+                    or _start_pane_screen(pane) != original_screen):
+                return "retained"
+            return "closed" if _close_pane(pane) else "close-failed"
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    return "retained"
+
+
+def _opencode_tui_scoped_config():
+    """Hearting-owned scoped TUI config for owned OpenCode launches, or None.
+
+    Activation projects ``tui/hearting-owned-tui.json`` into the managed
+    OpenCode runtime home; pointing OPENCODE_TUI_CONFIG at it adds only the
+    hearting TUI identity entry through the official global, override,
+    project, .opencode merge order, so user config, explicit overrides,
+    disables, plugins, and options are preserved.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    scoped = os.path.join(config_home, "opencode", "tui", "hearting-owned-tui.json")
+    return scoped if os.path.isfile(scoped) else None
+
+
+def _export_opencode_tui_scoped(pane):
+    """Export OPENCODE_TUI_CONFIG into the pane before an owned OpenCode start.
+
+    Best-effort enhancement, never a launch refusal: any failure degrades to
+    a receipt note and the start proceeds. Mirrors the ingress send-text
+    shape (prompt wait, occupancy recheck, ordered typing, no clock wait).
+    Codex/Claude paths and binder semantics are untouched.
+    """
+    scoped = _opencode_tui_scoped_config()
+    if scoped is None:
+        return "missing"
+    if _pane_has_agent(pane):
+        return "pane-occupied"
+    if not _wait_for_shell_prompt(pane):
+        return "shell-readiness-timeout"
+    state = _pane_has_agent(pane) or _pane_foreground_shell(pane)
+    if state:
+        return state
+    # An explicit OPENCODE_TUI_CONFIG the pane already carries wins: the
+    # scoped file only fills an unset-or-empty value, so user overrides keep
+    # their options, plugins, and disables through the official merge order.
+    line = ("export OPENCODE_TUI_CONFIG=${OPENCODE_TUI_CONFIG:-%s}"
+            % shlex.quote(scoped))
+    try:
+        text = subprocess.run(["herdr", "pane", "send-text", pane, line],
+                              capture_output=True, text=True, timeout=5)
+        if text.returncode != 0:
+            return "send-failed"
+        enter = subprocess.run(["herdr", "pane", "send-keys", pane, "Enter"],
+                               capture_output=True, text=True, timeout=5)
+        if enter.returncode != 0:
+            return "send-failed"
+    except Exception:
+        return "send-failed"
+    return "exported"
+
+
+def _seat_successor_path(pane):
+    digest = hashlib.sha256(str(pane).encode("utf-8")).hexdigest()[:32]
+    return peer_message.peer_state_root() / "seat-successors" / f"{digest}.json"
+
+
+def _mark_seat_successor(pane, beside, kind, session_id):
+    """`start --beside`: the started pane is the seat successor of the agent beside it.
+
+    The one fact a later `retire` from this pane needs to hand that agent's routes on
+    (OPERATIONS same-seat change). Best effort: a missing mark only means no handover."""
+    try:
+        path = _seat_successor_path(pane)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"schema": 1, "pane": pane, "beside": beside,
+                                   "successor": {"harness": kind, "session_id": session_id or ""},
+                                   "at": time.time()}, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _seat_handover(ident, own_sid, own_harness):
+    """After `retire` proved the predecessor exited: when this session runs in the pane started
+    beside the predecessor, its routes become this session's, across harnesses
+    (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
+    this is not a seat change (the receipt then stays as it was); it never fails the retire."""
+    pane = os.environ.get("HERDR_PANE_ID", "")
+    if not pane:
+        return None
+    path = _seat_successor_path(pane)
+    try:
+        mark = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(mark, dict) or mark.get("pane") != pane or mark.get("beside") != ident["pane"]:
+        return None
+    recorded = (mark.get("successor") or {}).get("session_id")
+    if not own_sid or own_harness not in {"claude", "codex", "opencode"} or (recorded and recorded != own_sid):
+        return "skipped:successor-unverified"
+    try:
+        import dispatch_seat_handover as handover
+        row = handover.record_retire_handover(
+            ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ)
+    except Exception:  # noqa: BLE001 - the retire itself already succeeded
+        return "error"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return str(len(row["bindings"])) if row else "none"
+
+
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
@@ -875,18 +1120,65 @@ def cmd_start(args):
         pane_cwd = os.path.realpath(os.path.expanduser(str(args.cwd)))
         if not os.path.isdir(pane_cwd):
             print(f"started=false reason=cwd-not-a-directory agent={args.kind} "
-                  f"name={args.name} pane={args.pane} cwd={pane_cwd}")
+                  f"name={args.name} pane={args.pane or '-'} cwd={pane_cwd}")
             return 1
         if flag:
             cwd_flag = [flag, pane_cwd]
 
+    created_shell = created_screen = created_deadline = None
+    created_pane = False
+
+    def cleanup():
+        return (f" pane_cleanup={_failed_start_cleanup(args.pane, created_shell, created_screen)}"
+                if created_pane else "")
+
+    if getattr(args, "beside", None):
+        cmd = ["herdr", "pane", "split", "--pane", args.beside,
+               "--direction", "right", "--no-focus"]
+        if pane_cwd:
+            cmd += ["--cwd", pane_cwd]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=_herdr_get_timeout())
+            payload = json.loads(proc.stdout or "")
+            result = payload.get("result") if isinstance(payload, dict) else None
+            pane = result.get("pane") if isinstance(result, dict) else None
+            new_id = pane.get("pane_id") if isinstance(pane, dict) else None
+            split_ok = (proc.returncode == 0 and isinstance(payload, dict) and not payload.get("error")
+                        and isinstance(new_id, str) and bool(new_id.strip())
+                        and new_id != args.beside and pane.get("focused") is False)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            split_ok = False
+        if not split_ok:
+            print(f"started=false reason=pane-split-failed agent={args.kind} "
+                  f"name={args.name} pane=- beside={args.beside}")
+            return 1
+        args.pane = new_id
+        created_pane = True
+        created_shell = _start_shell_identity(new_id)
+        created_deadline = time.monotonic() + _BESIDE_READY_SECONDS
+        readiness, created_shell = _wait_for_created_shell(
+            args.pane, pane_cwd, created_shell, created_deadline)
+        if readiness:
+            print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
+                  f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
+            return 1
+
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
-    ingress_note = _ensure_pane_ingress(args.pane, args.kind, pane_cwd)
+    # split --cwd already supplies cwd in our new shell. Do not type a second
+    # Claude cd; existing caller-provided panes still use their normal bootstrap.
+    ingress_note = _ensure_pane_ingress(args.pane, args.kind, None if created_pane else pane_cwd)
     if ingress_note:
         print(f"started=false reason={ingress_note} agent={args.kind} name={args.name} "
-              f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else ""))
+              f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
         return 1
+
+    # Owned scoped TUI config for OpenCode only: best-effort export, never a
+    # refusal. Every other kind keeps its exact previous behavior.
+    tui_scoped = None
+    if args.kind == "opencode":
+        tui_scoped = _export_opencode_tui_scoped(args.pane)
 
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
@@ -920,12 +1212,25 @@ def cmd_start(args):
     if full_agent_args:
         cmd += ["--"] + full_agent_args
 
+    if created_pane:
+        readiness, created_shell = _wait_for_created_shell(
+            args.pane, pane_cwd, created_shell, created_deadline)
+        if readiness:
+            print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
+                  f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
+            return 1
+        created_screen = _start_shell_snapshot(args.pane, created_shell)
+
     try:
         # `cwd=` here moves only this CLI process, never the launched agent — the agent
         # is put in place by `_CWD_FLAG` above. Kept because herdr itself resolves some
         # relative paths against its caller.
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=args.cwd or None)
     except (OSError, subprocess.SubprocessError):
+        if created_pane:
+            print(f"started=false reason=herdr-invocation-failed agent={args.kind} "
+                  f"name={args.name} pane={args.pane}" + cleanup())
+            return 1
         return _unavailable("herdr-invocation-failed")
 
     # F-100c: herdr answers `agent_started` with the agent block; a Claude/Codex id is
@@ -936,10 +1241,15 @@ def cmd_start(args):
     agent_block = None
     payload_error = None
     try:
-        payload = json.loads(proc.stdout or "")
-        if isinstance(payload, dict):
-            payload_error = payload.get("error")
-            agent_block = (payload.get("result") or {}).get("agent")
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                payload = json.loads(stream or "")
+            except ValueError:
+                continue
+            if isinstance(payload, dict):
+                payload_error = payload.get("error")
+                agent_block = (payload.get("result") or {}).get("agent")
+                break
         if isinstance(agent_block, dict):
             started_sid = (agent_block.get("agent_session") or {}).get("value") or None
     except Exception:
@@ -947,13 +1257,18 @@ def cmd_start(args):
     started = proc.returncode == 0 and not payload_error
     # herdr can report an error body with exit 0 (e.g. agent_name_taken).
     # Preserve its bounded machine-readable code instead of silently discarding
-    # the only explanation of a refused start. Do not echo arbitrary error text.
+    # the only explanation of a refused start. A non-JSON native stderr becomes
+    # a bounded control-free code; the full stream is never printed here.
     failure_reason = ""
     if not started:
         code = payload_error.get("code") if isinstance(payload_error, dict) else None
+        stderr_code = _start_stderr_code(proc.stderr)
         failure_reason = (code if isinstance(code, str)
                           and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", code)
-                          else "herdr-start-error" if payload_error else "herdr-start-failed")
+                          else "herdr-start-error" if payload_error
+                          else "herdr-stderr-" + stderr_code if stderr_code
+                          else "herdr-start-failed")
+    cleanup_note = cleanup() if not started else ""
     trust_wait = _native_trust_reason(args.kind, _read_screen(args.pane)) if started else None
     # herdr names no Codex thread for a daemon-attached TUI; the launcher proves it from the
     # one new root rollout (see the block comment above `_BIND_SECONDS`). Embedded
@@ -997,6 +1312,8 @@ def cmd_start(args):
     # Interactive managed ingress is retired, so `managed=false` is no longer a defect
     # signal; the field stays for receipt compatibility and `session_id=` is what says
     # whether the session got an identity.
+    if started and getattr(args, "beside", None):
+        _mark_seat_successor(args.pane, args.beside, args.kind, started_sid)
     managed = "-"
     if started and _MANAGED_INGRESS.get(args.kind):
         verdict = _pane_is_managed(args.pane)
@@ -1010,8 +1327,186 @@ def cmd_start(args):
         + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
+        + cleanup_note
+        + (f" tui_scoped={tui_scoped}" if tui_scoped else "")
     )
     return 0
+
+
+# One normal exit action, without retry or force: Claude's documented command
+# avoids its two-key Ctrl+D confirmation. Other harnesses retain one Ctrl+D.
+_RETIRE_ACTIONS = {"codex": (("send-keys", "ctrl+d"),),
+                   "claude": (("send-text", "/exit"), ("send-keys", "enter")),
+                   "opencode": (("send-keys", "ctrl+d"),)}
+_RETIRE_SECONDS = 5
+
+
+def _retire_process_record(pid):
+    """Local kernel identity, including argv, for an observed foreground process."""
+    try:
+        root = Path(f"/proc/{pid}")
+        stat = (root / "stat").read_text().rsplit(") ", 1)[1].split()
+        raw = (root / "cmdline").read_bytes()
+        if len(raw) > 65536 or not raw or not raw.endswith(b"\0"):
+            return None
+        argv = [part.decode("utf-8", errors="strict") for part in raw[:-1].split(b"\0")]
+        start = stat[19]
+        if (not start.isdigit() or _proc_start_ticks(pid) != start
+                or os.readlink(root / "ns/pid") != os.readlink("/proc/self/ns/pid")):
+            return None
+        return {"start": start, "group": int(stat[2]), "argv": argv}
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+
+
+def _retire_pane_info(pane, timeout=5):
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=timeout)
+        payload = json.loads(proc.stdout or "")
+        result = payload.get("result") if isinstance(payload, dict) else None
+        info = result.get("process_info") if isinstance(result, dict) else None
+        if (proc.returncode or not isinstance(payload, dict) or payload.get("error")
+                or not isinstance(info, dict) or info.get("pane_id") != pane
+                or any(type(info.get(key)) is not int or info[key] <= 0
+                       for key in ("shell_pid", "foreground_process_group_id"))
+                or not isinstance(info.get("foreground_processes"), list)
+                or not info["foreground_processes"]):
+            return None
+        return info
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _retire_foreground(pane, harness):
+    info = _retire_pane_info(pane)
+    if info is None or len(info["foreground_processes"]) != 1:
+        return None
+    item = info["foreground_processes"][0]
+    pid = item.get("pid") if isinstance(item, dict) else None
+    argv = item.get("argv") if isinstance(item, dict) else None
+    if (type(pid) is not int or pid <= 0 or pid == info["shell_pid"]
+            or pid != info["foreground_process_group_id"]
+            or not isinstance(argv, list) or not argv
+            or any(not isinstance(arg, str) for arg in argv)
+            or os.path.basename(argv[0]) != harness):
+        return None
+    identity = _retire_process_record(pid)
+    shell_start = _proc_start_ticks(info["shell_pid"])
+    if (identity is None or not shell_start or identity["argv"] != argv
+            or identity["group"] != info["foreground_process_group_id"]):
+        return None
+    return {"pid": pid, **identity, "shell_pid": info["shell_pid"],
+            "shell_start": shell_start}
+
+
+def _retire_shell_returned(info, identity):
+    if info is None or info["shell_pid"] != identity["shell_pid"]:
+        return False
+    shell = identity["shell_pid"]
+    processes = info["foreground_processes"]
+    if (info["foreground_process_group_id"] != shell or len(processes) != 1
+            or not isinstance(processes[0], dict) or type(processes[0].get("pid")) is not int
+            or processes[0]["pid"] != shell
+            or _proc_start_ticks(shell) != identity["shell_start"]):
+        return False
+    # A shell foreground alone cannot authorize closing over a still-live
+    # predecessor that detached itself. Absence is distinct from unreadability.
+    try:
+        os.stat(f"/proc/{identity['pid']}")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def _retire_target(target):
+    try:
+        state, ident, rc, reason = _interpret_payload(_run_herdr_get(target), target)
+        if any(not isinstance(value, str) or not value for value in ident.values()):
+            raise ValueError("malformed target")
+        return state, ident, rc, reason
+    except (AttributeError, TypeError, ValueError):
+        return ("herdr-unavailable", {"harness": "-", "session_id": "-",
+                "name": target, "pane": "-"}, 4, "herdr-protocol-error")
+
+
+def cmd_retire(args):
+    target = args.target
+    ident = {"harness": "-", "session_id": "-", "name": target, "pane": "-"}
+
+    def finish(reason, retired=False, handover=None):
+        tail = f" handover={handover}" if handover else ""
+        _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
+                to_session_id=ident["session_id"], to_pane=ident["pane"],
+                summary_text=f"[retire] {target} {reason}{tail}", receipt=reason,
+                status="sent" if retired else "failed")
+        print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
+              f"name={ident['name']} pane={ident['pane']}{tail}")
+        return 0 if retired else 1
+
+    if _herdr_missing():
+        return finish("herdr-not-found")
+    state, ident, _, reason = _retire_target(target)
+    if state not in ("idle", "done"):
+        return finish(reason if state == "herdr-unavailable" else f"agent-{state}")
+    pane, harness = ident["pane"], ident["harness"]
+    if not isinstance(pane, str) or not pane or pane == "-":
+        return finish("pane-unverified")
+    own_sid, own_harness = _current_session_identity()
+    if (pane == os.environ.get("HERDR_PANE_ID")
+            or (own_sid and ident["session_id"] == own_sid and harness == own_harness)):
+        return finish("self-target")
+    if harness not in _RETIRE_ACTIONS:
+        return finish("normal-exit-unverified")
+    identity = _retire_foreground(pane, harness)
+    if identity is None:
+        return finish("foreground-unverified")
+    # Resolve again after process inspection so a renamed/replaced target is
+    # never acted on using the earlier pane or SID.
+    state2, ident2, _, _ = _retire_target(target)
+    if state2 not in ("idle", "done") or ident2 != ident:
+        return finish("target-changed")
+    if _retire_foreground(pane, harness) != identity:
+        return finish("foreground-changed")
+    lines = _read_screen(target)
+    readiness = (_native_trust_reason(harness, lines) or _screen_ready(harness, lines)) if lines else "screen-unavailable"
+    if readiness:
+        return finish(readiness)
+    try:
+        for index, (operation, value) in enumerate(_RETIRE_ACTIONS[harness]):
+            if index and _retire_foreground(pane, harness) != identity:
+                return finish("foreground-changed")
+            sent = subprocess.run(["herdr", "pane", operation, pane, value],
+                                  capture_output=True, text=True, timeout=5)
+            send_error = False
+            if (sent.stdout or sent.stderr).strip():
+                try:
+                    payload = json.loads(sent.stdout or sent.stderr)
+                    send_error = not isinstance(payload, dict) or bool(payload.get("error"))
+                except ValueError:
+                    send_error = True
+            if sent.returncode or send_error:
+                return finish("exit-send-failed")
+    except (OSError, subprocess.SubprocessError):
+        return finish("exit-send-unknown")
+    deadline = time.monotonic() + _RETIRE_SECONDS
+    while time.monotonic() < deadline:
+        info = _retire_pane_info(pane, timeout=max(.1, deadline - time.monotonic()))
+        if info is None:
+            return finish("shell-return-unverified")
+        if _retire_shell_returned(info, identity):
+            # A final exact shell read is required immediately before closing.
+            if not _retire_shell_returned(_retire_pane_info(pane), identity):
+                return finish("shell-changed")
+            # The predecessor has exited: a seat successor now answers for its routes.
+            handover = _seat_handover(ident, own_sid, own_harness)
+            if not _close_pane(pane):
+                return finish("pane-close-failed", handover=handover)
+            return finish("normal-exit", True, handover=handover)
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    return finish("agent-still-running")
 
 
 # ---------------------------------------------------------------------------
@@ -1267,7 +1762,7 @@ def cmd_watch(args):
     until = list(args.until or [])
     wake = args.wake
     if wake == "auto":
-        wake = "hook" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "none"
+        wake = "hook" if _caller_is_claude() else "none"
 
     # Dedupe is its own serialization point, entered BEFORE the herdr pre-checks
     # and held until the winning watch_id is published. A bare `O_EXCL` create
@@ -2331,10 +2826,11 @@ def _native_trust_reason(harness, lines):
 
 
 def _process_session(pane, harness):
-    """The session the pane's foreground Claude/Codex process is on now, or None.
+    """The session the pane's foreground runtime process is on now, or None.
 
-    Read from the process the way the Fleet board does (Claude's `sessions/<pid>.json`,
-    which is rewritten on `/clear`; Codex's open rollout). herdr's own `agent_session`
+    Read from the process the way the Fleet board does (`fleet.process_identity`:
+    Claude's `sessions/<pid>.json`, rewritten on `/clear`; Codex's open rollout;
+    OpenCode's TUI selection record). herdr's own `agent_session`
     follows a `/clear` only when its integration reports it, and has been seen to keep
     the previous session for good (live panes 2026-10-01), so a second tidy in the same
     window would otherwise never clear it."""
@@ -2346,20 +2842,16 @@ def _process_session(pane, harness):
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         if tools_dir.is_dir() and str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))
-        from fleet.collectors import claude as claude_collector, codex as codex_collector
+        from fleet.process_identity import PROVEN, process_identity
     except Exception:
         return None
     for process in processes:
         try:
-            pid = int(process.get("pid"))
-            if harness == "claude":
-                sid = claude_collector.session_id_of_process(pid)
-            else:
-                sid = codex_collector.session_id_of_process(pid)
+            found = process_identity(int(process.get("pid")), harness)
         except Exception:
             continue
-        if sid:
-            return sid
+        if found.confidence == PROVEN:
+            return found.session_id
     return None
 
 
@@ -2818,10 +3310,16 @@ def build_parser():
     p_start = sub.add_parser("start")
     p_start.add_argument("name")
     p_start.add_argument("--kind", required=True, choices=("claude", "codex", "opencode"))
-    p_start.add_argument("--pane", required=True)
+    pane_choice = p_start.add_mutually_exclusive_group(required=True)
+    pane_choice.add_argument("--pane")
+    pane_choice.add_argument("--beside")
     p_start.add_argument("--cwd", default=None)
     p_start.add_argument("--permission-mode", choices=("bypass", "inherit"), default=None)
     p_start.set_defaults(func=cmd_start)
+
+    p_retire = sub.add_parser("retire")
+    p_retire.add_argument("target")
+    p_retire.set_defaults(func=cmd_retire)
 
     # --- SD-122 (10) detached steward watch ---
     p_watch = sub.add_parser("watch")

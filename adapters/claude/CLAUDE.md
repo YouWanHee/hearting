@@ -31,34 +31,60 @@ another adapter.
 - Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
 - Repo-root `skills/` is the canonical Skill authoring tree; `tools/sync-entry-skill-layer.py` projects it into `adapters/claude/skills/` (generated — do not hand-edit the projection). Claude-native hooks, commands, settings, and kernel helper agents live under `adapters/claude/`; behavior personas live in the portable unit catalog `roles/units/`.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
-- Call the six runtime-root-sensitive utilities (`capability-route`, `artifact_producer`, `spec-transaction`, `dispatch-owner`, `dispatch-batch`, `dispatch-node`) through the installed `$AGENT_HOME`; a checkout-relative call to one of them is allowed only under dev activation (`AGENT_HOME` is that checkout itself).
+- Run harness utilities as `hearting run <utility>` (Routing and Execution); a checkout-relative call is for dev activation only (`AGENT_HOME` is that checkout itself).
 - Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch`; its armed line carries the same `parent_next=` directive a launch receipt does, and `join`/`status`/`rearm`/`ack` read the watcher's disk receipt. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` reports `prompted=true` only after the submission was observed; `failed`/`queued`/`unverified` are typed verdicts (a `blocked` target or an open form is never typed into), and a dim `❯ …` line in an *empty* target input is Claude Code's prompt suggestion, not an unsubmitted prompt. Every pane prompt goes through that wrapper (never `herdr agent prompt`/`pane send-text` directly): its ledger row (`to.pane`, caller session, digest, verdict receipt) is the only attribution herdr's own log lacks.
 
 ## Routing and Execution
 
-For ordinary execution use `capability-route.py compose --campaign-key
-<stream> --start --prompt-file <task>` through active `AGENT_HOME` (name the
-work stream; `artifact_producer.py campaign-list` shows active keys, and
-`--unassigned` is the only keyless form). Runtime prepares the cycle, starts declared
-frames and reuses exact attempts. Follow `parent_next`; reuse `resume_command`
-after wakes or corrections. At `needs-question`, compare completed frames and
-ask the native interview. Actual release precedes owner execution; runtime
-closes route/cycle at success or once idle. The commands below remain low-level interfaces.
+<!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
+Ordinary execution is one command, the same in every harness:
+
+```
+hearting run capability-route compose --start --prompt-file <task> \
+  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+```
+
+`hearting` is on PATH. `hearting run <utility>` runs that harness utility from
+`AGENT_HOME` when it is set (dev activation: that checkout), else from the
+installed release. The slug comes from the task. The stream defaults to this
+session's latest stream in the same artifact root; the first compose names one
+with `--campaign-key` (a folder name or close spelling joins the matching active
+stream, and a refusal lists the active keys) or opts out with `--unassigned`.
+The runtime prepares the cycle, picks each leg's harness from live usage within
+the sealed candidates, starts frames and the owner, reuses exact attempts, and
+closes the route and cycle at success or once idle.
+
+Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
+end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
+`parent_next_command` once. An absent directive is not `end-turn`, so never
+filter the command's stdout. After a wake or a correction, run
+`resume_command`; answer a BLOCKED owner with `correction_command
+--message-file <file>`. At `needs-question`, compare the two frame briefs and
+follow the receipt's `next_step`: `resume_command --interview <file>` registers
+the question, the person answers it once in the native question surface, and
+`resume_command --answers <file>` records the intent, releases the gate and
+starts the owner.
+
+Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallback.py"
+--node <node> --start`: route, slug, parent and harness come from the owner's
+current route and environment, and a member of a sealed parallel group starts
+its whole group in one batch. Dispatch depth 3 is forbidden.
+<!-- END generated from core/fragments/bootstrap-dispatch.md -->
 
 Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
 capability that owns the artifacts; §0.2.1 then picks the **shape** of the
 work before any preset: new non-direct work defaults to `framed` (exceptions
 there). `direct`, `solo`, `staged`, and `framed` go through
-`utilities/capability-route.py compose` (one command — cwd, artifact root,
+`hearting run capability-route compose` (cwd, artifact root,
 tracking, drift verdict, spec-read gate, and both eligibility probes default
 from the checkout; a staged `--graph execute,test,report` is your own stage
 subgraph of the owning capability). Use the preset recipe
 (`capability-route.py compile`) only when the request names the entry's full
 loop or a promotion signal or spec-backed flow requires it; never bend a
 loosely matching request into the nearest preset graph. Apply §0.3. For
-`direct`/`solo` routes the sealed `small_work_confirmation` (`notice`, the
-default) replaces the blocking card with the one `[경로]` line `compose`
-prints plus one clause of scope, unless the work is destructive or
+`direct`/`solo` routes user-authored turns receive the §0.4 card; received
+peer envelopes use the one `[경로]` line `compose` prints plus one clause
+of scope, unless the work is destructive or
 external-facing; otherwise present the five-field card in §0.4 before
 material work unless scope and route are already approved — deliver it
 through `AskUserQuestion` (five fields as the question body, options
@@ -71,22 +97,11 @@ For `autopilot-code`, `direct` is inline, `quick` is one registered dispatch-dep
 owner, and `standard+` follows `code-plan -> code-execute -> code-test ->
 code-report` under `core/OPERATIONS.md §5.10`. Dispatch depth 3 is forbidden.
 
-Receipts state the next action; you do not carry the delivery taxonomy.
-`parent_next=end-turn` means a runtime carrier owns that attempt — end the turn
-and start no wait, poll, re-arm, or recap for it. `parent_next=bounded-wait`
-means run the printed `parent_next_command` once. Never filter launch stdout:
-an unstated directive is not `end-turn`. Depth-0 launches each frame leg in
-its own Bash call — never two in one, since one waiter arms per call — with
-the four `AGENT_ARTIFACT_*` variables exported each time; the rewake hook
-carries the join, and `release --answers` alone authorizes the owner's launch.
-`OPERATIONS §5.10b` owns the rest.
-
 Checked wrappers keep `capability_mode` separate from a non-owner
 `worker_mode`, which must equal its portable `unit`. A dispatch-depth-1 owner is
 `_kernel/owner` with no worker mode; contradictory owner/stage tuples fail
 before prompt, registry, or spawn. Legacy `mode` is read-only compatibility
-data. Use `stage-dispatch-fallback.py` for ordinary standard+ dispatch-depth-2 work and one
-`dispatch-batch.py --parallel-group` call for each sealed 2–4-way group. Contract v3 claims one
+data. Contract v3 claims one
 stable attempt before spawn; the retired broker only supports `status`/`stop`.
 
 Keep native agents distinct from registered headless worker dispatch; a restriction on one surface never silently extends to the other. Preserve model role, intensity, depth, tests, safety, and validation on fallback. Do not run drill automatically. A Codex job the openai-codex plugin detaches after its foreground timeout runs in the plugin's own queue, never in jobs.log; Fleet shows it only as a read-only plugin-queue row. Launch substantial Codex delegation that needs attempt-grade tracking or gates through registered dispatch instead.
@@ -134,7 +149,7 @@ Portable behavior contract = `roles/response-policy.md`.
 - **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience or repository contract applies. Code, code comments, commit messages, and PR text follow the repository's language, even when the runtime `language` setting names another.
 - Keep responses concise and match promises with same-turn action.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.
-- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms.
+- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms. Other sessions use Fleet tag and pane (SID if needed), role in parentheses; without a tag, herdr name and pane, rather than internal abbreviations.
 - Verify before asserting and follow existing conventions.
 - **Local evidence before recall** — answer a domain question from the repository's research/analysis/briefing artifacts first; model memory is the fallback, a memory-only answer says so and flags its risky specifics, and the §0.4 card exemption never waives this evidence check.
 - Ask only for genuinely non-obvious or destructive choices; proceed with the recommended reversible path when no answer is needed. Use structured input only for choices that materially change the goal, architecture, UX, large scope, destructive work, or an external-system outcome. Continue low-risk reversible work autonomously. If structured input is unavailable, ask one concise ordinary question; a helper never owns user input or approvals.

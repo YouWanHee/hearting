@@ -17,8 +17,10 @@ are imported lazily, inside the functions that need them.
 """
 import json
 import os
+from pathlib import Path
 import re
 import stat
+import sys
 import time
 
 SCHEMA = 1
@@ -43,6 +45,15 @@ _LEDGER_EVENTS = frozenset(("compose", "compile", "continuation", "start"))
 COMPOSING_EVENTS = frozenset(("compose", "compile", "continuation"))
 
 
+def _session_identity(env):
+    """`utilities/session_identity.identity`, imported lazily (this module needs only `tools`)."""
+    utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    from session_identity import identity
+    return identity(env)
+
+
 def writer_identity(environ=None):
     """Return the depth-0 ledger anchor as ``(harness, session_id)`` when known.
 
@@ -56,21 +67,10 @@ def writer_identity(environ=None):
         return None
     if depth != 0:
         return None
-    sessions = {
-        "codex": env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID") or "",
-        "claude": env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_SESSION_ID") or "",
-        "opencode": env.get("OPENCODE_SESSION_ID") or "",
-    }
-    explicit = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
-    if explicit:
-        if explicit not in sessions:
-            return None
-        harness, session_id = explicit, sessions[explicit]
-    else:
-        found = [(harness, sid) for harness, sid in sessions.items() if sid]
-        if len(found) != 1:
-            return None
-        harness, session_id = found[0]
+    found = _session_identity(env)
+    if not found.known:
+        return None
+    harness, session_id = found.harness, found.session_id
     if harness not in HARNESSES or WRITER_SUPPORT.get(harness) != "env":
         return None
     try:

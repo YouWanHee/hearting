@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import anchored_capacity_failure  # noqa: E402
+from route_authority import scan_anchored_death  # noqa: E402
 from dispatch_contract import resolve_agent_home as _resolve_agent_home  # noqa: E402
 from dispatch_contract import resolve_dispatch_state_root  # noqa: E402
 from tools.fleet.model import (  # noqa: E402
@@ -23,19 +23,10 @@ from tools.fleet.model import (  # noqa: E402
     classify_attempt_evidence,
 )
 
-# SD-15 (OPERATIONS §5.10 ⑨): if an open row's dispatch log shows a limit/auth death
-# pattern, judge it DEAD regardless of the SQLite session mtime — this is the axis that
-# catches OpenCode's hang-on-limit (#8203), which the wrapper's launch watch cannot.
-# Kept in sync with dispatch-headless.py DEATH_PATTERNS (intentional duplication).
-LIMIT_RE = re.compile(
-    r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b|"
-    r"hit your (session|usage) limit|session limit reached|usage[_ ]limit[_ ]reached|"
-    r"usage limit reached|weekly limit|rate limit(ed)?|provider rate limit|"
-    r"exceeded retry limit|[^0-9]429[^0-9]|invalid api key|authentication_error|"
-    r"not logged in|please run /login|unauthorized|[^0-9]401[^0-9]|"
-    r"credit balance is too low|insufficient (credit|quota|funds)",
-    re.I,
-)
+# SD-15 (OPERATIONS §5.10 ⑨): if an open row's dispatch log shows a limit/auth death,
+# judge it DEAD regardless of transcript mtime (the wrapper's launch watch may have
+# missed it, or the child died -- or hung, OpenCode #8203 -- after launch). The
+# classification is the one shared table (route_authority.scan_anchored_death).
 
 
 def log_shows_limit(agent_home: Path, slug: str) -> Path | None:
@@ -63,11 +54,8 @@ def log_shows_limit(agent_home: Path, slug: str) -> Path | None:
                 tail = fh.read().decode("utf-8", errors="replace")
         except OSError:
             continue
-        nonempty = [ln for ln in tail.splitlines() if ln.strip()]
-        for ln in nonempty[-3:]:
-            match = LIMIT_RE.search(ln) if len(ln) <= 200 else None
-            if match and ("capacity" not in match.group(0).lower() or anchored_capacity_failure(ln)):
-                return lf
+        if scan_anchored_death(tail):
+            return lf
     return None
 
 

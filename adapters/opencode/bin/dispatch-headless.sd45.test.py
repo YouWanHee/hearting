@@ -410,6 +410,57 @@ class OpenCodePermissionDefault(unittest.TestCase):
             config = json.loads(WH.scoped_external_directory_config("/tmp/fixture-artifact-root"))
         self.assertEqual(config["permission"]["external_directory"]["*"], "allow")
 
+    def test_read_roots_are_readable_but_not_editable(self):
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}, clear=False):
+            config = json.loads(WH.scoped_external_directory_config(
+                "/tmp/fixture-artifact-root", None, (),
+                execution_access_read_roots=("/tmp/fixture-read",),
+            ))
+        rules = config["permission"]["external_directory"]
+        self.assertEqual(rules["/tmp/fixture-read"], "allow")
+        self.assertEqual(rules["/tmp/fixture-read/**"], "allow")
+        self.assertEqual(rules["*"], "deny")
+        self.assertIsNone(rules.get("/tmp/fixture-other"))
+        edit = config["permission"]["edit"]
+        self.assertEqual(edit["/tmp/fixture-read"], "deny")
+        self.assertEqual(edit["/tmp/fixture-read/**"], "deny")
+
+    def test_read_root_covered_by_write_side_keeps_its_write_rule(self):
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}, clear=False):
+            config = json.loads(WH.scoped_external_directory_config(
+                "/tmp/fixture-artifact-root", None, ("/tmp/fixture-read/sub",),
+                execution_access_read_roots=("/tmp/fixture-read", "/tmp/fixture-artifact-root"),
+            ))
+        rules = config["permission"]["external_directory"]
+        self.assertEqual(rules["/tmp/fixture-read"], "allow")
+        edit = config["permission"]["edit"]
+        self.assertEqual(edit["/tmp/fixture-read"], "deny")
+        self.assertEqual(edit["/tmp/fixture-read/**"], "deny")
+        # The writable child wins over the broader read deny (native last-match).
+        self.assertEqual(edit["/tmp/fixture-read/sub"], "allow")
+        self.assertEqual(edit["/tmp/fixture-read/sub/**"], "allow")
+        # A read root identical to a writable root adds no deny at all.
+        self.assertNotIn("/tmp/fixture-artifact-root", edit)
+
+    def test_read_roots_overlay_selected_agent_without_new_defaults(self):
+        before = {"permission": {"external_directory": {"*": "deny"}, "edit": {"*": "ask"}},
+                  "agent": {"build": {"permission": {"bash": "ask"}}}}
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(before)}, clear=False):
+            after = json.loads(WH.scoped_external_directory_config(
+                "/tmp/fixture-artifact-root", None, ("/tmp/fixture-read/sub",),
+                execution_access_read_roots=("/tmp/fixture-read",),
+                selected_agent="build",
+            ))
+        local = after["agent"]["build"]["permission"]
+        self.assertEqual(local["external_directory"]["/tmp/fixture-read"], "allow")
+        self.assertEqual(local["external_directory"]["/tmp/fixture-read/**"], "allow")
+        self.assertEqual(local["edit"]["/tmp/fixture-read"], "deny")
+        self.assertEqual(local["edit"]["/tmp/fixture-read/**"], "deny")
+        self.assertEqual(local["edit"]["/tmp/fixture-read/sub"], "allow")
+        self.assertEqual(local["edit"]["/tmp/fixture-read/sub/**"], "allow")
+        self.assertEqual(local["bash"], "ask")
+        self.assertNotIn("read", local)
+
     def test_report_bundle_root_is_narrowly_allowed(self):
         with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}, clear=False):
             config = json.loads(WH.scoped_external_directory_config(

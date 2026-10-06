@@ -12,6 +12,8 @@ import sys
 import artifact_producer
 from stage_session_contract import slice_files_sha256, slice_text_sha256
 from dispatch_contract import DispatchContractError, validate_attempt_metadata
+# The declaration judgment is a route authority one; `declared` stays for importers.
+from route_authority import declared_subsession as declared  # noqa: F401
 
 STATE_BUCKET = (".runtime", "stage-sessions")
 
@@ -57,27 +59,12 @@ _sha_files = slice_files_sha256
 def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) -> None:
     """Validate a complete declaration, derive its ledger, and initialize it."""
 
-    values = (
-        args.subsession_id, args.subsession_index, args.subsession_count,
-        args.subsession_mode, args.session_chain_id, args.phase_brief,
-        args.narrow_verify, args.expected_round_trips,
-    )
-    if any(value is not None for value in values) and not all(value is not None for value in values):
-        raise DispatchContractError("subsession-arguments-incomplete", "all stage-session axes are required")
-    if not args.subsession_id:
-        if args.stage_authority != 1:
-            raise DispatchContractError(
-                "stage-authority-zero-without-subsession", str(args.route_node or "")
-            )
+    if not declared(args):
         args.state_ledger = ""
         args.fixed_files_sha256 = ""
         args.narrow_verify_sha256 = ""
         args.phase_brief_sha256 = ""
         return
-    if args.stage_authority != 0:
-        raise DispatchContractError("subsession-stage-authority-forbidden", args.subsession_id)
-    if args.dispatch_depth != 2 or not args.route_id or not args.route_node:
-        raise DispatchContractError("subsession-route-binding-invalid", args.subsession_id)
     if not args.attempt_id:
         if action == "dry-run":
             args.attempt_id = "att-dry-run-stage-session"

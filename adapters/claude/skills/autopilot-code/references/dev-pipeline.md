@@ -50,35 +50,31 @@ and exact registry check. A raw depth-0 `nested-headless` call without that cont
 `prospective-owner-check-required`; it is not evidence that nested networking is unavailable.
 Once the Codex owner is running, its internal probe instead requires the launcher's actual
 network marker.
-Dispatch every durable node through `utilities/dispatch-node.py`; it binds the route identity,
-node, write scope, completion gate, exact fallback tuple, and current attempt axes to the
-selected adapter wrapper:
+Dispatch every durable node through `utilities/stage-dispatch-fallback.py`; it binds the
+route identity, node, write scope, completion gate, exact fallback tuple, and current attempt
+axes, and picks the stage's harness from the sealed pins and live usage. Route, slug, parent
+and registry come from this owner's current route and environment:
 
 ```bash
-STAGE_OUTPUT=$(python3 "$AGENT_HOME/utilities/dispatch-node.py" \
-  --route "$ROUTE_FILE" --node "$NODE_ID" --adapter "$STAGE_ADAPTER" \
-  --action start --slug "$STAGE_SLUG" --qa "$QA" \
-  --parent "$CONDUCTOR_SLUG" --prompt-text "$STAGE_PROMPT" \
-  -- --jobs "$CANONICAL_JOBS")
+STAGE_OUTPUT=$(python3 "$AGENT_HOME/utilities/stage-dispatch-fallback.py" \
+  --node "$NODE_ID" --start --prompt-file "$STAGE_PROMPT_FILE")
 printf '%s\n' "$STAGE_OUTPUT"
 ATTEMPT_ID=$(printf '%s\n' "$STAGE_OUTPUT" | sed -n 's/^attempt_id=//p' | tail -1)
 test -n "$ATTEMPT_ID"
 ```
 
-For a sealed 2–4-node `parallel_group`, replace every member-level launch with one
-atomic batch call; the command returns all stable attempt IDs in its bounded JSON receipt:
+A member of a sealed 2–4-node `parallel_group` starts its whole group: the same command
+runs one atomic `dispatch-batch.py` call, whose bounded JSON receipt returns every stable
+attempt ID. The batch directly is the same call:
 
 ```bash
 BATCH_OUTPUT=$(python3 "$AGENT_HOME/utilities/dispatch-batch.py" \
-  --route "$ROUTE_FILE" --parallel-group "$PARALLEL_GROUP" --action start \
-  --slug-prefix "$CONDUCTOR_SLUG" --parent "$CONDUCTOR_SLUG" --qa "$QA" \
-  --jobs "$CANONICAL_JOBS" --prompt-text "$STAGE_PROMPT")
+  --parallel-group "$PARALLEL_GROUP" --start --prompt-text "$(cat "$STAGE_PROMPT_FILE")")
 printf '%s\n' "$BATCH_OUTPUT"
 ```
 
-Sequential `dispatch-node.py` or `dispatch-chain` calls are not a parallel batch:
-admission and wrapper starts would no longer be one transaction. Individual group-member
-`register`/`start` calls therefore fail closed. The batch seals the complete N-way group,
+Separate member starts are not a parallel batch: admission and wrapper starts would no
+longer be one transaction, so a member-level `register` fails closed. The batch seals the complete N-way group,
 exact parent generation, profile, perspective, leg index, and required/realized independence
 axes. On an idempotent repeat it consumes no capacity for exact active/completed legs. A
 single missing-leg recovery proves every other N-1 member; any larger partial launch is denied.
@@ -284,9 +280,7 @@ Skip for direct. quick uses an inline micro-plan. For standard+, first verify th
 ```bash
 AGENT_HOME=$(utilities/agent-home.sh)
 NODE_ID=plan
-STAGE_ADAPTER=claude # choose claude, codex, or opencode from checked route evidence
-STAGE_SLUG="${CONDUCTOR_SLUG}-plan"
-STAGE_PROMPT="<sub-skill contract + absolute input paths (Intent: shards/frame/intent.md first, then every direction brief) + output contract + slug>"
+STAGE_PROMPT_FILE=<file holding: sub-skill contract + absolute input paths (Intent: shards/frame/intent.md first, then every direction brief) + output contract>
 # Run the route-bound dispatch transaction from "Standard+ Stage Dispatch",
 # capture ATTEMPT_ID, then use that same value for `capability-route.py complete`.
 ```
@@ -356,8 +350,7 @@ to in-session only under the closed rules above.
 condition is the plan's own declaration: when `plan.md` carries one `slices` block (2–4
 packages with exactly disjoint files, each able to finish independently), do not default to
 one long serial session. Run one command:
-`python3 utilities/dispatch-batch.py --parallel-group execute --route <route-file>
---parent <owner slug> --slug-prefix <prefix> --slices <plan.md> --action start`.
+`python3 "$AGENT_HOME/utilities/dispatch-batch.py" --parallel-group execute --slices <plan.md> --start`.
 It reads the block, mints the chain and slice ids, writes one phase brief per slice, proves
 exact files, worktree and write-scope containment and pairwise disjointness with the same
 `load_manifest` the admission re-proves, reserves the slots, and registers and starts the

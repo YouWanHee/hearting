@@ -1018,7 +1018,14 @@ def build_grant(
             "the effective Codex sandbox cannot project requested writable roots",
         )
     if request.read_roots:
-        unmet.append("read-roots-unprojected")
+        if runtime == "opencode":
+            # Projected through permission-level external_directory
+            # (read-only) by the OpenCode launcher: the grant reflects the
+            # roots instead of reporting them unprojected. Every other
+            # runtime keeps the previous refusal.
+            pass
+        else:
+            unmet.append("read-roots-unprojected")
     if (request.writable_roots or gpu_logical) and file_grade == "none":
         unmet.append("file-enforcement-none")
     if gpu_logical:
@@ -1067,7 +1074,7 @@ def build_grant(
     return ExecutionAccessGrant(
         request_sha256=request.request_sha256,
         writable_roots=request.writable_roots,
-        read_roots=(),
+        read_roots=request.read_roots if runtime == "opencode" else (),
         additional_writable_roots=additional,
         absorbed_writable_roots=absorbed,
         network=network,

@@ -1680,6 +1680,147 @@ class SharedAdmissionTest(ProducerTestBase):
         self.assertEqual(ctx.exception.code, "shared-kind-not-admissible")
 
 
+class CompletedSpecPublicationTest(ProducerTestBase):
+    def _completed(self, tree=None, *, capability="autopilot-spec", seal=True):
+        self._publication_sequence = getattr(self, "_publication_sequence", 0) + 1
+        route, path = self.route("direct", capability,
+            "update" if capability == "autopilot-spec" else "academic",
+            slug=f"completion-publication-{self._publication_sequence}")
+        cycle = P.begin(self.root, route_file=path, capability=capability, intensity="direct")
+        for rel, data in (tree or {"prd.md": b"# Official PRD\n"}).items():
+            self.write_output(cycle, "spec/" + rel, data)
+        if seal:
+            self.close(route, path)
+            P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        return route, path, cycle
+
+    def _seed(self, admission):
+        return {"schema_version": 1, "reference_id": admission["shared_reference_id"],
+                "revision_id": admission["shared_reference_revision_id"],
+                "content_digest": admission["content_digest"]}
+
+    def _publish(self, cycle, *, settle=True):
+        return P.completed_spec_publication(self.root, cycle_id=cycle["cycle_id"], settle=settle)
+
+    def test_completed_missing_lineage_is_detected_and_normal_completion_admits_once(self):
+        self.activate()
+        _, path, cycle = self._completed({"REPORT.md": b"PASS evidence\n", "prd.md": b"# User PRD\n"})
+        before = {p: p.read_bytes() for p in Path(cycle["cycle_dir"]).rglob("*") if p.is_file()}
+        observed = self._publish(cycle, settle=False)
+        self.assertEqual(observed["status"], "pending")
+        self.assertIn(observed, P.status(self.root)["shared_spec_publications"])
+        self.assertEqual(P.list_references(self.root, "spec"), [])
+        first = self._publish(cycle)
+        self.assertEqual(first["status"], "admitted", first)
+        reference = P.list_references(self.root, "spec")[0]
+        self.assertEqual(reference["revisions"], [first["shared_reference_revision_id"]])
+        again = self._publish(cycle)
+        self.assertEqual(again["admission"]["status"], "reused")
+        self.assertEqual(again["shared_reference_revision_id"], first["shared_reference_revision_id"])
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertTrue(R.outcome_path(path).is_file())
+
+    def test_interrupted_publication_retries_existing_journal_without_rewriting_sealed_work(self):
+        self.activate()
+        _, path, cycle = self._completed()
+        manifest = Path(cycle["cycle_dir"]) / "manifest.json"
+        sealed, outcome = manifest.read_bytes(), R.outcome_path(path).read_bytes()
+        with mock.patch.object(P, "_commit_shared", side_effect=P.ProducerError("shared-base-mismatch", "fault")):
+            pending = self._publish(cycle)
+        self.assertEqual(pending["status"], "pending")
+        journal = next(P.shared_journal_path(self.root, "probe").parent.glob("*.json"))
+        revision_id = json.loads(journal.read_text())["revision_id"]
+        recovered = self._publish(cycle)
+        self.assertEqual(recovered["status"], "admitted", recovered)
+        self.assertEqual(recovered["shared_reference_revision_id"], revision_id)
+        self.assertFalse(journal.exists())
+        self.assertEqual(manifest.read_bytes(), sealed)
+        self.assertEqual(R.outcome_path(path).read_bytes(), outcome)
+        self.assertEqual(P.read_cycle_record(self.root, cycle["cycle_id"])["state"], "sealed")
+
+    def test_legacy_public_finalize_recovery_publishes_after_closed_outcome_without_new_command(self):
+        import contextlib
+        import io
+        self.activate()
+        _, path, cycle = self._completed()
+        manifest = Path(cycle["cycle_dir"]) / "manifest.json"
+        original, outcome = manifest.read_bytes(), R.outcome_path(path).read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = P.main(["finalize", "--artifact-root", str(self.root), "--cycle", cycle["cycle_id"]])
+        self.assertEqual(code, P.OK, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["shared_publication"]["status"], "admitted")
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertEqual(R.outcome_path(path).read_bytes(), outcome)
+
+    def test_actual_component_prd_is_selected_without_using_a_foreign_component_or_snapshot(self):
+        self.activate()
+        route, _, cycle = self._completed({"prd.md": b"root", "a/prd.md": b"a", "b/prd.md": b"b",
+                                          "snapshots/v42/prd.md": b"draft", "REPORT.md": b"PASS"})
+        record = P.read_cycle_record(self.root, cycle["cycle_id"])
+        directory = Path(cycle["cycle_dir"])
+        scoped = {**route, "nodes": [{"write_scope": ["spec/b/**"]}]}
+        selected = P.official_spec_primary_path(self.root, record, scoped)
+        self.assertEqual(selected, directory / "artifacts/spec/b/prd.md")
+        self.assertEqual(selected.read_bytes(), b"b")
+        selected.unlink()
+        self.assertIsNone(P.official_spec_primary_path(self.root, record, scoped))
+        self.assertEqual((directory / "artifacts/spec/a/prd.md").read_bytes(), b"a")
+
+    def test_seed_reference_component_merge_and_later_latest_do_not_rebase_retry(self):
+        self.activate()
+        _, _, base = self._completed({"a/prd.md": b"# A\nold\n", "b/prd.md": b"# B\nkept\n"})
+        initial = self._publish(base)
+        seed = self._seed(initial["admission"])
+        # A second reference makes a guessed keyless identity ambiguous.
+        P.admit_shared(self.root, cycle_id=base["cycle_id"], kind="spec", source="spec",
+                       key="separate", allow_new_reference=True)
+        receipt = {**seed, "components": ["a"], "seed_complete": True, "component_seeds": {"a": True}}
+        _, _, delta = self._completed({"a/prd.md": b"# A\nchanged\n",
+                                      P.SPEC_BASE_RECEIPT: json.dumps(receipt).encode()})
+        merged = self._publish(delta)
+        self.assertEqual(merged["status"], "admitted", merged)
+        self.assertEqual(merged["shared_reference_id"], initial["shared_reference_id"])
+        self.assertEqual((Path(merged["admission"]["revision_dir"]) / "b/prd.md").read_bytes(), b"# B\nkept\n")
+        next_seed = self._seed(merged["admission"])
+        _, _, later = self._completed({"a/prd.md": b"# A\nchanged\n", "b/prd.md": b"# B\nnew\n",
+                                      P.SPEC_BASE_RECEIPT: json.dumps(next_seed).encode()})
+        newest = self._publish(later)
+        again = self._publish(delta)
+        self.assertEqual(again["shared_reference_revision_id"], merged["shared_reference_revision_id"])
+        ref = P._read_json(P._reference_path(self.root, "spec", initial["shared_reference_id"]))
+        self.assertEqual(ref["latest_revision_id"], newest["shared_reference_revision_id"])
+
+    def test_competing_latest_conflict_stays_pending_with_original_base_and_bytes(self):
+        self.activate()
+        _, _, base = self._completed({"prd.md": b"# PRD\n## Policy\nold\n"})
+        initial = self._publish(base)["admission"]
+        seed = json.dumps(self._seed(initial)).encode()
+        _, _, left = self._completed({"prd.md": b"# PRD\n## Policy\nleft\n", P.SPEC_BASE_RECEIPT: seed})
+        _, path, right = self._completed({"prd.md": b"# PRD\n## Policy\nright\n", P.SPEC_BASE_RECEIPT: seed})
+        winner = self._publish(left)
+        before = {p: p.read_bytes() for p in Path(right["cycle_dir"]).rglob("*") if p.is_file()}
+        pending = self._publish(right)
+        self.assertEqual((pending["status"], pending["reason"]), ("pending", "shared-spec-conflict"))
+        self.assertEqual(self._publish(right)["reason"], "shared-spec-conflict")
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        ref = P._read_json(P._reference_path(self.root, "spec", initial["shared_reference_id"]))
+        self.assertEqual(ref["latest_revision_id"], winner["shared_reference_revision_id"])
+        self.assertTrue(R.outcome_path(path).is_file())
+
+    def test_missing_prd_draft_abandoned_and_research_are_not_promoted(self):
+        self.activate()
+        _, _, missing = self._completed({"REPORT.md": b"PASS\n"})
+        self.assertEqual(self._publish(missing)["reason"], "official-spec-prd-missing")
+        _, _, draft = self._completed(seal=False)
+        self.assertEqual(self._publish(draft)["status"], "not-applicable")
+        _, _, research = self._completed(capability="autopilot-research")
+        self.assertEqual(self._publish(research)["status"], "not-applicable")
+        P.finalize(self.root, cycle_id=draft["cycle_id"], allow_open_route=True,
+                   state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(self._publish(draft)["status"], "not-applicable")
+        self.assertEqual(P.list_references(self.root, "spec"), [])
+
+
 class CliTest(ProducerTestBase):
     def run_cli(self, *argv):
         import io
@@ -3615,6 +3756,8 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
         with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
             result=P.begin(self.root,route_file=route_file,capability=capability,intensity="standard",
                            jobs=jobs,owner_attempt_id=owner)
+            if capability == "autopilot-spec":
+                self.write_output(result, rel="spec/prd.md", data=b"# Official transaction PRD\n")
             artifact=self.write_output(result,rel=("spec/_internal/reviews/verdict.md" if capability=="autopilot-spec"
                 else "plans/fixture/final_report.md"),data=b"verified fixture report\n")
             node=next(node for node in route["nodes"] if (node["id"]=="review" if capability=="autopilot-spec" else node.get("terminal")))
@@ -5829,6 +5972,25 @@ class PrimarySupportExclusionTest(unittest.TestCase):
     def test_explicit_primary_inside_support_still_wins(self):
         rows = [("artifacts/_internal/notes.md", b""), ("artifacts/plans/report.md", b"")]
         self.assertEqual(P._choose_primary(rows, "_internal/notes.md"), "artifacts/_internal/notes.md")
+
+    def test_official_prd_selection_respects_component_scope_explicit_choice_and_other_capability(self):
+        rows = [("artifacts/spec/REPORT.md", b"PASS"), ("artifacts/spec/prd.md", b"root"),
+                ("artifacts/spec/a/prd.md", b"a"), ("artifacts/spec/b/prd.md", b"b")]
+        whole = {"capability": "autopilot-spec", "nodes": [{"write_scope": ["spec/**"]}]}
+        component = {"capability": "autopilot-spec", "nodes": [{"write_scope": ["spec/b/**"]}]}
+        self.assertEqual(P._choose_primary(rows, None, route=whole), "artifacts/spec/prd.md")
+        self.assertEqual(P._choose_primary(rows, None, route=component), "artifacts/spec/b/prd.md")
+        self.assertEqual(P._choose_primary(rows, "spec/a/prd.md", route=component), "artifacts/spec/a/prd.md")
+        self.assertEqual(P._choose_primary(rows[:1], None, route=whole), "artifacts/spec/REPORT.md")
+        self.assertIsNone(P.official_spec_primary(component, ["artifacts/spec/prd.md", "artifacts/spec/a/prd.md"]))
+        # The unchanged generic fallback is case-sensitive: uppercase REPORT.md
+        # is not its report.md candidate, so prd.md still wins for this input.
+        self.assertEqual(P._choose_primary(rows, None, route={"capability": "autopilot-code"}),
+                         "artifacts/spec/prd.md")
+        generic_report = [("artifacts/documents/report.md", b"generic report"), *rows]
+        self.assertEqual(P._choose_primary(generic_report, None, route={"capability": "autopilot-code"}),
+                         "artifacts/documents/report.md")
+        self.assertEqual(P._choose_primary(generic_report, None, route=whole), "artifacts/spec/prd.md")
 
 
 class SharedSpecMergeTest(SharedBaseGuardTest):

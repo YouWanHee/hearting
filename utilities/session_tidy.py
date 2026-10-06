@@ -212,24 +212,23 @@ def is_worker(env=None) -> bool:
     return any(key.startswith("OPENCODE_DISPATCH") and value for key, value in env.items())
 
 
-# Session-id variables the harnesses export to tool subprocesses.
-SESSION_ENV = (
-    ("claude", ("CLAUDE_CODE_SESSION_ID",)),
-    ("codex", ("CODEX_THREAD_ID", "CODEX_SESSION_ID")),
-    ("opencode", ("OPENCODE_SESSION_ID",)),
-)
-
-
 def session_from_env(harness: Optional[str] = None, env=None) -> tuple[Optional[str], Optional[str]]:
-    """(harness, session id) from the harness-provided variables, or (harness, None)."""
-    env = os.environ if env is None else env
-    for name, keys in SESSION_ENV:
-        if harness and name != harness:
-            continue
-        for key in keys:
-            if env.get(key):
-                return name, env[key].strip()
-    return harness, None
+    """(harness, session id) from the harness-provided variables, or (harness, None).
+
+    Read by `session_identity`; with several harnesses' ids inherited and none
+    named, the first in its claude, codex, opencode order answers.
+    """
+    from session_identity import identity, session_ids
+    sessions = session_ids(env)
+    if harness:
+        session_id = sessions.get(harness, (None, None))[0]
+        return harness, session_id.strip() if session_id else None
+    found = identity(env)
+    if found.known and found.session_id:
+        return found.harness, found.session_id.strip()
+    for name, (session_id, _variable) in sessions.items():
+        return name, session_id.strip()
+    return None, None
 
 
 _PROJECT_KEYS: dict[str, str] = {}

@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Each adapter's capability declaration, and the shared decision that reads it."""
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import dispatch_parent_completion as P  # noqa: E402
+import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import harness_capabilities as HC  # noqa: E402
+import parent_next_directive as pnd  # noqa: E402
+
+NATIVE_SESSION_ENV = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID",
+                      "opencode": "OPENCODE_SESSION_ID"}
+
+
+def direct_parent(harness, session="parent-session"):
+    return SimpleNamespace(action="start", dispatch_depth=1, execution_surface="registered-headless",
+                           registered_worker=True, parent_session_id=session,
+                           parent_harness=harness, attempt_id="att-capability-contract")
+
+
+class DeclarationTest(unittest.TestCase):
+    def test_every_adapter_declares_the_same_keys(self):
+        shapes = set()
+        for harness in HC.HARNESSES:
+            with self.subTest(harness=harness):
+                declared = HC.capabilities(harness)
+                self.assertEqual(declared["harness"], harness)
+                shapes.add((tuple(sorted(declared)), tuple(sorted(declared["parent_completion"]))))
+        self.assertEqual(len(shapes), 1, shapes)
+
+    def test_every_declared_carrier_is_a_delivery_the_runtime_knows(self):
+        for carrier in HC.declared_carriers():
+            with self.subTest(carrier=carrier):
+                self.assertIn(carrier, pending_delivery.RECIPIENT_KINDS)
+                self.assertEqual(pnd.parent_next(carrier, "att-x", agent_home=HC.ROOT)[0],
+                                 pnd.NEXT_END_TURN)
+
+    def test_a_malformed_declaration_is_refused(self):
+        good = HC.capabilities("codex")
+        broken = (
+            {**good, "schema_version": 2},
+            {**good, "harness": "claude"},
+            {**good, "parent_completion": {**good["parent_completion"], "parent_proof": "trust-me"}},
+            {**good, "parent_completion": {**good["parent_completion"], "without_carrier": "maybe"}},
+            {**good, "parent_completion": {**good["parent_completion"], "carrier": None}},
+            {**good, "parent_completion": {k: v for k, v in good["parent_completion"].items()
+                                           if k != "reason"}},
+        )
+        for value in broken:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                path = HC.declaration_path("codex", Path(td))
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaises(HC.HarnessCapabilityError):
+                    HC.capabilities("codex", Path(td))
+        with self.assertRaises(HC.HarnessCapabilityError):
+            HC.capabilities("other")
+        self.assertIsNone(HC.parent_completion("other")["carrier"])
+
+
+class ParentCompletionDecisionTest(unittest.TestCase):
+    """One decision per harness, read from its declaration (no harness branch)."""
+
+    def decide(self, harness, environ, session="parent-session"):
+        request = direct_parent(harness, session)
+        with mock.patch.dict(os.environ, environ, clear=True):
+            request.parent_completion_delivery = P.resolve_parent_completion_delivery(request)
+            try:
+                P.validate_interactive_parent_launch(request)
+                refused = ""
+            except P.DispatchContractError as exc:
+                refused = exc.reason
+        return request.parent_completion_delivery, request.parent_completion_reason, refused
+
+    def test_each_parent_gets_its_declared_carrier_or_its_declared_fallback(self):
+        for harness in HC.HARNESSES:
+            declared = HC.parent_completion(harness)
+            own = {NATIVE_SESSION_ENV[harness]: "parent-session"}
+            other = {NATIVE_SESSION_ENV[harness]: "another-session"}
+            with self.subTest(harness=harness):
+                delivery, reason, refused = self.decide(harness, own)
+                if declared["carrier"]:
+                    self.assertEqual((delivery, reason, refused), (declared["carrier"], declared["reason"], ""))
+                else:
+                    self.assertEqual((delivery, reason, refused), ("poll-fallback", "parent-identity-unmatched", ""))
+                delivery, reason, refused = self.decide(harness, other)
+                if declared["carrier"] and declared["parent_proof"] == "runtime-hook":
+                    # The carrier binds the session itself; nothing to prove at launch.
+                    self.assertEqual(delivery, declared["carrier"])
+                    continue
+                self.assertEqual((delivery, reason), ("poll-fallback", "parent-identity-unmatched"))
+                self.assertEqual(refused, "native-parent-identity-unproven"
+                                 if declared["without_carrier"] == "refuse" else "")
+
+    def test_the_decision_follows_the_declaration_not_the_harness_name(self):
+        declarations = {
+            "opencode": {"carrier": "opencode-turn", "reason": "opencode-plugin-turn",
+                         "parent_proof": "native-session", "without_carrier": "refuse"},
+        }
+        with mock.patch.object(P, "declared_parent_completion",
+                               side_effect=lambda harness: declarations.get(harness)
+                               or HC.parent_completion(harness)):
+            self.assertEqual(self.decide("opencode", {"OPENCODE_SESSION_ID": "parent-session"}),
+                             ("opencode-turn", "opencode-plugin-turn", ""))
+            self.assertEqual(self.decide("opencode", {"OPENCODE_SESSION_ID": "another-session"}),
+                             ("poll-fallback", "parent-identity-unmatched", "native-parent-identity-unproven"))
+
+    def test_an_ambiguous_caller_reaches_no_session_carrier(self):
+        delivery, reason, _refused = self.decide(
+            "codex", {"CODEX_THREAD_ID": "parent-session", "OPENCODE_SESSION_ID": "other"})
+        self.assertEqual((delivery, reason), ("poll-fallback", "parent-identity-unmatched"))
+
+
+if __name__ == "__main__":
+    unittest.main()

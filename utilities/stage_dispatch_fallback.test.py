@@ -504,6 +504,190 @@ class FallbackTest(unittest.TestCase):
   first_round=F.attempt_identity(SimpleNamespace(slug="fallback-plan-check",parent="owner",parent_attempt_id=parent),
                                  route,{"id":"plan-check"},{"child_harness":"codex"},1)
   self.assertNotEqual(started,first_round)
+
+ def closure_history(self,route,*,tail_note="dead-worker-fail",tail_class="fail",tail_status="done"):
+  # BC P0: an invalid-contract transport followed by a readable FAIL. IDs,
+  # source HEADs and artifacts are fixture-owned, never the live BC registry.
+  self.seed_parent()
+  history=[]
+  for aid,harness,note,failure,extra,status in (
+   ("att-contract","codex","dead-route-completion-rejected","contract","","done"),
+   ("att-verdict","claude",tail_note,tail_class,"automatic_retry_of=att-contract,",tail_status),
+  ):
+   history.append(f"2026-10-06T00:00:00Z\t{status}\t{self.repo}\t{self.repo}\tfallback-test\t"
+    "attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,"
+    f"registered_worker=1,fallback_hop=same-harness-headless,worker_type=stage,harness={harness},"
+    f"route_id={route['route_id']},route_hash={route['route_hash']},route_node=test,"
+    "parent_attempt_id=att-fallback-parent,parent_sid=fixture-native-parent,launch_head=old-source-head,"
+    f"launch_claimed=1,launch_started=1,terminal_event=result,process_exit=0,{extra}"
+    f"attempt_id={aid},note={note},failure_class={failure}\n")
+  with self.jobs.open("a") as handle:handle.write("".join(history))
+  return "".join(history).encode()
+
+ def closure_action(self,path,action,patches=(),prompt=None):
+  argv=["stage-dispatch-fallback.py","--route",str(path),"--node","test","--slug","fallback-test",
+        "--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),"--"+action]
+  if prompt is not None:argv.extend(["--prompt-file",str(prompt)])
+  out=io.StringIO();err=io.StringIO()
+  with contextlib.ExitStack() as stack:
+   stack.enter_context(mock.patch.object(sys,"argv",argv))
+   stack.enter_context(mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})))
+   stack.enter_context(self.compiled_order())
+   for patch in patches:stack.enter_context(patch)
+   stack.enter_context(contextlib.redirect_stdout(out));stack.enter_context(contextlib.redirect_stderr(err))
+   code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+  return code,out.getvalue()+err.getvalue()
+
+ def test_readable_fail_after_transport_retry_starts_one_new_semantic_round(self):
+  import dispatch_contract as DC
+  import dispatch_replacement as REPLACEMENT
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text());node=next(n for n in route["nodes"] if n["id"]=="test")
+   self.seed_predecessor_markers(path,"test")
+   old_rows=self.closure_history(route)
+   original=self.jobs.read_bytes()
+   (self.repo/"x").write_text("changed source closes the recorded findings\n")
+   subprocess.run(["git","-C",str(self.repo),"commit","-qam","close findings"],check=True)
+   new_head=subprocess.check_output(["git","-C",str(self.repo),"rev-parse","HEAD"],text=True).strip()
+   prior_input=self.art/"prior-FAIL.md";prior_input.write_text("FAIL: close both original findings.\n")
+   original_input=prior_input.read_bytes()
+   prompt=self.art/"closure-task.md"
+   prompt.write_text(f"Check corrected HEAD {new_head}, only x, against {prior_input}.\n")
+   prompt_bytes=prompt.read_bytes()
+   commands=[];spawn_claims=[];real_run=subprocess.run
+   def wrapper(command,**kwargs):
+    if not any(str(part).endswith("/bin/dispatch-headless.py") for part in command):
+     return real_run(command,**kwargs)
+    commands.append(command)
+    aid=self.arg(command,"--attempt-id")
+    metadata={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+     "execution_surface":"registered-headless","registered_worker":"1","fallback_hop":"same-harness-headless",
+     "worker_type":"stage","unit":"qa/test","harness":"codex","attempt_id":aid,
+     "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":"test",
+     "parent_attempt_id":"att-fallback-parent","parent_sid":"fixture-native-parent","launch_head":new_head}
+    retry=self.arg(command,"--automatic-retry-of")
+    if retry:metadata["automatic_retry_of"]=retry
+    # Exercise the production admission and atomic register/claim fences;
+    # only native worker execution is replaced at this existing wrapper seam.
+    REPLACEMENT.admission(self.jobs,self.jobs.read_text().splitlines(),metadata)
+    if "--dry-run" in command:return SimpleNamespace(returncode=0,stdout="check=ok\n",stderr="")
+    row=f"2026-10-06T00:01:00Z\topen\t{self.repo}\t{self.repo}\tfallback-test\t"+",".join(f"{k}={v}" for k,v in metadata.items())
+    started="--start" in command
+    claimed=DC.claim_attempt_row(self.jobs,aid,row,launch=started)
+    if started and claimed:spawn_claims.append(aid)
+    return SimpleNamespace(returncode=0,stdout="check=ok\nregistered=1\nstarted="+str(int(started))+"\nchild_spawned="+str(int(started and claimed))+"\n",stderr="")
+   patch=mock.patch.object(F.subprocess,"run",side_effect=wrapper)
+   for action in ("dry-run","register","start"):
+    code,output=self.closure_action(path,action,patches=(patch,),prompt=prompt)
+    self.assertEqual(code,0,output)
+   ids=[self.arg(command,"--attempt-id") for command in commands]
+   expected=F.attempt_identity(SimpleNamespace(slug="fallback-test",parent="owner",parent_attempt_id="att-fallback-parent"),
+                               route,node,{"child_harness":"codex"},1,3)
+   self.assertEqual(ids,[expected]*3)
+   self.assertTrue(all("--automatic-retry-of" not in command for command in commands))
+   for command in commands:
+    task=Path(self.arg(command,"--prompt-file")).read_text()
+    self.assertIn(new_head,task);self.assertIn(str(prior_input),task)
+    self.assertIn("Round protocol (round 3",task)
+    self.assertIn("dead-route-completion-rejected",task);self.assertIn("dead-worker-fail",task)
+    self.assertEqual(self.arg(command,"--write-scope"),";".join(node["write_scope"]))
+   self.assertEqual(prior_input.read_bytes(),original_input);self.assertEqual(prompt.read_bytes(),prompt_bytes)
+   self.assertEqual(spawn_claims,[expected])
+   final=self.jobs.read_bytes()
+   self.assertTrue(final.startswith(original));self.assertIn(old_rows,final)
+   launched=F.registry_rows(self.jobs,route["route_id"],"test")[-1]
+   self.assertEqual(launched["launch_head"],new_head)
+   self.assertNotIn("automatic_retry_of",launched)
+   # Repeat/concurrent claims converge on the same existing registry row.
+   row=final.decode().splitlines()[-1]
+   from concurrent.futures import ThreadPoolExecutor
+   with ThreadPoolExecutor(max_workers=2) as pool:
+    claimed=list(pool.map(lambda _:DC.claim_attempt_row(self.jobs,expected,row,launch=True),range(2)))
+   self.assertEqual(claimed,[False,False]);self.assertEqual(self.jobs.read_bytes(),final)
+   # The old transport budget is still spent, including a direct attempt to
+   # bypass the normal semantic-round entrance with its replacement link.
+   self.assertTrue(REPLACEMENT._budget_exhausted(self.jobs,F.registry_rows(self.jobs,route["route_id"],"test")[1]))
+   with self.assertRaises(DC.DispatchContractError) as caught:
+    REPLACEMENT.admission(self.jobs,final.decode().splitlines(),{**launched,"attempt_id":"att-second-death",
+                                                                "automatic_retry_of":"att-verdict"})
+   self.assertEqual(caught.exception.reason,"automatic-replacement-exhausted")
+
+ def test_a_readable_result_never_links_a_retry_but_a_transport_death_does(self):
+  # RA-4: a worker's own FAIL or BLOCKED is its result on any node, capped or
+  # not (BC rt-8a569384 execute FAIL -> linked -> exhausted -> inline).
+  import copy
+  base={"_status":"done","attempt_id":"att-prior","automatic_retry_of":"att-first",
+        "note":"dead-worker-fail","failure_class":"fail","worker_type":"stage"}
+  before=copy.deepcopy(base)
+  for changes in ({},{"note":"dead-worker-blocked","failure_class":"blocked"},
+                  {"note":"dead-worker-blocked","failure_class":"blocked","worker_type":"review"}):
+   with self.subTest(readable=changes):
+    self.assertEqual(F.retry_predecessor([{**base,**changes}]),"")
+  self.assertEqual(base,before)
+  # A reviewer's finished FAIL is completed-review-blocking; its bare
+  # dead-worker-fail stays a death, as the round census reads it.
+  for changes in ({"worker_type":"review"},
+                  {"note":"dead-route-completion-rejected","failure_class":"contract"},
+                  {"note":"dead-worker-runtime-error","failure_class":"runtime"},
+                  {"note":"dead-capacity","failure_class":"capacity"},
+                  {"note":"dead-worker-fail","failure_class":"contract"}):
+   with self.subTest(transport=changes):
+    self.assertEqual(F.retry_predecessor([{**base,**changes}]),"att-prior")
+  self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"0"}]),"att-first")
+  self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"1"}]),"")
+
+ def test_a_readable_result_in_the_launch_window_is_reported_not_retried(self):
+  for note,failure_class,verdict in (("dead-worker-fail","fail","FAIL"),("dead-worker-blocked","blocked","BLOCKED")):
+   with self.subTest(verdict=verdict):
+    self.jobs.write_text(
+     f"2026-10-07T00:00:00Z\tdone\t{self.repo}\t{self.repo}\tstage\t"
+     f"route_id=rt-own,route_node=execute,attempt_id=att-launched,worker_type=stage,note={note},failure_class={failure_class}\n")
+    with mock.patch.object(F,"attempt_process_quiescence",return_value=SimpleNamespace(state="quiescent",reason="process-absent")):
+     state,fields=F.terminal_attempt_state(self.jobs,"rt-own","execute","att-launched")
+    self.assertEqual((state,fields["review_verdict"],fields["note"]),("terminal",verdict,note))
+    self.assertIsNotNone(F.finished_verdict_row(self.jobs,"rt-own","execute","att-launched"))
+
+ def test_closure_check_uses_its_existing_revision_and_verdict_ceiling(self):
+  cap=F.DISPATCH_NODE.REVIEW_ROUND_CAP
+  route={"effective_intensity":"standard"};node={"id":"test","kind":"pipeline-stage"}
+  rows=[("done",{"attempt_id":aid,"note":"dead-worker-fail","failure_class":"fail",
+                 "worker_type":"stage"}) for aid in ("att-round-one","att-round-two")]
+  exhausted=cap.round_budget(route,node,rows)
+  self.assertEqual(exhausted.state,"exhausted")
+  revision={"answers":["att-round-two"]}
+  budget=cap.round_budget(route,node,rows,revisions=[revision])
+  self.assertEqual((budget.state,budget.round_kind,budget.verdict_rounds),("admit","closure-check",2))
+  latest={"_status":"done",**rows[-1][1],"automatic_retry_of":"att-transport"}
+  self.assertEqual(F.retry_predecessor([latest]),"")
+  rows.append(("done",{**rows[-1][1],"attempt_id":"att-round-three"}))
+  spent=cap.round_budget(route,node,rows,revisions=[revision,{"answers":["att-round-three"]}])
+  self.assertEqual((spent.state,spent.verdict_rounds),("exhausted",3))
+
+ def test_semantic_closure_still_refuses_cap_verdictless_live_and_unsettled_rounds(self):
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text());self.seed_predecessor_markers(path,"test");self.seed_parent()
+   parent=self.jobs.read_bytes()
+   cases=(("dead-worker-fail","fail","done","review-round-budget-exhausted"),
+          ("dead-invalid-envelope","contract","done","review-verdictless-bound"),
+          ("dead-worker-fail","fail","open","prior-attempt-still-live"),
+          ("dead-worker-fail","fail","done","round-unsettled"))
+   for note,failure,status,reason in cases:
+    with self.subTest(reason=reason):
+     self.jobs.write_bytes(parent)
+     self.closure_history(route,tail_note=note,tail_class=failure,tail_status=status)
+     if reason=="review-round-budget-exhausted":
+      self.jobs.write_text(self.jobs.read_text().replace("note=dead-route-completion-rejected,failure_class=contract",
+                                                       "note=dead-worker-fail,failure_class=fail"))
+     if reason=="round-unsettled":
+      self.jobs.write_text(self.jobs.read_text().replace("attempt_id=att-verdict,",
+       "attempt_id=att-verdict,terminal_conflict=1,conflicting_terminal_note=dead-worker-runtime-error,conflicting_failure_class=runtime,conflicting_classifier_source=fixture,"))
+     before=self.jobs.read_bytes()
+     with mock.patch.object(F,"run_wrapper",side_effect=AssertionError("refused round launched")):
+      code,output=self.closure_action(path,"start")
+     self.assertNotEqual(code,0,output);self.assertIn("reason="+reason,output)
+     self.assertEqual(self.jobs.read_bytes(),before)
  def test_review_round_cap_correction_round_attaches_protocol_block_to_prompt_file(self):
   # Plan-correction B2 (third surface): unlike dispatch-node.py (which builds
   # its own prompt) and dispatch-batch.py (which gets the block for free by
@@ -683,10 +867,10 @@ class FallbackTest(unittest.TestCase):
   self.assertIn(row["preferred_honored"],(True,False))
   self.assertEqual(row["preferred_honored"],row["child_harness"]=="codex")
   for harness in ("claude","codex"): self.assertIn(harness,row["counts"])
- def test_wrapper_command_projects_selected_lifecycle_to_codex_and_claude(self):
+ def test_wrapper_command_projects_selected_lifecycle_to_every_harness(self):
   path=self.route(same_status="supported"); route=json.loads(path.read_text()); node=next(n for n in route["nodes"] if n["id"]=="plan")
   args=SimpleNamespace(action="dry-run",slug="stage",parent="owner",mode="dev/refactor",qa="standard",worker_role=None,model_role="deep maker",prompt_file=None,jobs=self.jobs,route=path,launch_lifecycle="foreground-scoped",foreground_timeout=123.0)
-  for ordinal,harness in ((1,"codex"),(2,"claude")):
+  for ordinal,harness in ((1,"codex"),(2,"claude"),(2,"opencode")):
    row=self.tuple(harness,"supported")
    command=F.wrapper_command(args,route,node,row,ordinal,"att-test")
    self.assertEqual(command[command.index("--worker-type")+1],"stage")
@@ -699,7 +883,8 @@ class FallbackTest(unittest.TestCase):
   command=F.wrapper_command(args,route,node,self.tuple("codex","supported"),1,"att-test")
   self.assertNotIn("--foreground-timeout",command)
   command=F.wrapper_command(args,route,node,self.tuple("opencode","supported"),1,"att-test")
-  self.assertNotIn("--launch-lifecycle",command)
+  self.assertEqual(command[command.index("--launch-lifecycle")+1],"detached")
+  self.assertNotIn("--foreground-timeout",command)
   frame=next(n for n in route["nodes"] if n["id"]=="frame")
   command=F.wrapper_command(args,route,frame,self.tuple("codex","supported"),1,"att-test")
   self.assertEqual(command[command.index("--worker-type")+1],"support")
@@ -1069,6 +1254,35 @@ class FallbackTest(unittest.TestCase):
    F.legacy_parent_generation_conflict(self.jobs,legacy,"att-parent-new"),
    "attempt-identity-parent-generation-conflict",
   )
+ def test_an_owner_names_only_the_node_and_the_action(self):
+  path=self.route(same_status="supported")
+  explicit=self.run_chain(path)
+  self.seed_predecessor_markers(path,"plan")
+  cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--capability-mode","dev",
+       "--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--action","dry-run"]
+  clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
+  env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
+       "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),
+       "AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent","AGENT_OWNER_ROUTE_FILE":str(path)}
+  implied=subprocess.run(cmd,text=True,capture_output=True,env=env)
+  self.assertEqual((implied.returncode,explicit.returncode),(0,0),implied.stdout+implied.stderr)
+  self.assertIn("selected_hop=",implied.stdout)
+  self.assertEqual([l for l in implied.stdout.splitlines() if l.startswith("selected_hop=")],
+                   [l for l in explicit.stdout.splitlines() if l.startswith("selected_hop=")])
+  # Without --route the owner's current route is used; this fixture owner row carries no
+  # route binding, so the launch route in AGENT_OWNER_ROUTE_FILE is not trusted in its place.
+  unbound=subprocess.run([a for a in cmd if a not in ("--route",str(path))],text=True,capture_output=True,env=env)
+  self.assertEqual(unbound.returncode,64,unbound.stdout+unbound.stderr)
+  self.assertIn("reason=owner-route-default-unresolved",unbound.stdout)
+ def test_a_group_member_start_is_its_group_batch(self):
+  seen=[]
+  args=SimpleNamespace(route=Path("/r/route.json"),node="test-a",parent="owner",qa="standard",jobs=None,
+                       prompt_file=None,reviewed_evidence=None)
+  with mock.patch.object(F.subprocess,"run",side_effect=lambda argv,check: seen.append(argv) or SimpleNamespace(returncode=0)), \
+       contextlib.redirect_stderr(io.StringIO()):
+   self.assertEqual(F.start_parallel_group(args,"verify-pair"),0)
+  self.assertEqual(seen[0][1:],[str(ROOT/"utilities/dispatch-batch.py"),"--route","/r/route.json","--parallel-group","verify-pair",
+                                "--action","start","--parent","owner","--qa","standard"])
  def test_parallel_register_is_rejected_without_creating_a_row(self):
   path=self.route(); first=self.run_register(path); second=self.run_register(path)
   self.assertEqual(first.returncode,65,first.stdout+first.stderr)

@@ -30,6 +30,7 @@ from dispatch_attempt_policy import (
     REVIEW_BLOCKING_NOTE,
     SUCCESS_NOTES,
     deferred_completion,
+    readable_result,
     terminal_conflict_pending,
 )
 
@@ -394,6 +395,33 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
         next_action=_NEXT_ACTION_BY_STATE[state],
         closure_check_used=closure_check_used,
     )
+
+
+def last_verdict_blocking(rows, worker_type):
+    """True when the latest verdict round, past any verdict-less tail, is a
+    blocking FAIL: the node's gate failed and no later verdict answered it.
+    OPERATIONS §5.10 reads a sub-session opened now as a gap retry of the
+    unfinished items, never as planned subdivision.
+    """
+    verdicts = [(status, metadata) for status, metadata in rows if classify_round_row(
+        status, metadata, worker_type=metadata.get("worker_type") or worker_type) == "verdict"]
+    return _last_round_blocking_verdict(verdicts[-1:], worker_type)
+
+
+def gate_unmet(rows, worker_type):
+    """True when the node's latest settled round left its gate unmet: a blocking
+    verdict, or a worker's own BLOCKED (no judgment reached, items left), with no
+    later verdict answering it. Deaths and live rows are passed over. OPERATIONS
+    §5.10 reads a sub-session opened now as a gap retry of the unfinished items,
+    never as planned subdivision.
+    """
+    for status, metadata in reversed(list(rows)):
+        kind = classify_round_row(status, metadata, worker_type=metadata.get("worker_type") or worker_type)
+        if kind == "verdict":
+            return _last_round_blocking_verdict([(status, metadata)], worker_type)
+        if kind == "verdict-less" and readable_result(metadata) == "BLOCKED":
+            return True
+    return False
 
 
 def _last_round_blocking_verdict(rows, worker_type):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from hearting_gates import gates_on, same_work_or_refuse
+from session_identity import session_label
 
 import base64
 from contextlib import contextmanager
@@ -39,11 +40,8 @@ from dispatch_receipt_identity import receipt_digest as shared_receipt_digest, u
 _GOVERNOR_WITNESS_HANDLES: dict[tuple[str, str], object] = {}
 
 
-def is_linked_worktree_slice(metadata: Mapping[str, object]) -> bool:
-    """A sub-session slice (`stage_authority=0`) runs in a linked worktree while its
-    owner row keeps the route cwd, so only a slice may differ from its parent's
-    worktree; every other identity comparison stays exact."""
-    return bool(metadata.get("subsession_id")) and str(metadata.get("stage_authority", "")) == "0"
+# Sub-session standing is a route authority judgment; the name stays for its readers.
+from route_authority import linked_worktree_slice as is_linked_worktree_slice  # noqa: E402
 
 
 def _governor_witness_key(root: Path, token: str) -> tuple[str, str]:
@@ -469,11 +467,6 @@ FOREGROUND_FAILURES = frozenset({
 # The fixed failure words; `exit-N`/`signal-N` are validated separately.
 _FOREGROUND_FIXED_FAILURES = FOREGROUND_FAILURES - {"none"}
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
-_CAPACITY_TERMINAL_RE = re.compile(
-    r"(?:error\s*[:\-]\s*)?(?:selected\s+)?model(?:\s+[A-Za-z0-9._:/-]+)?\s+"
-    r"(?:is\s+)?at\s+capacity[.!]?",
-    re.I,
-)
 
 
 def codex_standard_owner_network_enabled(
@@ -532,39 +525,8 @@ REPLICA_RESERVATION_ROW_KEYS = (
 )
 
 
-def anchored_capacity_failure(text: str) -> bool:
-    """Accept only a terminal capacity error, never prose discussing one.
-
-    Adapters may emit either a plain CLI line or a JSON event.  The bounded
-    last-three-line rule is shared by the early wrapper watch and the SD-58
-    foreground watchdog so delayed failures receive the same classification.
-    """
-
-    def terminal(value: str) -> bool:
-        return bool(_CAPACITY_TERMINAL_RE.fullmatch(value.strip()))
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()][-3:]
-    for line in lines:
-        if len(line) > 200:
-            continue
-        if terminal(line):
-            return True
-        try:
-            payload = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        pending = [payload]
-        while pending:
-            item = pending.pop()
-            for key, value in item.items():
-                if isinstance(value, dict):
-                    pending.append(value)
-                elif key in {"message", "error", "detail"} and isinstance(value, str) and terminal(value):
-                    return True
-    return False
-
+# One copy of the terminal capacity judgment (route_authority); the name stays for readers.
+from route_authority import anchored_capacity_failure  # noqa: E402,F401
 
 def resolve_agent_home(runtime_pointer: str | Path | None = None) -> Path:
     """Validated AGENT_HOME (source root) resolution shared by every consumer
@@ -7726,9 +7688,7 @@ def record_evidence_change(
                 "evidence_changed_at": changed_at,
                 "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "observed_by": (os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
-                                or os.environ.get("CLAUDE_SESSION_ID")
-                                or os.environ.get("CODEX_THREAD_ID")
-                                or os.environ.get("OPENCODE_SESSION_ID") or "operator"),
+                                or session_label()),
                 "observed_in": " ".join(command) or None,
             }
             handle.seek(0, os.SEEK_END)
@@ -9555,14 +9515,9 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
 
 
 # Stable facts of one attempt's work. A row whose launcher never claimed it may be
-# relaunched by a new launcher whose per-launch values (lease nonce, release home,
-# parent runtime pid, sealed input digest) differ.
-_RELAUNCH_STABLE_KEYS = (
-    "attempt_id", "attempt_schema_version", "harness", "worker_type", "dispatch_depth",
-    "capability", "parent_sid", "parent_attempt_id", "route_id", "route_hash", "route_node",
-    "owner_route_id", "owner_route_hash", "automatic_retry_of",
-    "replacement_original_attempt_id", "replacement_family_id", "replacement_claim_digest",
-)
+# relaunched by a new launcher whose per-launch values differ; the one definition of
+# "same work, another launcher" is `route_authority`'s.
+from route_authority import RELAUNCH_STABLE_KEYS as _RELAUNCH_STABLE_KEYS  # noqa: E402
 
 
 def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> bool:

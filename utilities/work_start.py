@@ -26,9 +26,10 @@ from dispatch_completion_join import (
     join_selected_attempts, current_delivery_state, delivery_classification,
     delivery_required_action, completion_harvest_command,
 )
-from dispatch_parent_completion import default_parent_session_id, interactive_parent_identity
+from route_authority import caller_identity as interactive_parent_identity, default_parent_session_id
+import route_authority
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
-from parent_next_directive import parent_next
+from parent_next_directive import correction_command, entrypoint, parent_next, resume_command
 from execution_access import ExecutionAccessError, prepare_task_request
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 import route_plan as RP
@@ -387,12 +388,7 @@ def _current_parent_session_id():
 
 def _owns(meta, parent, jobs):
     """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
-    if parent and meta.get("parent_sid") == parent:
-        return True
-    if not parent or jobs is None:
-        return False
-    from dispatch_seat_handover import owns
-    return owns(meta, parent, jobs)
+    return route_authority.owns(meta, parent, jobs)
 
 
 def _slot(route, node, rows, jobs=None):
@@ -657,6 +653,15 @@ def _capacity_pause(result, attention, resume):
         waiting["retry_at"] = attention["retry_at"]
     if attention.get("usage_state"):
         waiting["usage_state"] = attention["usage_state"]
+    if attention.get("usage_state") == "allocation-usage-gate":
+        # The route's balanced allocation, not a usage limit, holds this harness.
+        harness, gate = attention.get("harness", ""), attention.get("usage_gate_used_percent")
+        when = ("After retry_at, when the last usage window at the gate resets, run resume_command once"
+                if attention.get("retry_at") else
+                f"No reset time is known: run resume_command once after {harness} usage drops below the {gate}% gate")
+        waiting["next_step"] = (f"The route's balanced allocation holds {harness}: its usage is at or above the "
+            f"{gate}% gate, not at a usage limit. Nothing failed and nothing was started. {when}, "
+            "from the session that owns the route; completed stages are kept.")
     waiting.pop("parent_next", None)
     waiting.pop("parent_next_command", None)
     return waiting
@@ -674,13 +679,14 @@ def _outcome(jobs, aid):
         # No log or result exists to harvest; the way on is to start the same work again.
         route_file = row[1].get("owner_route_file") or row[1].get("route_file")
         if route_file:
-            result["recovery_command"] = shlex.join([
-                sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
-                "--route", route_file, "--jobs", str(jobs)])
+            result["recovery_command"] = resume_command(route_file, jobs, agent_home=ROOT)
     if action == "advance-completed":
         if row and row[1].get("workflow_completion") == "runtime-v1":
-            from dispatch_terminal_commit import completed_owner_handoff
+            from dispatch_terminal_commit import completed_owner_handoff, completed_owner_publication
             result["handoff"] = completed_owner_handoff(jobs, *row)
+            publication = completed_owner_publication(jobs, *row)
+            if publication is not None:
+                result["shared_publication"] = publication
     return result
 
 
@@ -1052,8 +1058,7 @@ def _first_leg_state(root, decision_record, jobs, receipt):
     row = _rows(jobs).get(aid) if aid else None
     if row is None or row[0] != "done":
         return receipt
-    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                         "start", "--route", str(leg_path), "--jobs", str(Path(jobs).resolve())])
+    resume = resume_command(leg_path, Path(jobs).resolve(), agent_home=ROOT)
     result = {**receipt, "resume_command": resume}
     for key in ("parent_next", "parent_next_reason", "parent_next_command"):
         result.pop(key, None)
@@ -1234,7 +1239,7 @@ def _owner_parked_response(result, jobs, aid):
     after_proceed = ("A proceed settles the owner's finished work automatically."
                      if verdict_pass(owner_meta) else "A proceed starts the continuation automatically.")
     extra = {"owner_report": report} if report else {}
-    release = shlex.join([sys.executable, str(ROOT / "utilities/workflow-supervisor.py"), "release",
+    release = shlex.join([sys.executable, entrypoint(ROOT, "utilities/workflow-supervisor.py"), "release",
                           "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
                           "--decision", "proceed"])
     if parked["status"] == "blocked":
@@ -1283,8 +1288,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     """Advance preparation once; repeating this call creates no duplicate job."""
     request = validate_request(route.get("work_request"))
     path, jobs = Path(path).resolve(), Path(jobs).resolve()
-    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                         "start", "--route", str(path), "--jobs", str(jobs)])
+    resume = resume_command(path, jobs, agent_home=ROOT)
     result["resume_command"] = resume
     from dispatch_notice_state import closed_outcome
     import inline_finish
@@ -1318,17 +1322,48 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         rows = _rows(jobs)
         if owner and owner not in rows:
             raise ValueError("closed-route-owner-missing")
+        publication = None
         for aid, (status, meta) in rows.items():
             if meta.get("workflow_completion") == "runtime-v1" and (
                     aid == owner or route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}):
                 # An owner with nothing to settle (`not-applicable`: replaced, stopped at a gate or not
                 # passed) does not hold the closed route back; every other unfinished settlement does.
-                from dispatch_terminal_commit import owner_completion_state
-                if owner_completion_state(jobs, status, meta).state not in {"complete", "not-applicable"}:
+                from dispatch_terminal_commit import owner_completion_state, settle_owner_completion
+                completion = owner_completion_state(jobs, status, meta)
+                if completion.reason == "shared-spec-publication-pending":
+                    # Only the post-seal publication obligation uses this normal
+                    # retry. All earlier identity/gate/closure refusals stay put.
+                    retry = settle_owner_completion(jobs, status, meta)
+                    publication = retry.shared_publication if retry is not None else None
+                    completion = owner_completion_state(jobs, status, meta)
+                if completion.state not in {"complete", "not-applicable"}:
                     return {**result, "state": "needs-attention", "reason": "workflow-completion-pending",
-                            "required_action": "inspect-recovery", "outcome": closed}
+                            "required_action": "inspect-recovery", "outcome": closed,
+                            **({"shared_publication": publication} if publication is not None else {})}
+                if route.get("capability") == "autopilot-spec" and completion.state == "complete" and publication is None:
+                    from dispatch_terminal_commit import completed_owner_publication
+                    publication = completed_owner_publication(jobs, status, meta)
+        if route.get("capability") == "autopilot-spec" and publication is None:
+            import artifact_producer
+            root_value = route.get("artifact_root")
+            if not isinstance(root_value, str) or not root_value.strip():
+                # A historical closed route may lack the compiled root. Keep
+                # its sealed result and report the publication gap without
+                # guessing a root from the caller's cwd or preparing new work.
+                publication = {"status": "pending", "reason": "spec-artifact-root-unavailable"}
+            else:
+                root = Path(root_value).resolve()
+                cycle = artifact_producer.route_cycle_for(root, route)
+                publication = (artifact_producer.completed_spec_publication(root, cycle_id=cycle["cycle_id"], settle=True)
+                               if cycle is not None else {"status": "pending", "reason": "spec-cycle-unavailable"})
+            if publication["status"] == "pending":
+                return {**result, "state": "needs-attention", "reason": "shared-spec-publication-pending",
+                        "required_action": "inspect-recovery", "outcome": closed, "shared_publication": publication,
+                        "next_step": "Preserve the completed work and inspect the publication reason. "
+                                     "The same normal completion retry keeps the original source/base; no model restarts."}
         return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
-                                      "outcome": closed})
+                                      "outcome": closed,
+                                      **({"shared_publication": publication} if publication is not None else {})})
     if RESOURCE_RESUME.route_selected(route):
         resource = RESOURCE_RESUME.observation(route, jobs)
         if resource["state"] != "resource-succeeded":
@@ -1336,7 +1371,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             supervised = RESOURCE_RESUME.supervisor_alive(resource.get("supervision"))
             artifacts = prepare_route_artifact_env(path, start=True, jobs=jobs)
             output = Path(artifacts["AGENT_ARTIFACT_OUTPUT_DIR"])
-            runner_command = shlex.join([sys.executable, str(ROOT / "utilities/resource-runner.py"),
+            runner_command = shlex.join([sys.executable, entrypoint(ROOT, "utilities/resource-runner.py"),
                 "--registry", str(output / "resource-runs.json"), "start", "--run-id", route["route_id"],
                 "--cwd", route["cwd"], "--log", str(output / "logs/resume-run.log"),
                 "--route", str(path), "--node", "resume-run", "--jobs", str(jobs), "--"])
@@ -1516,10 +1551,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "Run resume_command again later (for a busy admission lock, after about a minute); "
                     "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
-    result["correction_command"] = shlex.join([
-        sys.executable, str(ROOT / "utilities/capability-route.py"), "correct",
-        "--jobs", str(jobs), "--attempt-id", aid,
-    ])
+    result["correction_command"] = correction_command(aid, jobs, agent_home=ROOT)
     if status == "done":
         gate_response = _owner_gate_response(route, path, jobs, aid, metadata, result)
         if gate_response is not None:
@@ -1611,7 +1643,7 @@ def _compose_again(route) -> str:
     # A framed compose names no capability: the shape is the route.
     named = [] if shape == "framed" else ["--capability", route["capability"],
                                           "--capability-mode", str(route.get("capability_mode") or "default")]
-    argv = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
+    argv = [sys.executable, entrypoint(ROOT, "utilities/capability-route.py"), "compose",
             "--slug", str(route.get("slug") or route["route_id"]), *named, "--shape", shape,
             "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
             "--prompt-file", str(task), "--start"]
@@ -1631,8 +1663,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
     result = {"route_file": str(Path(path).resolve()), "route_id": route["route_id"],
               "launches": [], "owner_started": False,
               "advisories": OWNER_WRITE_ADVISORY.advisories(route),
-              "resume_command": shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                  "start", "--route", str(Path(path).resolve()), "--jobs", str(Path(jobs).resolve())])}
+              "resume_command": resume_command(Path(path).resolve(), Path(jobs).resolve(), agent_home=ROOT)}
     try:
         result = _advance(route, path, jobs, result, wait=wait, interview=interview,
                           answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
@@ -1655,8 +1686,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
             result["observation_error"] = str(observation_error)
     if result["state"] == "needs-attention":
         result.setdefault("required_action", "inspect-preparation")
-        result["resume_command"] = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
-                                                "start", "--route", str(path), "--jobs", str(jobs)])
+        result["resume_command"] = resume_command(path, jobs, agent_home=ROOT)
         result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
             "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
             "failure, then use resume_command; a usage-limit stop resumes after the limit resets, and a silent death "

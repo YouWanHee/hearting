@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "harness": "opencode",
+  "parent_completion": {
+    "carrier": null,
+    "reason": null,
+    "parent_proof": null,
+    "without_carrier": "poll"
+  }
+}

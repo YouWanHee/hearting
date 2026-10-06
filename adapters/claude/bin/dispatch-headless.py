@@ -139,7 +139,6 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
-    pin_target,
     require_top_route,
     resolve_runtime_profile,
     route_selection_pin,
@@ -159,11 +158,15 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    bind_request as bind_execution_access_request,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
+)
+import route_authority  # noqa: E402
+from route_authority import (  # noqa: E402
+    bind_access_request as bind_execution_access_request,
+    pin_target,
 )
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity via resolve_qa
@@ -172,55 +175,9 @@ INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "advers
 # derived below. The jobs.log `qa=` field is retained (derived value) for
 # fleet-collector compatibility.
 
-# SD-15 (OPERATIONS §5.10 ⑨): immediate limit/auth failure patterns shared
-# between launch-time early-exit detection and the liveness/wait DEAD verdict.
-# Each tuple is (reason, lowercase substring regex); the first match wins.
-# utilities/dispatch-liveness.sh intentionally duplicates the list as LIMIT_RE
-# across the Python/shell runtime boundary; keep the two synchronized.
-DEATH_PATTERNS = [
-    ("capacity", r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b"),
-    ("network-operation-not-permitted", r"operation not permitted|network is unreachable|network access denied"),
-    ("session-limit", r"hit your (?:session|usage) limit|session limit reached"),
-    ("usage-limit", r"usage limit reached|weekly limit|rate limit(?:ed)?|\b429\b"),
-    ("auth", r"invalid api key|authentication_error|not logged in|please run /login|unauthorized|\b401\b"),
-    ("credit", r"credit balance is too low|insufficient (?:credit|quota|funds)"),
-]
-_RESET_RE = re.compile(
-    r"resets?(?:\s+at)?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{1,2}\s*(?:am|pm))",
-    re.I,
-)
-
-
-def scan_death(text: str) -> tuple[str, str] | None:
-    """Return (reason, reset) if the log text shows a limit/auth death, else None.
-
-    reset is a best-effort human string ('3pm', '15:45', ...) or '' when absent.
-    Shared contract with dispatch-liveness.sh LIMIT_RE — keep the pattern lists in sync.
-    """
-    low = text.lower()
-    reason = ""
-    for name, pat in DEATH_PATTERNS:
-        if re.search(pat, low):
-            reason = name
-            break
-    if not reason:
-        return None
-    m = _RESET_RE.search(text)
-    reset = re.sub(r"\s+", "", m.group(1)) if m else ""
-    return reason, reset
-
-
-def scan_anchored_death(text: str) -> tuple[str, str] | None:
-    """Inspect only terse terminal CLI lines, never completion-report prose."""
-    for line in [line.strip() for line in text.splitlines() if line.strip()][-3:]:
-        if len(line) > 200:
-            continue
-        death = scan_death(line)
-        if death:
-            if death[0] == "capacity" and not anchored_capacity_failure(line):
-                continue
-            return death
-    return None
+# SD-15 (OPERATIONS §5.10 ⑨): limit/auth/capacity deaths are classified by the one shared
+# table (route_authority), the same at launch and in liveness for every harness.
+from route_authority import DEATH_PATTERNS, scan_anchored_death, scan_death  # noqa: E402,F401
 
 
 def parser() -> argparse.ArgumentParser:
@@ -832,24 +789,7 @@ _STANDARD_PLUS_INTENSITY = {"standard", "strong", "thorough", "adversarial"}
 def _bind_runtime_parent(args: argparse.Namespace) -> None:
     """Bind a cross-harness direct child to the actual Codex caller runtime."""
 
-    current_thread = os.environ.get("CODEX_THREAD_ID") or os.environ.get(
-        "CODEX_SESSION_ID"
-    )
-    claude_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    caller_harness = (
-        os.environ.get("AGENT_DISPATCH_CALLER_HARNESS")
-        or ("codex" if current_thread and not claude_session else None)
-        or ("claude" if claude_session and not current_thread else None)
-    )
-    if args.dispatch_depth == 1:
-        if current_thread and caller_harness == "codex":
-            args.parent_session_id = current_thread
-            args.parent_slug = None
-            args.parent_harness = "codex"
-        elif claude_session and caller_harness == "claude":
-            args.parent_session_id = claude_session
-            args.parent_slug = None
-            args.parent_harness = "claude"
+    route_authority.bind_runtime_parent(args, honor_force=False)
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:

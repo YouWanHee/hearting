@@ -721,7 +721,8 @@ def delivery_required_action(state: CurrentDeliveryState) -> str:
 def completion_harvest_command(attempt_id: str, action: str, *, jobs: str, surface: str) -> str:
     """Project an already-decided record action; grant no workflow authority."""
     if action == "finish-workflow":
-        utility = Path(__file__).with_name("dispatch_terminal_commit.py")
+        from parent_next_directive import entrypoint
+        utility = entrypoint(Path(__file__).resolve().parents[1], "utilities/dispatch_terminal_commit.py")
         return f"python3 {shlex.quote(str(utility))} finish --jobs {shlex.quote(jobs)} --attempt {shlex.quote(attempt_id)}"
     if action not in {"complete-open", "inspect-done-failure"}:
         return ""
@@ -755,9 +756,9 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
                         or route["route_hash"] != (meta.get("owner_route_hash") or meta.get("route_hash"))
                         or route.get("route_id") != (meta.get("owner_route_id") or meta.get("route_id"))):
                     continue
-                work_commands[child["attempt_id"]] = shlex.join([
-                    sys.executable, str(Path(__file__).absolute().with_name("capability-route.py")),
-                    "start", "--route", str(path), "--jobs", jobs])
+                from parent_next_directive import resume_command
+                work_commands[child["attempt_id"]] = resume_command(
+                    path, jobs, agent_home=Path(__file__).resolve().parents[1])
                 if meta["worker_type"] == "owner" and child["required_action"] == "inspect-done-failure":
                     import dispatch_replacement
                     parked = dispatch_replacement.owner_parked_gate(Path(jobs), child["attempt_id"])

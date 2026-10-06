@@ -140,7 +140,6 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
-    pin_target,
     require_top_route,
     resolve_runtime_profile,
     route_selection_pin,
@@ -167,11 +166,15 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    bind_request as bind_execution_access_request,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
     request_path as execution_access_request_path,
+)
+import route_authority  # noqa: E402
+from route_authority import (  # noqa: E402
+    bind_access_request as bind_execution_access_request,
+    pin_target,
 )
 # Verification rigor is derived from intensity via resolve_qa
 # (dispatch_mode_contract.py, the single qa/intensity SoT — CONVENTIONS §1.1).
@@ -183,60 +186,9 @@ INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "advers
 # is scoped to this set for owner (conductor) launches only.
 _STANDARD_PLUS_INTENSITY = STANDARD_PLUS_INTENSITIES
 
-# SD-15 (OPERATIONS §5.10 ⑨): immediate limit/auth failure patterns — homomorphic port of the Claude
-# wrapper's DEATH_PATTERNS. codex exec surfaces provider limit/auth failures as JSON
-# events (`--json`), but a raw tail substring scan still matches the text inside those
-# events, so no JSON parsing is needed (same as the Claude tail scan). Runtime-currentness
-# (2026-07, openai/codex#9148·#12677·#11434·#4840): codex prints "exceeded retry limit,
-# last status: 429 Too Many Requests" / "usage_limit_reached" and generally exits non-zero
-# on retry exhaustion, so the launch early-exit watch is realizable (best-effort). The
-# shell/other-adapter counterparts (dispatch-liveness.py LIMIT_RE) keep the same list —
-# intentional cross-runtime duplication, keep in sync.
-DEATH_PATTERNS = [
-    ("capacity", r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b"),
-    ("network-operation-not-permitted", r"operation not permitted|network is unreachable|network access denied"),
-    ("session-limit", r"hit your (?:session|usage) limit|session limit reached"),
-    ("usage-limit", r"usage[_ ]limit[_ ]reached|usage limit reached|weekly limit|"
-     r"rate limit(?:ed)?|provider rate limit|exceeded retry limit|\b429\b"),
-    ("auth", r"invalid api key|authentication_error|not logged in|please run /login|unauthorized|\b401\b"),
-    ("credit", r"credit balance is too low|insufficient (?:credit|quota|funds)"),
-]
-_RESET_RE = re.compile(
-    r"resets?(?:\s+at)?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{1,2}\s*(?:am|pm))",
-    re.I,
-)
-
-
-def scan_death(text: str) -> tuple[str, str] | None:
-    """Return (reason, reset) if the log text shows a limit/auth death, else None.
-
-    reset is a best-effort human string ('3pm', '15:45', ...) or '' when absent.
-    Homomorphic with the Claude wrapper's scan_death and dispatch-liveness.py LIMIT_RE.
-    """
-    low = text.lower()
-    reason = ""
-    for name, pat in DEATH_PATTERNS:
-        if re.search(pat, low):
-            reason = name
-            break
-    if not reason:
-        return None
-    m = _RESET_RE.search(text)
-    reset = re.sub(r"\s+", "", m.group(1)) if m else ""
-    return reason, reset
-
-
-def scan_anchored_death(text: str) -> tuple[str, str] | None:
-    """Inspect only terse terminal CLI lines, never completion-report prose."""
-    for line in [line.strip() for line in text.splitlines() if line.strip()][-3:]:
-        if len(line) > 200:
-            continue
-        death = scan_death(line)
-        if death:
-            if death[0] == "capacity" and not anchored_capacity_failure(line):
-                continue
-            return death
-    return None
+# SD-15 (OPERATIONS §5.10 ⑨): limit/auth/capacity deaths are classified by the one shared
+# table (route_authority), the same at launch and in liveness for every harness.
+from route_authority import DEATH_PATTERNS, scan_anchored_death, scan_death  # noqa: E402,F401
 
 
 def parser() -> argparse.ArgumentParser:
@@ -382,27 +334,8 @@ def _bind_runtime_parent(args: argparse.Namespace) -> None:
     Dispatch-depth-2 workers keep their explicit conductor/owner envelope; the legacy
     force switch remains available when a checked fallback intentionally rebinds it.
     """
-    force_current = os.environ.get("CODEX_DISPATCH_PARENT_CURRENT_FORCE") == "1"
-    current_thread = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
-    claude_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    caller_harness = (
-        os.environ.get("AGENT_DISPATCH_CALLER_HARNESS")
-        or ("codex" if current_thread and not claude_session else None)
-        or ("claude" if claude_session and not current_thread else None)
-    )
-    if args.dispatch_depth == 1:
-        if current_thread and caller_harness == "codex":
-            args.parent_session_id = current_thread
-            args.parent_harness = "codex"
-            args.parent_slug = None
-        elif claude_session and caller_harness == "claude":
-            args.parent_session_id = claude_session
-            args.parent_harness = "claude"
-            args.parent_slug = None
-        elif force_current:
-            args.parent_slug = None
-    elif force_current and current_thread:
-        args.parent_session_id = current_thread
+
+    route_authority.bind_runtime_parent(args, honor_force=True)
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:
@@ -1937,7 +1870,8 @@ def nested_codex_home_path(worktree: Path, jobs: Path | None = None) -> Path:
 
 
 def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None,
-                              *, jobs: Path | None = None) -> Path:
+                              *, jobs: Path | None = None,
+                              projection_root: Path | None = None) -> Path:
     """Create a writable Codex home inside the owner's sandbox.
 
     Recursive ``codex exec`` needs to write session/app-server state. Pointing
@@ -1956,7 +1890,7 @@ def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None,
     # not the source-only task worktree containing this wrapper. Otherwise a
     # nested eligibility check compares a worktree-linked local CODEX_HOME with
     # the inherited canonical AGENT_HOME and rejects a valid recursive launch.
-    projection_root = resolve_agent_home().resolve()
+    projection_root = Path(projection_root or resolve_agent_home().resolve())
     installer = projection_root / "adapters" / "codex" / "bin" / "install-runtime-projection.sh"
     env = {**os.environ, "AGENT_HOME": str(projection_root), "CODEX_HOME": str(destination)}
     result = subprocess.run(
@@ -2159,6 +2093,20 @@ def resolve_agent_home() -> Path:
     return _resolve_agent_home(runtime_pointer=Path.home() / ".codex" / "hearting")
 
 
+def child_runtime_homes(args: argparse.Namespace, profile_home: Path | None) -> dict[str, str]:
+    """The Codex home a child runs with, and the harness root a pinned home projects.
+
+    The owner-only home is linked to the release this launch resolved, so the child runs
+    that release too (OPERATIONS §5.9a): after a later pointer change the home and
+    `AGENT_HOME` still agree, and the child's own starts pass the projection check.
+    """
+    if args.nested_codex_home is not None:
+        return {"CODEX_HOME": str(args.nested_codex_home), "AGENT_HOME": str(args.nested_codex_root)}
+    if profile_home is not None:
+        return {"CODEX_HOME": str(profile_home)}
+    return {}
+
+
 def ensure_runtime_home_projection(worktree: Path) -> Path | None:
     """Deprecated observation hook; liveness resolves canonical external homes."""
     return None
@@ -2182,6 +2130,12 @@ def check_runtime_projection(worktree: str, require_hook_trust: bool) -> int:
             print(result.stdout, end="")
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)
+        lines = (result.stdout or "").splitlines()
+        if not any(line.startswith("reason=") for line in lines):
+            # The link-by-link projection check names each failure inside its own line; the
+            # receipt still needs the one reason a launcher reads.
+            first = next((line for line in lines if ":failed" in line), "") or f"exit-{result.returncode}"
+            return fail("codex-runtime-projection-mismatch", result.returncode, detail=first[:300])
     return result.returncode
 
 
@@ -2811,13 +2765,18 @@ def main(argv: list[str]) -> int:
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     args.nested_codex_home = None
+    args.nested_codex_root = None
     try:
         args.nested_codex_home_path = (
             nested_codex_home_path(worktree, args.jobs_path)
             if args.nested_headless_network else None
         )
         if action == "start" and args.nested_headless_network:
-            args.nested_codex_home = prepare_nested_codex_home(worktree, jobs=args.jobs_path)
+            # The home projects the release this launch resolved, and the child runs that same
+            # release (OPERATIONS §5.9a): a later pointer change moves neither of them.
+            args.nested_codex_root = sealed_launch_home(args.agent_home)
+            args.nested_codex_home = prepare_nested_codex_home(
+                worktree, jobs=args.jobs_path, projection_root=args.nested_codex_root)
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     prompt_name = (
@@ -3017,10 +2976,7 @@ def main(argv: list[str]) -> int:
         else:
             dispatch_env.pop("AGENT_DISPATCH_COMPLETION_STATE_FILE", None)
             dispatch_env.pop("AGENT_DISPATCH_SUPERVISOR_LEASE_FILE", None)
-        if args.nested_codex_home is not None:
-            dispatch_env["CODEX_HOME"] = str(args.nested_codex_home)
-        elif profile_home is not None:
-            dispatch_env["CODEX_HOME"] = str(profile_home)
+        dispatch_env.update(child_runtime_homes(args, profile_home))
         launch_parent_completion_sidecar(args, jobs)
         if args.managed_sidecar_state == "launch-failed":
             annotate_attempt_row(

@@ -23,6 +23,7 @@ from typing import Callable
 
 import dispatch_contract as DC
 from artifact_receipt import _write_once
+import route_authority
 
 ROOT = Path(__file__).resolve().parents[1]
 DEATH_NOTES = frozenset({
@@ -183,18 +184,18 @@ def seal_launch_input(args, harness: str, task: str) -> str:
     return ',replacement_input_digest='+_digest(payload)
 
 
-# A later launcher of the same attempt may run from a newer release and resolve
-# afresh (admission still checks that against the source). The work and the
-# permissions it is granted must not change.
-_RESEAL_STABLE_KEYS = ('schema', 'attempt_id', 'harness', 'jobs', 'worktree', 'argv', 'task',
-                       'route_id', 'route_node', 'owner_route_id', 'applied_permissions')
+# A later launcher of the same attempt may run from a newer release or another place (inside
+# the parent's sandbox or on the host) and resolve afresh (admission still checks that against
+# the source). The work and the permissions it is granted must not change
+# (`route_authority.same_sealed_work`).
+_RESEAL_STABLE_KEYS = route_authority.RESEAL_STABLE_KEYS
 
 
 def _reseal_allowed(jobs, aid, path, payload):
     """A launcher stopped before its claim sealed this input; the next one may reseal it."""
     previous = _read(path)
     stored = json.loads(_bytes(payload))  # compare in the stored form: a tuple reads back as a list
-    if not previous or any(previous.get(key) != stored.get(key) for key in _RESEAL_STABLE_KEYS):
+    if not previous or not route_authority.same_sealed_work(previous, stored):
         return False
     rows = []
     for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
@@ -1111,7 +1112,7 @@ PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolv
 def _check_tuple(candidate, replay, transition=None):
     """The candidate must match the sealed input; only runtime-derived values may follow a new release,
     and only the profile-derived ones may follow a verified profile transition."""
-    for key in ('harness', 'jobs', 'worktree'):
+    for key in route_authority.REPLACEMENT_FIXED_KEYS:
         if candidate.get(key) != replay.get(key):
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
     drift = candidate.get('launch_home') != replay.get('launch_home')
@@ -1131,7 +1132,9 @@ def _check_tuple(candidate, replay, transition=None):
                 same_work_or_refuse('replacement-runtime-drift', key)
             else:
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
-    if candidate.get('applied_permissions') != replay.get('applied_permissions'):
+    # Where the replacement's launcher runs is not a permission change (route_authority).
+    if (route_authority.granted_permissions(candidate.get('applied_permissions'))
+            != route_authority.granted_permissions(replay.get('applied_permissions'))):
         if not drift:
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'applied_permissions')
         from hearting_gates import same_work_or_refuse
@@ -1191,18 +1194,10 @@ def _canonical_argv(argv):
 
 
 def _authorized(jobs, rows, meta):
-    if meta.get('dispatch_depth') == '2':
-        parent = meta.get('parent_attempt_id')
-        if not parent or os.environ.get('AGENT_DISPATCH_ATTEMPT_ID') != parent or parent not in rows:
-            raise DC.DispatchContractError('replacement-parent-identity-unproven')
-        fields, parent_meta = rows[parent]
-        if fields[1] not in {'open','running'} or not DC._parent_liveness_evidence(Path(jobs), parent_meta)[0]:
-            raise DC.DispatchContractError('replacement-parent-not-live')
-    else:
-        from work_start import _current_parent_session_id, _owns
-        # The launching session, or its confirmed same-seat successor after a /clear.
-        if not meta.get('parent_sid') or not _owns(meta, _current_parent_session_id(), jobs):
-            raise DC.DispatchContractError('replacement-parent-identity-unproven')
+    def current_session():
+        from work_start import _current_parent_session_id
+        return _current_parent_session_id()
+    route_authority.require_replacement_parent(jobs, rows, meta, current_session=current_session)
 
 
 def _replacement_task(record, source, replay):
@@ -1283,6 +1278,11 @@ def _capacity_hold(jobs, source, model=None):
     if hold:
         return hold
     _, route = _route(jobs, source.get('attempt_id'), source)
+    from model_profile import sealed_pin_harness
+    if sealed_pin_harness(route, worker_type=source.get('worker_type')) == harness:
+        # A sealed pin moves only for a real usage limit (harness_hold above), as at its
+        # first launch and on the stage path; the soft allocation gate does not move it.
+        return None
     allocation = route.get('dispatch_allocation') or {}
     if allocation.get('strategy') not in {'balanced', 'capacity-aware'}:
         return None  # legacy routes keep their existing hard-quota contract
@@ -1315,9 +1315,12 @@ def _capacity_hold(jobs, source, model=None):
     )
     if selected == harness:
         return None  # original all-gated recovery, quality bands and relief remain intact
-    return {'label': 'allocation-usage-gate', 'until_epoch': None,
+    source_of_score = report['sources'].get(harness)
+    return {'label': 'allocation-usage-gate',
+            'until_epoch': capacity.gate_release_epoch(
+                harness, source_of_score, usage_gate_used_percent=gate),
             'headroom': score, 'usage_gate_used_percent': gate,
-            'capacity_source': report['sources'].get(harness)}
+            'capacity_source': source_of_score}
 
 
 def _launcher_budget(command, source):
@@ -1649,7 +1652,8 @@ def recovery_instructions(args):
             'Preserve the original failure and report any second failure as needs-attention.\n')
     gate = (record.get('proof') or {}).get('parked_gate')
     if gate:
-        read = shlex.join([sys.executable, str(ROOT/'utilities/workflow-supervisor.py'), 'await-release',
+        from parent_next_directive import entrypoint
+        read = shlex.join([sys.executable, entrypoint(ROOT, 'utilities/workflow-supervisor.py'), 'await-release',
                            '--route', record['route_file'], '--gate', gate, '--jobs', str(jobs),
                            '--max', '0', '--answers-out']) + ' <file>'
         text += (f'The original owner stopped at human gate {gate} (raise epoch {record["proof"].get("gate_epoch")}); '

@@ -63,7 +63,7 @@ from dispatch_allocation import (  # noqa: E402
     attempt_counts,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
-from model_profile import sealed_pin_harness  # noqa: E402
+from route_authority import sealed_pin_harness  # noqa: E402
 
 CAPACITY_SPEC = importlib.util.spec_from_file_location(
     "harness_capacity", ROOT / "utilities" / "harness-capacity.py"
@@ -2154,12 +2154,14 @@ def node_launch_command(*, route_path, leg, parent, prompt_text, reviewed_eviden
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--route", type=Path, required=True)
+    parser.add_argument("--route", type=Path, help="default: this owner's current route")
     parser.add_argument("--parallel-group")
     parser.add_argument("--replica-group")
     parser.add_argument("--action", choices=("dry-run", "start"), default="dry-run")
-    parser.add_argument("--slug-prefix", required=True)
-    parser.add_argument("--parent", required=True)
+    parser.add_argument("--start", dest="action", action="store_const", const="start",
+                        help="same as --action start")
+    parser.add_argument("--slug-prefix", help="default: the parent")
+    parser.add_argument("--parent", help="default: this session's own name (AGENT_DISPATCH_SELF_SLUG)")
     parser.add_argument("--qa", default=None)
     parser.add_argument("--jobs", type=Path)
     parser.add_argument("--log-dir", type=Path)
@@ -2194,6 +2196,15 @@ def main(argv: list[str] | None = None) -> int:
     from review_input import add_arguments, resolve_input, is_review_node
     add_arguments(parser)
     args = parser.parse_args(argv)
+    if args.route is None:
+        from owner_route_binding import OwnerRouteBindingError, default_owner_route_file
+        try:
+            args.route = Path(default_owner_route_file(args.jobs))
+        except OwnerRouteBindingError as exc:
+            print(f"check=failed\nreason={exc}\ndetail=name the route with --route\nchild_spawned=0")
+            return 64
+    args.parent = args.parent or os.environ.get("AGENT_DISPATCH_SELF_SLUG") or ""
+    args.slug_prefix = args.slug_prefix or args.parent
     if args.parallel_group and args.replica_group and args.parallel_group != args.replica_group:
         parser.error("--parallel-group and --replica-group aliases must match")
     args.parallel_group = args.parallel_group or args.replica_group

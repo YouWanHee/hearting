@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 
 from hearting_gates import gates_on  # noqa: E402
-from model_profile import pinned_launch_harness  # noqa: E402
+from route_authority import pinned_launch_harness  # noqa: E402
 from stage_session_contract import (  # noqa: E402
     ADAPTERS,
     StageSessionError,
@@ -313,6 +313,7 @@ def dispatch_command(
         "--subsession-index", str(session["index"]),
         "--subsession-count", str(session["count"]),
         "--subsession-mode", manifest["mode"],
+        "--subsession-purpose", session.get("subsession_purpose") or "planned",
         "--session-chain-id", manifest["chain_id"],
         "--phase-brief", session["phase_brief"],
         "--stage-authority", "0",

@@ -117,6 +117,50 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             result = self.inspect(log)
         self.assertEqual(result["reason"], "artifact-outside-root")
 
+    def _path(self, encoded):
+        return Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+
+    def test_a_missing_path_naming_one_file_by_the_same_tail_is_that_file(self):
+        # RA-8, BC C route plan-check: the handoff dropped one parent directory.
+        real = self.root / "campaigns/cycle/artifacts/plans/plan-check.md"
+        real.parent.mkdir(parents=True)
+        real.write_text("review\n")
+        typo = self.base / "elsewhere" / ".agent_reports" / "campaigns/cycle/artifacts/plans/plan-check.md"
+        for verdict, blocker in (("PASS", "none"), ("FAIL", "G1 wrong padding")):
+            with self.subTest(verdict=verdict):
+                result = self.inspect(self.write_log(verdict=verdict, blocker=blocker, artifact=str(typo), sandbox=False))
+                self.assertEqual((result["state"], result["verdict"], result["artifact_state"]),
+                                 ("valid", verdict, "readable"))          # the verdict is never changed
+                self.assertEqual(self._path(result["artifact_path_b64"]), real)
+                self.assertEqual(self._path(result["artifact_named_path_b64"]), typo)
+                self.assertEqual(result["envelope_normalized"], "artifact-same-tail")
+                self.assertNotIn("artifact_origin_path_b64", result)  # not a producer-recorded move
+        # No file with that tail, or two of them, leaves the handoff outside the root.
+        absent = self.base / "elsewhere" / ".agent_reports" / "campaigns/cycle/artifacts/absent.md"
+        (self.root / "a/.agent_reports").mkdir(parents=True)
+        (self.root / "a/.agent_reports/twice.md").write_text("one\n")
+        (self.root / "twice.md").write_text("two\n")
+        twice = self.base / "elsewhere" / ".agent_reports" / "a" / ".agent_reports" / "twice.md"
+        for path in (absent, twice):
+            with self.subTest(path=path.name):
+                result = self.inspect(self.write_log(verdict="PASS", blocker="none", artifact=str(path), sandbox=False))
+                self.assertEqual(result["reason"], "artifact-outside-root")
+
+    def test_a_pass_with_an_explained_none_blocker_is_a_pass_and_keeps_the_note(self):
+        # RA-8, BC C route test: `blocker: none (...)` was discarded and rerun for ~13 min.
+        artifact = self.root / "envelope.md"
+        artifact.write_text("ok\n")
+        result = self.inspect(self.write_log(
+            verdict="PASS", blocker="none (범위 한정 PASS; G5 별도)", artifact=str(artifact), sandbox=False))
+        self.assertEqual((result["state"], result["verdict"], result["blocker_reason"], result["artifact_state"]),
+                         ("valid", "PASS", "none", "readable"))
+        self.assertEqual(result["envelope_normalized"], "pass-blocker-note")
+        self.assertEqual(result["pass_note_excerpt"], "범위 한정 PASS; G5 별도")
+        for blocker in ("not-none", "none, but G1 was skipped", "nonexistent (x)", "none ()"):
+            with self.subTest(blocker=blocker):
+                result = self.inspect(self.write_log(verdict="PASS", blocker=blocker, artifact=str(artifact), sandbox=False))
+                self.assertEqual(result["reason"], "pass-blocker-not-none")
+
     def test_a_review_artifact_that_declares_fail_contradicts_a_pass_envelope(self):
         # P-4: the round that shipped as a pass. Envelope PASS, artifact body
         # opening with `## 평결: FAIL`. The envelope keeps its authority (the

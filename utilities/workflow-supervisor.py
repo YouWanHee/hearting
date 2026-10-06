@@ -653,10 +653,9 @@ def cmd_watch(args):
 def cmd_gate(args):
     route = load_route(args.route)
     if args.block and not getattr(args, "jobs", None) \
-            and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1" \
-            and os.environ.get("AGENT_HARNESS", "codex").lower() == "codex":
+            and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1":
         raise SupervisorError(
-            "human-gate-jobs-required: Codex strict gate --block requires explicit --jobs"
+            "human-gate-jobs-required: a registered worker's gate --block requires explicit --jobs"
         )
     ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
@@ -1599,8 +1598,8 @@ def owner_continuation(route, route_path, gate, jobs):
     parked = dispatch_replacement.owner_parked_gate(Path(jobs), attempt)
     if not parked or parked["gate"] != gate or parked["status"] != "proceed":
         return None
-    resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
-                         "--route", str(Path(route_path).resolve()), "--jobs", str(jobs)])
+    from parent_next_directive import resume_command
+    resume = resume_command(Path(route_path).resolve(), jobs, agent_home=ROOT)
     try:
         code, receipt = start_owner_continuation(route_path, jobs)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:

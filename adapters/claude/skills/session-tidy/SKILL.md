@@ -23,11 +23,14 @@ Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 
 work, then pass the card to a peer session; only this calling window is cleared, never the
 target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
 
+For a new successor at this seat, replace the clear sequence below with `peer-steward.py start --beside "$HERDR_PANE_ID"` → `handoff` → `enqueue --no-clear`; after its ACK and the predecessor's final idle result, the successor uses `peer-steward.py retire <predecessor>` (§5.14).
+
 ## Steps
 
 1. **Card.** Write four short fields in the user's language and pipe them in:
    what is in progress, the decisions still waiting, what to do next, and the related
-   paths, PRs and sessions. Point to artifacts; do not summarize them again.
+   paths, PRs and sessions (Fleet tag·pane, role in parentheses; herdr name·pane
+   when untagged). Point to artifacts; do not summarize them again.
 
    ```bash
    python3 "$AGENT_HOME/utilities/session_tidy.py" card <<'CARD'
@@ -66,7 +69,7 @@ target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
    new session first, a new card or a handoff cancels the `이어서해` quietly. Anything else
    the helper cannot decide leaves the window as it is plus one result line at the next prompt.
 
-3. **Handoff only.** For `인계 <받을 세션>`, after step 2:
+3. **Handoff only.** For `인계 <받을 세션>` to an already-running target, after step 2:
 
    ```bash
    python3 "$AGENT_HOME/utilities/session_tidy.py" handoff <target>

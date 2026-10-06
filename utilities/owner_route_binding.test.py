@@ -1032,5 +1032,34 @@ class QuickNodeBindingTest(unittest.TestCase):
         self.assertEqual(str(caught.exception), "quick-owner-node-missing")
 
 
+class DefaultOwnerRouteTest(unittest.TestCase):
+    """A stage launch that names no route means the owner's current route, or nothing."""
+
+    def test_the_current_route_answers_and_anything_unsettled_names_no_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text("")
+            env = {"AGENT_DISPATCH_ATTEMPT_ID": "att-owner", "AGENT_DISPATCH_JOBS": str(jobs)}
+            current = M.OwnerRouteBinding(str(Path(tmp) / "route-2.json"), "rt-2", "sha256:2")
+            for status in ("owner-route-launch-binding", "owner-route-advance-current"):
+                with self.subTest(status=status), mock.patch.object(
+                        M, "resolve_owner_route_lifecycle", return_value=(current, status)):
+                    self.assertEqual(M.default_owner_route_file(environ=env), current.route_file)
+            for status in ("owner-route-advance-pending", "owner-route-binding-absent"):
+                with self.subTest(status=status), mock.patch.object(
+                        M, "resolve_owner_route_lifecycle", return_value=(current, status)), \
+                        self.assertRaisesRegex(M.OwnerRouteBindingError, "owner-route-default-unresolved"):
+                    M.default_owner_route_file(environ=env)
+            pending = M._advance_root(jobs) / M._advance_key("att-owner", "rt-2", "sha256:2")
+            pending.mkdir(parents=True)
+            (pending / "candidate.json").write_text("{}")
+            with mock.patch.object(M, "resolve_owner_route_lifecycle",
+                                   return_value=(current, "owner-route-advance-current")), \
+                    self.assertRaisesRegex(M.OwnerRouteBindingError, "successor-not-adopted"):
+                M.default_owner_route_file(environ=env)
+            with self.assertRaisesRegex(M.OwnerRouteBindingError, "outside-owner"):
+                M.default_owner_route_file(environ={})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -425,12 +425,10 @@ class DispatchV20ConformanceTest(unittest.TestCase):
             ROOT / "skills/autopilot-code/references/dev-pipeline.md"
         ).read_text(encoding="utf-8")
         for required in (
-            "utilities/dispatch-node.py",
+            "utilities/stage-dispatch-fallback.py",
             "utilities/dispatch-batch.py",
-            '--route "$ROUTE_FILE"',
-            '--node "$NODE_ID"',
-            '-- --jobs "$CANONICAL_JOBS"',
-            '--jobs "$CANONICAL_JOBS" --prompt-text "$STAGE_PROMPT"',
+            '--node "$NODE_ID" --start',
+            '--parallel-group "$PARALLEL_GROUP" --start',
             "ATTEMPT_ID=",
             "--attempt-id <exact-attempt-id>",
         ):
@@ -444,8 +442,8 @@ class DispatchV20ConformanceTest(unittest.TestCase):
             ROOT / "hooks/stage-dispatch-reminder.sh"
         ).read_text(encoding="utf-8")
         for required in (
-            "dispatch-node.py --route <route-file>",
-            "--jobs <canonical-jobs.log>",
+            "stage-dispatch-fallback.py",
+            "--node ${node} --start",
             "attempt_id",
         ):
             self.assertIn(required, reminder)

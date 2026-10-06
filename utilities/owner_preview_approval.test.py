@@ -612,7 +612,7 @@ class PollingParentBase(OwnerRefineBase):
     def owner_env(self):
         return {**os.environ, "AGENT_ARTIFACT_ROOT": str(self.root), "AGENT_DISPATCH_JOBS": str(self.jobs),
                 "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_ATTEMPT_ID": self.owner,
-                "AGENT_HARNESS": "opencode"}
+                "AGENT_DISPATCH_CURRENT_HARNESS": "opencode"}
 
     def owner_block(self):
         """The owner's own `gate --block`, as the runtime-rendered owner prompt tells it to run."""

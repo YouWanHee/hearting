@@ -677,6 +677,30 @@ class ProveSerialChainTest(unittest.TestCase):
             self.assertIsInstance(proof, ADVANCE.ProvenSerialChain)
             self.assertEqual(tuple(proof.rows_by_index), (1, 2, 3))
 
+    def test_runtime_gap_retry_label_is_proven_but_a_declared_gap_retry_is_never_planned(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            harness = SimpleNamespace(base=base, artifact_root=base / ".agent_reports", jobs=base / "jobs.log", lease=base / "lease")
+            harness.artifact_root.mkdir()
+            harness.jobs.touch()
+            route, manifest = _real_chain_fixture(harness, CLAUDE, 2)
+            planned_rows = harness.jobs.read_text(encoding="utf-8")
+            # dispatch-node.py records a planned declaration opened after a gate
+            # failure as the gap retry it is (OPERATIONS §5.10).
+            harness.jobs.write_text(
+                planned_rows.replace("subsession_purpose=planned", "subsession_purpose=gap-retry"), encoding="utf-8")
+            proof = ADVANCE.prove_serial_chain(harness.jobs, manifest["chain_id"], parent_attempt_id="att-parent")
+            self.assertIsInstance(proof, ADVANCE.ProvenSerialChain)
+            source = Path(manifest["_manifest_path"])
+            raw = json.loads(source.read_text(encoding="utf-8"))
+            for session in raw["sessions"]:
+                session["subsession_purpose"] = "gap-retry"
+            source.write_text(json.dumps(raw), encoding="utf-8")
+            CHAIN.persist_chain_manifest(harness.jobs, load_manifest(source, route=route, node=route["nodes"][0]))
+            harness.jobs.write_text(planned_rows, encoding="utf-8")
+            proof = ADVANCE.prove_serial_chain(harness.jobs, manifest["chain_id"], parent_attempt_id="att-parent")
+            self.assertEqual(proof, ADVANCE.ChainProofRefusal("serial-chain-row-metadata-mismatch"))
+
 
 class SerialChainFrontierTest(unittest.TestCase):
     def test_frontier_proof_is_required_before_pending_rows_are_exempt(self):

@@ -121,6 +121,7 @@ class TerminalCommitResult:
     detail: Optional[str] = None
     terminal_nodes: tuple[str, ...] = ()
     envelope_text: Optional[str] = None
+    shared_publication: Optional[Mapping[str, Any]] = None
 
 
 def _default_close_route(route, route_file, **kwargs):
@@ -151,12 +152,18 @@ def _default_seal_envelope(**kwargs):
     return _seal_owner_envelope(**kwargs)
 
 
+def _default_shared_publication(root, *, cycle_id):
+    import artifact_producer
+    return artifact_producer.completed_spec_publication(root, cycle_id=cycle_id, settle=True)
+
+
 @dataclass(frozen=True)
 class TerminalCommitServices:
     close_route: Any = _default_close_route
     finalize_exact_cycle: Any = _default_finalize_exact_cycle
     seal_envelope: Any = _default_seal_envelope
     crash_after: Optional[str] = None
+    shared_publication: Any = _default_shared_publication
 
 
 @dataclass(frozen=True)
@@ -345,6 +352,9 @@ def select_primary_artifact(route: Mapping[str, Any], gates: Mapping[str, Any],
         candidate = _placed(Path(explicit))
         if candidate.is_absolute() and _in_root_regular(candidate, root) and candidate.stat().st_size:
             return candidate.resolve()
+    official = _official_spec_primary(root, route, binding)
+    if official is not None:
+        return official
     contract = route.get("workflow_contract") or {}
     declared = contract.get("terminal_nodes")
     if not isinstance(declared, list) or not declared:
@@ -358,6 +368,32 @@ def select_primary_artifact(route: Mapping[str, Any], gates: Mapping[str, Any],
             if candidate.is_absolute() and _in_root_regular(candidate, root) and candidate.stat().st_size:
                 candidates.append(candidate.resolve())
     return candidates[0] if len(candidates) == 1 else (candidates[0] if candidates else None)
+
+
+def _official_spec_primary(root, route, binding):
+    if route.get("capability") != "autopilot-spec" or not (binding or {}).get("cycle_id"):
+        return None
+    import artifact_producer
+    record = artifact_producer.read_cycle_record(root, binding["cycle_id"])
+    return (artifact_producer.official_spec_primary_path(root, record, route)
+            if record is not None else None)
+
+
+def _publication_observation(request, route, binding):
+    if route.get("capability") != "autopilot-spec" or binding is None:
+        return None
+    import artifact_producer
+    return artifact_producer.completed_spec_publication(request.artifact_root, cycle_id=binding["cycle_id"])
+
+
+def _completed_result(request, services, route, binding, terminal_nodes, envelope, detail=None):
+    publication = None
+    if route.get("capability") == "autopilot-spec" and binding is not None:
+        publication = getattr(services, "shared_publication", _default_shared_publication)(
+            request.artifact_root, cycle_id=binding["cycle_id"])
+        if getattr(services, "crash_after", None) == "admission-after":
+            raise RuntimeError("crash-after-admission")
+    return TerminalCommitResult("completed", None, detail, terminal_nodes, envelope, publication)
 
 
 def _seal_owner_envelope(*, request: TerminalCommitRequest, route: Mapping[str, Any],
@@ -650,7 +686,9 @@ def _exact_owner_handoff(jobs: Path, attempt: str, route: Mapping[str, Any]) -> 
         if not isinstance(encoded, str) or not encoded:
             return None
         primary = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
-        return {"primary": str(primary)}
+        # The terminal artifact names PASS evidence. It is not an explicit
+        # user/owner choice of the spec's representative document.
+        return {"primary": str(primary), "source": "terminal-artifact"}
     except (OSError, UnicodeError, ValueError, TypeError, RuntimeError):
         return None
     return None
@@ -1078,6 +1116,14 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             if selected_primary is None:
                 selected_primary = _valid_cycle_primary(binding_value.get("primary"),
                                                         root=request.artifact_root, binding=binding_value)
+            if route.get("capability") == "autopilot-spec":
+                if (request.owner_handoff or {}).get("source") == "terminal-artifact":
+                    selected_primary = (_valid_cycle_primary(binding_value.get("primary"),
+                        root=request.artifact_root, binding=binding_value)
+                        or _official_spec_primary(request.artifact_root, route, binding_value)
+                        or selected_primary)
+                elif selected_primary is None:
+                    selected_primary = _official_spec_primary(request.artifact_root, route, binding_value)
             if (selected_primary is not None and binding_value.get("primary") != str(selected_primary)
                     and existing_state_value is None):
                 pending_primary = selected_primary
@@ -1214,6 +1260,8 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
                                               **finalize_args)
                 state = _advance_state(path, commit_id, "route-closed", "producer-finalized",
                                        {"producer": "finalized"})
+                if checkpoint == "finalize-after":
+                    raise RuntimeError("crash-after-finalize")
             else:
                 state = _advance_state(path, commit_id, "route-closed", "not-applicable",
                                        {"producer": "not-applicable"})
@@ -1229,7 +1277,7 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
                                             terminal_nodes)
             _advance_state(path, commit_id, state["state"], "owner-envelope-sealed",
                            {"envelope": "sealed"})
-            return TerminalCommitResult("completed", None, None, terminal_nodes, envelope)
+            return _completed_result(request, services, route, binding_value, terminal_nodes, envelope)
         if state.get("state") == "owner-envelope-sealed":
             if production_services:
                 _verify_settled_outputs(request, route, commit_id, binding_value)
@@ -1240,7 +1288,8 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
                 return TerminalCommitResult("recoverable", exc.code, exc.detail, terminal_nodes)
             # §45 D-127: the stored envelope is delivered as it was; a report that
             # changed or went away afterwards is information beside it, not a failure.
-            return TerminalCommitResult("completed", None, after_seal, terminal_nodes, envelope_text)
+            return _completed_result(request, services, route, binding_value, terminal_nodes,
+                                     envelope_text, after_seal)
         return TerminalCommitResult("recoverable", "recovery-unavailable", "partial-state", terminal_nodes)
     except TerminalCommitError as exc:
         _record_attempt(request, exc.code, exc.detail)
@@ -1620,6 +1669,9 @@ def owner_completion_state(jobs, status, metadata) -> CompletionState:
                    owner_attempt_id=request.owner_attempt_id).binding if producer_lifecycle_applies(route) else None)
         _verify_settled_outputs(request, route, state["terminal_commit_id"], binding)
         _read_sealed_owner_envelope(request, state["terminal_commit_id"])
+        publication = _publication_observation(request, route, binding)
+        if publication is not None and publication["status"] == "pending":
+            return CompletionState("pending", "shared-spec-publication-pending")
         import workflow_state as workflow
         ledger = workflow.WorkflowLedger(state["route_id"], state["route_hash"], jobs=Path(jobs))
         if ledger.state()["workflow_state"] == "COMPLETE":
@@ -1649,6 +1701,17 @@ def completed_owner_handoff(jobs, status, metadata):
     return _read_sealed_owner_envelope(request, state["terminal_commit_id"])
 
 
+def completed_owner_publication(jobs, status, metadata):
+    """Fresh publication facts beside, never inside, the immutable handoff."""
+    request = _completion_request(jobs, status, metadata)
+    if request is None:
+        return None
+    route = json.loads(request.route_file.read_text())
+    binding = (load_producer_binding(artifact_root=request.artifact_root, route_id=route["route_id"],
+               owner_attempt_id=request.owner_attempt_id).binding if producer_lifecycle_applies(route) else None)
+    return _publication_observation(request, route, binding)
+
+
 def inspect_owner_completion(jobs, status, metadata):
     """Read-only closure diagnosis; used by public start and operator recovery."""
     result = {"attempt_id": metadata.get("attempt_id"), "state": "closure-pending"}
@@ -1663,7 +1726,15 @@ def inspect_owner_completion(jobs, status, metadata):
         result["state"] = "closure-pending" if owner_completion_pending(jobs, status, metadata) else "completed"
         path = _commit_state_path(request)
         result["checkpoint"] = json.loads(path.read_text()).get("state") if path.exists() else "not-claimed"
-        result["recovery_command"] = shlex.join([sys.executable, str(Path(__file__).resolve()), "finish",
+        if producer_lifecycle_applies(route):
+            binding = load_producer_binding(artifact_root=request.artifact_root, route_id=route["route_id"],
+                                            owner_attempt_id=request.owner_attempt_id).binding
+            publication = _publication_observation(request, route, binding)
+            if publication is not None:
+                result["shared_publication"] = publication
+        from parent_next_directive import entrypoint
+        result["recovery_command"] = shlex.join([sys.executable, entrypoint(
+            Path(__file__).resolve().parents[1], "utilities/dispatch_terminal_commit.py"), "finish",
             "--jobs", str(Path(jobs).resolve()), "--attempt", metadata["attempt_id"]])
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
         result.update(reason=getattr(exc, "code", "recovery-unavailable"), detail=str(exc))
@@ -1733,7 +1804,8 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         # terminal failure. Preserve their typed reason without model content.
         result = TerminalCommitResult("recoverable", "recovery-unavailable",
                                       str(getattr(exc, "code", type(exc).__name__)))
-    if result.result != "completed" and _parent_has_notice_carrier(metadata):
+    publication_pending = result.shared_publication is not None and result.shared_publication.get("status") == "pending"
+    if (result.result != "completed" or publication_pending) and _parent_has_notice_carrier(metadata):
         from dispatch_supervision import materialize
         try:
             materialize(Path(jobs), {metadata["attempt_id"]}, reason="workflow-completion-pending")
@@ -1761,7 +1833,8 @@ def cleanup_recover():
     if state.get("terminal_commit_id") != scope.terminal_commit_id:
         raise TerminalCommitError("transaction-conflict", "cleanup-commit-mismatch")
     result = settle_terminal_commit(request)
-    print(json.dumps({"result": result.result, "reason": result.reason, "detail": result.detail}))
+    print(json.dumps({"result": result.result, "reason": result.reason, "detail": result.detail,
+                      **({"shared_publication": result.shared_publication} if result.shared_publication is not None else {})}))
     return 0 if result.result == "completed" else 70
 
 
@@ -1786,5 +1859,6 @@ if __name__ == "__main__":
         raise SystemExit(3)
     if result.result == "completed":
         materialize_after_terminal_close(args.jobs, args.attempt)
-    print(json.dumps({"result": result.result, "reason": result.reason, "detail": result.detail}))
+    print(json.dumps({"result": result.result, "reason": result.reason, "detail": result.detail,
+                      **({"shared_publication": result.shared_publication} if result.shared_publication is not None else {})}))
     raise SystemExit(0 if result.result == "completed" else 70)

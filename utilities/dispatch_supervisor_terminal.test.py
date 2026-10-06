@@ -194,6 +194,17 @@ class OpencodeGap1TerminalClassificationTest(unittest.TestCase):
         self.assertEqual(result.failure_class, "pass")
         self.assertEqual(result.reconcile_reason, "exact-final-handoff")
 
+    def test_an_explained_none_blocker_keeps_a_pass_on_every_runtime(self):
+        # RA-8: the shared rule both terminal readers use.
+        for runtime in ("claude", "opencode"):
+            with self.subTest(runtime=runtime):
+                result = SUPERVISOR.classify_session_result(
+                    {"result": "artifact: /a.md\nverdict: PASS\nblocker: none (scope-limited PASS)"},
+                    0, runtime=runtime)
+                self.assertEqual((result.note, result.failure_class), ("completed-supervisor", "pass"))
+        refused = SUPERVISOR.classify_codex_result("artifact: /a.md\nverdict: PASS\nblocker: G1 skipped")
+        self.assertEqual((refused.note, refused.reconcile_reason), ("dead-contract", "pass-blocker-not-none"))
+
     def test_broken_stream_still_classifies_as_dead_protocol(self):
         result = SUPERVISOR.classify_supervisor_log(
             str(FIXTURES / "broken-stream.jsonl"), "opencode"

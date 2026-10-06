@@ -27,6 +27,11 @@ bounded wait only costs time.
 """
 from __future__ import annotations
 
+import os
+import shlex
+import sys
+from pathlib import Path
+
 NEXT_END_TURN = "end-turn"
 NEXT_BOUNDED_WAIT = "bounded-wait"
 
@@ -59,20 +64,76 @@ JOIN_SLACK_MS = 5_000
 STEWARD_CARRIER_WAKE = "hook"
 
 
-def _entrypoint(agent_home, relative: str) -> str:
+def command_home(agent_home) -> str:
+    """The harness root a printed command names, or "" when the root is unknown.
+
+    A printed command outlives the process that printed it: it sits in a
+    receipt, reaches a successor session, or runs hours later after a capacity
+    wait. A managed release (`<data>/hearting/releases/<v>`, also when reached
+    through a runtime projection such as `~/.codex/hearting`) is therefore
+    printed as its `<data>/hearting/current` pointer, so the command runs the
+    release installed when it runs, not the one that happened to print it. A
+    session's own pin (OPERATIONS §5.9a) is its exported `AGENT_HOME` and each
+    row's sealed launch home, never a printed path. Any other root -- a
+    checkout, a test tree -- is printed as given.
+    """
+    root = str(agent_home or "").strip().rstrip("/")
+    if not root:
+        return ""
+    releases = os.path.dirname(os.path.realpath(root))
+    if os.path.basename(releases) == "releases":
+        pointer = os.path.join(os.path.dirname(releases), "current")
+        if os.path.isfile(os.path.join(pointer, "core", "CORE.md")):
+            return pointer
+    return root
+
+
+def entrypoint(agent_home, relative: str) -> str:
     """Absolute path to a checked entry point, or "" when the root is unknown.
 
     A bare `dispatch-wait` is not on any PATH here; printing one would hand the
     parent a command that fails with command-not-found exactly when it is the
     only thing standing between the work and a lost completion.
     """
-    root = str(agent_home or "").strip().rstrip("/")
+    root = command_home(agent_home)
     return f"{root}/{relative}" if root else ""
+
+
+def registry_args(jobs) -> list[str]:
+    """`--jobs <registry>` unless it is the stable default a bare call uses here and in a new session.
+
+    A bare `start` reads `AGENT_DISPATCH_JOBS` first, so the registry is left
+    out only when that variable is unset or names this same registry.
+    """
+    if not jobs:
+        return []
+    try:
+        from dispatch_contract import stable_state_root
+        named = Path(jobs).resolve()
+        inherited = os.environ.get("AGENT_DISPATCH_JOBS")
+        if (named == (stable_state_root(os.environ) / "jobs.log").resolve()
+                and (not inherited or Path(inherited).resolve() == named)):
+            return []
+    except (ImportError, OSError, ValueError, RuntimeError):
+        pass
+    return ["--jobs", str(jobs)]
+
+
+def resume_command(route_file, jobs=None, *, agent_home) -> str:
+    """The command that continues one sealed route; its route file is the whole handle."""
+    return shlex.join([sys.executable, entrypoint(agent_home, "utilities/capability-route.py"),
+                       "start", "--route", str(route_file), *registry_args(jobs)])
+
+
+def correction_command(attempt_id, jobs=None, *, agent_home) -> str:
+    """The command that answers or corrects one existing owner, by its attempt id."""
+    return shlex.join([sys.executable, entrypoint(agent_home, "utilities/capability-route.py"),
+                       "correct", *registry_args(jobs), "--attempt-id", str(attempt_id)])
 
 
 def wait_command(attempt_id: str, *, agent_home=None) -> str:
     """The exact bounded wait a `bounded-wait` receipt authorizes."""
-    entry = _entrypoint(agent_home, "utilities/dispatch-wait.sh")
+    entry = entrypoint(agent_home, "utilities/dispatch-wait.sh")
     if not entry:
         return ""
     return f"{entry} --attempt-id {attempt_id} --max {WAIT_MAX_SECONDS}"
@@ -135,7 +196,7 @@ def steward_next(
         reason = "steward-line-does-not-arm"
     else:
         reason = f"steward-wake-{(wake or 'unset').strip() or 'unset'}"
-    entry = _entrypoint(agent_home, "utilities/peer-steward.py")
+    entry = entrypoint(agent_home, "utilities/peer-steward.py")
     if not entry or not watch_id or watch_id == "-":
         return NEXT_BOUNDED_WAIT, f"{reason}-entrypoint-unknown", ""
     # A watch's own deadline may be hours (the hook budget is ~6 h). Waiting that

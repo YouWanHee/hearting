@@ -15,7 +15,7 @@ from owner_route_binding import OwnerRouteBindingError, validate_owner_route_bin
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
                                parse_registry_metadata)
-from model_profile import pinned_launch_harness, sealed_pin_harness
+from route_authority import pinned_launch_harness, sealed_pin_harness
 from dispatch_lifecycle import (
     FOREGROUND_NOTICE,
     FOREGROUND_SCOPED,
@@ -130,8 +130,8 @@ _HINTS = {
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
     "review-output-frame-forbidden": "a frame worker returns its advisory verdict through the ordinary dispatch handoff; drop --review-output",
-    "frame-artifact-scope-missing": "export all four of AGENT_ARTIFACT_ROOT, AGENT_ARTIFACT_CAMPAIGN_ID, AGENT_ARTIFACT_CYCLE_ID "
-                                    "and AGENT_ARTIFACT_CYCLE_DIR in the same Bash call as the launch (OPERATIONS §5.10b)",
+    "frame-artifact-scope-missing": "launch frames through their route: compose --start (or the receipt's resume_command) "
+                                    "binds each leg's cycle itself (OPERATIONS §5.10b)",
     "route-node-unknown": "--route-node must name an id present in the sealed route's nodes list",
     "route-node-worker-type-forbidden": "--route-node selects a frame node's own profile and role; only --worker-type frame may use it",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag. "
@@ -398,6 +398,16 @@ def _parse(argv):
             i += 1
             continue
         name, equal, value = arg.partition("=")
+        if name == "--action":
+            # The stage tools spell the same request `--action start`.
+            if not equal:
+                if i + 1 >= len(argv):
+                    raise OwnerError("invalid-action:--action")
+                value = argv[i + 1]
+                i += 1
+            if value not in {"dry-run", "register", "start"}:
+                raise OwnerError(f"invalid-action:--action={value}")
+            name, equal, arg = f"--{value}", "", f"--{value}"
         if name in {"--dry-run", "--register", "--start"}:
             if equal:
                 raise OwnerError(f"invalid-action:{arg}")

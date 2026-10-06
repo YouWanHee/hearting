@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.fleet import interaction as fleet_interaction
 from tools.fleet import session_registry
 from dispatch_contract import WRAPPER_PARENT_HARNESSES
+import route_authority  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
     DELIVERY_TIMING_POINTS,
     JoinContractError,
@@ -1883,10 +1884,8 @@ class ManagedGateway:
                     rows = _rows(jobs.read_text().splitlines())
                     for aid in originals | observed:
                         metadata = rows[aid][1]
-                        if metadata.get("dispatch_depth") == "1":
-                            if metadata.get("parent_sid") != thread_id:
-                                raise ValueError("replacement-parent-invalid")
-                        elif metadata.get("parent_attempt_id") != parent_attempt_id:
+                        if not route_authority.lineage_parent_matches(
+                                metadata, thread_id=thread_id, parent_attempt_id=parent_attempt_id):
                             raise ValueError("replacement-parent-invalid")
                     normalized["replacement_lineage"] = lineage
                 if attention:
@@ -1894,10 +1893,8 @@ class ManagedGateway:
                     rows = _rows(jobs.read_text().splitlines())
                     for item in checked_attention:
                         metadata = rows[item["source_attempt_id"]][1]
-                        if metadata.get("dispatch_depth") == "1":
-                            if metadata.get("parent_sid") != thread_id:
-                                raise ValueError("replacement-parent-invalid")
-                        elif metadata.get("parent_attempt_id") != parent_attempt_id:
+                        if not route_authority.lineage_parent_matches(
+                                metadata, thread_id=thread_id, parent_attempt_id=parent_attempt_id):
                             raise ValueError("replacement-parent-invalid")
                     normalized["replacement_attention"] = checked_attention
             except (ValueError, OSError, KeyError, RuntimeError) as exc:
