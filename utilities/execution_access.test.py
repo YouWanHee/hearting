@@ -664,6 +664,11 @@ class ExecutionAccessTest(unittest.TestCase):
         self.assertIn(self.worktree, parent.writable_roots)
         self.assertIn(self.root / "scoped" / "write", parent.writable_roots)
         self.assertFalse(parent.network_allowed)
+        self.assertEqual("att-parent", parent.attempt_id)
+        self.assertEqual("codex-exec", parent.runtime)
+        self.assertEqual("workspace-write", parent.sandbox)
+        self.assertEqual("os-sandbox", parent.file_enforcement)
+        self.assertEqual("os-sandbox", parent.network_enforcement)
 
         metadata["execution_access_effective_sha256"] = "0" * 64
         jobs.write_text(

@@ -152,6 +152,14 @@ class CodexSandboxMountShape(unittest.TestCase):
             self.assertEqual(WH.effective_runtime_sandbox(args), "danger-full-access")
             self.assertIsNone(WH.invalid_codex_mount_target(args, worktree))
 
+    def test_nested_read_only_and_explicit_full_keep_the_selected_sandbox(self):
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CHILD": "1"}):
+            for sandbox in ("read-only", "danger-full-access"):
+                args = self.args("headless")
+                args.sandbox = sandbox  # also the resolved forced-sandbox value
+                self.assertFalse(WH.uses_enclosing_codex_sandbox(args))
+                self.assertEqual(sandbox, WH.effective_runtime_sandbox(args))
+
     def test_directory_shape_is_valid_with_workspace_sandbox(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.dict(os.environ, {"AGENT_DISPATCH_CHILD": "1"}):

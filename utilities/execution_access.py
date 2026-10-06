@@ -119,6 +119,11 @@ class ParentGrant:
     read_roots: tuple[Path, ...] = ()
     network_allowed: bool = False
     boundary: str = "parent-effective-grant"
+    attempt_id: str = ""
+    runtime: str = ""
+    sandbox: str = ""
+    file_enforcement: str = "none"
+    network_enforcement: str = "none"
 
 
 @dataclass(frozen=True)
@@ -483,6 +488,8 @@ class ExecutionAccessGrant:
     network_enforcement: str
     unmet: tuple[str, ...]
     source_path: Path | None = None
+    enclosing_parent_attempt_id: str | None = None
+    enclosing_parent_network_allowed: bool = False
 
 
 def request_path(
@@ -950,6 +957,7 @@ def build_grant(
     network_available: bool = False,
     effective_sandbox: str = "workspace-write",
     gpu_resource_scope: bool = False,
+    enclosing_parent: ParentGrant | None = None,
 ) -> ExecutionAccessGrant:
     """Compute the effective explicit grant; never create runtime argv."""
 
@@ -962,9 +970,32 @@ def build_grant(
     absorbed = tuple(root for root in request.writable_roots if _covered(root, defaults))
     additional = tuple(root for root in request.writable_roots if not _covered(root, defaults))
 
+    if enclosing_parent is not None:
+        if (not runtime.startswith("codex") or effective_sandbox != "danger-full-access"
+                or not enclosing_parent.runtime.startswith("codex")
+                or enclosing_parent.sandbox != "workspace-write"
+                or enclosing_parent.file_enforcement != "os-sandbox"
+                or enclosing_parent.network_enforcement not in ("os-sandbox", "none")
+                or not re.fullmatch(r"[A-Za-z0-9._-]+", enclosing_parent.attempt_id)):
+            raise ExecutionAccessError(
+                "execution-access-enforcement-unavailable:codex-parent-sandbox",
+                "the enclosing parent has no checked workspace-write OS boundary",
+            )
+        assert_within_parent(request, enclosing_parent, is_child=True)
+        for root in defaults:
+            if not _covered(root, enclosing_parent.writable_roots):
+                _reject("execution-access-exceeds-parent", root,
+                        "default writable root exceeds the enclosing parent grant")
+        # The outer sandbox already projects these roots. Inner --add-dir does
+        # not establish a new grant when the inner mount sandbox is disabled.
+        absorbed, additional = request.writable_roots, ()
+        network_available = enclosing_parent.network_allowed
+
     if runtime.startswith("codex"):
-        file_grade = "os-sandbox" if effective_sandbox == "workspace-write" else "none"
-        network_grade = "os-sandbox" if effective_sandbox == "workspace-write" else "none"
+        file_grade = (enclosing_parent.file_enforcement if enclosing_parent else
+                      "os-sandbox" if effective_sandbox == "workspace-write" else "none")
+        network_grade = (enclosing_parent.network_enforcement if enclosing_parent else
+                         "os-sandbox" if effective_sandbox == "workspace-write" else "none")
     elif runtime.startswith("claude") or runtime == "opencode":
         file_grade = "tool-permission"
         network_grade = "none"
@@ -1044,6 +1075,8 @@ def build_grant(
         network_enforcement=network_grade,
         unmet=tuple(sorted(set(unmet))),
         source_path=request.source_path,
+        enclosing_parent_attempt_id=enclosing_parent.attempt_id if enclosing_parent else None,
+        enclosing_parent_network_allowed=enclosing_parent.network_allowed if enclosing_parent else False,
     )
 
 
@@ -1059,6 +1092,7 @@ def bind_request(
     network_available: bool = False,
     effective_sandbox: str = "workspace-write",
     gpu_resource_scope: bool = False,
+    inherit_parent_sandbox: bool = False,
 ) -> ExecutionAccessGrant | None:
     """Resolve, validate, constrain, and grade an explicit request.
 
@@ -1071,6 +1105,8 @@ def bind_request(
         return None
     request = load_request(source, context=context)
     assert_within_parent(request, parent, is_child=is_child)
+    if inherit_parent_sandbox and (not is_child or parent is None):
+        raise ExecutionAccessError("execution-access-exceeds-parent:parent-grant-unknown")
     return build_grant(
         request,
         runtime=runtime,
@@ -1078,6 +1114,7 @@ def bind_request(
         network_available=network_available,
         effective_sandbox=effective_sandbox,
         gpu_resource_scope=gpu_resource_scope,
+        enclosing_parent=parent if inherit_parent_sandbox else None,
     )
 
 
@@ -1130,6 +1167,12 @@ def publish_effective_grant(
             "os-sandbox" if runtime.startswith("codex") and sandbox == "workspace-write" else "none"
         ),
     }
+    if grant is not None and grant.enclosing_parent_attempt_id is not None:
+        record.update({"boundary": "parent-os-sandbox",
+                       "enclosing_parent_attempt_id": grant.enclosing_parent_attempt_id,
+                       "network_allowed": grant.enclosing_parent_network_allowed,
+                       "os_filesystem_enforced": grant.file_enforcement == "os-sandbox",
+                       "os_network_enforced": grant.network_enforcement == "os-sandbox"})
     if (grant is not None and runtime.startswith("codex")
             and sandbox == "danger-full-access" and grant.file_enforcement == "none"):
         record.update({"boundary": "logical-request", "unmet": list(grant.unmet),
@@ -1247,6 +1290,11 @@ def load_parent_effective_grant(
         writable_roots=tuple(Path(root) for root in record["writable_roots"]),
         read_roots=tuple(Path(root) for root in record["read_roots"]),
         network_allowed=record["network_allowed"],
+        attempt_id=record["attempt_id"],
+        runtime=record["runtime"],
+        sandbox=record["sandbox"],
+        file_enforcement=record.get("file_enforcement", "none"),
+        network_enforcement=record.get("network_enforcement", "none"),
     )
 
 
@@ -1263,6 +1311,9 @@ def receipt_fields(grant: ExecutionAccessGrant) -> dict[str, str]:
         "execution_access_enforcement": enforcement,
         "execution_access_unmet": ";".join(grant.unmet) if grant.unmet else "none",
     }
+    if grant.enclosing_parent_attempt_id is not None:
+        fields["execution_access_boundary"] = "parent-os-sandbox"
+        fields["execution_access_parent_attempt"] = grant.enclosing_parent_attempt_id
     for key, value in fields.items():
         if not _PIPE_VALUE.fullmatch(value):
             raise ExecutionAccessError(
