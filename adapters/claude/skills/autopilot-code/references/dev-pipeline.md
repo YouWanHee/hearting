@@ -224,7 +224,7 @@ as a registered review worker instead of an owner:
 ```bash
 python3 <agent-home>/utilities/dispatch-owner.py --adapter <harness> --start \
   --worktree <worktree> --slug <slug> \
-  --capability autopilot-code --capability-mode debug --qa standard \
+  --capability autopilot-code --capability-mode debug \
   --intensity standard --dispatch-depth 1 --worker-type review \
   --unit qa/code-review --model-role qa/code-review \
   --assigned-contract autopilot-code --owner <slug> --model-profile deep \

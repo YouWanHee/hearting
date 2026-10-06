@@ -435,8 +435,7 @@ A legacy hash collision is diagnostic
    - **The parallel-subdivision surface an owner actually calls.** One command reads the plan's single `slices` block, writes and proves the manifest and phase briefs, reserves the slots, registers and starts the slices; the gate that follows is typed too:
 
      ```
-     python3 utilities/dispatch-batch.py --parallel-group <node> --route <route-file> \
-       --parent <owner slug> --slug-prefix <prefix> --slices <plan.md> --action start
+     python3 utilities/dispatch-batch.py --parallel-group <node> --slices <plan.md> --start
      python3 utilities/capability-route.py complete --route <route-file> --node <node> \
        --evidence <stage evidence> --jobs <registry> --subsession-manifest <chain.json>
      ```
@@ -849,7 +848,7 @@ gone, the join recovery tick and `dispatch-registry.py reconcile` repeat the
 watcher's own group and tagged-descendant observation and record the same clean
 drain proof, after which the existing close path runs. An owner supervisor
 started from an older release keeps its old join, so release such a row once with
-`python3 "$AGENT_HOME/utilities/dispatch-registry.py" reconcile --jobs <jobs.log> --attempt <attempt-id> --apply`
+`hearting run dispatch-registry reconcile --jobs <jobs.log> --attempt <attempt-id> --apply`
 from the current release (it changes nothing while a residue process still
 runs). The launcher/watchdog owns signals; join/reconcile own proof recovery,
 bounded typed observer-error diagnostics and notification, not guessed process
@@ -909,9 +908,6 @@ agent home value it resolved into the child's environment; no descendant
 wrapper or hook recomputes agent home from its own physical install location
 once launched.
 
-The model may yield `runtime_wait: registered-children` only after each checked
-`--start` receipt reports `registered=1`, `started=1`, and `child_spawned=1`.
-`check=ok`, a dry-run identifier, or a register-only row is never launch evidence.
 For `stage-session-chain.py`, `registered=1` is a boolean for successful
 registration of the entire `registered_sessions=N` batch, not the number of
 rows registered; `started=1` and `child_spawned=1` prove only the manifest's

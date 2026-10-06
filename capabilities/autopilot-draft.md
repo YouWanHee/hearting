@@ -60,9 +60,8 @@ most `frame_interview.py`'s `QUESTION_CAP` short questions — one topic each,
 2–4 options, one recommended, no harness vocabulary, only decisions the user
 alone can make; `utilities/frame_interview.py validate` is the bar and
 `gate --block` refuses what fails it). Depth-0 puts those questions to the
-user, records the answers with `workflow-supervisor.py release --gate
-frame-review --decision proceed|revise|stop --answers <file>`, and renders
-`shards/frame/intent.md` with `frame_interview.py render-intent`.
+user; the receipt's `resume_command --answers <file>` validates the answers, renders
+`shards/frame/intent.md`, releases the gate and starts the owner.
 
 The owner **receives** `intent.md`'s path as an input. It raises no gate,
 waits on no release, and renders no intent of its own — all of that is

@@ -100,11 +100,7 @@ For `autopilot-code`, `direct` is inline, `quick` is one registered dispatch-dep
 owner, and `standard+` follows `code-plan -> code-execute -> code-test ->
 code-report` under `core/OPERATIONS.md §5.10`. Dispatch depth 3 is forbidden.
 
-Checked wrappers keep `capability_mode` separate from a non-owner
-`worker_mode`, which must equal its portable `unit`. A dispatch-depth-1 owner is
-`_kernel/owner` with no worker mode; contradictory owner/stage tuples fail
-before prompt, registry, or spawn. Legacy `mode` is read-only compatibility
-data. Contract v3 claims one
+Contract v3 claims one
 stable attempt before spawn; the retired broker only supports `status`/`stop`.
 
 Keep native agents distinct from registered headless worker dispatch; a restriction on one surface never silently extends to the other. Preserve model role, intensity, depth, tests, safety, and validation on fallback. Do not run drill automatically. A Codex job the openai-codex plugin detaches after its foreground timeout runs in the plugin's own queue, never in jobs.log; Fleet shows it only as a read-only plugin-queue row. Launch substantial Codex delegation that needs attempt-grade tracking or gates through registered dispatch instead.

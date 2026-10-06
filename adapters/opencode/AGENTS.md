@@ -126,12 +126,9 @@ external-facing; otherwise present the §0.4 five-field card before material
 work unless already approved, and close with the §0.5 card. Load full
 capability detail only in the acting owner or worker.
 
-Check `preflight.sh headless [--check] <worktree>`. Launch only registered jobs
-through `preflight.sh dispatch --dry-run|--register|--start` with the complete
-tuple in `core/OPERATIONS.md`. Keep `capability_mode` separate from a non-owner
-`worker_mode`, which must equal its portable `unit`; a dispatch-depth-1 owner is
-`_kernel/owner` with no worker mode. `worker_role` and legacy `mode` are
-read-only metadata, not bootstrap identity. Monitor
+Check `preflight.sh headless [--check] <worktree>`. `preflight.sh dispatch
+--dry-run|--register|--start` runs the raw wrapper; the route commands above
+reach it with the sealed tuple. Monitor
 `preflight.sh liveness [jobs.log]`; harvest via `preflight.sh harvest`. For an
 attempt you launched, its receipt outranks that general monitoring.
 OpenCode is eligible for the registered standard+ dispatch-depth-2 path —
@@ -141,13 +138,10 @@ attempt row before spawn and starts no child for a duplicate claim. Broker v1/v2
 routes are read-only migration inputs; the retired broker exposes only legacy
 `status`/`stop`.
 
-**OpenCode has no automatic wake carrier, and this is not carrier parity with
-Claude.** Nothing wakes this session on its own: follow the top-level
-receipt's `parent_next` and run `parent_next_command` once only when it says
-`bounded-wait`. Nested leg receipts remain evidence and add no child
-waits, and `needs-attention` after an expired wait grants no repeat wait. Do not
-describe or rely on a Claude-style carrier here; that gap is a deliberate scope
-boundary, not a defect to work around.
+While this session is idle, the hearting plugin hands it the completion records
+owed to it as its next turn (`opencode-turn`, `core/ADAPTATION.md` §7.4), and
+a launch receipt then says `end-turn`; a server without that carrier gets
+`bounded-wait`. Nested leg receipts remain evidence and add no child waits.
 
 `standard+` uses a dispatch-depth-1 capability owner and separable dispatch-depth-2
 `code-plan -> code-execute -> code-test -> code-report` workers. `direct` is
