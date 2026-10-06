@@ -82,6 +82,7 @@ utility-deferred	artifact_workflow_groups.py
 utility-deferred	capability-grounding.sh
 utility-deferred	capability-route.py
 utility-deferred	capability_route.test.py
+utility-deferred	capacity_auto_resume.py
 utility-deferred	claude-session-supervisor.py
 utility-deferred	claude_session_supervisor.test.py
 utility-deferred	codex-app-server-supervisor.py
@@ -196,7 +197,6 @@ utility-deferred	route_lineage.py
 utility-deferred	route_lineage.test.py
 utility-deferred	session_summary_trigger.py
 utility-deferred	session_identity.py
-utility-deferred	capacity_auto_resume.py
 utility-deferred	session_notice.py
 utility-deferred	session_tidy.py
 utility-deferred	session_tidy_clear.py
