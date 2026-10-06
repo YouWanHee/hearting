@@ -7577,6 +7577,9 @@ class ComposeRouteTest(TestRoute):
    (Path(tmp)/"repo-wt"/"taken").mkdir()
    self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
    self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
+   (primary/"new.txt").write_text("new\n")                     # a new file not yet added is work in progress too
+   self.assertEqual(R.prepare_isolated_worktree(primary,"z")["reason"],"primary-has-local-work")
+   (primary/"new.txt").unlink()
    # work in progress stays where it is: an uncommitted change, or a commit the base lacks
    (primary/"a.txt").write_text("changed\n")
    self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
@@ -7586,7 +7589,9 @@ class ComposeRouteTest(TestRoute):
    # the route compose moved into that worktree is found from the primary checkout after /clear
    routes=Path(tmp)/"reports"; R.canonical_routes_dir(routes).mkdir(parents=True)
    path=R.canonical_routes_dir(routes)/("rt-"+"f"*16+".json")
-   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"artifact_root":str(routes)}),encoding="utf-8")
+   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"slug":"fix-x","artifact_root":str(routes)}),encoding="utf-8")
+   other=R.canonical_routes_dir(routes)/("rt-"+"e"*16+".json")     # another route in a worktree it was not made for
+   other.write_text(json.dumps({"route_id":"rt-"+"e"*16,"nodes":[],"cwd":str(wt),"slug":"elsewhere","artifact_root":str(routes)}),encoding="utf-8")
    with mock.patch.object(R,"_route_chain_module",return_value=None), \
         mock.patch.object(R,"_compose_artifact_root",return_value=str(routes)):
     self.assertEqual(R.caller_open_route(primary)[:2],(str(path),"cwd"))
