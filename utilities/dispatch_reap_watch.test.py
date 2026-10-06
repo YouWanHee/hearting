@@ -905,5 +905,55 @@ class DispatchReapWatchTest(unittest.TestCase):
                         parent.wait(timeout=5)
 
 
+class DrainScanRetryTest(unittest.TestCase):
+    """One unverifiable drain scan (a process exiting mid-walk) is looked at
+    again within the drain grace; only a lasting one leaves no receipt."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dispatch_reap_watch_module", WATCH)
+        self.watcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.watcher)
+
+    def watch(self, scans, grace):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        metadata = {"attempt_id": "att-drain-retry", "pid_observer_ns": "pid:[1]"}
+        annotated = []
+        patches = {
+            "attempt_record": lambda jobs, aid: (["now", "open", "/r", "/w", "s", ""], metadata),
+            "exact_binding": lambda *args: True,
+            "process_namespace_identity": lambda *args: "pid:[1]",
+            "attempt_scan_namespace_authority": lambda meta: True,
+            "launched_attempt_identity": lambda fields: "identity",
+            "process_start_ticks": lambda pid: "gone",
+            "process_group_observation": lambda pgid: D.ProcessGroupObservation("empty"),
+            "attempt_tagged_descendants": mock.Mock(side_effect=scans),
+            # Stop right after the receipt write: the rest of the watcher is not under test.
+            "annotate_attempt_row": lambda jobs, aid, values: annotated.append(values) and False,
+        }
+        args = SimpleNamespace(jobs=Path("/nonexistent/jobs.log"), attempt_id="att-drain-retry", pid=1,
+                               pid_start="1", pgid=1, interval=0.01, drain_interval_max=0.02,
+                               residue_grace=grace, parent_recheck_interval=1.0)
+        with ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(self.watcher, name, value))
+            stack.enter_context(mock.patch.object(self.watcher.time, "sleep", lambda seconds: None))
+            return self.watcher.watch(args), annotated
+
+    def test_a_transient_unverifiable_scan_still_seals_the_drain_receipt(self):
+        denied = D.ProcessGroupObservation("unverifiable", reason="procfs-environ:4242:same-uid-unobservable")
+        code, annotated = self.watch([denied, D.ProcessGroupObservation("empty")], grace=30.0)
+        self.assertEqual(code, 65)   # the stubbed receipt write reports no change
+        self.assertEqual(len(annotated), 1)
+        self.assertEqual(annotated[0]["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_PROOF)
+        self.assertEqual(annotated[0]["launch_outcome"], "governed-process-group-drained")
+
+    def test_a_lasting_unverifiable_scan_leaves_no_receipt(self):
+        denied = D.ProcessGroupObservation("unverifiable", reason="procfs-environ:4242:same-uid-unobservable")
+        code, annotated = self.watch([denied], grace=0.0)
+        self.assertEqual((code, annotated), (69, []))
+
+
 if __name__ == "__main__":
     unittest.main()
