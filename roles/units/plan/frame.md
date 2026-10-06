@@ -114,7 +114,8 @@ created: {YYYY-MM-DD}
            - {text: "latency report written", check: "test -f reports/latency.md"}
          verify: "one line: what verification looks at"   # optional
          hands_over: [reports/latency.md]                   # optional: what the next leg reads
-         # optional notes for the owner, not compiled into stages: parallel: [...], extra_stages: [{id, unit, after, verify}]
+         parallel: [...]                                    # optional: work the owner may split into slices
+         extra_stages: [{id, unit, after, verify}]          # optional: compiled as node plan-<id> after `after`, shaped on a catalogue check/measurement stage of that unit (never one that edits source)
      execution_scope: complete   # optional: complete (default) | report
    ```
 

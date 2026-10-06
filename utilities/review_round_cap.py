@@ -68,6 +68,9 @@ def is_round_capped_node(node):
     return isinstance(node, Mapping) and (
         node.get("id") in ROUND_CAPPED_NODE_IDS
         or (node.get("kind") == "review-worker" and node.get("unit") == "qa/plan-review")
+        # A stage a plan added is shaped on a catalog stage and keeps that stage's budget.
+        or (isinstance(node.get("plan_stage"), Mapping)
+            and node["plan_stage"].get("template") in ROUND_CAPPED_NODE_IDS)
     )
 
 
@@ -356,7 +359,7 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
     if verdictless_streak >= VERDICTLESS_BOUND and route.get("route_plan") is not None:
         # RA-5: BLOCKED rounds that keep shrinking the leg's unmet items are progress (route_authority).
         import route_authority
-        counted = route_authority.blocked_progress(route, rows)
+        counted = route_authority.blocked_progress(route, rows, worker_type=worker_type)
         progress_reset = counted < verdictless_streak
         verdictless_streak = counted
     if "live" in kinds:

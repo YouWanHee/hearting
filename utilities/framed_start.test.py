@@ -733,9 +733,9 @@ class BlockedProgressTest(LegPlanTest):
                          "worker_type": "stage", "route_node": "test", "log_file": str(log),
                          "artifact_root": str(self.root)})
 
-    def budget(self, route, rows):
+    def budget(self, route, rows, **node_fields):
         import review_round_cap as RC
-        node = next(n for n in route["nodes"] if n["id"] == "test")
+        node = {**next(n for n in route["nodes"] if n["id"] == "test"), **node_fields}
         # The worker's artifact root, as the runtime that launched it names it.
         with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)}):
             return RC.round_budget(route, node, rows)
@@ -758,9 +758,66 @@ class BlockedProgressTest(LegPlanTest):
             with self.subTest(label):
                 rows = [self.blocked_round(route, 1, {"d1", "d2"}), second]
                 self.assertEqual(self.budget(route, rows).state, "verdictless-bound")
+        # A row that names no worker type reads as its node's: a review's FAIL is no verdict.
+        bare = lambda row: (row[0], {k: v for k, v in row[1].items() if k != "worker_type"})
+        failed = ("done", {"attempt_id": "att-test-9", "note": "dead-worker-fail", "failure_class": "fail",
+                           "route_node": "test"})
+        rows = [bare(self.blocked_round(route, 1, {"d1", "d2"})), failed, bare(self.blocked_round(route, 2, {"d2"}))]
+        self.assertEqual(self.budget(route, rows, kind="review-worker").state, "verdictless-bound")
         planless = {**route, "route_plan": None}
         rows = [self.blocked_round(route, 1, {"d1", "d2"}), self.blocked_round(route, 2, {"d2"})]
         self.assertEqual(self.budget(planless, rows).state, "verdictless-bound")
+
+
+class PlanExtraStageTest(StartBase):
+    """A plan's extra stage is a real node shaped on a catalog stage, with that stage's gate and budget."""
+
+    EXTRA = {**CODE_STAGED, "extra_stages": [{"id": "measure", "unit": "qa/test", "after": "test",
+                                              "verify": "run the latency script three times"}]}
+
+    def leg_route(self, leg):
+        self.set_briefs(leg, leg)
+        self.set_interview({"legs": [leg]})
+        result = self.settle()
+        paths = self.leg_routes()
+        self.assertEqual(len(paths), 1, json.dumps(self.record()["decision"].get("proposals"), default=str)[:3000])
+        (path,) = paths
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_the_extra_stage_runs_after_its_stage_with_the_templates_gate_budget_and_own_files(self):
+        import review_round_cap as RC
+        route = self.leg_route(self.EXTRA)
+        ids = [n["id"] for n in route["nodes"]]
+        self.assertEqual(ids[ids.index("test") + 1], "plan-measure")
+        nodes = {n["id"]: n for n in route["nodes"]}
+        measure, test = nodes["plan-measure"], nodes["test"]
+        self.assertEqual((measure["unit"], measure["kind"], measure["completion_gate"]),
+                         (test["unit"], test["kind"], test["completion_gate"]))
+        self.assertEqual(measure["plan_stage"], {"id": "measure", "template": "test",
+                                                 "verify": "run the latency script three times"})
+        self.assertEqual(measure["depends_on"], ["test"])
+        self.assertIn("plan-measure", nodes["report"]["depends_on"])
+        self.assertTrue(all("parts/plan/measure/" in out for out in measure["outputs"]), measure["outputs"])
+        self.assertTrue(all("parts/plan/measure" in scope for scope in measure["write_scope"]))
+        self.assertTrue(RC.is_round_capped_node(measure))                  # same budget as the stage it copies
+        self.assertEqual(R.verify_route(json.loads(json.dumps(route)))["route_id"], route["route_id"])
+        import worker_bootstrap as WB
+        self.assertIn("run the latency script three times", WB.plan_leg_prompt(route, "plan-measure"))
+
+    def test_an_extra_stage_that_cannot_be_shaped_or_placed_is_left_out_and_named(self):
+        leg = {**CODE_STAGED, "extra_stages": [{"id": "x", "unit": "no/such-unit", "after": "test"},
+                                               {"id": "y", "unit": "qa/test", "after": "report"},
+                                               {"id": "z", "unit": "qa/test", "after": "nowhere"},
+                                               # an approval-gated stage (deploy, full-run...) is never a template
+                                               {"id": "w", "unit": "_kernel/resource", "after": "test"},
+                                               # a stage that changes the source would land after the last check
+                                               {"id": "patch", "unit": "dev/backend", "after": "test"}]}
+        route = self.leg_route(leg)
+        self.assertFalse([n for n in route["nodes"] if n.get("plan_stage")])
+        row = next(r for r in self.record()["decision"]["proposals"] if r["node"] == "frame")
+        self.assertEqual(sorted(note for note in row["read_notes"] if note.startswith("extra-stage")),
+                         ["extra-stage-not-compiled:patch", "extra-stage-not-compiled:w", "extra-stage-not-compiled:x",
+                          "extra-stage-not-compiled:y", "extra-stage-not-compiled:z"])
 
 
 class FailureTableTest(StartBase):
