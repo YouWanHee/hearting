@@ -355,18 +355,21 @@ class Case4RetryLinkTest(unittest.TestCase):
 
 
 class Case5ReadRootsTest(unittest.TestCase):
-    """Case 5: read roots are not projected into the grant (Claude and Codex rows)."""
+    """Case 5: one read-only request is readable and unwritten on every harness (RA-7, stage 3);
+    the grant records each runtime's guarantee."""
 
-    def test_read_roots_are_dropped_and_reported_unmet(self):
+    def test_read_roots_are_projected_on_every_runtime(self):
         request = ExecutionAccessRequest(
             writable_roots=(), read_roots=(Path("/nas/records"),), network_required=False,
             network_reason="", network_hosts=(), enforcement_required="any", justification=(),
             request_sha256="0" * 64, source_path=Path("/tmp/request.json"))
-        for runtime in ("claude-cli", "codex-exec"):
+        for runtime, grade in (("claude-cli", "tool-permission"), ("codex-exec", "os-sandbox"),
+                               ("opencode", "tool-permission")):
             with self.subTest(runtime=runtime):
                 grant = RA.access_grant(request, runtime=runtime)
-                self.assertEqual(grant.read_roots, ())
-                self.assertIn("read-roots-unprojected", grant.unmet)
+                self.assertEqual(grant.read_roots, (Path("/nas/records"),))
+                self.assertEqual(grant.unwritable_read_roots, (Path("/nas/records"),))
+                self.assertEqual((grant.read_enforcement, grant.unmet), (grade, ()))
 
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):

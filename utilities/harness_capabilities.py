@@ -42,6 +42,20 @@ direct registered dispatch-depth-1 child finished:
     session id: ``verified`` -- the publisher proved it from the process;
     ``claim`` -- a reported value that is not taken as proof.
 
+``access`` says how the runtime realizes a portable execution access request
+(read-only roots, writable roots, network) and how strongly:
+
+``enforcement``
+    ``os-sandbox`` -- an OS sandbox whose launch mode decides the guarantee
+    (writes outside the writable roots and network are blocked under
+    ``workspace-write``; ``read-only`` blocks every write; ``danger-full-access``
+    blocks nothing), it has no host allowlist, and a child sandbox can nest
+    inside a parent's; ``tool-permission`` -- the runtime's tool permission
+    rules carry the request, the network is not enforced.
+``means``
+    What the adapter uses for each axis (``read``, ``write``, ``network``): the
+    projection table, as the adapters realize it.
+
 A declaration is data, never an approval step: reading it adds no gate.
 """
 from __future__ import annotations
@@ -60,6 +74,8 @@ PARENT_COMPLETION_KEYS = ("carrier", "reason", "parent_proof", "without_carrier"
 SESSION_IDENTITY_KEYS = ("env", "process_proof", "herdr_session_id")
 PROCESS_PROOFS = frozenset({"session-registry", "open-rollout", "tui-selection"})
 HERDR_SESSION_IDS = frozenset({"verified", "claim"})
+ACCESS_ENFORCEMENT = frozenset({"os-sandbox", "tool-permission"})
+ACCESS_AXES = ("read", "write", "network")
 # A parent named by no adapter has no runtime that could carry its completion.
 NO_PARENT_CARRIER = {"carrier": None, "reason": None, "parent_proof": None,
                      "without_carrier": "poll"}
@@ -106,6 +122,12 @@ def _validate(harness: str, value: object) -> dict:
         refuse("session_identity.process_proof")
     if identity["herdr_session_id"] not in HERDR_SESSION_IDS:
         refuse("session_identity.herdr_session_id")
+    access = value.get("access")
+    if (not isinstance(access, dict) or sorted(access) != ["enforcement", "means"]
+            or access["enforcement"] not in ACCESS_ENFORCEMENT
+            or not isinstance(access["means"], dict) or sorted(access["means"]) != sorted(ACCESS_AXES)
+            or not all(isinstance(text, str) and text for text in access["means"].values())):
+        refuse("access")
     return value
 
 
@@ -167,3 +189,8 @@ def herdr_verified_harnesses() -> frozenset[str]:
     """Harnesses whose herdr ``agent_session`` value is a proven session id."""
     return frozenset(harness for harness, declared in _readable_identities().items()
                      if declared["herdr_session_id"] == "verified")
+
+
+def access(harness: str) -> dict:
+    """How ``harness`` realizes an execution access request (see the module doc)."""
+    return json.loads(json.dumps(capabilities(harness)["access"]))

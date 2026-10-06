@@ -14,5 +14,13 @@
     ],
     "process_proof": "session-registry",
     "herdr_session_id": "verified"
+  },
+  "access": {
+    "enforcement": "tool-permission",
+    "means": {
+      "read": "--add-dir with an Edit deny rule per root",
+      "write": "--add-dir",
+      "network": "unenforced"
+    }
   }
 }

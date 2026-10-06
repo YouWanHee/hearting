@@ -24,6 +24,7 @@ from execution_access import (
     load_parent_effective_grant,
     publish_effective_grant,
     prepare_task_request,
+    receipt_fields,
     receipt_fragment,
 )
 
@@ -620,18 +621,64 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertEqual("tool-permission", grant.file_enforcement)
         self.assertEqual("none", grant.network_enforcement)
 
-    def test_opencode_grant_reflects_read_roots_while_other_runtimes_do_not(self) -> None:
+    def test_claude_reads_and_never_writes_its_read_only_roots(self) -> None:
+        # RA-7, Claude's means: each read-only root is an --add-dir and gets an Edit deny rule.
         readonly = self.root / "readonly-data"
         readonly.mkdir()
         self.write_request(read_roots=[str(readonly)])
         request = load_request(self.request_file, context=self.context)
-        grant = build_grant(request, runtime="opencode")
-        self.assertEqual(tuple(request.read_roots), tuple(grant.read_roots))
-        self.assertNotIn("read-roots-unprojected", grant.unmet)
-        for runtime in ("codex-exec", "claude-cli"):
-            other = build_grant(request, runtime=runtime)
-            self.assertEqual((), other.read_roots)
-            self.assertIn("read-roots-unprojected", other.unmet)
+        prompt, log = self.root / "prompt.txt", self.root / "log.jsonl"
+        rule = f"Edit(//{str(readonly.resolve()).lstrip('/')}/**)"
+        for delivery, runtime in (("one-shot", "claude-cli"), ("session-resume-supervised", "claude-supervisor")):
+            with self.subTest(delivery=delivery):
+                grant = build_grant(request, runtime=runtime)
+                command = self.claude.shell_command(self.claude_args(delivery, grant), prompt, log)
+                self.assertIn(f"--add-dir {readonly.resolve()}", command)
+                self.assertIn(f"--add-dir {self.scoped}", command)       # the writable root stays writable
+                self.assertIn(rule, command)
+                self.assertNotIn(f"Edit(//{str(self.scoped).lstrip('/')}/**)", command.split("--permission-mode")[0])
+        # A read-only root inside the worktree keeps the worktree writable: no deny rule for it.
+        inner = self.worktree / "records"
+        inner.mkdir()
+        self.write_request(read_roots=[str(inner)])
+        grant = build_grant(load_request(self.request_file, context=self.context), runtime="claude-cli",
+                            default_writable_roots=(self.worktree, self.artifact))
+        command = self.claude.shell_command(self.claude_args("one-shot", grant), prompt, log)
+        self.assertIn(f"--add-dir {inner.resolve()}", command)
+        self.assertNotIn(f"Edit(//{str(inner.resolve()).lstrip('/')}/**)", command)
+
+    def test_every_runtime_projects_read_roots_with_its_own_guarantee(self) -> None:
+        # RA-7: one read-only request is readable and unwritten on all three harnesses; the
+        # grant records how strongly (`harness_capabilities` access enforcement).
+        readonly = self.root / "readonly-data"
+        readonly.mkdir()
+        self.write_request(read_roots=[str(readonly)], writable_roots=[], justification={})
+        request = load_request(self.request_file, context=self.context)
+        for runtime, sandbox, grade in (("opencode", "workspace-write", "tool-permission"),
+                                        ("claude-cli", "workspace-write", "tool-permission"),
+                                        ("claude-supervisor", "workspace-write", "tool-permission"),
+                                        ("codex-exec", "workspace-write", "os-sandbox"),
+                                        ("codex-exec", "read-only", "os-sandbox")):
+            with self.subTest(runtime=runtime, sandbox=sandbox):
+                grant = build_grant(request, runtime=runtime, effective_sandbox=sandbox)
+                self.assertEqual(tuple(request.read_roots), tuple(grant.read_roots))
+                self.assertEqual(tuple(request.read_roots), tuple(grant.unwritable_read_roots))
+                self.assertEqual((grant.read_enforcement, grant.unmet), (grade, ()))
+                self.assertEqual(receipt_fields(grant)["execution_access_enforcement"], grade)
+        open_sandbox = build_grant(request, runtime="codex-exec", effective_sandbox="danger-full-access")
+        self.assertEqual((open_sandbox.read_enforcement, open_sandbox.unmet), ("none", ("read-only-unenforced",)))
+        # A read-only root inside a writable area stays writable there, and the grant says so.
+        inside = build_grant(request, runtime="claude-cli", default_writable_roots=(self.root,))
+        self.assertEqual((inside.unwritable_read_roots, inside.read_enforcement, inside.unmet),
+                         ((), "none", ("read-only-root-writable",)))
+        self.write_request(read_roots=[str(readonly)], writable_roots=[], justification={},
+                           enforcement_required="os-sandbox")
+        strict = load_request(self.request_file, context=self.context)
+        self.assertEqual(build_grant(strict, runtime="codex-exec").read_enforcement, "os-sandbox")
+        for runtime in ("claude-cli", "opencode"):
+            with self.assertRaises(ExecutionAccessError) as refused:
+                build_grant(strict, runtime=runtime)
+            self.assertEqual(refused.exception.reason, f"execution-access-enforcement-unavailable:{runtime}")
 
     def test_read_overlay_keeps_contract_deny_inside_selected_agent(self) -> None:
         readonly = self.root / "readonly-data"
