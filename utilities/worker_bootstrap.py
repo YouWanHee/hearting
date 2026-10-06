@@ -534,8 +534,13 @@ def plan_leg_prompt(route, node_id=None) -> str:
         lines.append(f"Handed over by leg {row['leg']}: " + "; ".join(row["items"]))
     if leg.get("parallel"):
         lines.append("Parallel slices the plan suggests: " + "; ".join(leg["parallel"]))
+    added = {(n.get("plan_stage") or {}).get("id"): n["id"] for n in route.get("nodes") or [] if n.get("plan_stage")}
     for stage in leg.get("extra_stages") or []:
-        lines.append("Extra stage the plan suggests: " + ", ".join(f"{k} {v}" for k, v in stage.items()))
+        if stage["id"] in added:
+            lines.append(f"Stage the plan added: {added[stage['id']]} after {stage.get('after')}"
+                         + (f" (verify: {stage['verify']})" if stage.get("verify") else ""))
+        else:
+            lines.append("Extra stage the plan suggests: " + ", ".join(f"{k} {v}" for k, v in stage.items()))
     if plan and plan.get("adopted_brief"):
         lines.append(f"Adopted direction: the brief {plan['adopted_brief']} (the person chose its route).")
     if not lines:

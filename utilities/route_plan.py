@@ -294,8 +294,9 @@ def _plan_fields(raw, index, notes):
 
     `done_when`: 1-5 checks that the leg is finished, each a sentence or `{text, check}` (`check` is a
     command), sealed with stable ids `d1`, `d2`... in the order written. `verify`: one line saying
-    what verification looks at. `hands_over`: what the next leg reads. `parallel` and `extra_stages`
-    are notes for the owner: the compiler does not turn them into nodes."""
+    what verification looks at. `hands_over`: what the next leg reads. `parallel`: work the owner may
+    split through the plan's slices. `extra_stages`: `{id, unit, after, verify}` stages the compiler
+    adds as `plan-<id>` nodes (`compose_subgraph_recipe`)."""
     fields = {}
 
     def bad(name):
@@ -512,7 +513,8 @@ def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
     "notes": [...]}`. An invalid first leg raises ProposalError, since nothing could start. An invalid
     later leg ends the proposal before it (`leg-invalid:<i>:<reason>` in `notes`); the legs before it
     stay valid. An approval row for a part its leg does not carry, or for a leg that was cut, is
-    left out and named in `notes`.
+    left out and named in `notes`, as is an extra stage the compiler could not place
+    (`extra-stage-not-compiled:<id>`).
     """
     scope = proposal.get("execution_scope", "complete")
     if scope not in ("complete", "report"):
@@ -528,6 +530,9 @@ def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
             notes.append(reason)
             break
         composed = (route.get("composed_recipe") or {}).get("compose") or {}
+        placed = {stage.get("id") for stage in composed.get("extra_stages") or ()}
+        notes.extend(f"extra-stage-not-compiled:{stage['id']}" for stage in leg.get("extra_stages") or ()
+                     if stage["id"] not in placed)
         facts.append({"capability": route["capability"], "mode": route["capability_mode"],
                       "shape": (route.get("selection") or {}).get("shape"),
                       "graph": list(composed.get("graph") or []) or None,

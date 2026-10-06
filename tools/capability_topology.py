@@ -1525,6 +1525,38 @@ def resolve_shared_part(registry, host_recipe, part_id):
             "node": node, "row": row, "scope": scope, "merged_anchor": merged}
 
 
+# Catalog stages a plan's extra stage may not be shaped on: owners, resource runners and frames
+# are not stages, and these ids carry input rules of their own.
+PLAN_STAGE_TEMPLATE_EXCLUDED_IDS = frozenset({"plan-check", "review"})
+
+
+def plan_stage_part(registry, host_recipe, stage):
+    """A part-shaped row for a stage a plan adds (`extra_stages`), or None.
+
+    The stage is shaped on the first catalog stage whose unit is `stage["unit"]` -- the host's
+    own stages first, then every other recipe -- and keeps that stage's kind, gate and budget; its
+    files move under `parts/plan/<id>/` inside the host's scope, exactly as a borrowed part's do."""
+    unit, stage_id = stage.get("unit"), stage.get("id")
+    if not isinstance(unit, str) or not isinstance(stage_id, str):
+        return None
+    hosts_first = [host_recipe] + [r for r in registry.get("recipes", []) if r is not host_recipe]
+    for recipe in hosts_first:
+        for node in recipe["standard_plus"]["nodes"]:
+            if (node.get("unit") == unit and node.get("dispatch_depth") == 2
+                    and node.get("kind") not in ("capability-owner", "resource-runner", "runtime-terminal")
+                    and node.get("worker_type") != "frame" and (node.get("continuation") or {}).get("kind", "inline-next") == "inline-next"
+                    and node.get("id") not in PLAN_STAGE_TEMPLATE_EXCLUDED_IDS):
+                scope = json.loads(json.dumps(host_recipe["artifact_scope"]))
+                needed = PART_ANCHOR_BY_KIND.get(node.get("kind"))
+                if needed and not scope.get(needed):
+                    return None
+                return {"part": f"{recipe['capability']}:{node['id']}", "capability": "plan", "stage": stage_id,
+                        "recipe": recipe, "node": node, "row": {}, "scope": scope, "merged_anchor": None,
+                        "plan_stage": {"id": stage_id, "template": node["id"],
+                                       **({"verify": stage["verify"]} if stage.get("verify") else {})}}
+    return None
+
+
 def borrowable_parts(registry, host_recipe):
     """Part ids this host recipe can borrow, in catalog order."""
     return [part_id for part_id in (part_catalog(registry).get("parts") or {})

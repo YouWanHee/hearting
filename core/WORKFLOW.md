@@ -297,7 +297,10 @@ and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `veri
 and `hands_over`, and the brief whose route the person chose, reach the owner and
 every stage worker of that leg from the sealed decision; a `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
-`route_plan.read_leg_items`).
+`route_plan.read_leg_items`). A leg's `extra_stages` entry becomes node
+`plan-<id>` right after its `after` stage, shaped on the catalogue stage of the
+same unit (its gate, review budget and start approval) and writing under
+`parts/plan/<id>/`; one that cannot be placed is named in `read_notes`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
 <task>` with the selected shape/graph. The slug comes from the task; the

@@ -68,6 +68,9 @@ def is_round_capped_node(node):
     return isinstance(node, Mapping) and (
         node.get("id") in ROUND_CAPPED_NODE_IDS
         or (node.get("kind") == "review-worker" and node.get("unit") == "qa/plan-review")
+        # A stage a plan added is shaped on a catalog stage and keeps that stage's budget.
+        or (isinstance(node.get("plan_stage"), Mapping)
+            and node["plan_stage"].get("template") in ROUND_CAPPED_NODE_IDS)
     )
 
 

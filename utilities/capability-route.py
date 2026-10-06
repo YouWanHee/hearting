@@ -2858,7 +2858,8 @@ def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
     return auxiliary
 
 
-def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False):
+def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
+                            extra_stages=None):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
     The nodes keep their unit, kind, gate, write scope, profile and permissions;
@@ -2904,6 +2905,21 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
             unknown.append(key)
             continue
         rows.append((key, f"{capability}-{stage}", unit, part))
+    # A plan's extra stages (`extra_stages`): each is shaped on a catalog stage of the same unit and
+    # runs right after the stage it names; one that cannot be shaped or placed is left to the owner.
+    placed = []
+    for stage in extra_stages or ():
+        part = TOPO.plan_stage_part(registry, base_recipe, stage)
+        node_id = f"plan-{stage.get('id')}"
+        after = [index for index, row in enumerate(rows) if row[1] == stage.get("after")]
+        if part is None or not after or after[0] == len(rows) - 1 or node_id in {row[1] for row in rows}:
+            continue
+        rows.insert(after[0] + 1, (part["part"], node_id, None, part))
+        placed.append({key: stage[key] for key in ("id", "unit", "after", "verify") if key in stage})
+        view[node_id] = part["node"]
+        order[node_id] = {"depends_on": [stage["after"]]}
+        follower = rows[after[0] + 2][1]
+        order[follower] = {"depends_on": list(order.get(follower, {}).get("depends_on") or []) + [node_id]}
     if unknown:
         raise ValueError(
             "compose-graph-unknown-node:" + ",".join(unknown)
@@ -2916,7 +2932,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         raise ValueError("compose-graph-duplicate-node")
     source_of = {node_id: (part["node"] if part else view[node_id]) for _, node_id, _, part in rows}
     for _, node_id, _, part in rows:
-        if part:
+        if part and not part.get("plan_stage"):
             borrowed_ids = {p["stage"]: other for _, other, _, p in rows
                             if p and p["recipe"] is part["recipe"]}
             order[node_id] = {"depends_on": [borrowed_ids[dep] for dep in part["node"].get("depends_on") or []
@@ -2988,6 +3004,8 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
                     moved[out] = relocate(out)[0]
             node["outputs"] = [moved.get(out, out) for out in originals]
             node["part"] = key
+            if part.get("plan_stage"):
+                node["plan_stage"] = dict(part["plan_stage"])
             if catalog_row.get("start_approval"):
                 node["start_approval"] = catalog_row["start_approval"]
             if part["merged_anchor"]:
@@ -3036,7 +3054,12 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
             return (name, target, *(f"parts/{_capability}/{stage}/{target}"
                                     for stage in producers_in(_capability, target)))
 
-        node["inputs"], sources = _compose_inputs(origin_nodes, source_of[node_id], kept, find_input, alternates)
+        if part and part.get("plan_stage"):
+            # A plan's stage reads what the stage before it wrote.
+            node["inputs"], sources = [out for out in (previous or {}).get("outputs") or []
+                                       if not TOPO._is_semantic_output(out)], {}
+        else:
+            node["inputs"], sources = _compose_inputs(origin_nodes, source_of[node_id], kept, find_input, alternates)
         if sources:
             node["input_sources"] = sources
             if set(sources) & set(input_names):
@@ -3047,7 +3070,8 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         node.pop("parallel_group", None)
         nodes.append(node)
         meta[node_id] = {"part_id": part_id, "originals": originals, "moved": moved,
-                         "input_names": input_names, "catalog": bool(part) or node_id in optional}
+                         "input_names": {} if part and part.get("plan_stage") else input_names,
+                         "catalog": bool(part) or node_id in optional}
     # SD-165 name mapping, sealed as `part_io` (absent on a route that uses no catalog part).
     produced = {}
     for index, node in enumerate(nodes):
@@ -3187,9 +3211,12 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         "human_gates": sorted(set(gates)),
         "human_gate_bindings": bindings,
         "resume_retry_boundaries": list(ids),
-        "compose": {"origin": "compose", "shape": "staged", "graph": [row[0] for row in rows],
+        "compose": {"origin": "compose", "shape": "staged",
+                    "graph": [row[0] for row in rows if not (row[3] and row[3].get("plan_stage"))],
                     "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
     }
+    if placed:
+        recipe["compose"]["extra_stages"] = placed
     if used_parts:
         # Catalog rows this recipe derives from; `capability_registry_digest` reads it.
         recipe["compose"]["parts"] = sorted(used_parts)
@@ -3214,7 +3241,8 @@ def _versioned_subgraph(registry, recipe):
             if isinstance(node.get("input_sources"), dict):
                 for name, source in node["input_sources"].items():
                     sealed.setdefault(name, source)
-        return compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None) == recipe
+        return compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None,
+                                       extra_stages=meta.get("extra_stages")) == recipe
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return False
 
@@ -3587,7 +3615,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
-                  selection_pins=None, route_plan=None, frameless=False, execution_scope=None):
+                  selection_pins=None, route_plan=None, frameless=False, execution_scope=None,
+                  extra_stages=None):
     """Resolve every default, then compile through the ordinary sealer.
 
     `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
@@ -3700,8 +3729,11 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         projected = project_entry_execution_scope({"capability": capability, "mode": capability_mode,
                                                    "shape": shape, "graph": source_graph}, "report", registry)
         graph_spec = parse_graph_spec(",".join(projected.get("graph") or []), capabilities)
+    if extra_stages is None and isinstance(route_plan, dict) and isinstance(route_plan.get("leg"), dict):
+        extra_stages = route_plan["leg"].get("extra_stages")   # the plan's own stages, from the sealed leg
     selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input,
-                                                preserve_base_dependencies=execution_scope == "report")
+                                                preserve_base_dependencies=execution_scope == "report",
+                                                extra_stages=extra_stages)
                        if graph_spec is not None else base)
     if execution_scope == "report" and shape == "staged" and graph_spec is not None and profile is None:
         # The narrowed graph is made only from existing recipe/catalog parts. Keep each
@@ -3834,7 +3866,7 @@ def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
     return compose_route(
         **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
                               slug=f"{frame_route.get('slug') or 'framed'}-leg{index}"),
-        **_leg_evidence(leg, readiness), frameless=True)
+        **_leg_evidence(leg, readiness), frameless=True, extra_stages=leg.get("extra_stages"))
 
 
 def _leg_evidence(leg, readiness):
