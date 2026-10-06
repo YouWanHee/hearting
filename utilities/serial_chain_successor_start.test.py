@@ -57,6 +57,19 @@ class StartReceiptTest(unittest.TestCase):
                 self.assertEqual(chain.parse_start_receipt(0, no_spawn, "att-x")["verdict"], "not-spawned")
                 self.assertEqual(chain.parse_start_receipt(75, success, "att-x")["verdict"], "returncode-nonzero")
 
+    def test_only_a_failed_start_without_its_own_reason_gets_the_placeholder(self):
+        # BC ssadv-03fe0af8: a successful successor start recorded reason=invalid-wrapper-receipt.
+        chain = _load_chain()
+        success = "check=ok\nattempt_id=att-x\nregistered=1\nstarted=1\nduplicate_attempt=0\nchild_spawned=1\n"
+        self.assertEqual(chain.parse_start_receipt(0, success, "att-x")["wrapper_reason"], "")
+        self.assertEqual(chain.parse_start_receipt(0, success + "reason=none\n", "att-x")["wrapper_reason"], "none")
+        no_spawn = success.replace("child_spawned=1", "child_spawned=0")
+        self.assertEqual(chain.parse_start_receipt(0, no_spawn, "att-x")["wrapper_reason"], "invalid-wrapper-receipt")
+        self.assertEqual(chain.parse_start_receipt(0, no_spawn + "reason=governor-full\n", "att-x")["wrapper_reason"],
+                         "governor-full")
+        self.assertEqual(chain.parse_start_receipt(75, "reason=Bad Text\n", "att-x")["wrapper_reason"],
+                         "invalid-wrapper-receipt")
+
     def test_duplicate_and_foreign_receipts_fail_closed(self):
         chain = _load_chain()
         base = "check=ok\nattempt_id=att-x\nregistered=1\nstarted=1\nchild_spawned=1\n"
