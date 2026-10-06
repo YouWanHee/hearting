@@ -7,6 +7,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -83,6 +84,15 @@ class SessionIdentityDeclarationTest(unittest.TestCase):
         self.assertEqual(set(env), set(HC.HARNESSES))
         self.assertEqual(herdr.verified_id_harnesses(), HC.herdr_verified_harnesses())
         names = [name for names in env.values() for name in names]
+        # One unreadable or invalid declaration leaves only that harness unknown.
+        real = HC.capabilities
+        def missing_opencode(harness, root=HC.ROOT):
+            if harness == "opencode":
+                raise HC.HarnessCapabilityError("harness-capabilities-unreadable:opencode")
+            return real(harness, root)
+        with unittest.mock.patch.object(HC, "capabilities", side_effect=missing_opencode):
+            self.assertEqual(set(HC.session_env()), {"claude", "codex"})
+            self.assertEqual(HC.herdr_verified_harnesses(), {"claude", "codex"})
         self.assertEqual(len(names), len(set(names)), "a session variable belongs to one harness")
 
 

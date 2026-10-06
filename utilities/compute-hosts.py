@@ -59,11 +59,11 @@ SSH_BRIDGE_MAX_FDS = 256
 SSH_BRIDGE_MAX_CONNECTIONS = 256
 SSH_BRIDGE_ENV_BYTES = 1024 * 1024
 def _declared_session_env():
-    """`{harness: (variable, ...)}` as each adapter declares it (`harness_capabilities`)."""
+    """`{harness: (variable, ...)}` as the readable adapters declare it (`session_identity`)."""
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)
-    from harness_capabilities import session_env
+    from session_identity import session_env
     return session_env()
 
 

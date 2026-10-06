@@ -137,12 +137,28 @@ def session_identity(harness: str) -> dict:
     return dict(capabilities(harness)["session_identity"])
 
 
+def _readable_identities() -> dict[str, dict]:
+    """The session-identity declaration of every harness whose adapter is readable.
+
+    Identity is read on every launch, label and probe, so one unreadable or invalid
+    declaration (a packaged tree without that adapter) leaves only that harness
+    unknown instead of failing everything that asks who a session is.
+    """
+    found = {}
+    for harness in HARNESSES:
+        try:
+            found[harness] = capabilities(harness)["session_identity"]
+        except HarnessCapabilityError:
+            continue
+    return found
+
+
 def session_env() -> dict[str, tuple[str, ...]]:
-    """``{harness: (variable, ...)}`` -- the session id variables every adapter declares."""
-    return {harness: tuple(capabilities(harness)["session_identity"]["env"]) for harness in HARNESSES}
+    """``{harness: (variable, ...)}`` -- the session id variables the readable adapters declare."""
+    return {harness: tuple(declared["env"]) for harness, declared in _readable_identities().items()}
 
 
 def herdr_verified_harnesses() -> frozenset[str]:
     """Harnesses whose herdr ``agent_session`` value is a proven session id."""
-    return frozenset(harness for harness in HARNESSES
-                     if capabilities(harness)["session_identity"]["herdr_session_id"] == "verified")
+    return frozenset(harness for harness, declared in _readable_identities().items()
+                     if declared["herdr_session_id"] == "verified")
