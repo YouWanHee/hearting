@@ -117,7 +117,7 @@ def parse_start_receipt(returncode: int, stdout: str, attempt_id: str) -> dict:
         values[key] = value
     wrapper_reason = values.get("reason", "")
     if not re.fullmatch(r"[a-z0-9][a-z0-9:._-]{0,127}", wrapper_reason):
-        wrapper_reason = "invalid-wrapper-receipt"
+        wrapper_reason = ""
     if returncode != 0:
         verdict = "returncode-nonzero"
     elif conflicts:
@@ -137,6 +137,9 @@ def parse_start_receipt(returncode: int, stdout: str, attempt_id: str) -> dict:
                 (values["child_spawned"] == "1", "not-spawned"),
             )
             verdict = next((reason for ok, reason in checks if not ok), "ok")
+    if verdict != "ok" and not wrapper_reason:
+        # Only a failed start whose own reason could not be read gets the placeholder.
+        wrapper_reason = "invalid-wrapper-receipt"
     return {
         "ok": verdict == "ok", "verdict": verdict, "wrapper_reason": wrapper_reason,
         "returncode": returncode, "fields": values,
