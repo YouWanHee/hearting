@@ -6,6 +6,7 @@ from unittest import mock
 ROOT=Path(__file__).resolve().parents[1]; SCRIPT=ROOT/"utilities/dispatch-registry.py"
 sys.path[:0]=[str(ROOT),str(ROOT/"utilities")]
 import dispatch_contract as D  # noqa: E402
+import dispatch_pending_delivery as PD  # noqa: E402
 from dispatch_contract import (attempt_process_quiescence,  # noqa: E402
                                attempt_tagged_descendants,
                                observed_attempt_liveness,
@@ -2390,6 +2391,42 @@ class ExactAttemptDeliveryBackstopTest(unittest.TestCase):
    self.assertEqual(sorted(path.name for path in unrelated.parent.iterdir()),
                     ["unrelated-acked.json"])
    self.assertEqual(list(outbox.rglob("*.pruned")),[])
+
+
+ def test_exact_apply_honors_prune_tombstone_for_its_target(self):
+  # Recheck shape: a record already acked and pruned (tombstone present,
+  # record absent, zero-byte tombstone just like prune() leaves it) must
+  # not resurrect as a pending record under exact scope either -- the same
+  # record-and-tombstone condition the global sweep honors.
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log"
+   attempt="att-exact-tombstone-1"
+   jobs.write_text(
+    "2026-08-28T00:00:00Z\topen\t/r\t/w\texecute\t"
+    "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+    "execution_surface=registered-headless,registered_worker=1,"
+    "fallback_hop=same-harness-headless,"
+    f"attempt_id={attempt},parent_attempt_id=att-reconcile-parent,"
+    "parent_completion_delivery=claude-parent-runtime,"
+    f"parent_sid=sess-{attempt},route_id=rt-reconcile-fixture,"
+    "route_node=execute,harness=claude\n")
+   self.assertTrue(D.close_attempt_row(jobs,attempt,"completed-marker"))
+   meta=parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
+   root=jobs.resolve(strict=False).parent
+   tomb=PD.tombstone_path(PD.record_path(root,meta["parent_sid"],meta["delivery_id"]))
+   tomb.parent.mkdir(parents=True,exist_ok=True)
+   tomb.touch()
+   before_tomb=tomb.read_bytes()
+   result=subprocess.run([sys.executable,str(SCRIPT),"reconcile","--jobs",str(jobs),
+    "--agent-home",str(base),"--attempt",attempt,"--apply"],
+    capture_output=True,text=True)
+   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+   record=json.loads(result.stdout)
+   self.assertEqual(record["attempted"],1,record)
+   self.assertEqual(record["pending_delivery"],
+                    {"applied":{"materialized":0},"scope":"exact-attempt-only"})
+   self.assertEqual(list((root/"pending-delivery").glob("*/*.json")),[])
+   self.assertEqual(tomb.read_bytes(),before_tomb)
 
 
 class DetachedResidueDrainReconcileTest(unittest.TestCase):

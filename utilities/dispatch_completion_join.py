@@ -482,6 +482,26 @@ def supersede_pending_delivery_for_advance(jobs: Path, predecessor_attempt_id: s
     return "superseded"
 
 
+def materialize_backstop_due(root, parent_sid, delivery_id) -> bool:
+    """Whether the idempotent materialize backstop may run for one row.
+
+    Shared by the global sweep below and the exact-attempt scope in
+    ``dispatch-registry.py`` so both honor the same condition: only when the
+    record file is absent AND no prune tombstone exists. A pruned record's
+    tombstone is proof its terminal state was already delivered and retained
+    past retention -- the backstop must never resurrect it as a fresh pending
+    obligation (B1). Read-only: no files are created, moved, or unlinked here.
+    """
+    if not parent_sid or not delivery_id:
+        return False
+    try:
+        record_file = pending_delivery.record_path(root, parent_sid, delivery_id)
+    except pending_delivery.PendingDeliveryError:
+        return False
+    return not record_file.is_file() \
+        and not pending_delivery.tombstone_path(record_file).is_file()
+
+
 def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
     """SD-111 P2 trigger 2 + the single declared expiry actor (§2-b-2/§2-c).
 
@@ -531,21 +551,10 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
             from dispatch_owner_input import materialize_unresolved
             materialize_unresolved(jobs, attempt_id)
         if attempt_id and metadata.get("delivery_intent") == "1":
-            record_file = None
-            if metadata.get("parent_sid") and metadata.get("delivery_id"):
-                try:
-                    record_file = pending_delivery.record_path(
-                        root, metadata["parent_sid"], metadata["delivery_id"]
-                    )
-                except pending_delivery.PendingDeliveryError:
-                    record_file = None
-            if (
-                record_file is not None
-                and not record_file.is_file()
-                and not pending_delivery.tombstone_path(record_file).is_file()
-            ):
-                if materialize_after_terminal_close(jobs, attempt_id) is not None:
-                    result["materialized"] += 1
+            if materialize_backstop_due(root, metadata.get("parent_sid"),
+                                        metadata.get("delivery_id")) \
+                    and materialize_after_terminal_close(jobs, attempt_id) is not None:
+                result["materialized"] += 1
 
     pending_root = root / "pending-delivery"
     if pending_root.is_dir():
