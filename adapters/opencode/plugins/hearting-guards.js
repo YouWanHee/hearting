@@ -740,6 +740,7 @@ function collectCandidates(args) {
 const CARRIER_ENV = "AGENT_PARENT_COMPLETION_CARRIER"
 const CARRIER_KIND = "opencode-turn"
 const CARRIER_INTERVAL_MS = 5000
+const CARRIER_ROOTS_RETRY_MS = 60000
 const sweepTool = path.join(root, "utilities", "dispatch_session_sweep.py")
 const OWED_STATES = new Set(["pending", "claimed", "sent-ambiguous"])
 
@@ -771,13 +772,18 @@ function createCompletionCarrier(ctx) {
   const status = new Map()
   const busy = new Set()
   let roots = null
+  let rootsAt = 0
   let timer = null
   const prompter = () => ctx.client?.session
   const available = () => !isWorkerSession() && typeof prompter()?.promptAsync === "function"
 
   // A cheap look at this session's own records, so an idle tick spawns nothing.
   async function owed(sid) {
-    if (roots === null) roots = (await carrierCommand("roots")) || []
+    // Known roots are kept; none known yet (no state root, or the lookup failed) is asked again later.
+    if (!roots?.length && Date.now() - rootsAt >= CARRIER_ROOTS_RETRY_MS) {
+      rootsAt = Date.now()
+      roots = (await carrierCommand("roots")) || []
+    }
     const digest = createHash("sha256").update(sid).digest("hex")
     for (const base of roots) {
       let names = []
