@@ -11,6 +11,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
+import harness_capabilities as HC  # noqa: E402
 import parent_next_directive as pnd  # noqa: E402
 
 
@@ -98,6 +99,12 @@ def _resolver_return_values(source_path: Path) -> set[str]:
             assert imports.get(alias) == "dispatch_parent_completion", source_path
             values.update(_resolver_return_values(
                 ROOT / "utilities" / "dispatch_parent_completion.py"))
+        elif (isinstance(node.value, ast.Subscript)
+              and isinstance(node.value.slice, ast.Constant)
+              and node.value.slice.value == "carrier"):
+            # A carrier an adapter declares (`harness_capabilities`): every
+            # declared one is a value the resolver can return.
+            values.update(HC.declared_carriers())
         else:
             raise AssertionError(f"{source_path}: unsupported return expression")
     return values
