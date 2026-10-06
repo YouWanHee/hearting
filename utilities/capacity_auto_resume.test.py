@@ -71,11 +71,21 @@ class RunTest(unittest.TestCase):
         self.assertGreaterEqual(self.clock[0], RETRY_EPOCH + C.SLACK_SECONDS)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][2:5], ["start", "--route", "/r/route.json"])
+        self.assertTrue(calls[0][1].endswith("/utilities/capability-route.py"))
         record = json.loads(self.path.read_text())
         self.assertEqual((record["state"], record["owner_attempt_id"]), ("resumed", "att-1"))
         notify.assert_called_once()
         self.assertEqual(C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0],
                                call=lambda *a, **k: self.fail("resumed twice")), 0)
+
+    def test_the_resume_runs_the_installed_release_not_the_arming_one(self):
+        done = SimpleNamespace(returncode=0, stdout="{}\n")
+        calls = []
+        with mock.patch("parent_next_directive.command_home", return_value="/data/hearting/current"), \
+             mock.patch.object(C, "_notify"):
+            C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0],
+                  call=lambda argv, **kw: calls.append(argv) or done)
+        self.assertEqual(calls[0][1], "/data/hearting/current/utilities/capability-route.py")
 
     def test_a_removed_record_ends_the_wait(self):
         def sleep(seconds):

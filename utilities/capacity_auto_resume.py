@@ -100,7 +100,10 @@ def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run) -> 
     record = json.loads(path.read_text(encoding="utf-8"))
     if record.get("state") != "armed":
         return 0
-    argv = [sys.executable, str(ROOT / "utilities" / "capability-route.py"), "start",
+    # The installed release at resume time, not the one that armed this wait hours
+    # earlier (the printed-command rule, `parent_next_directive.entrypoint`).
+    from parent_next_directive import entrypoint
+    argv = [sys.executable, entrypoint(ROOT, "utilities/capability-route.py"), "start",
             "--route", record["route_file"], "--jobs", record["jobs"]]
     done = call(argv, text=True, capture_output=True, check=False)
     lines = [line for line in (done.stdout or "").splitlines() if line.strip()]
