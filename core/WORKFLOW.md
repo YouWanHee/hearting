@@ -253,8 +253,10 @@ its scope: reuse that record, and choose `framed` again only when the scope
 changed. The main session judges the scope; nothing picks a campaign's latest
 record automatically. `direct` is unchanged. A route made from a proposal
 (`compose --route-plan <record>#<i>`, a command the runtime prints) has no frame
-nodes. Both frame legs of every frame — `framed`, the recipe frames and quick's —
-are `top`: a pin with a profile or an explicit profile wins and is not lowered
+nodes, and neither has a `solo` or `staged` compose: those shapes are chosen for
+decided work, so they compile without the recipe's frame pair (a route sealed
+earlier keeps the frame nodes it was sealed with). Both frame legs of every
+frame — `framed` and a preset recipe's own frame pair — are `top`: a pin with a profile or an explicit profile wins and is not lowered
 automatically; a frame-rule `top` that stops at a usage limit is retried once at
 `deep` through the SD-157 replacement lineage, and the lowering is recorded.
 The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를
@@ -265,14 +267,18 @@ The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향�
 `route_proposal_review`: each brief's validated proposal or
 `proposal:none(<reason>)`, whether the two are `equal`, the start-approval parts
 each leg would carry, and `frame_downgrade` (node, original and actual profile,
-cause, attempt) when a leg ran one profile lower. Depth-0 writes the one
-interview (§0.4): one route question in the person's words — yes-no when the
-two proposals are equal, choice when they differ, "다르게" being the existing
-off-menu answer — plus a `route_proposals` field `{question, by_option}` that
-maps each option label to the proposal it selects; a start-approval question for
-each approval part, yes-no with the approving option marked `"approves": true`
-and an id equal to the brief's section 7 id (a non-ASCII id is converted to an ASCII slug; use the id the review shows). Together with the direction questions they stay inside
-`QUESTION_CAP`; offer only routes a brief proposed. After the answers, the
+cause, attempt) when a leg ran one profile lower. Its `interview_template`
+already holds the route question (`route-choice`: yes-no when the two proposals
+are equal or only one is valid, choice when they differ, each option marked with
+`"proposal": <frame node>`; "다르게" is the existing off-menu answer) and one
+yes-no question per start-approval part (`<key>-leg<leg>`, the approving option
+marked `"approves": true`). Depth-0 words them in the person's language (§0.4)
+and adds the direction questions beside them, all inside `QUESTION_CAP`; a later
+leg's approval question may be left out, and that leg then keeps its gate. When
+the interview is submitted the runtime builds `route_proposals`
+`{question, by_option}` from the marks and the validated proposals and records
+it with the question. An interview that writes `route_proposals` itself is read
+as written and offers only routes a brief proposed. After the answers, the
 same `start` records the decision, compiles and starts the first leg only
 (`--route-plan <record>#0`, `--parent-cycle <frame cycle>`), and closes the frame
 route once that start receipt exists; its receipt is the first leg's own.
@@ -318,9 +324,14 @@ The acting parent records the answer's source in the optional typed `actor_kind`
 field: `user`, `supervisor`, `automatic`, `headless-owner`, or `unknown`. Mark
 `user` only for the person's actual reply; a file without a source is `unknown`,
 not a user decision. This declaration is provenance, not native authentication.
-Existing person-only gates and start approvals accept only user answers; other
-allowed releases preserve their source in the journal and intent. A registered
-worker cannot use this field to bypass its existing release restrictions.
+`frame-review` takes the person's answer or a supervisor session's answer on
+the person's behalf (`supervisor`); the intent records it as
+`agreed-on-behalf`. A supervisor's yes does not start a `deploy`, `handback`
+or `preview` part: its leg starts and that part keeps its own gate for the
+person. Other person-only gates and start approvals accept only user answers;
+other allowed releases preserve their source in the journal and intent. A
+registered worker cannot use this field to bypass its existing release
+restrictions.
 Runtime settlement closes the route and cycle before owner success is delivered.
 Direct start also prepares the inline cycle and returns its `artifact_env`;
 use that output path without a separate producer `begin`. Replaying start on a
@@ -577,8 +588,9 @@ before it reaches anyone; the cap and the wording rules are machine-checked at
 the raise for every route carrying the gate, `quick` included, while steps 1–3
 above stay obligations on the acting session that nothing checks mechanically.
 Only code/design/draft/refine/spec recipes carry the frame pair at `quick` and
-above, before the owner; the `framed` shape (§0.2.1) runs the same pair ahead of
-any non-direct work. Other recipes retain their topology. `direct` asks its
+above, before the owner, when they run as a preset (`compile`); the `framed`
+shape (§0.2.1) runs the same pair ahead of any non-direct work, and a `solo` or
+`staged` compose has none. Other recipes retain their topology. `direct` asks its
 question inline in the §0.4 card and records the answer in the plan or work log.
 The recorded answers become `shards/frame/intent.md`, rendered by depth-0.
 The runtime supplies the released task and decisions to the owner and every

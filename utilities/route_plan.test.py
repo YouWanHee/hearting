@@ -118,12 +118,11 @@ class ExtractionTest(unittest.TestCase):
         cases = {
             "section-missing": "## 1. Problem\n\nx\n" + "",
             "block-missing": "## 8. 경로 조립 제안\n\nno block here\n",
-            "block-multiple": fenced(ok) + "\n```yaml\n" + ok + "```\n",
             "yaml-invalid": fenced("route_proposal_v1: [unclosed\n"),
             "yaml-alias": fenced("route_proposal_v1:\n  summary: &a s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n  x: *a\n"),
             "yaml-tag": fenced("route_proposal_v1:\n  summary: !custom s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"),
             "yaml-invalid-duplicate": fenced("route_proposal_v1:\n  summary: a\n  summary: b\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"),
-            "schema-invalid:document": fenced("route_proposal_v1:\n  summary: s\n  legs: []\n  other: 1\n"),
+            "schema-invalid:document": fenced("route_proposal_v1: [not, a, mapping]\n"),
             "schema-invalid:legs": fenced("route_proposal_v1:\n  summary: s\n  legs: []\n"),
             "schema-invalid:summary": fenced("route_proposal_v1:\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"),
             "schema-invalid:legs[0].shape": fenced("route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: batch}\n"),
@@ -153,10 +152,35 @@ class ExtractionTest(unittest.TestCase):
         self.assertEqual(self.reason(elsewhere), "block-missing")
         after = "## 8. 경로 조립 제안\n\nnone\n\n## 9. Notes\n\n```yaml\n" + body + "```\n"
         self.assertEqual(self.reason(after), "block-missing")
-        heading_variants = ("### 8. 경로 조립 제안", "8. **경로 조립 제안**", "## 8) 경로 조립 제안 (proposal)")
+        heading_variants = ("### 8. 경로 조립 제안", "8. **경로 조립 제안**", "## 8) 경로 조립 제안 (proposal)",
+                            "## 8. Route proposal", "**8. Route proposal**", "8) Route", "## 8 Route")
         for heading in heading_variants:
             with self.subTest(heading):
                 self.assertEqual(self.parse(f"{heading}\n\n```yaml\n{body}```\n")["legs"][0]["shape"], "direct")
+        self.assertEqual(self.reason("## 80. Route proposal\n\nnone\n"), "section-missing")
+
+    def test_a_brief_with_no_section_8_heading_is_read_whole_and_says_so(self):
+        body = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
+        proposal, _, notes = RP.parse_proposal_with_notes("## Route\n\n```yaml\n" + body + "```\n")
+        self.assertEqual(proposal["legs"][0]["shape"], "direct")
+        self.assertEqual(notes, ["section-8-heading-missing:read-whole-brief"])
+
+    def test_several_blocks_read_the_first_one_that_holds_a_proposal(self):
+        ok = "route_proposal_v1:\n  summary: first\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
+        other = ok.replace("first", "second")
+        proposal, _, notes = RP.parse_proposal_with_notes(fenced(ok) + "\n```yaml\n" + other + "```\n")
+        self.assertEqual((proposal["summary"], notes), ("first", ["blocks:2:read-1"]))
+        broken = fenced("route_proposal_v1: [unclosed\n") + "\n```yaml\n" + other + "```\n"
+        proposal, _, notes = RP.parse_proposal_with_notes(broken)
+        self.assertEqual((proposal["summary"], notes), ("second", ["blocks:2:read-2"]))
+
+    def test_unknown_fields_are_ignored_and_named(self):
+        text = fenced("route_proposal_v1:\n  summary: s\n  done_when: [tests pass]\n  legs:\n"
+                      "    - {capability: autopilot-code, shape: direct, verify: pytest}\nnote: x\n")
+        proposal, _, notes = RP.parse_proposal_with_notes(text)
+        self.assertEqual(proposal["legs"][0]["capability"], "autopilot-code")
+        self.assertNotIn("verify", proposal["legs"][0])
+        self.assertEqual(notes, ["ignored:note", "ignored:done_when", "ignored:legs[0]:verify"])
 
     def test_an_indented_fence_under_a_list_item_is_read(self):
         body = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
@@ -269,11 +293,15 @@ class ProposalValidationTest(ValidationBase):
                 self.assertFalse([b for b in route["human_gate_bindings"] if b["gate"] == "frame-review"])
                 self.assertNotIn("route_plan", route)          # validating seals nothing
 
-    def test_one_invalid_leg_makes_the_whole_proposal_none_with_its_reason(self):
+    def test_an_invalid_later_leg_ends_the_proposal_before_it_and_an_invalid_first_leg_makes_it_none(self):
         bad_graph = {"capability": "autopilot-code", "shape": "staged", "graph": ["test", "execute"]}   # order
-        row = self.evaluate([DIRECT, bad_graph])
-        self.assertIsNone(row["proposal"])
-        self.assertRegex(row["reason"], r"^leg-invalid:1:compose-graph-order:test-before-execute")
+        row = self.evaluate([DIRECT, bad_graph, dict(DIRECT)], approvals=[{"key": "full-run", "leg": 2, "question": "q"}])
+        self.assertEqual(row["reason"], "valid", row)
+        self.assertEqual([leg["shape"] for leg in row["proposal"]["legs"]], ["direct"])
+        self.assertEqual((len(row["facts"]["legs"]), row["proposal"]["entry_approvals"]), (1, []))
+        self.assertRegex(row["read_notes"][0], r"^leg-invalid:1:compose-graph-order:test-before-execute")
+        self.assertEqual(row["read_notes"][1:], ["entry-approval-mismatch:full-run@2"])
+        self.assertIsNone(self.evaluate([bad_graph, DIRECT])["proposal"])
         unknown = self.evaluate([{"capability": "autopilot-nope", "shape": "direct"}])
         self.assertRegex(unknown["reason"], r"^leg-invalid:0:compose-capability-unknown")
         mode = self.evaluate([{"capability": "autopilot-code", "mode": "nope", "shape": "direct"}])
@@ -302,10 +330,12 @@ class ProposalValidationTest(ValidationBase):
         self.assertEqual(ok["reason"], "valid", ok)
         self.assertEqual([(a["leg"], a["start_approval"], a["part"]) for a in ok["facts"]["start_approvals"]],
                          [(0, "full-run", "autopilot-lab:full-run")])
+        # A row for a part its leg does not carry is left out and named; the proposal stays valid.
         wrong_leg = self.evaluate([DIRECT, LAB_SETUP], approvals=[{"key": "full-run", "leg": 0, "question": "q"}])
-        self.assertEqual(wrong_leg["reason"], "entry-approval-mismatch:full-run@0")
+        self.assertEqual((wrong_leg["reason"], wrong_leg["proposal"]["entry_approvals"]), ("valid", []))
+        self.assertEqual(wrong_leg["read_notes"], ["entry-approval-mismatch:full-run@0"])
         absent = self.evaluate([CODE_STAGED], approvals=[{"key": "deploy", "leg": 0, "question": "q"}])
-        self.assertEqual(absent["reason"], "entry-approval-mismatch:deploy@0")
+        self.assertEqual(absent["read_notes"], ["entry-approval-mismatch:deploy@0"])
         # No approval is asked for: the proposal is valid and the decision gates it later.
         bare = self.evaluate([LAB_SETUP])
         self.assertEqual(bare["reason"], "valid")
@@ -493,11 +523,14 @@ class RoutePlanCompileTest(PlanFixture):
         self.assertEqual(verified["route_plan"]["index"], 1)
 
     def test_a_staged_route_without_a_graph_is_the_recipe_order_minus_frame_nodes(self):
+        with mock.patch.object(R, "DECIDED_SHAPES", ()):     # the recipe as sealed before decided shapes
+            framed_recipe = self.leg()
         plain = self.leg()
         planned = self.leg(route_plan=self.binding(1))
-        self.assertIn("frame", [n["id"] for n in plain["nodes"]])
+        self.assertIn("frame", [n["id"] for n in framed_recipe["nodes"]])
         ids = [n["id"] for n in planned["nodes"]]
-        self.assertEqual(ids, [i for i in [n["id"] for n in plain["nodes"]] if i not in ("frame", "frame-alternative")])
+        self.assertEqual(ids, [i for i in [n["id"] for n in framed_recipe["nodes"]] if i not in ("frame", "frame-alternative")])
+        self.assertEqual([n["id"] for n in plain["nodes"]], ids)        # a decided staged route: the same order
         self.assertEqual(planned["composed"], True)
         self.assertNotIn("frame-review", planned["human_gates"])
         self.assertEqual(planned["nodes"][0]["depends_on"], [])
@@ -514,9 +547,12 @@ class RoutePlanCompileTest(PlanFixture):
         R.verify_route(json.loads(json.dumps(planned)), R.ROOT)
 
     def test_a_solo_route_runs_its_one_shot_without_the_quick_frame_bootstrap(self):
+        with mock.patch.object(R, "DECIDED_SHAPES", ()):
+            self.assertEqual([n["id"] for n in self.leg(shape="solo")["nodes"]], ["frame", "frame-alternative", "one-shot"])
         plain = self.leg(shape="solo")
         planned = self.leg(shape="solo", route_plan=self.binding(1))
-        self.assertEqual([n["id"] for n in plain["nodes"]], ["frame", "frame-alternative", "one-shot"])
+        self.assertEqual([n["id"] for n in plain["nodes"]], ["one-shot"])
+        R.verify_route(json.loads(json.dumps(plain)), R.ROOT)
         self.assertEqual([n["id"] for n in planned["nodes"]], ["one-shot"])
         self.assertEqual(planned["nodes"][0]["depends_on"], [])
         self.assertNotIn("frame-review", planned["human_gates"])

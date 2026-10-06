@@ -3517,6 +3517,12 @@ def _inherited_selection_pins(binding, artifact_root):
     return pins
 
 
+# Shapes a session picks for work that is already decided (the person named the capability and
+# its stages, a stopped route continues, or an approved proposal's next leg): they compile without
+# the recipe's frame pair. Routes sealed before this rule keep the frame nodes they were sealed with.
+DECIDED_SHAPES = ("solo", "staged")
+
+
 def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artifact_root,
                   intensity=None, signals=(), spec_read=None, drift_verdict=None,
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
@@ -3528,11 +3534,12 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
 
     `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
     and compiles without frame nodes; `frameless` alone is the same compile without the seal, the form
-    a proposal leg is validated in.
+    a proposal leg is validated in. A `solo` or `staged` shape is chosen for work that is already
+    decided, so it compiles without the recipe's frame pair too; `framed` is where a frame runs.
     """
     import route_plan as RP
     sealed_plan = RP.sealed_form(route_plan) if route_plan is not None else None
-    frameless = frameless or route_plan is not None
+    frameless = frameless or route_plan is not None or shape in DECIDED_SHAPES
     if execution_scope is None and route_plan is not None:
         execution_scope = route_plan_execution_scope(route_plan)
     if execution_scope is not None and execution_scope not in ("complete", "report"):
@@ -3788,7 +3795,7 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
     route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
                            parent_harness=owner or "claude")
-    scope = (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {}).get("execution_scope")
+    scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
     return route
@@ -3797,16 +3804,16 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
 def route_plan_execution_scope(binding):
     """The start choice every leg of one frame decision carries.
 
-    The first leg was only selected with all of its start approvals given. A later leg keeps
-    `complete` only when each start approval it declares was also given for that leg in the same
-    interview; a part the person did not approve keeps its gate. `report` carries as it is, except
-    to a staged leg that would have no step left before its first approval (that leg keeps its gate).
+    A leg keeps `complete` only when each start approval it declares was given for that leg in the
+    same interview; a part not approved there (one held for the person included) keeps its gate.
+    `report` carries as it is, except to a later staged leg that would have no step left before its
+    first approval (that leg keeps its gate).
     """
     if not isinstance(binding, dict) or type(binding.get("index")) is not int:
         return None
     approvals = (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {})
     scope = approvals.get("execution_scope")
-    if binding["index"] == 0 or scope not in ("complete", "report"):
+    if scope not in ("complete", "report") or (binding["index"] == 0 and scope == "report"):
         return scope
     legs = binding.get("legs")
     if not isinstance(legs, list) or not 0 <= binding["index"] < len(legs) or not isinstance(legs[binding["index"]], dict):
@@ -4762,7 +4769,11 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         route_recipe=TOPO.resolve_recipe(
             registry, route.get("capability"), route.get("capability_mode")
         )
-        if route.get("route_plan") is not None and route.get("effective_intensity")=="quick":
+        decided=((route.get("selection") or {}).get("route_origin")=="compose"
+                 and (route.get("selection") or {}).get("shape") in DECIDED_SHAPES
+                 and not any(_frame_node(n) for n in route.get("nodes",[])))
+        if (route.get("route_plan") is not None or decided) and route.get("effective_intensity")=="quick":
+            # A leg of a plan, or a decided compose shape; a route sealed with its frame pair keeps it.
             route_recipe=_frameless_recipe(route_recipe)
         if route.get("effective_intensity") not in ("direct", "quick"):
             expected_nodes=json.loads(json.dumps(route_recipe["standard_plus"]["nodes"]))

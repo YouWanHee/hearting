@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import importlib.util
+import contextlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import fcntl
 from unittest.mock import patch
 
@@ -50,15 +52,19 @@ class QuiescenceTest(unittest.TestCase):
                     "drift_verdict": "within-spec", "workflow_mode": "tracked",
                     "artifact_guard": {"satisfied": True, "source": "hermetic-fixture"}})
         else:
-            route = Q.ROUTES.compose_route(
-                capability="autopilot-code",
-                capability_mode="debug", slug="fixture",
-                shape="solo" if quick else "staged", graph=None if quick else node,
-                intensity="quick" if quick else "standard", cwd=cwd, artifact_root=str(root),
-                spec_read="hermetic-fixture", drift_verdict="hermetic-fixture",
-                dispatch_evidence=None if quick else evidence,
-                registered_headless_evidence={"candidates": candidates} if quick else None,
-                unassigned=True)
+            # A quick route carries its frame pair here, as one sealed before decided shapes
+            # compiled without it does (and as a preset compile still does).
+            frames = mock.patch.object(Q.ROUTES, "DECIDED_SHAPES", ()) if quick else contextlib.nullcontext()
+            with frames:
+                route = Q.ROUTES.compose_route(
+                    capability="autopilot-code",
+                    capability_mode="debug", slug="fixture",
+                    shape="solo" if quick else "staged", graph=None if quick else node,
+                    intensity="quick" if quick else "standard", cwd=cwd, artifact_root=str(root),
+                    spec_read="hermetic-fixture", drift_verdict="hermetic-fixture",
+                    dispatch_evidence=None if quick else evidence,
+                    registered_headless_evidence={"candidates": candidates} if quick else None,
+                    unassigned=True)
         Q.ROUTES.verify_route(route, allow_stale_registry=True)
         path = root / ".runtime" / "routes" / f"{route['route_id']}.json"
         path.write_text(json.dumps(route), encoding="utf-8")

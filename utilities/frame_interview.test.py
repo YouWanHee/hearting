@@ -82,6 +82,8 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(FI.answer_actor_kind(unmarked, registered_worker=True), "headless-owner")
         with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
             FI.answer_actor_kind(good_answers(interview), registered_worker=True)
+        with self.assertRaisesRegex(ValueError, "gate-release-actor-refused: .* supervisor"):
+            FI.answer_actor_kind(good_answers(interview, actor_kind="supervisor"), registered_worker=True)
 
     def test_only_clear_no_answer_responses_remain_pending(self):
         interview = good_interview()
@@ -159,6 +161,19 @@ class ValidateTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual([h for h in FI.jargon_hits(text) if h not in ("노드",)], [], text)
         self.assertEqual(FI.jargon_hits("노드 대신 마디라고 부를까요?"), ["노드"])
+
+    def test_code_names_in_backticks_are_names_and_ids_stay_hits(self):
+        """e5b72b: a file name with `route` in it was refused three times before it could be asked."""
+        ok = good_interview()
+        ok["questions"][0]["question"] = "Should the fix also cover `capability_route.test.py`?"
+        ok["brief"]["affected"] = "The checks in `utilities/route_plan.test.py` and the report."
+        self.assertEqual(FI.validate(ok), [])
+        self.assertEqual(FI.jargon_hits("Should the fix also cover capability_route.test.py?"), ["route"])
+        self.assertEqual(FI.jargon_hits("Keep `rt-da62cded` as it is?"), ["rt-da62cded"])
+        self.assertEqual(FI.jargon_hits("Should `route_plan.py` go to the owner?"), ["owner"])
+
+    def test_the_question_example_is_one_valid_question(self):
+        self.assertEqual(FI.validate(good_interview(questions=[copy.deepcopy(FI.QUESTION_EXAMPLE)])), [])
 
     def test_abbreviations_are_not_sentence_ends_and_two_questions_are_caught(self):
         ok = good_interview(understanding="You want approval in seconds, e.g. under five, with short questions.")
@@ -357,7 +372,7 @@ class IntentTest(unittest.TestCase):
         interview = good_interview()
         interview["questions"][0]["options"][0]["approves"] = True
         proposal = {"entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-scope"}]}
-        for kind in ("supervisor", "automatic", "headless-owner", "unknown"):
+        for kind in ("automatic", "headless-owner", "unknown"):
             with self.subTest(kind=kind):
                 answers = good_answers(interview, actor_kind=kind, understanding_confirmed=False, correction="Limit scope.")
                 answers["answers"]["q-cap"].update(choice=1, note="Three is enough.")
@@ -370,6 +385,38 @@ class IntentTest(unittest.TestCase):
                 self.assertNotIn("user's own choice", text)
                 self.assertFalse(FI.approvals_given(interview, answers, proposal)[0]["accepted"])
         self.assertTrue(FI.approvals_given(interview, good_answers(interview), proposal)[0]["accepted"])
+
+    def test_a_supervisor_answer_is_agreed_on_the_persons_behalf_and_holds_person_only_starts(self):
+        """User decision 2026-10-07: a supervisor may answer frame-review for the person, under its own name."""
+        interview = good_interview()
+        interview["questions"][0]["options"][0]["approves"] = True
+        answers = good_answers(interview, actor_kind="supervisor", understanding_confirmed=False, correction="Limit scope.")
+        answers["answers"]["q-cap"]["choice"] = 1
+        text = FI.render_intent(interview, answers, now="2026-10-07")
+        self.assertIn("status: agreed-on-behalf-with-correction\nactor_kind: supervisor", text)
+        self.assertIn("## Confirmed understanding (on the person's behalf)", text)
+        self.assertIn("**Supervisor's correction:** Limit scope.", text)
+        self.assertIn("(supervisor choice)", text)
+        self.assertIn("status: agreed-on-behalf\n", FI.render_intent(interview, good_answers(interview, actor_kind="supervisor")))
+        for key in ("full-run", "deploy", "handback", "preview"):
+            with self.subTest(key=key):
+                proposal = {"entry_approvals": [{"key": key, "leg": 0, "question": "q-scope"}]}
+                row, = FI.approvals_given(interview, answers, proposal)
+                person_only = key in FI.PERSON_ONLY_START_APPROVALS
+                self.assertEqual((row["accepted"], row.get("held_for_person", False)), (not person_only, person_only))
+                self.assertTrue(FI.approvals_given(interview, good_answers(interview), proposal)[0]["accepted"])
+                declined = good_answers(interview, actor_kind="supervisor")
+                declined["answers"]["q-scope"]["choice"] = 1
+                self.assertEqual(FI.approvals_given(interview, declined, proposal)[0],
+                                 {"key": key, "leg": 0, "question": "q-scope", "label": "Approval step only",
+                                  "accepted": False})
+        self.assertEqual(FI.PERSON_ONLY_START_APPROVALS, ("deploy", "handback", "preview"))
+        self.assertTrue(FI.answer_releases_gate("supervisor", "frame-review"))
+        self.assertTrue(FI.answer_releases_gate("user", "preview-disposition"))
+        for kind, gate in (("supervisor", "preview-disposition"), ("supervisor", "plan-approval"),
+                           ("automatic", "frame-review"), ("unknown", "frame-review"), ("headless-owner", "frame-review")):
+            with self.subTest(kind=kind, gate=gate):
+                self.assertFalse(FI.answer_releases_gate(kind, gate))
 
     def test_legacy_recorded_actor_is_read_context_only(self):
         answers = good_answers(good_interview())

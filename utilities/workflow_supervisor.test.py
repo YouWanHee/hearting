@@ -2692,13 +2692,17 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                 before = answer_path.read_bytes()
                 out = io.StringIO()
                 with mock.patch.object(tidy_decisions, "record_interview_answers") as memory, \
-                     mock.patch.object(SUP, "owner_continuation") as continuation, contextlib.redirect_stdout(out):
+                     mock.patch.object(SUP, "owner_continuation", return_value=None) as continuation, \
+                     contextlib.redirect_stdout(out):
                     self.assertEqual(SUP.main(["release", "--route", str(path), "--gate", "frame-review",
                         "--decision", "proceed", "--answers", str(answer_path), "--jobs", str(jobs)]), 0)
                 effective = kind or "unknown"
                 self.assertEqual(answer_path.read_bytes(), before)
                 memory.assert_not_called()
-                continuation.assert_not_called()
+                if kind == "supervisor":          # an answer on the person's behalf continues the work
+                    continuation.assert_called_once()
+                else:
+                    continuation.assert_not_called()
                 payload = json.loads(out.getvalue())
                 resolution = WS.human_gate_resolution(SUP.ledger_for(route, jobs).journal(), "frame-review")
                 sidecar = json.loads(SUP.gate_release_sidecar_path(path).read_text())["gate_releases"][0]
@@ -2905,6 +2909,25 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                 SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
                           "--jobs", str(jobs)])
         self.assertEqual(json.loads(buf.getvalue().strip().splitlines()[-1])["refusal"], "gate-not-blocked")
+
+    def test_a_supervisor_answer_releases_a_depth0_frame_review_and_no_other_person_gate(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(payload["release_authority"], "depth-0")
+        answers, _ = self._answers(value, actor_kind="supervisor")
+        buf = io.StringIO()
+        with mock.patch.object(SUP, "owner_continuation", return_value=None), contextlib.redirect_stdout(buf):
+            self.assertEqual(SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                       "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)]), 0)
+        self.assertEqual(json.loads(buf.getvalue())["actor_kind"], "supervisor")
+        for gate in ("preview-disposition", "plan-approval"):
+            with self.subTest(gate=gate):
+                with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                    SUP.assert_release_authority("supervisor", {"release_authority": "depth-0"}, {"gate": gate}, gate)
 
     def test_preview_approval_cannot_be_self_released_even_by_a_legacy_owner(self):
         binding = {"gate": "preview-disposition"}

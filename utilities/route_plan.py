@@ -53,6 +53,8 @@ _CAPABILITY = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _MODE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _GRAPH_TOKEN = re.compile(r"[a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9/_.-]*){0,2}")
 _SECTION_HEAD = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*8[ \t]*[.):]?[ \t]*(?:\*\*)?[^\n]*경로 조립 제안", re.M)
+# Section 8 under a title in any language: a heading or a numbered line that starts with 8.
+_SECTION_NUMBER = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*(?:\*\*)?[ \t]*8(?![0-9])|(?:\*\*)?[ \t]*8[ \t]*[.):])[^\n]*", re.M)
 _NEXT_SECTION = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*(?:9|1[0-9])[ \t]*[.):]", re.M)
 _FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([A-Za-z0-9_-]*)[ \t]*$")
 
@@ -187,10 +189,12 @@ def none_text(reason) -> str:
     return f"proposal:none({reason})"
 
 
-def _section8(text: str) -> str:
-    head = _SECTION_HEAD.search(text)
+def _section8(text: str):
+    """Section 8 of a brief, found by its title or, under a title in another language, by its
+    number; None when the brief has no section 8 heading at all."""
+    head = _SECTION_HEAD.search(text) or _SECTION_NUMBER.search(text)
     if head is None:
-        raise ProposalError("section-missing")
+        return None
     rest = text[head.end():]
     tail = _NEXT_SECTION.search(rest)
     section = rest[:tail.start()] if tail else rest
@@ -261,9 +265,15 @@ def _text(value, *, name, required=False):
     return value.strip()
 
 
-def _normal_leg(raw, index):
-    if not isinstance(raw, dict) or set(raw) - {"capability", "mode", "shape", "graph", "intensity", "why"}:
+_LEG_FIELDS = frozenset({"capability", "mode", "shape", "graph", "intensity", "why"})
+_DOCUMENT_FIELDS = frozenset({"summary", "legs", "entry_approvals", "execution_scope"})
+
+
+def _normal_leg(raw, index, notes=None):
+    if not isinstance(raw, dict):
         raise ProposalError(f"schema-invalid:legs[{index}]")
+    if set(raw) - _LEG_FIELDS and notes is not None:
+        notes.append(f"ignored:legs[{index}]:" + ",".join(sorted(map(str, set(raw) - _LEG_FIELDS))))
     capability, shape = raw.get("capability"), raw.get("shape")
     if not isinstance(capability, str) or not _CAPABILITY.fullmatch(capability):
         raise ProposalError(f"schema-invalid:legs[{index}].capability")
@@ -331,7 +341,7 @@ def question_renames(source) -> list:
     """The approval question ids `parse_proposal_with_source` normalized in a brief's proposal block
     (`[{leg, key, question, original}]`, display only); `[]` when none or the block does not parse."""
     try:
-        body = next(iter(_load_yaml(source).values()))
+        body = _load_yaml(source)[PROPOSAL_SCHEMA]
         return _approval_rows(body.get("entry_approvals") or [], len(body["legs"]))[1]
     except (ProposalError, AttributeError, KeyError, TypeError, StopIteration):
         return []
@@ -344,18 +354,52 @@ def parse_proposal(text: str) -> dict:
 
 def parse_proposal_with_source(text: str) -> tuple:
     """`(proposal, source)`: the normalized proposal and the fenced block's own text."""
+    return parse_proposal_with_notes(text)[:2]
+
+
+def _readable_block(blocks):
+    """`(source, document, index)` of the first block whose YAML holds a `route_proposal_v1`
+    mapping; the first block's own reason when none does."""
+    first = None
+    for index, block in enumerate(blocks):
+        source = textwrap.dedent(block)
+        try:
+            document = _load_yaml(source)
+        except ProposalError as exc:
+            first = first or exc
+            continue
+        if isinstance(document, dict) and isinstance(document.get(PROPOSAL_SCHEMA), dict):
+            return source, document, index
+        first = first or ProposalError("schema-invalid:document")
+    raise first
+
+
+def parse_proposal_with_notes(text: str) -> tuple:
+    """`(proposal, source, notes)`. What a brief wrote around its proposal is read, not refused:
+    section 8 under a title in any language (the whole brief when it has no section 8 heading),
+    the first readable block when there are several, and unknown fields ignored. `notes` says
+    each time that happened, for the person who reads the review."""
     if len(text.encode("utf-8")) > MAX_BRIEF_BYTES:
         raise ProposalError("brief-too-large")
-    blocks = _proposal_blocks(_section8(text))
-    if not blocks:
-        raise ProposalError("block-missing")
+    notes = []
+    section = _section8(text)
+    if section is None:
+        blocks = _proposal_blocks(text)
+        if not blocks:
+            raise ProposalError("section-missing")
+        notes.append("section-8-heading-missing:read-whole-brief")
+    else:
+        blocks = _proposal_blocks(section)
+        if not blocks:
+            raise ProposalError("block-missing")
+    source, document, index = _readable_block(blocks)
     if len(blocks) > 1:
-        raise ProposalError("block-multiple")
-    source = textwrap.dedent(blocks[0])
-    document = _load_yaml(source)
-    body = document.get(PROPOSAL_SCHEMA) if isinstance(document, dict) and len(document) == 1 else None
-    if not isinstance(body, dict) or set(body) - {"summary", "legs", "entry_approvals", "execution_scope"}:
-        raise ProposalError("schema-invalid:document")
+        notes.append(f"blocks:{len(blocks)}:read-{index + 1}")
+    if set(document) - {PROPOSAL_SCHEMA}:
+        notes.append("ignored:" + ",".join(sorted(map(str, set(document) - {PROPOSAL_SCHEMA}))))
+    body = document[PROPOSAL_SCHEMA]
+    if set(body) - _DOCUMENT_FIELDS:
+        notes.append("ignored:" + ",".join(sorted(map(str, set(body) - _DOCUMENT_FIELDS))))
     scope = body.get("execution_scope", "complete")
     if scope not in ("complete", "report"):
         raise ProposalError("schema-invalid:document")
@@ -367,8 +411,8 @@ def parse_proposal_with_source(text: str) -> tuple:
         raise ProposalError("schema-invalid:entry_approvals")
     rows = _approval_rows(approvals, len(legs))[0]
     return ({"summary": _text(body.get("summary"), name="summary", required=True),
-             "legs": [_normal_leg(raw, index) for index, raw in enumerate(legs)],
-             "entry_approvals": rows, "execution_scope": scope}, source)
+             "legs": [_normal_leg(raw, index, notes) for index, raw in enumerate(legs)],
+             "entry_approvals": rows, "execution_scope": scope}, source, notes)
 
 
 def leg_arguments(leg) -> dict:
@@ -381,28 +425,39 @@ def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
     """Compile every leg through `compile_leg(leg, index) -> route` (a memory compile that writes,
     starts and records nothing) and reconcile `entry_approvals` with the parts the legs really carry.
 
-    Returns `{"legs": [facts], "start_approvals": [{leg, key, part, node}]}`; raises ProposalError
-    for the first invalid leg, so one bad leg makes the whole proposal none.
+    Returns `{"legs": [facts], "start_approvals": [{leg, key, part, node}], "entry_approvals": [rows],
+    "notes": [...]}`. An invalid first leg raises ProposalError, since nothing could start. An invalid
+    later leg ends the proposal before it (`leg-invalid:<i>:<reason>` in `notes`); the legs before it
+    stay valid. An approval row for a part its leg does not carry, or for a leg that was cut, is
+    left out and named in `notes`.
     """
     scope = proposal.get("execution_scope", "complete")
     if scope not in ("complete", "report"):
         raise ProposalError("schema-invalid:document")
-    facts, approvals = [], []
+    facts, approvals, notes = [], [], []
     for index, leg in enumerate(proposal["legs"]):
         try:
             route = compile_leg(leg, index)
         except ValueError as exc:
-            raise ProposalError(f"leg-invalid:{index}:{str(exc).strip().splitlines()[0][:120] if str(exc).strip() else 'rejected'}") from exc
+            reason = f"leg-invalid:{index}:{str(exc).strip().splitlines()[0][:120] if str(exc).strip() else 'rejected'}"
+            if index == 0:
+                raise ProposalError(reason) from exc
+            notes.append(reason)
+            break
         composed = (route.get("composed_recipe") or {}).get("compose") or {}
         facts.append({"capability": route["capability"], "mode": route["capability_mode"],
                       "shape": (route.get("selection") or {}).get("shape"),
                       "graph": list(composed.get("graph") or []) or None,
                       "intensity": route["effective_intensity"]})
         approvals.extend({"leg": index, **row} for row in start_approvals(route))
+    kept = []
     for row in proposal.get("entry_approvals", []):
-        if not any(item["leg"] == row["leg"] and item["start_approval"] == row["key"] for item in approvals):
-            raise ProposalError(f"entry-approval-mismatch:{row['key']}@{row['leg']}")
-    return {"legs": facts, "start_approvals": approvals, "execution_scope": scope}
+        if any(item["leg"] == row["leg"] and item["start_approval"] == row["key"] for item in approvals):
+            kept.append(row)
+        else:
+            notes.append(f"entry-approval-mismatch:{row['key']}@{row['leg']}")
+    return {"legs": facts, "start_approvals": approvals, "execution_scope": scope,
+            "entry_approvals": kept, "notes": notes}
 
 
 def evaluate_brief(path, *, root, node, compile_leg, start_approvals) -> dict:
@@ -418,14 +473,19 @@ def evaluate_brief(path, *, root, node, compile_leg, start_approvals) -> dict:
         row["sha256"] = hashlib.sha256(raw).hexdigest()
         if len(raw) > MAX_BRIEF_BYTES:
             raise ProposalError("brief-too-large")
-        proposal, source = parse_proposal_with_source(raw.decode("utf-8"))
+        proposal, source, notes = parse_proposal_with_notes(raw.decode("utf-8"))
         facts = validate_proposal(proposal, compile_leg=compile_leg, start_approvals=start_approvals)
     except ProposalError as exc:
         row["reason"] = str(exc)
     except (OSError, UnicodeError):
         row["reason"] = "brief-unreadable"
     else:
+        # The proposal is what can run: the legs that compiled and the approval rows that match them.
+        proposal = {**proposal, "legs": proposal["legs"][:len(facts["legs"])],
+                    "entry_approvals": facts["entry_approvals"]}
         row.update(proposal=proposal, reason=VALID, facts=facts, source=source)
+        if notes + facts["notes"]:
+            row["read_notes"] = notes + facts["notes"]
     return row
 
 

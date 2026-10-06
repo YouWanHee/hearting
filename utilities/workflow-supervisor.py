@@ -754,7 +754,7 @@ def cmd_gate(args):
                 errors = INTERVIEW.validate(
                     interview, intensity=str(route.get("effective_intensity") or "standard"))
                 if errors:
-                    raise SupervisorError("interview-invalid: " + "; ".join(errors[:8]))
+                    raise SupervisorError("interview-invalid: " + "; ".join(errors))
                 if interview.get("round", 1) != epoch + 1:
                     raise SupervisorError(
                         f"interview-round-mismatch: interview round {interview.get('round', 1)} "
@@ -1399,7 +1399,7 @@ def assert_release_authority(actor_kind, resolution, binding, gate):
     no authority keep the `any` allowance; a binding that declares `depth-0`
     is honoured even when the raise predates this field.
     """
-    if actor_kind == "user":
+    if INTERVIEW.answer_releases_gate(actor_kind, gate):
         return
     if gate == "preview-disposition":
         raise SupervisorError("gate-release-authority-refused: preview-disposition requires the person's decision")
@@ -1733,7 +1733,7 @@ def cmd_release(args):
                             released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
     record_answered_decisions(route, answered_interview, answers, actor_kind=actor_kind)
-    if args.decision == "proceed" and actor_kind == "user":
+    if args.decision == "proceed" and INTERVIEW.answer_releases_gate(actor_kind, args.gate):
         jobs = args.jobs or (None if payload.get("ledger_root_source") == "AGENT_WORKFLOW_ROOT"
                              else default_jobs_path())
         if jobs:
@@ -1845,7 +1845,7 @@ def release_answers(ledger, gate, decision, answers_path):
         raise SupervisorError(f"interview-answers-unreadable: {answers_path}: {exc}") from exc
     errors = INTERVIEW.validate_answers(interview, answers)
     if errors:
-        raise SupervisorError("interview-answers-invalid: " + "; ".join(errors[:8]))
+        raise SupervisorError("interview-answers-invalid: " + "; ".join(errors))
     return answers
 
 

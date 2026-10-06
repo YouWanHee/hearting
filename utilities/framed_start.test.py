@@ -396,16 +396,17 @@ class NoneEndingTest(StartBase):
         self.set_briefs(brief([DIRECT], section=False), "## 8. 경로 조립 제안\n\nnothing fenced\n")
         result = self.assert_none("proposal-not-verified")
         rows = {row["node"]: row for row in self.record()["decision"]["proposals"]}
-        self.assertEqual(rows["frame"]["reason"], "section-missing")
+        self.assertEqual(rows["frame"]["reason"], "block-missing")          # section 8 under another title
         self.assertEqual(rows["frame-alternative"]["reason"], "block-missing")
 
-    def test_a164_4_one_invalid_leg_makes_the_whole_brief_none(self):
+    def test_an_invalid_later_leg_is_cut_and_named_and_a_copy_with_it_is_not_verified(self):
         bad = {"capability": "autopilot-code", "shape": "staged", "graph": ["execute", "no-such-stage"]}
         self.set_briefs([DIRECT, bad], DIRECT)
         self.set_interview({"legs": [DIRECT, bad]})
         self.assert_none("proposal-not-verified")
         rows = {row["node"]: row for row in self.record()["decision"]["proposals"]}
-        self.assertRegex(rows["frame"]["reason"], r"^leg-invalid:1:compose-graph-unknown-node")
+        self.assertEqual((rows["frame"]["reason"], len(rows["frame"]["proposal"]["legs"])), ("valid", 1))
+        self.assertRegex(rows["frame"]["read_notes"][0], r"^leg-invalid:1:compose-graph-unknown-node")
         self.assertEqual(rows["frame-alternative"]["reason"], "valid")
 
 
@@ -481,6 +482,31 @@ class ApprovalTest(StartBase):
                 NoneEndingTest.assert_none(self, "approval-missing:full-run")
                 self.assertEqual(self.leg_calls, [])
 
+    def test_a_supervisor_yes_starts_a_full_run_and_holds_a_preview_for_the_person(self):
+        self.lab()
+        self.answers["actor_kind"] = "supervisor"
+        self.assertEqual(self.settle()["state"], "running")
+        given, = self.record()["decision"]["approvals"]["given"]
+        self.assertEqual((given["key"], given["accepted"]), ("full-run", True))
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertEqual(route["entry_execution_scope"], "complete")
+        self.tearDown()
+        self.setUp()
+        approvals = [{"key": "preview", "leg": 0, "question": "route"}]
+        refine = {"capability": "autopilot-refine", "shape": "solo", "why": "preview and refine"}
+        self.set_briefs(refine, refine, approvals=approvals)
+        self.set_interview({"legs": [refine], "entry_approvals": approvals})
+        self.answers["actor_kind"] = "supervisor"
+        self.assertEqual(self.settle()["state"], "running")
+        given, = self.record()["decision"]["approvals"]["given"]
+        self.assertEqual((given["key"], given["accepted"], given["held_for_person"]), ("preview", False, True))
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertNotIn("entry_execution_scope", route)                 # the preview keeps its own gate
+        self.assertTrue("preview-disposition" in route.get("human_gates", []) or any(
+            "preview-disposition" in node.get("inline_human_gates", []) for node in route["nodes"]), route)
+        task = self.leg_calls[0][self.leg_calls[0].index("--prompt-text") + 1]
+        self.assertIn("(autopilot-refine:transaction): held for the person at its own gate", task)
+
     def test_a_leg_with_an_approval_part_and_no_approval_asked_ends_as_none(self):
         self.lab(approval=False)
         NoneEndingTest.assert_none(self, "approval-missing:full-run")
@@ -507,6 +533,95 @@ class ApprovalTest(StartBase):
         self.assertIn("(starts now)", text)
         answers["answers"]["run-ok"]["choice"] = 1
         self.assertIn("question `run-ok`: declined", FI.render_intent(interview, answers, now="2026-10-01", approval_scope=scope))
+
+
+class RuntimeBuiltInterviewTest(StartBase):
+    """The runtime builds the route question and the start-approval questions from the validated
+    proposals; the session only words them, and the marks become `route_proposals` on submission."""
+
+    def built(self):
+        root, record, output = W._framed_cycle(self.route)
+        return W._interview_questions(W._proposal_rows(self.route, self.jobs, root, record, output))
+
+    def worded(self, questions, *extra):
+        for number, item in enumerate(questions):
+            item.update(topic=f"topic {number}", question=f"Question {number}?", why="Only you can say.")
+            for at, option in enumerate(item["options"]):
+                option.update(label=f"Option {at}", means=f"Choosing option {at}.")
+        return {"schema": FI.SCHEMA, "route_id": self.route["route_id"], "round": 1, "summary": "-",
+                "understanding": "Do the work the request names.",
+                "brief": {"problem": "p", "outcome": "o", "affected": "a", "constraints": "c", "open": ""},
+                "questions": questions + list(extra)}
+
+    def submit(self, interview, choices, *, actor_kind="user"):
+        derived, errors = W._marked_route_proposals(self.route, self.jobs, interview)
+        self.assertEqual(errors, [])
+        self.assertEqual(FI.validate(derived), [])
+        self.interview = derived
+        self.answers = {"schema": FI.ANSWERS_SCHEMA, "route_id": self.route["route_id"], "round": 1,
+                        "actor_kind": actor_kind, "understanding_confirmed": True, "correction": "",
+                        "answers": {qid: {"choice": choice, "note": ""} for qid, choice in choices.items()}}
+        return derived
+
+    def test_equal_proposals_get_one_yes_no_route_question_marked_with_the_first_brief(self):
+        questions = self.built()
+        self.assertEqual([(q["id"], q["kind"]) for q in questions], [(FI.ROUTE_QUESTION_ID, "yes-no")])
+        self.assertEqual([o.get(FI.PROPOSAL_MARK) for o in questions[0]["options"]], ["frame", None])
+        self.assertTrue(all(q["question"] == "" and q["why"] == "" for q in questions))   # wording is the session's
+
+    def test_different_proposals_get_one_choice_per_brief_and_each_selects_its_own_route(self):
+        for choice, expected in ((0, "inline"), (1, "running")):
+            with self.subTest(choice=choice):
+                self.tearDown()
+                self.setUp()
+                self.set_briefs(DIRECT, CODE_STAGED)
+                questions = self.built()
+                self.assertEqual(questions[0]["kind"], "choice")
+                self.assertEqual([o[FI.PROPOSAL_MARK] for o in questions[0]["options"]], F.FRAME_IDS)
+                derived = self.submit(self.worded(questions), {FI.ROUTE_QUESTION_ID: choice})
+                self.assertEqual(sorted(derived["route_proposals"]["by_option"]), ["Option 0", "Option 1"])
+                result = self.settle()
+                self.assertEqual(result["state"], expected, result)
+                self.assertEqual(self.record()["decision"]["selected"], f"Option {choice}")
+
+    def test_a_start_approval_gets_its_own_question_and_a_yes_starts_the_leg(self):
+        self.set_briefs(LAB_SETUP, LAB_SETUP)                    # the briefs name no approval question
+        questions = self.built()
+        self.assertEqual([q["id"] for q in questions], [FI.ROUTE_QUESTION_ID, "full-run-leg0"])
+        self.assertEqual([o.get("approves") for o in questions[1]["options"]], [True, None])
+        derived = self.submit(self.worded(questions), {FI.ROUTE_QUESTION_ID: 0, "full-run-leg0": 0})
+        self.assertEqual(derived["route_proposals"]["by_option"]["Option 0"]["entry_approvals"],
+                         [{"key": "full-run", "leg": 0, "question": "full-run-leg0"}])
+        result = self.settle()
+        self.assertEqual(result["state"], "running", result)
+        given = self.record()["decision"]["approvals"]["given"]
+        self.assertEqual([(row["question"], row["accepted"]) for row in given], [("full-run-leg0", True)])
+
+    def test_a_later_legs_approval_question_may_be_left_out_and_that_leg_keeps_its_gate(self):
+        self.set_briefs([DIRECT, LAB_SETUP], [DIRECT, LAB_SETUP])
+        questions = self.built()
+        self.assertEqual([q["id"] for q in questions], [FI.ROUTE_QUESTION_ID, "full-run-leg1"])
+        derived = self.submit(self.worded(questions[:1]), {FI.ROUTE_QUESTION_ID: 0})
+        self.assertEqual(derived["route_proposals"]["by_option"]["Option 0"]["entry_approvals"], [])
+        self.assertEqual(self.settle()["state"], "inline")
+        self.assertEqual(self.record()["decision"]["approvals"]["given"], [])
+
+    def test_marks_that_name_no_valid_proposal_or_sit_on_two_questions_are_reported(self):
+        self.set_briefs(DIRECT, "## 8. 경로 조립 제안\n\nnone\n")
+        questions = self.built()
+        questions[0]["options"][1][FI.PROPOSAL_MARK] = "frame-alternative"
+        _, errors = W._marked_route_proposals(self.route, self.jobs, self.worded(questions))
+        self.assertEqual(errors, [f"{FI.ROUTE_QUESTION_ID}.options[1].proposal: no valid proposal from 'frame-alternative'"])
+        twice = self.worded(self.built(), dict(question("again"), options=[
+            {"label": "a", "means": "a", FI.PROPOSAL_MARK: "frame"}, {"label": "b", "means": "b"}]))
+        self.assertEqual(W._marked_route_proposals(self.route, self.jobs, twice)[1],
+                         ["questions: proposal marks belong to one route question"])
+
+    def test_an_interview_that_maps_its_own_proposals_or_has_no_marks_is_unchanged(self):
+        own = copy.deepcopy(self.interview)
+        self.assertEqual(W._marked_route_proposals(self.route, self.jobs, own), (own, []))
+        plain = self.worded([question("scope")])
+        self.assertEqual(W._marked_route_proposals(self.route, self.jobs, plain), (plain, []))
 
 
 class FailureTableTest(StartBase):
@@ -894,7 +1009,8 @@ class CatalogueInputTest(F.FramedBase):
 
     def test_recipe_internal_and_quick_frames_get_the_same_unit_prompt_and_catalogue(self):
         for shape, graph in (("staged", None), ("solo", None)):
-            with self.subTest(shape):
+            # A recipe's own frame pair: as a preset compile seals it (and compose did before decided shapes).
+            with self.subTest(shape), mock.patch.object(R, "DECIDED_SHAPES", ()):
                 route = R.compose_route(
                     capability="autopilot-code", capability_mode=None, shape=shape, graph=graph, slug="frames",
                     cwd=R.ROOT, artifact_root=self.root, spec_read="fixture", campaign_key="k",
@@ -957,7 +1073,9 @@ class ReviewStartTest(F.FramedStartTest):
         self.assertEqual((review["equal"], review["wording_differs"]), (False, False))
         self.assertIn("frame_downgrade", review)
         self.assertIsNone(review["frame_downgrade"])                  # nothing ran lower
-        self.assertIn("route_proposals", result["next_step"])
+        self.assertIn("\"proposal\" and \"approves\" marks", result["next_step"])
+        route_question, = result["interview_template"]["questions"]      # only the valid brief is offered
+        self.assertEqual([o.get(FI.PROPOSAL_MARK) for o in route_question["options"]], ["frame", None])
         self.assertEqual(result["frame_interview"]["route_proposal_review"], review)
         self.assertEqual(len(self.calls), 2)                          # nothing launched to learn this
 
