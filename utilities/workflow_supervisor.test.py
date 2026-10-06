@@ -3218,7 +3218,7 @@ class TestLegacyPreviewGateRecovery(WorkflowFixture):
         # SD-OPEN-33; the parent's own `start` passes the internal option and its receipt is the delivery.
         route, path = self.two_stage_route(human_gate="preview-disposition",
             continuation={"kind": "human-gate", "gate": "preview-disposition"})
-        jobs, _recipient, _attempt = self.owner_registry(recipient_kind="opencode-turn")
+        jobs, _recipient, _attempt = self.owner_registry(recipient_kind="codex-stop-hook")
         jobs.write_text(jobs.read_text(encoding="utf-8").replace("\topen\t", "\tdone\t"), encoding="utf-8")
         artifact = self.base / "preview.md"
         artifact.write_text("Proposed edit for the person's review.")
@@ -3602,11 +3602,11 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
     Only that call carries the internal option. An owner's own `gate --block` is refused
     `gate-carrier-unsupported` for a recipient kind with no carrier, except `poll-fallback`: that parent
     polls `capability-route.py start`, which reads the ledger, so the raise is taken and no record is
-    written (SD-OPEN-33 stays open for `opencode-turn` and `codex-stop-hook`).
+    written (SD-OPEN-33 stays open for `codex-stop-hook`).
     """
     GATE = "full-run-authorization"
     OPTION = "AGENT_GATE_RECEIPT_DELIVERY"
-    NO_PUSH_CARRIER = ("opencode-turn", "codex-native-queue", "codex-managed-gateway")
+    NO_PUSH_CARRIER = ("codex-stop-hook", "codex-native-queue", "codex-managed-gateway")
 
     def setUp(self):
         super().setUp()
@@ -3647,13 +3647,16 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
                                  "blocked")
 
     def test_a_kind_with_a_push_carrier_keeps_its_record_whatever_the_option_says(self):
-        jobs, _session, _attempt = self.owner_registry(recipient_kind="claude-parent-runtime")
-        jobs.write_text(jobs.read_text(encoding="utf-8").replace("\topen\t", "\tdone\t"), encoding="utf-8")
-        code, payload = self.block(jobs, **{self.OPTION: "1"})
-        self.assertEqual(code, 0)
-        self.assertTrue(payload["delivery_created"])
-        self.assertTrue(Path(payload["delivery"]).is_file())
-        self.assertEqual(len(self.records(jobs)), 1)
+        # Both read the parent's records themselves, so the record reaches it after the owner exited.
+        for kind in ("claude-parent-runtime", "opencode-turn"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                jobs = self.exited_owner(kind)
+                code, payload = self.block(jobs, **{self.OPTION: "1"})
+                self.assertEqual(code, 0)
+                self.assertTrue(payload["delivery_created"])
+                self.assertTrue(Path(payload["delivery"]).is_file())
+                self.assertEqual(len(self.records(jobs)), 1)
 
     def test_without_the_option_every_kind_is_refused_as_before(self):
         for kind in self.NO_PUSH_CARRIER:
@@ -3663,13 +3666,13 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
                 with self.assertRaises(SUP.SupervisorError) as caught:
                     self.block(jobs)
                 self.assertIn("gate-carrier-", str(caught.exception))
-                if kind == "opencode-turn":
+                if kind == "codex-stop-hook":
                     self.assertIn("gate-carrier-unsupported", str(caught.exception))
                 self.assertEqual(self.records(jobs), [])
                 self.assertNotEqual(self.state(jobs), "BLOCKED_HUMAN_GATE")
 
     def test_a_registered_worker_cannot_use_the_option_to_get_a_gate_nobody_is_told_about(self):
-        jobs = self.exited_owner("opencode-turn")
+        jobs = self.exited_owner("codex-stop-hook")
         with self.assertRaises(SUP.SupervisorError) as caught:
             self.block(jobs, **{self.OPTION: "1", "AGENT_DISPATCH_REGISTERED_WORKER": "1"})
         self.assertIn("gate-carrier-unsupported", str(caught.exception))
@@ -3685,14 +3688,14 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
                          "blocked")
         # a kind with no push carrier and no polling start keeps the typed refusal
         self.setUp()
-        jobs, _session, _attempt = self.owner_registry(recipient_kind="opencode-turn")
+        jobs, _session, _attempt = self.owner_registry(recipient_kind="codex-stop-hook")
         with self.assertRaises(SUP.SupervisorError) as caught:
             self.block(jobs, AGENT_DISPATCH_REGISTERED_WORKER="1")
         self.assertIn("gate-carrier-unsupported", str(caught.exception))
         self.assertEqual(self.records(jobs), [])
 
     def test_a_repeated_block_converges_and_the_persons_answer_works_without_a_record(self):
-        jobs = self.exited_owner("opencode-turn")
+        jobs = self.exited_owner("codex-stop-hook")
         self.block(jobs, **{self.OPTION: "1"})
         code, again = self.block(jobs, **{self.OPTION: "1"})
         self.assertEqual((code, again["action"], again["delivery"]), (0, "blocked", None))

@@ -388,6 +388,8 @@ class OwnerPreviewApprovalTest(OwnerRefineBase):
 
 PARENTS = (("claude-parent-runtime", "claude"), ("codex-native-queue", "codex"),
            ("codex-managed-gateway", "codex"), ("opencode-turn", "opencode"), ("poll-fallback", "opencode"))
+# Parent kinds whose carrier reads the parent's own records, so a raise keeps one.
+RECORD_CARRIERS = ("claude-parent-runtime", "opencode-turn")
 
 
 class LooseOutputLegClosureTest(OwnerRefineBase):
@@ -436,9 +438,9 @@ class OwnerGateReachesEveryParentTest(OwnerRefineBase):
 
     The runtime raises `preview-disposition` inside the parent's own `start`; the receipt that call
     returns is the delivery, so a parent kind with no push carrier still asks. `poll-fallback` (what an
-    OpenCode depth-0 parent really gets) is polled the same way and takes its owner's own `gate --block`
-    with no record; `opencode-turn` and `codex-stop-hook` keep their typed refusal, see
-    `workflow_supervisor.test.py`.
+    OpenCode depth-0 parent without the plugin carrier gets) is polled the same way and takes its owner's
+    own `gate --block` with no record; a record-reading carrier (`claude-parent-runtime`, `opencode-turn`)
+    also keeps a record; `codex-stop-hook` keeps its typed refusal, see `workflow_supervisor.test.py`.
     """
 
     def fresh(self, name, *args, **kwargs):
@@ -477,9 +479,9 @@ class OwnerGateReachesEveryParentTest(OwnerRefineBase):
                 fixture = self.fresh("test_a_pass_that_never_raised_asks_in_the_start_receipt_for_every_parent_kind",
                                      harness, parent=kind)
                 first = fixture.start(run=self.no_launch)
-                self.assert_asks(fixture, first, records=1 if kind == "claude-parent-runtime" else 0)
+                self.assert_asks(fixture, first, records=1 if kind in RECORD_CARRIERS else 0)
                 again = fixture.start(run=self.no_launch)        # a repeated start asks, never raises twice
-                self.assert_asks(fixture, again, records=1 if kind == "claude-parent-runtime" else 0)
+                self.assert_asks(fixture, again, records=1 if kind in RECORD_CARRIERS else 0)
                 self.assert_not_settled(fixture)
 
     def test_a_blocked_owner_that_obeyed_the_refusal_line_is_asked_about_never_replaced(self):
@@ -495,7 +497,7 @@ class OwnerGateReachesEveryParentTest(OwnerRefineBase):
                     first = fixture.start(run=self.no_launch)
                     again = fixture.start(run=self.no_launch)
                 for receipt in (first, again):
-                    self.assert_asks(fixture, receipt, records=1 if kind == "claude-parent-runtime" else 0)
+                    self.assert_asks(fixture, receipt, records=1 if kind in RECORD_CARRIERS else 0)
                 self.assertEqual(fixture.jobs.read_text(), rows, "no row was added or changed")
                 self.assert_not_settled(fixture)
                 self.assertEqual(DR.owner_parked_gate(fixture.jobs, fixture.owner)["status"], "blocked")

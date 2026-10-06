@@ -81,11 +81,20 @@ class ParentCompletionDecisionTest(unittest.TestCase):
                 refused = exc.reason
         return request.parent_completion_delivery, request.parent_completion_reason, refused
 
+    @staticmethod
+    def calling(harness, session):
+        """The environment a tool command of `session` has in a current `harness` runtime."""
+        env = {NATIVE_SESSION_ENV[harness]: session}
+        declared = HC.parent_completion(harness)
+        if declared["parent_proof"] == "carrier-env":
+            env[HC.CARRIER_ENV] = f"{declared['carrier']}:{session}"
+        return env
+
     def test_each_parent_gets_its_declared_carrier_or_its_declared_fallback(self):
         for harness in HC.HARNESSES:
             declared = HC.parent_completion(harness)
-            own = {NATIVE_SESSION_ENV[harness]: "parent-session"}
-            other = {NATIVE_SESSION_ENV[harness]: "another-session"}
+            own = self.calling(harness, "parent-session")
+            other = self.calling(harness, "another-session")
             with self.subTest(harness=harness):
                 delivery, reason, refused = self.decide(harness, own)
                 if declared["carrier"]:
@@ -113,6 +122,19 @@ class ParentCompletionDecisionTest(unittest.TestCase):
                              ("opencode-turn", "opencode-plugin-turn", ""))
             self.assertEqual(self.decide("opencode", {"OPENCODE_SESSION_ID": "another-session"}),
                              ("poll-fallback", "parent-identity-unmatched", "native-parent-identity-unproven"))
+
+    def test_an_opencode_parent_is_woken_only_by_a_runtime_that_names_the_carrier(self):
+        self.assertEqual(HC.parent_completion("opencode")["carrier"], "opencode-turn")
+        self.assertEqual(self.decide("opencode", self.calling("opencode", "parent-session")),
+                         ("opencode-turn", "opencode-plugin-turn", ""))
+        self.assertEqual(pnd.parent_next("opencode-turn", "att-x", agent_home=HC.ROOT)[0], pnd.NEXT_END_TURN)
+        # A server started before the carrier existed names nothing: its parent keeps the bounded wait.
+        for env in ({"OPENCODE_SESSION_ID": "parent-session"},
+                    {"OPENCODE_SESSION_ID": "parent-session", HC.CARRIER_ENV: ""},
+                    {"OPENCODE_SESSION_ID": "parent-session", HC.CARRIER_ENV: "opencode-turn:another-session"},
+                    {"OPENCODE_SESSION_ID": "parent-session", HC.CARRIER_ENV: "claude-parent-runtime:parent-session"}):
+            with self.subTest(env=env):
+                self.assertEqual(self.decide("opencode", env), ("poll-fallback", "parent-identity-unmatched", ""))
 
     def test_an_ambiguous_caller_reaches_no_session_carrier(self):
         delivery, reason, _refused = self.decide(

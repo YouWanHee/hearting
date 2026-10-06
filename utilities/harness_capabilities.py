@@ -17,7 +17,11 @@ direct registered dispatch-depth-1 child finished:
 ``parent_proof``
     What must hold at launch for the carrier to reach the parent:
     ``native-session`` -- the calling session is the registered parent;
-    ``runtime-hook`` -- the carrier binds the session itself.
+    ``runtime-hook`` -- the carrier binds the session itself;
+    ``carrier-env`` -- the runtime running the carrier names, in the calling
+    command's environment (``CARRIER_ENV``), the carrier and the exact
+    session it carries as ``<carrier>:<session>``. A runtime that predates
+    its carrier names nothing, so its parent keeps the fallback.
 ``without_carrier``
     What a direct registered launch does when the carrier cannot reach the
     parent: ``poll`` -- the receipt discloses a bounded wait; ``refuse`` -- the
@@ -34,7 +38,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HARNESSES = ("claude", "codex", "opencode")
 SCHEMA_VERSION = 1
-PARENT_PROOFS = frozenset({"native-session", "runtime-hook"})
+PARENT_PROOFS = frozenset({"native-session", "runtime-hook", "carrier-env"})
+CARRIER_ENV = "AGENT_PARENT_COMPLETION_CARRIER"
 WITHOUT_CARRIER = frozenset({"poll", "refuse"})
 PARENT_COMPLETION_KEYS = ("carrier", "reason", "parent_proof", "without_carrier")
 # A parent named by no adapter has no runtime that could carry its completion.

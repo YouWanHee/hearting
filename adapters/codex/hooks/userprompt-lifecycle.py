@@ -356,17 +356,14 @@ def native_queue_prompt_receipts(sid: str):
     if not sid:
         return [], []
     from dispatch_contract import dispatch_state_roots, resolve_agent_home
-    from dispatch_session_sweep import sweep_deliver, _bounded_receipt_text
-    batches, texts = [], []
+    from dispatch_session_sweep import delivery_context, sweep_deliver
+    batches = []
     for root in dict.fromkeys(dispatch_state_roots(resolve_agent_home())):
         records, _ = sweep_deliver(root, "codex-native-queue", sid)
         if records:
             batches.append((root, records))
-            texts.extend(_bounded_receipt_text(record) for record in records)
-    if not texts:
-        return batches, []
-    return batches, ["Hearting pending completion receipts (inspect exact attempts; "
-                     "transport delay does not change child outcome):\n" + "\n".join(texts)]
+    context = delivery_context(batches)
+    return batches, [context] if context else []
 
 
 def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) -> None:

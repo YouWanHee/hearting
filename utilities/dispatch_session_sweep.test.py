@@ -360,39 +360,144 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             len(log_path.read_text(encoding="utf-8").splitlines()), 2
         )
 
-class OpenCodeStaticScanTest(unittest.TestCase):
-    """A-22: OpenCode has 0 runtime credentials on this machine -- static
-    source-scan only. PASS-by-execution is never claimed for this fixture
-    (plan §7.1-3)."""
+class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
+    """The OpenCode plugin carrier: look, claim and render through the shared sweep, hand the text
+    to the idle session's next turn, then ack (taken) or release (not taken)."""
 
-    def setUp(self):
-        self.source = (
-            ROOT / "adapters" / "opencode" / "plugins" / "hearting-guards.js"
-        ).read_text(encoding="utf-8")
+    SID = "ses-oc-parent"
+    _seed = SweepTest._seed
 
-    def _handler_body(self, handler_key: str) -> str:
-        marker = f'"{handler_key}": async ('
-        start = self.source.index(marker)
-        # Slice to the next top-level handler key at the same indent, or EOF.
-        rest = self.source[start + len(marker):]
-        end = rest.index('\n  "', 0) if '\n  "' in rest else len(rest)
-        return rest[:end]
+    def env(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        env = dict(os.environ)
+        env.update(HARNESS_STATE_ROOT=str(self.root), AGENT_DISPATCH_JOBS=str(self.root / "jobs.log"),
+                   AGENT_HOME=str(ROOT))
+        for key in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                    "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH"):
+            env.pop(key, None)
+        return env
 
-    def test_transform_handler_never_calls_the_sweep(self):
-        body = self._handler_body("experimental.chat.system.transform")
-        self.assertNotIn("sd111SessionSweep", body)
+    def seed_turn(self, **overrides):
+        return self._seed(self.SID, recipient_kind="opencode-turn", **overrides)
 
-    def test_chat_message_handler_calls_the_sweep(self):
-        body = self._handler_body("chat.message")
-        self.assertIn("sd111SessionSweep(sid)", body)
+    def state(self):
+        return PD.read(self.root, self.SID, "delivery-" + "a" * 32)["state"]
 
-    def test_sweep_helper_has_exactly_one_definition_and_one_call_site(self):
-        # `function sd111SessionSweep(sid) {` (the definition) plus exactly
-        # one `sd111SessionSweep(sid)` call expression (inside "chat.message",
-        # asserted separately above) -- two occurrences of the name total.
-        occurrences = self.source.count("sd111SessionSweep(sid)")
-        self.assertEqual(occurrences, 2)
-        self.assertEqual(self.source.count("function sd111SessionSweep(sid)"), 1)
+    def cli(self, action, stdin=""):
+        proc = subprocess.run([sys.executable, str(HERE / "dispatch_session_sweep.py"), action,
+                               "--recipient-kind", "opencode-turn", "--session", self.SID],
+                              input=stdin, capture_output=True, text=True, env=self.env(), check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_the_sweep_steps_claim_render_and_settle_one_record(self):
+        self.seed_turn()
+        roots = self.cli("roots")
+        self.assertIn(str(self.root), roots)
+        owed = self.cli("deliver")
+        self.assertEqual([item["delivery_id"] for item in owed["records"]], ["delivery-" + "a" * 32])
+        self.assertIn("att-0000000000000000000000000000bbbb", owed["text"])
+        self.assertIn("Follow each receipt's required_action", owed["text"])
+        self.assertEqual(self.state(), "claimed")
+        self.assertEqual(self.cli("deliver")["records"], [])      # a live claim is not handed out twice
+        self.assertEqual(self.cli("release", json.dumps(owed))["count"], 1)
+        self.assertEqual(self.state(), "pending")
+        again = self.cli("deliver")
+        self.assertEqual(self.cli("ack", json.dumps(again))["count"], 1)
+        self.assertEqual(self.state(), "acked")
+
+    def test_every_runtime_renders_delivered_records_with_one_text(self):
+        self.seed_turn()
+        records, _ = SWEEP.sweep_deliver(self.root, "opencode-turn", self.SID)
+        text = SWEEP.delivery_context([(self.root, records)])
+        self.assertTrue(text.startswith(SWEEP.COMPLETION_DELIVERY_HEADER))
+        self.assertIn("harvest", text)      # the exact next handle the queue carrier also sends
+        gate = _receipt(children=[{**_receipt()["children"][0], "required_action": "human-gate:frame-review",
+                                   "reason": "/tmp/frame-summary.json"}])
+        gate_record = {"delivery_id": "delivery-gate", "receipt": gate}
+        text = SWEEP.delivery_context([(self.root, [gate_record])])
+        self.assertTrue(text.startswith(SWEEP.GATE_DELIVERY_HEADER))
+        self.assertIn("gate=frame-review", text)
+        self.assertEqual(SWEEP.delivery_context([]), "")
+        for hook in (ROOT / "hooks" / "dispatch-session-sweep.py",
+                     ROOT / "adapters" / "codex" / "hooks" / "userprompt-lifecycle.py"):
+            self.assertIn("delivery_context", hook.read_text(encoding="utf-8"))
+
+    def run_plugin(self, body, *, prompt_async="accept"):
+        js = r'''
+import { pathToFileURL } from "node:url";
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
+const prompts = [];
+const session = {
+  messages: async () => ({data: []}), prompt: async () => ({data: null}),
+  promptAsync: async (request) => { prompts.push(request); return MODE === "accept" ? {data: undefined, response: {ok: true, status: 204}} : {error: {name: "NotFound"}, response: {ok: false, status: 404}} },
+};
+if (MODE === "absent") delete session.promptAsync;
+process.env.HERDR_PANE_ID = "";
+const hooks = await AgentHarnessGuards({client: {app: {log: async () => {}}, session}, directory: process.cwd()});
+const settle = async () => { for (let i = 0; i < 100 && !globalThis.done; i++) await new Promise(r => setTimeout(r, 50)); };
+BODY
+hooks.dispose();
+console.log(JSON.stringify({prompts}));
+'''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body)
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=self.env(), cwd=str(self.root),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(run.stdout.strip().splitlines()[-1])
+
+    IDLE_THEN_WAIT = r'''
+const out = {env: {}};
+await hooks["shell.env"]({sessionID: "ses-oc-parent"}, out);
+globalThis.carrierEnv = out.env.AGENT_PARENT_COMPLETION_CARRIER;
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses-oc-parent"}}});
+for (let i = 0; i < 200; i++) { await new Promise(r => setTimeout(r, 50)); if (prompts.length) break; }
+await new Promise(r => setTimeout(r, 1500));
+console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
+'''
+
+    def test_an_idle_parent_gets_its_record_as_its_next_turn_and_the_record_is_acked(self):
+        self.seed_turn()
+        result = self.run_plugin(self.IDLE_THEN_WAIT)
+        self.assertEqual(len(result["prompts"]), 1)
+        request = result["prompts"][0]
+        self.assertEqual(request["path"], {"id": self.SID})
+        self.assertNotIn("noReply", request["body"])      # a turn, not a silent insert
+        self.assertIn("att-0000000000000000000000000000bbbb", request["body"]["parts"][0]["text"])
+        self.assertEqual(self.state(), "acked")
+
+    def test_a_turn_opencode_did_not_take_is_released_for_the_next_pass(self):
+        self.seed_turn()
+        result = self.run_plugin(self.IDLE_THEN_WAIT, prompt_async="refuse")
+        self.assertEqual(len(result["prompts"]), 1)
+        self.assertEqual(self.state(), "pending")
+
+    def test_the_carrier_names_itself_only_where_it_can_carry(self):
+        script = r'''
+const out = {env: {}};
+await hooks["shell.env"]({sessionID: "ses-oc-parent"}, out);
+console.log(JSON.stringify({carrierEnv: out.env.AGENT_PARENT_COMPLETION_CARRIER}));
+'''
+        for mode, expected in (("accept", "opencode-turn:ses-oc-parent"), ("absent", "")):
+            with self.subTest(mode=mode):
+                js_env = self.run_plugin_env(script, mode)
+                self.assertEqual(js_env, expected)
+
+    def run_plugin_env(self, script, mode):
+        js = r'''
+import { pathToFileURL } from "node:url";
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
+const session = {promptAsync: async () => ({response: {ok: true}})};
+if (MODE === "absent") delete session.promptAsync;
+process.env.HERDR_PANE_ID = "";
+const hooks = await AgentHarnessGuards({client: {app: {log: async () => {}}, session}, directory: process.cwd()});
+BODY
+hooks.dispose();
+'''.replace("MODE", json.dumps(mode)).replace("BODY", script)
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=self.env(), cwd=str(self.root),
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(run.stdout.strip().splitlines()[-1])["carrierEnv"]
 
 
 if __name__ == "__main__":

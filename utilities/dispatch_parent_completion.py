@@ -18,7 +18,7 @@ from dispatch_contract import (DispatchContractError, annotate_attempt_row,
 # authority judgment (`route_authority`); these names remain for importers.
 from route_authority import (caller_identity as interactive_parent_identity,  # noqa: F401
                              default_parent_harness, default_parent_session_id)
-from harness_capabilities import parent_completion as declared_parent_completion
+from harness_capabilities import CARRIER_ENV, parent_completion as declared_parent_completion
 
 
 def worker_runtime_identity(harness: str) -> dict[str, str]:
@@ -135,6 +135,9 @@ def _parent_reachable(args, declared: dict) -> bool:
     """The declared carrier reaches this parent (`harness_capabilities` parent_proof)."""
     if declared["parent_proof"] == "runtime-hook":
         return True
+    if declared["parent_proof"] == "carrier-env":
+        return bool(args.parent_session_id) and (
+            os.environ.get(CARRIER_ENV) == f"{declared['carrier']}:{args.parent_session_id}")
     try:
         harness, session = interactive_parent_identity()
     except DispatchContractError:

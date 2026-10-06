@@ -250,12 +250,11 @@ class OpenCodeParentCompletionDelivery(unittest.TestCase):
         self.assertEqual(frame_args.parent_completion_reason, owner_args.parent_completion_reason)
 
     def test_frame_worker_type_under_non_claude_parent_yields_bounded_wait(self):
-        # This pins the depth-1 `frame` case under a non-Claude (OpenCode)
-        # depth-0 parent as `parent_next=bounded-wait` with a real
-        # `parent_next_command` -- existing, correct behaviour this cycle
-        # deliberately does not change (no `opencode-turn` producer is built
-        # here). Both the delivery resolution and the receipt-line rendering
-        # are the real functions, not text parsed off a printed line.
+        # A depth-1 `frame` under an OpenCode depth-0 parent whose runtime does
+        # not name the `opencode-turn` carrier (a server that predates it) keeps
+        # `parent_next=bounded-wait` with a real `parent_next_command`. Both the
+        # delivery resolution and the receipt-line rendering are the real
+        # functions, not text parsed off a printed line.
         with mock.patch.dict(os.environ, {}, clear=True):
             args = delivery_args(worker_type="frame", parent_harness="opencode")
             delivery = WH.resolve_parent_completion_delivery(args)
@@ -266,6 +265,19 @@ class OpenCodeParentCompletionDelivery(unittest.TestCase):
         self.assertEqual(fields["parent_next"], "bounded-wait")
         self.assertNotEqual(fields["parent_next_command"], "-")
         self.assertIn("att-frame-oc-1", fields["parent_next_command"])
+
+    def test_an_opencode_parent_with_the_plugin_carrier_ends_its_turn(self):
+        env = {"OPENCODE_SESSION_ID": "oc-parent", "AGENT_PARENT_COMPLETION_CARRIER": "opencode-turn:oc-parent"}
+        for worker in ("owner", "frame", "review"):
+            with self.subTest(worker=worker), mock.patch.dict(os.environ, env, clear=True):
+                args = delivery_args(worker_type=worker, parent_harness="opencode", parent_session_id="oc-parent")
+                delivery = WH.resolve_parent_completion_delivery(args)
+                args.parent_completion_delivery = delivery
+                WH.validate_interactive_parent_launch(args)
+            self.assertEqual((delivery, args.parent_completion_reason), ("opencode-turn", "opencode-plugin-turn"))
+            lines = WH.parent_next_receipt_lines(delivery, "att-oc-1", agent_home=str(ROOT))
+            fields = dict(line.split("=", 1) for line in lines)
+            self.assertEqual(fields["parent_next"], "end-turn")
 
     def test_register_action_stdout_carries_the_delivery_receipt(self):
         with tempfile.TemporaryDirectory() as td:

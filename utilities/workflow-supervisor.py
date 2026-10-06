@@ -840,10 +840,14 @@ def cmd_gate(args):
 
 # The recipient kinds whose carriers were actually taught `human-gate:` (v59).
 # One kind, two carriers: asyncRewake and the UserPromptSubmit sweep both
-# deliver to a `claude-parent-runtime` recipient.
+# deliver to a `claude-parent-runtime` recipient; the OpenCode plugin's turn
+# carrier delivers the same records to an `opencode-turn` recipient.
 GATE_CARRIER_KINDS = frozenset({
-    "claude-parent-runtime", "codex-managed-gateway", "codex-native-queue",
+    "claude-parent-runtime", "codex-managed-gateway", "codex-native-queue", "opencode-turn",
 })
+# Carriers that read the parent's records themselves, so a record always reaches
+# the parent; the Codex kinds deliver through a live sealed owner.
+GATE_RECORD_CARRIER_KINDS = frozenset({"claude-parent-runtime", "opencode-turn"})
 
 # A parent with no push carrier was told `bounded-wait`: it polls `capability-route.py start`, and that
 # call reads the ledger (`dispatch_replacement.owner_parked_gate`) and answers `waiting-human-gate`.
@@ -921,10 +925,11 @@ def gate_delivered_in_receipt():
 def gate_carrier_holds(recipient_kind, route, jobs_path):
     """Whether the recipient's push carrier can hold a record for this raise right now.
 
-    `claude-parent-runtime` always can (its sweep and rewake read the record). The Codex kinds need a
-    live sealed owner: after the owner exited there is no carrier, only the parent's own receipt.
+    A record-reading carrier always can (Claude's sweep and rewake, the OpenCode plugin's turn
+    carrier). The Codex kinds need a live sealed owner: after the owner exited there is no carrier,
+    only the parent's own receipt.
     """
-    if recipient_kind == "claude-parent-runtime":
+    if recipient_kind in GATE_RECORD_CARRIER_KINDS:
         return True
     if recipient_kind not in GATE_CARRIER_KINDS:
         return False
@@ -958,8 +963,8 @@ def gate_recipient(route, jobs_path, *, receipt_delivery=False):
         raise SupervisorError(f"gate-recipient-unresolved: recipient kind {recipient_kind!r}")
     if recipient_kind not in GATE_CARRIER_KINDS and not (receipt_delivery or polled):
         # A carrier may be selected only after its receipt vocabulary and live
-        # recipient proof exist. OpenCode and the legacy Codex stop hook still do
-        # not carry this contract and therefore fail closed here.
+        # recipient proof exist. The legacy Codex stop hook still does not carry
+        # this contract and therefore fails closed here.
         raise SupervisorError(
             "gate-carrier-unsupported: no human-gate carrier for recipient kind "
             f"{recipient_kind!r} (SD-OPEN-33); supported: "
