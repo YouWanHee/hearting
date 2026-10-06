@@ -160,6 +160,7 @@ utility-deferred	dispatch_terminal_commit.py
 utility-deferred	dispatch_v20.test.py
 utility-deferred	extract_web_figures.py
 utility-deferred	fleet_cutover_gate.py
+utility-deferred	foreground_terminal.py
 utility-deferred	frame_interview.py
 utility-deferred	harness-capacity.py
 utility-deferred	harness_capabilities.py
@@ -196,7 +197,6 @@ utility-deferred	route_lineage.py
 utility-deferred	route_lineage.test.py
 utility-deferred	session_summary_trigger.py
 utility-deferred	session_identity.py
-utility-deferred	foreground_terminal.py
 utility-deferred	session_notice.py
 utility-deferred	session_tidy.py
 utility-deferred	session_tidy_clear.py
