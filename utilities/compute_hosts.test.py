@@ -1215,7 +1215,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         meta = json.loads(
             (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["provenance"],
-                         {"agent_home": None, "attempt_id": None, "session": None})
+                         {"agent_home": None, "attempt_id": None, "session": None,
+                          "route": None})
         # The conda-selection field keeps its own meaning beside provenance.
         self.assertIsNone(meta["env"])
 
@@ -1252,7 +1253,8 @@ class LauncherProvenanceTest(unittest.TestCase):
             (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["provenance"],
                          {"agent_home": str(home.resolve()),
-                          "attempt_id": attempt, "session": None})
+                          "attempt_id": attempt, "session": None,
+                          "route": None})
 
     def test_invalid_attempt_never_reaches_the_payload(self):
         home = self.make_home()
@@ -1265,6 +1267,22 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertIn("export AGENT_HOME=", dry.stdout)
         self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=''", dry.stdout)
         self.assertNotIn("prov-pwned", dry.stdout)
+
+    def test_the_run_record_names_the_launching_route(self):
+        module = load_module()
+        route = self.root / "route.json"
+        route.write_text(json.dumps({"route_id": "rt-0123456789abcdef"}))
+        self.assertEqual(module._launcher_route({"AGENT_OWNER_ROUTE_FILE": str(route)}),
+                         {"route_id": "rt-0123456789abcdef", "route_file": str(route), "source": "environment"})
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        tail = [{"ts": 1, "route_file": "/gone.json"}, {"ts": 2, "route_file": str(route)}]
+        with mock.patch("fleet.route_chain.writer_identity", return_value=("claude", "sid-1")), \
+             mock.patch("fleet.route_chain.read_tail", return_value=tail):
+            found = module._launcher_route({})
+        self.assertEqual((found["route_id"], found["source"]), ("rt-0123456789abcdef", "session-route-chain"))
+        self.assertIsNone(module._launcher_route({"AGENT_OWNER_ROUTE_FILE": str(self.root / "absent.json")}))
 
     def test_provenance_keys_are_always_exported(self):
         home = self.make_home()
@@ -1320,7 +1338,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         meta = json.loads(
             (self.run_root / run_id / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["provenance"],
-                         {"agent_home": None, "attempt_id": None, "session": None})
+                         {"agent_home": None, "attempt_id": None, "session": None,
+                          "route": None})
 
     def test_invalid_attempt_clears_foreign_attempt_only(self):
         home = self.make_home()

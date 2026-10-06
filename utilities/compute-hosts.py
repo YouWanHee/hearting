@@ -569,6 +569,44 @@ def _launcher_provenance(values=None, _resolver=None):
     return provenance
 
 
+def _launcher_route(values=None):
+    """`{route_id, route_file, source}` of the route this launch belongs to, or None.
+
+    A registered owner or worker names its route in its environment; an interactive
+    session's route is the latest one its own route-chain ledger recorded. This is
+    attribution for the run record, not authority over the route: nothing is
+    refused when it is unknown.
+    """
+    values = os.environ if values is None else values
+    route_file, source = None, None
+    for key in ("AGENT_OWNER_ROUTE_FILE", "AGENT_ROUTE_FILE"):
+        if values.get(key):
+            route_file, source = values[key], "environment"
+            break
+    if route_file is None:
+        try:
+            tools = str(Path(__file__).resolve().parents[1] / "tools")
+            if tools not in sys.path:
+                sys.path.insert(0, tools)
+            from fleet import route_chain
+            identity = route_chain.writer_identity(values)
+            lines = route_chain.read_tail(*identity) if identity else []
+            last = max(lines, key=lambda line: line.get("ts") or 0) if lines else {}
+            if isinstance(last.get("route_file"), str) and last["route_file"]:
+                route_file, source = last["route_file"], "session-route-chain"
+        except Exception:
+            return None
+    if not route_file:
+        return None
+    try:
+        route_id = json.loads(Path(route_file).read_text(encoding="utf-8")).get("route_id")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(route_id, str) or not route_id:
+        return None
+    return {"route_id": route_id, "route_file": str(route_file), "source": source}
+
+
 def _socket_inodes(pid, proc_root=Path("/proc")):
     inodes = set()
     try:
@@ -2167,7 +2205,8 @@ def cmd_run(args):
             "provenance": {"agent_home": provenance.get("AGENT_HOME"),
                            "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
                            "session": ({"harness": owner["harness"], "id": owner["id"]}
-                                       if owner else None)},
+                                       if owner else None),
+                           "route": _launcher_route()},
             "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
