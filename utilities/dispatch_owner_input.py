@@ -104,10 +104,10 @@ def _reachable(row, value, live):
 
 
 def _answers_blocked_owner(row, live):
-    """An owner that ended BLOCKED is waiting for an answer, not gone: a correction sent to it is
-    kept (`retained`) and the next start continues the route with it (dispatch_replacement)."""
-    return (not live and row.status == "done"
-            and row.metadata.get("note") == "dead-worker-blocked")
+    """An owner that ended BLOCKED, or with a readable FAIL, waits for a person, not gone
+    (`route_authority.answerable_owner_end`): a correction sent to it is kept (`retained`) and
+    the next start continues the route with it (dispatch_replacement)."""
+    return not live and bool(route_authority.answerable_owner_end(row.status, row.metadata))
 
 
 def _owner_phase(attempt):
@@ -207,8 +207,9 @@ def _retained_fields(item):
     if item["state"] != "retained":
         return {}
     return {"retained": True,
-            "next_step": "The owner had ended BLOCKED; this answer is kept for it. Starting the route "
-                "continues the work in a replacement owner that receives this answer first."}
+            "next_step": "The owner had ended (BLOCKED, or with a FAIL a person may answer with a fix); "
+                "this answer is kept for it. Starting the route continues the work in a replacement "
+                "owner that receives this answer first."}
 
 
 # Input no owner turn consumed: kept for an ended owner, or queued/undelivered when the owner
@@ -219,7 +220,7 @@ UNCONSUMED_STATES = frozenset({"retained", "queued", "undelivered"})
 def retained(jobs, attempt):
     """Answers no owner turn consumed, oldest first. Read-only.
 
-    Once the owner ended BLOCKED these are the answers its continuation receives
+    Once the owner ended (BLOCKED, or a readable FAIL) these are the answers its continuation receives
     (dispatch_replacement 'corrected'), including one queued just before it ended."""
     path = _path(jobs, attempt)
     if path.is_symlink():
@@ -236,7 +237,7 @@ def retained(jobs, attempt):
 
 
 def blocked_owner_answers(jobs, attempt):
-    """The unconsumed answers of an owner that has ended BLOCKED, read now; [] otherwise."""
+    """The unconsumed answers of an owner that ended waiting for a person, read now; [] otherwise."""
     try:
         row, _ = _target(jobs, attempt)
     except (InputError, JoinContractError, OSError, ValueError, KeyError):

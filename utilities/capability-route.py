@@ -8019,7 +8019,17 @@ def _dependency_revisions(route, node, jobs=None, *, reviewed_input=None):
         for revision in _review_input_revision_records(generation, node["id"], jobs)
         if reviewed_input is None or revision.get("evidence") == {
             "path": reviewed_input.get("path"), "sha256": reviewed_input.get("sha256")}
-    ]
+    ] + _answered_fix_revisions(route, jobs)
+
+
+def _answered_fix_revisions(route, jobs):
+    """A person's approved fix for this route's FAIL-ended owner answers the FAIL rows its
+    claim pinned (`dispatch_replacement.answered_fix_revisions`): the same closure-check
+    basis a revision naming that FAIL gives, within the verdict ceiling cap + 1."""
+    if jobs is None:
+        return []
+    import dispatch_replacement
+    return dispatch_replacement.answered_fix_revisions(jobs, route.get("route_id"))
 
 
 def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines,
