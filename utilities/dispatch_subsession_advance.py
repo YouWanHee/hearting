@@ -733,6 +733,11 @@ def advance_chain_step(jobs: Path, parent_attempt_id: str, joined: dict) -> Chai
     except (OSError, ValueError):
         record = None
     reason = (record or {}).get("reason", "")
+    retries = ((record or {}).get("phases") or {}).get("start_retries") or []
+    if record is not None and record.get("outcome") is None and retries:
+        return ChainAdvanceStep("deferred", chain_id=chain_id, predecessor_index=predecessor_index,
+                                successor_index=successor_index, reason=retries[-1].get("reason", ""),
+                                subsession_advance_id=advance_id)
     if reason == "terminal-evidence-conflict":
         # An evidence review pauses this chain; it does not cancel unopened
         # slices or discard the owner that will resume after the disposition.
@@ -776,8 +781,13 @@ def drive_serial_chain(
     allow_advance: Callable[[], bool] | None = None,
     emit: Callable[[dict], None] | None = None,
     replacement_checkpoint: Callable | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> ChainDriveResult:
-    """Run every serial successor at one non-model supervisor checkpoint."""
+    """Run every serial successor at one non-model supervisor checkpoint.
+
+    A successor start refused for a reason waiting may fix is started again here,
+    at a backed-off interval, until its advance record's grace runs out; only
+    then is it a refusal that closes the rest of the chain."""
 
     initial_attempts = set(attempts)
     initial_receipt = dict(receipt)
@@ -801,6 +811,7 @@ def drive_serial_chain(
     refusal = None
     closed: tuple[str, ...] = ()
     unclosed: tuple[str, ...] = ()
+    retry_interval = 0.25
     if replacement_checkpoint is None:
         from dispatch_replacement import advance_batch
         replacement_checkpoint = lambda selected: (
@@ -827,6 +838,13 @@ def drive_serial_chain(
                                     reason=attention[0].get("reason") or "replacement-needs-attention")
         else:
             step = advance_chain_step(jobs, parent_attempt_id, joined)
+        if step.outcome == "deferred":
+            if emit:
+                emit({"type": "dispatch.supervisor.chain-advance-deferred", "chain_id": chain_id,
+                      "successor_index": step.successor_index, "reason": step.reason})
+            sleep(retry_interval)
+            retry_interval = min(DC.PRELAUNCH_WAIT_INTERVAL_MAX_SECONDS, retry_interval * 2)
+            continue
         if step.outcome != "advanced":
             refusal = step if step.outcome == "refused" else None
             if refusal is not None:
@@ -1158,6 +1176,17 @@ def _refused(
     )
 
 
+def _start_waits(request: SubsessionAdvanceRequest, start_result: dict) -> bool:
+    """A start refused before spawning for a reason waiting may fix, its row still registered only."""
+
+    if start_result.get("child_spawned") or start_result.get("reason") not in DC.PRELAUNCH_PROCESS_BLOCK_REASONS:
+        return False
+    attempt_id = request.successor_session.get("attempt_id")
+    rows = [row for row in _registry_rows_for_chain(request.jobs, request.chain_id)
+            if row["metadata"].get("attempt_id") == attempt_id]
+    return bool(rows) and row_is_registered_only(rows[-1]["status"], rows[-1]["metadata"])
+
+
 def _result_from_record(record: dict, record_path: Path) -> SubsessionAdvanceResult:
     phases = record.get("phases") or {}
     registered = "registered" in phases
@@ -1305,6 +1334,23 @@ def coordinate_subsession_advance(
         if "started" not in record["phases"]:
             cp("before-start")
             start_result = services.start_successor(request, claim=claim)
+            if _start_waits(request, start_result):
+                # Nothing was spawned and waiting may fix it: keep the start
+                # open and record why, until the prelaunch grace runs out.
+                retries = record["phases"].setdefault("start_retries", [])
+                retries.append({"at_ns": time.time_ns(), "reason": str(start_result.get("reason") or "unknown"),
+                                "returncode": start_result.get("returncode")})
+                if retries[-1]["at_ns"] - retries[0]["at_ns"] < DC.PRELAUNCH_WAIT_GRACE_SECONDS * 1_000_000_000:
+                    _atomic_json(record_path, record)
+                    return SubsessionAdvanceResult(
+                        outcome="deferred",
+                        reason="subsession-advance-successor-start-deferred:" + retries[-1]["reason"],
+                        subsession_advance_id=subsession_advance_id,
+                        successor_subsession_index=request.successor_subsession_index,
+                        successor_attempt_id=claim.successor_attempt_id,
+                        claim_key=tuple(claim.claim_key), registered=True, started=False,
+                        child_spawned=False, record_path=record_path,
+                    )
             record["phases"]["started"] = {
                 "committed_at_ns": time.time_ns(), "result": start_result,
             }
