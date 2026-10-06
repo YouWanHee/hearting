@@ -1706,16 +1706,94 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
 
 
 def _with_next_leg(route, result):
-    """Attach the route plan's next leg to a `completed` receipt. Information only: it is never
-    written into `parent_next`, `parent_next_command` or `required_action`, and nothing starts it."""
+    """Attach the route plan's next leg to a `completed` receipt; `start_work` then starts it
+    (`_advance_plan`). It is never written into `parent_next` or `required_action`."""
     if result.get("state") != "completed" or route.get("route_plan") is None:
         return result
     leg = RP.next_leg_for_route(route)
     return {**result, "next_leg": leg} if leg else result
 
 
+def _plan_leg(route, jobs, index):
+    """`(route, path)` of leg `index` of the approved plan `route` belongs to: the one already
+    recorded in the plan cursor, or compiled now from the previous leg and recorded.
+
+    The plan's own arguments, `--route-plan <record>#<index>` and the finished leg's sealed cycle as
+    parent: exactly what the printed `next_leg.compose_command` would seal. One lock per decision
+    keeps two starts from compiling the same leg twice."""
+    module = _route_module()
+    sealed = RP.validate_sealed(route["route_plan"])
+    root = Path(route["artifact_root"]).resolve()
+    binding = RP.read_route_plan(f"{root / sealed['decision']}#{index}", root)
+    if binding["digest"] != sealed["digest"]:
+        raise ValueError("route-plan-digest-changed")
+    decision = binding["record"]["decision"]
+    frame_route_id = decision["frame_route"]["route_id"]
+    lock_path = RP.plan_cursor_path(root, frame_route_id)
+    if lock_path is None:
+        raise ValueError("plan-cursor-unlocated")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path.with_name(lock_path.name + ".lock"), "a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        for row in RP.plan_cursor(root, frame_route_id, binding["digest"]):
+            if row["index"] == index:
+                leg_path = root / row["route_file"]
+                return module.verify_route(json.loads(leg_path.read_text(encoding="utf-8"))), leg_path
+        cycle = RP.completed_cycle(route)
+        if cycle is None:
+            raise ValueError("route-plan-previous-leg-not-sealed")
+        context = decision["first_leg_compose"]["context"]
+        prompt = Path(context["prompt_file"])
+        readiness = {}
+
+        def probe():
+            if "value" not in readiness:
+                readiness["value"] = module.proposal_readiness(route, jobs)
+            return readiness["value"]
+        leg_route = module.compile_first_leg(
+            binding["leg"], frame_route=route, frame_cycle_id=cycle["cycle_id"], context=context,
+            binding=binding, index=index, readiness=probe,
+            work_request={"text": prompt.read_text(encoding="utf-8"), "owner_harness": context.get("owner")})
+        leg_path = Path(module.canonical_route_path(str(root), leg_route["route_id"]))
+        if not leg_path.exists():
+            module.publish_composed_route(leg_route, str(root), plan=RP.display_plan(decision["proposal"]["legs"]))
+        RP.append_plan_cursor(root, frame_route_id, {
+            "digest": binding["digest"], "index": index, "route_id": leg_route["route_id"],
+            "route_hash": leg_route["route_hash"], "route_file": leg_path.relative_to(root).as_posix(),
+            "after_route_id": route["route_id"], "by": {"session": _current_parent_session_id() or None},
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        return module.verify_route(json.loads(leg_path.read_text(encoding="utf-8"))), leg_path
+
+
+def _advance_plan(route, jobs, result, *, run, sleep, clock):
+    """A finished leg of an approved plan starts the plan's next leg (the plan cursor).
+
+    The person approved every leg in the one frame interview, so the next leg starts without
+    another question; the receipt returned is the new leg's own. A plan approved for a report
+    (`execution_scope: report`) stops after its leg with `next_leg` as information, as before."""
+    following = result.get("next_leg")
+    if result.get("state") != "completed" or not isinstance(following, dict):
+        return result
+    try:
+        sealed = RP.validate_sealed(route["route_plan"])
+        root = Path(route["artifact_root"]).resolve()
+        record = RP.read_route_plan(f"{root / sealed['decision']}#{sealed['index']}", root)["record"]
+        if (record["decision"].get("approvals") or {}).get("execution_scope") == "report":
+            return result
+        leg_route, leg_path = _plan_leg(route, jobs, following["index"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {**result, "plan_advance": {"state": "not-started", "leg": following.get("index"),
+                                           "reason": str(exc)[:240]},
+                "next_step": "This leg finished. The plan's next leg did not start: " + str(exc)[:160]
+                    + ". Run next_leg.compose_command to start it, or report the reason."}
+    started = start_work(leg_route, leg_path, jobs, run=run, sleep=sleep, clock=clock)
+    return {**started, "plan_advanced": {"leg": following["index"], "after_route_id": route["route_id"],
+                                         "route_file": str(leg_path)}}
+
+
 def _compose_again(route) -> str:
-    """The compose command that starts an automatically closed route's work again."""
+    """The compose command that starts an automatically closed route's work again: the same shape,
+    stages, intensity, pins and plan reference the closed route was sealed with."""
     task = Path(route["artifact_root"]) / ".runtime" / "route-autoclose" / f"{route['route_id']}.task.md"
     if not task.is_file():
         task.parent.mkdir(parents=True, exist_ok=True)
@@ -1731,6 +1809,17 @@ def _compose_again(route) -> str:
             "--prompt-file", str(task), "--start"]
     if RESOURCE_RESUME.route_selected(route):
         argv += ["--graph", "resume-run,run-verify"]
+    elif shape == "staged" and ((route.get("composed_recipe") or {}).get("compose") or {}).get("graph"):
+        argv += ["--graph", ",".join(route["composed_recipe"]["compose"]["graph"])]
+    if shape == "staged" and route.get("effective_intensity"):
+        argv += ["--intensity", route["effective_intensity"]]
+    elif shape == "framed" and len(RP.frame_legs(route)) == 2:
+        argv += ["--intensity", "strong"]           # both frame legs again
+    for token in RP.pin_tokens(route.get("selection_pins")):
+        argv += ["--pin", token]
+    if route.get("route_plan") is not None:
+        sealed = route["route_plan"]
+        argv += ["--route-plan", f"{Path(route['artifact_root']).resolve() / sealed['decision']}#{sealed['index']}"]
     if route.get("campaign_key"):
         argv += ["--campaign-key", route["campaign_key"]]
     elif route.get("parent_cycle_id"):
@@ -1778,6 +1867,9 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
         for advisory in OWNER_WRITE_ADVISORY.receipt_advisories(launch.get("receipt", "")):
             if advisory not in result["advisories"]:
                 result["advisories"].append(advisory)
+    advanced = _advance_plan(route, jobs, result, run=run, sleep=sleep, clock=clock)
+    if advanced is not result:
+        return advanced          # the next leg's own start already armed its own resume
     return _arm_capacity_resume(result, path, jobs)
 
 

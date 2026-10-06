@@ -767,49 +767,93 @@ class FirstLegStateReplayTest(StartBase):
             self.assertNotIn("next_leg", again)               # the only leg of its plan
         self.untouched(before)
 
-    def test_a_finished_leg_that_is_not_the_last_names_the_next_leg_and_starts_nothing(self):
+    def started_leg(self, result):
+        path = Path(result["plan_advanced"]["route_file"])
+        return json.loads(path.read_text(encoding="utf-8")), path
+
+    def cursor(self):
+        path = RP.plan_cursor_path(self.root, self.route["route_id"])
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+    def test_a_finished_leg_starts_the_plans_next_leg_once(self):
+        """Plan cursor: the person approved both legs, so the next one starts without another question."""
         self.set_briefs([DIRECT, self.SECOND], [DIRECT, self.SECOND])
         self.set_interview({"legs": [DIRECT, self.SECOND]})
         self.settle()
         route, leg_path = self.leg()
         cycle = self.finish_leg(route, leg_path)
-        before = self.snapshot()
         again = self.replay()
-        self.assertEqual(again["state"], "completed", again)
-        self.assertEqual(again["next_leg"]["index"], 1)
-        self.assertEqual(shlex.split(again["next_leg"]["compose_command"])[shlex.split(again["next_leg"]["compose_command"]).index("--parent-cycle") + 1], cycle)
-        self.untouched(before)
+        self.assertEqual((again["state"], again["required_action"]), ("inline", "execute-inline"), again)
+        self.assertEqual(again["plan_advanced"]["leg"], 1)
+        second, second_path = self.started_leg(again)
+        self.assertEqual((again["route_id"], second["route_plan"]["index"]), (second["route_id"], 1))
+        self.assertEqual(P.read_cycle_record(self.root, again["artifact_env"]["AGENT_ARTIFACT_CYCLE_ID"])
+                         ["parent_cycle_id"], cycle)
+        rows = self.cursor()
+        self.assertEqual([(row["index"], row["route_id"], row["after_route_id"]) for row in rows],
+                         [(1, second["route_id"], route["route_id"])])
+        self.assertEqual(rows[0]["by"], {"session": "parent"})
+        # The same resume line again: the frame answers for the leg already started, compiles nothing.
+        before = len(self.leg_routes())
+        replayed = self.replay()
+        self.assertEqual((replayed["route_id"], replayed["state"]), (second["route_id"], "inline"), replayed)
+        self.assertEqual((len(self.leg_routes()), len(self.cursor())), (before, 1))
 
-    def test_the_frame_answers_for_the_furthest_started_leg_and_no_next_leg_after_the_last(self):
+    def test_a_successor_session_continues_the_plan_on_the_same_resume_line(self):
+        self.set_briefs([DIRECT, self.SECOND], [DIRECT, self.SECOND])
+        self.set_interview({"legs": [DIRECT, self.SECOND]})
+        self.settle()
+        route, leg_path = self.leg()
+        self.finish_leg(route, leg_path)
+        with mock.patch.object(W, "default_parent_session_id", return_value="successor"):
+            again = self.replay()
+        self.assertEqual((again["state"], again["plan_advanced"]["leg"]), ("inline", 1), again)
+        self.assertEqual(self.cursor()[0]["by"], {"session": "successor"})
+
+    def test_a_three_leg_plan_runs_to_its_end_on_the_same_resume_line(self):
         third = {**self.SECOND, "why": "then the third"}
         self.set_briefs([DIRECT, self.SECOND, third], [DIRECT, self.SECOND, third])
         self.set_interview({"legs": [DIRECT, self.SECOND, third]})
         self.settle()
-        route, leg_path = self.leg()
-        self.finish_leg(route, leg_path)
-        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_DISPATCH_")}
-        expected_index, current = 1, route
-        for _ in range(2):
+        current, path = self.leg()
+        for expected in (1, 2):
+            self.finish_leg(current, path)
             again = self.replay()
-            self.assertEqual((again["state"], again["route_id"]), ("completed", current["route_id"]), again)
-            self.assertEqual(again["next_leg"]["index"], expected_index)
-            # The fixture begins the leg's cycle itself, so only the compose part of the printed command runs.
-            argv = [token for token in shlex.split(again["next_leg"]["compose_command"]) if token != "--start"]
-            done = subprocess.run(argv, text=True, capture_output=True, env=env)
-            self.assertEqual(done.returncode, 0, done.stderr)
-            path = Path(json.loads(done.stdout)["route_file"])
-            composed = json.loads(path.read_text(encoding="utf-8"))
-            # Composed but not started: the frame still points at the same next leg.
-            self.assertEqual(self.replay()["next_leg"]["index"], expected_index)
-            self.finish_leg(composed, path)
-            expected_index, current = expected_index + 1, composed
+            self.assertEqual((again["state"], again["plan_advanced"]["leg"]), ("inline", expected), again)
+            current, path = self.started_leg(again)
+        self.finish_leg(current, path)
         before = self.snapshot()
         last = self.replay()
         self.assertEqual((last["state"], last["required_action"]), ("completed", "advance-completed"), last)
         self.assertEqual((last["route_id"], current["route_plan"]["index"]), (current["route_id"], 2))
         self.assertEqual(last["route_decision"]["frame_route_id"], self.route["route_id"])
         self.assertNotIn("next_leg", last)
+        self.assertNotIn("plan_advanced", last)
+        self.assertEqual([row["index"] for row in self.cursor()], [1, 2])
         self.untouched(before)
+
+    def test_a_plan_approved_for_a_report_stops_after_its_leg_with_the_next_leg_as_information(self):
+        self.set_briefs([DIRECT, self.SECOND], [DIRECT, self.SECOND])
+        self.set_interview({"legs": [DIRECT, self.SECOND], "execution_scope": "report"})
+        self.settle()
+        route, leg_path = self.leg()
+        self.finish_leg(route, leg_path)
+        before = self.snapshot()
+        again = self.replay()
+        self.assertEqual((again["state"], again["next_leg"]["index"]), ("completed", 1), again)
+        self.assertNotIn("plan_advanced", again)
+        self.assertEqual(self.cursor(), [])
+        self.untouched(before)
+
+    def test_a_leg_composed_again_keeps_its_stages_intensity_pins_and_plan(self):
+        self.staged_leg()
+        route, _ = self.leg()
+        argv = shlex.split(W._compose_again(route))
+        self.assertEqual(argv[argv.index("--graph") + 1], "plan,execute,test,report")
+        self.assertEqual(argv[argv.index("--intensity") + 1], route["effective_intensity"])
+        self.assertTrue(argv[argv.index("--route-plan") + 1].endswith("route-decision.json#0"))
+        for token in RP.pin_tokens(route.get("selection_pins")):
+            self.assertIn(token, argv)
 
     def test_a_finished_staged_owner_leg_answers_completed(self):
         first = self.staged_leg()

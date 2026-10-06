@@ -857,10 +857,12 @@ class PinnedFourReceiptSurfacesTest(PinnedPlanFixture):
         self.finish_leg(route, leg_path)
         read = RP.next_leg_for_route(route)
         self.assertIsNotNone(read)
-        resumed = S.W.start_work(route, leg_path, self.jobs)
-        self.assertEqual(resumed["state"], "completed")
-        self.assertEqual(resumed["next_leg"], read)
         self.assertEqual(set(self.pin_values(shlex.split(read["compose_command"]))), SelectionPinContinuationTest.FRAME_PINS)
+        # The resume starts that next leg itself (plan cursor), sealed with the same pins the command prints.
+        resumed = S.W.start_work(route, leg_path, self.jobs)
+        self.assertEqual((resumed["state"], resumed["plan_advanced"]["leg"]), ("inline", read["index"]), resumed)
+        started = json.loads(Path(resumed["plan_advanced"]["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(set(RP.pin_tokens(started["selection_pins"])), SelectionPinContinuationTest.FRAME_PINS)
 
     def test_the_other_receipt_surfaces_read_through_the_same_projection(self):
         for name in ("capability-route.py", "dispatch_completion_join.py", "inline_finish.py", "work_start.py"):

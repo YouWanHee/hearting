@@ -776,6 +776,49 @@ def latest_leg_route(route):
     return current
 
 
+# --- The plan cursor -------------------------------------------------------------------
+# One append-only row per leg the runtime started from an approved decision, beside the
+# decision's frame route (the same shape as a route's recorded pin changes): which leg, the
+# route sealed for it, who advanced the plan and when. A replayed start reads it, so the same
+# leg is never compiled twice.
+
+PLAN_CURSOR_SCHEMA = 1
+
+
+def plan_cursor_path(root, frame_route_id) -> Path | None:
+    if not isinstance(frame_route_id, str) or not re.fullmatch(r"rt-[0-9a-f]{8,64}", frame_route_id):
+        return None
+    return Path(root).resolve() / ".runtime" / "framed-decision" / f"{frame_route_id}.plan-cursor.jsonl"
+
+
+def plan_cursor(root, frame_route_id, digest) -> list:
+    """The started legs of one decision, oldest first; rows for another decision are ignored."""
+    path = plan_cursor_path(root, frame_route_id)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path else []
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("schema") == PLAN_CURSOR_SCHEMA and row.get("digest") == digest
+                and type(row.get("index")) is int and isinstance(row.get("route_file"), str)):
+            rows.append(row)
+    return rows
+
+
+def append_plan_cursor(root, frame_route_id, row) -> None:
+    path = plan_cursor_path(root, frame_route_id)
+    if path is None:
+        raise ValueError("plan-cursor-unlocated")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"schema": PLAN_CURSOR_SCHEMA, **row}, sort_keys=True) + "\n")
+
+
 def next_leg_for_route(route):
     """`project_next_leg` for a finished route, found from its own sealed cycle; None otherwise."""
     if not isinstance(route, dict) or route.get("route_plan") is None:
