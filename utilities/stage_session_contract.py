@@ -192,6 +192,62 @@ def derive_gap_retry_manifest(
     }
 
 
+def derive_continuation_manifest(
+    manifest: dict[str, Any], unfinished_indexes, *, ran=(), notes=None, brief_dir: Path,
+) -> dict[str, Any]:
+    """The serial chain that finishes a stopped one, derived instead of hand-written.
+
+    `unfinished_indexes` are the sessions that did not pass, in order: one in `ran` (it ran
+    and did not pass) is run again as a `gap-retry` of itself, one that never started runs
+    as planned. A session that passed is not repeated. `notes` maps an index to the lines
+    its retry must know (what the previous attempt finished and what it left); they are
+    appended to a copy of its brief under `brief_dir`, the original brief is kept.
+    Identities derive from the source manifest's hash, so deriving again is
+    byte-identical and the same continuation is reused."""
+    if "_manifest_sha256" not in manifest:
+        raise StageSessionError("continuation-source-manifest-not-loaded")
+    by_index = {session["index"]: session for session in manifest["sessions"]}
+    wanted = [index for index in dict.fromkeys(unfinished_indexes) if index in by_index]
+    if not wanted:
+        raise StageSessionError("continuation-requires-an-unfinished-session")
+    parent = manifest["_manifest_sha256"]
+    sessions = []
+    for offset, index in enumerate(wanted, 1):
+        source = by_index[index]
+        derived = {key: source[key] for key in ("adapter", "fixed_files", "narrow_verify", "expected_round_trips")}
+        derived.update({
+            "subsession_id": f"ss-cont-{parent[:16]}-{offset}",
+            "attempt_id": f"att-cont-{parent[:16]}-{offset}",
+            "slug": f"cont-{parent[:8]}-{offset}",
+            "phase_brief": source["phase_brief"],
+            "continues": source["subsession_id"],
+        })
+        if index in ran:
+            derived["subsession_purpose"] = GAP_RETRY_PURPOSE
+            derived["gap_retry_of"] = source["subsession_id"]
+        lines = (notes or {}).get(index) or []
+        if lines:
+            brief = Path(brief_dir) / f"{derived['subsession_id']}.brief.md"
+            brief.parent.mkdir(parents=True, exist_ok=True)
+            brief.write_text(Path(source["phase_brief"]).read_text(encoding="utf-8").rstrip("\n")
+                             + "\n\n## From the previous attempt\n\n" + "".join(f"- {line}\n" for line in lines),
+                             encoding="utf-8")
+            derived["phase_brief"] = str(brief)
+        if "node" in source:
+            derived["node"] = source["node"]
+        sessions.append(derived)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "stage-session-chain",
+        "chain_id": f"ssc-cont-{parent[:16]}",
+        "mode": "serial",
+        **{key: manifest[key] for key in ("worktree", "route_file", "route_id", "route_hash",
+                                          "route_node", "completion_gate")},
+        "continues_manifest_sha256": parent,
+        "sessions": sessions,
+    }
+
+
 def _absolute(value: object, *, base: Path, field: str) -> Path:
     if not isinstance(value, str) or not value:
         raise StageSessionError(f"{field}-missing")

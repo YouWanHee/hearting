@@ -283,7 +283,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("action", choices=("check", "census", "register", "start", "plan-slices"))
     p.add_argument("--manifest", help="chain manifest (check/census/register/start)")
-    p.add_argument("--parent", help="owner slug (register/start)")
+    p.add_argument("--parent", help="owner slug (register/start); default: this session's own (AGENT_DISPATCH_SELF_SLUG)")
     p.add_argument("--jobs")
     p.add_argument("--route", help="plan-slices: compiled route file")
     p.add_argument("--node", default="execute", help="plan-slices: subdivision-permitted node id")
@@ -314,6 +314,7 @@ def main() -> int:
             }, sort_keys=True))
             return 65
         return 0
+    args.parent = args.parent or os.environ.get("AGENT_DISPATCH_SELF_SLUG")
     if not args.manifest or not args.parent:
         p.error(f"{args.action} requires --manifest and --parent")
     try:

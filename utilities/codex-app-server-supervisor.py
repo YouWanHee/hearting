@@ -1223,7 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
                 delivered.update(drive.traversed)
                 delivered.update(drive.closed)
                 delivered.update(partition.refusal_settled)
-                chain_notice = subsession_advance.chain_delivery_notice(drive, joined_rows)
+                chain_notice = subsession_advance.chain_delivery_notice(drive, joined_rows, Path(args.jobs))
                 if runtime_reconcile(args, joined, set(new_attempts)):
                     receipt = run_join(args, new_attempts)
                     joined_rows = current_children(

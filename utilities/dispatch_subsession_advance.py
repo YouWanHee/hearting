@@ -26,6 +26,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ import dispatch_subsession_resume_record as RESUME_RECORD  # noqa: E402
 from stage_session_contract import (
     ADAPTERS,
     GAP_RETRY_PURPOSE,
+    derive_continuation_manifest,
     load_manifest,
     sealed_pointer_bytes,
     slice_files_sha256,
@@ -918,7 +920,78 @@ def drive_serial_chain(
     )
 
 
-def chain_delivery_notice(result: ChainDriveResult, rows) -> str:
+def _previous_attempt_notes(route: dict, chain_id: str, row: dict) -> list[str]:
+    """What a stopped session's retry must know: how its attempt ended, what it recorded as
+    done (the chain handoff it flushed), and the leg's done-when items it left unmet."""
+    metadata = row["metadata"]
+    lines = [f"The previous attempt {metadata.get('attempt_id')} ended {metadata.get('note') or row['status']}."]
+    try:
+        handoff = HANDOFF.handoff_path(route["artifact_root"], route["route_id"], chain_id).read_text(encoding="utf-8")
+        if f"predecessor_attempt_id: {metadata.get('attempt_id')}" in handoff:
+            done = handoff.split("## Completed", 1)[1].split("\n## ", 1)[0]
+            lines += [f"Already done: {item[2:].strip()}" for item in done.splitlines() if item.startswith("- ")]
+    except (OSError, IndexError, KeyError, TypeError):
+        pass
+    try:
+        import route_authority
+        import route_plan
+        unmet = route_authority._blocked_round_items(route, metadata)
+        items = ((route_plan.leg_plan(route) or {}).get("leg") or {}).get("done_when") or []
+        lines += [f"Left unmet: {item['id']}: {item['text']}" for item in items if unmet and item["id"] in unmet]
+    except Exception:  # the items are a help, never a reason to withhold the continuation
+        pass
+    return lines
+
+
+def chain_continuation(jobs: Path, chain_id: str) -> dict | None:
+    """The serial chain that finishes a stopped one: written once beside the chain's handoff
+    under the route's artifact root, with the one command that starts it. None while any
+    session is still open, when every session passed, or when the chain cannot be read."""
+    manifest = load_chain_manifest(jobs, chain_id)
+    if not isinstance(manifest, dict) or manifest.get("mode") != "serial":
+        return None
+    try:
+        from dispatch_replacement_subsession import project
+        rows, _mapping = project(jobs, manifest, _registry_rows_for_chain(jobs, chain_id))
+        route = json.loads(Path(manifest["route_file"]).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    latest = {}
+    for row in rows:
+        try:
+            latest[int(row["metadata"].get("subsession_index", ""))] = row
+        except ValueError:
+            continue
+    unfinished, ran, notes = [], set(), {}
+    for session in manifest["sessions"]:
+        row = latest.get(session["index"])
+        if row is not None and row["status"] not in TERMINAL_STATUSES:
+            return None
+        metadata = (row or {}).get("metadata") or {}
+        if row is not None and row["status"] == "done" and DC.success_note(metadata) and DC.verdict_pass(metadata):
+            continue
+        unfinished.append(session["index"])
+        if metadata.get("launch_started") == "1":
+            ran.add(session["index"])
+            notes[session["index"]] = _previous_attempt_notes(route, chain_id, row)
+    if not unfinished:
+        return None
+    home = HANDOFF.handoff_path(route["artifact_root"], route["route_id"], chain_id).parent
+    try:
+        derived = derive_continuation_manifest(manifest, unfinished, ran=ran, notes=notes, brief_dir=home)
+        path = home / f"{derived['chain_id']}.json"
+        if not path.is_file():
+            path.write_text(json.dumps(derived, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except (OSError, ValueError, KeyError):
+        return None
+    from parent_next_directive import entrypoint
+    command = shlex.join([sys.executable, entrypoint(ROOT, "utilities/stage-session-chain.py"),
+                          "start", "--manifest", str(path)])
+    return {"chain_id": derived["chain_id"], "manifest": str(path),
+            "sessions": [session["continues"] for session in derived["sessions"]], "command": command}
+
+
+def chain_delivery_notice(result: ChainDriveResult, rows, jobs: Path | None = None) -> str:
     chain_id = result.refusal.chain_id if result.refusal else ""
     members = []
     for row in rows:
@@ -934,6 +1007,10 @@ def chain_delivery_notice(result: ChainDriveResult, rows) -> str:
     ][:16]
     if result.refusal is None and not failed:
         return ""
+    continuation = chain_continuation(Path(jobs), chain_id) if jobs is not None and chain_id else None
+    then = (f" The rest is written as {continuation['manifest']} ("
+            f"{', '.join(continuation['sessions'])}); start it with: {continuation['command']}"
+            if continuation else "")
     if result.refusal is not None:
         closed = ",".join(result.closed) or "none"
         unclosed = ",".join(result.unclosed) or "none"
@@ -941,9 +1018,9 @@ def chain_delivery_notice(result: ChainDriveResult, rows) -> str:
             f"Serial chain {chain_id}: advance stopped before index "
             f"{result.refusal.successor_index or '?'} ({result.refusal.reason}); "
             f"never-started slices closed: {closed}; not closed: {unclosed}."
-            + (f" Slices that did not pass: {','.join(failed)}." if failed else "")
+            + (f" Slices that did not pass: {','.join(failed)}." if failed else "") + then
         )
-    return f"Serial chain {chain_id}: slices that did not pass: {','.join(failed)}."
+    return f"Serial chain {chain_id}: slices that did not pass: {','.join(failed)}." + then
 
 
 def _load_ledger_module():

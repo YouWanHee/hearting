@@ -912,6 +912,87 @@ class ChainDeliveryNoticeDeferredTest(unittest.TestCase):
         self.assertEqual(notice, "")
 
 
+class ChainContinuationTest(unittest.TestCase):
+    """D5: a stopped serial chain's rest is derived by the runtime, not hand-written by the owner."""
+
+    def setUp(self):
+        from stage_session_contract import load_manifest
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        (base / "source").mkdir()
+        self.jobs = base / "state" / "jobs.log"
+        self.jobs.parent.mkdir()
+        route_path = base / "route.json"
+        self.route = {"route_id": "rt-" + "a" * 16, "route_hash": "sha256:" + "1" * 64, "cwd": str(base),
+                      "artifact_root": str(base / "reports"),
+                      "nodes": [{"id": "execute", "completion_gate": "code-execute", "write_scope": ["source/**"]}]}
+        route_path.write_text(json.dumps(self.route), encoding="utf-8")
+        self.route["_route_file"] = str(route_path)
+        sessions = []
+        for index in (1, 2, 3):
+            (base / f"brief-{index}.md").write_text(f"phase {index}\n", encoding="utf-8")
+            (base / "source" / f"s{index}.py").write_text("\n", encoding="utf-8")
+            sessions.append({"subsession_id": f"ss-phase-{index:04d}", "attempt_id": f"att-phase-{index:04d}",
+                             "adapter": "codex", "slug": f"phase-{index}", "phase_brief": str(base / f"brief-{index}.md"),
+                             "fixed_files": [str(base / "source" / f"s{index}.py")], "narrow_verify": "true",
+                             "expected_round_trips": 1})
+        source = base / "chain.json"
+        source.write_text(json.dumps({
+            "schema_version": 1, "kind": "stage-session-chain", "chain_id": "ssc-phases", "mode": "serial",
+            "worktree": str(base), "route_file": str(route_path), "route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"], "route_node": "execute", "completion_gate": "code-execute",
+            "sessions": sessions}), encoding="utf-8")
+        self.load = lambda path: load_manifest(path, route=self.route, node=self.route["nodes"][0])
+        manifest = self.load(source)
+        pointer = SA.chain_manifest_pointer_path(self.jobs, "ssc-phases")
+        pointer.parent.mkdir(parents=True)
+        pointer.write_text(json.dumps(manifest), encoding="utf-8")
+        HANDOFF.flush_handoff(
+            HANDOFF.handoff_path(self.route["artifact_root"], self.route["route_id"], "ssc-phases"),
+            predecessor_attempt_id="att-phase-0002", predecessor_subsession_id="ss-phase-0002",
+            manifest_sha256=manifest["_manifest_sha256"], completed_items=["18 assertions pass"],
+            next_command="-", invariants=[], forbidden_files=[])
+
+    def rows(self, second_status="done"):
+        def row(index, status, **meta):
+            meta = {"session_chain_id": "ssc-phases", "subsession_mode": "serial", "subsession_index": str(index),
+                    "attempt_id": f"att-phase-{index:04d}", **meta}
+            return "\t".join(["now", status, "1", "owner", f"phase-{index}", ",".join(f"{k}={v}" for k, v in meta.items())])
+        self.jobs.write_text("\n".join([
+            row(1, "done", note="completed-marker", failure_class="pass", launch_started="1"),
+            row(2, second_status, note="dead-worker-blocked", failure_class="blocked", launch_started="1"),
+            row(3, "cancelled", note="subsession-chain-advance-refused", launch_started="0")]) + "\n", encoding="utf-8")
+
+    def test_the_stopped_session_runs_again_with_what_it_did_and_the_never_started_one_follows(self):
+        self.rows()
+        found = SA.chain_continuation(self.jobs, "ssc-phases")
+        derived = self.load(found["manifest"])                    # a manifest the chain accepts as it is
+        self.assertEqual(found["sessions"], ["ss-phase-0002", "ss-phase-0003"])     # the passed one is not repeated
+        retry, rest = derived["sessions"]
+        self.assertEqual((retry["subsession_purpose"], retry["gap_retry_of"]), ("gap-retry", "ss-phase-0002"))
+        brief = Path(retry["phase_brief"]).read_text(encoding="utf-8")
+        self.assertTrue(brief.startswith("phase 2"))
+        self.assertIn("ended dead-worker-blocked", brief)
+        self.assertIn("Already done: 18 assertions pass", brief)
+        self.assertNotIn("subsession_purpose", rest)
+        self.assertEqual(Path(rest["phase_brief"]).read_text(encoding="utf-8"), "phase 3\n")
+        self.assertIn(f"stage-session-chain.py start --manifest {found['manifest']}", found["command"])
+        again = SA.chain_continuation(self.jobs, "ssc-phases")
+        self.assertEqual(again, found)                             # derived once, reused
+        result = SA.ChainDriveResult(
+            receipt={}, joined_rows=(), attempts=frozenset(), joined_before={}, traversed=frozenset(),
+            last_advanced_attempt_id=None, closed=(), unclosed=(),
+            refusal=SA.ChainAdvanceStep("refused", chain_id="ssc-phases", predecessor_index=2, successor_index=3,
+                                        reason="predecessor-blocked"))
+        self.assertIn("start it with: " + found["command"], SA.chain_delivery_notice(result, [], self.jobs))
+
+    def test_a_chain_still_running_or_wholly_passed_has_no_continuation(self):
+        self.rows(second_status="running")
+        self.assertIsNone(SA.chain_continuation(self.jobs, "ssc-phases"))
+        self.assertIsNone(SA.chain_continuation(self.jobs, "ssc-unknown"))
+
+
 class StartWaitRetryTest(unittest.TestCase):
     """A successor start refused before spawning for a reason waiting may fix is
     started again within the prelaunch grace, each refusal kept in the record."""
