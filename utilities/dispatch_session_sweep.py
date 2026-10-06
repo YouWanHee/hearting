@@ -82,6 +82,8 @@ def is_human_gate_record(record: object) -> bool:
     if not isinstance(record, dict):
         return False
     receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+    if receipt.get("kind") == "human-gate":
+        return True  # the strict gate receipt a Codex owner raises (human_gate_receipt)
     children = receipt.get("children") if isinstance(receipt.get("children"), list) else []
     return any(
         isinstance(child, dict)
@@ -104,6 +106,11 @@ def _bounded_receipt_text(record: dict) -> str:
     if receipt.get("kind") == "supervision":
         from dispatch_supervision import render_text
         return render_text(receipt)
+    if receipt.get("kind") == "human-gate":
+        return (f"delivery_id={record.get('delivery_id', '-')} route_id={receipt.get('route_id', '-')} "
+                f"route_file={receipt.get('route_file', '-')} attempt_id={receipt.get('owner_attempt_id', '-')} "
+                f"required_action={HUMAN_GATE_PREFIX}{receipt.get('gate', '-')} "
+                f"gate={receipt.get('gate', '-')} artifact={receipt.get('artifact_path', '-')}")
     if receipt.get("kind") == "notice":
         from session_notice import render_text
         return render_text(receipt)

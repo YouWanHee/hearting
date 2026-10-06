@@ -846,8 +846,10 @@ GATE_CARRIER_KINDS = frozenset({
     "claude-parent-runtime", "codex-managed-gateway", "codex-native-queue", "opencode-turn",
 })
 # Carriers that read the parent's records themselves, so a record always reaches
-# the parent; the Codex kinds deliver through a live sealed owner.
-GATE_RECORD_CARRIER_KINDS = frozenset({"claude-parent-runtime", "opencode-turn"})
+# the parent: Claude's sweep and rewake, the OpenCode plugin's turn carrier, and the
+# Codex prompt hook's sweep (it also reads the strict gate receipt once the owner's
+# sidecar watcher has ended). Only the managed gateway still needs a live owner.
+GATE_RECORD_CARRIER_KINDS = frozenset({"claude-parent-runtime", "opencode-turn", "codex-native-queue"})
 
 # A parent with no push carrier was told `bounded-wait`: it polls `capability-route.py start`, and that
 # call reads the ledger (`dispatch_replacement.owner_parked_gate`) and answers `waiting-human-gate`.
@@ -926,8 +928,8 @@ def gate_carrier_holds(recipient_kind, route, jobs_path):
     """Whether the recipient's push carrier can hold a record for this raise right now.
 
     A record-reading carrier always can (Claude's sweep and rewake, the OpenCode plugin's turn
-    carrier). The Codex kinds need a live sealed owner: after the owner exited there is no carrier,
-    only the parent's own receipt.
+    carrier, the Codex prompt-hook sweep). The managed gateway needs a live sealed owner: after the
+    owner exited it has no carrier, only the parent's own receipt.
     """
     if recipient_kind in GATE_RECORD_CARRIER_KINDS:
         return True
@@ -1216,11 +1218,17 @@ def create_gate_delivery(
         owner = _owner_row(_registry_rows(jobs_path), route["route_id"])
         metadata = owner["meta"] if owner is not None else {}
         sealed_batch_id = metadata.get("managed_sealed_batch_id") or ""
+        # The native queue's record is read by the parent's prompt sweep as well, so it
+        # outlives the owner's watcher; only the gateway needs the owner alive.
+        live_needed = recipient_kind != HUMAN_GATE.RECIPIENT_KIND
         if (
-            owner is None or owner["status"] not in {"open", "running"}
+            owner is None
+            or (live_needed and owner["status"] not in {"open", "running"})
             or metadata.get("attempt_id") != attempt_id
             or not sealed_batch_id
         ):
+            if in_receipt:
+                return None, False  # no strict receipt to keep: the parent reads it in its own receipt
             raise SupervisorError("gate-carrier-unavailable: live sealed owner missing")
         try:
             receipt = HUMAN_GATE.make_receipt(
