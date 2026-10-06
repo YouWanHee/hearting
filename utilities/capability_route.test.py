@@ -7558,6 +7558,25 @@ class ComposeRouteTest(TestRoute):
    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
    self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
    self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_spec_read_auto_accepts_this_sessions_recorded_read_of_the_unchanged_spec(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   repo=Path(tmp)/"repo"; reports=repo/".agent_reports"; home=Path(tmp)/"home"
+   (reports/"spec").mkdir(parents=True); home.mkdir(); prd=reports/"spec"/"prd.md"; prd.write_text("# prd\n",encoding="utf-8")
+   read=lambda session: subprocess.run(["sh",str(R.ROOT/"hooks"/"spec-read-marker.sh"),"--file",str(prd),"--session",session,
+                                        "--agent-home",str(home)],check=True,capture_output=True,text=True)
+   with mock.patch.object(R,"resolve_agent_home",return_value=str(home)), \
+        mock.patch.object(R.ROUTE_AUTHORITY,"default_parent_session_id",return_value="sess-a"):
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+    read("sess-b")                                    # another session's read is not this one's
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+    read("sess-a")
+    got=R.compose_spec_read(repo,reports,"auto")
+    self.assertEqual(got,{"satisfied":True,"source":R.SPEC_READ_MARKER_PREFIX+str(prd)})
+    os.utime(prd,(prd.stat().st_atime,prd.stat().st_mtime+5))   # the spec changed after the read
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+   with mock.patch.object(R.ROUTE_AUTHORITY,"default_parent_session_id",side_effect=D.DispatchContractError("caller-harness-ambiguous")):
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+    self.assertTrue(R.compose_spec_read(Path(tmp)/"none",Path(tmp)/"none","auto")["satisfied"])   # no spec: identity never asked
  def test_spec_read_auto_notes_the_shared_spec_layout_without_refusing(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp); ref=root/"shared"/"spec"/"ref_abc"

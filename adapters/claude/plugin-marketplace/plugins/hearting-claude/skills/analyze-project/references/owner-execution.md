@@ -112,8 +112,9 @@ python3 "$AGENT_HOME/utilities/compose-route.py" \
 - The tracked-gate fields (`--tracking`, `--spec-read`, `--drift-verdict`,
   `--workflow-mode`, `--artifact-guard`) are optional. A stated field passes
   through unchanged; an omitted one takes `compile`'s default, the same one
-  `compose` records. With a `spec/prd.md` present, the default names that file
-  and asks for `--spec-read <source>` after you read it.
+  `compose` records. With a `spec/prd.md` present, the default is satisfied once
+  this session has read that file (the read hook records it); before that it names
+  the file to read.
 - Dispatch evidence comes from the live nested-eligibility probe by default; pass
   `--dispatch-evidence <file>` when you already hold checked evidence. With no
   supported tuple the route fails closed.

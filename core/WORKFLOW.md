@@ -363,7 +363,8 @@ to obtain a complete recipe. `compose` fills omitted flags from the checkout: cw
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
-artifact root and the caller has not named what was read; the latest `prd.md` of
+artifact root and neither this session's read hook recorded reading it unchanged
+nor the caller named what was read; the latest `prd.md` of
 a `shared/spec/<ref>/` revision only adds one `[경로]` card line with its path), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`

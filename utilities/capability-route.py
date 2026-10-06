@@ -3278,8 +3278,9 @@ DEFAULT_ARTIFACT_GUARD = "compose-prechecked"
 
 def compose_spec_read(cwd, artifact_root, explicit):
     """`auto` is honest, not permissive: with no spec candidate it records the
-    absence; with a `spec/prd.md` present it refuses and names the file the
-    caller must read and assert (`--spec-read <source>`). The spec-read gate is
+    absence; with a `spec/prd.md` present it is satisfied when this session's read
+    hook recorded reading that file unchanged, and otherwise refuses and names the
+    file the caller must read (or assert with `--spec-read <source>`). The spec-read gate is
     a real invariant (WORKFLOW §7.0); compose only removes the boilerplate case.
     A shared-spec `prd.md` never blocks compose: the record says which file is
     there to read and `compose_card` passes that path on as one line."""
@@ -3292,11 +3293,45 @@ def compose_spec_read(cwd, artifact_root, explicit):
             if candidate.is_file():
                 present.append(str(candidate))
         shared.extend(_compose_shared_spec_prds(root))
+    unread = sorted(set(present) - set(_spec_reads_recorded(present, artifact_root) if present else ()))
+    if unread:
+        raise ValueError("compose-spec-read-required:" + ",".join(unread))
     if present:
-        raise ValueError("compose-spec-read-required:" + ",".join(sorted(set(present))))
+        return {"satisfied": True, "source": SPEC_READ_MARKER_PREFIX + ",".join(sorted(set(present)))}
     if shared:
         return {"satisfied": True, "source": SPEC_READ_SHARED_PREFIX + ",".join(sorted(set(shared)))}
     return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
+
+
+SPEC_READ_MARKER_PREFIX = "spec-read-marker: "
+
+
+def _spec_reads_recorded(paths, artifact_root):
+    """The `paths` this session has read unchanged, as the read hook recorded them
+    (`hooks/spec-read-marker.sh`: `<agent home>/.spec-grounding/<session>__<root key>`
+    holding the file's mtime at the read). Only a root-level `spec/prd.md` of the
+    artifact root has such a key; anything unreadable counts as not read."""
+    try:
+        session = ROUTE_AUTHORITY.default_parent_session_id()
+    except ValueError:                      # an ambiguous caller has no reads of its own
+        return []
+    if not session:
+        return []
+    root = Path(artifact_root)
+    key = str(root.parent).replace("/", "_").replace(" ", "_")
+    marker = Path(resolve_agent_home()) / ".spec-grounding" / f"{session}__{key}"
+    try:
+        recorded = int(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return []
+    read = []
+    for path in paths:
+        try:
+            if Path(path) == root / "spec" / "prd.md" and int(Path(path).stat().st_mtime) == recorded:
+                read.append(path)
+        except OSError:
+            continue
+    return read
 
 
 def _compose_spec_read_notice(route):
