@@ -210,6 +210,72 @@ def sweep_deliver(
     return claimed, len(entries)
 
 
+GATE_DELIVERY_HEADER = (
+    "Hearting human gate awaiting your decision (SD-123/129). Read the named artifact "
+    "(an interview file or a frame summary), put the [방향 확인] card and every interview "
+    "question to the user through AskUserQuestion -- one topic at a time, in plain words, "
+    "recommended answer first -- then record the answer with `workflow-supervisor.py "
+    "release --route <route file> --gate <name> --decision proceed|revise|stop "
+    "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
+    "`await-release` or has paused at the gate; the release continues the work either way. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+COMPLETION_DELIVERY_HEADER = (
+    "Hearting runtime delivery (SD-111 durable pending records for this session). "
+    "Follow each receipt's required_action. advance-completed confirms that attempt's "
+    "completion: consume its result without another harvest, then follow the owning "
+    "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
+    "runtime-owned close/finalize; a closed route needs no restart. "
+    "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
+    "For other unresolved actions use the exact checked recovery surface. "
+    "A receipt may repeat an earlier async notice; do not repeat an already handled action. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+
+
+def _followup(root: Path, record: dict) -> str:
+    """The exact next handle for one completion record (the queue carrier's text); never raises."""
+    receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+    if receipt.get("kind") == "supervision" or not isinstance(receipt.get("children"), list):
+        return ""
+    try:
+        from dispatch_completion_join import completion_followup_text
+        return completion_followup_text(
+            receipt, jobs=str(Path(root) / "jobs.log"),
+            surface=str(Path(__file__).resolve().parents[1] / "adapters" / "codex" / "bin" / "preflight.sh"))
+    except Exception:  # noqa: BLE001 -- the bounded receipt line still reaches the parent
+        return ""
+
+
+def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
+    """The one text a parent receives for its delivered records, whichever runtime carries it.
+
+    ``batches`` pairs each state root with the records claimed there. Gate notices are
+    answered, completions are consumed, so they get separate instructions.
+    """
+
+    gate_lines: list[str] = []
+    lines: list[str] = []
+    followups: list[str] = []
+    for root, records in batches:
+        for record in records:
+            text = _bounded_receipt_text(record)
+            if is_human_gate_record(record):
+                gate_lines.append(text)
+                continue
+            lines.append(text)
+            follow = _followup(root, record)
+            if follow and follow not in followups:
+                followups.append(follow)
+    blocks: list[str] = []
+    if gate_lines:
+        blocks.append(GATE_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in gate_lines))
+    if lines:
+        blocks.append(COMPLETION_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in lines)
+                      + "".join("\n" + follow for follow in followups))
+    return "\n\n".join(blocks)
+
+
 def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by: str) -> int:
     """Ack the records whose bounded receipt was injected; returns the count.
 
@@ -281,3 +347,67 @@ def sweep(
     elapsed_ns = time.monotonic_ns() - start_ns
     _append_self_instrumentation(root, elapsed_ns, len(entries), claimed)
     return ("claimed" if claimed else "refused", len(entries))
+
+
+def _state_roots() -> list[Path]:
+    from dispatch_contract import dispatch_state_roots, resolve_agent_home
+    return [Path(root) for root in dict.fromkeys(dispatch_state_roots(resolve_agent_home()))
+            if Path(root).is_dir()]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """A runtime carrier's steps for one session's records, as JSON on stdout.
+
+    ``roots`` names the state roots; ``deliver`` claims what is owed to the session and renders it; the carrier then
+    hands the text to its runtime and answers ``ack`` (taken) or ``release`` (not
+    taken, so the next pass claims it again), passing ``deliver``'s records on stdin.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("action", choices=("roots", "deliver", "ack", "release"))
+    parser.add_argument("--recipient-kind", default="")
+    parser.add_argument("--session", default="")
+    args = parser.parse_args(argv)
+    if args.action == "roots":
+        # Where this runtime's records live, so a carrier can look before it asks.
+        print(json.dumps([str(root) for root in _state_roots()]))
+        return 0
+    if not args.session:
+        parser.error("--session is required")
+    if args.recipient_kind not in pending_delivery.RECIPIENT_KINDS:
+        parser.error(f"unknown recipient kind {args.recipient_kind}")
+    if args.action == "deliver":
+        batches = []
+        for root in _state_roots():
+            records, _entries = sweep_deliver(root, args.recipient_kind, args.session)
+            if records:
+                batches.append((root, records))
+        print(json.dumps({
+            "text": delivery_context(batches),
+            "records": [{"root": str(root), "storage_key": record.get(STORAGE_KEY) or args.session,
+                         "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner")}
+                        for root, records in batches for record in records],
+        }, ensure_ascii=False))
+        return 0
+    try:
+        handed = json.load(sys.stdin).get("records") or []
+    except (ValueError, AttributeError):
+        handed = []
+    done = 0
+    for item in handed:
+        try:
+            root, key, delivery_id = Path(item["root"]), item["storage_key"], item["delivery_id"]
+            if args.action == "ack":
+                done += ack_delivered(root, args.session, [{"delivery_id": delivery_id, STORAGE_KEY: key}],
+                                      acked_by=f"{args.recipient_kind}:{args.session}")
+            else:
+                pending_delivery.release_claim(root, key, delivery_id, claim_owner=item["claim_owner"])
+                done += 1
+        except (KeyError, TypeError, OSError, pending_delivery.PendingDeliveryError):
+            continue
+    print(json.dumps({"action": args.action, "count": done}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

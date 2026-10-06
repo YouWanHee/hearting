@@ -1,7 +1,8 @@
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync, spawn } from "node:child_process"
-import { existsSync, mkdirSync, writeFileSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, writeFileSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync, readdirSync } from "node:fs"
+import { createHash } from "node:crypto"
 
 const pluginDir = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.resolve(pluginDir, "../../..")
@@ -728,42 +729,112 @@ function collectCandidates(args) {
   return (result.stdout || "").trim()
 }
 
-// SD-111 P4 -- OpenCode carrier 2. Called only from "chat.message" (turn
-// identity), never from "experimental.chat.system.transform" (which the
-// header comment above documents as re-firing on every model call --
-// title generation, the answering turn, and every tool-loop continuation).
-// A22 asserts zero re-injection there; this function must never be called
-// from that handler. OpenCode is measured `documented-only` for
-// session-generation proof (§3.5), so the sweep this spawns is always
-// refused with `pending-delivery-generation-unproven` -- fire-and-forget,
-// fail-open, must never block or throw into the turn.
-function sd111SessionSweep(sid) {
-  if (!sid || isWorkerSession()) return
-  const script = [
-    "import sys",
-    "sys.path.insert(0, sys.argv[2])",
-    "try:",
-    "    from dispatch_contract import dispatch_state_roots, resolve_agent_home",
-    "    from dispatch_session_sweep import sweep",
-    "    roots = dispatch_state_roots(resolve_agent_home())",
-    "except Exception:",
-    "    roots = ()",
-    "for r in roots:",
-    "    try:",
-    "        sweep(r, 'opencode-turn', sys.argv[1], 'unsupported')",
-    "    except Exception:",
-    "        pass",
-  ].join("\n")
-  try {
-    const child = spawn("python3", ["-c", script, sid, path.join(root, "utilities")], {
-      cwd: root,
-      env: { ...process.env, AGENT_HOME: root },
-      detached: true,
-      stdio: "ignore",
+// Parent completion carrier (`opencode-turn`, utilities/harness_capabilities.py). A parent
+// that launched a registered owner is told `parent_next=end-turn` and yields; this plugin
+// process -- not the model -- finds the records owed to that session and starts its next
+// turn with them through promptAsync. The shared sweep claims, renders and acks
+// (utilities/dispatch_session_sweep.py); the plugin only looks, hands the text over and
+// reports whether OpenCode took it. Tool commands carry CARRIER_ENV so a launch can tell
+// a runtime that has this carrier from one that predates it. Fail-open: a carrier
+// problem never blocks or throws into a turn.
+const CARRIER_ENV = "AGENT_PARENT_COMPLETION_CARRIER"
+const CARRIER_KIND = "opencode-turn"
+const CARRIER_INTERVAL_MS = 5000
+const sweepTool = path.join(root, "utilities", "dispatch_session_sweep.py")
+const OWED_STATES = new Set(["pending", "claimed", "sent-ambiguous"])
+
+// One bounded sweep step off the server's event loop; any failure is null.
+function carrierCommand(action, sid, handed) {
+  return new Promise((resolve) => {
+    let out = ""
+    let child
+    const finish = (value) => { clearTimeout(timer); resolve(value) }
+    const timer = setTimeout(() => { try { child?.kill("SIGKILL") } catch {} ; finish(null) }, 10000)
+    try {
+      child = spawn("python3", [sweepTool, action, "--recipient-kind", CARRIER_KIND, "--session", sid || ""], {
+        cwd: root, env: { ...process.env, AGENT_HOME: root }, stdio: ["pipe", "pipe", "ignore"],
+      })
+    } catch { finish(null); return }
+    child.on("error", () => finish(null))
+    child.stdout.on("data", (chunk) => { out += chunk })
+    child.on("close", (code) => {
+      if (code !== 0) { finish(null); return }
+      try { finish(JSON.parse(out || "null")) } catch { finish(null) }
     })
-    child.unref()
-  } catch {
-    // best-effort; carrier 2 must never block a turn
+    child.stdin.on("error", () => {})
+    child.stdin.end(handed ? JSON.stringify(handed) : "")
+  })
+}
+
+function createCompletionCarrier(ctx) {
+  const sessions = new Set()
+  const status = new Map()
+  const busy = new Set()
+  let roots = null
+  let timer = null
+  const prompter = () => ctx.client?.session
+  const available = () => !isWorkerSession() && typeof prompter()?.promptAsync === "function"
+
+  // A cheap look at this session's own records, so an idle tick spawns nothing.
+  async function owed(sid) {
+    if (roots === null) roots = (await carrierCommand("roots")) || []
+    const digest = createHash("sha256").update(sid).digest("hex")
+    for (const base of roots) {
+      let names = []
+      try { names = readdirSync(path.join(base, "pending-delivery", digest)) } catch { continue }
+      for (const name of names) {
+        if (!name.startsWith("delivery-") || !name.endsWith(".json")) continue
+        try {
+          const record = JSON.parse(readFileSync(path.join(base, "pending-delivery", digest, name), "utf8"))
+          if (record?.recipient_kind === CARRIER_KIND && OWED_STATES.has(record.state)) return true
+        } catch {}
+      }
+    }
+    return false
+  }
+
+  async function deliver(sid, look = true) {
+    if (!sid || busy.has(sid) || !available()) return
+    if (status.get(sid) === "busy" || status.get(sid) === "retry") return
+    busy.add(sid)
+    let timeout
+    try {
+      if (look && !(await owed(sid))) return
+      const claimed = await carrierCommand("deliver", sid)
+      if (!claimed?.text || !Array.isArray(claimed.records) || !claimed.records.length) return
+      let taken = false
+      try {
+        const result = await Promise.race([
+          prompter().promptAsync({ path: { id: sid }, body: { parts: [{ type: "text", text: claimed.text }] } }),
+          new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("carrier-timeout")), 5000) }),
+        ])
+        taken = Boolean(result) && result.error == null && result.response?.ok !== false
+      } catch { taken = false }
+      // Taken: the session's next turn holds the receipt. Not taken: the next pass claims it again.
+      await carrierCommand(taken ? "ack" : "release", sid, claimed)
+    } catch {
+    } finally {
+      clearTimeout(timeout)
+      busy.delete(sid)
+    }
+  }
+
+  return {
+    // The env a tool command of `sid` carries: only a runtime that will carry the receipt says so.
+    env(sid) {
+      if (!sid || !available()) return null
+      sessions.add(sid)
+      if (!timer) {
+        timer = setInterval(() => { for (const id of sessions) deliver(id).catch(() => {}) }, CARRIER_INTERVAL_MS)
+        timer.unref?.()
+      }
+      return `${CARRIER_KIND}:${sid}`
+    },
+    status(sid, type) { if (sid && type) status.set(sid, type) },
+    // A finished turn also looks past its own records (a seat handover stores them elsewhere).
+    async idle(sid) { if (!sid) return; status.set(sid, "idle"); if (sessions.has(sid)) await deliver(sid, false) },
+    forget(sid) { sessions.delete(sid); status.delete(sid) },
+    dispose() { if (timer) clearInterval(timer); timer = null; sessions.clear() },
   }
 }
 
@@ -910,9 +981,10 @@ export const AgentHarnessGuards = async (ctx) => {
   markPluginLoaded(dispatchSlug())
   peerIdentityLog(ctx, "plugin", "plugin-registered")
   registerPaneContext(ctx)
+  const completionCarrier = createCompletionCarrier(ctx)
 
   return ({
-  dispose: () => retirePaneContext(ctx),
+  dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
   event: async ({ event }) => {
     if (event && event.type === "session.compacted") {
       collectCard("compact", (event.properties && event.properties.sessionID) || "", baseDir(ctx))
@@ -923,6 +995,9 @@ export const AgentHarnessGuards = async (ctx) => {
     // It refreshes the summary and pane, starts the cycle checkpoint observation and
     // touches the heartbeat; memory has no
     // idle or session-end step (it exchanges after writes and reads, D-82/D-83).
+    if (event && event.type === "session.status") {
+      completionCarrier.status(event.properties?.sessionID || "", event.properties?.status?.type || "")
+    }
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
       observePaneCallback(ctx, "session.idle", eventSid)
@@ -932,6 +1007,7 @@ export const AgentHarnessGuards = async (ctx) => {
       }
       spawnCheckpoint(eventSid)
       await pendingPeerDelivery(ctx, eventSid)
+      completionCarrier.idle(eventSid).catch(() => {})
       // Liveness side-channel: touch the heartbeat for the active dispatch slug
       // so dispatch-liveness.py can detect stale/crashed headless sessions even
       // when the OpenCode SQLite session mtime is inconclusive.
@@ -941,6 +1017,7 @@ export const AgentHarnessGuards = async (ctx) => {
       const sid = (event.properties && event.properties.sessionID) || ""
       if (sid) {
         spawnSummary(sid, "final")
+        completionCarrier.forget(sid)
         promptBySession.delete(sid)
         turnBySession.delete(sid)
         memoryBySession.delete(sid)
@@ -959,7 +1036,6 @@ export const AgentHarnessGuards = async (ctx) => {
     const sid = eventSid || "opencode-plugin"
     spawnSummary(eventSid, "initial")
     await projectPane(eventSid, ctx)
-    sd111SessionSweep(sid)
     const prompt = promptText(output)
     const turn = input.messageID || output?.message?.id || ""
     if (prompt) promptBySession.set(sid, prompt)
@@ -1036,6 +1112,7 @@ export const AgentHarnessGuards = async (ctx) => {
     for (const key of inheritedIdentityEnv) output.env[key] = ""
     const sid = input && input.sessionID
     if (sid) output.env.OPENCODE_SESSION_ID = sid
+    output.env[CARRIER_ENV] = completionCarrier.env(sid) || ""
   },
   // The two kept write gates (hooks/core-write-guard.py): installed release copies
   // and the shared checkout seen from a linked worktree. Anything else is allowed.

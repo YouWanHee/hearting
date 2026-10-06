@@ -2,9 +2,9 @@
   "schema_version": 1,
   "harness": "opencode",
   "parent_completion": {
-    "carrier": null,
-    "reason": null,
-    "parent_proof": null,
+    "carrier": "opencode-turn",
+    "reason": "opencode-plugin-turn",
+    "parent_proof": "carrier-env",
     "without_carrier": "poll"
   }
 }

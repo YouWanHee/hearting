@@ -27,9 +27,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "utilities"))
 from dispatch_contract import dispatch_state_roots, resolve_agent_home  # noqa: E402
 from dispatch_session_sweep import (  # noqa: E402
-    _bounded_receipt_text,
     ack_delivered,
-    is_human_gate_record,
+    delivery_context,
     sweep_deliver,
 )
 
@@ -66,8 +65,7 @@ def main() -> int:
     except Exception:  # noqa: BLE001 -- fail-open, never block the session
         return 0
     seen: set[Path] = set()
-    lines: list[str] = []
-    gate_lines: list[str] = []
+    batches: list[tuple[Path, list[dict]]] = []
     for root in roots:
         if root in seen:
             continue
@@ -80,49 +78,19 @@ def main() -> int:
             records, _entries = sweep_deliver(root, RECIPIENT_KIND, session_id)
         except Exception:  # noqa: BLE001 -- fail-open (§13.33.1-(3))
             continue
-        if not records:
-            continue
-        for record in records:
-            text = _bounded_receipt_text(record)
-            (gate_lines if is_human_gate_record(record) else lines).append(text)
+        if records:
+            batches.append((root, records))
+    # Gate notices reach the session here too (SD-123 (8)(b) carrier 2): whether the
+    # `asyncRewake` hook process survives an interrupt or a compaction is unmeasured
+    # (SD-OPEN-29/32), so the next prompt is the required fallback.
+    context = delivery_context(batches)
+    for root, records in batches:
         try:
             ack_delivered(root, session_id, records, acked_by=f"session-sweep:{session_id}")
         except Exception:  # noqa: BLE001
             pass
-    if not lines and not gate_lines:
+    if not context:
         return 0
-    blocks: list[str] = []
-    if gate_lines:
-        # SD-123 (8)(b) carrier 2. This is the required fallback, not a nicety:
-        # whether the `asyncRewake` hook process survives an interrupt or a
-        # compaction is unmeasured (SD-OPEN-29/32), so the gate must also reach
-        # the session on its next prompt. Telling the recipient to *harvest* a
-        # gate would be wrong -- a gate is answered, not collected.
-        blocks.append(
-            "Hearting human gate awaiting your decision (SD-123/129). Read the named artifact "
-            "(an interview file or a frame summary), put the [방향 확인] card and every interview "
-            "question to the user through AskUserQuestion -- one topic at a time, in plain words, "
-            "recommended answer first -- then record the answer with `workflow-supervisor.py "
-            "release --route <route file> --gate <name> --decision proceed|revise|stop "
-            "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
-            "`await-release` or has paused at the gate; the release continues the work either way. "
-            "Do not start Monitor, dispatch-wait, or a polling loop.\n"
-            + "\n".join(f"- {line}" for line in gate_lines)
-        )
-    if lines:
-        blocks.append(
-            "Hearting runtime delivery (SD-111 durable pending records for this session). "
-            "Follow each receipt's required_action. advance-completed confirms that attempt's "
-            "completion: consume its result without another harvest, then follow the owning "
-            "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
-            "runtime-owned close/finalize; a closed route needs no restart. "
-            "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
-            "For other unresolved actions use the exact checked recovery surface. "
-            "A receipt may repeat an earlier async notice; do not repeat an already handled action. "
-            "Do not start Monitor, dispatch-wait, or a polling loop.\n"
-            + "\n".join(f"- {line}" for line in lines)
-        )
-    context = "\n\n".join(blocks)
     print(
         json.dumps(
             {
