@@ -90,7 +90,9 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertEqual((args.parent_session_id, args.parent_harness, args.parent_slug),
                          ("claude-sid", "claude", None))
         self.assertEqual(RA.caller_identity({"CLAUDE_CODE_SESSION_ID": "claude-sid"}), ("claude", "claude-sid"))
-        self.assertEqual(RA.correction_source_session({"CLAUDE_CODE_SESSION_ID": "claude-sid"}), "operator")
+        # One reading now: the correction sender is the same session caller_identity names
+        # (the old copy did not read CLAUDE_CODE_SESSION_ID and labelled it "operator").
+        self.assertEqual(RA.correction_source_session({"CLAUDE_CODE_SESSION_ID": "claude-sid"}), "claude-sid")
 
 
 class Case2SealedPinTest(unittest.TestCase):
