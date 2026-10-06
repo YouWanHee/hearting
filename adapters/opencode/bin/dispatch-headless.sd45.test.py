@@ -454,6 +454,24 @@ class OpenCodePermissionDefault(unittest.TestCase):
         # A read root identical to a writable root adds no deny at all.
         self.assertNotIn("/tmp/fixture-artifact-root", edit)
 
+    def test_a_read_root_inside_the_worktree_stays_writable_and_a_holding_one_stays_denied(self):
+        # BC: a read root inside the worktree denied the owner's own edits while its grant
+        # recorded it writable; a read root holding a writable root keeps its deny (hearting-verify-cc).
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}, clear=False):
+            config = json.loads(WH.scoped_external_directory_config(
+                "/tmp/fixture-artifact-root", None, ("/data/out",),
+                execution_access_read_roots=("/tmp/fixture-wt/docs", "/data"),
+                worktree="/tmp/fixture-wt", selected_agent="build",
+            ))
+        for permission in (config["permission"], config["agent"]["build"]["permission"]):
+            edit = permission["edit"]
+            for pattern in ("/tmp/fixture-wt/docs", "/tmp/fixture-wt/docs/**", "docs", "docs/**"):
+                self.assertNotIn(pattern, edit)
+            self.assertEqual(edit["/data/**"], "deny")
+            self.assertEqual(permission["external_directory"]["/data/**"], "allow")
+        edit = config["permission"]["edit"]
+        self.assertEqual((edit["/data/out"], edit["/data/out/**"]), ("allow", "allow"))
+
     def test_read_roots_overlay_selected_agent_without_new_defaults(self):
         before = {"permission": {"external_directory": {"*": "deny"}, "edit": {"*": "ask"}},
                   "agent": {"build": {"permission": {"bash": "ask"}}}}
