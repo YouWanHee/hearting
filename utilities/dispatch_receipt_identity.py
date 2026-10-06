@@ -17,7 +17,7 @@ CANONICAL_CHILD_KEYS = frozenset({
     # A receipt without it has exactly the bytes and digest it had before.
     "next_leg",
 })
-NOTICE_KINDS = frozenset({"human-gate", "supervision"})
+NOTICE_KINDS = frozenset({"human-gate", "supervision", "notice"})
 COMPLETION_ACTIONS = frozenset({"complete-open", "inspect-done-failure", "advance-completed",
                                 "finish-workflow", "inspect-recovery"})
 # The two closure-blocked:<gate reason> literals mirror

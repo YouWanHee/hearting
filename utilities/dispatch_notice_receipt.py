@@ -10,12 +10,15 @@ def codec(receipt: dict):
     if isinstance(receipt, dict) and receipt.get("kind") == "supervision":
         import dispatch_supervision
         return dispatch_supervision
+    if isinstance(receipt, dict) and receipt.get("kind") == "notice":
+        import session_notice
+        return session_notice
     import human_gate_receipt
     return human_gate_receipt
 
 
 def is_notice(receipt: object) -> bool:
-    return isinstance(receipt, dict) and receipt.get("kind") in {"human-gate", "supervision"}
+    return isinstance(receipt, dict) and receipt.get("kind") in {"human-gate", "supervision", "notice"}
 
 
 def validate_pending_record(record: dict, **kwargs) -> dict:

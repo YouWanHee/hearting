@@ -406,7 +406,7 @@ def _replacement_disposition(root: Path, recipient_key: str, value: dict) -> str
     Human gates retain their original delivery contract and are never retired.
     """
     receipt = value.get("receipt") or {}
-    if (receipt.get("kind") in {"human-gate", "supervision"}
+    if (receipt.get("kind") in {"human-gate", "supervision", "notice"}
             or any(isinstance(child, dict) and str(child.get("required_action", "")).startswith("human-gate:")
                    for child in receipt.get("children", []))):
         return ""
