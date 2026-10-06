@@ -620,6 +620,19 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertEqual("tool-permission", grant.file_enforcement)
         self.assertEqual("none", grant.network_enforcement)
 
+    def test_opencode_grant_reflects_read_roots_while_other_runtimes_do_not(self) -> None:
+        readonly = self.root / "readonly-data"
+        readonly.mkdir()
+        self.write_request(read_roots=[str(readonly)])
+        request = load_request(self.request_file, context=self.context)
+        grant = build_grant(request, runtime="opencode")
+        self.assertEqual(tuple(request.read_roots), tuple(grant.read_roots))
+        self.assertNotIn("read-roots-unprojected", grant.unmet)
+        for runtime in ("codex-exec", "claude-cli"):
+            other = build_grant(request, runtime=runtime)
+            self.assertEqual((), other.read_roots)
+            self.assertIn("read-roots-unprojected", other.unmet)
+
     def test_receipt_matches_projection_and_is_absent_without_request(self) -> None:
         self.assertEqual("", receipt_fragment(None))
         grants = (
