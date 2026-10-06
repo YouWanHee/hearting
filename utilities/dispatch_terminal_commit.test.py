@@ -1725,7 +1725,9 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             replay = terminal.settle_terminal_commit(request)
             self.assertEqual(replay.result, "completed", replay)
             handoff = terminal.completed_owner_handoff(jobs, "done", meta)
-            placed = next(Path(fixture.root).rglob("prd.md"))
+            # Admission also creates a shared PRD; the claimed cycle primary
+            # above remains the owner handoff's representative on replay.
+            placed = official
         self.assertIn(f"artifact: {placed.resolve()}", handoff)
 
     def test_a_changed_or_missing_report_is_history_after_settlement(self):

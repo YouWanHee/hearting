@@ -7727,11 +7727,10 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
         elif len(refs) > 1:
             raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
         else:
-            route = _read_json(Path(record["route_file"]))
-            if (route is None or route.get("route_id") != record.get("route_id")
-                    or route.get("route_hash") != record.get("route_hash")
-                    or route_identity.route_hash(route) != record.get("route_hash")):
-                raise ProducerError("route-binding-mismatch", cycle_id)
+            # Reuse the sealed manifest's canonical route admission, including
+            # verified continuations of the cycle's original begin identity.
+            document = _read_json(directory / "manifest.json") or {}
+            _route_file, route = resolve_cycle_manifest_route(root, record, document)
             primary = official_spec_primary_path(root, record, route)
             if primary is None:
                 return {**result, "reason": "official-spec-prd-missing"}
