@@ -421,6 +421,32 @@ def _strip_particles(token: str) -> str:
     return token
 
 
+_KOREAN_WRITE_TAIL = re.compile(
+    r"(?:을|를|은|는|이|가|도|만|및)?\s*(?:가능|하다|한다|함|하기|하고|합니다|해요|하여|해서|해|할|됨|된다)?")
+
+
+def _affirmed_write(words: str, *, alone: bool = False) -> str | None:
+    """The write word a clause affirms, by where it stands rather than which words
+    surround it: a Korean one followed by nothing but a particle, `가능` or a plain
+    ending (`…/out에 결과 저장`, `쓰기 가능`), an English one with no other word
+    before it (`write …/out`). With `alone` no other word may stand before it either
+    (a parenthesis right after a path: `(write)`, `(덮어쓰기 가능)`). Anything else
+    (`수정 대상 아님`, `nothing written to`) affirms nothing and stays read."""
+
+    for found in _SCOPE_WRITES.finditer(words):
+        start = found.start()
+        while start > 0 and (words[start - 1].isalnum() or words[start - 1] == "_"):
+            start -= 1                                   # the whole word the match sits in
+        before = re.findall(r"[\w가-힣]+", words[:start])
+        tail = re.sub(r"^[\W_]+|[\W_]+$", "", words[found.end():])
+        if re.search(r"[가-힣]", found.group(0)):
+            if _KOREAN_WRITE_TAIL.fullmatch(tail) and not (alone and before):
+                return found.group(0)
+        elif not before:
+            return found.group(0)
+    return None
+
+
 def _scope_access(clauses: list[str], parenthesized: list[bool] | None = None) -> list[tuple[str, str]]:
     """`(access, why)` for each clause of the scope field: `write` only where the
     clause says it writes there and says nothing that reads, negates or excludes,
@@ -445,16 +471,19 @@ def _scope_access(clauses: list[str], parenthesized: list[bool] | None = None) -
             leading = {}
         words = _TASK_PATH.sub(" ", clause)        # a path's own letters say nothing
         for kind, pattern in (("exclude", _SCOPE_EXCLUDED), ("read", _SCOPE_READ_ONLY),
-                              ("negated", _SCOPE_NEGATED), ("write", _SCOPE_WRITES)):
+                              ("negated", _SCOPE_NEGATED)):
             found = pattern.search(words)
-            if not found:
-                continue
-            if has_path:
-                marks[index].setdefault(kind, found.group(0))
-            elif kind != "write":
-                (marks[owner] if owner is not None else leading).setdefault(kind, found.group(0))
-            elif owner == index - 1 and parenthesized[index]:
-                marks[owner].setdefault(kind, found.group(0))
+            if found:
+                (marks[index] if has_path else marks[owner] if owner is not None else leading
+                 ).setdefault(kind, found.group(0))
+        if has_path:
+            written = _affirmed_write(words)
+            if written:
+                marks[index].setdefault("write", written)
+        elif owner == index - 1 and parenthesized[index]:
+            written = _affirmed_write(words, alone=True)
+            if written:
+                marks[owner].setdefault("write", written)
         if excluded_from is None and owner is not None and "exclude" in marks[owner]:
             excluded_from = owner
     result = []
@@ -471,7 +500,7 @@ def _scope_access(clauses: list[str], parenthesized: list[bool] | None = None) -
         elif "read" in mark or "negated" in mark:
             result.append(("read", f"reads:{mark.get('read') or mark['negated']}"))
         else:
-            result.append(("read", "no write word"))
+            result.append(("read", "no affirmed write word"))
     return result
 
 

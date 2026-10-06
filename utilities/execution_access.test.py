@@ -944,6 +944,25 @@ class DerivedAccessTest(unittest.TestCase):
             # A write word about something else does not attach to a path.
             "범위: 결과 보고서 작성, /x/raw": {"/x/raw": "read"},
             "범위: /x/raw, 결과 보고서 작성": {"/x/raw": "read"},
+            # Where a write word stands decides, not which words surround it (PROBE4).
+            "범위: /x/out 저장, /x/raw 삭제하면 안 돼": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 안돼": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 생성, /x/raw 수정 불필요": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, nothing written to /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, neither edit nor delete /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, refrain from editing /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw must stay unmodified": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 X": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 대상 아님": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 말 것": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/raw (보고서 작성)": {"/x/raw": "read"},
+            "범위: /x/raw (원본) 수정": {"/x/raw": "read"},
+            "범위: /x/out (결과 위치, 덮어쓰기 가능)": {"/x/out": "read"},
+            "범위: 수정 없음, /x/out 저장": {"/x/out": "read"},
+            "범위: /x/raw (write), /x/out (no write)": {"/x/raw": "write", "/x/out": "read"},
+            "범위: /x/out (덮어쓰기 가능)": {"/x/out": "write"},
+            "범위: /x/out에 결과 저장한다": {"/x/out": "write"},
+            "범위: /x/store 저장소 확인": {"/x/store": "read"},
         }
         for line, expected in cases.items():
             with self.subTest(line=line):
