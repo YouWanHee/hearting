@@ -971,5 +971,33 @@ class OpencodeTerminalRecognitionTest(unittest.TestCase):
         self.assertIsNone(parsed)
 
 
+class ExactBoundaryTableTest(unittest.TestCase):
+    """Each harness's own turn boundary is named once; readers ask the table."""
+
+    def test_each_harness_recognizes_only_its_own_boundary(self):
+        envelope = "artifact: -\nverdict: FAIL\nblocker: tests failed"
+        logs = {
+            "codex": [{"type": "item.completed", "item": {"type": "agent_message", "text": envelope}},
+                      {"type": "turn.completed"}],
+            "claude": [{"type": "result", "subtype": "success", "is_error": False, "result": envelope}],
+            "opencode": [{"type": "text", "part": {"type": "text", "text": envelope}},
+                         {"type": "step_finish", "part": {"type": "step-finish", "reason": "stop"}}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for harness, rows in logs.items():
+                path = Path(tmp) / f"{harness}.jsonl"
+                path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+                parsed = terminal._read_terminal(path)
+                if harness == "claude":
+                    parsed = {**parsed, "native_completed": True}
+                with self.subTest(harness=harness):
+                    self.assertEqual(parsed["verdict"], "FAIL")
+                    self.assertEqual({h: terminal.exact_boundary(parsed, h) for h in logs},
+                                     {h: h == harness for h in logs})
+                    self.assertNotEqual(terminal.boundary_label(parsed["source"]), parsed["source"])
+        self.assertFalse(terminal.exact_boundary({"source": "exact-claude-result"}, "claude"))
+        self.assertEqual(set(terminal.EXACT_BOUNDARY_SOURCES), {"claude", "codex", "opencode"})
+
+
 if __name__ == "__main__":
     unittest.main()
