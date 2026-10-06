@@ -25,6 +25,7 @@ from execution_access import (
     read_roots_data,
     resolve_task_targets,
 )
+import execution_access as EA
 
 
 class ExecutionAccessTest(unittest.TestCase):
@@ -778,6 +779,268 @@ class ExecutionAccessTest(unittest.TestCase):
             "execution-access-enforcement-unavailable:codex-network-hosts",
             raised.exception.reason,
         )
+
+
+class DerivedAccessTest(unittest.TestCase):
+    """A task folder outside the worktree reaches every harness without a hand-written
+    request: the task text names read roots, only the approved scope names write roots."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.home = self.root / "home"
+        self.worktree = self.root / "worktree"
+        self.artifact = self.root / "artifact"
+        self.state = self.root / "state" / "dispatch"
+        self.other = self.root / "projects" / "other"
+        self.elsewhere = self.root / "projects" / "elsewhere"
+        for path in (self.home / ".ssh", self.worktree / "src", self.artifact, self.state,
+                     self.other / "out", self.other / "ref", self.other / "data" / "raw",
+                     self.other / "docs", self.elsewhere):
+            path.mkdir(parents=True)
+        (self.other / "docs" / "prd.md").write_text("spec\n", encoding="utf-8")
+        env = {"HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
+               "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "XDG_CONFIG_HOME": str(self.home / ".config")}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+        self.jobs = self.state / "jobs.log"
+
+    def route(self, text, *, capability="autopilot-code"):
+        return {"route_id": "rt-derive", "route_hash": "sha256:" + "d" * 64, "cwd": str(self.worktree),
+                "artifact_root": str(self.artifact), "capability": capability, "work_request": {"text": text}}
+
+    def task(self):
+        o = self.other
+        return ("# 다른 프로젝트 정리\n"
+                f"범위: {o}/out에 결과 저장, {o}/ref 읽기만, {o}/data/raw 제외\n"
+                f"입력: {o}/data 와 {o}/docs/prd.md, 참고 {self.elsewhere}\n"
+                f"{self.home}/.ssh/config, {self.worktree}/src, {o}/missing, /tmp\n")
+
+    def prepared(self, path):
+        return (json.loads(path.read_text(encoding="utf-8")),
+                json.loads(path.with_name("binding.json").read_text(encoding="utf-8")))
+
+    def test_the_approved_scope_writes_and_the_task_text_only_reads(self):
+        path = prepare_task_request(self.route(self.task()), self.jobs)
+        request, binding = self.prepared(path)
+        o = self.other
+        self.assertEqual(request["writable_roots"], [str(o / "out")])
+        self.assertEqual(request["read_roots"], sorted([str(o / "docs"), str(o / "ref"), str(self.elsewhere)]))
+        self.assertIn("approved scope field (line 2, writes:저장)", request["justification"][str(o / "out")])
+        self.assertIn("task text (line 3, task text)", request["justification"][str(self.elsewhere)])
+        skipped = {row["path"]: row["reason"] for row in binding["derivation"]["skipped"]}
+        self.assertEqual(skipped[str(o / "data" / "raw")], "excluded-by-scope")
+        self.assertEqual(skipped[str(o / "data")], "holds-excluded-path")
+        self.assertEqual(skipped[str(self.home / ".ssh" / "config")], "sensitive")
+        self.assertEqual(skipped[str(self.worktree / "src")], "already-granted")
+        self.assertEqual(skipped[str(o / "missing")], "missing")
+        self.assertEqual(skipped["/tmp"], "too-broad")
+        self.assertEqual(path, prepare_task_request(self.route(self.task()), self.jobs))
+
+    def test_every_harness_projects_the_same_derived_roots(self):
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / "install")
+        request = load_request(prepare_task_request(self.route(self.task()), self.jobs), context=context)
+        grants = [build_grant(request, runtime=runtime, default_writable_roots=(self.worktree,))
+                  for runtime in ("codex-exec", "claude-cli", "opencode")]
+        self.assertEqual({(g.writable_roots, g.read_roots) for g in grants},
+                         {(request.writable_roots, request.read_roots)})
+        self.assertEqual([g.read_enforcement for g in grants], ["os-sandbox", "tool-permission", "tool-permission"])
+
+    def test_a_node_other_than_the_owner_only_reads(self):
+        path = prepare_task_request(self.route(self.task()), self.jobs, node="frame")
+        self.assertEqual(path.parent.name, "frame")
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], [])
+        self.assertIn(str(self.other / "out"), request["read_roots"])
+        notes = {row["path"]: row.get("note") for row in binding["derivation"]["granted"]}
+        self.assertEqual(notes[str(self.other / "out")], "node-reads-only")
+
+    def test_a_manual_request_wins_over_derivation(self):
+        manual = self.root / "manual.json"
+        manual.write_text(json.dumps({"schema_version": 1, "writable_roots": [str(self.elsewhere)],
+                                      "read_roots": [], "network": {"required": False}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(manual)}):
+            self.assertIsNone(prepare_task_request(self.route(self.task()), self.jobs))
+            run_root = self.root / "runs"
+            with mock.patch.object(EA, "_lab_run_root", return_value=run_root):
+                path = prepare_task_request(self.route(self.task(), capability="autopilot-lab"), self.jobs)
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], sorted([str(self.elsewhere), str(run_root)]))
+        self.assertEqual(request["read_roots"], [])
+        self.assertNotIn("derivation", binding)
+
+    def test_a_node_keeps_what_it_derived_at_its_first_preparation(self):
+        (self.other / "out").rmdir()
+        first = prepare_task_request(self.route(self.task()), self.jobs)
+        before = first.read_bytes()
+        (self.other / "out").mkdir()      # appears later: a resume does not widen the grant
+        self.assertEqual(prepare_task_request(self.route(self.task()), self.jobs), first)
+        self.assertEqual(first.read_bytes(), before)
+        self.assertEqual(json.loads(before)["writable_roots"], [])
+
+    def test_a_preparation_from_before_derivation_keeps_deriving_nothing(self):
+        route = self.route(self.task())
+        with mock.patch.object(EA, "_lab_run_root", return_value=self.root / "runs"), \
+                mock.patch.object(EA, "derive_task_access", return_value=EA.DerivedAccess((), (), (), {})):
+            old = prepare_task_request(dict(route, capability="autopilot-lab"), self.jobs)
+        self.assertNotIn("derivation", self.prepared(old)[1])
+        with mock.patch.object(EA, "_lab_run_root", return_value=self.root / "runs"):
+            again = prepare_task_request(dict(route, capability="autopilot-lab"), self.jobs)
+        self.assertEqual(again, old)
+        self.assertEqual(self.prepared(again)[0]["read_roots"], [])
+
+    def test_a_derived_root_the_validator_refuses_is_dropped_not_refused(self):
+        broad = EA.DerivedAccess((Path("/"),), (), (("/", "Derived write root"),),
+                                 {"granted": [{"path": "/", "access": "write", "line": 1, "source": "scope",
+                                               "text": "범위: /"}], "skipped": []})
+        with mock.patch.object(EA, "derive_task_access", return_value=broad):
+            self.assertIsNone(prepare_task_request(self.route("범위: /\n"), self.jobs))
+            with mock.patch.object(EA, "_lab_run_root", return_value=self.root / "runs"):
+                path = prepare_task_request(self.route("범위: /\n", capability="autopilot-lab"), self.jobs)
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], [str(self.root / "runs")])
+        self.assertEqual(binding["derivation"]["granted"], [])
+        self.assertTrue(binding["derivation"]["dropped"].startswith("execution-access-root-too-broad"))
+
+    def test_a_qualifier_after_a_scope_path_belongs_to_that_path(self):
+        # The start card's scope holds what is included and what is excluded (WORKFLOW §0.4);
+        # a path is written only where its clause says so and nothing else.
+        cases = {
+            "범위: /x/out, /x/raw(제외)": {"/x/out": "read", "/x/raw": "excluded"},
+            "범위: /x/out 쓰기, /x/raw (읽기 전용)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out (write), /x/raw (read-only)": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out에 저장, /x/raw (손대지 않음)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out 저장, /x/raw, 읽기만": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 쓰기 (원본 /x/raw 제외)": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out 수정, 원본 /x/raw 유지": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw is off-limits": {"/x/out": "write", "/x/raw": "excluded"},
+            "범위: /x/out 저장, /x/ro (write-protected)": {"/x/out": "write", "/x/ro": "excluded"},
+            "범위: /x/out에 쓰지 마": {"/x/out": "excluded"},
+            "범위: /x/a 읽고 결과 저장": {"/x/a": "read"},
+            "범위: /x/db 기록조사": {"/x/db": "read"},
+            "범위: /x/plain": {"/x/plain": "read"},
+            "> 범위: /x/quoted 저장": {"/x/quoted": "read"},
+            "범위: /data/outputs, /data/write_here": {"/data/outputs": "read", "/data/write_here": "read"},
+            "범위: /data/input 저장": {"/data/input": "write"},
+            "범위: 읽기만, /x/a 저장": {"/x/a": "read"},
+            "범위: 다음은 제외, /x/a 저장, /x/b 저장": {"/x/a": "excluded", "/x/b": "excluded"},
+            # A negated action is not a write (hearting-verify-cc PROBE3).
+            "범위: /x/out 생성, /x/raw 수정 안 함": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 생성, /x/raw 변경 없음": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 쓰기 불가": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 삭제하면 안 됨": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 못 함": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정하지 않음": {"/x/out": "write", "/x/raw": "excluded"},
+            "Scope: /x/out (write), /x/raw (no writes)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, don't modify /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw cannot be modified": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw shouldn't be edited": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, avoid writing /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, do not modify /x/raw": {"/x/out": "write", "/x/raw": "excluded"},
+            # A write word about something else does not attach to a path.
+            "범위: 결과 보고서 작성, /x/raw": {"/x/raw": "read"},
+            "범위: /x/raw, 결과 보고서 작성": {"/x/raw": "read"},
+            # Where a write word stands decides, not which words surround it (PROBE4).
+            "범위: /x/out 저장, /x/raw 삭제하면 안 돼": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 안돼": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 생성, /x/raw 수정 불필요": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, nothing written to /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, neither edit nor delete /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, refrain from editing /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw must stay unmodified": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 X": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 대상 아님": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정 말 것": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/raw (보고서 작성)": {"/x/raw": "read"},
+            "범위: /x/raw (원본) 수정": {"/x/raw": "read"},
+            "범위: /x/out (결과 위치, 덮어쓰기 가능)": {"/x/out": "read"},
+            "범위: 수정 없음, /x/out 저장": {"/x/out": "read"},
+            "범위: /x/raw (write), /x/out (no write)": {"/x/raw": "write", "/x/out": "read"},
+            "범위: /x/out (덮어쓰기 가능)": {"/x/out": "write"},
+            "범위: /x/out에 결과 저장한다": {"/x/out": "write"},
+            "범위: /x/store 저장소 확인": {"/x/store": "read"},
+            # An English write word after its path stands alone, and a question is no answer (PROBE5).
+            "Scope: /x/out (write), /x/raw (writes disabled)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out (write), /x/raw (edits blocked)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw writes disabled": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out (write), /x/raw (write-locked)": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정?": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 쓰기 가능, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write results to /x/out, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: save outputs under /x/out, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 생성한다, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out write": {"/x/out": "write"},
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual({row[1]: row[2] for row in EA._task_paths(line)}, expected)
+
+    def test_the_verifier_probe_never_widens_to_write(self):
+        # ACCESS-DERIVATION-PROBE.py (hearting-verify-cc [28]), as a regression.
+        X = self.root / "X"
+        for name in ("out", "raw", "keep", "other", "secret_stuff"):
+            (X / name).mkdir(parents=True)
+        (X / "out" / "f.txt").write_text("x", encoding="utf-8")
+        (self.home / "docs").mkdir()
+        (X / "lnk_ssh").symlink_to(self.home / ".ssh")
+        (X / "lnk_home").symlink_to(self.home)
+        (X / "lnk_etc").symlink_to("/etc")
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / "install",
+                                      environ={"HOME": str(self.home)})
+        cases = [
+            ("범위: $X/out (write), $X/raw (read-only)", True, {"$X/out": "write", "$X/raw": "read"}, {}),
+            ("범위: $X/out, $X/raw(제외)", True, {"$X/out": "read"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $X/out 쓰기, $X/raw (읽기 전용)", True, {"$X/out": "write", "$X/raw": "read"}, {}),
+            ("범위: $X/out, $X/raw (손대지 않음)", True, {"$X/out": "read"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $X/out 쓰기 (원본 $X/raw 제외)", True, {"$X/out": "write"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $X/out, $X/raw, 읽기만", True, {"$X/out": "read", "$X/raw": "read"}, {}),
+            ("범위: $X/out, $X/raw 원본 유지, $X/keep is off-limits", True,
+             {"$X/out": "read", "$X/raw": "read"}, {"$X/keep": "excluded-by-scope"}),
+            ("범위: $X/lnk_ssh 저장", True, {}, {"$X/lnk_ssh": "sensitive"}),
+            ("범위: $X/lnk_home 저장", True, {}, {"$X/lnk_home": "too-broad"}),
+            ("범위: $X/lnk_etc 저장", True, {}, {"$X/lnk_etc": "sensitive"}),
+            ("범위: /, $H 저장", True, {}, {"$H": "too-broad"}),
+            ("범위: $X/out/../../home/.ssh 저장", True, {}, {"$X/out/../../home/.ssh": "not-a-path"}),
+            ("범위: $X/out 저장", False, {"$X/out": "read"}, {}),
+            ("결과는 $X/out 에 쓰고 $X/raw 를 읽는다", True, {"$X/out": "read", "$X/raw": "read"}, {}),
+            ("> 범위: $X/other 저장\n참고 문서 인용", True, {"$X/other": "read"}, {}),
+            ("범위: $X/secret_stuff 저장", True, {}, {"$X/secret_stuff": "sensitive"}),
+            ("범위: $X/out/f.txt 저장", True, {"$X/out": "read"}, {}),
+            ("Scope: write $X/out; not $X/raw", True, {"$X/out": "write"}, {"$X/raw": "excluded-by-scope"}),
+            ("범위: $H/docs 저장", True, {"$H/docs": "write"}, {}),
+        ]
+        def short(path):
+            return path.replace(str(X), "$X").replace(str(self.home), "$H")
+        for text, write, granted, skipped in cases:
+            with self.subTest(text=text):
+                derived = EA.derive_task_access(
+                    {"work_request": {"text": text.replace("$X", str(X)).replace("$H", str(self.home))}},
+                    context, write=write)
+                self.assertEqual({short(r["path"]): r["access"] for r in derived.record["granted"]}, granted)
+                self.assertEqual({short(r["path"]): r["reason"] for r in derived.record["skipped"]}, skipped)
+                for row in derived.record["granted"]:
+                    self.assertTrue(row["why"])
+        rows = EA.derive_task_access({"work_request": {"text": f"범위: {X}/out에 결과 저장"}}, context)
+        self.assertIn("writes:저장", rows.justification[0][1])
+
+    def test_the_task_text_reader(self):
+        rows = EA._task_paths(
+            "**범위:** /a/out에 저장, /a/ref 참조, /a/raw 제외, /a/after\n"
+            "- Scope: /b/x (read-only /b/y)\n"
+            "scope: {writes: [\"/c/w\"], reads: [\"/c/r\"]}\n"
+            "see https://example.com/d/e and 경로:/f/g. and /h/보고서_v2초안\n"
+            "범위 변경: /i/j\n")
+        found = {(path, access, source) for _, path, access, source, _, _ in rows}
+        self.assertEqual(found, {
+            ("/a/out", "write", "scope"), ("/a/ref", "read", "scope"), ("/a/raw", "excluded", "scope"),
+            ("/a/after", "excluded", "scope"), ("/b/x", "read", "scope"), ("/b/y", "read", "scope"),
+            ("/c/w", "write", "scope"), ("/c/r", "read", "scope"), ("/f/g", "read", "task"),
+            ("/h/보고서_v2초안", "read", "task"), ("/i/j", "read", "task")})
 
 
 if __name__ == "__main__":

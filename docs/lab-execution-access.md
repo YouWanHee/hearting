@@ -14,8 +14,24 @@ Inventory가 없거나 주석 템플릿 상태라면 경로를 추측하지 않�
 
 ## 외부 데이터 경로 지정
 
-사용자가 승인한 정확한 경로를 기존 JSON 형식으로 지정한다. 다음 경로는 예시이며
-실제 승인된 경로로 바꿔야 한다. 자유로운 작업 설명에 나온 경로는 grant로 추정하지 않는다.
+수동 요청 파일이 없으면 start·resume이 봉인된 작업문에서 요청을 만든다
+(`execution_access.derive_task_access`).
+
+- 읽기 루트: 작업문에 나온 절대경로 중 실제로 있는 폴더. 파일이면 그 폴더다.
+- 쓰기 루트: 시작 카드의 `범위:`(`Scope:`) 칸에서 쓰기 표현(쓰기·저장·수정·생성·write·save 등)이 있고
+  읽기·제외 표현은 없는 구절의 기존 폴더만, owner에만 준다. 경로 뒤 괄호나 쉼표 뒤의 경로 없는 구절
+  (`(제외)`, `(읽기 전용)`, `, 읽기만`)은 바로 앞 경로에 붙는다. 쓰기 표현이 없거나 읽기·쓰기가 섞인
+  경로는 읽기, 제외 표현(제외·금지·않·off-limits 등)이 처음 나온 경로부터는 읽기에서도 뺀다. 해석이 애매하면
+  권한이 작은 쪽으로 정한다. 작업문의 다른 곳에 나온 경로는 쓰기 루트가 되지 않는다.
+- 빼는 것: credentials·키·`~/.ssh` 같은 홈의 숨김 폴더·사용자/런타임 설정·시스템 영역, 없는 경로,
+  너무 넓은 경로, worktree·artifact root처럼 이미 쓸 수 있는 곳.
+- 근거: 루트마다 요청의 `justification`에 출처(범위 칸/작업문, 몇째 줄, 그렇게 정한 표현, 그 구절)가 남는다.
+  준비된 `binding.json`의 `derivation`에는 받은 루트와 뺀 경로·이유가 남는다.
+- 같은 route 노드는 처음 준비한 결과를 resume에서도 그대로 쓴다. 도출한 루트가 검증을 통과하지 못하면
+  그 루트들만 빼고 시작하며, 도출 때문에 시작이 거절되지는 않는다.
+
+수동 요청 파일은 계속 받으며, 있으면 도출보다 우선한다. 다음 경로는 예시이며
+실제 승인된 경로로 바꿔야 한다.
 
 ```json
 {
@@ -86,9 +102,9 @@ Codex의 `workspace-write`에서는 writable root를 OS sandbox에 적용한다.
 request가 없는 builder argv는 유지한다. 공식 Codex 설정도 파일 경로별 permission과
 workspace 확장을 지원한다. [Codex permissions 설정](https://learn.chatgpt.com/docs/config-file/config-reference)
 
-현재 Hearting builder는 추가 `read_roots`를 읽기 전용 grant로 투영하지 않는다.
-그 입력을 보존하되 `read-roots-unprojected`로 보고하며, `os-sandbox`를 요구하면 거부한다.
-현재 지원되는 외부 데이터 grant가 필요하면 승인된 최소 writable root를 명시한다.
+`read_roots`는 세 하네스 모두 읽기 전용으로 투영한다(어댑터 선언표 `access`). Codex sandbox는
+어디든 읽고 writable root에만 쓰며, Claude는 루트마다 `--add-dir`와 Edit 거부 규칙,
+OpenCode는 `external_directory` 읽기 전용이다. 실제 보장 수준은 grant의 `read_enforcement`에 남는다.
 
 SSH 등 네트워크가 필요하면 기존 `network.required=true`와 `reason`을 명시하고 기존
 owner 네트워크 정책을 따른다. `network.hosts`는 현재 호스트별 격리를 보장하지 않는다.

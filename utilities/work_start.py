@@ -443,7 +443,8 @@ def _start(route, path, jobs, node, harness, run):
     access_diagnostic = ""
     # Explicit requests keep precedence; lab owners combine that validated
     # input with their inventory run storage through the same request format.
-    # Frame/code defaults are unchanged, and start/resume share this path.
+    # Otherwise the request carries what the approved task names (its target
+    # table and the roots derived from its text); start/resume share this path.
     lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
     if lab_owner or not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
         try:
