@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "harness": "codex",
+  "parent_completion": {
+    "carrier": "codex-native-queue",
+    "reason": "native-thread-queue",
+    "parent_proof": "native-session",
+    "without_carrier": "refuse"
+  }
+}

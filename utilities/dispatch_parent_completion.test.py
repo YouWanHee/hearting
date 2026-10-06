@@ -45,7 +45,8 @@ class ParentDeliveryContract(unittest.TestCase):
         with self.assertRaises(P.DispatchContractError) as raised:
             P.validate_interactive_parent_launch(request)
         self.assertEqual(raised.exception.reason, "native-parent-identity-unproven")
-        self.assertIn("CODEX_THREAD_ID", str(raised.exception))
+        self.assertIn("codex", str(raised.exception))
+        self.assertIn("thread-parent", str(raised.exception))
 
     def test_every_adapter_parser_binds_the_actual_parent_session(self):
         for parent, key in (("codex", "CODEX_THREAD_ID"),

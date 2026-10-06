@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "harness": "claude",
+  "parent_completion": {
+    "carrier": "claude-parent-runtime",
+    "reason": "claude-async-rewake-resume",
+    "parent_proof": "runtime-hook",
+    "without_carrier": "poll"
+  }
+}
