@@ -161,24 +161,26 @@ def with_training_progress(snapshot, resource_jobs=(), now=None):
     matches = {}
     remote_matches = {}
     for job in resource_jobs or ():
+        if getattr(job, "liveness", None) != "working":
+            continue
         training = getattr(job, "training_progress", None)
-        if getattr(job, "liveness", None) != "working" or not isinstance(training, dict):
-            continue
-        observed = training.get("observed_at")
-        updated = training.get("progress_updated_at")
-        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+        if isinstance(training, dict):
+            observed = training.get("observed_at")
+            updated = training.get("progress_updated_at")
+            if all(isinstance(value, (int, float)) and not isinstance(value, bool)
                    and math.isfinite(value) for value in (observed, updated)) \
-                or not 0 <= now - observed <= 30:
-            continue
-        key = (training.get("pid"), str(training.get("starttime")), training.get("process_group"))
-        if not _pos_int(key[0]) or not _pos_int(key[2]) \
-                or key[2] != getattr(job, "process_group", None):
-            continue
-        # Multiple registrations with different observations are ambiguous.
-        if key in matches and matches[key] != training:
-            matches[key] = None
-        else:
-            matches.setdefault(key, training)
+                    and 0 <= now - observed <= 30:
+                key = (training.get("pid"), str(training.get("starttime")),
+                       training.get("process_group"))
+                if _pos_int(key[0]) and _pos_int(key[2]) \
+                        and key[2] == getattr(job, "process_group", None):
+                    # Multiple registrations with different observations are ambiguous.
+                    if key in matches and matches[key] != training:
+                        matches[key] = None
+                    else:
+                        matches.setdefault(key, training)
+        # Remote candidates register independently of local training: an
+        # all-remote run (local collect None) must still join its own host.
         for candidate in getattr(job, "remote_training", None) or ():
             if not isinstance(candidate, dict) or candidate.get("remote") is not True:
                 continue
