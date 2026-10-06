@@ -205,7 +205,7 @@ def pin_changes_path(route) -> Path | None:
     root = route.get("artifact_root") if isinstance(route, dict) else None
     route_id = route.get("route_id") if isinstance(route, dict) else None
     if not isinstance(root, str) or not root or not isinstance(route_id, str) \
-            or not re.fullmatch(r"rt-[0-9a-f]{8,64}", route_id):
+            or not re.fullmatch(r"rt-[A-Za-z0-9-]{1,64}", route_id):
         return None
     return Path(root).resolve() / ".runtime" / "routes" / f"{route_id}.pin-changes.jsonl"
 
@@ -279,6 +279,15 @@ def route_in_force(route):
     return view
 
 
+def moved_owner_harness(route, launched_harness: str | None) -> str | None:
+    """The owner harness the route's parent moved to after an owner launched on
+    `launched_harness`, or None. Only a recorded change moves a replacement; a sealed pin the
+    original launch did not follow (a usage-limit fallback) keeps today's same-harness replay."""
+    changes = [row for row in pin_changes(route) if row.get("target") == "owner"]
+    harness = changes[-1]["pin"]["harness"] if changes else None
+    return harness if harness and harness != launched_harness else None
+
+
 def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
                       tuples: list, candidates: list, now: float | None = None) -> dict | None:
     """Append one pin change for this route; None when the pin in force is already `pin`."""
@@ -322,7 +331,9 @@ def pinned_launch_harness(route, *, worker_type: str | None, requested: str | No
     return pinned, (requested if requested not in (None, pinned) else None)
 
 
-# A replacement replays its source on the same harness, registry and worktree.
+# A replacement replays its source on the same harness, registry and worktree -- unless the
+# route's parent moved the owner pin before the claim (`moved_owner_harness`): that owner
+# replacement takes the ordinary owner launch on the new harness with the same work.
 REPLACEMENT_FIXED_KEYS = ("harness", "jobs", "worktree")
 
 

@@ -879,6 +879,11 @@ def claim(jobs: Path, aid: str) -> dict:
                   'reuse': _reuse_snapshot(jobs, route, lines)}
         if proof.get('death_kind') == FRAME_CAPACITY:
             record['profile_transition'] = dict(FRAME_TRANSITION)
+        moved = route_authority.moved_owner_harness(route, replay.get('harness')) \
+            if meta.get('worker_type') == 'owner' else None
+        if moved:
+            # The route's parent moved the owner pin before this claim: the replacement runs there.
+            record['harness'] = moved
         # Index first: every retry admission sees the consumed budget after a crash.
         _reserve_source(jobs, aid, family)
         _once(_record_path(jobs, family), record)
@@ -1075,11 +1080,21 @@ def admission(jobs, lines, metadata):
                     'attempt_id': source['attempt_id'], 'binding_digest': source['review_input_digest']}):
             raise DC.DispatchContractError('reviewed-evidence-replacement-mismatch')
     expected_task = _replacement_task(record, source, replay)
-    _check_tuple(candidate, replay, _transition_of(record))
+    moved = _moved_harness(record, replay)
+    if moved:
+        # The route's parent moved the owner before this claim: the same work on the new harness.
+        # Its command, resolved settings and permission realization are the new harness's own.
+        if candidate.get('harness') != moved:
+            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'harness')
+        for key in ('jobs', 'worktree'):
+            if candidate.get(key) != replay.get(key):
+                raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
+    else:
+        _check_tuple(candidate, replay, _transition_of(record))
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
     expected_argv = _replacement_argv(record, source, replay)
-    if candidate.get('argv') != expected_argv:
+    if not moved and candidate.get('argv') != expected_argv:
         raise DC.DispatchContractError('replacement-argv-mismatch')
     if Path(record['route_file']).with_suffix('.outcome.json').exists():
         raise DC.DispatchContractError('replacement-route-closed')
@@ -1242,6 +1257,47 @@ def _command(jobs, record, source, replay):
     return [sys.executable,str(root/f'adapters/{replay["harness"]}/bin/dispatch-headless.py'),*argv]
 
 
+def _moved_harness(record, replay):
+    """The harness a claim moved this replacement to, or None when it replays its source's."""
+    harness = record.get('harness')
+    return harness if harness and harness != replay.get('harness') else None
+
+
+def _argv_value(argv, flag):
+    for index, arg in enumerate(argv):
+        if arg == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith(flag + '='):
+            return arg.split('=', 1)[1]
+    return None
+
+
+def _moved_owner_command(jobs, record, source, replay):
+    """A replacement owner on the harness its route's parent moved the pin to.
+
+    The source command belongs to another harness, so it is not replayed: the same work (task,
+    route, worktree, access request, parent session) takes the ordinary owner launch path, which
+    builds the new harness's own command from the route in force."""
+    _runtime_drift(replay)
+    task = _replacement_task(record, source, replay)
+    prompt = _directory(jobs)/'tasks'/(record['replacement_attempt_id']+'.txt')
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    raw = task.encode()
+    if prompt.is_symlink() or (not _write_once(prompt.parent,prompt,raw) and prompt.read_bytes()!=raw):
+        raise DC.DispatchContractError('replacement-task-conflict')
+    command = [sys.executable, str(ROOT.resolve()/'utilities/dispatch-owner.py'), '--start',
+               '--adapter', record['harness'], '--route-evidence', record['route_file'],
+               '--jobs', str(Path(jobs).resolve()), '--worktree', replay['worktree'],
+               '--slug', _argv_value(replay['argv'], '--slug') or record['replacement_attempt_id'],
+               '--attempt-id', record['replacement_attempt_id'],
+               '--automatic-retry-of', record['original_attempt_id'], '--prompt-file', str(prompt)]
+    for flag in ('--execution-access-file', '--parent-session-id'):
+        value = _argv_value(replay['argv'], flag)
+        if value:
+            command += [flag, value]
+    return command
+
+
 # The detached launcher returns once the owner is claimed; slow shared storage needs room.
 LAUNCHER_TIMEOUT_SECONDS = 600
 
@@ -1390,9 +1446,13 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         if not (binding and binding[1] in rows and (rows[binding[1]][0][1] not in {'open','running'}
                 or rows[binding[1]][1].get('launch_claimed') == '1')):
             # Nothing is launched yet: limit, drift and cleanup are judged before anything durable is written.
-            hold = _capacity_hold(jobs, source, _retry_model(source, kind))
+            _, current_route = _route(jobs, aid, source)
+            moved = (route_authority.moved_owner_harness(current_route, launch_input(jobs, aid, source).get('harness'))
+                     if source.get('worker_type') == 'owner' else None)
+            hold_source = {**source, 'harness': moved, 'model': None} if moved else source
+            hold = _capacity_hold(jobs, hold_source, None if moved else _retry_model(source, kind))
             if hold:
-                return _capacity_wait(jobs, aid, source, hold)
+                return _capacity_wait(jobs, aid, hold_source, hold)
             _runtime_drift(launch_input(jobs, aid, source))
             _settle_terminal_cleanup(jobs, rows, aid, source)
         record = claim(Path(jobs), aid)
@@ -1415,7 +1475,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                 return {'state':'running','attempt_id':replacement,'record':record}
         replay = launch_input(jobs,aid,source)
         from dispatch_replacement_batch import command as batch_command
-        command = batch_command(jobs, record, source, replay) or _command(jobs,record,source,replay)
+        command = (_moved_owner_command(jobs, record, source, replay) if _moved_harness(record, replay)
+                   else batch_command(jobs, record, source, replay) or _command(jobs,record,source,replay))
         env = dict(os.environ)
         # The old launcher reservation/owner tuple is not a grant for its successor.
         for key in list(env):

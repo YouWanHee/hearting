@@ -1323,6 +1323,74 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    def _move_owner(self, harness='claude'):
+        import route_authority as RA
+        return RA.record_pin_change(self.route, target='owner', pin={'harness': harness}, by={'harness': 'codex',
+                                    'session_id': 'parent'}, source='unattributed', tuples=[], candidates=[])
+
+    def _moved_successor(self, record, command, harness='claude'):
+        """The new harness's wrapper seals the forwarded owner command and registers the replacement."""
+        aid = record['replacement_attempt_id']
+        args = SimpleNamespace(**vars(self.args)); args.attempt_id = aid
+        args.replacement_input_argv = command[3:]
+        meta = {k: v for k, v in self.meta.items() if k not in ('note', 'failure_class', 'launch_outcome',
+                                                                'replacement_input_digest')}
+        meta.update(worker_type='owner', harness=harness, attempt_id=aid, automatic_retry_of='att-source',
+                    launch_claimed='0', replacement_family_id=record['family_id'],
+                    replacement_original_attempt_id='att-source', replacement_ordinal='1',
+                    replacement_claim_digest=R._digest(record))
+        meta.update(D.parse_registry_metadata(R.seal_launch_input(args, harness, 'the raw task')))
+        self.write(meta, 'open', append=True)
+        return meta
+
+    def test_a_parent_moved_owner_pin_continues_the_answered_owner_on_the_new_harness(self):
+        # RA-3: BC's Codex owner ended BLOCKED; its parent moved the owner pin to Claude and answered.
+        self._blocked_owner()
+        self._answer()
+        self.assertEqual(self._move_owner()['previous'], None)
+        result, commands = self._launch()
+        record = result['record']
+        self.assertEqual(record['harness'], 'claude')
+        (command,) = commands
+        self.assertTrue(command[1].endswith('utilities/dispatch-owner.py'))
+        self.assertEqual(command[command.index('--adapter') + 1], 'claude')
+        self.assertEqual(command[command.index('--attempt-id') + 1], record['replacement_attempt_id'])
+        self.assertEqual(command[command.index('--automatic-retry-of') + 1], 'att-source')
+        self.assertEqual(Path(command[command.index('--prompt-file') + 1]).read_text(), 'the raw task')
+        # The Claude wrapper's own sealed input is admitted as the same work ...
+        moved = self._moved_successor(record, command)
+        lines = self.jobs.read_text().splitlines()
+        self.assertEqual(R.admission(self.jobs, lines, moved)['harness'], 'claude')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('approved: start the full run', text)        # the answer goes first, unchanged
+        # ... and a launch on any other harness is not.
+        wrong = {**moved, 'attempt_id': record['replacement_attempt_id']}
+        with mock.patch.object(R, 'launch_input', side_effect=lambda jobs, aid, meta: {
+                **json.loads((R._directory(self.jobs) / 'inputs' / (aid + '.json')).read_text()),
+                **({'harness': 'opencode'} if aid == record['replacement_attempt_id'] else {})}):
+            with self.assertRaises(D.DispatchContractError) as refused:
+                R.admission(self.jobs, lines, wrong)
+        self.assertEqual((refused.exception.reason, refused.exception.detail),
+                         ('replacement-input-tuple-mismatch', 'harness'))
+
+    def test_a_pin_moved_after_the_claim_leaves_that_replacement_on_its_harness(self):
+        self._blocked_owner()
+        self._answer()
+        record = self.claim()
+        self.assertNotIn('harness', record)
+        self._move_owner()
+        result, commands = self._launch()
+        self.assertTrue(commands[0][1].endswith('adapters/codex/bin/dispatch-headless.py'))
+
+    def test_without_a_recorded_change_the_owner_replays_on_its_own_harness(self):
+        self._blocked_owner()
+        self._answer()
+        self.route['selection_pins'] = {'owner': {'harness': 'claude'}}   # sealed, never followed by the launch
+        result, commands = self._launch()
+        self.assertNotIn('harness', result['record'])
+        self.assertTrue(commands[0][1].endswith('adapters/codex/bin/dispatch-headless.py'))
+
     def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
         import dispatch_owner_input as I
         meta = {**self.meta, 'worker_type': 'owner'}
