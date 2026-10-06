@@ -70,10 +70,6 @@ def _exact_campaign_control(root: Path, campaign_path_value: Path, path: Path,
         Path(path).relative_to(root).as_posix(), node_kind, prospective=prospective,
     ).allowed
 STATE_FIELDS = ("state", "satisfied_on", "satisfaction_event_id")
-_RUNTIME_SESSION_ENV = (("CLAUDE_CODE_SESSION_ID", "claude"),
-                        ("CODEX_THREAD_ID", "codex"),
-                        ("CODEX_SESSION_ID", "codex"),
-                        ("OPENCODE_SESSION_ID", "opencode"))
 MAX_JSON = 16 * 1024 * 1024
 
 # A cycle sealed `state: active` (route open at seal time, D-6) whose route has
@@ -708,16 +704,14 @@ def _materialize(root, path):
 
 
 def _agent_actor():
-    harness = os.environ.get("AGENT_HARNESS")
-    session = None
-    if not harness:
-        for key, name in _RUNTIME_SESSION_ENV:
-            if os.environ.get(key):
-                harness, session = name, os.environ[key]
-                break
-    if session is None and harness:
-        session = next((os.environ.get(key) for key, _name in _RUNTIME_SESSION_ENV
-                        if os.environ.get(key)), None)
+    # The calling harness and session come from the one shared resolver; an
+    # ambiguous or mislabeled environment is an unknown actor, never a guess.
+    from dispatch_contract import DispatchContractError
+    from route_authority import caller_identity
+    try:
+        harness, session = caller_identity()
+    except DispatchContractError:
+        harness, session = "", ""
     if not harness or not session:
         return "agent:unknown", {"harness": None, "session_id": None}
     return "agent:%s:%s" % (harness, session), {"harness": harness, "session_id": session}

@@ -2230,6 +2230,23 @@ class TestGateSubjectNotCaller(WorkflowFixture):
             json.dumps({"gate_releases": [{"no_gate": 1}, "junk"]}), encoding="utf-8")
         self.assertEqual(ROUTE._gate_releases(str(path)), [])
 
+    def test_a_registered_worker_names_its_registry_to_block_on_every_harness(self):
+        """The explicit `--jobs` rule for a registered worker's `gate --block` is
+        one rule: no harness label turns it on or off."""
+        _route, path = self.two_stage_route(human_gate="frame-review")
+        jobs, _session, _attempt = self.owner_registry(route_id="rt-fixture0000000")
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness), mock.patch.dict(os.environ, {
+                    "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                    "AGENT_DISPATCH_CURRENT_HARNESS": harness}):
+                with self.assertRaisesRegex(SUP.SupervisorError, "human-gate-jobs-required"):
+                    SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                              "--block", "--artifact", "a.json"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, SUP.main([
+                "gate", "--route", str(path), "--gate", "frame-review", "--block",
+                "--jobs", str(jobs), "--artifact", "a.json"]))
+
     def test_a_new_attempt_can_re_raise_the_same_gate(self):
         """Blocking finding #2(a). `IMMUTABLE_FIELDS` includes `attempt_ids`, so a
         delivery id keyed only on (recipient, route, gate) made a second attempt's
@@ -3103,9 +3120,10 @@ class TestQuickPreviewApplyGate(WorkflowFixture):
         preview.write_text("Change original to revised.")
         node = route["nodes"][0]
         with mock.patch.dict(os.environ, {"AGENT_ROUTE_FILE": str(path), "AGENT_ROUTE_NODE": "one-shot",
-                "AGENT_DISPATCH_JOBS": str(jobs), "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_HARNESS": "claude"}):
+                "AGENT_DISPATCH_JOBS": str(jobs), "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                "AGENT_DISPATCH_CURRENT_HARNESS": "claude"}):
             for harness in ("codex", "claude", "opencode"):
-                with mock.patch.dict(os.environ, {"AGENT_HARNESS": harness}):
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_CURRENT_HARNESS": harness}):
                     with self.assertRaises(producer.ProducerError):
                         producer._quick_refine_write_gate(artifact_root, target)
                     self.assertEqual(producer.check_write(artifact_root, target)["reason"], "quick-preview-approval-required")

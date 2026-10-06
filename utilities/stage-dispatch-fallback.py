@@ -1264,10 +1264,9 @@ def wrapper_command(
     # never synthesizes a worker_role from topology kind, node, or model role.
     if args.worker_role:
         command += ["--worker-role", args.worker_role]
-    if harness in {"codex", "claude"}:
-        command += ["--launch-lifecycle", lifecycle]
-        if lifecycle == FOREGROUND_SCOPED:
-            command += ["--foreground-timeout", str(args.foreground_timeout)]
+    command += ["--launch-lifecycle", lifecycle]
+    if lifecycle == FOREGROUND_SCOPED:
+        command += ["--foreground-timeout", str(args.foreground_timeout)]
     command += ["--model-role", _unit_role(node.get("unit")) or node.get("role", "fast implementer")]
     command += ["--model-profile", node["model_profile"]]
     if capacity_settings:

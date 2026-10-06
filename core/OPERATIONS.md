@@ -686,8 +686,8 @@ route-scoped JSON result reports `ledger_root`, `ledger_root_source`,
 `AGENT_WORKFLOW_ROOT` remains authoritative, then inherited
 `AGENT_DISPATCH_JOBS`, then the installed agent-home fallback; callers may no
 longer mistake a silent `CREATED` result from another root for the route state.
-The strict Codex `gate --block` carrier is narrower: it must receive an explicit
-`--jobs` before it mutates the ledger or creates delivery; legacy Claude and
+A registered worker's `gate --block` is narrower on every harness: it must
+receive an explicit `--jobs` before it mutates the ledger or creates delivery;
 read-only no-jobs status/await/release compatibility remains available.
 
 **Advance evidence is four-part and fail-closed.** Before a supervisor may
