@@ -802,6 +802,11 @@ pending attempts. Missing, changed, advanced or still-open route bindings and
 launched owners retain the existing reconciliation rules. Fleet may remove
 the cancelled row from its active set without granting successor readiness.
 
+**Exact reconcile stays attempt-scoped.** A normal `dispatch-reconcile
+--attempt <id> --apply` covers that attempt, its process drain, and its
+related join-recovery; unrelated pending deliveries stay with the
+selector-less bulk `reconcile --apply` maintenance path.
+
 Progress is observed by the runtime from exact native tool identifiers and
 completion states, scoped file changes, and bounded verification leases.
 A quiet window creates a durable `no-progress` supervision notice, not a signal,

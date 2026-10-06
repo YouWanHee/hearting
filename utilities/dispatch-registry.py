@@ -96,6 +96,7 @@ from dispatch_completion_join import (  # noqa: E402
     current_attempt_row,
     exact_attempt_row,
     materialize_after_terminal_close,
+    materialize_backstop_due,
     reconcile_pending_delivery,
     review_terminal_evidence,
 )
@@ -1689,6 +1690,22 @@ def reconcile(rows, args):
         # This operator repair is bound to one exact attempt. Do not make its
         # transaction a carrier for unrelated pending deliveries.
         record["pending_delivery"] = {"skipped": "exact-attempt-only"}
+    elif args.apply and exact_selection:
+        # Normal exact --attempt scope: the target attempt's own missing
+        # delivery record (close/commit-to-trigger-1 crash window) is still
+        # repaired through the exact per-attempt backstop API, under the same
+        # record-and-tombstone condition as the global sweep -- a pruned
+        # record is never resurrected. Unrelated recipient expiry and the
+        # global retention prune stay with the selector-less bulk path.
+        target_meta = selected[0]["meta"]
+        materialized = 0
+        if target_meta.get("delivery_intent") == "1" and materialize_backstop_due(
+                args.jobs.resolve(strict=False).parent, target_meta.get("parent_sid"),
+                target_meta.get("delivery_id")) \
+                and materialize_after_terminal_close(args.jobs, args.attempt) is not None:
+            materialized = 1
+        record["pending_delivery"] = {"applied": {"materialized": materialized},
+                                      "scope": "exact-attempt-only"}
     elif args.apply:
         # SD-111 P2 §2-b-2/§2-c: this `reconcile` call is the existing
         # bounded-cadence "dispatch reconcile path" -- the materialize
