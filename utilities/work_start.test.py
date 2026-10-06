@@ -877,7 +877,6 @@ class WorkStartTest(unittest.TestCase):
              mock.patch("dispatch_replacement._logical_key",
                         side_effect=lambda r, m: {"root_route_id": "rt-root", "node": "__owner__"}), \
              mock.patch("dispatch_replacement._route", return_value=(self.path, self.route)), \
-             mock.patch("dispatch_replacement._runtime_drift"), \
              mock.patch("dispatch_replacement._terminal_absent", side_effect=AssertionError("no log to read")), \
              mock.patch("dispatch_contract.attempt_process_quiescence",
                         return_value=SimpleNamespace(state="quiescent", reason="process-absent")), \

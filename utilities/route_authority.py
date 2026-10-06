@@ -365,6 +365,57 @@ def granted_permissions(applied) -> dict:
     return {key: value for key, value in (applied or {}).items() if key not in LAUNCH_LOCATION_VALUES}
 
 
+# A sealed fact and the same value computed again now. The release a launch ran from is where it
+# ran, not what work it is: its row and sealed input keep the `launch_home` it ran from, a
+# continuation records its own, and a different current value on that axis is neither a refusal
+# nor a diagnostic. That covers a replacement's `launch_home` and the values the runtime derives
+# from its release, and the launch roots of a managed release that moved to another verified
+# managed release copy (`release_moved`). The launcher's location is `LAUNCH_LOCATION_VALUES`; the
+# process table yields to the drain receipt its watcher sealed
+# (`dispatch_contract._denied_process_outside_attempt`). The work, the permissions granted to
+# it and the route's own seal are still compared.
+RELEASE_DERIVED_VALUES = frozenset({
+    "model", "reasoning", "resolved_model_settings", "resolved_completion_delivery",
+    "parent_completion_delivery", "execution_surface", "fallback_hop", "model_role", "model_profile"})
+RELEASE_LAUNCH_ROOTS = frozenset({"registry_root", "launch_home", "runtime_root", "wrapper_root"})
+_RELEASE_IDENTITY_FIELDS = frozenset({"release_id", "content_digest", "binding_digest"})
+_MANAGED_RELEASE_ID = re.compile(r"release:[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[0-9a-f]{12}")
+
+
+def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
+    """The sealed launch roots that differ from the current ones only because the installed
+    release moved: from one managed release (as sealed) to another verified managed release
+    copy (``managed_release(path)``). Each release root must lie in its own side's runtime
+    root, and the registry (`jobs_path`) may differ only by the release fields its runtime
+    resolved. A runtime home or other projection tree, a development checkout, and a
+    malformed root are never a release move."""
+
+    def root(roots, name):
+        value = roots.get(name) if isinstance(roots, dict) else None
+        if (isinstance(value, dict) and value.get("kind") == name
+                and isinstance(value.get("path"), str) and os.path.isabs(value["path"])):
+            return value
+        return None
+
+    def inside(value, runtime):
+        path, top = Path(value["path"]), Path(runtime["path"])
+        return path == top or top in path.parents
+
+    old, new = root(sealed, "runtime_root"), root(current, "runtime_root")
+    if (old is None or new is None or not _MANAGED_RELEASE_ID.fullmatch(str(old.get("release_id") or ""))
+            or not managed_release(new["path"])):
+        return frozenset()
+    moved = {name for name in RELEASE_LAUNCH_ROOTS
+             if root(sealed, name) is not None and root(current, name) is not None
+             and inside(root(sealed, name), old) and inside(root(current, name), new)}
+    before, after = root(sealed, "jobs_path"), root(current, "jobs_path")
+    if (before is not None and after is not None
+            and {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+            <= _RELEASE_IDENTITY_FIELDS):
+        moved.add("jobs_path")
+    return frozenset(moved)
+
+
 def same_sealed_work(previous, current) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
     return (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
