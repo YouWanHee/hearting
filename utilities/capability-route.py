@@ -3920,6 +3920,51 @@ def compose_campaign_selection(route):
     return selection
 
 
+def compose_resolve_campaign_key(artifact_root, key):
+    """`(key, given)`: a key no campaign carries, but that names exactly one active
+    campaign by its folder, id or spelling, joins that campaign (`given` keeps what
+    was typed); any other key is returned unchanged with `given` None.
+
+    Only an exact key used to join, so a folder name (`2026-09-04_prd-v25`) or a
+    near spelling quietly opened a duplicate stream (BC 2026-09-04)."""
+    rows = compose_campaign_summaries(artifact_root)
+    if not rows or any(r.get("key") == key for r in rows):
+        return key, None
+
+    def norm(value):
+        try:
+            return ARTIFACT_LOCATOR.slugify(ARTIFACT_LOCATOR.strip_leading_date(str(value or "")))[0]
+        except ARTIFACT_LOCATOR.LocatorError:
+            return ""
+
+    wanted = norm(key)
+    matches = {r["key"] for r in rows
+               if r.get("state") == "active" and r.get("key") not in (None, "_unassigned")
+               and (key in (r.get("locator"), r.get("campaign_id"))
+                    or (wanted and wanted in (norm(r.get("key")), norm(r.get("locator")))))}
+    return (matches.pop(), key) if len(matches) == 1 else (key, None)
+
+
+COMPOSE_SLUG_WORDS = 6
+
+
+def compose_default_slug(task_text, *, capability=None, shape=None):
+    """The slug a compose names from its own task, so `--slug` is optional.
+
+    The first line with ASCII words names it (up to six words). A task with
+    none, such as a request written only in Korean, is named by its capability
+    and a short digest of the text, so two such tasks still get different names."""
+    text = task_text or ""
+    for line in text.splitlines()[:40]:
+        words = re.findall(r"[A-Za-z0-9]+", line)
+        if any(re.search(r"[A-Za-z]", word) for word in words):
+            return ARTIFACT_LOCATOR.slugify("-".join(words[:COMPOSE_SLUG_WORDS]))[0]
+    parts = [capability or shape or "work"]
+    if text.strip():
+        parts.append(hashlib.sha256(text.encode("utf-8")).hexdigest()[:6])
+    return ARTIFACT_LOCATOR.slugify("-".join(parts))[0]
+
+
 def _compose_campaign_line(selection):
     mode = selection["mode"]
     if mode == "join":
@@ -9311,6 +9356,30 @@ def _resolve_compose_plan(a, route_plan=None):
         return None, None
 
 
+def _session_campaign_key(artifact_root):
+    """The campaign key of this session's latest route in the same artifact root, or None.
+
+    Only that latest route counts: when it named no campaign (a parent cycle or an
+    explicit `--unassigned`), nothing older is reached for."""
+    rc = _route_chain_module()
+    if rc is None:
+        return None
+    try:
+        identity = _route_chain_identity("compose", None)
+        if identity is None:
+            return None
+        harness, sid, _depth, _by = identity
+        root = os.path.realpath(artifact_root)
+        for line in reversed(rc.read_tail(harness, sid)):
+            if os.path.realpath(str(line.get("artifact_root") or "")) != root:
+                continue
+            key = line.get("campaign_key")
+            return key if isinstance(key, str) and key else None
+    except Exception:
+        return None
+    return None
+
+
 def _emit_compiled_route(a,route,artifact_root,output=None):
     """Shared tail of compile/compose: runtime-root check, canonical write-once, owner binding, prints."""
     output=output if output is not None else getattr(a,"output",None)
@@ -9427,7 +9496,7 @@ def main():
     c.add_argument("--artifact-guard",default=DEFAULT_ARTIFACT_GUARD)
     c.add_argument("--output")
     cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
-    cp.add_argument("--slug",required=True)
+    cp.add_argument("--slug",default=None,help="default: named from the task's first line with ASCII words")
     cp.add_argument("--start",action="store_true",help="prepare and start the selected work; the runtime owns frame launches and waiting")
     cp.add_argument("--prompt-file",type=Path,help="the user's task, stored with the route for frame and owner execution")
     cp.add_argument("--owner",choices=("claude","codex","opencode"),help="explicit owner runtime; otherwise use normal selection (same as --pin owner=<harness>)")
@@ -9436,7 +9505,7 @@ def main():
                          "frame legs or depth-2 workers and every resume/replacement reuses it. TARGET is owner|frame|worker, "
                          "e.g. --pin owner=opencode:<provider/model>@<effort> --pin worker=opencode. "
                          "Top models are accepted for frame only (owner/worker keep the tool and drop the model with a warning)")
-    cp.add_argument("--campaign-key",help="the work stream this route joins or creates (required unless --parent-cycle or --unassigned); `artifact_producer.py campaign-list` shows active keys. Size it as a stream with a one-sentence closing condition — not a project name, not a one-cycle task (join the stream that task serves)")
+    cp.add_argument("--campaign-key",help="the work stream this route joins or creates (default: this session's latest campaign in the same artifact root; a folder name or near spelling of one active campaign joins it); `artifact_producer.py campaign-list` shows active keys. Size it as a stream with a one-sentence closing condition — not a project name, not a one-cycle task (join the stream that task serves)")
     cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
     cp.add_argument("--plan",default=None,help="optional declared capability sequence for this session's route chain, e.g. research,draft,apply; shown in Fleet, not sealed into the route")
@@ -9602,6 +9671,18 @@ def main():
             raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
+        if a.campaign_key is None and a.parent_cycle is None and not a.unassigned:
+            a.campaign_key=_session_campaign_key(artifact_root)
+            if a.campaign_key:
+                print(f"campaign_key_default={a.campaign_key} source=this-session-latest-route",file=sys.stderr)
+        elif a.campaign_key is not None:
+            a.campaign_key,given=compose_resolve_campaign_key(artifact_root,a.campaign_key)
+            if given is not None:
+                print(f"campaign_key_resolved={a.campaign_key} given={given}",file=sys.stderr)
+        if a.slug is None:
+            a.slug=compose_default_slug(a.prompt_file.read_text() if a.prompt_file else "",
+                                        capability=a.capability or (None if shape=="framed" else COMPOSE_DEFAULT_CAPABILITY),
+                                        shape=shape)
         route_plan_binding, route_plan_unreadable = None, False
         if a.route_plan:
             # Unreadable, mismatched or out of range: the same compose as without the argument, plus one card line.

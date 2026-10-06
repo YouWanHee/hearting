@@ -7194,6 +7194,64 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual([n["id"] for n in route["nodes"]],["eval-run","metrics","report"])
   with self.assertRaisesRegex(ValueError,r"compose-mode-unknown:nosuch \(modes: eval,setup\)"):
    self.compose(capability="autopilot-lab",capability_mode="nosuch")
+ def test_compose_names_its_slug_from_the_task(self):
+  self.assertEqual(R.compose_default_slug("# Fix the streaming window sim for r5 today\nmore"),"fix-the-streaming-window-sim-for")
+  self.assertEqual(R.compose_default_slug("표면 정리\nPR #197 검증 요청"),"pr-197")
+  korean=R.compose_default_slug("표면 정리 갈래 시작",capability="autopilot-code")
+  self.assertRegex(korean,r"^autopilot-code-[0-9a-f]{6}$")
+  self.assertNotEqual(korean,R.compose_default_slug("다른 작업",capability="autopilot-code"))
+  self.assertEqual(R.compose_default_slug("",shape="framed"),"framed")
+  self.assertEqual(R.compose_default_slug("2026-09-10 r5 window"),"2026-09-10-r5-window")  # the route drops the date
+ def test_a_folder_name_or_near_spelling_joins_the_existing_stream(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   for locator,cid,key,state in (("2026-09-14_tts-v6-release","1","tts-v6-release","active"),
+                                 ("2026-09-15_bc-prd","4","autopilot-spec:rt-0123456789abcdef","active"),
+                                 ("2026-09-13_old-stream","3","old-stream","superseded")):
+    camp=root/"campaigns"/locator; camp.mkdir(parents=True)
+    (camp/"campaign.json").write_text(json.dumps({"campaign_id":"camp_"+cid*32,"key":key,"title":key,"goal":"g","state":state,"cycles":[],"created_on":"2026-09-14T00:00:00Z"}))
+   for given,expected in (("2026-09-14_tts-v6-release","tts-v6-release"),("TTS_v6_release","tts-v6-release"),
+                          ("camp_"+"1"*32,"tts-v6-release"),("bc-prd","autopilot-spec:rt-0123456789abcdef"),
+                          ("2026-09-15_bc-prd","autopilot-spec:rt-0123456789abcdef")):
+    with self.subTest(given=given):
+     self.assertEqual(R.compose_resolve_campaign_key(tmp,given),(expected,given))
+   for kept in ("tts-v6-release","tts-v7-release","2026-09-13_old-stream","old-stream"):
+    with self.subTest(kept=kept):
+     self.assertEqual(R.compose_resolve_campaign_key(tmp,kept),(kept,None))
+   self.assertEqual(R.compose_resolve_campaign_key(str(root/"fresh"),"x"),("x",None))
+ def test_the_session_latest_route_in_the_root_names_the_default_campaign(self):
+  import types
+  lines=[{"artifact_root":"/r/a","campaign_key":"older"},{"artifact_root":"/r/b","campaign_key":"other-root"},
+         {"artifact_root":"/r/a","campaign_key":"latest"}]
+  rc=types.SimpleNamespace(read_tail=lambda harness,sid: list(lines))
+  with mock.patch.object(R,"_route_chain_module",return_value=rc), \
+       mock.patch.object(R,"_route_chain_identity",return_value=("claude","sid",0,None)):
+   self.assertEqual(R._session_campaign_key("/r/a"),"latest")
+   self.assertIsNone(R._session_campaign_key("/r/c"))
+   lines.append({"artifact_root":"/r/a","campaign_key":None,"parent_cycle_id":"cyc_"+"a"*32})
+   self.assertIsNone(R._session_campaign_key("/r/a"))  # never reaches past a keyless latest route
+  with mock.patch.object(R,"_route_chain_identity",return_value=None):
+   self.assertIsNone(R._session_campaign_key("/r/a"))
+ def test_compose_cli_needs_no_slug_and_resolves_the_stream(self):
+  import contextlib, io
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); camp=root/"campaigns"/"2026-09-14_tts-v6-release"; camp.mkdir(parents=True)
+   (camp/"campaign.json").write_text(json.dumps({"campaign_id":"camp_"+"1"*32,"key":"tts-v6-release","title":"TTS v6","goal":"ship","state":"active","cycles":[],"created_on":"2026-09-14T00:00:00Z"}))
+   prompt=root/"task.md"; prompt.write_text("Fix the streaming window\n")
+   route=self.compose(shape="direct",graph=None,artifact_root=tmp,campaign_key="tts-v6-release")
+   seen=[]
+   def capture(**kwargs):
+    seen.append(kwargs); return route
+   base=[str(P),"compose","--shape","direct","--cwd",str(R.ROOT),"--artifact-root",tmp,"--prompt-file",str(prompt),"--explain"]
+   for extra,session,note in ((["--campaign-key","2026-09-14_tts-v6-release"],None,"campaign_key_resolved=tts-v6-release"),
+                              ([],"tts-v6-release","campaign_key_default=tts-v6-release")):
+    err=io.StringIO()
+    with mock.patch.object(sys,"argv",base+extra), mock.patch.object(R,"compose_route",side_effect=capture), \
+         mock.patch.object(R,"_session_campaign_key",return_value=session), \
+         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+     self.assertEqual(R.main(),0)
+    self.assertEqual((seen[-1]["slug"],seen[-1]["campaign_key"]),("fix-the-streaming-window","tts-v6-release"))
+    self.assertIn(note,err.getvalue())
  def test_graph_spec_parsing(self):
   self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])
   for bad in ("", " , ", "execute,execute", "Bad!"):
