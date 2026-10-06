@@ -419,8 +419,7 @@ console.log(JSON.stringify(logs));
     def run_pane_projection_fixture(self, body, timeout=5):
         # Fixed native invocation/SDK/child fixtures; expected results below are literals.
         js = r'''
-import { readFileSync } from "node:fs";
-import { existsSync as fsExistsSync } from "node:fs";
+import { existsSync as fsExistsSync, readFileSync, readFileSync as fsReadFileSync } from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -434,7 +433,7 @@ function fixture(options = {}) {
     "/proc/self/stat": Buffer.from(options.stat || "123 (opencode) S " + "0 ".repeat(18) + "77 0")};
   const scope = {path, Buffer, process: {pid: 123, env: Object.assign(
       {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "ses_foreign"}, options.env || {})},
-    isWorkerSession: () => !!options.worker, existsSync: fsExistsSync,
+    isWorkerSession: () => !!options.worker, existsSync: fsExistsSync, readFileSync: fsReadFileSync,
     root: options.root || "fixture-root", herdrProjection: options.herdrProjection || "fixture-projector",
     Date: {now: () => now}, AbortController,
     openSync: file => {reads.push(file);if (!files[file]) throw Error("foreign proc read");return file},
@@ -786,6 +785,157 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
         for row in result["logs"]:
             if row["extra"]["reason"] in ("publisher-spawn-error", "publisher-sync-fallback-error"):
                 self.assertEqual((row["extra"]["errorCode"], row["extra"]["errorErrno"]), ("ENOENT", -2))
+
+    def _write_tui_record(self, state_dir, pid, start, sid):
+        record_dir = Path(state_dir) / "hearting" / "tui-identity"
+        record_dir.mkdir(parents=True, exist_ok=True)
+        record = record_dir / f"{pid}-{start}.json"
+        record.write_text(json.dumps({"schema": "hearting-tui-selection-v1",
+                                      "sessionID": sid, "pid": pid, "start": start}))
+        return record
+
+    def test_opencode_bare_origin_with_tui_record_publishes_through_existing_path(self):
+        self._write_tui_record(str(self.state), 123, "77", "ses_A")
+        result = self.run_pane_projection_fixture(r'''
+const observation = JSON.stringify({schema: "hearting-pane-observation-v1", reason: "report-attempts-finished",
+ session_report: "exit0", metadata_report: "exit0"});
+const f = fixture({argv: ["opencode", "--auto", "--model", "provider/model"],
+  env: {XDG_STATE_HOME: "%%STATE%%"}});
+const ctx = f.ctx();
+await f.scope.projectPane("ses_A", ctx);
+f.children[0].stdout.write(observation);
+await new Promise(resolve => setImmediate(resolve)); f.exit(0);
+console.log(JSON.stringify({commands: f.commands, logs: f.logs}));
+'''.replace("%%STATE%%", str(self.state)))
+        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"]])
+        finished = [row["extra"] for row in result["logs"] if row["extra"]["reason"] == "report-attempts-finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual((finished[0]["sessionReport"], finished[0]["metadataReport"]), ("exit0", "exit0"))
+
+    def test_opencode_bare_origin_without_matching_tui_record_stays_unavailable(self):
+        self._write_tui_record(str(self.state), 123, "77", "ses_other")
+        for options, record in (({}, None), ({"record": "mismatch"}, None)):
+            with self.subTest(options=options):
+                result = self.run_pane_projection_fixture(r'''
+const f = fixture({argv: ["opencode", "--auto", "--model", "provider/model"],
+  env: {XDG_STATE_HOME: "%%STATE%%"}});
+await f.scope.projectPane("ses_A", f.ctx());
+console.log(JSON.stringify({commands: f.commands, logs: f.logs}));
+'''.replace("%%STATE%%", str(self.state) if options.get("record") else "/nonexistent-state-dir"))
+                self.assertEqual(result["commands"], [])
+                self.assertIn("native-origin-unavailable", [row["extra"]["reason"] for row in result["logs"]])
+
+    def test_opencode_resume_argv_never_uses_tui_record(self):
+        self._write_tui_record(str(self.state), 123, "77", "ses_A")
+        result = self.run_pane_projection_fixture(r'''
+const f = fixture({argv: ["opencode", "--session", "ses_A", "--continue"],
+  env: {XDG_STATE_HOME: "%%STATE%%"}});
+await f.scope.projectPane("ses_A", f.ctx());
+console.log(JSON.stringify({commands: f.commands, logs: f.logs}));
+'''.replace("%%STATE%%", str(self.state)))
+        self.assertEqual(result["commands"], [])
+        self.assertIn("native-origin-unavailable", [row["extra"]["reason"] for row in result["logs"]])
+
+    def test_opencode_selection_swap_during_sdk_skips_late_publish(self):
+        record = self._write_tui_record(str(self.state), 123, "77", "ses_A")
+        swapped = {"schema": "hearting-tui-selection-v1", "sessionID": "ses_B", "pid": 123, "start": "77"}
+        body = r'''
+import * as realFs from "node:fs";
+const f = fixture({argv: ["opencode", "--auto", "--model", "provider/model"],
+  env: {XDG_STATE_HOME: "%%STATE%%"}});
+const ctx = f.ctx(async () => {
+  realFs.writeFileSync("%%RECORD%%", JSON.stringify(%%SWAPPED%%));
+  return {data: {id: "ses_A"}};
+});
+await f.scope.projectPane("ses_A", ctx);
+console.log(JSON.stringify({commands: f.commands, logs: f.logs}));
+'''.replace("%%STATE%%", str(self.state)).replace("%%RECORD%%", str(record)).replace(
+            "%%SWAPPED%%", json.dumps(swapped))
+        result = self.run_pane_projection_fixture(body)
+        self.assertEqual(result["commands"], [])
+        reasons = [row["extra"]["reason"] for row in result["logs"]]
+        self.assertIn("publisher-stale-selection", reasons)
+        self.assertNotIn("publisher-spawned", reasons)
+
+    def test_opencode_tui_entry_records_selection_and_clears_on_home_and_dispose(self):
+        body = open(ROOT / "adapters/opencode/tui/hearting-tui-identity.ts").read().replace(
+            'import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"', "").replace(
+            'import path from "node:path"', "").replace(
+            "export default", "var __module =")
+        js = r'''
+import path from "node:path";
+import * as realFs from "node:fs";
+import vm from "node:vm";
+const input = JSON.parse(process.env.FIXTURE_TUI);
+const stat = "456 (opencode) S " + "0 ".repeat(18) + "99 0";
+const scope = {path, Date, JSON,
+  mkdirSync: realFs.mkdirSync, renameSync: realFs.renameSync, rmSync: realFs.rmSync,
+  writeFileSync: realFs.writeFileSync,
+  readFileSync: (file, enc) => String(file) === "/proc/self/stat" ? stat : realFs.readFileSync(file, enc),
+  process: {pid: 456, env: {XDG_STATE_HOME: input.state}}};
+let current = {name: "home"};
+const subs = [], unsubs = [], disposed = [], slotRegs = [];
+const api = {route: {get current() {return current}},
+  event: {on: (type, handler) => {subs.push([type, handler]); return () => unsubs.push(type)}},
+  lifecycle: {onDispose: (fn) => disposed.push(fn)},
+  slots: {register: (plugin) => {slotRegs.push(plugin); return "mock-slot-id"}}};
+vm.runInNewContext(input.source, scope);
+await scope.__module.tui(api);
+const read = () => {
+  try {
+    return realFs.readFileSync(input.record, "utf8");
+  } catch { return null }
+};
+const slots = slotRegs[0].slots;
+const fire = (type, event) => subs.find(([name]) => name === type)[1](event || {});
+const home = read();
+fire("session.created", {type: "session.created", properties: {sessionID: "ses_new", info: {id: "ses_new"}}});
+const gap = read();
+current = {name: "session", params: {sessionID: "ses_new"}};
+slots.session_prompt_right({}, {session_id: "ses_new"});
+const mounted = read();
+slots.session_prompt_right({}, {session_id: "ses_other"});
+const disagree = read();
+current = {name: "workspace-smoke", params: {tab: 0}};
+slots.app_bottom({});
+const customCleared = read();
+current = {name: "session", params: {sessionID: "ses_back"}};
+slots.app_bottom({});
+const appWrote = read();
+fire("session.deleted", {type: "session.deleted", properties: {sessionID: "ses_back", info: {id: "ses_back"}}});
+const clearedByDelete = read();
+current = {name: "home"};
+slots.home_prompt_right({}, {});
+const cleared = read();
+for (const fn of disposed) await fn();
+console.log(JSON.stringify({id: scope.__module.id, hasServer: "server" in scope.__module,
+  slotNames: Object.keys(slots), subscribed: subs.map(([type]) => type),
+  unsubscribed: unsubs, home, gap, mounted: mounted && JSON.parse(mounted).sessionID,
+  disagree: disagree && JSON.parse(disagree).sessionID, customCleared,
+  appWrote: appWrote && JSON.parse(appWrote).sessionID, clearedByDelete, cleared}));
+'''
+        env = dict(os.environ, FIXTURE_TUI=json.dumps({
+            "source": body, "state": str(self.state),
+            "record": str(Path(self.state) / "hearting" / "tui-identity" / "456-99.json")}))
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=env,
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result["id"], "hearting.tui-identity")
+        self.assertFalse(result["hasServer"])
+        self.assertEqual(sorted(result["slotNames"]), ["app_bottom", "home_prompt_right", "session_prompt_right"])
+        self.assertEqual(result["subscribed"], ["session.created", "session.deleted", "tui.session.select",
+            "session.next.prompted", "message.updated", "session.status", "session.idle"])
+        self.assertIsNone(result["home"])
+        self.assertIsNone(result["gap"])
+        self.assertEqual(result["mounted"], "ses_new")
+        self.assertEqual(result["disagree"], "ses_new")
+        self.assertIsNone(result["customCleared"])
+        self.assertEqual(result["appWrote"], "ses_back")
+        self.assertIsNone(result["clearedByDelete"])
+        self.assertIsNone(result["cleared"])
+        self.assertEqual(sorted(result["unsubscribed"]), sorted(result["subscribed"]))
 
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''

@@ -157,7 +157,11 @@ gate only; it does not replace this source-order review.
 Identity publishers retain bounded launch errors and may use one bounded fallback
 with the same invocation after a failed launch. A live launched helper must not
 be duplicated. Helper exit success records an attempt, not authoritative identity
-publication or peer receipt.
+publication or peer receipt. An OpenCode TUI's actual current session selection
+is an independent provenance input only when read inside that TUI from the
+native route and bound to the same TUI process lifecycle; it is never estimated
+from a callback session id, an SDK-first root, timing, pane labels, or daemon
+environment.
 
 On OpenCode, non-route deep roles use a deep tier when the selected whole-file model configuration declares one, and otherwise retain the existing balanced-deep fallback. Explicit role edits target that same resolved tier. Registered jobs continue to resolve their sealed model profile independently of role families.
 

@@ -552,6 +552,67 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn(os.path.realpath(str(self.tmp_root)), cmd[cmd.index("--") + 1:])
         self.assertNotIn("--cwd", cmd)
 
+    def _scoped_tui_config(self):
+        scoped = Path(os.environ["HOME"]) / ".config" / "opencode" / "tui"
+        scoped.mkdir(parents=True, exist_ok=True)
+        target = scoped / "hearting-owned-tui.json"
+        target.write_text('{"$schema": "https://opencode.ai/tui.json", "plugin": ["./hearting-tui-identity.ts"]}\n',
+                          encoding="utf-8")
+        return str(target)
+
+    def test_opencode_start_exports_scoped_tui_config_before_launch(self):
+        import contextlib
+        import io
+        scoped = self._scoped_tui_config()
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                side_effect=_idle_shell_run) as run_mock, \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "opencode", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        argvs = [c[0][0] for c in run_mock.call_args_list]
+        sends = [a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]]
+        self.assertEqual(len(sends), 1, argvs)
+        self.assertIn("OPENCODE_TUI_CONFIG=", sends[0][-1])
+        self.assertIn(scoped, sends[0][-1])
+        self.assertLess(argvs.index(sends[0]),
+                        argvs.index(_agent_start_cmd(run_mock)))
+        self.assertIn(["herdr", "pane", "send-keys", "w1:pM", "Enter"], argvs)
+        self.assertIn("tui_scoped=exported", out.getvalue())
+        # The launch argv itself gains no new flag: the config travels in the pane env.
+        cmd = _agent_start_cmd(run_mock)
+        self.assertNotIn("OPENCODE_TUI_CONFIG", " ".join(cmd))
+
+    def test_scoped_export_keeps_an_explicit_override_already_in_the_pane(self):
+        # The captured prelaunch line runs in an isolated child shell: an
+        # explicit user value survives, an unset value takes the scoped file.
+        scoped = self._scoped_tui_config()
+        line = "export OPENCODE_TUI_CONFIG=${OPENCODE_TUI_CONFIG:-%s}" % scoped
+        keep = subprocess.run(["sh", "-c", line + '; printf %s "$OPENCODE_TUI_CONFIG"'],
+                              capture_output=True, text=True, timeout=10,
+                              env={"OPENCODE_TUI_CONFIG": "/user/tui.json", "PATH": os.environ["PATH"]})
+        self.assertEqual(keep.stdout, "/user/tui.json")
+        fill = subprocess.run(["sh", "-c", line + '; printf %s "$OPENCODE_TUI_CONFIG"'],
+                              capture_output=True, text=True, timeout=10,
+                              env={"PATH": os.environ["PATH"]})
+        self.assertEqual(fill.stdout, scoped)
+
+    def test_opencode_start_without_scoped_config_proceeds_and_notes_missing(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                side_effect=_idle_shell_run) as run_mock, \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "opencode", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        argvs = [c[0][0] for c in run_mock.call_args_list]
+        self.assertEqual([a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]], [])
+        self.assertIn("tui_scoped=missing", out.getvalue())
+        _agent_start_cmd(run_mock)
+
     def test_pane_input_waits_for_shell_readiness_and_times_out_without_start(self):
         self._ingress()
         calls = []

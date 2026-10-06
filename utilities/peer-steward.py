@@ -964,6 +964,58 @@ def _failed_start_cleanup(pane, original_shell, original_screen):
     return "retained"
 
 
+def _opencode_tui_scoped_config():
+    """Hearting-owned scoped TUI config for owned OpenCode launches, or None.
+
+    Activation projects ``tui/hearting-owned-tui.json`` into the managed
+    OpenCode runtime home; pointing OPENCODE_TUI_CONFIG at it adds only the
+    hearting TUI identity entry through the official global, override,
+    project, .opencode merge order, so user config, explicit overrides,
+    disables, plugins, and options are preserved.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    scoped = os.path.join(config_home, "opencode", "tui", "hearting-owned-tui.json")
+    return scoped if os.path.isfile(scoped) else None
+
+
+def _export_opencode_tui_scoped(pane):
+    """Export OPENCODE_TUI_CONFIG into the pane before an owned OpenCode start.
+
+    Best-effort enhancement, never a launch refusal: any failure degrades to
+    a receipt note and the start proceeds. Mirrors the ingress send-text
+    shape (prompt wait, occupancy recheck, ordered typing, no clock wait).
+    Codex/Claude paths and binder semantics are untouched.
+    """
+    scoped = _opencode_tui_scoped_config()
+    if scoped is None:
+        return "missing"
+    if _pane_has_agent(pane):
+        return "pane-occupied"
+    if not _wait_for_shell_prompt(pane):
+        return "shell-readiness-timeout"
+    state = _pane_has_agent(pane) or _pane_foreground_shell(pane)
+    if state:
+        return state
+    # An explicit OPENCODE_TUI_CONFIG the pane already carries wins: the
+    # scoped file only fills an unset-or-empty value, so user overrides keep
+    # their options, plugins, and disables through the official merge order.
+    line = ("export OPENCODE_TUI_CONFIG=${OPENCODE_TUI_CONFIG:-%s}"
+            % shlex.quote(scoped))
+    try:
+        text = subprocess.run(["herdr", "pane", "send-text", pane, line],
+                              capture_output=True, text=True, timeout=5)
+        if text.returncode != 0:
+            return "send-failed"
+        enter = subprocess.run(["herdr", "pane", "send-keys", pane, "Enter"],
+                               capture_output=True, text=True, timeout=5)
+        if enter.returncode != 0:
+            return "send-failed"
+    except Exception:
+        return "send-failed"
+    return "exported"
+
+
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
@@ -1019,6 +1071,12 @@ def cmd_start(args):
         print(f"started=false reason={ingress_note} agent={args.kind} name={args.name} "
               f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
         return 1
+
+    # Owned scoped TUI config for OpenCode only: best-effort export, never a
+    # refusal. Every other kind keeps its exact previous behavior.
+    tui_scoped = None
+    if args.kind == "opencode":
+        tui_scoped = _export_opencode_tui_scoped(args.pane)
 
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
@@ -1160,6 +1218,7 @@ def cmd_start(args):
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
         + cleanup_note
+        + (f" tui_scoped={tui_scoped}" if tui_scoped else "")
     )
     return 0
 

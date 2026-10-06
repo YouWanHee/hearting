@@ -759,6 +759,13 @@ def _linked_entries(
         )
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
+        tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
+        entries.append(_entry(tui_entry, home / "tui/hearting-tui-identity.ts", "hook_config"))
+        # Owned scoped TUI config: dormant until an owned launch points
+        # OPENCODE_TUI_CONFIG at it. Never auto-read (the loader only reads
+        # tui.json/tui.jsonc by name), never merged into user files.
+        owned_tui = source_root / "adapters/opencode/tui/owned-tui.json"
+        entries.append(_entry(owned_tui, home / "tui/hearting-owned-tui.json", "hook_config"))
     else:
         raise ActivationError(f"unsupported runtime: {runtime}")
 
@@ -1827,6 +1834,102 @@ def _unmerge_codex_identity_config(
     return [str(config)]
 
 
+def _seed_opencode_tui_entry(active_root: Path, previous: Optional[dict], scope: str = "global") -> dict:
+    """Absent-only TUI registration for the hearting TUI identity entry.
+
+    Writes the registration-only ``tui.json`` into the managed OpenCode
+    runtime home only when no ``tui.json``/``tui.jsonc`` exists there. An
+    existing file is user-owned by definition: it stays byte-identical and
+    the bare identity stays unsupported on that host (reported, never merged
+    around). Existing plugins, options, and disables are preserved because
+    nothing present is ever edited.
+    """
+    result: dict = {"kind": "opencode-tui-seeded", "managed_config": None, "status": "skipped"}
+    template = active_root / "adapters" / "opencode" / "tui" / "tui.json"
+    if not template.is_file():
+        result["status"] = "template-missing"
+        return result
+    try:
+        text = template.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ActivationError(f"invalid OpenCode TUI template: {template}: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ActivationError(f"invalid OpenCode TUI template: {template}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("plugin"), list):
+        raise ActivationError(
+            f"invalid OpenCode TUI template: {template}: registration-only plugin list required"
+        )
+    home = paths.runtime_home("opencode", scope)
+    target = home / "tui.json"
+    override = home / "tui.jsonc"
+    result["path"] = str(target)
+    if override.is_symlink() or override.is_file():
+        result["status"] = "user-managed"
+        return result
+    if override.exists():
+        raise ActivationError(f"invalid OpenCode TUI config: {override} is not a regular file")
+    previous_record: dict = {}
+    if previous:
+        candidate = previous.get("managed_config", {}).get("opencode_tui")
+        if isinstance(candidate, dict):
+            previous_record = candidate
+    # Ownership comes only from the prior activation record, never from byte
+    # equality: a user file identical to the template stays user-owned, and a
+    # symlink (user successor by shape) is never claimed or followed.
+    if target.is_symlink():
+        result["status"] = "user-managed"
+        return result
+    if target.is_file():
+        try:
+            current = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ActivationError(f"invalid OpenCode TUI config: {target}: {exc}") from exc
+        recorded = previous_record.get("seeded")
+        if isinstance(recorded, str) and recorded and current == recorded:
+            result["status"] = "present"
+            result["managed_config"] = {"seeded": recorded}
+            return result
+        result["status"] = "user-managed"
+        return result
+    if target.exists():
+        raise ActivationError(f"invalid OpenCode TUI config: {target} is not a regular file")
+    # destructive-ok: reason=create the registration-only tui.json activation owns, only when absent; boundary=the new file alone, user files untouched
+    _atomic_text(target, text)
+    result["status"] = "seeded"
+    result["managed_config"] = {"seeded": text}
+    return result
+
+
+def _unseed_opencode_tui_entry(state: dict, scope: str = "global", dry_run: bool = False) -> List[str]:
+    """Remove the tui.json activation seeded, only while it is still exactly what it wrote.
+
+    A symlink, an unrecorded file, or user-changed bytes are a successor and
+    stay untouched through the normal safe-filesystem removal.
+    """
+    managed = (state.get("managed_config") or {}) if isinstance(state, dict) else {}
+    record = managed.get("opencode_tui") if isinstance(managed, dict) else None
+    seeded = record.get("seeded") if isinstance(record, dict) else None
+    if not isinstance(seeded, str) or not seeded:
+        return []
+    target = paths.runtime_home("opencode", scope) / "tui.json"
+    if target.is_symlink() or not target.is_file():
+        return []
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    if text != seeded:
+        return []
+    if not dry_run:
+        try:
+            _remove_path(target)
+        except ActivationError:
+            return []
+    return [str(target)]
+
+
 def _codex_identity_health(active_root: Path, scope: str = "global") -> tuple[bool, List[str]]:
     """``(missing, conflicts)`` for the Codex identity policy; a release without it is healthy."""
     try:
@@ -1904,6 +2007,8 @@ def _prepare_runtime_config(
         return [_merge_claude_settings(active_root, previous, scope)]
     if runtime == "codex":
         return [_merge_codex_identity_config(active_root, previous, scope)]
+    if runtime == "opencode":
+        return [_seed_opencode_tui_entry(active_root, previous, scope)]
     return []
 
 
@@ -2885,9 +2990,18 @@ def activate(
                 ),
                 "codex_identity": next(
                     (
-                        change["managed_config"]
+                        change.get("managed_config")
                         for change in config_changes
                         if change.get("kind") == "codex-config-merged"
+                        and change.get("managed_config")
+                    ),
+                    None,
+                ),
+                "opencode_tui": next(
+                    (
+                        change.get("managed_config")
+                        for change in config_changes
+                        if change.get("kind") == "opencode-tui-seeded"
                         and change.get("managed_config")
                     ),
                     None,
@@ -3218,6 +3332,8 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
         restored = _unmerge_claude_settings(state, scope, dry_run=dry_run)
     elif runtime == "codex":
         restored = _unmerge_codex_identity_config(state, scope, dry_run=dry_run)
+    elif runtime == "opencode":
+        restored = _unseed_opencode_tui_entry(state, scope, dry_run=dry_run)
     if not dry_run:
         bundles = paths.harness_state_dir(runtime, scope) / "bundles"
         if bundles.is_dir() and not bundles.is_symlink():
