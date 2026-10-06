@@ -212,5 +212,155 @@ class ResourceProgressTest(unittest.TestCase):
         self.assertIsNone(self.collect())
 
 
+class ResourceProgressProductionTest(unittest.TestCase):
+    """Bridge arms[].production: local unwrap vs remote-origin guard.
+
+    Mirrors tf-rehancer.canonical-resource-bridge/v1 (cnn T/B arms): child
+    identity/directory/config live inside arm["production"] with an explicit
+    host. Remote-origin arms must never be resolved in local /proc and their
+    metadata alone never proves live/done.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        (self.repo / "configs").mkdir(parents=True)
+        self.config = self.repo / "configs" / "a.json"
+        self.config.write_text(json.dumps({"training": {"attempts": 400000}}))
+        self.digest = hashlib.sha256(self.config.read_bytes()).hexdigest()
+        self.directory = self.root / "runs" / "first"
+        self.directory.mkdir(parents=True)
+        self.path = self.directory / "progress.json"
+        self.path.write_text(json.dumps({
+            "attempt": 27346, "successful": 27342, "skipped": 4,
+            "last": {"attempt": 27346, "metrics": {"loss": 0.0048248}}}))
+        self.now = time.time()
+        os.utime(self.path, (self.now - 600, self.now - 600))
+        self.wrapper = {"pid": 4, "starttime": "10", "command_hash": "a" * 64,
+                        "process_group": 4, "cwd": str(self.repo), "argv": ["wrapper"]}
+        self.child = {"pid": 42, "starttime": "11", "command_hash": "b" * 64,
+                      "process_group": 4, "cwd": str(self.repo),
+                      "argv": ["python", "run.py", "--config", str(self.config)]}
+        self.run = dict(self.wrapper)
+        self.lookups = []
+
+    def write_metadata(self, metadata):
+        (self.root / "run.json").write_text(json.dumps(metadata))
+
+    def reader(self, pid):
+        self.lookups.append(pid)
+        return copy.deepcopy({4: self.wrapper, 42: self.child}.get(pid))
+
+    def collect(self, metadata):
+        self.lookups = []
+        self.write_metadata(metadata)
+        return progress.collect(self.run, self.root / "resource-runs.json", self.now,
+                                process_reader=self.reader)
+
+    def local_nested(self):
+        return {"capacity": "T", "state": "training-updates",
+                "run_id": "local-20261006-t",
+                "production": {
+                    "schema": "tf-rehancer.cnn-production/v1",
+                    "capacity": "T", "gpu_index": 0,
+                    "directory": str(self.directory),
+                    "config_sha256": self.digest, "state": "training-updates",
+                    "run_name": "t_local",
+                    "compute_run_id": "local-20261006-t",
+                    "process_identity": {"pid": 42, "starttime": 11,
+                                         "cmdline_sha256": "b" * 64}}}
+
+    def remote_arm(self, pid=3945450, start=565464077, capacity="T", gpu=0,
+                   run="t_baseline_20261006", receipt_host="cnn"):
+        return {"capacity": capacity, "state": "training-updates",
+                "run_id": "cnn-20261006-015922-tf-canonical-%s-scratch400k-a1"
+                          % capacity.lower(),
+                "compute_host_receipt": {
+                    "host": receipt_host, "gpus": str(gpu),
+                    "run_id": "cnn-20261006-015922-tf-canonical-%s-scratch400k-a1"
+                              % capacity.lower()},
+                "production": {
+                    "schema": "tf-rehancer.cnn-production/v1", "host": "cnn",
+                    "capacity": capacity, "gpu_index": gpu,
+                    "directory": "/home/nas/user/Uihyeop/NN_Zoo/TF-Rehancer_artifacts"
+                                 "/cnn_canonical_20261006/recovery-a1/%s/runs/%s"
+                                 % (capacity.lower(), run),
+                    "config_sha256": "9" * 64, "state": "training-updates",
+                    "run_name": run,
+                    "compute_run_id": "cnn-20261006-015922-tf-canonical-%s-scratch400k-a1"
+                                      % capacity.lower(),
+                    "wrapper_identity": {"pid": 3945423, "starttime": 565463952,
+                                         "cmdline_sha256": "c" * 64},
+                    "process_identity": {"pid": pid, "starttime": start,
+                                         "cmdline_sha256": "d" * 64},
+                    "progress": {"attempt": 43915, "successful": 43904,
+                                 "skipped": 11}}}
+
+    def test_local_nested_production_unwraps_with_origin(self):
+        value = self.collect({"arms": [self.local_nested()]})
+        self.assertIsNotNone(value)
+        self.assertEqual((value["arm"], value["attempt"], value["config_sha256"]),
+                         ("t_local", 27346, self.digest))
+        origin = value.get("production_origin")
+        self.assertIsNotNone(origin)
+        self.assertEqual(origin.get("compute_run_id"), "local-20261006-t")
+        self.assertNotIn("host", origin)
+        self.assertEqual(set(self.lookups), {4, 42})
+
+    def test_remote_nested_production_never_looked_up(self):
+        arm = self.remote_arm()
+        self.assertIsNone(self.collect({"arms": [arm]}))
+        self.assertEqual(self.lookups, [4])
+        self.assertNotIn(3945450, self.lookups)
+        self.assertNotIn(3945423, self.lookups)
+        # Receipt-only host marks remote origin too.
+        arm = self.local_nested()
+        arm["compute_host_receipt"] = {"host": "cnn"}
+        arm["production"] = {**arm["production"],
+                             "process_identity": {"pid": 3945450, "starttime": 565464077,
+                                                  "cmdline_sha256": "d" * 64}}
+        self.assertIsNone(self.collect({"arms": [arm]}))
+        self.assertNotIn(3945450, self.lookups)
+
+    def test_two_remote_arms_fail_soft_without_lookup(self):
+        metadata = {"arms": [self.remote_arm(pid=3945450, start=565464077,
+                                             capacity="T", gpu=0,
+                                             run="t_baseline_20261006"),
+                             self.remote_arm(pid=3945451, start=565464078,
+                                             capacity="B", gpu=1,
+                                             run="b_baseline_20261006")]}
+        self.assertIsNone(self.collect(metadata))
+        self.assertEqual(self.lookups, [4])
+        self.assertNotIn(3945450, self.lookups)
+        self.assertNotIn(3945451, self.lookups)
+
+    def test_mixed_local_and_remote_attaches_local_only(self):
+        plain = {"name": "first", "state": "training-updates",
+                 "directory": str(self.directory), "config_sha256": self.digest,
+                 "process_identity": {"pid": 42, "starttime": 11,
+                                      "cmdline_sha256": "b" * 64}}
+        value = self.collect({"arms": [plain, self.remote_arm()]})
+        self.assertIsNotNone(value)
+        self.assertEqual(value["arm"], "first")
+        self.assertNotIn("production_origin", value)
+        self.assertNotIn(3945450, self.lookups)
+
+    def test_plain_arm_with_remote_receipt_never_looked_up(self):
+        arm = {"name": "foreign-receipt-arm", "state": "training-updates",
+               "directory": str(self.directory), "config_sha256": self.digest,
+               "process_identity": {"pid": 42, "starttime": 11,
+                                    "cmdline_sha256": "b" * 64},
+               "compute_host_receipt": {"host": "cnn", "gpus": "0"}}
+        self.assertIsNone(self.collect({"arms": [arm]}))
+        self.assertEqual(self.lookups, [4])
+        self.assertNotIn(42, self.lookups)
+
+    def test_duplicate_local_nested_arms_stay_ambiguous(self):
+        arm = self.local_nested()
+        self.assertIsNone(self.collect({"arms": [arm, copy.deepcopy(arm)]}))
+
+
 if __name__ == "__main__":
     unittest.main()
