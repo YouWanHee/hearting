@@ -503,6 +503,54 @@ def retry_predecessor(prior_rows):
     return ""
 
 
+def _blocked_round_items(route, metadata):
+    """The unmet `done_when` ids a BLOCKED round left, from the items file beside its artifact;
+    None when that round's items cannot be judged (no plan items, no readable file, or a file
+    bound to another route, node or attempt)."""
+    if readable_result(metadata) != "BLOCKED":
+        return None
+    import base64
+    import route_plan as RP
+    from codex_dispatch_terminal import inspect_terminal_attempt
+    try:
+        terminal = inspect_terminal_attempt(
+            metadata.get("log_file"), worktree=metadata.get("cwd") or route.get("cwd"),
+            artifact_root_metadata=metadata.get("artifact_root") or route.get("artifact_root"))
+        encoded = terminal.get("artifact_path_b64")
+        if not encoded:
+            return None
+        artifact = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+        items = RP.read_leg_items(route, artifact)
+    except (OSError, ValueError, TypeError):
+        return None
+    if (items is None or items.get("attempt_id") != metadata.get("attempt_id")
+            or items.get("node") != metadata.get("route_node")):
+        return None
+    return frozenset(items["unmet"])
+
+
+def blocked_progress(route, rows) -> int:
+    """How many of the newest rounds, all without a verdict, count toward the verdict-less bound
+    once progress is taken into account (RA-5).
+
+    Two BLOCKED rounds in a row bind a node. A BLOCKED round whose unmet `done_when` items are a
+    strict subset of the previous BLOCKED round's is progress: the count starts again at it. When
+    either round's items cannot be judged (no plan items), nothing resets, exactly as before."""
+    tail = []
+    for status, metadata in reversed(list(rows)):
+        kind = classify_round_row(status, metadata, worker_type=metadata.get("worker_type") or "test")
+        if kind != "verdict-less":
+            break
+        tail.append(metadata)
+    tail.reverse()
+    streak, previous = 0, None
+    for metadata in tail:
+        current = _blocked_round_items(route, metadata) if route.get("route_plan") is not None else None
+        streak = 1 if previous is not None and current is not None and current < previous else streak + 1
+        previous = current
+    return streak
+
+
 # The round budget already has one implementation (`review_round_cap`); these
 # are its names in this module, not copies.
 classify_round_row = _ROUND.classify_round_row
