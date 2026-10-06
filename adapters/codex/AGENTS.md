@@ -137,6 +137,9 @@ Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallb
 --node <node> --start`: route, slug, parent and harness come from the owner's
 current route and environment, and a member of a sealed parallel group starts
 its whole group in one batch. Dispatch depth 3 is forbidden.
+
+Message another session only with `hearting run peer-steward prompt
+<name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.
 <!-- END generated from core/fragments/bootstrap-dispatch.md -->
 
 Harness selection reads the user-owned `dispatch-defaults.yaml` over
@@ -152,13 +155,12 @@ Launch registered jobs only through `preflight.sh dispatch
 `_kernel/owner` with no worker mode. `worker_role` and legacy `mode` are
 read-only metadata, not bootstrap identity. A direct interactive launch selects
 completion by the parent runtime: a Codex parent uses its
-native queue and a Claude parent uses Claude resume. Parent identity is the
-calling native session; no launcher or gateway probe changes it. Native queue
+native queue and a Claude parent uses Claude resume. Native queue
 delivery does not force Stop/PreToolUse trust. Keep the parent
 conversational; a wait is never an in-model `sleep`/liveness loop.
 `--allow-unmanaged-parent-poll` stays operator-only.
-Legacy stamped Stop state is recovery-only and permits one exact terminal
-`--status all --attempt-id` harvest, never raw output or a broad selector.
+Legacy stamped Stop state permits only one exact terminal
+`--status all --attempt-id` harvest.
 Dispatch contract v3 atomically claims one stable
 attempt row before spawn and starts no child for a duplicate claim. A standard+
 Codex dispatch-depth-1 owner receives workspace-write network access for this purpose;

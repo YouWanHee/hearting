@@ -446,6 +446,12 @@ def usable_session_id(value):
     return text
 
 
+def _arrived_body_digests(text):
+    """Digests the sealed body may have once it arrives: a runtime's input surface can add or
+    trim whitespace around a prompt (OpenCode appends a trailing space), never change it."""
+    return {hashlib.sha256(v.encode("utf-8")).hexdigest() for v in (text, text.rstrip(), text.strip())}
+
+
 def parse_peer_trailer(text, recipient=None, *, include_ref=False):
     """→ {harness, session_id, name} for the LAST trailer in ``text``, else ``None``.
 
@@ -479,7 +485,7 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
             if (not _valid_transfer_endpoint(sender) or not _valid_transfer_endpoint(target)
                     or type(record.get("schema_version")) is not int or record["schema_version"] != 1
                     or record.get("message_id") != ref
-                    or record.get("body_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    or record.get("body_sha256") not in _arrived_body_digests(text)
                     or sender.get("harness") != result["harness"]
                     or any(target.get(k) != recipient.get(k) for k in ("harness", "session_id"))):
                 return result
