@@ -719,10 +719,10 @@ def _framed_cycle(route):
     return root, record, producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
 
 
-def _framed_facts(root, output):
-    """The two brief rows and the intent row the decision binds, or None when a file is missing."""
+def _framed_facts(root, output, legs=RP.FRAME_PAIR):
+    """The brief row of each frame leg and the intent row the decision binds, or None when a file is missing."""
     rows = []
-    for node in ("frame", "frame-alternative"):
+    for node in legs:
         brief = output / "shards" / node / "direction-brief.md"
         if brief.is_symlink() or not brief.is_file():
             return None
@@ -758,7 +758,7 @@ def _proposal_rows(route, jobs, root, record, output):
 
     return [RP.evaluate_brief(output / "shards" / node / "direction-brief.md", root=root, node=node,
                               compile_leg=compile_leg, start_approvals=module.route_start_approvals)
-            for node in ("frame", "frame-alternative")]
+            for node in RP.frame_legs(route)]
 
 
 def _grouped_approvals(row):
@@ -934,7 +934,8 @@ def _decide(route, jobs, root, record, output, briefs, intent):
 
     def ended(reason, rows=None):
         if rows is None:
-            return RP.none_decision(frame_route=frame_route, briefs=briefs, intent=intent, reason=reason)
+            return RP.none_decision(frame_route=frame_route, briefs=briefs, intent=intent, reason=reason,
+                                    legs=RP.frame_legs(route))
         return RP.build_decision(frame_route=frame_route, selected=RP.NONE, reason=reason, briefs=briefs,
                                  intent=intent, proposals=rows)
 
@@ -1177,7 +1178,7 @@ def _framed_settle(route, path, jobs, result, *, closed=None, wait=False, run=su
             elif closed:
                 raise ValueError("route-decision-missing: the route closed without its decision record")
             else:
-                facts = _framed_facts(root, output)
+                facts = _framed_facts(root, output, RP.frame_legs(route))
                 if facts is None:
                     return {**result, "state": "needs-attention", "reason": "frame-outcome-needs-inspection"}
                 briefs, intent = facts

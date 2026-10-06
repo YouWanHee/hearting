@@ -238,7 +238,7 @@ shape and explicit choices determine the route; defaults only fill omissions:
 | `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
 | `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's parts (stage ids, summaries, inputs/outputs, units, human gates, `shareable`, `start_approval`, optional and borrowable parts) with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
-| `framed` | **the default for new non-direct work**; capability and stages are not yet chosen | `compose --shape framed` — two `top` frame legs propose the smallest route, one interview confirms it, and the runtime starts its first leg only (SD-164) |
+| `framed` | **the default for new non-direct work**; capability and stages are not yet chosen | `compose --shape framed` — one frame leg (both `top` legs with `--intensity strong` or higher, for uncertain or hard-to-reverse work) proposes the smallest route, one interview confirms it, and the runtime starts its first leg only (SD-164) |
 
 **`framed` is the default; four cases skip the frame.** Work that is not
 `direct` starts with `compose --shape framed --campaign-key <stream> --start
@@ -255,14 +255,16 @@ record automatically. `direct` is unchanged. A route made from a proposal
 (`compose --route-plan <record>#<i>`, a command the runtime prints) has no frame
 nodes, and neither has a `solo` or `staged` compose: those shapes are chosen for
 decided work, so they compile without the recipe's frame pair (a route sealed
-earlier keeps the frame nodes it was sealed with). Both frame legs of every
-frame — `framed` and a preset recipe's own frame pair — are `top`: a pin with a profile or an explicit profile wins and is not lowered
+earlier keeps the frame nodes it was sealed with). A `framed` route's one leg
+is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own
+frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered
 automatically; a frame-rule `top` that stops at a usage limit is retried once at
 `deep` through the SD-157 replacement lineage, and the lowering is recorded.
 The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를
-조립해 제안합니다" and "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or,
+with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
 
-**Frame procedure at depth-0 (`framed`).** `start` launches the two frame legs
+**Frame procedure at depth-0 (`framed`).** `start` launches the frame legs
 (separate launches, no owner) and returns `needs-interview` with
 `route_proposal_review`: each brief's validated proposal or
 `proposal:none(<reason>)`, whether the two are `equal`, the start-approval parts

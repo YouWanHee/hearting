@@ -1104,7 +1104,8 @@ def create_local_frame_gate_delivery(route, gate, artifact, jobs_path, epoch, *,
         return None
     frames = [n for n in route.get("nodes", []) if n.get("worker_type") == "frame"
               and n.get("dispatch_depth") == 1]
-    if {n.get("id") for n in frames} != {"frame", "frame-alternative"}:
+    import route_plan as RP
+    if not RP.valid_frame_legs(route, [n.get("id") for n in frames]):
         return None
     if release_actor_kind() == "headless-owner" or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"):
         raise SupervisorError("frame-gate-depth0-required")

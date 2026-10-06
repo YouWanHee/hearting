@@ -31,9 +31,9 @@ anything commits.
 
 ## Independence Contract
 
-- You are one of exactly two frame legs the depth-0 session launches itself;
-  there is no third leg at any intensity. Work blind: do not look for, read,
-  or converge toward the other leg's shard. Disagreement between legs is
+- You are the one frame leg, or one of two, that the depth-0 session launches
+  itself; there is no third leg at any intensity. Work blind: do not look for,
+  read, or converge toward another leg's shard. Disagreement between legs is
   signal for the plan synthesizer, not an error to reconcile.
 - Like `autopilot-research` retrieval, breadth beats early convergence: sweep
   the problem from more than one angle (symptom evidence, root cause,

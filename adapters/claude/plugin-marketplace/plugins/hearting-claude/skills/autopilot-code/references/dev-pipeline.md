@@ -263,7 +263,7 @@ Skip only for `direct` (orient-lite carries the framing posture inline). For `qu
 and every `standard+` intensity, the direction gate already ran (owner-execution.md
 "Pre-Owner Direction Gate"): depth-0 itself launched exactly two frame legs — `frame`
 and `frame-alternative`, both `top` (a pin with a profile or an explicit profile wins; a
-route made from a proposal via `--route-plan` has no frame nodes) — as its own
+route made from a proposal via `--route-plan`, or as a `solo` or `staged` compose, has no frame nodes) — as its own
 bootstrap layer, after route binding and producer begin but before owner launch. There is no third frame leg
 at any intensity; `strong+` widening applies only to plan and implementation review
 (above), never to frame. See `core/WORKFLOW.md` for the full depth-0 procedure.

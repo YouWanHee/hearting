@@ -27,6 +27,10 @@ SCHEMA = "route_decision_v1"
 CAPABILITY = "route-frame"
 SHAPE = "framed"
 NODE_IDS = ("frame", "frame-alternative", "route-decision")
+# A framed route runs one frame leg by default, and both legs for uncertain or hard-to-reverse
+# work (user decision 2026-10-07). A recipe's own frame pair is always both legs.
+ONE_LEG_NODE_IDS = ("frame", "route-decision")
+FRAME_PAIR = ("frame", "frame-alternative")
 TERMINAL_NODE = "route-decision"
 RECORD_RELATIVE = "shards/frame/route-decision.json"
 MAX_RECORD_BYTES = 262144
@@ -66,8 +70,22 @@ def is_framed_route(route) -> bool:
     if (route.get("selection") or {}).get("shape") != SHAPE or route.get("effective_intensity") != "standard":
         return False
     nodes = route.get("nodes")
-    return (isinstance(nodes, list) and tuple(n.get("id") for n in nodes) == NODE_IDS
+    return (isinstance(nodes, list) and tuple(n.get("id") for n in nodes) in (NODE_IDS, ONE_LEG_NODE_IDS)
             and nodes[-1].get("kind") == "runtime-terminal" and nodes[-1].get("terminal") is True)
+
+
+def frame_legs(route) -> tuple:
+    """The frame legs a route declares, in order: both legs of a pair, or the one leg of a framed
+    route that runs one."""
+    ids = {n.get("id") for n in (route or {}).get("nodes") or [] if isinstance(n, dict)
+           and n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1}
+    return tuple(node for node in FRAME_PAIR if node in ids)
+
+
+def valid_frame_legs(route, legs) -> bool:
+    """Whether `legs` is a frame set this route may have: the pair, or `frame` alone on a framed route."""
+    legs = set(legs)
+    return legs == set(FRAME_PAIR) or (legs == {"frame"} and is_framed_route(route))
 
 
 def _canonical(value) -> bytes:
@@ -103,11 +121,11 @@ def build_decision(*, frame_route, selected, reason, briefs, intent, proposal=No
     }
 
 
-def none_decision(*, frame_route, briefs, intent, reason=NO_PROPOSAL_READ) -> dict:
+def none_decision(*, frame_route, briefs, intent, reason=NO_PROPOSAL_READ, legs=_FRAME_NODES) -> dict:
     """The minimal ending: no proposal was selected, so no leg starts and the main session composes next."""
     return build_decision(
         frame_route=frame_route, selected=NONE, reason=reason, briefs=briefs, intent=intent,
-        proposals=[{"node": node, "proposal": None, "reason": reason} for node in _FRAME_NODES])
+        proposals=[{"node": node, "proposal": None, "reason": reason} for node in legs])
 
 
 def build_record(decision, first_leg=None) -> dict:
