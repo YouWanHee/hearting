@@ -158,6 +158,24 @@ PROPOSAL_MARK = "proposal"
 def approval_question_id(leg, key) -> str:
     """The id of the yes/no question that approves the `key` parts of leg `leg`."""
     return f"{key}-leg{leg}"
+
+
+# Who answers a frame-review interview (user decision 2026-10-07): the person, or a supervisor
+# session answering on the person's behalf. The supervisor's answer keeps its source. It does not
+# approve a start that changes the person's real artifact or something outside the workspace:
+# those parts keep their gate for the person.
+FRAME_REVIEW_SOURCES = ("user", "supervisor")
+PERSON_ONLY_START_APPROVALS = ("deploy", "handback", "preview")
+
+
+def answer_releases_gate(actor_kind, gate) -> bool:
+    """Whether an answer from `actor_kind` releases `gate` (any gate for the person)."""
+    return actor_kind == "user" or (gate == "frame-review" and actor_kind in FRAME_REVIEW_SOURCES)
+
+
+def answer_approves_start(actor_kind, key) -> bool:
+    """Whether an answer from `actor_kind` approves starting the `key` parts now."""
+    return actor_kind == "user" or (actor_kind == "supervisor" and key not in PERSON_ONLY_START_APPROVALS)
 APPROVAL_FIELDS = frozenset({"key", "leg", "question"})
 
 
@@ -447,14 +465,15 @@ def answer_actor_kind(answers: dict, *, registered_worker=False) -> str:
     """Declared answer provenance; an unmarked file never implies a person.
 
     The caller supplies its known worker identity separately. A worker cannot
-    claim a user reply, and an unmarked worker answer retains that known source.
-    This is not authentication of an interactive caller's declaration.
+    claim a user reply or a supervisor's reply for the person, and an unmarked
+    worker answer retains that known source. This is not authentication of an
+    interactive caller's declaration.
     """
     kind = answers.get("actor_kind", "unknown")
     if not isinstance(kind, str) or kind not in ANSWER_ACTOR_KINDS:
         raise ValueError("actor_kind: expected one of " + ", ".join(ANSWER_ACTOR_KINDS))
-    if registered_worker and kind == "user":
-        raise ValueError("gate-release-actor-refused: a registered worker cannot claim user answers")
+    if registered_worker and kind in FRAME_REVIEW_SOURCES:
+        raise ValueError(f"gate-release-actor-refused: a registered worker cannot claim {kind} answers")
     return "headless-owner" if registered_worker and kind == "unknown" else kind
 
 
@@ -471,22 +490,28 @@ def recorded_answer_context(answers, actor_kind):
 
 def approvals_given(interview: dict, answers: dict, proposal) -> list:
     """Each `entry_approvals` row of the selected proposal with the answer to its question:
-    `{key, leg, question, label, accepted}`. Only the option marked `approves: true` accepts."""
+    `{key, leg, question, label, accepted}`. Only the option marked `approves: true` accepts.
+    A supervisor's yes to a part only the person approves is `held_for_person`: the leg may
+    start, and that part keeps its gate."""
     if not isinstance(proposal, dict):
         return []
     table = _question_table(interview.get("questions") or [])
     given = answers.get("answers") if isinstance(answers.get("answers"), dict) else {}
+    kind = answer_actor_kind(answers)
     rows = []
     for approval in proposal.get("entry_approvals") or []:
         question = table.get(approval.get("question"))
         chosen = resolve_answer(question, given.get(approval.get("question"))) if question else {"state": "unanswered", "label": None, "index": None}
         same_route_question = (isinstance(interview.get("route_proposals"), dict)
                                and approval.get("question") == interview["route_proposals"].get("question"))
-        accepted = answer_actor_kind(answers) == "user" and (
-            chosen["state"] == "chosen" if same_route_question else
-            chosen["state"] == "chosen" and _approves(question, chosen["index"]))
-        rows.append({"key": approval.get("key"), "leg": approval.get("leg"), "question": approval.get("question"),
-                     "label": chosen["label"], "accepted": accepted})
+        said_yes = (chosen["state"] == "chosen" if same_route_question else
+                    chosen["state"] == "chosen" and _approves(question, chosen["index"]))
+        accepted = said_yes and answer_approves_start(kind, approval.get("key"))
+        row = {"key": approval.get("key"), "leg": approval.get("leg"), "question": approval.get("question"),
+               "label": chosen["label"], "accepted": accepted}
+        if said_yes and not accepted and kind in FRAME_REVIEW_SOURCES:
+            row["held_for_person"] = True
+        rows.append(row)
     return rows
 
 
@@ -672,10 +697,13 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None, app
     confirmed = answers.get("understanding_confirmed") is True
     actor_kind = answer_actor_kind(answers)
     human = actor_kind == "user"
+    on_behalf = actor_kind in FRAME_REVIEW_SOURCES and not human
     speaker = "User" if human else actor_kind.capitalize()
+    agreed = "agreed-on-behalf" if on_behalf else "agreed"
     lines = [
         "---",
-        ("status: agreed" if confirmed else "status: agreed-with-correction") if human else "status: recorded",
+        (f"status: {agreed}" if confirmed else f"status: {agreed}-with-correction") if human or on_behalf
+        else "status: recorded",
         f"actor_kind: {actor_kind}",
         f"created: {stamp}",
         f"route_id: {interview.get('route_id', '-')}",
@@ -685,7 +713,8 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None, app
         "",
         "# Intent",
         "",
-        "## Confirmed understanding" if human else "## Recorded understanding",
+        "## Confirmed understanding" if human else
+        "## Confirmed understanding (on the person's behalf)" if on_behalf else "## Recorded understanding",
         "",
         _inline(interview.get("understanding")) or "-",
     ]
@@ -755,7 +784,8 @@ def _route_lines(interview: dict, answers: dict, scope: dict) -> list[str]:
         lines += ["", "Start approvals:"]
     for row in given:
         parts = ", ".join(scope.get((row["key"], row["leg"])) or []) or "the steps named in the question"
-        verdict = "approved" if row["accepted"] else ("declined" if row["label"] is not None else "not answered")
+        verdict = ("approved" if row["accepted"] else "held for the person" if row.get("held_for_person")
+                   else "declined" if row["label"] is not None else "not answered")
         lines.append(f"- {row['key']} for leg {row['leg']} ({parts}) — question `{row['question']}`: {verdict}")
     return lines
 

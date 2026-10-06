@@ -82,6 +82,8 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(FI.answer_actor_kind(unmarked, registered_worker=True), "headless-owner")
         with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
             FI.answer_actor_kind(good_answers(interview), registered_worker=True)
+        with self.assertRaisesRegex(ValueError, "gate-release-actor-refused: .* supervisor"):
+            FI.answer_actor_kind(good_answers(interview, actor_kind="supervisor"), registered_worker=True)
 
     def test_only_clear_no_answer_responses_remain_pending(self):
         interview = good_interview()
@@ -370,7 +372,7 @@ class IntentTest(unittest.TestCase):
         interview = good_interview()
         interview["questions"][0]["options"][0]["approves"] = True
         proposal = {"entry_approvals": [{"key": "full-run", "leg": 0, "question": "q-scope"}]}
-        for kind in ("supervisor", "automatic", "headless-owner", "unknown"):
+        for kind in ("automatic", "headless-owner", "unknown"):
             with self.subTest(kind=kind):
                 answers = good_answers(interview, actor_kind=kind, understanding_confirmed=False, correction="Limit scope.")
                 answers["answers"]["q-cap"].update(choice=1, note="Three is enough.")
@@ -383,6 +385,38 @@ class IntentTest(unittest.TestCase):
                 self.assertNotIn("user's own choice", text)
                 self.assertFalse(FI.approvals_given(interview, answers, proposal)[0]["accepted"])
         self.assertTrue(FI.approvals_given(interview, good_answers(interview), proposal)[0]["accepted"])
+
+    def test_a_supervisor_answer_is_agreed_on_the_persons_behalf_and_holds_person_only_starts(self):
+        """User decision 2026-10-07: a supervisor may answer frame-review for the person, under its own name."""
+        interview = good_interview()
+        interview["questions"][0]["options"][0]["approves"] = True
+        answers = good_answers(interview, actor_kind="supervisor", understanding_confirmed=False, correction="Limit scope.")
+        answers["answers"]["q-cap"]["choice"] = 1
+        text = FI.render_intent(interview, answers, now="2026-10-07")
+        self.assertIn("status: agreed-on-behalf-with-correction\nactor_kind: supervisor", text)
+        self.assertIn("## Confirmed understanding (on the person's behalf)", text)
+        self.assertIn("**Supervisor's correction:** Limit scope.", text)
+        self.assertIn("(supervisor choice)", text)
+        self.assertIn("status: agreed-on-behalf\n", FI.render_intent(interview, good_answers(interview, actor_kind="supervisor")))
+        for key in ("full-run", "deploy", "handback", "preview"):
+            with self.subTest(key=key):
+                proposal = {"entry_approvals": [{"key": key, "leg": 0, "question": "q-scope"}]}
+                row, = FI.approvals_given(interview, answers, proposal)
+                person_only = key in FI.PERSON_ONLY_START_APPROVALS
+                self.assertEqual((row["accepted"], row.get("held_for_person", False)), (not person_only, person_only))
+                self.assertTrue(FI.approvals_given(interview, good_answers(interview), proposal)[0]["accepted"])
+                declined = good_answers(interview, actor_kind="supervisor")
+                declined["answers"]["q-scope"]["choice"] = 1
+                self.assertEqual(FI.approvals_given(interview, declined, proposal)[0],
+                                 {"key": key, "leg": 0, "question": "q-scope", "label": "Approval step only",
+                                  "accepted": False})
+        self.assertEqual(FI.PERSON_ONLY_START_APPROVALS, ("deploy", "handback", "preview"))
+        self.assertTrue(FI.answer_releases_gate("supervisor", "frame-review"))
+        self.assertTrue(FI.answer_releases_gate("user", "preview-disposition"))
+        for kind, gate in (("supervisor", "preview-disposition"), ("supervisor", "plan-approval"),
+                           ("automatic", "frame-review"), ("unknown", "frame-review"), ("headless-owner", "frame-review")):
+            with self.subTest(kind=kind, gate=gate):
+                self.assertFalse(FI.answer_releases_gate(kind, gate))
 
     def test_legacy_recorded_actor_is_read_context_only(self):
         answers = good_answers(good_interview())

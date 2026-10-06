@@ -246,8 +246,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
         authority = (resolution.get("release_authority") or
                      ("depth-0" if resolution.get("interview") else None) or
                      binding.get("release_authority") or "depth-0")
-        if authority == "depth-0" and (registered_worker or actor_kind != "user"):
-            raise ValueError("gate-release-authority-refused: frame-review requires the person's actual answer")
+        if authority == "depth-0" and (registered_worker or not FI.answer_releases_gate(actor_kind, "frame-review")):
+            raise ValueError("gate-release-authority-refused: frame-review takes the person's actual answer, "
+                             "or a supervisor's answer on the person's behalf")
         response = {**response, "actor_kind": actor_kind}
     if not next_round and resolution["status"] != "not-raised" and resolution.get("artifact") != str(question_path):
         raise ValueError("frame-interview-binding-conflict: use the currently registered interview")
@@ -920,7 +921,8 @@ def _leg_task_text(route, root, output, briefs, intent, approvals):
     lines += ["", "## Execution scope", "", approvals.get("execution_scope", "complete"),
               "", "## Start approvals given", ""]
     lines += [f"- {row['key']} for leg {row['leg']} ({', '.join(row['parts']) or 'steps named in the question'}): "
-              + ("approved" if row["accepted"] else "not approved") for row in approvals["given"]] or ["- none"]
+              + ("approved" if row["accepted"] else "held for the person at its own gate" if row.get("held_for_person")
+                 else "not approved") for row in approvals["given"]] or ["- none"]
     return "\n".join(lines) + "\n"
 
 
@@ -959,8 +961,9 @@ def _decide(route, jobs, root, record, output, briefs, intent):
                         if item["leg"] == row["leg"] and item["start_approval"] == row["key"]})
         given.append({**row, "parts": parts})
     for item in match["facts"]["start_approvals"]:
-        if item["leg"] == 0 and not any(row["accepted"] and row["leg"] == 0 and row["key"] == item["start_approval"]
-                                        for row in given):
+        # A part held for the person starts with its leg and keeps its own gate.
+        if item["leg"] == 0 and not any((row["accepted"] or row.get("held_for_person")) and row["leg"] == 0
+                                        and row["key"] == item["start_approval"] for row in given):
             return ended(f"approval-missing:{item['start_approval']}", shown)
     execution_scope = choice.get("execution_scope") or choice["proposal"].get("execution_scope", "complete")
     if execution_scope not in ("complete", "report"):

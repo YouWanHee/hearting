@@ -3712,7 +3712,7 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
     route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
                            parent_harness=owner or "claude")
-    scope = (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {}).get("execution_scope")
+    scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
     return route
@@ -3721,16 +3721,16 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
 def route_plan_execution_scope(binding):
     """The start choice every leg of one frame decision carries.
 
-    The first leg was only selected with all of its start approvals given. A later leg keeps
-    `complete` only when each start approval it declares was also given for that leg in the same
-    interview; a part the person did not approve keeps its gate. `report` carries as it is, except
-    to a staged leg that would have no step left before its first approval (that leg keeps its gate).
+    A leg keeps `complete` only when each start approval it declares was given for that leg in the
+    same interview; a part not approved there (one held for the person included) keeps its gate.
+    `report` carries as it is, except to a later staged leg that would have no step left before its
+    first approval (that leg keeps its gate).
     """
     if not isinstance(binding, dict) or type(binding.get("index")) is not int:
         return None
     approvals = (((binding.get("record") or {}).get("decision") or {}).get("approvals") or {})
     scope = approvals.get("execution_scope")
-    if binding["index"] == 0 or scope not in ("complete", "report"):
+    if scope not in ("complete", "report") or (binding["index"] == 0 and scope == "report"):
         return scope
     legs = binding.get("legs")
     if not isinstance(legs, list) or not 0 <= binding["index"] < len(legs) or not isinstance(legs[binding["index"]], dict):

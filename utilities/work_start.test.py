@@ -1443,7 +1443,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         question_bytes = registered.read_bytes()
         original = json.loads(answer.read_text())
         with mock.patch.object(tidy_decisions, "record_interview_answers", return_value="recorded") as record:
-            for kind in (None, "unknown", "supervisor", "automatic", "headless-owner"):
+            for kind in (None, "unknown", "automatic", "headless-owner"):
                 with self.subTest(kind=kind):
                     supplied = {**original, "actor_kind": kind}
                     if kind is None:
@@ -1470,6 +1470,23 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             self.assertEqual(self.step(answers=answer), released)
             self.assertEqual((self.calls, record.call_count), (["gate", "release"], 1))
 
+    def test_a_supervisor_answer_releases_frame_review_on_the_persons_behalf(self):
+        asked = self.step(interview=self.question_file)
+        answer = self.answers()
+        response = json.loads(answer.read_text())
+        response["actor_kind"] = "supervisor"
+        answer.write_text(json.dumps(response))
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            with self.assertRaisesRegex(ValueError, "gate-release-actor-refused"):
+                self.step(answers=answer)                    # a registered worker is not the supervisor
+        self.assertEqual(self.resolution()["status"], "blocked")
+        released = self.step(answers=answer)
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(self.resolution()["actor_kind"], "supervisor")
+        self.assertIn("status: agreed-on-behalf\nactor_kind: supervisor", Path(released["intent_file"]).read_text())
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertEqual(Path(asked["interview_file"]).parent, Path(released["interview_file"]).parent)
+
     def test_registered_caller_cannot_claim_a_user_before_immutable_save(self):
         answer = self.answers()
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
@@ -1487,7 +1504,7 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         legacy = {**self.resolution(), "release_authority": None}
         answer = self.answers()
         response = json.loads(answer.read_text())
-        response["actor_kind"] = "supervisor"
+        response["actor_kind"] = "automatic"
         answer.write_text(json.dumps(response))
         with mock.patch.object(WF.WS, "human_gate_resolution", return_value=legacy):
             with self.assertRaisesRegex(ValueError, "gate-release-authority-refused"):

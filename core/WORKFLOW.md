@@ -322,9 +322,14 @@ The acting parent records the answer's source in the optional typed `actor_kind`
 field: `user`, `supervisor`, `automatic`, `headless-owner`, or `unknown`. Mark
 `user` only for the person's actual reply; a file without a source is `unknown`,
 not a user decision. This declaration is provenance, not native authentication.
-Existing person-only gates and start approvals accept only user answers; other
-allowed releases preserve their source in the journal and intent. A registered
-worker cannot use this field to bypass its existing release restrictions.
+`frame-review` takes the person's answer or a supervisor session's answer on
+the person's behalf (`supervisor`); the intent records it as
+`agreed-on-behalf`. A supervisor's yes does not start a `deploy`, `handback`
+or `preview` part: its leg starts and that part keeps its own gate for the
+person. Other person-only gates and start approvals accept only user answers;
+other allowed releases preserve their source in the journal and intent. A
+registered worker cannot use this field to bypass its existing release
+restrictions.
 Runtime settlement closes the route and cycle before owner success is delivered.
 Direct start also prepares the inline cycle and returns its `artifact_env`;
 use that output path without a separate producer `begin`. Replaying start on a

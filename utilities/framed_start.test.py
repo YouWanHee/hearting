@@ -482,6 +482,31 @@ class ApprovalTest(StartBase):
                 NoneEndingTest.assert_none(self, "approval-missing:full-run")
                 self.assertEqual(self.leg_calls, [])
 
+    def test_a_supervisor_yes_starts_a_full_run_and_holds_a_preview_for_the_person(self):
+        self.lab()
+        self.answers["actor_kind"] = "supervisor"
+        self.assertEqual(self.settle()["state"], "running")
+        given, = self.record()["decision"]["approvals"]["given"]
+        self.assertEqual((given["key"], given["accepted"]), ("full-run", True))
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertEqual(route["entry_execution_scope"], "complete")
+        self.tearDown()
+        self.setUp()
+        approvals = [{"key": "preview", "leg": 0, "question": "route"}]
+        refine = {"capability": "autopilot-refine", "shape": "solo", "why": "preview and refine"}
+        self.set_briefs(refine, refine, approvals=approvals)
+        self.set_interview({"legs": [refine], "entry_approvals": approvals})
+        self.answers["actor_kind"] = "supervisor"
+        self.assertEqual(self.settle()["state"], "running")
+        given, = self.record()["decision"]["approvals"]["given"]
+        self.assertEqual((given["key"], given["accepted"], given["held_for_person"]), ("preview", False, True))
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertNotIn("entry_execution_scope", route)                 # the preview keeps its own gate
+        self.assertTrue("preview-disposition" in route.get("human_gates", []) or any(
+            "preview-disposition" in node.get("inline_human_gates", []) for node in route["nodes"]), route)
+        task = self.leg_calls[0][self.leg_calls[0].index("--prompt-text") + 1]
+        self.assertIn("(autopilot-refine:transaction): held for the person at its own gate", task)
+
     def test_a_leg_with_an_approval_part_and_no_approval_asked_ends_as_none(self):
         self.lab(approval=False)
         NoneEndingTest.assert_none(self, "approval-missing:full-run")

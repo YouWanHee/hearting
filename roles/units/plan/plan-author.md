@@ -42,8 +42,9 @@ baseline.
   Constraints, and **Decisions** were agreed with the user at the frame gate.
   The plan's direction section cites each decision by its question id and
   never contradicts one; a decision the plan cannot honor is reported as a
-  blocker in the plan's risk section, not silently re-decided. A user
-  correction (`status: agreed-with-correction`) overrides every brief.
+  blocker in the plan's risk section, not silently re-decided. A correction
+  (`status: agreed-with-correction`, or `agreed-on-behalf-with-correction` when a
+  supervisor answered for the person) overrides every brief.
 
 ## Branch Selection
 

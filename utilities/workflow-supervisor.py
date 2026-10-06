@@ -1399,7 +1399,7 @@ def assert_release_authority(actor_kind, resolution, binding, gate):
     no authority keep the `any` allowance; a binding that declares `depth-0`
     is honoured even when the raise predates this field.
     """
-    if actor_kind == "user":
+    if INTERVIEW.answer_releases_gate(actor_kind, gate):
         return
     if gate == "preview-disposition":
         raise SupervisorError("gate-release-authority-refused: preview-disposition requires the person's decision")
@@ -1733,7 +1733,7 @@ def cmd_release(args):
                             released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
     record_answered_decisions(route, answered_interview, answers, actor_kind=actor_kind)
-    if args.decision == "proceed" and actor_kind == "user":
+    if args.decision == "proceed" and INTERVIEW.answer_releases_gate(actor_kind, args.gate):
         jobs = args.jobs or (None if payload.get("ledger_root_source") == "AGENT_WORKFLOW_ROOT"
                              else default_jobs_path())
         if jobs:
