@@ -13,3 +13,7 @@ For tier and role targets, omitting `@effort` preserves the configured tier budg
 An invalid target or unsupported budget is rejected before user-file mutation. `--dry-run` and byte-identical no-op requests create no config directory, lock, or backup. A real edit validates the complete candidate, preserves other declarations, comments, ordering, line endings, native settings and unrelated user files, writes one exact preimage backup for an existing config, then atomically publishes the candidate under a canonical target lock. Concurrent invocations of this command serialize. The filesystem's final precheck-to-rename interval is not a kernel compare-and-swap against non-cooperating writers; callers report conflicts they observe and do not roll back a later successor.
 
 The command configures future consumer reads. It does not rewrite generated adapter projections, active route seals, or process-local model selections. Use the existing runtime consumer and route policy as the authority for those surfaces.
+
+## Shipped-default-only maintenance
+
+A change that touches only the shipped default stays separate from the user-owned actual model set: edit `adapters/<harness>/config/models.conf`, then finish through the normal generation and existing fixture path as small `direct` work. It does not pick new concrete default values on its own, does not sync provider or user config, and does not clean up model-name literals across the repo.

@@ -23,6 +23,8 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 A worker assigned a parallel sub-session slice (phase brief, fixed files, `stage_authority=0`) edits only its fixed files and runs only its verify command. It makes no git writes — no safety checkpoint, phase commit, checkout, restore, stash, reset or rollback — and leaves `checklist.md` and the dev log to the owner. A file outside the list stops the slice with a handoff to the owner.
 
+Assign known approved test files together in the initial `fixed_files`. A later simple scope omission stays in the same approved work: the slice stops with a bounded patch plus the exact-path handoff and the owner continues it. Such an omission needs no new user approval, no new owner, and no separate repair. This does not relax the runtime `fixed_files` union or the foreign-sibling fence, and does not authorize automatic scope expansion.
+
 A commit-expected single-session stage commits all validated tracked source files it changed, including documentation and configuration examples. Source ownership follows the assigned scope and content, not filename extension. Add only exact owned paths; exclude artifact shadows, runtime state, and unrelated dirty files.
 
 ## Artifact Ownership

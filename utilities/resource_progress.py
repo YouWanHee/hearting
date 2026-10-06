@@ -154,6 +154,67 @@ def _schedule_epoch(training, attempt, total):
             "attempt_in_epoch": position, "state": state}
 
 
+def _arm_production_view(arm):
+    """Split one arm into local-verifiable fields plus production origin.
+
+    Bridge arms nest identity/directory/config inside ``arm["production"]``;
+    plain arms keep them top-level. In both shapes an explicit ``host`` (or
+    ``compute_host_receipt.host``) marks remote origin. Returns ``(fields,
+    remote)``; ``remote`` is True when such a host is present. Remote arms
+    must never be resolved in local /proc and their metadata alone never
+    proves live/done, so the caller skips them without ``process_reader``. The
+    embedded ``production.progress`` counters are never consumed here;
+    attempted/phase summary stays with oc-attempt-summary.
+    """
+    if not isinstance(arm, dict):
+        return None, False
+    production = arm.get("production")
+    if isinstance(production, dict):
+        identity = production.get("process_identity")
+        if not isinstance(identity, dict):
+            return None, False
+        state = arm.get("state")
+        if not isinstance(state, str):
+            state = production.get("state")
+        name = arm.get("name")
+        if not isinstance(name, str):
+            name = production.get("run_name")
+        if not isinstance(name, str):
+            name = None
+        host = production.get("host")
+        if not isinstance(host, str) or not host:
+            receipt = arm.get("compute_host_receipt")
+            host = receipt.get("host") if isinstance(receipt, dict) else None
+            if not isinstance(host, str) or not host:
+                host = None
+        origin = {}
+        for key in ("schema", "host", "compute_run_id", "capacity", "gpu_index"):
+            value = production.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) \
+                    and value != "":
+                origin[key] = value
+        run_id = arm.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            origin["run_id"] = run_id
+        return {"identity": identity, "directory": production.get("directory"),
+                "config_sha256": production.get("config_sha256"),
+                "state": state, "name": name, "origin": origin or None}, \
+            host is not None
+    if not isinstance(arm.get("process_identity"), dict):
+        return None, False
+    host = arm.get("host")
+    if not isinstance(host, str) or not host:
+        receipt = arm.get("compute_host_receipt")
+        host = receipt.get("host") if isinstance(receipt, dict) else None
+        if not isinstance(host, str) or not host:
+            host = None
+    return {"identity": arm.get("process_identity"),
+            "directory": arm.get("directory"),
+            "config_sha256": arm.get("config_sha256"),
+            "state": arm.get("state"), "name": arm.get("name"),
+            "origin": None}, host is not None
+
+
 def collect(run, registry, now, process_reader=observe_process, config_resolver=resolve_config):
     """Return one optional active-arm observation; unknown or ambiguous shapes fail soft."""
     try:
@@ -168,22 +229,25 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
             return None
         candidates = []
         for arm in arms:
-            if not isinstance(arm, dict):
+            view, remote = _arm_production_view(arm)
+            if view is None:
                 continue
-            identity = arm.get("process_identity")
-            if not isinstance(identity, dict):
+            if remote:
+                # Remote-origin production: never resolve its PID in local
+                # /proc and never treat its metadata as live/done proof.
                 continue
+            identity = view["identity"]
             expected = {**identity, "command_hash": identity.get("command_hash")
                         or identity.get("cmdline_sha256")}
             child = process_reader(identity.get("pid"))
             if _matches(child, expected) and child["process_group"] == wrapper["process_group"]:
-                candidates.append((arm, child))
+                candidates.append((view, child))
         if len(candidates) != 1:
             return None
-        arm, child = candidates[0]
+        view, child = candidates[0]
         if Path(child["cwd"]).resolve(strict=True) != Path(run["cwd"]).resolve(strict=True):
             return None
-        directory = arm.get("directory")
+        directory = view["directory"]
         if not isinstance(directory, str) or not directory:
             return None
         directory = Path(directory)
@@ -203,7 +267,7 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
         config_path = Path(resolved["path"])
         config_bytes, _ = _read(config_path, Path(child["cwd"]).resolve(strict=True))
         digest = hashlib.sha256(config_bytes).hexdigest()
-        if digest != _hash(arm.get("config_sha256")):
+        if digest != _hash(view["config_sha256"]):
             return None
         config = _json(config_bytes)
         training = config.get("training")
@@ -224,7 +288,7 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
         return {
             "pid": child["pid"], "starttime": child["starttime"],
             "command_hash": child["command_hash"], "process_group": child["process_group"],
-            "phase": arm.get("state"), "arm": arm.get("name"),
+            "phase": view["state"], "arm": view["name"],
             "attempt": attempt, "attempt_total": total,
             "percent": attempt * 100.0 / total, "successful": successful, "skipped": skipped,
             "loss": loss, "loss_kind": "last-batch" if loss is not None else None,
@@ -236,6 +300,7 @@ def collect(run, registry, now, process_reader=observe_process, config_resolver=
             "progress_path": str(progress_path), "progress_sha256": hashlib.sha256(data).hexdigest(),
             "config_path": str(config_path), "config_ref": resolved["config_ref"],
             "config_sha256": digest,
+            **({"production_origin": view["origin"]} if view["origin"] is not None else {}),
             **({"schedule_epoch": epoch} if epoch is not None else {}),
         }
     except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError,

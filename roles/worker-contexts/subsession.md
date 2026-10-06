@@ -5,6 +5,10 @@
   assigned `_internal/state/<attempt_id>.md`; do not reload the full specification
   unless the phase brief names it. If a required edit falls outside the fixed
   list, stop and hand the gap back to the owner instead of widening scope.
+  Known approved test files belong in the initial `fixed_files`; a later simple
+  omission returns as a bounded patch plus the exact-path handoff under the same
+  approved owner — no new approval, no new owner, no separate repair, and no
+  relaxation of the runtime `fixed_files` union or the foreign-sibling fence.
 - In a declared sub-session, keep the state ledger current after at most three
   material edits and after each verification round trip. Before compaction, flush
   the current slice, completed items, exact next command, invariants, and
