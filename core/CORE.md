@@ -31,7 +31,10 @@ Runtime code should resolve it in this order:
 3. `${XDG_DATA_HOME:-$HOME/.local/share}/hearting/current` when a managed release is installed
 4. `$HOME/hearting` when a canonical linked checkout is present
 5. `$HOME/agent_setting` when a legacy linked checkout is present
-6. the adapter's legacy default install path, currently `$HOME/.claude` for the Claude Code adapter
+6. otherwise the managed-release default path from step 3, unvalidated (both
+   resolvers converge on it in a bare environment). `$HOME/.claude` is the Claude
+   Code runtime home, not a harness root, since managed releases replaced the
+   `~/.claude`-as-`AGENT_HOME` layout (2026-08-25).
 
 Use `utilities/agent-home.sh` in shell code when a concrete path is needed.
 

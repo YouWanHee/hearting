@@ -133,7 +133,7 @@ Claude Code projects created before the neutral artifact root use `.claude_repor
 
 For shell code, use `utilities/artifact-root.sh`. In a linked task worktree it resolves the primary checkout, so a tracked local artifact snapshot is never a write target. Headless dispatch passes that exact path with Claude `--add-dir`.
 
-For harness-home paths, use `utilities/agent-home.sh` or the equivalent rule: prefer `AGENT_HOME`, then `CLAUDE_HOME`, then a managed release, `$HOME/hearting`, legacy `$HOME/agent_setting`, and finally `$HOME/.claude`.
+For harness-home paths, use `utilities/agent-home.sh` or the equivalent rule: prefer `AGENT_HOME`, then `CLAUDE_HOME`, then a managed release, `$HOME/hearting`, legacy `$HOME/agent_setting`, and finally the managed-release default path unvalidated (`$HOME/.claude` is the runtime home, not a harness root).
 
 ### SD-88 demand selection
 
