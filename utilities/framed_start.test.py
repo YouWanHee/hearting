@@ -710,6 +710,59 @@ class LegPlanTest(StartBase):
                 self.assertIsNone(RP.read_leg_items(route, artifact))
 
 
+class BlockedProgressTest(LegPlanTest):
+    """RA-5: BLOCKED rounds that shrink the leg's unmet items are progress, not a stalled node."""
+
+    def blocked_round(self, route, number, unmet, *, attempt=None, node="test", items=True):
+        attempt = attempt or f"att-test-{number}"
+        output = self.root / "rounds" / f"r{number}"
+        output.mkdir(parents=True, exist_ok=True)
+        artifact = output / "test-report.md"
+        artifact.write_text("report\n", encoding="utf-8")
+        if items:
+            RP.leg_items_path(artifact).write_text(json.dumps({
+                "schema": "leg_items_v1", "route_id": route["route_id"], "node": node, "attempt_id": attempt,
+                "items": [{"id": i, "state": "unmet" if i in unmet else "met"} for i in ("d1", "d2")]}),
+                encoding="utf-8")
+        log = output / "worker.log"
+        events = [{"type": "item.completed", "item": {"type": "agent_message",
+                   "text": f"artifact: {artifact}\nverdict: BLOCKED\nblocker: items left"}},
+                  {"type": "turn.completed"}]
+        log.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        return ("done", {"attempt_id": f"att-test-{number}", "note": "dead-worker-blocked", "failure_class": "blocked",
+                         "worker_type": "stage", "route_node": "test", "log_file": str(log),
+                         "artifact_root": str(self.root)})
+
+    def budget(self, route, rows):
+        import review_round_cap as RC
+        node = next(n for n in route["nodes"] if n["id"] == "test")
+        # The worker's artifact root, as the runtime that launched it names it.
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)}):
+            return RC.round_budget(route, node, rows)
+
+    def test_shrinking_unmet_items_keep_the_node_going_and_a_stall_still_binds_it(self):
+        route = self.planned_leg()
+        shrinking = [self.blocked_round(route, 1, {"d1", "d2"}), self.blocked_round(route, 2, {"d2"})]
+        budget = self.budget(route, shrinking)
+        self.assertEqual((budget.state, budget.verdictless_streak, budget.progress_reset), ("admit", 1, True))
+        stalled = shrinking + [self.blocked_round(route, 3, {"d2"})]
+        self.assertEqual(self.budget(route, stalled).state, "verdictless-bound")
+        grown = [self.blocked_round(route, 1, {"d2"}), self.blocked_round(route, 2, {"d1", "d2"})]
+        self.assertEqual(self.budget(route, grown).state, "verdictless-bound")
+
+    def test_items_that_cannot_be_judged_keep_the_two_in_a_row_rule(self):
+        route = self.planned_leg()
+        for label, second in (("no file", self.blocked_round(route, 2, set(), items=False)),
+                              ("another attempt", self.blocked_round(route, 2, set(), attempt="att-other")),
+                              ("another node", self.blocked_round(route, 2, set(), node="review"))):
+            with self.subTest(label):
+                rows = [self.blocked_round(route, 1, {"d1", "d2"}), second]
+                self.assertEqual(self.budget(route, rows).state, "verdictless-bound")
+        planless = {**route, "route_plan": None}
+        rows = [self.blocked_round(route, 1, {"d1", "d2"}), self.blocked_round(route, 2, {"d2"})]
+        self.assertEqual(self.budget(planless, rows).state, "verdictless-bound")
+
+
 class FailureTableTest(StartBase):
     def test_a164_11_a_first_leg_compose_refusal_keeps_the_record_and_the_same_start_resumes(self):
         with mock.patch.object(R, "compile_first_leg", side_effect=ValueError("compose-graph-order:test-before-execute")):

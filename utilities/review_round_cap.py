@@ -310,6 +310,7 @@ class RoundBudget:
     round_kind: str
     next_action: str
     closure_check_used: bool
+    progress_reset: bool = False
 
 
 _NEXT_ACTION_BY_STATE = {
@@ -351,6 +352,13 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
         if kind != "verdict-less":
             break
         verdictless_streak += 1
+    progress_reset = False
+    if verdictless_streak >= VERDICTLESS_BOUND and route.get("route_plan") is not None:
+        # RA-5: BLOCKED rounds that keep shrinking the leg's unmet items are progress (route_authority).
+        import route_authority
+        counted = route_authority.blocked_progress(route, rows)
+        progress_reset = counted < verdictless_streak
+        verdictless_streak = counted
     if "live" in kinds:
         state = "blocked-live"
     elif "unsettled" in kinds:
@@ -394,6 +402,7 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
         round_kind=round_kind,
         next_action=_NEXT_ACTION_BY_STATE[state],
         closure_check_used=closure_check_used,
+        progress_reset=progress_reset,
     )
 
 
