@@ -46,6 +46,21 @@ class DeclarationTest(unittest.TestCase):
                 self.assertEqual(pnd.parent_next(carrier, "att-x", agent_home=HC.ROOT)[0],
                                  pnd.NEXT_END_TURN)
 
+    def test_the_access_projection_table_names_each_harness_s_means(self):
+        self.assertEqual({h: HC.access(h)["enforcement"] for h in HC.HARNESSES},
+                         {"claude": "tool-permission", "codex": "os-sandbox", "opencode": "tool-permission"})
+        for harness in HC.HARNESSES:
+            self.assertEqual(sorted(HC.access(harness)["means"]), sorted(HC.ACCESS_AXES))
+        good = HC.capabilities("codex")
+        for broken in ({**good, "access": {**good["access"], "enforcement": "trust"}},
+                       {**good, "access": {"enforcement": "os-sandbox", "means": {"read": "x"}}}):
+            with self.subTest(broken=broken["access"]), tempfile.TemporaryDirectory() as td:
+                path = HC.declaration_path("codex", Path(td))
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(broken), encoding="utf-8")
+                with self.assertRaises(HC.HarnessCapabilityError):
+                    HC.capabilities("codex", Path(td))
+
     def test_a_malformed_declaration_is_refused(self):
         good = HC.capabilities("codex")
         broken = (

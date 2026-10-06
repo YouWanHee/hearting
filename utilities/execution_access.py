@@ -43,6 +43,18 @@ _NETWORK_FIELDS = frozenset({"required", "reason", "hosts"})
 _RUNTIMES = frozenset(
     {"codex-exec", "codex-app-server", "claude-cli", "claude-supervisor", "opencode"}
 )
+
+
+def _runtime_harness(runtime: str) -> str:
+    return str(runtime).split("-", 1)[0]
+
+
+def _os_sandboxed(runtime: str) -> bool:
+    """Whether the runtime's declared access enforcement is an OS sandbox
+    (`harness_capabilities` `access.enforcement`); an unknown runtime has none."""
+    from harness_capabilities import HARNESSES, access
+    harness = _runtime_harness(runtime)
+    return harness in HARNESSES and access(harness)["enforcement"] == "os-sandbox"
 _PATH_BAD = re.compile(r"[\x00-\x1f\x7f,=]|[*?\[\]{}]")
 _URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _HOSTNAME = re.compile(
@@ -490,6 +502,11 @@ class ExecutionAccessGrant:
     source_path: Path | None = None
     enclosing_parent_attempt_id: str | None = None
     enclosing_parent_network_allowed: bool = False
+    # How strongly the read-only roots stay unwritten: the OS sandbox, the tool
+    # permission rules that carry them, or nothing; and the read-only roots that
+    # lie outside every writable area, the ones an adapter keeps unwritten.
+    read_enforcement: str = "none"
+    unwritable_read_roots: tuple[Path, ...] = ()
 
 
 def request_path(
@@ -959,26 +976,31 @@ def build_grant(
     gpu_resource_scope: bool = False,
     enclosing_parent: ParentGrant | None = None,
 ) -> ExecutionAccessGrant:
-    """Compute the effective explicit grant; never create runtime argv."""
+    """Compute the effective explicit grant; never create runtime argv.
+
+    How a runtime realizes the request is its adapter's declaration
+    (`harness_capabilities` `access`); nothing here branches on a harness name."""
 
     if runtime not in _RUNTIMES:
         raise ExecutionAccessError(
             f"execution-access-enforcement-unavailable:{_safe_subject(runtime)}",
             "runtime has no execution access projection",
         )
+    harness = _runtime_harness(runtime)
+    sandboxed = _os_sandboxed(runtime)
     defaults = tuple(Path(path).resolve(strict=False) for path in default_writable_roots)
     absorbed = tuple(root for root in request.writable_roots if _covered(root, defaults))
     additional = tuple(root for root in request.writable_roots if not _covered(root, defaults))
 
     if enclosing_parent is not None:
-        if (not runtime.startswith("codex") or effective_sandbox != "danger-full-access"
-                or not enclosing_parent.runtime.startswith("codex")
+        if (not sandboxed or effective_sandbox != "danger-full-access"
+                or not _os_sandboxed(enclosing_parent.runtime)
                 or enclosing_parent.sandbox != "workspace-write"
                 or enclosing_parent.file_enforcement != "os-sandbox"
                 or enclosing_parent.network_enforcement not in ("os-sandbox", "none")
                 or not re.fullmatch(r"[A-Za-z0-9._-]+", enclosing_parent.attempt_id)):
             raise ExecutionAccessError(
-                "execution-access-enforcement-unavailable:codex-parent-sandbox",
+                f"execution-access-enforcement-unavailable:{harness}-parent-sandbox",
                 "the enclosing parent has no checked workspace-write OS boundary",
             )
         assert_within_parent(request, enclosing_parent, is_child=True)
@@ -991,63 +1013,64 @@ def build_grant(
         absorbed, additional = request.writable_roots, ()
         network_available = enclosing_parent.network_allowed
 
-    if runtime.startswith("codex"):
+    if sandboxed:
         file_grade = (enclosing_parent.file_enforcement if enclosing_parent else
                       "os-sandbox" if effective_sandbox == "workspace-write" else "none")
         network_grade = (enclosing_parent.network_enforcement if enclosing_parent else
                          "os-sandbox" if effective_sandbox == "workspace-write" else "none")
-    elif runtime.startswith("claude") or runtime == "opencode":
-        file_grade = "tool-permission"
+        # The sandbox reads everywhere; read-only roots stay unwritten while it confines writes.
+        read_grade = (enclosing_parent.file_enforcement if enclosing_parent else
+                      "os-sandbox" if effective_sandbox in ("workspace-write", "read-only") else "none")
+    else:
+        file_grade = read_grade = "tool-permission"
         network_grade = "none"
-    else:  # pragma: no cover - guarded above
-        file_grade = network_grade = "none"
 
     unmet: list[str] = []
-    gpu_logical = (gpu_resource_scope and runtime.startswith("codex")
+    # A read-only root that holds or lies inside a writable area stays writable there.
+    writable_areas = (*defaults, *request.writable_roots,
+                      *(enclosing_parent.writable_roots if enclosing_parent else ()))
+    unwritable = tuple(root for root in request.read_roots
+                       if not any(_covered(root, (area,)) or _covered(area, (root,)) for area in writable_areas))
+    if request.read_roots and read_grade == "none":
+        unmet.append("read-only-unenforced")
+    elif len(unwritable) != len(request.read_roots):
+        unmet.append("read-only-root-writable")
+        read_grade = "none"
+    gpu_logical = (gpu_resource_scope and sandboxed
                    and effective_sandbox == "danger-full-access"
                    and request.enforcement_required == "any")
-    if (request.writable_roots and runtime.startswith("codex") and file_grade == "none"
-            and not gpu_logical):
+    if request.writable_roots and sandboxed and file_grade == "none" and not gpu_logical:
         sandbox_subject = (
-            "codex-read-only"
+            f"{harness}-read-only"
             if effective_sandbox == "read-only"
-            else "codex-file-sandbox"
+            else f"{harness}-file-sandbox"
         )
         raise ExecutionAccessError(
             f"execution-access-enforcement-unavailable:{sandbox_subject}",
-            "the effective Codex sandbox cannot project requested writable roots",
+            "the effective sandbox cannot project requested writable roots",
         )
-    if request.read_roots:
-        if runtime == "opencode":
-            # Projected through permission-level external_directory
-            # (read-only) by the OpenCode launcher: the grant reflects the
-            # roots instead of reporting them unprojected. Every other
-            # runtime keeps the previous refusal.
-            pass
-        else:
-            unmet.append("read-roots-unprojected")
     if (request.writable_roots or gpu_logical) and file_grade == "none":
         unmet.append("file-enforcement-none")
     if gpu_logical:
         unmet.append("network-enforcement-none")
 
     if request.network_required:
-        if runtime.startswith("codex"):
+        if sandboxed:
             if not network_available or (network_grade != "os-sandbox" and not gpu_logical):
                 raise ExecutionAccessError(
-                    "execution-access-enforcement-unavailable:codex-network-role-gated",
-                    "network is outside the current Codex launch policy; change the top-level launch request/role",
+                    f"execution-access-enforcement-unavailable:{harness}-network-role-gated",
+                    "network is outside the current launch policy; change the top-level launch request/role",
                 )
             if gpu_logical:
                 network = "granted-unenforced"
-                unmet.append("network-unenforced-codex")
+                unmet.append(f"network-unenforced-{harness}")
                 if request.network_hosts:
                     unmet.append("network-hosts-unenforced")
             elif request.network_hosts:
                 if request.enforcement_required == "os-sandbox":
                     raise ExecutionAccessError(
-                        "execution-access-enforcement-unavailable:codex-network-hosts",
-                        "Codex boolean network access cannot enforce the requested host allowlist",
+                        f"execution-access-enforcement-unavailable:{harness}-network-hosts",
+                        "a boolean sandbox network switch cannot enforce the requested host allowlist",
                     )
                 network = "granted-unenforced"
                 unmet.append("network-hosts-unenforced")
@@ -1055,17 +1078,19 @@ def build_grant(
                 network = "enforced"
         else:
             network = "granted-unenforced"
-            unmet.append(f"network-unenforced-{runtime.split('-', 1)[0]}")
+            unmet.append(f"network-unenforced-{harness}")
     else:
         network = "not-requested"
 
     relevant_grades = []
-    if request.writable_roots or request.read_roots:
+    if request.writable_roots:
         relevant_grades.append(file_grade)
+    if request.read_roots:
+        relevant_grades.append(read_grade)
     if request.network_required:
         relevant_grades.append(network_grade)
     if request.enforcement_required == "os-sandbox":
-        if request.read_roots or any(grade != "os-sandbox" for grade in relevant_grades):
+        if any(grade != "os-sandbox" for grade in relevant_grades):
             raise ExecutionAccessError(
                 f"execution-access-enforcement-unavailable:{runtime}",
                 "the requested axes are not enforced by an OS sandbox on this runtime",
@@ -1074,7 +1099,7 @@ def build_grant(
     return ExecutionAccessGrant(
         request_sha256=request.request_sha256,
         writable_roots=request.writable_roots,
-        read_roots=request.read_roots if runtime == "opencode" else (),
+        read_roots=request.read_roots,
         additional_writable_roots=additional,
         absorbed_writable_roots=absorbed,
         network=network,
@@ -1084,6 +1109,8 @@ def build_grant(
         source_path=request.source_path,
         enclosing_parent_attempt_id=enclosing_parent.attempt_id if enclosing_parent else None,
         enclosing_parent_network_allowed=enclosing_parent.network_allowed if enclosing_parent else False,
+        read_enforcement=read_grade if request.read_roots else "none",
+        unwritable_read_roots=unwritable,
     )
 
 
@@ -1167,27 +1194,29 @@ def publish_effective_grant(
         "read_roots": read,
         "network_allowed": bool(network_allowed),
         "file_enforcement": grant.file_enforcement if grant else (
-            "os-sandbox" if runtime.startswith("codex") and sandbox == "workspace-write"
-            else "tool-permission" if runtime.startswith(("claude", "opencode")) else "none"
+            ("os-sandbox" if sandbox == "workspace-write" else "none") if _os_sandboxed(runtime)
+            else "tool-permission" if runtime in _RUNTIMES else "none"
         ),
         "network_enforcement": grant.network_enforcement if grant else (
-            "os-sandbox" if runtime.startswith("codex") and sandbox == "workspace-write" else "none"
+            "os-sandbox" if _os_sandboxed(runtime) and sandbox == "workspace-write" else "none"
         ),
     }
+    if grant is not None and grant.read_roots:
+        record["read_enforcement"] = grant.read_enforcement
     if grant is not None and grant.enclosing_parent_attempt_id is not None:
         record.update({"boundary": "parent-os-sandbox",
                        "enclosing_parent_attempt_id": grant.enclosing_parent_attempt_id,
                        "network_allowed": grant.enclosing_parent_network_allowed,
                        "os_filesystem_enforced": grant.file_enforcement == "os-sandbox",
                        "os_network_enforced": grant.network_enforcement == "os-sandbox"})
-    if (grant is not None and runtime.startswith("codex")
+    if (grant is not None and _os_sandboxed(runtime)
             and sandbox == "danger-full-access" and grant.file_enforcement == "none"):
         record.update({"boundary": "logical-request", "unmet": list(grant.unmet),
                        "os_filesystem_enforced": False, "os_network_enforced": False})
         record["network_allowed"] = bool(network_allowed or grant.network == "granted-unenforced")
     if execution_selection is not None and execution_selection.get("gpu_scope") is True:
         record["execution_sandbox_selection"] = dict(execution_selection)
-        if runtime.startswith("codex") and sandbox == "danger-full-access":
+        if _os_sandboxed(runtime) and sandbox == "danger-full-access":
             record.update({"boundary": "logical-request" if grant else "logical-defaults",
                            "os_filesystem_enforced": False, "os_network_enforced": False})
     raw = _canonical_json_bytes(record)
@@ -1309,6 +1338,8 @@ def receipt_fields(grant: ExecutionAccessGrant) -> dict[str, str]:
     """Return exactly the five pipe-safe registry facts required by SD-141."""
 
     enforcement = grant.file_enforcement
+    if not grant.writable_roots and grant.read_roots:
+        enforcement = grant.read_enforcement
     if not grant.writable_roots and not grant.read_roots and grant.network != "not-requested":
         enforcement = grant.network_enforcement
     fields = {

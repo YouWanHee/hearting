@@ -14,5 +14,13 @@
     ],
     "process_proof": "open-rollout",
     "herdr_session_id": "verified"
+  },
+  "access": {
+    "enforcement": "os-sandbox",
+    "means": {
+      "read": "the sandbox reads everywhere and writes only to its writable roots",
+      "write": "sandbox writable roots",
+      "network": "sandbox network switch, no host allowlist"
+    }
   }
 }

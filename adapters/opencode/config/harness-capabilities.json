@@ -13,5 +13,13 @@
     ],
     "process_proof": "tui-selection",
     "herdr_session_id": "claim"
+  },
+  "access": {
+    "enforcement": "tool-permission",
+    "means": {
+      "read": "external_directory read-only permission",
+      "write": "external_directory permission",
+      "network": "unenforced"
+    }
   }
 }

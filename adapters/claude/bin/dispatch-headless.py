@@ -1064,6 +1064,17 @@ def _async_deny_tools(args: argparse.Namespace) -> tuple[str, ...]:
     return PROVEN_ASYNC_DENY
 
 
+def _read_only_projection(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    """The access request's read-only roots as Claude realizes them
+    (`harness_capabilities` access means): each root is an `--add-dir`, and the
+    roots the grant keeps unwritten get an Edit deny rule (Edit rules also govern Write)."""
+    grant = getattr(args, "execution_access_grant", None)
+    if grant is None:
+        return [], []
+    return ([str(root) for root in grant.read_roots],
+            [f"Edit(//{str(root).lstrip('/')}/**)" for root in grant.unwritable_read_roots])
+
+
 def _async_wait_policy(args: argparse.Namespace) -> str:
     if getattr(args, "resolved_completion_delivery", "") == "session-resume-supervised":
         return "runtime-supervised"
@@ -1277,6 +1288,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         if getattr(args, "execution_access_grant", None) is not None:
             for writable_dir in args.execution_access_grant.additional_writable_roots:
                 command += ["--add-dir", str(writable_dir)]
+        read_dirs, read_deny = _read_only_projection(args)
+        for read_dir in read_dirs:
+            command += ["--add-dir", read_dir]
         route = _supervisor_route(args)
         if route:
             command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
@@ -1289,7 +1303,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 "--model", args.resolved_model_settings["model"],
                 "--effort", args.resolved_model_settings["effort"],
             ]
-        for tool in _async_deny_tools(args):
+        for tool in (*_async_deny_tools(args), *read_deny):
             command += ["--disallowed-tool", tool]
         posture = _permission_posture(args)
         command += ["--permission-mode", str(posture["mode_flag"])]
@@ -1312,6 +1326,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     if getattr(args, "execution_access_grant", None) is not None:
         for writable_dir in args.execution_access_grant.additional_writable_roots:
             cmd += ["--add-dir", str(writable_dir)]
+    read_dirs, read_deny = _read_only_projection(args)
+    for read_dir in read_dirs:
+        cmd += ["--add-dir", read_dir]
     if args.resolved_model_settings["source"] != "inherit":
         cmd += [
             "--model",
@@ -1319,7 +1336,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "--effort",
             args.resolved_model_settings["effort"],
         ]
-    deny = _async_deny_tools(args)
+    deny = (*_async_deny_tools(args), *read_deny)
     if deny:
         cmd += ["--disallowedTools", ",".join(deny)]
     posture = _permission_posture(args)
