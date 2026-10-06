@@ -77,5 +77,38 @@ class CommitPolicyTest(unittest.TestCase):
         self.assertIn("may_commit", calls("claude"))
 
 
+
+class OpenCodeRealizationTest(unittest.TestCase):
+    """OpenCode refuses `git commit` to a no-commit worker through its own permission rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "opencode_dispatch_headless_commit", ROOT / "adapters/opencode/bin/dispatch-headless.py")
+        cls.wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.wrapper)
+
+    def deny(self, config, agent=None):
+        import json
+        return json.loads(self.wrapper.deny_commands(json.dumps(config), commit_policy.COMMIT_COMMANDS, agent))
+
+    def test_the_global_and_agent_bash_rules_end_with_the_denies(self):
+        denies = {"git commit": "deny", "git commit *": "deny"}
+        self.assertEqual(self.deny({})["permission"], {"bash": denies})
+        out = self.deny({"permission": {"bash": "allow", "edit": "allow"}})["permission"]
+        self.assertEqual(list(out), ["edit", "bash"])                       # last match wins
+        self.assertEqual(out["bash"], {"*": "allow", **denies})
+        out = self.deny({"permission": {"bash": {"git *": "allow"}}})["permission"]["bash"]
+        self.assertEqual(out, {"git *": "allow", **denies})
+        out = self.deny({"permission": "allow", "agent": {"build": {"permission": {"*": "allow"}}}}, "build")
+        self.assertEqual(out["permission"], {"*": "allow", "bash": denies})
+        self.assertEqual(out["agent"]["build"]["permission"], {"*": "allow", "bash": denies})
+
+    def test_the_launch_applies_it_only_to_a_no_commit_stage(self):
+        source = (ROOT / "adapters/opencode/bin/dispatch-headless.py").read_text(encoding="utf-8")
+        self.assertIn("if commit_policy.no_commit_stage(args):", source)
+        self.assertIn("deny_commands(", source)
+
 if __name__ == "__main__":
     unittest.main()

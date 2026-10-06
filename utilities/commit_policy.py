@@ -26,6 +26,8 @@ PROMPT_CLAUSE = (
     "- Your stage owner commits after this stage's own PASS gate and confirms diff attribution.\n\n"
 )
 REGISTRY_FRAGMENT = ",no_commit=1"
+# The commands a no-commit worker is refused where its runtime can refuse a command.
+COMMIT_COMMANDS = ("git commit",)
 
 
 def worktree_mutating_write_scope(write_scope: str | None) -> bool:
