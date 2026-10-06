@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -216,6 +217,123 @@ class TrainingProgressPipelineTest(unittest.TestCase):
         other = copy.deepcopy(self.rows[0])
         other.training_progress["attempt"] += 1
         self.assertIsNone(self.training_in(self.projected(rows=self.rows + [other])))
+
+
+class RemoteHostJoinTest(unittest.TestCase):
+    """Host-qualified remote join: own host only, never cross-host.
+
+    Display-only remote candidates attach to their own non-self host/GPU by
+    exact (host, pid, start) plus command hash when both sides carry it. The
+    same pid on two hosts, hash mismatch, staleness, ambiguity, or an
+    unreadable (foreign-euid) process all fail soft back to the raw line.
+    Verified local training keeps its own host.
+    """
+
+    def setUp(self):
+        self.now = time.time()
+
+    def job(self, training=None, remote=(), group=4, live="working"):
+        return SimpleNamespace(liveness=live, training_progress=training,
+                              remote_training=list(remote), process_group=group)
+
+    def candidate(self, host="cnn", pid=3945450, start=565464077, cmdhash="d" * 64,
+                  age=5, **over):
+        base = {"remote": True, "host": host, "pid": pid, "starttime": start,
+                "command_hash": cmdhash, "phase": "training-updates",
+                "arm": "t_baseline_20261006", "attempt": 67117,
+                "attempt_total": 400000, "percent": 16.77925,
+                "successful": 67096, "skipped": 21, "loss": 0.00985,
+                "loss_kind": "last-batch", "observed_at": self.now - age,
+                "progress_updated_at": self.now - age}
+        base.update(over)
+        return base
+
+    def process(self, pid=3945450, start=565464077, pgid=3945418, cmdhash="d" * 64,
+                command="python train", **over):
+        base = {"pid": pid, "proc_start": start, "pgid": pgid,
+                "command": command, "command_hash": cmdhash,
+                "progress": {"line": "raw heartbeat", "age_s": 1}}
+        base.update(over)
+        return base
+
+    def snapshot(self, hosts):
+        return {"configured": True, "observed_at": self.now, "hosts": hosts}
+
+    def host(self, name, processes, is_self=False, age=5, gpu=0, hostname=None):
+        row = {"host": name, "self": is_self, "reachable": True,
+               "observed_at": self.now - age,
+               "gpus": [{"index": gpu, "processes": list(processes)}]}
+        if hostname is not None:
+            row["hostname"] = hostname
+        return row
+
+    def training_in(self, snapshot, host=1, gpu=0, proc=0):
+        return snapshot["hosts"][host]["gpus"][gpu]["processes"][proc][
+            "progress"].get("training")
+
+    def test_remote_candidate_joins_only_its_host(self):
+        rows = [self.job(remote=[self.candidate()])]
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("moving4", [self.process(42, 11, 4)], is_self=True),
+                           self.host("cnn", [self.process()], hostname="cnn")]),
+            rows, now=self.now)
+        self.assertIsNone(self.training_in(out, host=0))
+        training = self.training_in(out)
+        self.assertEqual((training["attempt"], training["host"], training["pid"]),
+                         (67117, "cnn", 3945450))
+        self.assertGreaterEqual(training["progress_age_s"], 5)
+        self.assertEqual(out["hosts"][1]["gpus"][0]["processes"][0][
+            "progress"]["line"], "raw heartbeat")
+
+    def test_same_pid_two_hosts_keep_their_own_training(self):
+        local = {"pid": 42, "starttime": "11", "command_hash": "b" * 64,
+                 "process_group": 4, "phase": "training-updates", "arm": "arm",
+                 "attempt": 100, "attempt_total": 400000, "percent": 0.025,
+                 "successful": 100, "skipped": 0, "loss": None, "loss_kind": None,
+                 "observed_at": self.now - 5, "progress_updated_at": self.now - 5}
+        rows = [self.job(training=local,
+                         remote=[self.candidate(pid=42, start=11)])]
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("moving4", [self.process(
+                42, 11, 4, cmdhash="b" * 64)], is_self=True),
+                           self.host("cnn", [self.process(
+                               42, 11, 99, cmdhash="d" * 64)],
+                                           hostname="cnn")]),
+            rows, now=self.now)
+        self.assertEqual(self.training_in(out, host=0)["arm"], "arm")
+        self.assertEqual(self.training_in(out)["host"], "cnn")
+
+    def test_hash_mismatch_stale_and_ambiguous_fail_soft(self):
+        rows = [self.job(remote=[self.candidate(cmdhash="e" * 64)])]
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("cnn", [self.process()], hostname="cnn")]),
+            rows, now=self.now)
+        self.assertIsNone(self.training_in(out, host=0))
+        rows = [self.job(remote=[self.candidate(age=31)])]
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("cnn", [self.process()], hostname="cnn")]),
+            rows, now=self.now)
+        self.assertIsNone(self.training_in(out, host=0))
+        first = self.candidate()
+        second = dict(first, attempt=67118)
+        rows = [self.job(remote=[first, second])]
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("cnn", [self.process()], hostname="cnn")]),
+            rows, now=self.now)
+        self.assertIsNone(self.training_in(out, host=0))
+
+    def test_unreadable_process_and_self_host_never_join_remote(self):
+        rows = [self.job(remote=[self.candidate()])]
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("cnn", [self.process(command=None)],
+                                     hostname="cnn")]),
+            rows, now=self.now)
+        self.assertIsNone(self.training_in(out, host=0))
+        out = compute_hosts.with_training_progress(
+            self.snapshot([self.host("cnn", [self.process()], is_self=True,
+                                     hostname="cnn")]),
+            rows, now=self.now)
+        self.assertIsNone(self.training_in(out, host=0))
 
 
 if __name__ == "__main__":

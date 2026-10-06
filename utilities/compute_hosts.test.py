@@ -1338,6 +1338,45 @@ def probe_namespace():
     return namespace
 
 
+class ProbeCommandHashTest(unittest.TestCase):
+    """Per-GPU process command hash: stable same-EUID read, else None.
+
+    Narrow identity exposure for the host-qualified remote training join.
+    Unreadable, dead, or recycled pids fail soft so the join keeps the raw
+    probe line instead of mismatching.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ns = probe_namespace()
+
+    def spawn(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        self.addCleanup(child.wait, 2)
+        self.addCleanup(child.terminate)
+        return child
+
+    def test_live_process_hash_matches_cmdline_bytes(self):
+        import hashlib
+
+        child = self.spawn()
+        start = self.ns["proc_stat"](child.pid)["start"]
+        expected = hashlib.sha256(
+            Path("/proc/%d/cmdline" % child.pid).read_bytes()).hexdigest()
+        self.assertEqual(self.ns["process_command_hash"](child.pid, start), expected)
+
+    def test_dead_pid_and_recycled_start_are_none(self):
+        child = self.spawn()
+        start = self.ns["proc_stat"](child.pid)["start"]
+        child.terminate()
+        child.wait(timeout=5)
+        self.assertIsNone(self.ns["process_command_hash"](child.pid, start))
+        live = self.spawn()
+        live_start = self.ns["proc_stat"](live.pid)["start"]
+        self.assertIsNone(self.ns["process_command_hash"](live.pid, live_start + 1))
+
+
 class ProbeProgressTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
