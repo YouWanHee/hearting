@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
@@ -144,7 +145,10 @@ class ComputeHostsTest(unittest.TestCase):
         environ = mock.patch.dict(os.environ, {"TMPDIR": str(self.root)})
         environ.start()
         self.addCleanup(environ.stop)
-        self.env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.config)}
+        # A run's completion watch notifies through the dispatch state root; keep it here.
+        self.env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.config),
+                    "HARNESS_STATE_ROOT": str(self.root / "state")}
+        self.env.pop("AGENT_DISPATCH_JOBS", None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1059,7 +1063,10 @@ class LauncherProvenanceTest(unittest.TestCase):
         environ = mock.patch.dict(os.environ, {"TMPDIR": str(self.root)})
         environ.start()
         self.addCleanup(environ.stop)
-        self.env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.config)}
+        # A run's completion watch notifies through the dispatch state root; keep it here.
+        self.env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.config),
+                    "HARNESS_STATE_ROOT": str(self.root / "state")}
+        self.env.pop("AGENT_DISPATCH_JOBS", None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1370,6 +1377,63 @@ def probe_namespace():
     exec(compile(source.split("\ncpu_count = os.cpu_count()", 1)[0],
                  "<probe-helpers>", "exec"), namespace)
     return namespace
+
+
+class CompletionWatchTest(unittest.TestCase):
+    """A run started from an interactive session tells that session once when it ends."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.run_dir = self.root / "runs" / "here-1"
+        self.run_dir.mkdir(parents=True)
+        self.meta = {"run_id": "here-1", "host": "here",
+                     "provenance": {"session": {"harness": "claude", "id": "sid-7"},
+                                    "route": {"route_id": "rt-0123456789abcdef"}}}
+        (self.run_dir / "meta.json").write_text(json.dumps(self.meta))
+
+    def test_only_an_interactive_session_launch_is_watched(self):
+        module = load_module()
+        spawned = []
+        spawn = lambda argv, **kw: spawned.append(argv)
+        self.assertTrue(module._spawn_completion_watch(self.run_dir, self.meta, environ={}, spawn=spawn))
+        self.assertEqual(spawned[0][2:], ["watch-run", str(self.run_dir)])
+        self.assertFalse(module._spawn_completion_watch(self.run_dir, self.meta,
+                                                        environ={"AGENT_DISPATCH_DEPTH": "1"}, spawn=spawn))
+        no_session = {**self.meta, "provenance": {"session": None}}
+        self.assertFalse(module._spawn_completion_watch(self.run_dir, no_session, environ={}, spawn=spawn))
+        self.assertEqual(len(spawned), 1)
+
+    def test_the_watch_waits_for_the_exit_code_and_leaves_one_notice(self):
+        module = load_module()
+        clock, slept = [0.0], []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            clock[0] += seconds
+            (self.run_dir / "exit_code").write_text("3\n")
+
+        state = self.root / "state"
+        with mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state)}):
+            os.environ.pop("AGENT_DISPATCH_JOBS", None)
+            module.cmd_watch_run(SimpleNamespace(run_dir=str(self.run_dir)), sleep=sleep, now=lambda: clock[0])
+            utilities = str(Path(module.__file__).resolve().parent)
+            sys.path.insert(0, utilities)
+            import dispatch_session_sweep as sweep
+            claimed, _ = sweep.sweep_deliver(state / "dispatch", "claude-parent-runtime", "sid-7")
+        self.assertEqual(slept, [module.COMPLETION_POLL_SECONDS])
+        self.assertEqual(len(claimed), 1)
+        text = sweep.delivery_context([(state / "dispatch", claimed)])
+        self.assertIn("run here-1 on here ended with exit 3; read it with: compute-hosts tail here-1", text)
+        self.assertEqual(claimed[0]["route_id"], "rt-0123456789abcdef")
+
+    def test_a_removed_run_ends_the_watch_quietly(self):
+        module = load_module()
+        import shutil
+        shutil.rmtree(self.run_dir)
+        self.assertEqual(module.cmd_watch_run(SimpleNamespace(run_dir=str(self.run_dir)),
+                                              sleep=lambda s: self.fail("slept"), now=lambda: 0.0), 0)
 
 
 class ProbeCommandHashTest(unittest.TestCase):
