@@ -26,7 +26,7 @@ from dispatch_supervisor_terminal import classify_session_result, opencode_termi
 # (`failure_class=fail`) is unchanged. Only a `worker_type=review` row with a
 # readable artifact earns it; every other FAIL keeps the dead-worker note.
 from dispatch_attempt_policy import REVIEW_BLOCKING_NOTE
-from route_authority import HANDOFF_RE, pass_blocker_violation
+from route_authority import HANDOFF_RE, pass_blocker_note, pass_blocker_violation
 REVIEW_WORKER_TYPE = "review"
 
 
@@ -372,6 +372,10 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
                 sandbox_init = True
 
     verdict = handoff["verdict"]
+    # RA-8: a PASS whose blocker is `none (note)` is a PASS; the note is kept.
+    note = pass_blocker_note(handoff["blocker"]) if verdict == "PASS" else None
+    normalized = {"envelope_normalized": "pass-blocker-note",
+                  "pass_note_excerpt": _escape_and_bound(note)[0]} if note else {}
     failure_note = (
         "dead-sandbox-init"
         if verdict == "BLOCKED" and sandbox_init
@@ -387,8 +391,9 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
         terminal_source,
         verdict,
         "unchecked",
-        "none" if handoff["blocker"] == "none" else "worker-reported",
+        "none" if handoff["blocker"] == "none" or note is not None else "worker-reported",
         reason="none",
+        **normalized,
         artifact=handoff["artifact"],
         blocker=handoff["blocker"],
         diagnostic=diagnostic,
@@ -598,6 +603,25 @@ def directory_artifact_reason(artifact_path: Path, root: Path | None = None) -> 
     return "artifact-empty-directory"
 
 
+def same_tail_artifact(candidate: Path, root: Path) -> Path | None:
+    """The one existing path under ``root`` that a missing absolute artifact path
+    names by the same tail after the root's own directory name -- a mistyped
+    parent such as ``/home/nas/user/NN_Zoo/...`` for ``/home/nas/user/Uihyeop/NN_Zoo/...``
+    (RA-8). None when no such path exists or more than one does; the caller
+    still checks that the result stays inside ``root``.
+    """
+    found = set()
+    parts = candidate.parts
+    for index, part in enumerate(parts):
+        rest = parts[index + 1:]
+        if part != root.name or not rest or any(item in {"", ".", ".."} for item in rest):
+            continue
+        target = root.joinpath(*rest)
+        if os.path.lexists(target):
+            found.add(target)
+    return next(iter(found)) if len(found) == 1 else None
+
+
 def _encode_path(path: Path) -> str:
     return base64.urlsafe_b64encode(str(path).encode("utf-8")).decode("ascii").rstrip("=")
 
@@ -679,8 +703,11 @@ def inspect_terminal_attempt(
                 "contract-violation",
                 reason="artifact-outside-root",
             )
+        # RA-8: a missing path that names one existing file under the root by
+        # the same tail is that file; the path the worker wrote is kept.
+        named = same_tail_artifact(candidate, root) if not os.path.lexists(candidate) else None
         try:
-            artifact_path = candidate.resolve(strict=False)
+            artifact_path = (named or candidate).resolve(strict=False)
             artifact_path.relative_to(root)
         except (OSError, ValueError):
             return _result(
@@ -692,7 +719,11 @@ def inspect_terminal_attempt(
                 "contract-violation",
                 reason="artifact-outside-root",
             )
-        if not os.path.lexists(candidate):
+        if named is not None:
+            parsed["artifact_named_path_b64"] = _encode_path(candidate)
+            parsed["envelope_normalized"] = ",".join(
+                filter(None, (parsed.get("envelope_normalized"), "artifact-same-tail")))
+        elif not os.path.lexists(candidate):
             # An earlier release's checkpoint may have moved a cycle's loose output
             # into its declared bucket after the worker wrote its final handoff.
             # Follow only the producer's recorded same-cycle move, then recheck the

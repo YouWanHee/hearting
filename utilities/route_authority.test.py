@@ -209,11 +209,15 @@ class Case6UncappedAndEnvelopeTest(unittest.TestCase):
         self.assertFalse(RA.is_round_capped_node(execute))
         self.assertEqual(RA.retry_predecessor([_fail_row("att-2358")]), "")
 
-    def test_a_pass_with_an_explained_none_blocker_breaks_the_contract(self):
+    def test_a_pass_with_an_explained_none_blocker_is_a_pass(self):
+        # RA-8 (stage 2): the note is kept as a remark; other blocker text still breaks PASS.
         text = "artifact: /cycle/test_logs/envelope.md\nverdict: PASS\nblocker: none (범위 한정 PASS)"
         handoff = RA.HANDOFF_RE.search(text).groupdict()
         self.assertEqual(handoff["blocker"], "none (범위 한정 PASS)")
-        self.assertEqual(RA.pass_blocker_violation(handoff["verdict"], handoff["blocker"]), "pass-blocker-not-none")
+        self.assertIsNone(RA.pass_blocker_violation(handoff["verdict"], handoff["blocker"]))
+        self.assertEqual(RA.pass_blocker_note(handoff["blocker"]), "범위 한정 PASS")
+        self.assertEqual(RA.pass_blocker_note("none"), "")
+        self.assertEqual(RA.pass_blocker_violation("PASS", "G1 skipped"), "pass-blocker-not-none")
         self.assertIsNone(RA.pass_blocker_violation("PASS", "none"))
         self.assertIsNone(RA.pass_blocker_violation("FAIL", "G1 incomplete"))
         self.assertIsNone(RA.HANDOFF_RE.search("verdict: PASS\nblocker: none"))
