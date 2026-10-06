@@ -2737,6 +2737,10 @@ PRELAUNCH_PROCESS_BLOCK_REASONS = (
     "prior-attempt-still-live",
     "prior-attempt-unverifiable",
 )
+# A runtime that retries one of these itself keeps to the reap watcher's own
+# post-exit drain bounds: the backoff ceiling and the grace before it gives up.
+PRELAUNCH_WAIT_GRACE_SECONDS = 30.0
+PRELAUNCH_WAIT_INTERVAL_MAX_SECONDS = 2.0
 
 # SD-154/B-2 (defect #2): every reason that means "this route's own recorded
 # state needs a person or a `revise` call, not another launch attempt". A

@@ -912,5 +912,106 @@ class ChainDeliveryNoticeDeferredTest(unittest.TestCase):
         self.assertEqual(notice, "")
 
 
+class StartWaitRetryTest(unittest.TestCase):
+    """A successor start refused before spawning for a reason waiting may fix is
+    started again within the prelaunch grace, each refusal kept in the record."""
+
+    def setUp(self):
+        self.sandbox = Sandbox()
+        self.addCleanup(self.sandbox.close)
+        self.manifest = make_manifest()
+        self.sandbox.mark_terminal(1, "att-stage-session-1")
+        self.registered()
+
+    def registered(self, status="open", **changes):
+        self.sandbox.add_registry_row({"session_chain_id": CHAIN_ID, "subsession_index": "2",
+                                       "attempt_id": "att-stage-session-2", "launch_claimed": "0",
+                                       **changes}, status=status)
+
+    def services(self, *answers):
+        services = FakeServices(self.sandbox)
+        replies = list(answers)
+        real = services.start_successor
+        def start_successor(request, *, claim):
+            reply = replies.pop(0) if replies else None
+            if reply is None:
+                return real(request, claim=claim)
+            services.start_calls += 1
+            return {"child_spawned": False, "returncode": 78, "reason": reply}
+        services.start_successor = start_successor
+        return services
+
+    def advance(self, services):
+        return SA.coordinate_subsession_advance(make_request(self.sandbox, self.manifest, successor_index=2),
+                                                services)
+
+    def record(self, result):
+        return json.loads(Path(result.record_path).read_text(encoding="utf-8"))
+
+    def test_a_waiting_refusal_is_started_again_and_then_advances(self):
+        services = self.services("prior-attempt-unverifiable")
+        first = self.advance(services)
+        self.assertEqual((first.outcome, first.reason),
+                         ("deferred", "subsession-advance-successor-start-deferred:prior-attempt-unverifiable"))
+        record = self.record(first)
+        self.assertIsNone(record["outcome"])
+        self.assertNotIn("started", record["phases"])
+        self.assertEqual([r["reason"] for r in record["phases"]["start_retries"]], ["prior-attempt-unverifiable"])
+        second = self.advance(services)
+        self.assertEqual((second.outcome, second.successor_attempt_id), ("advanced", "att-stage-session-2"))
+        self.assertEqual((services.claim_calls, services.register_calls, services.start_calls), (1, 1, 2))
+        self.assertEqual(len(self.record(second)["phases"]["start_retries"]), 1)
+
+    def test_the_refusal_stands_once_the_grace_has_passed(self):
+        services = self.services("predecessor-process-unverifiable", "prior-attempt-unverifiable")
+        now = [10**18]
+        with mock.patch.object(SA.time, "time_ns", side_effect=lambda: now[0]):
+            self.assertEqual(self.advance(services).outcome, "deferred")
+            now[0] += int(SA.DC.PRELAUNCH_WAIT_GRACE_SECONDS * 1e9)
+            last = self.advance(services)
+        self.assertEqual((last.outcome, last.reason),
+                         ("refused", "subsession-advance-successor-start-failed:prior-attempt-unverifiable"))
+        record = self.record(last)
+        self.assertEqual([r["reason"] for r in record["phases"]["start_retries"]],
+                         ["predecessor-process-unverifiable", "prior-attempt-unverifiable"])
+        self.assertIn("started", record["phases"])
+        self.assertEqual(self.advance(services).outcome, "refused")   # a stood refusal is final
+        self.assertEqual(services.start_calls, 2)
+
+    def test_any_other_refusal_or_a_closed_row_is_refused_at_once(self):
+        result = self.advance(self.services("launch-error"))
+        self.assertEqual(result.outcome, "refused")
+        self.assertNotIn("start_retries", self.record(result)["phases"])
+
+    def test_a_row_its_wrapper_already_closed_is_not_started_again(self):
+        self.registered(status="done", launch_outcome="never-launched")
+        result = self.advance(self.services("prior-attempt-unverifiable"))
+        self.assertEqual((result.outcome, result.reason),
+                         ("refused", "subsession-advance-successor-start-failed:prior-attempt-unverifiable"))
+
+    def test_the_drive_waits_on_a_deferred_start_and_closes_only_a_refusal(self):
+        row = SimpleNamespace(attempt_id="att-1", status="done",
+                              metadata={"session_chain_id": CHAIN_ID, "subsession_mode": "serial",
+                                        "subsession_index": "1"})
+        steps = iter([SA.ChainAdvanceStep("deferred", chain_id=CHAIN_ID, predecessor_index=1,
+                                          successor_index=2, reason="prior-attempt-unverifiable")] * 3
+                     + [SA.ChainAdvanceStep("refused", chain_id=CHAIN_ID, predecessor_index=1, successor_index=2,
+                                            reason="subsession-advance-successor-start-failed:x")])
+        sleeps, events, closes = [], [], []
+        with mock.patch.object(SA, "advance_chain_step", side_effect=lambda *args: next(steps)), \
+                mock.patch.object(SA, "close_refused_chain_successors",
+                                  side_effect=lambda *args: closes.append(args) or ((), ())):
+            result = SA.drive_serial_chain(
+                jobs=Path("/unused/jobs.log"), parent_attempt_id="att-owner", attempts={"att-1"},
+                receipt={"state": "delivered", "children": []}, refresh=lambda attempts: [row],
+                join=lambda attempts: {"state": "delivered", "children": []},
+                reconcile=lambda joined, attempts: False, max_reparks=1, emit=events.append,
+                replacement_checkpoint=lambda selected: (selected, [], []), sleep=sleeps.append)
+        self.assertEqual(sleeps, [0.25, 0.5, 1.0])
+        self.assertEqual([e["type"] for e in events].count("dispatch.supervisor.chain-advance-deferred"), 3)
+        self.assertEqual(len(closes), 1)
+        self.assertEqual(result.refusal.reason, "subsession-advance-successor-start-failed:x")
+
+
 if __name__ == "__main__":
     unittest.main()
