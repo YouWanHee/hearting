@@ -1081,7 +1081,10 @@ and `correct` reports `owner-input-unsupported` before queueing; an owner
 already running under an older supervisor behaves the same way.
 An owner that already ended `BLOCKED` keeps the answer (`retained`), and `correct`
 continues its route in the same call through a replacement owner that receives it
-(see the SD-157 replacement rule in §5.10). Other ended owners still report
+(see the SD-157 replacement rule in §5.10). When the answer comes from a session
+that is not the route's parent, only the parent may launch that replacement: the
+answer stays kept and the parent receives one `answer-awaiting-parent` supervision
+notice naming the route's start command. Other ended owners still report
 `owner-input-unavailable-retain-correction`. An answer sent with an older attempt id
 follows the replacement lineage to the owner doing the work now.
 Corrections preserve route, completion and cleanup evidence; completed-prefix
