@@ -32,7 +32,7 @@ python3 "${AGENT_HOME:-$HOME/hearting}/utilities/spec-transaction.py" run \
   sh ./the-owning-capability-transaction.sh
 ```
 
-Exit 3 means the bounded wait expired; report the current owner and leave every spec surface unchanged; the next run allocates a fresh version number.
+Exit 3 means the bounded wait expired; report the current owner and leave every spec surface unchanged; the next run allocates a fresh version number. The lock is an `flock` on the artifact root's `.pipeline-lock`, so deleting that file while a transaction holds it lets a second transaction write at the same time.
 
 `--require-snapshot` is a deprecated compatibility flag and has no authority;
 snapshot enforcement is unconditional whenever an existing `prd.md` changes.
