@@ -3539,6 +3539,17 @@ def _cleanup_receipt_reason(metadata: dict[str, str]) -> str:
         return ""
 
 
+def _portable_cleanup_receipt(metadata: dict[str, str]) -> bool:
+    """Reuse the existing exact portable seal, never a cached absence alone."""
+    if not _cleanup_receipt_reason(metadata) or not _detached_group_drain_receipt(metadata):
+        return False
+    record = json.loads(base64.b64decode(metadata["cleanup_receipt_b64"], validate=True))
+    return bool(
+        record.get("proof_source") == "authenticated-namespace-portable"
+        and record.get("portable_receipt_digest") == _portable_teardown_receipt_digest(metadata)
+    )
+
+
 def resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
     try:
         return _resolve_attempt_cleanup(Path(jobs), attempt_id, apply=apply)
@@ -3733,6 +3744,14 @@ def attempt_process_quiescence(
         # positive descendant branch above proves additional live evidence.
         return result
     if probe.state == "unverifiable":
+        # The trusted watcher already proved this exact attempt drained. A
+        # later unrelated private environment must not undo that receipt and
+        # make recovery reseal it forever. Current positive tags won above;
+        # require the authoritative current group to remain empty as well.
+        if (terminal_receipt and _portable_cleanup_receipt(metadata)
+                and attempt_scan_namespace_authority(metadata)
+                and process_group_observation(int(metadata["pgid"])).state == "empty"):
+            return result
         # SD-79/80/89: the observer that produced a complete post-exit receipt
         # may itself have disappeared before a successor or retry is launched.
         # Consume that receipt only at an exact terminal gate, and only for the

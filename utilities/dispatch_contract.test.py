@@ -4241,6 +4241,74 @@ class TerminalCleanupResponsibilityTest(unittest.TestCase):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
   self.jobs=Path(self.tmp.name)/"jobs.log"
 
+ def portable_cleanup(self):
+  metadata=cancellation_metadata("att-portable-cleanup",portable=True)
+  namespace=D.process_namespace_identity()
+  metadata.update(pid="99999996",pgid="99999996",pid_start=D.process_start_ticks(os.getpid()),
+                  pid_ns=namespace,pid_observer_ns=namespace,group_reap_pgid="99999996",
+                  attempt_descendant_observer_ns=namespace)
+  metadata.update(note="completed-marker",completion_marker="original-marker",
+                  delivery_receipt_b64="original-delivery",failure_class="pass")
+  self.jobs.write_text(attempt_row(metadata,"done")+"\n")
+  denied=D.ProcessGroupObservation("unverifiable",reason="procfs-environ:997325:same-uid-unobservable")
+  with mock.patch.object(D,"_proc_observation",return_value=("missing","","")), \
+       mock.patch.object(D,"process_group_observation",return_value=D.ProcessGroupObservation("empty")), \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=denied), \
+       mock.patch.object(D,"attempt_scan_namespace_authority",return_value=True):
+   result=D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"],apply=True)
+  self.assertTrue(result["changed"],result)
+  self.assertEqual(result["proof_source"],"authenticated-namespace-portable")
+  return D.parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5]),denied
+
+ def test_portable_cleanup_converges_despite_later_private_environment(self):
+  sealed,denied=self.portable_cleanup()
+  original=self.jobs.read_bytes()
+  with mock.patch.object(D,"_proc_observation",return_value=("missing","","")), \
+       mock.patch.object(D,"process_group_observation",return_value=D.ProcessGroupObservation("empty")), \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=denied), \
+       mock.patch.object(D,"attempt_scan_namespace_authority",return_value=True):
+   self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"quiescent")
+   for _ in range(2):
+    result=D.resolve_attempt_cleanup(self.jobs,sealed["attempt_id"],apply=True)
+    self.assertTrue(result["settled"],result)
+    self.assertFalse(result["changed"],result)
+    self.assertEqual(self.jobs.read_bytes(),original)
+   self.assertEqual(D.attempt_process_quiescence(sealed).state,"unverifiable")
+  self.assertEqual(sealed["completion_marker"],"original-marker")
+  self.assertEqual(sealed["delivery_receipt_b64"],"original-delivery")
+  self.assertEqual(sealed["failure_class"],"pass")
+
+ def test_portable_cleanup_never_overrides_live_or_unknown_group(self):
+  sealed,denied=self.portable_cleanup()
+  live=D.ProcessGroupObservation("populated",((42,"901","S"),))
+  with mock.patch.object(D,"_proc_observation",return_value=("missing","","")), \
+       mock.patch.object(D,"attempt_scan_namespace_authority",return_value=True):
+   with mock.patch.object(D,"process_group_observation",return_value=D.ProcessGroupObservation("empty")), \
+        mock.patch.object(D,"attempt_tagged_descendants",return_value=live):
+    self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"live")
+   for group,expected in ((live,"live"),(D.ProcessGroupObservation("unverifiable",reason="unreadable"),"unverifiable")):
+    with self.subTest(group=group.state), \
+         mock.patch.object(D,"process_group_observation",return_value=group), \
+         mock.patch.object(D,"attempt_tagged_descendants",return_value=denied):
+     self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,expected)
+
+ def test_portable_cleanup_requires_exact_binding_and_current_namespace(self):
+  sealed,denied=self.portable_cleanup()
+  for mutation in ({"cleanup_receipt_b64":""},{"cleanup_receipt_digest":"sha256:wrong"},
+                   {"pid_start":"another-process"},{"route_hash":"sha256:foreign"},
+                   {"pid_observer_ns":"pid:[foreign]"}):
+   with self.subTest(mutation=mutation), \
+        mock.patch.object(D,"_proc_observation",return_value=("missing","","")), \
+        mock.patch.object(D,"process_group_observation",return_value=D.ProcessGroupObservation("empty")), \
+        mock.patch.object(D,"attempt_tagged_descendants",return_value=denied), \
+        mock.patch.object(D,"attempt_scan_namespace_authority",return_value=True):
+    self.assertEqual(D.attempt_process_quiescence({**sealed,**mutation},terminal_receipt=True).state,"unverifiable")
+  with mock.patch.object(D,"_proc_observation",return_value=("missing","","")), \
+       mock.patch.object(D,"process_group_observation",return_value=D.ProcessGroupObservation("empty")), \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=denied), \
+       mock.patch.object(D,"attempt_scan_namespace_authority",return_value=False):
+   self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"unverifiable")
+
  def test_terminal_proof_preserves_success_and_cannot_authorize_retry(self):
   metadata=extinct_metadata("att-cleanup-success")
   metadata.update(note="completed-marker",completion_marker="original-marker",

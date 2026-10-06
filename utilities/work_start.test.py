@@ -326,6 +326,32 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(self.start()["state"], "preparing")
         self.assertEqual(len(self.calls), 2)
 
+    def test_terminal_frame_cleanup_unavailable_reports_attention_without_relaunch(self):
+        first = self.start()
+        original = self.jobs.read_bytes()
+        children = [{"attempt_id": aid, "status": "done", "readiness": "pending",
+                     "reason": "process-unverifiable"} for aid in first["frame_attempts"]]
+        W.join_selected_attempts.side_effect = None
+        W.join_selected_attempts.return_value = {"state": "timeout", "children": children}
+        result = self.start()
+        self.assertEqual((result["state"], result["reason"]),
+                         ("needs-attention", "frame-cleanup-unverifiable"))
+        self.assertNotIn("parent_next", result)
+        self.assertNotIn("parent_next_command", result)
+        self.assertEqual(result["observation"]["children"], children)
+        self.assertEqual(self.jobs.read_bytes(), original)
+        self.assertEqual(len(self.calls), 2)
+        self.assertFalse((self.path.parent / "answers.json").exists())
+
+        children[0].update(status="open", reason="process-alive")
+        live = self.start()
+        self.assertEqual(live["state"], "preparing")
+        self.assertEqual(live["parent_next"], "end-turn")
+        expired = self.start(wait=True)
+        self.assertEqual((expired["state"], expired["reason"]),
+                         ("needs-attention", "parent-wait-deadline"))
+        self.assertEqual(len(self.calls), 2)
+
     def test_typed_budget_refusal_is_waiting_capacity_not_failure(self):
         run = self.make_run(refuse_node="frame-alternative", refuse_times=99,
                              receipt=self.refusal_receipt(retry_after_seconds=1))

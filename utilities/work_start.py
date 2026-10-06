@@ -1433,6 +1433,19 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         if joined["state"] != "ready":
             if wait:
                 return _wait_expired(result)
+            children = joined.get("children") or []
+            pending = [child for child in children if child.get("readiness") == "pending"]
+            if (pending and all(child.get("status") in {"done", "killed", "cancelled"}
+                                for child in children)
+                    and all(child.get("reason") == "process-unverifiable" for child in pending)):
+                result.pop("parent_next", None)
+                result.pop("parent_next_command", None)
+                return {**result, "state": "needs-attention", "reason": "frame-cleanup-unverifiable",
+                        "required_action": "report-pending-work",
+                        "next_step": "Completed frame results are preserved, but cleanup could not be verified. "
+                            "Report the exact pending attempts and observation; existing supervision retains "
+                            "cleanup responsibility. This receipt does not promise automatic delivery or "
+                            "authorize replacement attempts. Use resume_command for a requested follow-up."}
             return {**result, "state": "preparing",
                     "required_action": "wait-for-frame-results"}
         result.pop("parent_next", None)
