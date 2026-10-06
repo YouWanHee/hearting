@@ -1975,7 +1975,9 @@ def resolve_legacy(root: Path, rel: str) -> Dict[str, Any]:
             if ancestor in table:
                 missed.append(os.path.normpath(str(root / table[ancestor] / tail)))
     for candidate in dict.fromkeys(missed):
-        target, evidence = _follow_relocated(Path(candidate))
+        target, evidence = _follow_relocated(Path(candidate), require_exists=True)
+        if target is None:
+            target, evidence = _follow_relocated(Path(candidate), require_exists=False)
         if target is not None:
             try:
                 target_rel = target.relative_to(root).as_posix()
@@ -1996,12 +1998,15 @@ _RELOCATED_MAX_BYTES = 1 << 20
 _RELOCATED_MAX_HOPS = 8
 
 
-def _relocated_pointer_target(pointer: Path) -> Optional[Path]:
+def _relocated_pointer_target(pointer: Path, require_exists: bool = True) -> Optional[Path]:
     """Validate one sibling `<name>.RELOCATED.json` pointer file (read-only).
 
     Returns the absolute new location, or None when the pointer is absent,
-    unreadable, a symlink, schema-mismatched, fieldless, relative, missing,
-    or itself a symlink. Anything invalid is simply not evidence.
+    unreadable, a symlink, schema-mismatched, fieldless, relative, itself a
+    symlink, or -- with `require_exists` -- its target is missing. Anything
+    invalid is simply not evidence. Vanished intermediate targets are only
+    followed in the second pass, so previously resolving queries keep their
+    exact answers.
     """
     try:
         if not pointer.is_file() or os.path.islink(str(pointer)):
@@ -2021,15 +2026,22 @@ def _relocated_pointer_target(pointer: Path) -> Optional[Path]:
     target = Path(os.path.normpath(new_path))
     if not target.is_absolute():
         return None
-    try:
-        if not target.exists() or os.path.islink(str(target)):
+    if require_exists:
+        try:
+            if not target.exists() or os.path.islink(str(target)):
+                return None
+        except OSError:
             return None
-    except OSError:
-        return None
+    else:
+        try:
+            if os.path.islink(str(target)):
+                return None
+        except OSError:
+            return None
     return target
 
 
-def _deepest_relocated_slot(current: Path) -> Optional[Tuple[Path, str, str]]:
+def _deepest_relocated_slot(current: Path, require_exists: bool) -> Optional[Tuple[Path, str, str]]:
     """Deepest ancestor-or-self slot of `current` holding a valid pointer.
 
     Returns (new base, remaining tail, pointer path). Walks from `current`
@@ -2040,7 +2052,7 @@ def _deepest_relocated_slot(current: Path) -> Optional[Tuple[Path, str, str]]:
     while True:
         if node.name:
             pointer = node.parent / (node.name + _RELOCATED_SUFFIX)
-            target = _relocated_pointer_target(pointer)
+            target = _relocated_pointer_target(pointer, require_exists=require_exists)
             if target is not None:
                 return target, "/".join(reversed(tail_parts)), str(pointer)
         if node == node.parent:
@@ -2049,19 +2061,19 @@ def _deepest_relocated_slot(current: Path) -> Optional[Tuple[Path, str, str]]:
         node = node.parent
 
 
-def _follow_relocated(candidate: Path) -> Tuple[Optional[Path], List[str]]:
+def _follow_relocated(candidate: Path, require_exists: bool = True) -> Tuple[Optional[Path], List[str]]:
     """Follow sibling RELOCATED pointers from a missed candidate path.
 
     Returns (landed absolute target, pointer evidence paths oldest-first) or
-    (None, []). Hops are bounded with a visited-set cycle guard; a chain that
-    never lands on an existing target resolves to unresolved. Read-only: no
-    file or map is written.
+    (None, []). Only a hop landing on an existing target succeeds; hops are
+    bounded with a visited-set cycle guard. Read-only: no file or map is
+    written.
     """
     evidence: List[str] = []
     seen = {os.path.normpath(str(candidate))}
     current = candidate
     for _hop in range(_RELOCATED_MAX_HOPS):
-        slot = _deepest_relocated_slot(current)
+        slot = _deepest_relocated_slot(current, require_exists)
         if slot is None:
             return None, []
         target_base, tail, pointer = slot

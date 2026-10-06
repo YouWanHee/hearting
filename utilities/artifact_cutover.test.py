@@ -1286,6 +1286,15 @@ class RelocatedPointerTest(unittest.TestCase):
                 self.assertEqual(result["resolution"], "unresolved")
                 self.assertIsNone(result["absolute"])
 
+    def test_live_outer_pointer_beats_stale_deep_pointer(self):
+        live = self._moved_dir("live/releases", files=("X/sub/file.txt",))
+        self._pointer(self.root / "gone/releases/X", str(self.root / "void"))
+        self._pointer(self.root / "gone/releases", str(self.root / "live/releases"))
+        result = C.resolve_legacy(self.root, "gone/releases/X/sub/file.txt")
+        self.assertEqual(result["resolution"], "relocated")
+        self.assertEqual(result["absolute"], str(live / "X/sub/file.txt"))
+        self.assertNotIn("chain", result)
+
     def test_cycle_stays_unresolved(self):
         self._pointer(self.root / "a", str(self.root / "b"))
         self._pointer(self.root / "b", str(self.root / "a"))
