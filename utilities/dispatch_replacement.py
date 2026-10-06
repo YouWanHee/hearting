@@ -884,6 +884,10 @@ def claim(jobs: Path, aid: str) -> dict:
         if moved:
             # The route's parent moved the owner pin before this claim: the replacement runs there.
             record['harness'] = moved
+        access = _access_in_force(jobs, route) if meta.get('worker_type') == 'owner' else None
+        if access:
+            # The route's parent handed the next owner an access request: the replacement runs with it.
+            record['execution_access'] = access
         # Index first: every retry admission sees the consumed budget after a crash.
         _reserve_source(jobs, aid, family)
         _once(_record_path(jobs, family), record)
@@ -1090,7 +1094,7 @@ def admission(jobs, lines, metadata):
             if candidate.get(key) != replay.get(key):
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
     else:
-        _check_tuple(candidate, replay, _transition_of(record))
+        _check_tuple(candidate, replay, _transition_of(record), record.get('execution_access'))
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
     expected_argv = _replacement_argv(record, source, replay)
@@ -1112,7 +1116,7 @@ RUNTIME_DERIVED_KEYS = route_authority.RELEASE_DERIVED_VALUES
 PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolved_model_settings'})
 
 
-def _check_tuple(candidate, replay, transition=None):
+def _check_tuple(candidate, replay, transition=None, access=None):
     """The candidate must match the sealed input; only runtime-derived values may follow a new release,
     and only the profile-derived ones may follow a verified profile transition."""
     for key in route_authority.REPLACEMENT_FIXED_KEYS:
@@ -1131,12 +1135,26 @@ def _check_tuple(candidate, replay, transition=None):
             if not (drift and key in RUNTIME_DERIVED_KEYS):
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
     # Where the replacement's launcher runs is not a permission change (route_authority).
-    if (route_authority.granted_permissions(candidate.get('applied_permissions'))
-            != route_authority.granted_permissions(replay.get('applied_permissions'))):
+    granted = route_authority.granted_permissions(candidate.get('applied_permissions'))
+    sealed = route_authority.granted_permissions(replay.get('applied_permissions'))
+    if access:
+        # The access request the claim recorded replaces the source's, and what realizes it.
+        if (granted.get('execution_access') or {}).get('request_sha256') != access['request_sha256']:
+            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'execution_access')
+        granted, sealed = (_without_access(granted), _without_access(sealed))
+    if granted != sealed:
         if not drift:
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'applied_permissions')
         from hearting_gates import same_work_or_refuse
         same_work_or_refuse('replacement-runtime-drift', 'applied_permissions')
+
+
+def _without_access(permissions):
+    result = {key: value for key, value in permissions.items() if key != 'execution_access'}
+    if isinstance(result.get('opencode_permission'), dict):
+        result['opencode_permission'] = {key: value for key, value in result['opencode_permission'].items()
+                                         if key not in ('external_directory', 'edit')}
+    return result
 
 
 def replacement_row(jobs, lines, row):
@@ -1211,8 +1229,32 @@ def _replacement_task(record, source, replay):
     return task
 
 
+def _access_in_force(jobs, route):
+    """The prepared request the route's parent last handed its owner (`route_authority.access_in_force`),
+    with its digest; None while the request its first owner launched with stands."""
+    change = route_authority.access_in_force(route)
+    if change is None or change.get('source') == 'derived':
+        return None
+    import execution_access as EA
+    try:
+        path = EA.prepare_task_request(route, jobs, node='owner', environment=False)
+        context = EA.AccessContext.build(
+            worktree=str(route.get('cwd') or ''), artifact_root=str(route.get('artifact_root') or ''),
+            dispatch_state_root=Path(jobs).resolve().parent, agent_home=ROOT)
+        request = EA.load_request(path, context=context) if path is not None else None
+    except (EA.ExecutionAccessError, OSError, ValueError):
+        return None
+    if request is None:
+        return None
+    return {'request_path': str(path), 'request_sha256': request.request_sha256,
+            'source': change['source'], 'at': change['at']}
+
+
 def _replacement_argv(record, source, replay):
     options = {}
+    access = record.get('execution_access')
+    if access:
+        options['--execution-access-file'] = access['request_path']
     transition = _transition_of(record)
     if transition:
         options['--model-profile'] = transition['to']
@@ -1273,7 +1315,8 @@ def _moved_owner_command(jobs, record, source, replay):
                '--attempt-id', record['replacement_attempt_id'],
                '--automatic-retry-of', record['original_attempt_id'], '--prompt-file', str(prompt)]
     for flag in ('--execution-access-file', '--parent-session-id'):
-        value = _argv_value(replay['argv'], flag)
+        value = ((record.get('execution_access') or {}).get('request_path') if flag == '--execution-access-file'
+                 else None) or _argv_value(replay['argv'], flag)
         if value:
             command += [flag, value]
     return command

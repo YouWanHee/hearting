@@ -570,5 +570,80 @@ class ReleaseAxisTest(unittest.TestCase):
         self.assertIs(R.RUNTIME_DERIVED_KEYS, RA.RELEASE_DERIVED_VALUES)
 
 
+class AccessChangeTest(unittest.TestCase):
+    """BC rt-839dbd48: the route's parent hands its next owner another access request; the
+    request in force is the latest `access` row beside the route, and the sealed route stays."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        (base / "wt").mkdir()
+        self.data = base / "DB" / "WWD_LG"
+        self.data.mkdir(parents=True)
+        self.route = {"route_id": "rt-839dbd48af21216d", "route_hash": "sha256:" + "e" * 64,
+                      "artifact_root": str(base / "artifacts"), "cwd": str(base / "wt"),
+                      "selection_pins": {"contract_version": 1, "owner": {"harness": "opencode", "model": None,
+                                                                         "effort": None}}}
+        self.request_file = base / "access.json"
+        self.request_file.write_text(json.dumps({"schema_version": 1, "writable_roots": [],
+                                                 "read_roots": [str(self.data)], "network": {"required": False}}))
+        self.jobs = base / "state" / "jobs.log"
+
+    def row(self, root="/data/a", source="unattributed", route=None, digest=None):
+        request = {"read_roots": [root]}
+        return RA.record_access_change(route or self.route, request=request,
+                                       request_sha256=digest or RA.request_digest(request),
+                                       by={"harness": "opencode", "session_id": "oc-sid"}, source=source)
+
+    def test_the_latest_access_row_is_in_force_and_the_pins_are_untouched(self):
+        self.assertIsNone(RA.access_in_force(self.route))
+        first = self.row()
+        self.assertIsNone(first["previous_sha256"])
+        self.assertIsNone(self.row())                          # the same request again records nothing
+        second = self.row("/data/b", source="peer:hearting-4d·" + "f" * 32)
+        self.assertEqual(second["previous_sha256"], first["request_sha256"])
+        self.assertEqual(RA.access_in_force(self.route)["request_sha256"], second["request_sha256"])
+        self.row("/data/c", digest="0" * 64)                     # a row that does not digest to its request
+        self.assertEqual(RA.access_in_force(self.route)["request_sha256"], second["request_sha256"])
+        self.assertEqual(RA.pin_changes(self.route), [])       # the pin readers skip access rows
+        self.assertIs(RA.route_in_force(self.route), self.route)
+        other = dict(self.route, route_hash="sha256:" + "0" * 64)
+        self.assertIsNone(RA.access_in_force(other))
+
+    def given(self, *, caller=("opencode", "oc-sid"), owner_parent="oc-sid", env=True):
+        router = _load("route_authority_capability_route_access", "utilities/capability-route.py")
+        import work_start
+        rows = {"att-owner": ("done", {"worker_type": "owner", "owner_route_id": self.route["route_id"],
+                                       "parent_sid": owner_parent, "attempt_id": "att-owner"})}
+        extra = {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(self.request_file)} if env else {}
+        with mock.patch.dict(os.environ, extra), \
+             mock.patch.object(RA, "caller_identity", return_value=caller), \
+             mock.patch.object(work_start, "_rows", return_value=rows), \
+             mock.patch.object(router, "_turn_peer_source", return_value="unattributed"):
+            if not env:
+                os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+            return router._record_access_change(self.route, self.jobs)
+
+    def test_the_parent_s_request_at_start_or_correct_is_recorded_once(self):
+        self.assertIsNone(self.given(env=False))
+        result = self.given()
+        self.assertEqual((result["changed"], result["source"]), (True, "unattributed"))
+        (row,) = RA.access_changes(self.route)
+        self.assertEqual(row["request"]["read_roots"], [str(self.data)])
+        self.assertEqual(row["by"], {"harness": "opencode", "session_id": "oc-sid"})
+        self.assertFalse(self.given()["changed"])
+
+    def test_another_session_or_an_invalid_request_records_nothing(self):
+        refused = self.given(caller=("claude", "other-sid"))
+        self.assertEqual(refused, {"changed": False, "reason": "access-change-parent-only"})
+        self.request_file.write_text(json.dumps({"schema_version": 1, "writable_roots": ["/"],
+                                                 "read_roots": [], "network": {"required": False}}))
+        invalid = self.given()
+        self.assertFalse(invalid["changed"])
+        self.assertTrue(invalid["reason"].startswith("execution-access-root-too-broad"))
+        self.assertEqual(RA.access_changes(self.route), [])
+
+
 if __name__ == "__main__":
     unittest.main()

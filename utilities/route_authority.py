@@ -317,6 +317,76 @@ def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
         return row
 
 
+# The route's parent may also hand its next owner another execution access request: the
+# existing `AGENT_DISPATCH_EXECUTION_ACCESS_FILE` when it runs `start` or `correct`. Each one is
+# an `access` row in the same append-only record: the validated request, its digest, the digest
+# it replaced, who gave it, and what the runtime knew about where it came from. A node's first
+# preparation that derived roots from the approved task adds one row with source `derived`.
+# The latest row is the request in force (`access_in_force`); the pin readers above skip these.
+ACCESS_CHANGE_TARGET = "access"
+
+
+def access_changes(route) -> list[dict]:
+    """This route's recorded access requests, oldest first; rows for another route or hash are ignored."""
+    path = pin_changes_path(route)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path else []
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("schema") == PIN_CHANGE_SCHEMA
+                and row.get("target") == ACCESS_CHANGE_TARGET
+                and row.get("route_id") == route.get("route_id")
+                and row.get("route_hash") == route.get("route_hash")
+                and isinstance(row.get("request"), dict) and isinstance(row.get("source"), str)
+                and row.get("request_sha256") == request_digest(row["request"])):
+            rows.append(row)
+    return rows
+
+
+def request_digest(request: dict) -> str:
+    """The digest of a normalized execution access request (`execution_access.normalized_request`)."""
+    import hashlib
+    return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def access_in_force(route) -> dict | None:
+    """The latest access row of this route, or None while its first prepared request stands."""
+    rows = access_changes(route) if isinstance(route, dict) else []
+    return rows[-1] if rows else None
+
+
+def record_access_change(route, *, request: dict, request_sha256: str, by: dict, source: str,
+                         now: float | None = None) -> dict | None:
+    """Append one access request for this route; None when the request in force is already it."""
+    import fcntl
+    import time
+    path = pin_changes_path(route)
+    if path is None:
+        raise ValueError("access-change-route-unlocated")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        previous = access_in_force(route)
+        if previous is not None and previous["request_sha256"] == request_sha256:
+            return None
+        row = {"schema": PIN_CHANGE_SCHEMA, "route_id": route["route_id"], "route_hash": route["route_hash"],
+               "target": ACCESS_CHANGE_TARGET, "request": request, "request_sha256": request_sha256,
+               "previous_sha256": (previous or {}).get("request_sha256"), "by": dict(by), "source": source,
+               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return row
+
+
 def pinned_launch_harness(route, *, worker_type: str | None, requested: str | None, available) -> tuple[str | None, str | None]:
     """A sealed pin beats the requested harness while the pinned one is available.
 

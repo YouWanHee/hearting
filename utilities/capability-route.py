@@ -3420,6 +3420,42 @@ def _change_owner_pin(route, jobs, values):
             "source": (row or {}).get("source"), "warnings": warnings}
 
 
+def _record_access_change(route, jobs):
+    """The route's parent hands its next owner the execution access request in its environment
+    (`AGENT_DISPATCH_EXECUTION_ACCESS_FILE`): one `access` row beside the route
+    (`route_authority.record_access_change`), which the next owner and a replacement owner
+    launch with. Only the route's parent records it; a request that does not validate is not
+    recorded, and the launch meets it as it does today."""
+    import route_authority as RA
+    from execution_access import (AccessContext, ExecutionAccessError, load_request,
+                                  normalized_request, request_path)
+    from work_start import _rows
+    given = request_path(None)
+    if given is None:
+        return None
+    harness, session = RA.caller_identity()
+    owners = [meta for _status, meta in _rows(jobs).values()
+              if meta.get("worker_type") == "owner"
+              and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")}]
+    if owners and not RA.owns(owners[-1], session, jobs):
+        return {"changed": False, "reason": "access-change-parent-only"}
+    try:
+        context = AccessContext.build(worktree=str(route.get("cwd") or ""),
+                                      artifact_root=str(route.get("artifact_root") or ""),
+                                      dispatch_state_root=Path(jobs).expanduser().resolve(strict=False).parent,
+                                      agent_home=ROOT)
+        request = load_request(given, context=context)
+        row = RA.record_access_change(route, request=normalized_request(request),
+                                      request_sha256=request.request_sha256,
+                                      by={"harness": harness, "session_id": session},
+                                      source=_turn_peer_source(harness, session, route.get("cwd")))
+    except (ExecutionAccessError, OSError, ValueError) as exc:
+        return {"changed": False, "reason": getattr(exc, "reason", None) or str(exc)[:200]}
+    current = RA.access_in_force(route) or {}
+    return {"changed": row is not None, "request_sha256": current.get("request_sha256"),
+            "source": current.get("source")}
+
+
 def _main_session_only_models(harness):
     """The harness's `CFG_MAIN_SESSION_ONLY_MODELS`, or "" when it declares none
     or its model config cannot be read (compose then leaves the pin alone; the
@@ -9390,7 +9426,10 @@ def _continue_after_answer(jobs, attempt_id, correction):
                 "next_step": "The answer is kept, but this owner's route cannot continue (it is closed or "
                     "unreadable). Report that; compose the remaining work as a new route."}
     _record_route_chain(route, str(route_path), "start")
+    access_change = _record_access_change(route, jobs)
     receipt = start_work(route, route_path, jobs)
+    if access_change is not None:
+        receipt = {**receipt, "access_change": access_change}
     if receipt.get("reason") == "replacement-parent-identity-unproven":
         # Only the route's parent launches the continuation: it is told, so nobody repeats the answer.
         try:
@@ -9878,7 +9917,12 @@ def main():
         path = _emit_compiled_route(a,route,artifact_root)
         if a.start:
             from work_start import start_work
-            print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False),flush=True)
+            jobs=Path(a.jobs or _compose_default_jobs())
+            access_change=_record_access_change(route,jobs)
+            started=start_work(route,path,jobs)
+            if access_change is not None:
+                started={**started,"access_change":access_change}
+            print(json.dumps(started,ensure_ascii=False),flush=True)
         # Bookkeeping runs after the work has started: the start does not depend on it (the sweep
         # never closes this route, and a cycle it seals is never the one this route begins or continues).
         _route_autoclose(artifact_root,"compose",route)
@@ -9912,10 +9956,13 @@ def main():
         route=verify_route(json.loads(a.route.read_text()))
         jobs=Path(a.jobs or _compose_default_jobs())
         pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None
+        access_change=_record_access_change(route,jobs)
         _record_route_chain(route, str(Path(a.route).resolve()), "start")
         result=start_work(route,a.route,jobs,wait=a.wait,interview=a.interview,answers=a.answers,decision=a.decision)
         if pin_change is not None:
             result={**result,"pin_change":pin_change}
+        if access_change is not None:
+            result={**result,"access_change":access_change}
         print(json.dumps(result,ensure_ascii=False))
         return 0
     if a.command=="compile":
