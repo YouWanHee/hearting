@@ -610,6 +610,15 @@ class SliceCommandTest(unittest.TestCase):
         self.assertNotIn("--", command)
         self.assertNotIn("--parent-attempt-id", command)
 
+    def test_dispatch_command_forwards_the_declared_purpose(self):
+        # A derived gap-retry chain (`derive_gap_retry_manifest`) used to launch
+        # as `planned` because the purpose axis never left the manifest.
+        for declared, expected in ((None, "planned"), ("planned", "planned"), ("gap-retry", "gap-retry")):
+            session = dict(self.SESSION, **({} if declared is None else {"subsession_purpose": declared}))
+            with self.subTest(declared=declared):
+                command = SUBDIV.dispatch_command(self.MANIFEST, session, "register", "owner", Path("/j.log"))
+                self.assertEqual(command[command.index("--subsession-purpose") + 1], expected)
+
     def test_start_env_sets_git_optional_locks_off(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "state" / "jobs.log"

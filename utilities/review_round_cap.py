@@ -396,6 +396,17 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
     )
 
 
+def last_verdict_blocking(rows, worker_type):
+    """True when the latest verdict round, past any verdict-less tail, is a
+    blocking FAIL: the node's gate failed and no later verdict answered it.
+    OPERATIONS §5.10 reads a sub-session opened now as a gap retry of the
+    unfinished items, never as planned subdivision.
+    """
+    verdicts = [(status, metadata) for status, metadata in rows if classify_round_row(
+        status, metadata, worker_type=metadata.get("worker_type") or worker_type) == "verdict"]
+    return _last_round_blocking_verdict(verdicts[-1:], worker_type)
+
+
 def _last_round_blocking_verdict(rows, worker_type):
     """True when the most recent terminated round is a real blocking verdict
     (a review FAIL or a genuine test failure) -- SD-153 rule 5's "해소 안 된

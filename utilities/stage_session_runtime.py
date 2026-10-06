@@ -54,30 +54,47 @@ _sha_text = slice_text_sha256
 _sha_files = slice_files_sha256
 
 
+def declared(args: argparse.Namespace) -> bool:
+    """The one stage-session declaration judgment, read by `bind` and the dry-run preview.
+
+    True for a complete sub-session declaration (every axis, `stage_authority=0`,
+    bound to a dispatch-depth-2 route node), False for an ordinary full-stage
+    launch. A partial or contradictory declaration is refused, so no caller can
+    turn one raw flag into a sub-session.
+    """
+
+    def value(name):
+        return getattr(args, name, None)
+
+    values = tuple(value(name) for name in (
+        "subsession_id", "subsession_index", "subsession_count", "subsession_mode",
+        "session_chain_id", "phase_brief", "narrow_verify", "expected_round_trips",
+    ))
+    if any(item is not None for item in values) and not all(item is not None for item in values):
+        raise DispatchContractError("subsession-arguments-incomplete", "all stage-session axes are required")
+    stage_authority = getattr(args, "stage_authority", 1)
+    if not value("subsession_id"):
+        if stage_authority != 1:
+            raise DispatchContractError(
+                "stage-authority-zero-without-subsession", str(value("route_node") or "")
+            )
+        return False
+    if stage_authority != 0:
+        raise DispatchContractError("subsession-stage-authority-forbidden", value("subsession_id"))
+    if value("dispatch_depth") != 2 or not value("route_id") or not value("route_node"):
+        raise DispatchContractError("subsession-route-binding-invalid", value("subsession_id"))
+    return True
+
+
 def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) -> None:
     """Validate a complete declaration, derive its ledger, and initialize it."""
 
-    values = (
-        args.subsession_id, args.subsession_index, args.subsession_count,
-        args.subsession_mode, args.session_chain_id, args.phase_brief,
-        args.narrow_verify, args.expected_round_trips,
-    )
-    if any(value is not None for value in values) and not all(value is not None for value in values):
-        raise DispatchContractError("subsession-arguments-incomplete", "all stage-session axes are required")
-    if not args.subsession_id:
-        if args.stage_authority != 1:
-            raise DispatchContractError(
-                "stage-authority-zero-without-subsession", str(args.route_node or "")
-            )
+    if not declared(args):
         args.state_ledger = ""
         args.fixed_files_sha256 = ""
         args.narrow_verify_sha256 = ""
         args.phase_brief_sha256 = ""
         return
-    if args.stage_authority != 0:
-        raise DispatchContractError("subsession-stage-authority-forbidden", args.subsession_id)
-    if args.dispatch_depth != 2 or not args.route_id or not args.route_node:
-        raise DispatchContractError("subsession-route-binding-invalid", args.subsession_id)
     if not args.attempt_id:
         if action == "dry-run":
             args.attempt_id = "att-dry-run-stage-session"
