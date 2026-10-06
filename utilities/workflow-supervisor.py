@@ -654,9 +654,13 @@ def cmd_gate(args):
     route = load_route(args.route)
     if args.block and not getattr(args, "jobs", None) \
             and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1":
-        raise SupervisorError(
-            "human-gate-jobs-required: a registered worker's gate --block requires explicit --jobs"
-        )
+        # A registered worker's own registry, the same default `arm` takes.
+        args.jobs = os.environ.get("AGENT_DISPATCH_JOBS")
+        if not args.jobs:
+            raise SupervisorError(
+                "human-gate-jobs-required: a registered worker's gate --block requires --jobs "
+                "when AGENT_DISPATCH_JOBS is unset"
+            )
     ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:

@@ -32,7 +32,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -429,12 +428,15 @@ def _agent_home(env) -> Path:
 
 
 def refusal(root: str, top: Path, kind: str, target: str, env) -> str:
+    # The cycle folder already carries the date, so the slug is the name alone; a
+    # managed release is printed as its `current` pointer like every other printed command.
+    from parent_next_directive import entrypoint
+
     stem = Path(target).stem if kind == "edit" and target else kind
-    slug = f"{_slug_word(stem)}-{time.strftime('%m%d')}"
     command = " ".join([
-        "python3", shlex.quote(str(_agent_home(env) / "utilities" / "capability-route.py")),
+        "python3", shlex.quote(entrypoint(_agent_home(env), "utilities/capability-route.py")),
         "compose", "--shape", "direct", "--campaign-key", shlex.quote(_campaign_key(root, top)),
-        "--slug", shlex.quote(slug), "--cwd", shlex.quote(str(top))])
+        "--slug", shlex.quote(_slug_word(stem)), "--cwd", shlex.quote(str(top))])
     return (f"hearting: this session has no route for {root} yet (core/WORKFLOW.md §0.4). "
             f"Run this once, then retry:\n{command}\n"
             "Bigger work: use --shape solo, staged or framed instead. "

@@ -90,10 +90,23 @@ class EditTriggerTest(Fixture):
         self.assertTrue(line.startswith("python3 "), line)
         self.assertIn("capability-route.py compose --shape direct", line)
         self.assertIn("--campaign-key new-stream", line)
-        self.assertIn("--slug engine-", line)
+        self.assertIn("--slug engine --cwd", line)  # the cycle folder carries the date
         self.assertIn(f"--cwd {self.repo}", line)
         self.assertIn("--shape solo, staged or framed", reason)
         self.assertIn("capability-route.py start --route", reason)
+
+    def test_a_managed_release_is_printed_as_its_current_pointer(self):
+        hearting = self.home / ".local" / "share" / "hearting"
+        release = hearting / "releases" / "v9.9.9"
+        (release / "utilities").mkdir(parents=True)
+        (release / "utilities" / "capability-route.py").write_text("")
+        (release / "core").mkdir()
+        (release / "core" / "CORE.md").write_text("")
+        (hearting / "current").symlink_to(release)
+        line = self.judge(self.edit(self.repo / "src" / "engine.py"),
+                          AGENT_HOME=str(release)).splitlines()[1]
+        self.assertIn(f"{hearting / 'current'}/utilities/capability-route.py compose", line)
+        self.assertNotIn("releases/", line)
 
     def test_retry_passes_once_the_session_has_a_route_here(self):
         payload = self.edit(self.repo / "src" / "engine.py")

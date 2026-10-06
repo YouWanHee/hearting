@@ -719,6 +719,22 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout)["state"], "already-closed-automatically")
         self.assertIn("already closed automatically", done.stderr)
 
+    def test_finish_without_a_route_takes_this_sessions_latest_route_here(self):
+        route_file, route, record = self.autoclosed()
+        summary = self.base / "summary.md"
+        summary.write_text("done\n")
+        self.env["AGENT_ARTIFACT_ROOT"] = str(self.root)
+        evidence = self.cycle_dir(record) / "artifacts/documents/report.md"
+        done = self.run_as("codex", "session-b", "finish", "--evidence", evidence, "--summary-file", summary)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["state"], "already-closed-automatically")
+        by_id = self.run_as("codex", "session-b", "finish", "--route", route["route_id"],
+                            "--evidence", evidence, "--summary-file", summary)
+        self.assertEqual(by_id.returncode, 0, by_id.stderr)
+        other = self.run_as("codex", "session-c", "finish", "--evidence", evidence, "--summary-file", summary)
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("route-required", other.stderr)
+
     def test_n3_start_on_an_automatically_closed_route_hands_back_a_compose(self):
         route_file, route, _record = self.autoclosed()
         done = self.run_as("codex", "session-b", "start", "--route", route_file, "--jobs", self.jobs)

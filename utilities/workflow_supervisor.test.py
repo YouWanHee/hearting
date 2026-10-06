@@ -2230,22 +2230,29 @@ class TestGateSubjectNotCaller(WorkflowFixture):
             json.dumps({"gate_releases": [{"no_gate": 1}, "junk"]}), encoding="utf-8")
         self.assertEqual(ROUTE._gate_releases(str(path)), [])
 
-    def test_a_registered_worker_names_its_registry_to_block_on_every_harness(self):
-        """The explicit `--jobs` rule for a registered worker's `gate --block` is
-        one rule: no harness label turns it on or off."""
+    def test_a_registered_worker_blocks_on_its_own_registry_on_every_harness(self):
+        """A registered worker's `gate --block` reads its registry from
+        `AGENT_DISPATCH_JOBS` like `arm` does; with no registry at all it is
+        refused. One rule: no harness label turns it on or off."""
         _route, path = self.two_stage_route(human_gate="frame-review")
         jobs, _session, _attempt = self.owner_registry(route_id="rt-fixture0000000")
         for harness in ("codex", "claude", "opencode"):
             with self.subTest(harness=harness), mock.patch.dict(os.environ, {
                     "AGENT_DISPATCH_REGISTERED_WORKER": "1",
                     "AGENT_DISPATCH_CURRENT_HARNESS": harness}):
+                os.environ.pop("AGENT_DISPATCH_JOBS", None)
                 with self.assertRaisesRegex(SUP.SupervisorError, "human-gate-jobs-required"):
                     SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
                               "--block", "--artifact", "a.json"])
-        with contextlib.redirect_stdout(io.StringIO()):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                                          "AGENT_DISPATCH_JOBS": str(jobs)}), \
+                contextlib.redirect_stdout(out):
             self.assertEqual(0, SUP.main([
                 "gate", "--route", str(path), "--gate", "frame-review", "--block",
-                "--jobs", str(jobs), "--artifact", "a.json"]))
+                "--artifact", "a.json"]))
+        receipt = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(receipt["jobs_path"], str(jobs.resolve()))
 
     def test_a_new_attempt_can_re_raise_the_same_gate(self):
         """Blocking finding #2(a). `IMMUTABLE_FIELDS` includes `attempt_ids`, so a

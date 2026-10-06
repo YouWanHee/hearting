@@ -2778,6 +2778,14 @@ class TestContinuation(unittest.TestCase):
    self.assertEqual(actual["dispatch_evidence"],changed["dispatch_evidence"])
    self.assertTrue(R.canonical_route_path(artifact,actual["route_id"]).is_file())
    self.assertEqual(R.canonical(source),original)
+   # The artifact root defaults to the source route's own.
+   implied=subprocess.run([sys.executable,str(P),"continuation","--source-route",
+    str(R.canonical_route_path(artifact,source["route_id"])),"--resume-from-node","test",
+    "--requested-boundary","test","--reason","cli-implied-root",
+    "--dispatch-evidence",str(checked)],capture_output=True,text=True,
+    env={**os.environ,"AGENT_HOME":str(R.ROOT)},cwd=str(R.ROOT),timeout=30)
+   self.assertEqual(implied.returncode,0,implied.stderr)
+   self.assertTrue(R.canonical_route_path(artifact,json.loads(implied.stdout)["route_id"]).is_file())
    tampered=json.loads(json.dumps(changed))
    tampered["nodes"][0]["unit"]="qa/ml-debug"
    tampered["new_nodes"][0]["realized_contract_hash"]=R._continuation_contract_hash(tampered["nodes"][0])

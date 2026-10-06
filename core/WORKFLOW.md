@@ -694,8 +694,11 @@ that cycle and returns a receipt only after rechecking all three. A partial
 transaction remains `finish-pending` and is resumed with the same intent.
 
 ```text
-python3 utilities/capability-route.py finish --route <route.json> --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]
+python3 utilities/capability-route.py finish [--route <route.json|rt-id>] --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]
 ```
+
+Without `--route` it finishes this session's latest route under the cwd's
+artifact root.
 
 Ineligible inline routes and legacy recovery retain their explicit guarded
 completion and close steps; use their recorded route and producer evidence:
