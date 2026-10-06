@@ -236,8 +236,9 @@ def main(argv=None):
         else:
             from . import demo
 
-        def collector(harness_filter=None, usage="cache-only"):      # LIVE real data + injected demo fixtures (merged)
-            rs, rj = collect_all(harness_filter=harness_filter, usage="cache-only")
+        def collector(harness_filter=None, usage="cache-only", fast_first=False):      # LIVE real data + injected demo fixtures (merged)
+            rs, rj = collect_all(harness_filter=harness_filter, usage="cache-only",
+                                 **({"fast_first": True} if fast_first else {}))
             ds, dj = demo.collect(harness_filter=harness_filter)
             # Real rows are projected by collect_all. Only the injected rows
             # still need projection; never reread the live routes/artifact tree.
@@ -248,11 +249,13 @@ def main(argv=None):
             ds, dj = attach_projections(ds, dj)
             return rs + ds, rj + dj
 
-    def projected_collector(harness_filter=None, usage="cache-only"):
+    def projected_collector(harness_filter=None, usage="cache-only", fast_first=False):
+        fast_kw = {"fast_first": True} if fast_first else {}
         if usage == "cache-only":
-            sessions, jobs = collector(harness_filter=harness_filter)
+            sessions, jobs = collector(harness_filter=harness_filter, **fast_kw)
         else:
-            sessions, jobs = collector(harness_filter=harness_filter, usage=usage)
+            sessions, jobs = collector(harness_filter=harness_filter, usage=usage,
+                                       **fast_kw)
         projected_collector.last_resource_jobs = list(
             getattr(collect_all, "last_resource_jobs", []))
         projected_collector.last_resource_malformed = getattr(
@@ -314,14 +317,15 @@ def main(argv=None):
     base_collector = projected_collector
     previous_sessions = []
 
-    def live_collector(harness_filter=None):
+    def live_collector(harness_filter=None, fast_first=False):
         nonlocal previous_sessions
         effective = set(harness_filter) if harness_filter is not None else {"claude", "codex", "opencode"}
         live = set()
         if not disabled["api_disabled"] and args.section in ("fleet", "both"):
             live = render.live_harnesses(previous_sessions) & effective & {"claude", "codex"}
         usage = "refresh" if live else "cache-only"
-        sessions, jobs = base_collector(harness_filter=harness_filter, usage=usage)
+        sessions, jobs = base_collector(harness_filter=harness_filter, usage=usage,
+                                        **({"fast_first": True} if fast_first else {}))
         live_collector.last_resource_jobs = list(
             getattr(base_collector, "last_resource_jobs", []))
         live_collector.last_resource_malformed = getattr(

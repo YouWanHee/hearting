@@ -8252,8 +8252,16 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     live_order = _LiveOrderState()
     _configure_input(curses, os.environ)
 
+    first_snapshot = True
+
     def collect_snapshot():
-        sessions, jobs = collect_all(harness_filter=hfilter)
+        nonlocal first_snapshot
+        sessions, jobs = collect_all(harness_filter=hfilter,
+                                     **({"fast_first": True} if first_snapshot else {}))
+        # Only the first publication is fast: every later tick (the existing
+        # background refresh) runs the full pass, filling the details the
+        # first snapshot honestly left empty. --once/JSON never sets the flag.
+        first_snapshot = False
         sessions, jobs = list(sessions), list(jobs)
         gitinfo.enrich_entities(sessions + jobs, schedule_ahead=True)
         hearting = _HEARTING
