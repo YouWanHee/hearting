@@ -2125,14 +2125,24 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
                          ("running", "end-turn", "att-replacement"))
         self.assertEqual(result["correction"], {"retained": True, "request_id": "input-1"})
 
-    def test_another_session_s_answer_is_kept_and_names_who_continues_it(self):
+    def test_another_session_s_answer_is_kept_and_its_parent_is_told(self):
+        # RA-10: the route's parent receives a notice instead of the sender getting a dead end.
         receipt = {"state": "needs-attention", "reason": "replacement-parent-identity-unproven",
                    "next_step": "generic"}
-        code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=receipt)
+        with mock.patch("dispatch_supervision.materialize", return_value=[{}]) as told:
+            code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=dict(receipt))
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 1)
-        self.assertIn("session that started this route", result["next_step"])
+        self.assertEqual(told.call_args.kwargs["reason"], "answer-awaiting-parent")
+        self.assertEqual(told.call_args.args[1], {"att-owner"})
+        self.assertTrue(result["parent_notified"])
+        self.assertIn("parent session was notified", result["next_step"])
         self.assertTrue(result["correction"]["retained"])
+        # A parent with no carrier (bounded wait) keeps the plain instruction.
+        with mock.patch("dispatch_supervision.materialize", side_effect=ValueError("supervision-parent-carrier-unbound")):
+            code, result, calls, _ = self.correct(submitted={"retained": True}, receipt=dict(receipt))
+        self.assertFalse(result["parent_notified"])
+        self.assertIn("session that started this route", result["next_step"])
 
     def test_an_answer_to_a_live_owner_is_only_queued(self):
         code, result, calls, _ = self.correct(submitted={"request_id": "input-1", "duplicate": False})

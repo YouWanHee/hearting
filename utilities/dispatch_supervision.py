@@ -20,7 +20,9 @@ from dispatch_registry_cache import registry_lines
 import dispatch_pending_delivery as pending_delivery
 
 KIND = "supervision"
-REASONS = frozenset({"owner-input-undelivered", "no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending", "closure-blocked", "watch-deadline", "receiver-unavailable"})
+REASONS = frozenset({"owner-input-undelivered", "no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending", "closure-blocked", "watch-deadline", "receiver-unavailable", "answer-awaiting-parent"})
+# Another session answered a BLOCKED owner; only the route's parent launches the continuation.
+ANSWER_AWAITING_PARENT = "answer-awaiting-parent"
 
 
 class SupervisionError(ValueError):
@@ -68,10 +70,25 @@ def _root(rows: dict, attempt: str) -> str:
     raise SupervisionError("supervision-lineage-unresolved")
 
 
+def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
+    """The kept answers of a BLOCKED owner whose continuation has not launched yet."""
+    from dispatch_owner_input import blocked_owner_answers
+    from dispatch_replacement import _replacement_in_flight, _rows as replacement_rows
+    answers = blocked_owner_answers(jobs, aid)
+    if not answers:
+        return []
+    rows = replacement_rows(Path(jobs).read_text(encoding="utf-8").splitlines())
+    if aid in rows and _replacement_in_flight(jobs, rows, rows[aid][1]):
+        return []
+    return [item["id"] for item in answers]
+
+
 def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
     if reason == "owner-input-undelivered":
         from dispatch_owner_input import unresolved
         return any(unresolved(jobs, aid) for aid in attempts)
+    if reason == ANSWER_AWAITING_PARENT:
+        return any(_awaiting_answers(jobs, aid) for aid in attempts)
     from dispatch_contract import observed_attempt_liveness
     from codex_dispatch_terminal import terminal_envelope_observed
     for aid in attempts:
@@ -107,6 +124,9 @@ def _obligation_revision(rows: dict, attempts: list[str], reason: str, jobs=None
     if reason == "owner-input-undelivered":
         from dispatch_owner_input import unresolved_revision
         return hashlib.sha256(json.dumps([(aid, unresolved_revision(jobs, aid))
+                                          for aid in attempts]).encode()).hexdigest()
+    if reason == ANSWER_AWAITING_PARENT:
+        return hashlib.sha256(json.dumps([(aid, _awaiting_answers(jobs, aid))
                                           for aid in attempts]).encode()).hexdigest()
     if reason != "terminal-evidence-conflict":
         return ""
@@ -272,8 +292,27 @@ def _printed(name: str) -> str:
     return entrypoint(Path(__file__).resolve().parents[1], f"utilities/{name}")
 
 
+def _resume_text(receipt: dict) -> str:
+    """The route's start command for the notice's owner, or "" when its route cannot be read."""
+    try:
+        from dispatch_replacement import _route
+        from parent_next_directive import resume_command
+        rows = _rows(Path(receipt["job_registry"]))
+        path, _route_doc = _route(Path(receipt["job_registry"]), receipt["owner_attempt_id"],
+                                  rows[receipt["owner_attempt_id"]][1])
+        return resume_command(path, receipt["job_registry"], agent_home=Path(__file__).resolve().parents[1])
+    except Exception:  # noqa: BLE001 -- the notice still names the owner
+        return ""
+
+
 def render_text(receipt: dict) -> str:
     receipt = validate(receipt)
+    if receipt["reason"] == ANSWER_AWAITING_PARENT:
+        command = _resume_text(receipt)
+        return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "
+                "the answer is kept. Only this route's parent session launches its continuation, so "
+                "continue the work with the route's start command: the new owner receives the answer "
+                "first. Do not ask for the answer again." + (" " + command if command else ""))
     if receipt["reason"] == "owner-input-undelivered":
         command = shlex.join(["python3", _printed("capability-route.py"),
                               "correct", "--jobs", receipt["job_registry"],

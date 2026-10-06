@@ -236,6 +236,34 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
             managed_sealed_batch_id="batch-test", pid="99999999", pid_start="1")
             + row("att-child", pid="99999998", pid_start="1"))
 
+    def test_an_answer_from_another_session_reaches_the_parent_as_a_notice(self):
+        # RA-10: a non-parent's answer to a BLOCKED owner is not a dead end; the parent is told.
+        for kind in ("claude-parent-runtime", "codex-native-queue", "opencode-turn"):
+            with self.subTest(kind=kind):
+                self.jobs.write_text(row("att-owner", status="done", dispatch_depth="1", parent_attempt_id="",
+                    parent_sid="parent-test", parent_completion_delivery=kind, worker_type="owner",
+                    note="dead-worker-blocked"))
+                kept = [{"id": "input-1", "digest": "d1", "text": "use the smaller batch"}]
+                with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=kept), \
+                     mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+                     mock.patch.object(supervision, "_resume_text", return_value="python3 capability-route.py start --route /r.json"):
+                    record = supervision.materialize(self.jobs, {"att-owner"}, reason=supervision.ANSWER_AWAITING_PARENT)[0]
+                    self.assertEqual(record["recipient_kind"], kind)
+                    self.assertTrue(supervision.notice_is_current(record))
+                    text = supervision.render_text(record["receipt"])
+                    again = supervision.materialize(self.jobs, {"att-owner"}, reason=supervision.ANSWER_AWAITING_PARENT)[0]
+                self.assertEqual(again, record)                       # one answer, one notice
+                self.assertIn("answer is kept", text)
+                self.assertIn("Do not ask for the answer again", text)
+                self.assertIn("start --route /r.json", text)
+                with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=kept), \
+                     mock.patch("dispatch_replacement._replacement_in_flight", return_value=True):
+                    self.assertFalse(supervision.notice_is_current(record))   # the parent already continued
+                with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=[]):
+                    self.assertFalse(supervision.notice_is_current(record))
+                for path in (self.root / "pending-delivery").rglob("*.json"):
+                    path.unlink()
+
     def test_notice_is_idempotent_after_controller_restart_and_never_closes_rows(self):
         self._notice_rows()
         before = self.jobs.read_bytes()
