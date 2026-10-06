@@ -89,6 +89,7 @@ from artifact_producer import (  # noqa: E402
     review_lease_acquire,
 )
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
+from foreground_terminal import settle_foreground_exit  # noqa: E402
 from dispatch_lifecycle import (  # noqa: E402
     acquire_foreground_review_admission,
     acquire_review_admission,
@@ -1385,20 +1386,6 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     )
 
 
-def _foreground_failure_evidence(outcome) -> dict[str, str]:
-    """Evidence sealed when a foreground worker's process ends in failure.
-
-    The same fields the Claude/Codex foreground close writes, so the row reads
-    the same whichever tool ran it.
-    """
-    return {
-        "detected_by": "foreground-process-exit",
-        "failure_class": "runtime",
-        "reconcile_reason": outcome.failure,
-        "process_exit": str(outcome.exit_code),
-    }
-
-
 def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str, attempt_id: str | None = None) -> bool:
     """SD-15: flip this dispatch's own open row to done with a dead-<reason> note.
 
@@ -2647,21 +2634,17 @@ def main(argv: list[str]) -> int:
                 ),
             )
             args.worker_exit = outcome.exit_code
-            args.worker_failure = outcome.failure
-            if outcome.failure:
-                # Same close as the Claude/Codex wrappers: dead-<failure> with
-                # the process exit as runtime evidence (dead-interrupted when
-                # this call was stopped).
-                closed = bool(args.attempt_id) and close_attempt_row(
-                    jobs, args.attempt_id, f"dead-{outcome.failure}",
-                    evidence=_foreground_failure_evidence(outcome),
-                )
-                if closed:
-                    materialize_after_terminal_close(jobs, args.attempt_id)
-                else:
-                    close_job_row(
-                        jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
-                    )
+            settled = settle_foreground_exit(
+                jobs, args.attempt_id, log_path, outcome, worktree=args.worktree,
+                artifact_root=args.artifact_root, worker_type=args.worker_type,
+                legacy_close=lambda failure: close_job_row(
+                    jobs, args.slug, args.worktree, failure, "", args.attempt_id),
+            )
+            terminal = settled["inspection"]
+            args.terminal_inspection = terminal
+            args.terminal_verdict = settled["verdict"]
+            args.worker_failure = settled["worker_failure"]
+
         else:
             # SD-15: detached launches retain the short early-death watch.
             death = watch_early_death(proc, log_path, args.early_exit_watch)
