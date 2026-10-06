@@ -838,7 +838,8 @@ check_codex_bin_wrappers() {
     || ! grep -Fq -- '--worker-type' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'End with the kernel' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'prompt_path.write_text(prompt_text, encoding="utf-8")' adapters/codex/bin/dispatch-headless.py \
-    || ! grep -Fq 'fcntl.flock' adapters/codex/bin/dispatch-headless.py \
+    || ! grep -Fq 'fcntl.flock' utilities/dispatch_wrapper_common.py \
+    || ! grep -Fq 'jobs_lock = WRAPPER_COMMON.jobs_lock' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'registry_lock={jobs}.lock' utilities/launch_receipt.py \
     || ! grep -Fq 'launch_receipt.attempt_lines(' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'close_attempt_row' adapters/codex/bin/dispatch-harvest.py \

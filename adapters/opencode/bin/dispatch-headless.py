@@ -82,6 +82,19 @@ from dispatch_contract import (
 )
 from parent_next_directive import receipt_lines as parent_next_receipt_lines  # noqa: E402
 import launch_receipt  # noqa: E402
+import dispatch_wrapper_common as WRAPPER_COMMON  # noqa: E402
+# Identical in every wrapper; the old names stay so callers and mock targets do not move.
+_is_report_bundle_publish_stage = WRAPPER_COMMON.is_report_bundle_publish_stage
+_route_node_leg_fields = WRAPPER_COMMON.route_node_leg_fields
+_supervisor_route = WRAPPER_COMMON.supervisor_route
+fail = WRAPPER_COMMON.fail
+jobs_lock = WRAPPER_COMMON.jobs_lock
+prepare_review_output_request = WRAPPER_COMMON.prepare_review_output_request
+process_start_ticks = WRAPPER_COMMON.process_start_ticks
+read_launch_fence_failure = WRAPPER_COMMON.read_launch_fence_failure
+resolve_artifact_root = WRAPPER_COMMON.resolve_artifact_root
+resolve_report_bundle_root = WRAPPER_COMMON.resolve_report_bundle_root
+seed_launch_heartbeat = WRAPPER_COMMON.seed_launch_heartbeat
 from dispatch_summary import launch_summary_owner  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
@@ -175,18 +188,6 @@ INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "advers
 # table (route_authority), the same at launch and in liveness for every harness.
 from route_authority import DEATH_PATTERNS, scan_anchored_death, scan_death  # noqa: E402,F401
 from route_authority import ANSI_RE as _ANSI_RE  # noqa: E402,F401
-
-
-@contextmanager
-def jobs_lock(jobs: Path):
-    jobs.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = Path(f"{jobs}.lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield lock_path
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -302,52 +303,8 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-def fail(reason: str, code: int, **fields: str) -> int:
-    print("check=failed")
-    print(f"reason={reason}")
-    for key, value in fields.items():
-        print(f"{key}={value}")
-    return code
-
-
 # One copy, shared by the three wrappers (`route_authority`); the name stays for readers.
 completion_gate_fail_fields = route_authority.completion_gate_fail_fields
-
-
-def read_launch_fence_failure(fd: int) -> tuple[dict[str, object] | None, bool]:
-    """Read and close the fence's private, close-on-exec failure channel.
-
-    Returns the parsed failure record (or None) alongside whether the fence
-    was actually released: `BlockingIOError` means the write end is still
-    open (the child has not reached the fence yet, so nothing was released),
-    while an EOF read means the write end already closed (the fence was
-    released with no failure payload).
-    """
-    try:
-        os.set_blocking(fd, False)
-        try:
-            raw = os.read(fd, 16384)
-        except BlockingIOError:
-            return None, False
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    if not raw:
-        return None, True
-    try:
-        record = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, True
-    if (
-        not isinstance(record, dict)
-        or record.get("schema_version") != 1
-        or not isinstance(record.get("reason"), str)
-        or not isinstance(record.get("detail"), str)
-    ):
-        return None, True
-    return record, True
 
 
 class ModelSelectionError(ValueError):
@@ -566,56 +523,6 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         "source": "explicit", "role": "-", "profile": "unsealed",
         "tier": "explicit", "granularity": "legacy", "model": args.model, "variant": args.variant,
     }
-
-
-def resolve_artifact_root(worktree: str) -> str:
-    result = subprocess.run(
-        [str(ROOT / "utilities" / "artifact-root.sh"), worktree],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    value = result.stdout.strip()
-    if result.returncode != 0 or not value or not Path(value).is_absolute():
-        detail = (result.stderr or result.stdout or "invalid artifact root").strip()
-        raise ValueError(detail)
-    return value
-
-
-def _is_report_bundle_publish_stage(route_file: str | None, route_node: str | None) -> bool:
-    if not route_file or route_node != "publish":
-        return False
-    try:
-        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    expected = {
-        "id": "publish", "kind": "capability-owner", "unit": "_kernel/owner",
-        "completion_gate": "lab-publish", "dispatch_depth": 1,
-    }
-    return route.get("capability") == "autopilot-lab" and any(
-        all(node.get(key) == value for key, value in expected.items())
-        for node in route.get("nodes", []) if isinstance(node, dict)
-    )
-
-
-def resolve_report_bundle_root(route_file: str | None, route_node: str | None) -> Path | None:
-    if not _is_report_bundle_publish_stage(route_file, route_node):
-        return None
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "tools" / "report-bundle.py"), "root", "--optional"],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-    )
-    value = result.stdout.strip()
-    if result.returncode != 0:
-        raise ValueError((result.stderr or result.stdout or "invalid report bundle root").strip())
-    if not value:
-        return None
-    path = Path(value)
-    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
-        raise ValueError("configured report bundle root is not a safe directory")
-    return path
 
 
 def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
@@ -1052,18 +959,6 @@ def _supervised_owner(args: argparse.Namespace) -> bool:
             and getattr(args, "intensity", None) not in STANDARD_PLUS_INTENSITIES)
 
 
-def _supervisor_route(args: argparse.Namespace) -> tuple[str, str, str] | None:
-    """The route a supervised owner is bound to: the standard+ owner binding, or a
-    quick owner's own one-shot tuple, never a partial one."""
-    binding = getattr(args, "owner_route_binding", None)
-    if binding:
-        return binding.route_file, binding.route_id, binding.route_hash
-    route = tuple(getattr(args, key, None) for key in ("route_file", "route_id", "route_hash"))
-    if all(route) and getattr(args, "route_node", None) == "one-shot":
-        return route
-    return None
-
-
 def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> None:
     """Open correction admission at registration; without it `correct` stays unsupported."""
     if not _supervised_owner(args):
@@ -1132,60 +1027,6 @@ def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
 def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path) -> None:
     parent_completion.launch_parent_completion_sidecar(
         args, jobs, launch=launch_codex_queue_completion_sidecar, annotate=annotate_attempt_row)
-
-
-def _route_node_leg_fields(args):
-    """Read the sealed leg_class/auxiliary_check off this wrapper's route node.
-
-    W1c projection source: the fields are stamped by the compiler during
-    parallel-group expansion, so the wrapper reads its own sealed node instead
-    of trusting a second, independently-produced value. Missing node/fields
-    project the explicit absence marker `-`.
-    """
-    route_file = getattr(args, "route_file", None)
-    route_node = getattr(args, "route_node", None)
-    if not route_file or not route_node:
-        return "-", "-"
-    try:
-        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return "-", "-"
-    for node in route.get("nodes", []):
-        if isinstance(node, dict) and node.get("id") == route_node:
-            return (
-                str(node.get("leg_class") or "-"),
-                str(node.get("auxiliary_check") or "-"),
-            )
-    return "-", "-"
-
-
-def prepare_review_output_request(args) -> None:
-    args.review_output_binding = None
-    args.review_governed_lease_nonce = ""
-    if not args.review_output:
-        return
-    if (
-        args.dispatch_depth != 1
-        or args.worker_type != "review"
-        or args.unit != "qa/code-review"
-        or args.capability != "autopilot-code"
-        or args.execution_surface != "registered-headless"
-        or not args.registered_worker
-        or args.route_file
-        or getattr(args, "owner_route_binding", None)
-    ):
-        raise ProducerError("review-output-tuple-invalid")
-    cycle_id = os.environ.get("AGENT_ARTIFACT_CYCLE_ID", "")
-    producer_id = os.environ.get("AGENT_ARTIFACT_PRODUCER_ID", "")
-    if not cycle_id or not producer_id:
-        raise ProducerError("review-output-cycle-binding-missing")
-    args.review_output_binding = prepare_review_output_binding(
-        Path(args.artifact_root), cycle_id=cycle_id,
-        producer_id=producer_id, attempt_id=args.attempt_id,
-        review_output=args.review_output, capability=args.capability,
-        unit=args.unit, worktree=args.worktree,
-    )
-    args.review_governed_lease_nonce = secrets.token_hex(32)
 
 
 def acquire_review_lease_after_claim(
@@ -1495,28 +1336,6 @@ def annotate_job_row(jobs: Path, slug: str, worktree: str, extra_kv: str, attemp
             _atomic_registry_replace(jobs, "".join(lines).splitlines())
             return True
     return False
-
-
-def process_start_ticks(pid: int) -> str:
-    try:
-        return (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8").split()[21]
-    except (OSError, IndexError):
-        return ""
-
-
-def seed_launch_heartbeat(args: argparse.Namespace, jobs: Path, pid: int, start: str) -> str:
-    if not (args.attempt_id and args.route_id and args.route_node):
-        return "not-route-bound"
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "utilities/dispatch-progress.py"), "heartbeat",
-         "--attempt-id", args.attempt_id, "--route-id", args.route_id,
-         "--route-node", args.route_node, "--jobs", str(jobs),
-         "--phase", "launch", "--kind", "registry",
-         "--evidence", f"pid={pid};start={start or '-'}"],
-        cwd=ROOT, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return "ok" if result.returncode == 0 else "failed"
 
 
 def write_reset_cache(agent_home: Path, harness: str, reason: str, reset: str, jobs: Path | None = None) -> None:
