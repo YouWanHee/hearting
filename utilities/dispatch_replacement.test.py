@@ -1449,6 +1449,45 @@ class ReplacementTest(unittest.TestCase):
         self.assertNotEqual(second['family_id'], first['family_id'])
         self.assertEqual(second['logical_node']['after_capacity'], successor['attempt_id'])
 
+    def test_an_answered_replacement_its_launcher_refused_hands_the_answer_to_the_next_owner(self):
+        self._blocked_owner()
+        self._answer()
+        first = self.claim()
+        # The wrapper refused at spawn and closed the row: no model ever saw this prompt.
+        refused = self._die(self._successor(first, self.meta | {'worker_type': 'owner'}, status='open'),
+                            note='dead-launch-error', launch_outcome='never-launched', launch_claimed='0')
+        result, commands = self._launch(refused['attempt_id'])
+        self.assertEqual(len(commands), 1, result)
+        second = result['record']
+        self.assertEqual(second['proof']['death_kind'], 'unlaunched')
+        def text():
+            return R.recovery_instructions(SimpleNamespace(
+                automatic_retry_of=refused['attempt_id'], worker_type='owner', jobs_path=self.jobs,
+                attempt_id=second['replacement_attempt_id']))
+        rendered = text()
+        for expected in ('never started', f"{refused['attempt_id']} was itself the continuation of att-source",
+                         'ended BLOCKED and a person has answered it', 'approved: start the full run',
+                         'do not ask for it again', '<owner-corrections>'):
+            self.assertIn(expected, rendered)
+        # The answer is checked against the pinned digest exactly as before.
+        import dispatch_owner_input as I
+        path = I._path(self.jobs, 'att-source')
+        value = json.loads(path.read_text())
+        value['requests'][0].update(text='something else', digest=I._digest('something else'))
+        path.write_text(json.dumps(value))
+        with self.assertRaises(D.DispatchContractError) as caught:
+            text()
+        self.assertEqual(caught.exception.reason, 'replacement-correction-drift')
+
+    def test_an_unlaunched_owner_that_was_not_a_refused_replacement_carries_nothing_more(self):
+        self._unlaunched_owner()
+        record = self.claim()
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('never started', text)
+        self.assertNotIn('was itself the continuation', text)
+        self.assertNotIn('<owner-corrections>', text)
+
     def test_stage_worker_capacity_death_is_not_a_replacement_source(self):
         self.write({**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-capacity','failure_class':'capacity'})
         self.assertIsNone(R.death_kind(['now','done'],R._rows(self.jobs.read_text().splitlines())['att-source'][1]))

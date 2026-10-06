@@ -3066,6 +3066,11 @@ def _denied_process_outside_attempt(start: str, metadata: dict[str, str], *, hos
             and not any(metadata.get(key) for key in (
                 "pid", "pid_start", "pid_host", "pid_host_start", "pgid"))):
         return True  # atomic register-only row: no runner has claimed execution
+    if _detached_group_drain_receipt(metadata):
+        # The watcher sealed this receipt only from an empty tagged scan, and an
+        # environment passes from parent to child only, so no process born since
+        # can carry this attempt's tag. Readable tags still answer `live`.
+        return True
     origin = metadata.get("pid_start", "")
     authority = attempt_scan_namespace_authority(metadata) or (
         host_complete and _current_observer_is_host_like() and namespace_gone(metadata) == 'extinct')
