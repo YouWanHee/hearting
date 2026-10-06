@@ -186,60 +186,9 @@ INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "advers
 # is scoped to this set for owner (conductor) launches only.
 _STANDARD_PLUS_INTENSITY = STANDARD_PLUS_INTENSITIES
 
-# SD-15 (OPERATIONS §5.10 ⑨): immediate limit/auth failure patterns — homomorphic port of the Claude
-# wrapper's DEATH_PATTERNS. codex exec surfaces provider limit/auth failures as JSON
-# events (`--json`), but a raw tail substring scan still matches the text inside those
-# events, so no JSON parsing is needed (same as the Claude tail scan). Runtime-currentness
-# (2026-07, openai/codex#9148·#12677·#11434·#4840): codex prints "exceeded retry limit,
-# last status: 429 Too Many Requests" / "usage_limit_reached" and generally exits non-zero
-# on retry exhaustion, so the launch early-exit watch is realizable (best-effort). The
-# shell/other-adapter counterparts (dispatch-liveness.py LIMIT_RE) keep the same list —
-# intentional cross-runtime duplication, keep in sync.
-DEATH_PATTERNS = [
-    ("capacity", r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b"),
-    ("network-operation-not-permitted", r"operation not permitted|network is unreachable|network access denied"),
-    ("session-limit", r"hit your (?:session|usage) limit|session limit reached"),
-    ("usage-limit", r"usage[_ ]limit[_ ]reached|usage limit reached|weekly limit|"
-     r"rate limit(?:ed)?|provider rate limit|exceeded retry limit|\b429\b"),
-    ("auth", r"invalid api key|authentication_error|not logged in|please run /login|unauthorized|\b401\b"),
-    ("credit", r"credit balance is too low|insufficient (?:credit|quota|funds)"),
-]
-_RESET_RE = re.compile(
-    r"resets?(?:\s+at)?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{1,2}\s*(?:am|pm))",
-    re.I,
-)
-
-
-def scan_death(text: str) -> tuple[str, str] | None:
-    """Return (reason, reset) if the log text shows a limit/auth death, else None.
-
-    reset is a best-effort human string ('3pm', '15:45', ...) or '' when absent.
-    Homomorphic with the Claude wrapper's scan_death and dispatch-liveness.py LIMIT_RE.
-    """
-    low = text.lower()
-    reason = ""
-    for name, pat in DEATH_PATTERNS:
-        if re.search(pat, low):
-            reason = name
-            break
-    if not reason:
-        return None
-    m = _RESET_RE.search(text)
-    reset = re.sub(r"\s+", "", m.group(1)) if m else ""
-    return reason, reset
-
-
-def scan_anchored_death(text: str) -> tuple[str, str] | None:
-    """Inspect only terse terminal CLI lines, never completion-report prose."""
-    for line in [line.strip() for line in text.splitlines() if line.strip()][-3:]:
-        if len(line) > 200:
-            continue
-        death = scan_death(line)
-        if death:
-            if death[0] == "capacity" and not anchored_capacity_failure(line):
-                continue
-            return death
-    return None
+# SD-15 (OPERATIONS §5.10 ⑨): limit/auth/capacity deaths are classified by the one shared
+# table (route_authority), the same at launch and in liveness for every harness.
+from route_authority import DEATH_PATTERNS, scan_anchored_death, scan_death  # noqa: E402,F401
 
 
 def parser() -> argparse.ArgumentParser:

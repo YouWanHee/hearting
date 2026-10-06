@@ -37,11 +37,9 @@ STALE_MIN="${DISPATCH_STALE_MIN:-15}"   # Suspect hang/death after N quiet minut
 RUNTIME_ROOT="${DISPATCH_RUNTIME_ROOT:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
 PROJ="$RUNTIME_ROOT/projects"
 LOG_DIR="$STATE_ROOT/logs"
-# SD-15: if an open job log ends with a limit/auth fatal pattern, use that as
-# the DEAD reason. Keep this deliberate duplicate synchronized with
-# dispatch-headless.py DEATH_PATTERNS.
-LIMIT_RE='operation not permitted|network is unreachable|network access denied|hit your (session|usage) limit|session limit reached|usage limit reached|weekly limit|rate limit|[^0-9]429[^0-9]|invalid api key|authentication_error|not logged in|please run /login|unauthorized|[^0-9]401[^0-9]|credit balance is too low|insufficient (credit|quota|funds)'
-CAPACITY_RE='^(error[[:space:]]*[:\-][[:space:]]*)?(selected[[:space:]]+)?model([[:space:]]+[A-Za-z0-9._:/-]+)?[[:space:]]+(is[[:space:]]+)?at[[:space:]]+capacity[.!]?$'
+# SD-15: if an open job log ends with a limit/auth fatal line, use that as the
+# DEAD reason. The classification is the one shared table every harness reads
+# (route_authority.scan_anchored_death), not a shell copy of it.
 CODEX_TERMINAL_INSPECTOR="${CODEX_TERMINAL_INSPECTOR:-$SCRIPT_DIR/codex_dispatch_terminal.py}"
 OBSERVED_LIVENESS="${OBSERVED_LIVENESS:-$SCRIPT_DIR/dispatch-observed-liveness.py}"
 
@@ -53,11 +51,10 @@ scan_log_death() {  # $1=slug; print the matching log path and return 0.
   [ -n "$_slug" ] || return 1
   for lf in "$LOG_DIR/${_slug}."*.log "$LOG_DIR/${_slug}."*.jsonl; do
     [ -f "$lf" ] || continue
-    # Inspect the last three non-empty lines and accept only terse (≤200) matches.
-    lines=$(tail -n 40 "$lf" 2>/dev/null | awk 'NF' | tail -n 3)
-    hit=$(printf '%s\n' "$lines" | grep -Ei "$LIMIT_RE" | awk 'length($0) <= 200 { print; exit }')
-    [ -n "$hit" ] || hit=$(printf '%s\n' "$lines" | grep -Ei "$CAPACITY_RE" | awk 'length($0) <= 200 { print; exit }')
-    [ -n "$hit" ] && { printf '%s' "$lf"; return 0; }
+    # The shared scan inspects the last three non-empty lines and accepts only terse ones.
+    if tail -n 40 "$lf" 2>/dev/null | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import route_authority as r; sys.exit(0 if r.scan_anchored_death(sys.stdin.read()) else 1)' "$SCRIPT_DIR"; then
+      printf '%s' "$lf"; return 0
+    fi
   done
   return 1
 }

@@ -406,7 +406,7 @@ No retry — detection/closure/surfacing only.
 (anomalyco/opencode#8203) where it **hangs indefinitely on API errors** (rate limit / 429)
 instead of exiting. The launch early-exit-watch requires the child to *exit*, so a hang-on-limit
 escapes it and the row stays `open`. That case is instead caught by **axis 6** — 
-`adapters/opencode/bin/dispatch-liveness.py`'s `LIMIT_RE` log-tail scan (SD-15b) judges the open
+`adapters/opencode/bin/dispatch-liveness.py`'s shared `route_authority.scan_anchored_death` log-tail scan (SD-15b) judges the open
 row DEAD from the `Rate limited`/`Provider Rate Limit exceeded`/`429` line the hung child leaves
 in its log, independent of the SQLite session mtime. So OpenCode realizes: clean-exit-on-limit →
 launch watch; hang-on-limit → liveness log scan. (Claude and Codex realize both axes because

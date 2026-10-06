@@ -164,62 +164,10 @@ INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "advers
 # when omitted. The jobs.log `qa=` field is retained (derived value) for
 # fleet-collector compatibility.
 
-# SD-15 (OPERATIONS §5.10 ⑨): immediate limit/auth failure patterns — homomorphic port of the Claude
-# wrapper's DEATH_PATTERNS. `opencode run --format json` surfaces provider limit/auth
-# failures as text/JSON in the log; a raw tail substring scan matches either. Runtime-
-# currentness (2026-07, anomalyco/opencode#8203·#11104·#34886·#15890): OpenCode prints
-# "Provider Rate Limit exceeded [retrying in Ns attempt #N]", "API rate limited (429)",
-# and "Rate limited. Quick retry in 1s…". ⚠️ ADAPTATION CONSTRAINT: `opencode run` has a
-# known bug (#8203) where it *hangs* on API errors instead of exiting — the launch
-# early-exit watch proactively interrupts only the distinct anchored capacity class;
-# other hang-on-limit cases are caught later by dispatch-liveness.py's log scan.
-DEATH_PATTERNS = [
-    ("capacity", r"(?:selected\s+)?model\b.{0,80}\b(?:is\s+)?at capacity\b"),
-    ("network-operation-not-permitted", r"operation not permitted|network is unreachable|network access denied"),
-    ("session-limit", r"hit your (?:session|usage) limit|session limit reached"),
-    ("usage-limit", r"usage[_ ]limit[_ ]reached|usage limit reached|weekly limit|"
-     r"rate limit(?:ed)?|provider rate limit|exceeded retry limit|\b429\b"),
-    ("auth", r"invalid api key|authentication_error|not logged in|please run /login|unauthorized|\b401\b"),
-    ("credit", r"credit balance is too low|insufficient (?:credit|quota|funds)"),
-    ("permission-reject", r"permission requested:.*auto-rejecting"),
-]
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_RESET_RE = re.compile(
-    r"resets?(?:\s+at)?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)?|[0-9]{1,2}\s*(?:am|pm))",
-    re.I,
-)
-
-
-def scan_death(text: str) -> tuple[str, str] | None:
-    """Return (reason, reset) if the log text shows a limit/auth death, else None.
-
-    reset is a best-effort human string ('3pm', '15:45', ...) or '' when absent.
-    Homomorphic with the Claude wrapper's scan_death and dispatch-liveness.py LIMIT_RE.
-    """
-    low = text.lower()
-    reason = ""
-    for name, pat in DEATH_PATTERNS:
-        if re.search(pat, low):
-            reason = name
-            break
-    if not reason:
-        return None
-    m = _RESET_RE.search(text)
-    reset = re.sub(r"\s+", "", m.group(1)) if m else ""
-    return reason, reset
-
-
-def scan_anchored_death(text: str) -> tuple[str, str] | None:
-    """Inspect only terse terminal CLI lines, never completion-report prose."""
-    for line in [line.strip() for line in text.splitlines() if line.strip()][-3:]:
-        if len(_ANSI_RE.sub("", line)) > 200:
-            continue
-        death = scan_death(line)
-        if death:
-            if death[0] == "capacity" and not anchored_capacity_failure(line):
-                continue
-            return death
-    return None
+# SD-15 (OPERATIONS §5.10 ⑨): limit/auth/capacity deaths are classified by the one shared
+# table (route_authority), the same at launch and in liveness for every harness.
+from route_authority import DEATH_PATTERNS, scan_anchored_death, scan_death  # noqa: E402,F401
+from route_authority import ANSI_RE as _ANSI_RE  # noqa: E402,F401
 
 
 @contextmanager

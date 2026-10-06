@@ -223,6 +223,40 @@ class Case6UncappedAndEnvelopeTest(unittest.TestCase):
         self.assertIsNone(RA.HANDOFF_RE.search("verdict: PASS\nblocker: none"))
 
 
+class DeathPatternTest(unittest.TestCase):
+    """Audit #9: one death/limit table for every harness, at launch and in liveness."""
+
+    def test_every_reader_uses_the_one_table(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                wrapper = _load(f"route_authority_wrapper_{harness}", f"adapters/{harness}/bin/dispatch-headless.py")
+                self.assertIs(wrapper.DEATH_PATTERNS, RA.DEATH_PATTERNS)
+                self.assertIs(wrapper.scan_anchored_death, RA.scan_anchored_death)
+        self.assertIs(DC.anchored_capacity_failure, RA.anchored_capacity_failure)
+        for path in ("adapters/codex/bin/dispatch-liveness.py", "adapters/opencode/bin/dispatch-liveness.py",
+                     "utilities/dispatch-liveness.sh"):
+            text = (ROOT / path).read_text(encoding="utf-8")
+            self.assertIn("scan_anchored_death", text, path)
+            self.assertNotIn("LIMIT_RE", text, path)
+
+    def test_lines_that_split_by_harness_now_classify_alike(self):
+        # Claude's wrapper missed the first two; OpenCode's liveness missed the third.
+        cases = {"usage_limit_reached": "usage-limit",
+                 "error: exceeded retry limit, last status: 429 Too Many Requests": "usage-limit",
+                 "network is unreachable": "network-operation-not-permitted",
+                 "permission requested: bash; auto-rejecting": "permission-reject",
+                 "Selected model is at capacity": "capacity"}
+        for line, label in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(RA.scan_anchored_death(line), (label, ""))
+        self.assertEqual(RA.scan_death("You've hit your session limit · resets 3pm"), ("session-limit", "3pm"))
+        for prose in ("This report discusses rate limits at length " + "x" * 200,
+                      "the model is at capacity per an earlier note, continuing",
+                      "req_429abc finished"):
+            with self.subTest(prose=prose[:30]):
+                self.assertIsNone(RA.scan_anchored_death(prose))
+
+
 class OneHomeTest(unittest.TestCase):
     """The old names are this module's judgments, not copies."""
 
