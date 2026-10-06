@@ -809,7 +809,10 @@ def scoped_external_directory_config(
         return False
 
     write_side = [root for root in (artifact_root, report_bundle_root, *execution_access_roots) if root]
-    covered_roots = [str(root) for root in write_side] + list(contract_roots)
+    # The worktree is a writable area too: a read root inside it stays writable there, as its
+    # grant records (`read-only-root-writable`). A read root that holds a writable area keeps
+    # its deny with the area re-allowed below; one holding the worktree is refused as too broad.
+    covered_roots = [str(root) for root in write_side] + ([str(worktree)] if worktree else []) + list(contract_roots)
     read_deny_roots = [str(root) for root in execution_access_read_roots
                        if root and not any(_covers(cover, root) for cover in covered_roots)]
     write_keep_roots = [str(root) for root in write_side
