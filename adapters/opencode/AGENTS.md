@@ -90,8 +90,8 @@ the checkout; a staged `--graph execute,test,report` is your own stage
 subgraph). Use the preset recipe (`preflight.sh route --capability …`) only
 when the request names the entry's full loop or a promotion signal or
 spec-backed flow requires it. Apply §0.3. `direct`/`solo` routes carry the
-sealed `small_work_confirmation` (`notice` default): one `[경로]` line plus a
-scope clause instead of the blocking card, unless the work is destructive or
+§0.4 card through `question` on user-authored turns; received peer envelopes
+use one `[경로]` line plus a scope clause, unless the work is destructive or
 external-facing; otherwise present the §0.4 five-field card before material
 work unless already approved, and close with the §0.5 card. Load full
 capability detail only in the acting owner or worker.
@@ -215,7 +215,7 @@ Portable behavior contract = `roles/response-policy.md`.
 - Keep responses concise, match promises with same-turn action, verify before asserting, and follow current conventions; expose a convention change before committing it.
 - **Local evidence before recall** — answer a domain question from the repository's research/analysis/briefing artifacts first; model memory is the fallback, a memory-only answer says so and flags its risky specifics, and the §0.4 card exemption never waives this evidence check.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.
-- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms.
+- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms. Other sessions use Fleet tag and pane (SID if needed), role in parentheses; without a tag, herdr name and pane, rather than internal abbreviations.
 - Ask only for genuinely non-obvious or destructive choices. Continue reversible in-flow work and its implied validation, records, commit, and push. Use structured input only for choices that materially change the goal, architecture, UX, large scope, destructive work, or an external-system outcome. Continue low-risk reversible work autonomously. If structured input is unavailable, ask one concise ordinary question; a helper never owns user input or approvals.
 - Under `core/OPERATIONS.md §5.11`, commit and push validated `<agent-home>` instruction, rule, hook, preflight, or status-surface changes in the same turn without a separate user signal.
 

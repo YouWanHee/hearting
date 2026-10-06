@@ -1115,6 +1115,18 @@ stated otherwise, so the new TUI owns its rollout fd and same-cwd simultaneous
 starts stay exactly attributable; time-candidate threads stay out of Embedded
 attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
+Same-seat succession uses `peer-steward.py start --beside <predecessor-pane>`
+to open the successor to its right in the same tab without focus. The predecessor
+hands over its card and documents, receives the successor's ACK, leaves its last
+result and becomes idle; the successor then uses `retire <predecessor>` to send
+one normal exit action (Claude `/exit` + Enter; Codex/OpenCode Ctrl+D) and close
+that pane only after its original shell returns. A refused start closes
+its own newly split pane only when the same shell is agent-free and its visible
+screen is unchanged from the stable snapshot recorded before native start.
+Retirement refuses busy sessions, open forms, drafts, unknown process identity
+or an unconfirmed shell return; it has no retry, forced kill or forced close.
+Cards, notices and registered parent, route and worker identities are not moved.
+
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused
 or blocked (cross-session permission laundering forbidden); a blocked action reflects
@@ -1131,7 +1143,9 @@ wait` exactly once and leaves a disk receipt; no self-written sleep/poll loop), 
 foreground `utilities/peer-steward.py wait`, a one-shot idle-notify subscription (Claude
 `notify_when_idle`, secondary), or a registered continuation supervisor/monitor.
 `ListAgents` loops, "is it done yet?" messages, sleep loops, and periodic recaps are
-forbidden. A wait, watch, or subscription is observation, not a §0.6 continuation; a
+forbidden for completion watching. Foreground launch and retirement observations
+use a fixed monotonic deadline without renewing it or retrying a launch. A wait,
+watch, or subscription is observation, not a §0.6 continuation; a
 tracked workflow's obligation is unchanged.
 
 **Backgrounding `wait` is not a completion-detection path** (v56 correction). A background

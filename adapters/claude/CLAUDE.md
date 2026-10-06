@@ -56,9 +56,9 @@ subgraph of the owning capability). Use the preset recipe
 (`capability-route.py compile`) only when the request names the entry's full
 loop or a promotion signal or spec-backed flow requires it; never bend a
 loosely matching request into the nearest preset graph. Apply §0.3. For
-`direct`/`solo` routes the sealed `small_work_confirmation` (`notice`, the
-default) replaces the blocking card with the one `[경로]` line `compose`
-prints plus one clause of scope, unless the work is destructive or
+`direct`/`solo` routes user-authored turns receive the §0.4 card; received
+peer envelopes use the one `[경로]` line `compose` prints plus one clause
+of scope, unless the work is destructive or
 external-facing; otherwise present the five-field card in §0.4 before
 material work unless scope and route are already approved — deliver it
 through `AskUserQuestion` (five fields as the question body, options
@@ -134,7 +134,7 @@ Portable behavior contract = `roles/response-policy.md`.
 - **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience or repository contract applies. Code, code comments, commit messages, and PR text follow the repository's language, even when the runtime `language` setting names another.
 - Keep responses concise and match promises with same-turn action.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.
-- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms.
+- **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms. Other sessions use Fleet tag and pane (SID if needed), role in parentheses; without a tag, herdr name and pane, rather than internal abbreviations.
 - Verify before asserting and follow existing conventions.
 - **Local evidence before recall** — answer a domain question from the repository's research/analysis/briefing artifacts first; model memory is the fallback, a memory-only answer says so and flags its risky specifics, and the §0.4 card exemption never waives this evidence check.
 - Ask only for genuinely non-obvious or destructive choices; proceed with the recommended reversible path when no answer is needed. Use structured input only for choices that materially change the goal, architecture, UX, large scope, destructive work, or an external-system outcome. Continue low-risk reversible work autonomously. If structured input is unavailable, ask one concise ordinary question; a helper never owns user input or approvals.

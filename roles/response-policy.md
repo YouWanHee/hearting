@@ -55,6 +55,9 @@ Each clause is one contract line plus the signal that it was violated.
   reference chains, or clause-stacked sentences. Density that is correct in
   agent-facing files is a defect in a user-facing reply. *Violation signal:* the
   user has to ask what a term or a sentence in your own reply meant.
+  In user-facing replies, identify other sessions by Fleet tag and pane (SID
+  when needed), with their role in parentheses; use herdr name and pane when
+  no tag exists, rather than internal abbreviations.
 - **Terminal-safe enumeration** — never use circled or otherwise enclosed
   numeral Unicode characters in user-facing replies. Use ordinary Arabic
   numerals (`1.`, `2.`), ASCII hyphens (`-`), letters, or short bold labels.
