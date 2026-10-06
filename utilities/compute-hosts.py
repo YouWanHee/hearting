@@ -454,10 +454,11 @@ def _launcher_session_setup(values=None):
 # zero evaluations while training was unaffected.)
 PROVENANCE_ATTEMPT_PATTERN = re.compile(r"att-[A-Za-z0-9._-]{1,240}\Z")
 PROVENANCE_AGENT_HOME_BYTES_MAX = 4096
-# Cleared first, then selectively restored: a long-lived remote shell or tmux
-# server can retain an unrelated original environment, so omission alone would
-# still leak a foreign value into the payload. Only these two keys are ever
-# cleared here; the rest of the ambient environment is left untouched.
+# Always exported, the empty string when the launcher cannot validate a value: a
+# long-lived remote shell or tmux server can retain an unrelated original
+# environment, so omission would leak a foreign value, and a payload that reads
+# `os.environ[...]` must not die before its first step (BC 2026-10-06). Only these
+# two keys are set here; the rest of the ambient environment is left untouched.
 PROVENANCE_CLEAR_KEYS = ("AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID")
 
 
@@ -2033,6 +2034,14 @@ PY
 def cmd_claim(args):
     config = load_config()
     (name, host), = _select(config, [args.host])
+    if not args.session:
+        # The launcher's own session, read the way `run` exports it.
+        owner = _unique_session_owner(os.environ)
+        if owner is None or (args.harness and args.harness != owner["harness"]):
+            raise ConfigError("claim needs --session (and --harness) outside one harness session")
+        args.harness, args.session = owner["harness"], owner["id"]
+    elif not args.harness:
+        raise ConfigError("claim --session needs --harness")
     if args.harness not in {"claude", "codex", "opencode"}:
         raise ConfigError("claim harness must be claude, codex, or opencode")
     session_id = str(args.session or "").strip()
@@ -2099,15 +2108,15 @@ def cmd_run(args):
     rendered = " ".join(shlex.quote(part) for part in command)
 
     provenance = _launcher_provenance()
+    owner = _unique_session_owner(os.environ)
     # Provenance rides the same preamble as the compute identity, so it
     # crosses the local/SSH/tmux/setsid boundary together. Both keys are
-    # cleared first (a stale tmux server or remote shell may retain foreign
-    # values), then only validated values are added back; an empty mapping
-    # is normal (unknown here) and the payload must degrade gracefully.
+    # always set -- to the validated value, or to "" when it is unknown here --
+    # so a stale tmux server or remote shell cannot leak a foreign value and a
+    # strict read in the payload finds the key.
     setup = (_launcher_session_setup()
-             + ["unset " + " ".join(PROVENANCE_CLEAR_KEYS)]
-             + ["export %s=%s" % (key, shlex.quote(value))
-                for key, value in provenance.items()]
+             + ["export %s=%s" % (key, shlex.quote(provenance.get(key, "")))
+                for key in PROVENANCE_CLEAR_KEYS]
              + [
                  f"export HEARTING_COMPUTE_RUN_ID={shlex.quote(run_id)}",
                  f"export HEARTING_COMPUTE_HOST={shlex.quote(name)}",
@@ -2156,7 +2165,9 @@ def cmd_run(args):
     meta = {"run_id": run_id, "host": name, "command": command,
             "cwd": workdir, "env": env, "gpus": args.gpus,
             "provenance": {"agent_home": provenance.get("AGENT_HOME"),
-                           "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID")},
+                           "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
+                           "session": ({"harness": owner["harness"], "id": owner["id"]}
+                                       if owner else None)},
             "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -2395,9 +2406,9 @@ def build_parser():
         "claim", help="Bind a detached root PID to its exact launcher session")
     p_claim.add_argument("host")
     p_claim.add_argument("pid", type=int)
-    p_claim.add_argument("--harness", required=True,
-                         choices=("claude", "codex", "opencode"))
-    p_claim.add_argument("--session", required=True)
+    p_claim.add_argument("--harness", choices=("claude", "codex", "opencode"),
+                         help="default: this session's harness")
+    p_claim.add_argument("--session", help="default: this session's id")
     p_claim.add_argument("--json", action="store_true")
     p_claim.set_defaults(func=cmd_claim)
 

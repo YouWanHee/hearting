@@ -957,7 +957,8 @@ not replace the detached-process claim below. This rule was added after the
 remote GPU ancestry were both exact but the session variable had not crossed
 the SSH boundary.
 
-`claim <host> <pid> --harness <runtime> --session <id>` is the narrow bridge for
+`claim <host> <pid> [--harness <runtime> --session <id>]` (default: the calling
+session, when it is one unique harness session) is the narrow bridge for
 an already detached `nohup`/`setsid` process whose runtime ancestor and session
 environment no longer survive. It writes only to the shared run root's
 `.process-owners.json`, never to the inventory. Creation revalidates the remote
@@ -1037,15 +1038,14 @@ runtime-provided observation label rather than a registry authority claim — ac
 local/SSH/tmux/setsid boundary, recorded in the run's `meta.json` beside the
 untouched conda-selection `env` field. The selection is allowlisted:
 credentials, registry paths, session variables, and arbitrary env stay on the
-launcher side, and anything the launcher cannot validate is omitted rather
-than fabricated. Both keys are cleared before the validated values are added back,
+launcher side. Both keys are exported on every run, as the validated value or as
+the empty string when the launcher cannot validate one (unknown, not fabricated),
 so a stale remote-shell or tmux-server environment cannot leak a foreign value
-that would disagree with the recorded provenance. These values are observability provenance, not execution permission
-or data protection: a payload reads them with a missing-tolerant lookup
-(`os.environ.get`, resolver fallback) and keep running when they are absent. A
-strict lookup that fails the whole GPU run on missing provenance repeats the
-2026-10-06 BC_ResNet eval loss (`moving4-20261006-102542`, guard `KeyError`
-before the first inference, zero evaluations while training was unaffected).
+and a payload that reads `os.environ[...]` still runs (the 2026-10-06 BC_ResNet
+eval loss, `moving4-20261006-102542`, was a guard `KeyError` on a missing key
+before the first inference). `meta.json` also records the launcher's session when
+it is one unique harness session. These values are observability provenance, not
+execution permission or data protection.
 
 This is deliberately not dispatch: no capability, registry, attempt, or
 completion gate is involved, and the harness never chooses a host on its own.
