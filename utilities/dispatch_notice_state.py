@@ -249,6 +249,9 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
     if receipt.get("kind") == "supervision":
         from dispatch_supervision import notice_is_current as current
         return current(record)
+    if receipt.get("kind") == "notice":
+        from session_notice import notice_is_current as current
+        return current(record)
     if receipt.get("kind") == "human-gate":
         import human_gate_receipt as gate
         try:
