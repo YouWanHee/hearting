@@ -1696,6 +1696,12 @@ def reconcile(rows, args):
         # This operator repair is bound to one exact attempt. Do not make its
         # transaction a carrier for unrelated pending deliveries.
         record["pending_delivery"] = {"skipped": "exact-attempt-only"}
+    elif args.apply and exact_selection:
+        # A normal exact --attempt apply stays scoped to that attempt, its
+        # process drain, and its related join-recovery, which already ran
+        # through the exact per-attempt APIs above. Unrelated pending and
+        # outbox rows stay for the selector-less bulk maintenance path.
+        record["pending_delivery"] = {"skipped": "exact-attempt-only"}
     elif args.apply:
         # SD-111 P2 §2-b-2/§2-c: this `reconcile` call is the existing
         # bounded-cadence "dispatch reconcile path" -- the materialize

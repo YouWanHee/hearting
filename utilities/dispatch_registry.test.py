@@ -2203,6 +2203,32 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertEqual(observed_attempt_liveness("done",settled,terminal_receipt_gate=True).state,"terminal")
   self.assertNotIn("cancellation_quiescence_receipt",settled)
 
+ def test_settled_exact_apply_leaves_unrelated_pending_outbox_untouched(self):
+  # BC observation: installed `reconcile --attempt <id> --apply` on a settled
+  # drain (attempted=1, target unchanged) also swept the global pending
+  # outbox (pruned 78, skipped 6, unknown recipients, old digest skew). A
+  # normal exact --attempt apply stays scoped to its attempt, process drain,
+  # and related join-recovery; the selector-less bulk path keeps global
+  # maintenance. The planted record is prune-eligible (terminal + older than
+  # retention), so the old code would unlink it here.
+  self.write_row()
+  self.assertEqual(self.seal("--apply")["sealed"],1)
+  unrelated=self.base/"pending-delivery"/"fixture-recipient"/"unrelated-acked.json"
+  unrelated.parent.mkdir(parents=True)
+  unrelated.write_text(json.dumps({"state":"acked","delivery_id":"unrelated-1","recipient_key":"fixture-recipient","expiry_reason":"fixture"},sort_keys=True))
+  old=time.time()-8*86400;os.utime(unrelated,(old,old))
+  before_jobs=self.jobs.read_bytes();before_outbox=unrelated.read_bytes()
+  recovery=self.invoke("reconcile","--attempt",self.attempt,"--apply")
+  self.assertEqual(recovery.returncode,0,recovery.stdout+recovery.stderr)
+  record=json.loads(recovery.stdout)
+  self.assertEqual(record["attempted"],1,record)
+  self.assertEqual(record["decisions"][0]["category"],"terminal-settled",record)
+  self.assertFalse(record["decisions"][0]["closed"])
+  self.assertEqual(record["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(self.jobs.read_bytes(),before_jobs)
+  self.assertEqual(unrelated.read_bytes(),before_outbox)
+  names=sorted(path.name for path in unrelated.parent.iterdir())
+  self.assertEqual(names,["unrelated-acked.json"])
  def test_seal_survives_a_live_tagged_process_that_outlived_the_worker(self):
   """The exact shape that made the receipt unissuable: a leaked tagged process."""
   child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
