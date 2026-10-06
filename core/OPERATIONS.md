@@ -1032,12 +1032,12 @@ launcher itself runs inside a registered attempt, that attempt id as a
 runtime-provided observation label rather than a registry authority claim — across the
 local/SSH/tmux/setsid boundary, recorded in the run's `meta.json` beside the
 untouched conda-selection `env` field. The selection is allowlisted:
-credentials, registry paths, session variables, and arbitrary env never cross
-here, and anything the launcher cannot validate is omitted rather than
-fabricated. Both keys are cleared before the validated values are added back,
+credentials, registry paths, session variables, and arbitrary env stay on the
+launcher side, and anything the launcher cannot validate is omitted rather
+than fabricated. Both keys are cleared before the validated values are added back,
 so a stale remote-shell or tmux-server environment cannot leak a foreign value
 that would disagree with the recorded provenance. These values are observability provenance, not execution permission
-or data protection: a payload must read them with a missing-tolerant lookup
+or data protection: a payload reads them with a missing-tolerant lookup
 (`os.environ.get`, resolver fallback) and keep running when they are absent. A
 strict lookup that fails the whole GPU run on missing provenance repeats the
 2026-10-06 BC_ResNet eval loss (`moving4-20261006-102542`, guard `KeyError`
