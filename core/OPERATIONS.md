@@ -349,7 +349,10 @@ consumption evidence.
 
 `dispatch_attempt_policy.py` is the shared decision table. Terminal writers,
 join/harvest, and the retry claimant consume it; the jobs lock admits at most
-one automatic successor for an exact `automatic_retry_of` predecessor. An
+one automatic successor for an exact `automatic_retry_of` predecessor. Only a
+transport failure (a death, a runtime error, a capacity stop) is such a
+predecessor; a worker's readable `FAIL` or `BLOCKED` is its result, so the next
+launch of that node is new work on capped and uncapped nodes alike. An
 explicit new review round remains a workflow decision. Stage boundaries specify
 inputs and outcomes; they do not themselves imply another process launch.
 Conflicting terminal evidence preserves that result and receipt while pausing

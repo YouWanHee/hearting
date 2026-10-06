@@ -47,7 +47,8 @@ blocker: none | <one line>
 
 For a stage-authoritative attempt, use `PASS` only when the assigned completion
 gate is met. A supplied sub-session context defines its narrower PASS. Use
-`FAIL` when the attempt or review finished but its applicable gate or slice is
-not met, and `BLOCKED` when missing
-authority, input, or runtime state prevents continuation. `artifact: -` is
-allowed only for atomic read-only support with no durable output.
+`FAIL` for observed wrong behavior: the work or review was checked and does not
+meet its gate or slice. Use `BLOCKED` when no judgment was reached: missing
+authority, input or runtime state, or items left unfinished; the blocker line
+names what remains. `artifact: -` is allowed only for atomic read-only support
+with no durable output.

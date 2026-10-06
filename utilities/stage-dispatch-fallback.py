@@ -79,7 +79,7 @@ from dispatch_mode_contract import (  # noqa: E402
     validate_route_mode_axes,
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind  # noqa: E402
-from dispatch_attempt_policy import decide_attempt, committed_outcome
+from dispatch_attempt_policy import decide_attempt, committed_outcome, readable_result
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE  # noqa: E402
 from review_round_cap import classify_round_row  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
@@ -797,7 +797,8 @@ def finished_verdict_row(jobs: Path, route_id: str, node_id: str, attempt_id: st
         if row.get("attempt_id") != attempt_id or row.get("_status") != "done":
             continue
         worker_type = row.get("worker_type", "")
-        return row if classify_round_row("done", row, worker_type=worker_type) == "verdict" else None
+        verdict = classify_round_row("done", row, worker_type=worker_type) == "verdict"
+        return row if verdict or readable_result(row) else None
     return None
 
 
@@ -835,6 +836,9 @@ def terminal_attempt_state(
         return "terminal", fields
     if decision.action == "review":
         return "terminal", {**fields, "review_verdict": "FAIL"}
+    if readable_result(row):
+        # The worker's own FAIL/BLOCKED is this launch's result, never a fallback.
+        return "terminal", {**fields, "review_verdict": readable_result(row)}
     if decision.retry_kind == "capacity":
         return "capacity", {**fields, "failure_class": "capacity"}
     if decision.retry_allowed:
@@ -1874,7 +1878,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
 
     prior_failures = registry_failures(args.jobs, route["route_id"], node["id"])
     prior_rows = registry_rows(args.jobs, route["route_id"], node["id"])
-    args.automatic_retry_of = retry_predecessor(prior_rows, node, node_round_admission)
+    args.automatic_retry_of = retry_predecessor(prior_rows)
     failed_tuples = set(args.failed_tuple) | set(prior_failures)
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
@@ -2082,8 +2086,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             args, route, node, allocation_context, row, hop, ordinal, attempt_id,
                             attempts, prior_failures, output,
                             terminal_note=note,
-                            review_verdict=("PASS" if note not in (REVIEW_BLOCKING_NOTE, "dead-worker-fail")
-                                            else "FAIL"),
+                            review_verdict=(readable_result(verdict_row)
+                                            or ("FAIL" if note == REVIEW_BLOCKING_NOTE else "PASS")),
                         )
                     if (result.returncode != 0 or fields.get("check") == "failed"
                             or worker_failure != "-"):

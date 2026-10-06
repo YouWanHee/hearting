@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 import re
 
-from dispatch_attempt_policy import committed_outcome
+from dispatch_attempt_policy import committed_outcome, readable_result
 import review_round_cap as _ROUND
 
 
@@ -279,26 +279,21 @@ def declared_subsession(args) -> bool:
     return True
 
 
-def retry_predecessor(prior_rows, node, round_admission=None):
-    """Transport replacement and an admitted verdict round are different work.
+def retry_predecessor(prior_rows):
+    """The transport retry a new launch of this node continues, or "".
 
-    The shared round admission already counts the exact node's verdict and
-    revisions, and attempt_identity salts the new round. A genuine FAIL from
-    a transport successor still owns a verdict; its old retry link is not a
-    second death to replace. No original row or replacement budget is changed.
-    Uncapped work and verdictless failures retain the existing retry binding.
+    Only a transport failure (a death, a runtime error) is retried in place.
+    A worker's readable FAIL or BLOCKED is its result, on a capped node or
+    not: the next launch is new work, so it never inherits a retry link and
+    never spends the node's one replacement. Capped nodes still count it as a
+    round through the shared round admission. No original row is changed.
     """
     if not prior_rows:
         return ""
     latest = prior_rows[-1]
     status = latest["_status"]
     if committed_outcome(status, latest) == "failed":
-        from worker_bootstrap import worker_type_for_kind
-        worker_type = latest.get("worker_type") or worker_type_for_kind(node["kind"])
-        if (round_admission is not None and round_admission.budget.state == "admit"
-                and classify_round_row(status, latest, worker_type=worker_type) == "verdict"):
-            return ""
-        return latest.get("attempt_id", "")
+        return "" if readable_result(latest) else latest.get("attempt_id", "")
     if status == "open" and latest.get("launch_claimed") == "0":
         # Register/start reuse the same unlaunched transport successor. A
         # semantic round has no such link and keeps its own round identity.

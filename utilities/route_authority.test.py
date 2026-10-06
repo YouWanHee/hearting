@@ -149,15 +149,30 @@ class Case3TestRoundTest(unittest.TestCase):
 
 
 class Case4RetryLinkTest(unittest.TestCase):
-    """Case 4: a readable FAIL that inherited a transport retry link exhausted the replacement."""
+    """Case 4: a readable FAIL that inherited a transport retry link exhausted the replacement.
 
-    CAPPED = {"id": "test", "kind": "pipeline-stage"}
+    RA-4 (stage 2): a readable FAIL or BLOCKED never becomes a retry
+    predecessor, whatever its round admission; only a transport failure does.
+    """
 
-    def test_an_admitted_verdict_round_is_not_a_retry_of_the_last_fail(self):
-        admit = SimpleNamespace(budget=SimpleNamespace(state="admit"))
+    def test_a_readable_result_is_never_a_retry_predecessor(self):
         latest = _fail_row("att-0c43", automatic_retry_of="att-4cf2")
-        self.assertEqual(RA.retry_predecessor([latest], self.CAPPED, admit), "")
-        self.assertEqual(RA.retry_predecessor([latest], self.CAPPED, None), "att-0c43")
+        self.assertEqual(RA.retry_predecessor([latest]), "")
+        blocked = {**latest, "note": "dead-worker-blocked", "failure_class": "blocked"}
+        self.assertEqual(RA.retry_predecessor([blocked]), "")
+        death = {**latest, "note": "dead-route-completion-rejected", "failure_class": "contract"}
+        self.assertEqual(RA.retry_predecessor([death]), "att-0c43")
+
+    def test_the_attempt_policy_retries_only_transport_failures(self):
+        from dispatch_attempt_policy import decide_attempt
+        def retry(note, failure_class):
+            return decide_attempt("done", {"note": note, "failure_class": failure_class},
+                                  process_state="quiescent").retry_kind
+        self.assertEqual(retry("dead-worker-fail", "fail"), "")
+        self.assertEqual(retry("dead-worker-blocked", "blocked"), "")
+        self.assertEqual(retry("dead-exact-pid", "contract"), "fallback")
+        self.assertEqual(retry("dead-invalid-envelope", "invalid-envelope"), "fallback")
+        self.assertEqual(retry("dead-capacity", "capacity"), "capacity")
 
     def test_a_second_link_on_the_same_source_is_exhausted(self):
         source = ("2026-10-06T08:00:00Z\tdone\t/repo\t/wt\ttest-r2\t"
@@ -183,14 +198,16 @@ class Case5ReadRootsTest(unittest.TestCase):
 
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):
-    """Case 6: an uncapped execute FAIL keeps its retry link; envelopes are matched exactly."""
+    """Case 6: an uncapped execute FAIL; envelopes are matched exactly.
 
-    def test_an_uncapped_fail_is_linked_as_the_retry_predecessor(self):
-        # stage-dispatch-fallback admits a round only for a capped node, so an
-        # `execute` FAIL reaches this judgment with no round admission at all.
+    RA-4 (stage 2): the execute FAIL no longer becomes a retry predecessor, so
+    the owner's next execute is new work instead of an exhausted replacement.
+    """
+
+    def test_an_uncapped_fail_is_not_a_retry_predecessor(self):
         execute = {"id": "execute", "kind": "pipeline-stage"}
         self.assertFalse(RA.is_round_capped_node(execute))
-        self.assertEqual(RA.retry_predecessor([_fail_row("att-2358")], execute, None), "att-2358")
+        self.assertEqual(RA.retry_predecessor([_fail_row("att-2358")]), "")
 
     def test_a_pass_with_an_explained_none_blocker_breaks_the_contract(self):
         text = "artifact: /cycle/test_logs/envelope.md\nverdict: PASS\nblocker: none (범위 한정 PASS)"
