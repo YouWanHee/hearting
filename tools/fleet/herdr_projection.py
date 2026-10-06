@@ -104,14 +104,16 @@ def runtime_identity():
       Codex process proven neither way (the `--remote` TUI, `codex-code-mode-host`, an
       ambiguous match) is passed over for the ancestor that is, and no proof anywhere
       means ``("codex", None)``;
-    - OpenCode: a process named ``opencode`` — its session id is not readable from the
-      process, so it is always ``("opencode", None)``.
+    - OpenCode: a process named ``opencode`` — its session id is the one its own TUI
+      selection record or ``--session`` proves, else ``("opencode", None)``.
+
+    Every harness is read through `fleet.process_identity`, the one record shape.
 
     ``(None, None)`` when no runtime is found — CI, a detached helper, a test with a fake
     config dir.
     """
-    from fleet.collectors import claude as claude_collector, codex as codex_collector
     from fleet.collectors import procscan
+    from fleet.process_identity import PROVEN, process_identity
     pid, codex_seen, live = os.getpid(), False, []
 
     def live_codex():
@@ -122,23 +124,17 @@ def runtime_identity():
     for _ in range(_MAX_ANCESTORS):
         if not pid or pid <= 1:
             break
-        try:
-            session = claude_collector.session_id_of_process(pid)
-        except Exception:
-            session = None
-        if session:
-            return "claude", session
+        found = process_identity(pid, "claude")
+        if found.confidence == PROVEN:
+            return "claude", found.session_id
         comm = _comm(pid)
         if comm == "codex" or comm.startswith("codex-"):
             codex_seen = True
-            try:
-                thread = codex_collector.session_id_of_process(pid, live_codex)
-            except Exception:
-                thread = None
-            if thread:
-                return "codex", thread
+            found = process_identity(pid, "codex", live_codex=live_codex)
+            if found.confidence == PROVEN:
+                return "codex", found.session_id
         elif comm == "opencode":
-            return "opencode", None
+            return "opencode", process_identity(pid, "opencode").session_id or None
         pid = _parent(pid)
     return ("codex", None) if codex_seen else (None, None)
 
@@ -150,9 +146,10 @@ def may_report(harness: str, session_id: str, *, worker=None) -> bool:
     - Claude and Codex: the nearest runtime above this process must be proven to be on
       ``session_id`` (see `runtime_identity`); the payload and the environment
       (``CODEX_THREAD_ID`` included) are never the proof;
-    - OpenCode: only the harness is proven — the nearest runtime must be OpenCode — and
-      the session id is NOT checked, because OpenCode exposes none from the process. A
-      fake id under a real OpenCode ancestor is therefore still reported.
+    - OpenCode: the nearest runtime must be OpenCode, and when that process proves its
+      session (its TUI selection record or ``--session``) the id must match it. A process
+      that proves none — an older TUI without the selection record — keeps the
+      harness-only check, so its id is reported as before.
     Unknown identity is a refusal, never a guess: the header keeps its previous text.
     """
     harness = str(harness or "").lower()
@@ -163,7 +160,9 @@ def may_report(harness: str, session_id: str, *, worker=None) -> bool:
     runtime, own = runtime_identity()
     if runtime != harness:
         return False
-    return True if runtime == "opencode" else own == session_id
+    if runtime == "opencode" and own is None:
+        return True
+    return own == session_id
 
 
 def _runtime_name(harness: str, session_id: str) -> str:

@@ -2826,10 +2826,11 @@ def _native_trust_reason(harness, lines):
 
 
 def _process_session(pane, harness):
-    """The session the pane's foreground Claude/Codex process is on now, or None.
+    """The session the pane's foreground runtime process is on now, or None.
 
-    Read from the process the way the Fleet board does (Claude's `sessions/<pid>.json`,
-    which is rewritten on `/clear`; Codex's open rollout). herdr's own `agent_session`
+    Read from the process the way the Fleet board does (`fleet.process_identity`:
+    Claude's `sessions/<pid>.json`, rewritten on `/clear`; Codex's open rollout;
+    OpenCode's TUI selection record or `--session`). herdr's own `agent_session`
     follows a `/clear` only when its integration reports it, and has been seen to keep
     the previous session for good (live panes 2026-10-01), so a second tidy in the same
     window would otherwise never clear it."""
@@ -2841,20 +2842,16 @@ def _process_session(pane, harness):
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         if tools_dir.is_dir() and str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))
-        from fleet.collectors import claude as claude_collector, codex as codex_collector
+        from fleet.process_identity import PROVEN, process_identity
     except Exception:
         return None
     for process in processes:
         try:
-            pid = int(process.get("pid"))
-            if harness == "claude":
-                sid = claude_collector.session_id_of_process(pid)
-            else:
-                sid = codex_collector.session_id_of_process(pid)
+            found = process_identity(int(process.get("pid")), harness)
         except Exception:
             continue
-        if sid:
-            return sid
+        if found.confidence == PROVEN:
+            return found.session_id
     return None
 
 
