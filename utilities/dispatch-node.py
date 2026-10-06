@@ -315,8 +315,9 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
  return prior
 
 def subsession_purpose(jobs, route, node, chain_id, declared):
- """OPERATIONS §5.10: after a gate failure a sub-session is the gap retry of
- the unfinished items, never retroactive planned subdivision.
+ """OPERATIONS §5.10: after a gate failure or a BLOCKED (unfinished) round a
+ sub-session is the gap retry of the unfinished items, never retroactive
+ planned subdivision.
 
  Reads the full-stage census admission reads (sub-session rows are not in
  it), cut at this chain's first row, so register, start and the supervisor's
@@ -338,7 +339,7 @@ def subsession_purpose(jobs, route, node, chain_id, declared):
             if node.get("kind")=="review-worker" else {route["route_id"]})
  rows=[(cols[1],meta) for cols,meta in ROUTE.review_round_records(lines,route_ids,node["id"],jobs=jobs)]
  worker_type=node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")
- return "gap-retry" if REVIEW_ROUND_CAP.last_verdict_blocking(rows,worker_type) else declared
+ return "gap-retry" if ROUTE_AUTHORITY.gate_unmet(rows,worker_type) else declared
 
 # C-14: only the plan-check/impl-review/test QA anchors carry a review/correction
 # budget under CONVENTIONS §1.1. `execute`/`report` are outside that budget (P2-27

@@ -343,6 +343,7 @@ classify_round_row = _ROUND.classify_round_row
 round_budget = _ROUND.round_budget
 is_round_capped_node = _ROUND.is_round_capped_node
 last_verdict_blocking = _ROUND.last_verdict_blocking
+gate_unmet = _ROUND.gate_unmet
 
 
 # The worker's final three lines. Every terminal reader parses them with this
