@@ -360,6 +360,22 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             len(log_path.read_text(encoding="utf-8").splitlines()), 2
         )
 
+class StrictGateReceiptRenderTest(unittest.TestCase):
+    """The strict gate receipt a Codex owner raises is shown as a gate, with what to read."""
+
+    def test_a_strict_gate_receipt_is_a_gate_notice_with_its_artifact(self):
+        import dispatch_session_sweep as sweep
+        record = {"delivery_id": "delivery-x", "receipt": {
+            "kind": "human-gate", "route_id": "rt-0123456789abcdef", "route_file": "/r/route.json",
+            "owner_attempt_id": "att-owner", "gate": "full-run-authorization",
+            "artifact_path": "/art/gate.md"}}
+        self.assertTrue(sweep.is_human_gate_record(record))
+        text = sweep.delivery_context([(Path("/state"), [record])])
+        self.assertTrue(text.startswith(sweep.GATE_DELIVERY_HEADER))
+        self.assertIn("gate=full-run-authorization artifact=/art/gate.md", text)
+        self.assertIn("route_file=/r/route.json", text)
+
+
 class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
     """The OpenCode plugin carrier: look, claim and render through the shared sweep, hand the text
     to the idle session's next turn, then ack (taken) or release (not taken)."""

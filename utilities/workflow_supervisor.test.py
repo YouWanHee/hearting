@@ -3669,6 +3669,17 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
                 self.assertEqual(WS.human_gate_resolution(SUP.ledger_for(self.route, jobs).journal(), self.GATE)["status"],
                                  "blocked")
 
+    def test_a_codex_queue_gate_outlives_its_owner_but_the_gateway_does_not(self):
+        # The Codex prompt sweep reads the strict gate receipt after the owner's watcher ended;
+        # the managed gateway still needs the owner alive. Without a sealed receipt to keep,
+        # the parent reads the question in its own receipt (the test above).
+        for kind, holds in (("codex-native-queue", True), ("codex-managed-gateway", False),
+                            ("codex-stop-hook", False), ("claude-parent-runtime", True)):
+            with self.subTest(kind=kind):
+                self.setUp()
+                jobs = self.exited_owner(kind)
+                self.assertEqual(SUP.gate_carrier_holds(kind, self.route, jobs), holds)
+
     def test_a_kind_with_a_push_carrier_keeps_its_record_whatever_the_option_says(self):
         # Both read the parent's records themselves, so the record reaches it after the owner exited.
         for kind in ("claude-parent-runtime", "opencode-turn"):
