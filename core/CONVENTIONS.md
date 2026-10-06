@@ -32,7 +32,7 @@ Intensity supplies the default recipe below; an explicit graph selects its stage
 | `thorough` | Strong groups plus deeper synthesis/verification | A declared group may add a third implementation-risk, failure-mode, or contrarian leg; unchanged groups remain width two | The base recipe realizes only registry-declared 2–4-way siblings; composed routes may add other bounded dispatch-depth-2 perspectives | thorough |
 | `adversarial` | Thorough plus adversarial failure-mode/security verification | Use the route-declared width and adversarial perspective; no undeclared fan-out | Bounded declared group or composed adversary/verifier; dispatch depth remains at most 2 | adversarial |
 
-Stage gates check whether output can feed the next stage. Independent QA runs only where selected, using a separate execution with a different declared persona or perspective. Same-harness review is independent (SD-160, user decision 2026-09-27; allocation order in §2.1). Further legs retain declared profile and perspective diversity. Final verification remains capability-specific. Never add an omitted plan-check or report an unexecuted check as passed.
+Stage gates check whether output can feed the next stage. Independent QA runs only where selected, using a separate execution with a different declared persona or perspective. Same-harness review is independent (allocation order in §2.1). Further legs retain declared profile and perspective diversity. Final verification remains capability-specific. Never add an omitted plan-check or report an unexecuted check as passed.
 
 Dispatch depth is portable route topology, not process ancestry, runtime-native
 agent nesting, or proof of registry membership. Dispatch depth 0 is user-facing
@@ -161,7 +161,7 @@ a scalar quality ranking:
 | `mini` | Lifecycle, classification, title, or explicitly micro-semantic help | configured micro budget | forbidden for substantive registered dispatch-depth-1/2 owner, stage, and review nodes |
 | `top` | Above deep: the harness's main-session-only model, only by a route-sealed explicit selection under important or difficult-uncertain judgment | configured top budget, opt-in (undeclared runtime config refuses typed) | route-sealed dispatch-depth-1 owner only; not a stage node, leg, review worker, matrix cell, policy band, or capacity cascade |
 
-SD-88 v84 uses one pure resolver for compile and compose. `profile_demand`
+Compile and compose use one pure resolver. `profile_demand`
 contains `schema_version: 1`, `judgment_requirement`, `execution_scope`, nonempty
 `judgment_reason` and `execution_reason`, and nonempty `evidence_refs`.
 Predetermined work selects light for short-local execution and balanced for
@@ -205,7 +205,7 @@ execution cell. Never mutate the existing sealed profile or waive QA on return.
 
 ### §2.3. Unit Catalog and Role Binding
 
-The former runtime team agents are re-homed (2026-07-22, user decision: 승격+재홈) into the
+Dispatchable behaviors live in the
 portable **unit catalog** at `roles/units/<family>/<unit>.md`. A unit is the single
 declaration of one dispatchable behavior atom; its frontmatter binds the portable role
 name, worker type, floor, and I/O semantics (`roles/units/_schema.md` is the authoring
@@ -388,8 +388,7 @@ Verification and scan commands must not depend on the invoking login shell's
 dialect. The interactive default here is zsh: it does not word-split unquoted
 variable expansions, so a newline-joined file list silently collapses into one
 path, and Bash-only builtins (`mapfile`/`readarray`, `<<<` here-strings) fail
-outright. Grounded by the 2026-07-16 diagnosis where a worker's `mapfile` lint
-and a newline-expansion static scan both produced false verification verdicts.
+outright.
 
 - Pass file lists null-delimited — `find … -print0 | xargs -0 …` — or through
   the canonical helper `utilities/verify-files.sh` (POSIX sh, safe under
@@ -406,9 +405,7 @@ and a newline-expansion static scan both produced false verification verdicts.
 ### §4.3. Worktree Build Residue Hygiene
 
 A build run inside a linked worktree must not leave untracked artifacts that
-pollute `git status` and block guarded cleanup. Grounded by the 2026-07-16
-diagnosis where dependency-tracing stubs appeared under a worktree on every
-webpack build and required manual deletion before cleanup.
+pollute `git status` and block guarded cleanup.
 
 - The essential fix belongs to the project's build configuration (for
   example, pinning the dependency-tracing root to the primary checkout so
@@ -475,9 +472,7 @@ both, the root is `<cwd>/.agent_reports/`. This Git-worktree resolution path —
 primary worktree wins — is unchanged by the marker rule.
 
 Artifact directories are gitignored in every tracked repository, including
-`<agent-home>` (2026-07-31 policy change for the public v2.0 release: the
-former agent-home exception that committed artifact history is retired;
-pre-2.0 history remains reachable in git history). Add `.agent_reports/` to
+`<agent-home>`. Add `.agent_reports/` to
 `.gitignore` on first creation; treat legacy `.claude_reports/` similarly.
 Runtime grounding state (`.capability-grounding/`, `.route-grounding/`,
 `.spec-grounding/`, `.core-grounding/`) is likewise never tracked. Linked
@@ -624,7 +619,7 @@ Always create `_internal/` for a new artifact, even when empty, to mark modern l
 
 ## §5.8–§5.11. Operations
 
-Pipeline lock, git preflight, worktree dispatch, and `<agent-home>` push policy moved to `OPERATIONS.md` on 2026-06-23 with numbering preserved.
+Pipeline lock, git preflight, worktree dispatch, and `<agent-home>` push policy live in `OPERATIONS.md` with numbering preserved.
 
 ## §6. Autopilot Flow Matrix
 
@@ -776,7 +771,7 @@ Draft Step 0 and research Step 1.5 are the existing track-specific instances. Sp
 
 ## §7. Memory
 
-Unified memory moved to `MEMORY.md` on 2026-06-23 with §7 numbering preserved. That file is the single source.
+Unified memory lives in `MEMORY.md` with §7 numbering preserved. That file is the single source.
 # Route, resource, and report invariants
 
 Dispatch depth applies to portable route ownership: quick is dispatch depth 1,

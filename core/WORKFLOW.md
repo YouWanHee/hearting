@@ -88,9 +88,6 @@ external research, implementation, and completed-artifact inspection retain
 their §0.2/work-nature primaries. When analysis already exists, read it before
 deciding that reanalysis is needed.
 
-This boundary was strengthened after a 2026-07-14 incident where a context
-recovery request in a spec-backed project was routed to `analyze-project` before
-its existing legacy artifact root and memory-linked artifacts were read.
 
 **Hard artifact order:**
 
@@ -218,9 +215,6 @@ a mode retains its existing deployment/release behavior (`default`).
 | "Write an independent presentation for the recipient" | `autopilot-draft` | New document goal, not file collection |
 | "Deploy the application to production" | `autopilot-ship` | Obtain deploy approval at route start; retain post-deploy verification |
 
-Added after a 2026-07-14 incident where a checkpoint reevaluation with report
-regeneration was routed to `autopilot-refine` as primary from its surface
-artifact and the entire evaluation ran inline in the main session.
 
 ### 0.2.1. Shape Before Preset (SD-135)
 
@@ -494,11 +488,7 @@ changes, the acting session must hold a current, cwd-bound route record emitted
 by `utilities/capability-route.py compile` or `compose`. For code, that route is
 `autopilot-code` at no less than `direct`. A Skill invocation, the prose card,
 an earlier session's record, or a stale record from another cwd is not route
-participation. Hotfixes do not bypass this floor. This invariant was hardened
-after the 2026-07-24 Cairn incident in which a route card was shown but no
-route was entered and the feature was edited, committed, and deployed through
-silent no-route work, and again on 2026-10-02 when a read-only question grew
-into source edits, commits and GPU runs without a route.
+participation. Hotfixes do not bypass this floor.
 
 One gate checks this, and only for existence: the route presence gate
 (`utilities/route_presence_gate.py`, `core/HOOKS.md`). Before a session's
@@ -879,13 +869,6 @@ builder may remove the runtime gate only after sealing and revalidating the exac
 source route, gate, raise epoch, proceed decision, journal authority, and
 raise/release entry digests; otherwise continuation compilation fails closed.
 
-Grounded by the 2026-08-04 BC_ResNet_tf incident: training and its hard-negative
-loop finished, the wrapper contained no evaluation stage, the documentation
-named "separate eval" with no owner or trigger, the resource runner had no
-completion callback, the resource row was invisible to Fleet, and the acting
-agent ended its turn with no follow-up mechanism registered. Each of those five
-is now a mechanically checked condition rather than a convention.
-
 **Acting-agent obligation.** Do not end a turn while a tracked workflow has a
 non-terminal stage with no registered continuation. Before the turn ends,
 either the continuation is registered (supervisor armed, next stage dispatched,
@@ -1046,7 +1029,7 @@ These rules close three gaps: a broken trail caused by over-creating plans for q
 
 Every entry capability resolves through `capabilities/topologies.json`, the machine-readable execution-topology source. Intensity, topology class, worker kind, transport, DAG nodes, write scopes, promotion signals, and completion gates remain separate axes. `utilities/capability-route.py` compiles an immutable route bound to the registry digest (plus a `capability_registry_digest` over only the parts that route derives from: shared sections, its own capability's recipes and the gate contracts they cite, so an edit to another capability does not make it stale), source commit, physical absolute working directory, artifact root, and transport evidence. Adapters may project compact summaries and pointers, but must not copy the graph into bootstrap or Skill metadata.
 
-The route compiler is **enforced** (promoted from report-only, 2026-07-22): every node
+The route compiler is **enforced**: every node
 references a unit in `roles/units/`, and routing happens at entry only — a
 dispatch-depth-2 worker never routes and never selects another worker. Enumerated
 recipes are curated fast paths, not the default. For a request no recipe fits, the
