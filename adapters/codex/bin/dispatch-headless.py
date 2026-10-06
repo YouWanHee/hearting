@@ -146,6 +146,7 @@ from model_profile import (  # noqa: E402
     validate_registered_profile,
 )
 import commit_policy  # noqa: E402
+import harness_state_roots as HARNESS_STATE  # noqa: E402
 from model_config import (  # noqa: E402
     ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
     main_session_only_state, resolve_config, restricted_model,
@@ -968,29 +969,14 @@ def invalid_codex_mount_target(args: argparse.Namespace, worktree: Path) -> Path
     return None
 
 
-def _spec_grounding_dir(args: argparse.Namespace) -> Path:
-    return Path(args.agent_home) / ".spec-grounding"
-
-
-def spec_read_marker_required(args: argparse.Namespace) -> bool:
-    """The portable worker kernel requires a witnessed governing-PRD read
-    before spec-backed output, including workers without a route binding.
-    Registration carries that obligation; a review persona or network grant
-    does not. Preserve legacy route/owner grants and expose only the marker
-    directory for newly covered registered workers, never agent home.
-    """
-    return bool(
-        getattr(args, "route_id", None)
-        or getattr(args, "nested_headless_network", False)
-        or (
-            getattr(args, "execution_surface", None) == "registered-headless"
-            and getattr(args, "registered_worker", 0) == 1
-        )
-    )
-
-
-def _core_grounding_dir(args: argparse.Namespace) -> Path:
-    return Path(args.agent_home) / ".core-grounding"
+# Which harness state this launch writes, decided once for every harness (harness_state_roots);
+# this adapter opens it in its OS sandbox.
+spec_read_marker_required = HARNESS_STATE.spec_read_marker_required
+_spec_grounding_dir = HARNESS_STATE.spec_grounding_dir
+_core_grounding_dir = HARNESS_STATE.core_grounding_dir
+route_bound_worker_writable_dirs = HARNESS_STATE.route_bound_worker_writable_dirs
+progress_writable_dirs = HARNESS_STATE.progress_writable_dirs
+registry_writable_launch = HARNESS_STATE.registry_writable_launch
 
 
 def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
@@ -1018,78 +1004,6 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
         summary_owner_root,
     )
     return tuple(path.resolve() for path in candidates if path.is_dir())
-
-
-def route_bound_worker_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
-    """Grant set for the portable read-guard state directories.
-
-    Two launch shapes need them (review F-3): an ordinary registered
-    `dispatch_depth==2` Codex worker (plan-check round-1 Finding 1), and a
-    standard+ `nested_headless_network` owner launched without a `route_id` --
-    SD-72 grants the owner `.spec-grounding`/`.core-grounding` unconditionally,
-    so gating on `route_id` alone reopened the EROFS this cycle closes. A pure
-    query -- see `ensure_owner_writable_dirs`."""
-
-    if not (
-        getattr(args, "route_id", None)
-        or getattr(args, "nested_headless_network", False)
-    ):
-        return ()
-    return tuple(
-        path.resolve() for path in (_core_grounding_dir(args),) if path.is_dir()
-    )
-
-
-def progress_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
-    """The exact dispatch-state subdirectories a sandboxed attempt writes progress into.
-
-    SD-58's heartbeat/watchdog files live at `<state root>/heartbeats/<attempt>.json`
-    and `<state root>/watchdog/<attempt>.{json,lock}`. A depth-1 owner matched none
-    of the conditions that grant the state root (owner network widening, or a
-    depth-2 route-bound launch), so under codex's workspace-write sandbox those
-    paths were read-only and `preflight.sh stage-heartbeat` died
-    `[Errno 30] Read-only file system`. Two of the five owners lost on 2026-09-04
-    then reported BLOCKED and were recorded as failures despite finished work.
-
-    Only these two directories are exposed, not the state root: the owner needs to
-    record progress, not to reach the registry, logs, or supervisor state. A
-    launch that legitimately needs the registry keeps getting it through
-    `nested_owner_writable_dirs`.
-    """
-
-    if not getattr(args, "jobs_path", None):
-        return ()
-    root = dispatch_state_root(args.jobs_path)
-    return (root / "heartbeats", root / "watchdog")
-
-
-def registry_writable_launch(args: argparse.Namespace) -> bool:
-    """SD-OPEN-64: whether this launch needs the whole dispatch state root
-    (registry, `jobs.log`, `completion/<route_id>`), not just the two progress
-    directories above.
-
-    The prior condition (`nested_headless_network` or exactly
-    `dispatch_depth == 2`) was keyed on *dispatching-ness* -- whether this
-    launch spawns a child -- not on whether it closes its own registry row. A
-    quick standard+ depth-1 owner (`att-bccaa2f32dcf4bdb89c5ef48a7fcaa0f`,
-    `route_id=rt-1c3127a326589075`, SD-OPEN-44) is a registered route-bound
-    attempt that must run `capability-route.py complete` on itself, exactly
-    like a depth-2 worker does, but matched neither branch and lost the whole
-    state root. `write_completion_marker`'s `completion/<route_id>` mkdir hit
-    `[Errno 30] Read-only file system` first; a bwrap fixture granting only
-    that one directory (this cycle's SD-64 P-6 measurement) still hits a
-    second EROFS on `jobs.log`/`jobs.log.lock` right after, so a directory-only
-    grant can never be narrower than the state root for any attempt that
-    genuinely completes and closes its own row. The fix keys on *closes its
-    own row*: any attempt bound to a route with a real attempt id, depth
-    irrelevant -- the same scope a depth-2 worker already had, now shared by
-    a depth-1 route-bound owner too.
-    """
-
-    return bool(
-        getattr(args, "nested_headless_network", False)
-        or (getattr(args, "route_id", None) and getattr(args, "command_attempt_id", None))
-    )
 
 
 def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
