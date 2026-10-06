@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt
+from codex_dispatch_terminal import ARTIFACT_HINT_KEYS, REVIEW_BLOCKING_NOTE, inspect_terminal_attempt
 from dispatch_contract import close_attempt_row
 
 
@@ -52,6 +52,9 @@ def terminal_evidence(terminal: dict, terminal_note: str, log_path, outcome=None
                 failure_class="runtime",
                 reconcile_reason=outcome.failure,
             )
+    for key in ARTIFACT_HINT_KEYS:
+        if terminal.get(key):
+            evidence[key] = str(terminal[key])
     if terminal_note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
         evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
     return evidence

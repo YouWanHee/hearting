@@ -366,6 +366,9 @@ ATTEMPT_MUTABLE_METADATA = {
 }
 ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "api_status",
+    # Where an invalid artifact path was looked for (codex_dispatch_terminal.artifact_hint).
+    "artifact_base_root_b64",
+    "artifact_candidates_b64",
     "capacity_log",
     "classifier_source",
     "detected_by",
