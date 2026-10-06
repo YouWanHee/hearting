@@ -613,25 +613,40 @@ class FallbackTest(unittest.TestCase):
                                                                 "automatic_retry_of":"att-verdict"})
    self.assertEqual(caught.exception.reason,"automatic-replacement-exhausted")
 
- def test_semantic_round_selection_preserves_verdictless_and_uncapped_retry_bindings(self):
+ def test_a_readable_result_never_links_a_retry_but_a_transport_death_does(self):
+  # RA-4: a worker's own FAIL or BLOCKED is its result on any node, capped or
+  # not (BC rt-8a569384 execute FAIL -> linked -> exhausted -> inline).
   import copy
-  node={"id":"test","kind":"pipeline-stage"}
-  admission=F.DISPATCH_NODE.RoundAdmission(F.DISPATCH_NODE.REVIEW_ROUND_CAP.round_budget(
-      {"effective_intensity":"standard"},node,[("done",{"note":"dead-worker-fail","failure_class":"fail"})]))
   base={"_status":"done","attempt_id":"att-prior","automatic_retry_of":"att-first",
         "note":"dead-worker-fail","failure_class":"fail","worker_type":"stage"}
   before=copy.deepcopy(base)
-  self.assertEqual(F.retry_predecessor([base],node,admission),"")
+  for changes in ({},{"note":"dead-worker-blocked","failure_class":"blocked"},
+                  {"note":"dead-worker-blocked","failure_class":"blocked","worker_type":"review"}):
+   with self.subTest(readable=changes):
+    self.assertEqual(F.retry_predecessor([{**base,**changes}]),"")
   self.assertEqual(base,before)
-  for changes in ({"note":"dead-route-completion-rejected","failure_class":"contract"},
+  # A reviewer's finished FAIL is completed-review-blocking; its bare
+  # dead-worker-fail stays a death, as the round census reads it.
+  for changes in ({"worker_type":"review"},
+                  {"note":"dead-route-completion-rejected","failure_class":"contract"},
                   {"note":"dead-worker-runtime-error","failure_class":"runtime"},
                   {"note":"dead-capacity","failure_class":"capacity"},
-                  {"worker_type":"review"}):
-   with self.subTest(changes=changes):
-    self.assertEqual(F.retry_predecessor([{**base,**changes}],node,admission),"att-prior")
-  self.assertEqual(F.retry_predecessor([base],{"id":"execute","kind":"pipeline-stage"}),"att-prior")
-  self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"0"}],node,admission),"att-first")
-  self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"1"}],node,admission),"")
+                  {"note":"dead-worker-fail","failure_class":"contract"}):
+   with self.subTest(transport=changes):
+    self.assertEqual(F.retry_predecessor([{**base,**changes}]),"att-prior")
+  self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"0"}]),"att-first")
+  self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"1"}]),"")
+
+ def test_a_readable_result_in_the_launch_window_is_reported_not_retried(self):
+  for note,failure_class,verdict in (("dead-worker-fail","fail","FAIL"),("dead-worker-blocked","blocked","BLOCKED")):
+   with self.subTest(verdict=verdict):
+    self.jobs.write_text(
+     f"2026-10-07T00:00:00Z\tdone\t{self.repo}\t{self.repo}\tstage\t"
+     f"route_id=rt-own,route_node=execute,attempt_id=att-launched,worker_type=stage,note={note},failure_class={failure_class}\n")
+    with mock.patch.object(F,"attempt_process_quiescence",return_value=SimpleNamespace(state="quiescent",reason="process-absent")):
+     state,fields=F.terminal_attempt_state(self.jobs,"rt-own","execute","att-launched")
+    self.assertEqual((state,fields["review_verdict"],fields["note"]),("terminal",verdict,note))
+    self.assertIsNotNone(F.finished_verdict_row(self.jobs,"rt-own","execute","att-launched"))
 
  def test_closure_check_uses_its_existing_revision_and_verdict_ceiling(self):
   cap=F.DISPATCH_NODE.REVIEW_ROUND_CAP
@@ -644,11 +659,10 @@ class FallbackTest(unittest.TestCase):
   budget=cap.round_budget(route,node,rows,revisions=[revision])
   self.assertEqual((budget.state,budget.round_kind,budget.verdict_rounds),("admit","closure-check",2))
   latest={"_status":"done",**rows[-1][1],"automatic_retry_of":"att-transport"}
-  self.assertEqual(F.retry_predecessor([latest],node,F.DISPATCH_NODE.RoundAdmission(budget)),"")
+  self.assertEqual(F.retry_predecessor([latest]),"")
   rows.append(("done",{**rows[-1][1],"attempt_id":"att-round-three"}))
   spent=cap.round_budget(route,node,rows,revisions=[revision,{"answers":["att-round-three"]}])
   self.assertEqual((spent.state,spent.verdict_rounds),("exhausted",3))
-  self.assertEqual(F.retry_predecessor([latest],node,F.DISPATCH_NODE.RoundAdmission(spent)),"att-round-two")
 
  def test_semantic_closure_still_refuses_cap_verdictless_live_and_unsettled_rounds(self):
   with self.dispatch_env():

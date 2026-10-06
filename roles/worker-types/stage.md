@@ -16,8 +16,9 @@ changes to the stage owner for the post-gate commit.
 An owner-level scope decision recorded in your assignment is a boundary you
 work inside, not a blocker you report. If your assigned slice completed and was
 verified, the verdict is `PASS` even when the owner deferred something you would
-otherwise have done; reserve `BLOCKED` for missing authority, input, or runtime
-state that actually stopped you.
+otherwise have done. Report `BLOCKED` only when you reached no judgment:
+missing authority, input or runtime state stopped you, or items stayed
+unfinished; name what remains on the blocker line.
 
 If the assignment is a declared sub-session, execute only its phase brief and
 fixed files, maintain the required state ledger, and use only its narrow verify
