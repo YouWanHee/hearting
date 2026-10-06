@@ -32,6 +32,7 @@ import importlib.util
 import ipaddress
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -435,6 +436,133 @@ def _launcher_session_setup(values=None):
     }[owner["harness"]]
     setup.append("export %s=%s" % (canonical_key, shlex.quote(owner["id"])))
     return setup
+
+
+# Provenance the launcher forwards into a detached payload. Observability
+# only: these tell the payload which harness release and dispatch attempt
+# launched it (e.g. where preflight.sh lives, which attempt to tag a write
+# with). The attempt id travels as a runtime-provided observation label: its
+# shape check never claims registry authority over the attempt. They grant no execution permission, no data access, and no
+# lifecycle/registry claim, and a payload must treat every one of them as
+# optional: a launcher run outside any checkout or registered attempt
+# legitimately omits them, so a strict lookup must never fail the run.
+# (2026-10-06 BC_ResNet eval loss: a payload's strict os.environ lookups for
+# exactly these two keys raised KeyError before the first inference, scoring
+# zero evaluations while training was unaffected.)
+PROVENANCE_ATTEMPT_PATTERN = re.compile(r"att-[A-Za-z0-9._-]{1,240}\Z")
+PROVENANCE_AGENT_HOME_BYTES_MAX = 4096
+# Cleared first, then selectively restored: a long-lived remote shell or tmux
+# server can retain an unrelated original environment, so omission alone would
+# still leak a foreign value into the payload. Only these two keys are ever
+# cleared here; the rest of the ambient environment is left untouched.
+PROVENANCE_CLEAR_KEYS = ("AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID")
+
+
+def _valid_agent_home(candidate):
+    """True when this names a harness root on this machine."""
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    if len(candidate.encode("utf-8", "replace")) > PROVENANCE_AGENT_HOME_BYTES_MAX:
+        return False
+    if "\0" in candidate or "\n" in candidate or "\r" in candidate:
+        return False
+    if not os.path.isabs(candidate):
+        return False
+    try:
+        return (Path(candidate) / "core" / "CORE.md").is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _agent_home_from_resolver():
+    """Ask utilities/agent-home.sh without trusting it blindly.
+
+    The script always prints something (its final fallback is unvalidated),
+    so the caller must validate the answer before using it.
+    """
+    script = Path(__file__).resolve().parent / "agent-home.sh"
+    try:
+        result = subprocess.run(
+            ["sh", str(script)], text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    text = (result.stdout or "").strip()
+    return text.splitlines()[-1].strip() if text else ""
+
+
+def _resolve_launcher_agent_home(values=None, _resolver=None):
+    """Pin the harness release this launcher runs from, or "" when unknown.
+
+    Preference mirrors the portable resolver: a valid AGENT_HOME (or
+    CLAUDE_HOME adapter alias) first, otherwise utilities/agent-home.sh.
+    The returned path is the resolved release, so a detached payload names
+    the exact release in use even if a `current` pointer rotates later.
+    Anything unvalidated is omitted, never fabricated.
+    """
+    values = os.environ if values is None else values
+    candidates = []
+    for key in ("AGENT_HOME", "CLAUDE_HOME"):
+        try:
+            candidate = values.get(key)
+        except (AttributeError, TypeError):
+            candidate = None
+        if _valid_agent_home(candidate):
+            candidates.append(candidate)
+    if not candidates:
+        resolver = _resolver or _agent_home_from_resolver
+        try:
+            resolved_name = resolver()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            resolved_name = ""
+        if _valid_agent_home(resolved_name):
+            candidates.append(resolved_name)
+    if not candidates:
+        return ""
+    # Pin the release: a `current` symlink names whatever is newest, while
+    # the resolved directory names the release this launcher actually used.
+    try:
+        pinned = Path(candidates[0]).resolve(strict=False)
+    except OSError:
+        return candidates[0]
+    try:
+        if (pinned / "core" / "CORE.md").is_file():
+            return str(pinned)
+    except (OSError, ValueError):
+        pass
+    return candidates[0]
+
+
+def _valid_attempt_id(value):
+    """True when this has the shape of a registry-issued dispatch attempt id.
+
+    A shape check for a runtime-provided observation label only: matching the
+    pattern never claims registry authority over the attempt.
+    """
+    return isinstance(value, str) and PROVENANCE_ATTEMPT_PATTERN.match(value) is not None
+
+
+def _launcher_provenance(values=None, _resolver=None):
+    """Validated provenance to forward into the payload (possibly empty).
+
+    Only fields the runtime actually knows: the pinned harness release and,
+    when the launcher itself runs inside a registered attempt, that attempt
+    id. Credentials, registry paths, session variables, and arbitrary env
+    never leave here; unknown values are omitted, never fabricated.
+    """
+    values = os.environ if values is None else values
+    provenance = {}
+    home = _resolve_launcher_agent_home(values, _resolver=_resolver)
+    if home:
+        provenance["AGENT_HOME"] = home
+    try:
+        attempt = values.get("AGENT_DISPATCH_ATTEMPT_ID")
+    except (AttributeError, TypeError):
+        attempt = None
+    if _valid_attempt_id(attempt):
+        provenance["AGENT_DISPATCH_ATTEMPT_ID"] = attempt
+    return provenance
 
 
 def _socket_inodes(pid, proc_root=Path("/proc")):
@@ -960,7 +1088,8 @@ def progress_json_summary(raw):
     if not isinstance(record, dict):
         return None
     counters = []
-    for key in ("epoch", "step", "global_step", "iteration", "update", "successful"):
+    for key in ("epoch", "step", "global_step", "iteration", "update",
+                "attempt", "successful"):
         value = record.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**12:
             counters.append("%s %d" % (key, value))
@@ -1950,10 +2079,20 @@ def cmd_run(args):
     run_dir = config["run_root"] / run_id
     rendered = " ".join(shlex.quote(part) for part in command)
 
-    setup = _launcher_session_setup() + [
-        f"export HEARTING_COMPUTE_RUN_ID={shlex.quote(run_id)}",
-        f"export HEARTING_COMPUTE_HOST={shlex.quote(name)}",
-    ]
+    provenance = _launcher_provenance()
+    # Provenance rides the same preamble as the compute identity, so it
+    # crosses the local/SSH/tmux/setsid boundary together. Both keys are
+    # cleared first (a stale tmux server or remote shell may retain foreign
+    # values), then only validated values are added back; an empty mapping
+    # is normal (unknown here) and the payload must degrade gracefully.
+    setup = (_launcher_session_setup()
+             + ["unset " + " ".join(PROVENANCE_CLEAR_KEYS)]
+             + ["export %s=%s" % (key, shlex.quote(value))
+                for key, value in provenance.items()]
+             + [
+                 f"export HEARTING_COMPUTE_RUN_ID={shlex.quote(run_id)}",
+                 f"export HEARTING_COMPUTE_HOST={shlex.quote(name)}",
+             ])
     workdir = args.cwd or host.get("workdir")
     if workdir:
         setup.append(f"cd {shlex.quote(workdir)}")
@@ -1997,6 +2136,8 @@ def cmd_run(args):
         return 1
     meta = {"run_id": run_id, "host": name, "command": command,
             "cwd": workdir, "env": env, "gpus": args.gpus,
+            "provenance": {"agent_home": provenance.get("AGENT_HOME"),
+                           "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID")},
             "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         run_dir.mkdir(parents=True, exist_ok=True)

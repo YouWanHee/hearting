@@ -455,6 +455,50 @@ function observePanePublisher(child, ctx, sid, generation, onSpawnError = () => 
   })
 }
 
+// Publication-time root for the identity publisher only (core/CORE.md §2,
+// core/ADAPTATION.md identity-publisher row: bounded launch errors, one bounded
+// fallback with the same invocation, never a second child for a live launch).
+// The module-time root/helper freeze the release the plugin was imported from;
+// a managed release pruned afterwards leaves a deleted cwd and a missing
+// helper, so both the async spawn and the sync fallback fail with ENOENT
+// (Node child_process: a nonexistent cwd and a missing command both emit
+// ENOENT, errno -2 — the two causes are separated here, before spawn, not
+// inferred from the error). When the frozen pair is live it is used unchanged;
+// otherwise the first live harness root in the documented order wins and the
+// invocation (session argv, sequence, identity) stays identical. With no live
+// root the frozen pair is kept and the existing bounded error logs describe
+// the failure as before.
+function resolvePublisherTarget() {
+  const helperRel = path.join("tools", "fleet", "herdr_projection.py")
+  const live = (dir, helper) => {
+    try {
+      return !!dir && existsSync(path.join(dir, "core", "CORE.md"))
+        && existsSync(path.join(dir, "adapters", "opencode", "bin", "preflight.sh"))
+        && existsSync(helper)
+    } catch { return false }
+  }
+  if (live(root, herdrProjection)) return { root, helper: herdrProjection }
+  // Portable order only (core/CORE.md §2 minus adapter-specific compat keys,
+  // which this adapter must not reference): active AGENT_HOME, managed
+  // current, linked fallbacks.
+  const env = (process && process.env) || {}
+  const home = env.HOME || ""
+  const xdg = env.XDG_DATA_HOME || (home ? path.join(home, ".local", "share") : "")
+  const candidates = [env.AGENT_HOME,
+    xdg ? path.join(xdg, "hearting", "current") : "",
+    home ? path.join(home, "hearting") : "",
+    home ? path.join(home, "agent_setting") : ""]
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    let dir = ""
+    try { dir = path.resolve(candidate) } catch { continue }
+    if (!dir) continue
+    const helper = path.join(dir, helperRel)
+    if (live(dir, helper)) return { root: dir, helper }
+  }
+  return { root, helper: herdrProjection }
+}
+
 const paneProjectionBusy = new Map()
 const paneProjectionRetryAt = new Map()
 let paneProjectionGeneration = 0
@@ -516,14 +560,17 @@ async function projectPane(sid, ctx, retry = false) {
     if (panePublisherSlot) { binding.refreshPending = true; return }
     const reportSession = verified && paneNativeOrigin.state !== "invalidated"
     const startup = reportSession && paneNativeOrigin.state === "pending"
-    const args = [herdrProjection, "--harness", "opencode", "--session-id", sid]
+    // A pruned import-time release must not take both publisher paths down:
+    // resolve the live root/helper here so async and sync share one target.
+    const target = resolvePublisherTarget()
+    const args = [target.helper, "--harness", "opencode", "--session-id", sid]
     if (reportSession) {
       args.push("--seq", String(++paneReportSequence))
       if (startup) args.push("--session-start-source", "startup")
     } else args.push("--no-report-session")
     const slot = { child: null }
     panePublisherSlot = slot // Reserve before spawn, including synchronous reentrancy.
-    const options = { cwd: root, env: { ...process.env, AGENT_HOME: root },
+    const options = { cwd: target.root, env: { ...process.env, AGENT_HOME: target.root },
       detached: true, stdio: ["ignore", "pipe", "ignore"] }
     let fallbackTried = false, launched = false
     const fallback = () => {

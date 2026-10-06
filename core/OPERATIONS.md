@@ -1025,7 +1025,23 @@ remote shell or tmux server can retain an unrelated original `/proc` environment
 A missing or conflicting launcher identity therefore yields no session link.
 Processes without this managed-run marker retain the generic all-ancestry,
 ambiguity-fail-closed rule; cwd, title, transcript, and nearest-session guessing
-remain forbidden.
+remain forbidden. The launcher also forwards provenance the runtime actually
+knows — the pinned harness release (`AGENT_HOME`, resolved through the existing
+agent-home chain even when the launcher env lacks it) and, only when the
+launcher itself runs inside a registered attempt, that attempt id as a
+runtime-provided observation label rather than a registry authority claim — across the
+local/SSH/tmux/setsid boundary, recorded in the run's `meta.json` beside the
+untouched conda-selection `env` field. The selection is allowlisted:
+credentials, registry paths, session variables, and arbitrary env never cross
+here, and anything the launcher cannot validate is omitted rather than
+fabricated. Both keys are cleared before the validated values are added back,
+so a stale remote-shell or tmux-server environment cannot leak a foreign value
+that would disagree with the recorded provenance. These values are observability provenance, not execution permission
+or data protection: a payload must read them with a missing-tolerant lookup
+(`os.environ.get`, resolver fallback) and keep running when they are absent. A
+strict lookup that fails the whole GPU run on missing provenance repeats the
+2026-10-06 BC_ResNet eval loss (`moving4-20261006-102542`, guard `KeyError`
+before the first inference, zero evaluations while training was unaffected).
 
 This is deliberately not dispatch: no capability, registry, attempt, or
 completion gate is involved, and the harness never chooses a host on its own.
@@ -1086,7 +1102,11 @@ observed final visible shell prompt, including Powerline, within the existing bo
 (seconds converted to native milliseconds). Readiness includes the native foreground
 shell; past screen prompts are not readiness. Unknown, busy, occupied, form, and native
 trust screens receive no typed input; native trust remains a human decision and is
-reported as a wait reason, separate from whether the process was started.
+reported as a wait reason, separate from whether the process was started. A fresh
+Codex start the steward launches runs Embedded (`--no-daemon`) unless the caller
+stated otherwise, so the new TUI owns its rollout fd and same-cwd simultaneous
+starts stay exactly attributable; time-candidate threads stay out of Embedded
+attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused

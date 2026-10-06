@@ -283,6 +283,26 @@ def _load_cache(path, now):
             "horizon": data["horizon"], "cacheable": True, "dirty": False}, earlier
 
 
+def _fresh_snapshot(jobs, now, earlier):
+    """Fresh jobs.log read reusing already-validated `earlier` evidence, without a cache parse.
+
+    Only the shared-cache miss path uses this: the caller already ran the pre-lock
+    and post-lock `_load_cache` checks, so re-parsing the same cache file here
+    would only repeat JSON parse work. All freshness rules (stat before/after,
+    ctime, horizon/schema inside the earlier loads, settled/write-race checks
+    here) stay with the callers and `_build_snapshot`.
+    """
+    path = Path(jobs)
+    key = _stat_key(path)
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeError):
+        return None
+    stable = key is not None and _stat_key(path) == key
+    return {**_build_snapshot(text.splitlines(), now, earlier), "path": path, "key": key,
+            "horizon": now, "cacheable": _DISK_CACHE and stable and _settled(key), "dirty": True}
+
+
 def _snapshot(jobs, now, lines=None):
     """Candidates for one call: from `lines` when given, else the disk cache or a fresh read.
 
@@ -300,14 +320,7 @@ def _snapshot(jobs, now, lines=None):
                 return snapshot
         except Exception:  # noqa: BLE001 - a broken cache must never change the answer
             earlier = {}
-    key = _stat_key(path)
-    try:
-        text = path.read_text()
-    except (OSError, UnicodeError):
-        return None
-    stable = key is not None and _stat_key(path) == key
-    return {**_build_snapshot(text.splitlines(), now, earlier), "path": path, "key": key,
-            "horizon": now, "cacheable": _DISK_CACHE and stable and _settled(key), "dirty": True}
+    return _fresh_snapshot(path, now, earlier)
 
 
 @contextmanager
@@ -321,10 +334,11 @@ def _snapshot_guard(jobs, now, lines=None):
     if key is None or not _settled(key):
         yield _snapshot(jobs, now)
         return
+    pre_earlier = {}
     try:
-        cached, _earlier = _load_cache(path, now)
+        cached, pre_earlier = _load_cache(path, now)
     except Exception:  # noqa: BLE001 - broken cache remains a direct-read fallback
-        cached = None
+        cached, pre_earlier = None, {}
     if cached is not None:
         yield cached
         return
@@ -359,12 +373,16 @@ def _snapshot_guard(jobs, now, lines=None):
         yield _snapshot(path, now)
         return
     try:
+        post_earlier = {}
         try:
-            cached, _earlier = _load_cache(path, now)
+            cached, post_earlier = _load_cache(path, now)
         except Exception:  # noqa: BLE001
-            cached = None
+            cached, post_earlier = None, {}
         # Another cold process may have published while this one waited.
-        yield cached if cached is not None else _snapshot(path, now)
+        if cached is not None:
+            yield cached
+        else:
+            yield _fresh_snapshot(path, now, {**pre_earlier, **post_earlier})
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

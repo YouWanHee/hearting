@@ -931,6 +931,80 @@ class StartSessionBindTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("session_bind=ambiguous", out)
         self.assertIsNone(self._registry_record())
 
+    def test_an_embedded_start_never_binds_a_time_candidate(self):
+        """F2: an Embedded TUI owns its rollout fd, but the fd appears only after
+        its first thread exists. While it does not, another same-cwd execution's
+        lone new root rollout would satisfy the before/after binder — and the
+        resulting tier-1 record would outrank the later own fd forever. So an
+        Embedded start skips the binder entirely: unknown until the fd proves it,
+        zero registry writes from time candidates."""
+        import io
+        import contextlib
+        foreign = "01a0fa57-0000-7000-8000-0000000000f1"
+        self.late.append(lambda: self._rollout(foreign))
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
+             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+             mock.patch.object(peer_steward, "_bind_codex_session") as bind_mock, \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM",
+                                    "--cwd", str(self.project)])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("started=true", text)
+        self.assertIn("session_id=-", text)
+        self.assertNotIn("session_bind=", text)
+        self.assertEqual(bind_mock.call_count, 0)
+        self.assertIsNone(self._registry_record())
+        starts = [c for c in self.calls if c[:3] == ["herdr", "agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertIn("--no-daemon", starts[0])
+
+    def test_a_caller_stated_no_daemon_start_never_binds_a_time_candidate(self):
+        """F2 residual: a caller-stated `--no-daemon` really is Embedded execution
+        (the helper returns ``[]`` only to avoid injecting a duplicate flag), so it
+        must skip the binder like an injected one. Reproduced against 4543a6ec with
+        `_start(--, --no-daemon)`: the foreign root bound and would have been
+        written tier-1. No duplicate flag is injected on top of the caller's own."""
+        import io
+        import contextlib
+        foreign = "01a0fa57-0000-7000-8000-0000000000f2"
+        self.late.append(lambda: self._rollout(foreign))
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_bind_codex_session") as bind_mock, \
+             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
+             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM",
+                                    "--cwd", str(self.project), "--", "--no-daemon"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("started=true", text)
+        self.assertIn("session_id=-", text)
+        self.assertNotIn("session_bind=", text)
+        self.assertEqual(bind_mock.call_count, 0)
+        self.assertIsNone(self._registry_record())
+        starts = [c for c in self.calls if c[:3] == ["herdr", "agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        typed = starts[0][starts[0].index("--") + 1:]
+        self.assertEqual(typed.count("--no-daemon"), 1)
+
+    def test_stated_no_daemon_ignores_option_values_and_native_literal_boundary(self):
+        self.assertTrue(peer_steward._codex_stated_no_daemon(["--no-daemon"]))
+        self.assertTrue(peer_steward._codex_stated_no_daemon(["resume", "--no-daemon"]))
+        self.assertFalse(peer_steward._codex_stated_no_daemon([]))
+        self.assertFalse(peer_steward._codex_stated_no_daemon(["--remote", "unix:///x.sock"]))
+        self.assertFalse(peer_steward._codex_stated_no_daemon(["-m", "--no-daemon"]))
+        self.assertFalse(peer_steward._codex_stated_no_daemon(["--", "--no-daemon"]))
+
     def test_no_new_rollout_within_the_bound_times_out_without_failing(self):
         started = time.time()
         out = self._start()
@@ -1068,6 +1142,120 @@ class BindDeadlineConfirmationTest(unittest.TestCase):
     def test_a_candidate_that_vanishes_before_confirmation_is_not_bound(self):
         state, sid, _pid, _cwd = self._bind([["sid-a"], [], [], []])
         self.assertEqual((state, sid), ("timeout", None))
+
+
+class EmbeddedCodexStartTest(_TmpRootMixin, unittest.TestCase):
+    """Fresh steward-started Codex TUIs run Embedded (`--no-daemon`).
+
+    A shared-daemon TUI holds no rollout fd, so two same-cwd TUIs started moments
+    apart (2026-10-04: PID 3023216/3023356, 0.03 s apart) leave Fleet with no
+    per-process proof and both rows stay anonymous. An Embedded TUI owns its
+    transcript fd, and the existing fd resolver attributes each one exactly."""
+
+    def _start_cmd(self, *argv, kind="codex", support=True, ingress=None):
+        with mock.patch.object(peer_steward.shutil, "which",
+                               return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=_idle_shell_run) as run_mock, \
+             mock.patch.object(peer_steward, "_managed_ingress_dir",
+                               return_value=ingress), \
+             mock.patch.object(peer_steward, "_codex_supports_no_daemon",
+                               return_value=support):
+            rc = peer_steward.main(["start", "peer-c", "--kind", kind,
+                                    "--pane", "w1:pM", *argv])
+        self.assertEqual(rc, 0)
+        return _agent_start_cmd(run_mock)
+
+    def _typed(self, cmd):
+        return cmd[cmd.index("--") + 1:]
+
+    def test_a_fresh_codex_start_runs_embedded_first(self):
+        cmd = self._start_cmd("--cwd", str(self.tmp_root))
+        typed = self._typed(cmd)
+        self.assertEqual(typed[0], "--no-daemon")
+        self.assertEqual(typed[1], "--dangerously-bypass-approvals-and-sandbox")
+        self.assertEqual(typed.count("--no-daemon"), 1)
+
+    def test_resume_and_fork_keep_their_existing_thread(self):
+        # An Embedded resume of a thread open in another app is refused natively;
+        # continuing a thread must keep reaching it, never reshape the launch.
+        for args in (["resume", "01a1055e-bd7b-7481-a5f9-7b2cc1bee230"],
+                     ["fork", "01a1055e-bd7b-7481-a5f9-7b2cc1bee230"]):
+            with self.subTest(args=args):
+                cmd = self._start_cmd("--", *args)
+                self.assertNotIn("--no-daemon", self._typed(cmd))
+
+    def test_a_managed_ingress_is_never_given_a_conflicting_flag(self):
+        # The wrapper forwards trailing args to its `--remote` client; the managed
+        # path already attributes via registry + rollout transfer.
+        cmd = self._start_cmd(ingress=str(self.tmp_root / "bin"))
+        self.assertNotIn("--no-daemon", self._typed(cmd))
+
+    def test_a_caller_stated_daemon_stance_is_never_second_guessed(self):
+        for args in (["--no-daemon"], ["--remote", "unix:///tmp/x.sock"],
+                     ["--remote=unix:///tmp/x.sock"]):
+            with self.subTest(args=args):
+                cmd = self._start_cmd("--", *args)
+                self.assertLessEqual(self._typed(cmd).count("--no-daemon"),
+                                     1 if args == ["--no-daemon"] else 0)
+
+    def test_an_unrecognized_invocation_keeps_its_previous_shape(self):
+        cmd = self._start_cmd("--", "--future-flag")
+        self.assertNotIn("--no-daemon", self._typed(cmd))
+
+    def test_an_initial_prompt_is_still_a_fresh_start(self):
+        # A quoted prompt phrase is one argv token with a space: no native
+        # subcommand name contains a space, so this cannot be a subcommand.
+        cmd = self._start_cmd("--", "do stuff")
+        self.assertEqual(self._typed(cmd)[0], "--no-daemon")
+
+    def test_a_subcommand_after_a_prompt_word_is_never_reshaped(self):
+        # F1: official 0.160 parses `codex hello resume` with `resume` as the
+        # subcommand (`hello` sits in the PROMPT slot), so the scan must not stop
+        # at the first positional. `hello` alone really is a prompt per
+        # `codex --help` (`codex [OPTIONS] [PROMPT]`), pinned here so no future
+        # "fix" re-breaks it; native aliases (`e`, `a`) fail closed too.
+        for args, fresh in ((["hello", "resume", "--help"], False),
+                            (["hello", "fork", "--help"], False),
+                            (["hello"], True),
+                            (["e", "dated"], False),
+                            (["a"], False),
+                            (["--help"], False),
+                            (["-h"], False),
+                            (["--version"], False),
+                            (["--", "resume"], True),
+                            (["-m", "resume"], True),
+                            (["do", "stuff"], True)):
+            with self.subTest(args=args):
+                self.assertEqual(peer_steward._codex_fresh_tui_args(args), fresh)
+                cmd = self._start_cmd("--", *args)
+                self.assertEqual("--no-daemon" in self._typed(cmd), fresh)
+
+    def test_other_harnesses_and_unprobed_support_add_nothing(self):
+        cmd = self._start_cmd("--cwd", str(self.tmp_root), kind="claude")
+        self.assertNotIn("--no-daemon", self._typed(cmd))
+        cmd = self._start_cmd("--cwd", str(self.tmp_root), support=False)
+        self.assertNotIn("--no-daemon", self._typed(cmd))
+
+    def test_the_support_probe_is_fail_closed(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value=None):
+            self.assertFalse(peer_steward._codex_supports_no_daemon())
+        with mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=OSError("no codex")):
+            self.assertFalse(peer_steward._codex_supports_no_daemon())
+        bad = subprocess.CompletedProcess([], 1, stdout="--no-daemon", stderr="")
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=bad):
+            self.assertFalse(peer_steward._codex_supports_no_daemon())
+        plain = subprocess.CompletedProcess([], 0, stdout="usage: codex", stderr="")
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=plain):
+            self.assertFalse(peer_steward._codex_supports_no_daemon())
+
+    def test_freshness_scan_skips_known_root_options(self):
+        self.assertTrue(peer_steward._codex_fresh_tui_args(
+            ["--cd", "/work", "-m", "gpt-x", "--config", "k=v"]))
+        self.assertTrue(peer_steward._codex_fresh_tui_args([]))
+        self.assertFalse(peer_steward._codex_fresh_tui_args(["exec", "ls"]))
+        self.assertFalse(peer_steward._codex_fresh_tui_args(["--cd"]))
 
 
 class _WatchMixin(_TmpRootMixin):

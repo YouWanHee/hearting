@@ -420,6 +420,7 @@ console.log(JSON.stringify(logs));
         # Fixed native invocation/SDK/child fixtures; expected results below are literals.
         js = r'''
 import { readFileSync } from "node:fs";
+import { existsSync as fsExistsSync } from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -431,8 +432,10 @@ function fixture(options = {}) {
   const native = options.command || Buffer.from((options.argv || ["/native/opencode", "--session", "ses_A"]).join("\0") + "\0");
   const files = {"/proc/self/cmdline": native,
     "/proc/self/stat": Buffer.from(options.stat || "123 (opencode) S " + "0 ".repeat(18) + "77 0")};
-  const scope = {path, Buffer, process: {pid: 123, env: {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "ses_foreign"}},
-    isWorkerSession: () => !!options.worker, root: "fixture-root", herdrProjection: "fixture-projector",
+  const scope = {path, Buffer, process: {pid: 123, env: Object.assign(
+      {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "ses_foreign"}, options.env || {})},
+    isWorkerSession: () => !!options.worker, existsSync: fsExistsSync,
+    root: options.root || "fixture-root", herdrProjection: options.herdrProjection || "fixture-projector",
     Date: {now: () => now}, AbortController,
     openSync: file => {reads.push(file);if (!files[file]) throw Error("foreign proc read");return file},
     readSync: (fd, buffer, offset, size) => files[fd].copy(buffer, offset, 0, size), closeSync: () => {},
@@ -701,6 +704,88 @@ console.log(JSON.stringify({numericError: live.scope.publisherErrorFields({code:
         self.assertIn("async", [row["extra"].get("publisherPath") for row in result["live"]["logs"]])
         self.assertEqual(result["stale"]["sync"], 0)
         self.assertIn("publisher-sync-fallback-stale", [row["extra"]["reason"] for row in result["stale"]["logs"]])
+
+    def _live_publisher_root(self, name):
+        live = self.state / name
+        (live / "core").mkdir(parents=True)
+        (live / "core" / "CORE.md").write_text("live")
+        projector_dir = live / "adapters" / "opencode" / "bin"
+        projector_dir.mkdir(parents=True)
+        (projector_dir / "preflight.sh").write_text("live")
+        helper_dir = live / "tools" / "fleet"
+        helper_dir.mkdir(parents=True)
+        (helper_dir / "herdr_projection.py").write_text("live")
+        return live
+
+    def test_opencode_stale_release_root_resolves_live_target_with_same_invocation(self):
+        # Deleted import-time release (old rune ENOENT/-2 shape): async and sync
+        # share one resolved live target, same argv/seq/identity, fallback once.
+        live = self._live_publisher_root("live-root")
+        helper = str(live / "tools" / "fleet" / "herdr_projection.py")
+        observation = {"schema": "hearting-pane-observation-v1", "reason": "report-attempts-finished",
+                       "session_report": "exit0", "metadata_report": "exit0"}
+        body = r'''
+const observation = %%OBSERVATION%%;
+const syncResult = {pid: 901, status: 0, stdout: JSON.stringify(observation)};
+const f = fixture({root: "/deleted/releases/v3.2.13",
+  herdrProjection: "/deleted/releases/v3.2.13/tools/fleet/herdr_projection.py",
+  env: {AGENT_HOME: "%%LIVE%%"}, spawnNoPid: true, syncResult});
+const ctx = f.ctx();
+await f.scope.projectPane("ses_A", ctx);
+f.children[0].emit("error", Object.assign(Error("synthetic stale release failure"), {code: "ENOENT", errno: -2}));
+await f.scope.projectPane("ses_A", ctx); f.exit(1);
+console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
+'''.replace("%%OBSERVATION%%", json.dumps(observation)).replace("%%LIVE%%", str(live))
+        result = self.run_pane_projection_fixture(body)
+        startup = [helper, "--harness", "opencode", "--session-id", "ses_A",
+                   "--seq", "1000001", "--session-start-source", "startup"]
+        refresh = [helper, "--harness", "opencode", "--session-id", "ses_A", "--seq", "1000002"]
+        self.assertEqual(result["commands"], [startup, refresh])
+        self.assertEqual(len(result["sync"]), 1)
+        attempt = result["sync"][0]
+        self.assertEqual(attempt["exe"], "python3")
+        self.assertEqual(attempt["args"], startup)
+        self.assertEqual(attempt["config"]["cwd"], str(live))
+        self.assertEqual(attempt["config"]["env"]["AGENT_HOME"], str(live))
+        self.assertNotIn("deleted", json.dumps(result))
+        error = next(row["extra"] for row in result["logs"] if row["extra"]["reason"] == "publisher-spawn-error")
+        self.assertEqual((error["errorCode"], error["errorErrno"]), ("ENOENT", -2))
+        success = [row["extra"] for row in result["logs"] if row["extra"]["reason"] == "publisher-path-success"]
+        self.assertEqual([(row["publisherPath"], row["publisherRc"]) for row in success], [("sync-fallback", 0)])
+
+    def test_opencode_live_root_kept_when_interpreter_missing_on_both_paths(self):
+        # Same errno, other boundary: frozen root/helper live, so no switch —
+        # the interpreter failure stays bounded on async and sync, fallback once.
+        live = self._live_publisher_root("live-root")
+        other = self._live_publisher_root("other-root")
+        helper = str(live / "tools" / "fleet" / "herdr_projection.py")
+        body = r'''
+const f = fixture({root: "%%LIVE%%", herdrProjection: "%%HELPER%%",
+  env: {AGENT_HOME: "%%OTHER%%"}, spawnNoPid: true,
+  syncResult: {pid: 0, error: Object.assign(Error("synthetic interpreter missing"), {code: "ENOENT", errno: -2})}});
+const ctx = f.ctx();
+await f.scope.projectPane("ses_A", ctx);
+f.children[0].emit("error", Object.assign(Error("synthetic async interpreter missing"), {code: "ENOENT", errno: -2}));
+await f.scope.projectPane("ses_A", ctx); f.exit(1);
+console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
+'''.replace("%%LIVE%%", str(live)).replace("%%HELPER%%", helper).replace("%%OTHER%%", str(other))
+        result = self.run_pane_projection_fixture(body)
+        prefix = [helper, "--harness", "opencode", "--session-id", "ses_A"]
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
+            prefix + ["--seq", "1000002", "--session-start-source", "startup"]])
+        self.assertEqual(len(result["sync"]), 1)
+        attempt = result["sync"][0]
+        self.assertEqual(attempt["args"], result["commands"][0])
+        self.assertEqual(attempt["config"]["cwd"], str(live))
+        self.assertEqual(attempt["config"]["env"]["AGENT_HOME"], str(live))
+        self.assertNotIn(str(other), json.dumps(result))
+        reasons = [row["extra"]["reason"] for row in result["logs"]]
+        self.assertIn("publisher-spawn-error", reasons)
+        self.assertIn("publisher-sync-fallback-error", reasons)
+        self.assertNotIn("publisher-path-success", reasons)
+        for row in result["logs"]:
+            if row["extra"]["reason"] in ("publisher-spawn-error", "publisher-sync-fallback-error"):
+                self.assertEqual((row["extra"]["errorCode"], row["extra"]["errorErrno"]), ("ENOENT", -2))
 
     def test_opencode_persisted_context_and_completed_turn_ack_once(self):
         js = r'''

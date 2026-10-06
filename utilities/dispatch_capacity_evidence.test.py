@@ -643,6 +643,32 @@ class EvidenceCacheTests(unittest.TestCase):
         self.assertEqual(Q._usage(missing, env=self.env), (dict.fromkeys(Q.HARNESSES, "unknown"), {}))
         self.assertFalse(Path(f"{missing}.capacity-cache.json").exists())
 
+    def test_stable_stale_miss_reuses_postlock_earlier_without_third_cache_parse(self):
+        # Stable stale-cache miss: jobs.log changed after the cache was published,
+        # but the reference log tail did not. Pre-lock and post-lock `_load_cache`
+        # checks must stay, while the fresh jobs builder must reuse the already
+        # validated earlier evidence without a third cache parse.
+        self.settle()
+        first = Q.observations(self.jobs, now=self.now + 10, env=self.env)
+        self.assertEqual(len(first), 1)
+        self.assertTrue(self.cache_file().exists())
+        with self.jobs.open("a") as handle:
+            handle.write("\n")  # same rows, new jobs stat -> stale cache miss
+        self.settle(self.jobs)
+        with mock.patch.object(Q, "_load_cache", wraps=Q._load_cache) as loads, \
+                mock.patch.object(Q, "_build_snapshot", wraps=Q._build_snapshot) as build, \
+                self.native_reads() as reads:
+            found = Q.observations(self.jobs, now=self.now + 10, env=self.env)
+        self.assertEqual(found, first)
+        self.assertEqual(found, self.direct(Q.observations, self.jobs, now=self.now + 10, env=self.env))
+        # Pre-lock + post-lock only; the fresh build must not parse the cache again.
+        self.assertEqual(loads.call_count, 2)
+        self.assertEqual(build.call_count, 1)
+        previous = build.call_args[0][2] if len(build.call_args[0]) > 2 else build.call_args[1].get("previous")
+        self.assertTrue(previous, "fresh build must receive the validated earlier evidence")
+        # The unchanged reference log tail is not re-extracted.
+        reads.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
