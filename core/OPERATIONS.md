@@ -57,7 +57,9 @@ replacing a tracked directory with a symlink.
 The §5.8 lock protects only artifact writes. It does not detect an active merge or rebase, dirty files, detached HEAD, or the same branch in another worktree. A code-mutating capability, canonically `autopilot-code`, checks once before editing and again before every commit or write-back.
 
 Dispatch requires a branch in every route worktree, including spec-only
-routes whose artifacts live outside the checkout. Create it with
+routes whose artifacts live outside the checkout. `compose --start` creates it
+for source-changing work started from a primary checkout (`<repo>-wt/<slug>`,
+WORKFLOW compose defaults); elsewhere create it with
 `git worktree add -b <new-branch> <path> <base>`. For an existing detached task
 worktree, `git switch -c <new-branch>` inside that worktree preserves its current
 HEAD and uncommitted work. Dispatch refuses a detached HEAD as `unsafe-git-state`

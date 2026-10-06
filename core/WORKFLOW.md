@@ -359,7 +359,10 @@ stages are not mandatory. The sealed result shows the realized stages and omitte
 defaults before execution. Input/output, explicit human gates, and terminal proof
 remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
-to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd, artifact root
+to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
+non-direct `--start` whose stages change source from a primary checkout, the worktree
+`<repo>-wt/<slug>` on branch `<slug>` from the latest base, created or reused; a framed
+decision's first such leg does the same under the frame's slug), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the

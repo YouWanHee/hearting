@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -622,6 +623,35 @@ class RuntimeBuiltInterviewTest(StartBase):
         self.assertEqual(W._marked_route_proposals(self.route, self.jobs, own), (own, []))
         plain = self.worded([question("scope")])
         self.assertEqual(W._marked_route_proposals(self.route, self.jobs, plain), (plain, []))
+
+
+class LegWorktreeTest(StartBase):
+    """A source-changing leg runs in its own worktree, prepared from the frame's checkout."""
+
+    def test_the_first_source_changing_leg_is_sealed_in_the_prepared_worktree_with_its_own_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "repo-wt" / "framed"
+            subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+            probed = []
+
+            def readiness(frame_route, jobs):
+                probed.append(frame_route["cwd"])
+                row = {**T.nested("claude", "codex"), "checked_worktree": str(Path(frame_route["cwd"]).resolve())}
+                return {"tuples": [row], "candidates": T.registered_headless()["candidates"]}
+            prepared = {"state": "created", "path": str(worktree), "cwd": str(worktree), "branch": "framed",
+                        "base": "origin/main"}
+            self.set_briefs(CODE_STAGED, CODE_STAGED)
+            self.set_interview({"legs": [CODE_STAGED]})
+            with mock.patch.object(R, "proposal_readiness", side_effect=readiness), \
+                    mock.patch.object(R, "_isolates_worktree", return_value=True), \
+                    mock.patch.object(R, "prepare_isolated_worktree", return_value=prepared) as prepare:
+                result = self.settle()
+            self.assertTrue(result["owner_started"], result)
+            (leg_path,) = self.leg_routes()
+            leg = json.loads(leg_path.read_text(encoding="utf-8"))
+            self.assertEqual(leg["cwd"], str(worktree))
+            prepare.assert_called_once_with(self.route["cwd"], self.route["slug"])
+            self.assertIn(str(worktree), probed)                 # the worktree was probed, not the frame's checkout
 
 
 class OneLegFramedTest(StartBase):

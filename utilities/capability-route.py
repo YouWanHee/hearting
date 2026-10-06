@@ -3927,6 +3927,13 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
     route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
                            parent_harness=owner or "claude")
+    if leg["shape"] != "direct" and _isolates_worktree(route):
+        # Every leg of one decision shares the frame's worktree, prepared by the first leg that changes source.
+        worktree = prepare_isolated_worktree(frame_route["cwd"], frame_route.get("slug"))
+        if worktree.get("cwd"):
+            route = compose_route(**{**kwargs, "cwd": worktree["cwd"]},
+                                  **_leg_evidence(leg, lambda: readiness(worktree["cwd"])),
+                                  work_request=work_request, route_plan=binding, parent_harness=owner or "claude")
     scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
@@ -9368,6 +9375,58 @@ def stages_block(registry, recipe):
             "frame_brief_inputs":TOPO.frame_brief_inputs(registry,capability)}
 
 
+def _isolates_worktree(route):
+    """Whether this route gets its own worktree: it changes source, and its artifact root is a real
+    one (a temporary root is a fixture's, as for the route-chain ledger, which never touches the
+    checkout around it)."""
+    real_root = os.path.realpath(str(route.get("artifact_root") or ""))
+    real_tmp = os.path.realpath(tempfile.gettempdir())
+    return (real_root != real_tmp and not real_root.startswith(real_tmp + os.sep)
+            and any(_node_mutates_worktree(node) for node in route.get("nodes") or []))
+
+
+def _git(cwd, *args):
+    try:
+        result = subprocess.run(["git", "-C", str(cwd), *args], text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def prepare_isolated_worktree(cwd, slug):
+    """The isolated worktree a source-changing route runs in, when `cwd` is a primary checkout.
+
+    `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
+    `origin/<default>`, or the existing worktree at that path, reused as it is. Returns
+    `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
+    caller's cwd stays the route cwd (not a primary checkout, or the path or branch is taken).
+    Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
+    if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
+        return {"state": "skipped", "reason": "not-primary-checkout"}
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if not top or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(slug or "")):
+        return {"state": "skipped", "reason": "no-checkout-or-slug"}
+    relative = os.path.relpath(os.path.realpath(cwd), os.path.realpath(top))
+    path = Path(top).parent / f"{Path(top).name}-wt" / slug
+    inside = lambda root: str(Path(root) / relative) if relative != "." and (Path(root) / relative).is_dir() else str(root)
+    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if path.exists():
+        branch = _git(path, "symbolic-ref", "-q", "--short", "HEAD")
+        if branch and common and _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
+            return {"state": "reused", "path": str(path), "cwd": inside(path), "branch": branch, "base": None}
+        return {"state": "skipped", "reason": "path-occupied", "path": str(path)}
+    default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
+    _git(top, "fetch", "-q", "origin", default)
+    base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
+    if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
+        made = _git(top, "worktree", "add", str(path), slug)
+    else:
+        made = _git(top, "worktree", "add", "-b", slug, str(path), base)
+    if made is None:
+        return {"state": "skipped", "reason": "worktree-add-failed", "path": str(path)}
+    return {"state": "created", "path": str(path), "cwd": inside(path), "branch": slug, "base": base}
+
+
 def caller_open_route(cwd):
     """`(route_file | None, source, rows)`: the open route a bare `start` continues.
 
@@ -9987,7 +10046,7 @@ def main():
             pins={**_inherited_selection_pins(route_plan_binding,artifact_root),**pins}
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
-        route=compose_route(
+        compose_args=dict(
             capability=a.capability if shape=="framed" else (a.capability or COMPOSE_DEFAULT_CAPABILITY),
             capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
@@ -10007,6 +10066,17 @@ def main():
             selection_pins=pins or None,route_plan=route_plan_binding,
             execution_scope=a.execution_scope,
         )
+        route=compose_route(**compose_args)
+        worktree=None
+        if (a.start and a.cwd is None and a.dispatch_evidence is None and shape!="direct"
+                and _isolates_worktree(route)):
+            # Work that changes source runs in its own worktree, not in the shared primary checkout.
+            worktree=prepare_isolated_worktree(cwd,a.slug)
+            print("worktree_prepared="+worktree["state"]+"".join(
+                f" {key}={worktree[key]}" for key in ("path","branch","base","reason") if worktree.get(key)),file=sys.stderr)
+            if worktree.get("cwd"):
+                DISPATCH_DEFAULTS_WARNINGS.clear()
+                route=compose_route(**{**compose_args,"cwd":worktree["cwd"]})
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
@@ -10037,6 +10107,8 @@ def main():
             started=start_work(route,path,jobs)
             if access_change is not None:
                 started={**started,"access_change":access_change}
+            if worktree is not None and worktree.get("cwd"):
+                started={**started,"worktree":worktree}
             print(json.dumps(started,ensure_ascii=False),flush=True)
         # Bookkeeping runs after the work has started: the start does not depend on it (the sweep
         # never closes this route, and a cycle it seals is never the one this route begins or continues).

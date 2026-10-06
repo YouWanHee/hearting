@@ -7558,6 +7558,30 @@ class ComposeRouteTest(TestRoute):
    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
    self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
    self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_source_changing_work_gets_its_own_worktree_from_the_latest_base(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   git=lambda cwd,*args: subprocess.run(["git","-C",str(cwd),*args],check=True,capture_output=True,text=True).stdout.strip()
+   origin=Path(tmp)/"origin.git"; primary=Path(tmp)/"repo"
+   git(tmp,"init","-q","--bare","-b","main",str(origin)); git(tmp,"clone","-q",str(origin),str(primary))
+   git(primary,"-c","user.name=t","-c","user.email=t@t","commit","-q","--allow-empty","-m","base"); git(primary,"push","-q","origin","main")
+   (primary/"pkg").mkdir()
+   made=R.prepare_isolated_worktree(primary/"pkg","fix-x")
+   wt=Path(tmp)/"repo-wt"/"fix-x"
+   self.assertEqual((made["state"],made["path"],made["branch"],made["base"]),("created",str(wt),"fix-x","origin/main"))
+   self.assertEqual(made["cwd"],str(wt))                   # an untracked subdirectory is not in the new tree
+   self.assertEqual(git(wt,"rev-parse","HEAD"),git(primary,"rev-parse","origin/main"))
+   again=R.prepare_isolated_worktree(primary,"fix-x")         # the same work reuses its worktree
+   self.assertEqual((again["state"],again["path"],again["branch"]),("reused",str(wt),"fix-x"))
+   self.assertEqual(R.prepare_isolated_worktree(wt,"other")["reason"],"not-primary-checkout")
+   (Path(tmp)/"repo-wt"/"taken").mkdir()
+   self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
+   self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
+ def test_only_source_changing_routes_with_a_real_artifact_root_are_isolated(self):
+  source={"id":"execute","write_scope":["source/**"]}; plan={"id":"plan","write_scope":["artifacts/plans/**"]}
+  real=str(Path.home()/"project"/".agent_reports")
+  self.assertTrue(R._isolates_worktree({"artifact_root":real,"nodes":[plan,source]}))
+  self.assertFalse(R._isolates_worktree({"artifact_root":real,"nodes":[plan]}))
+  self.assertFalse(R._isolates_worktree({"artifact_root":tempfile.gettempdir()+"/x","nodes":[source]}))
  def test_a_bare_start_finds_this_sessions_open_route_else_the_one_open_route_of_the_cwd(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)/"reports"; routes=R.canonical_routes_dir(root); routes.mkdir(parents=True)
