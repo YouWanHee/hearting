@@ -199,7 +199,14 @@ def watch(args: argparse.Namespace) -> int:
         group = process_group_observation(args.pgid)
         descendants = attempt_tagged_descendants(metadata)
         if group.state == "unverifiable" or descendants.state == "unverifiable":
-            return 69
+            # A process exiting mid-scan reads as unverifiable for an instant.
+            # Look again at the backed-off interval, within the grace the drain
+            # already allows, before leaving this attempt without a receipt.
+            if time.monotonic() - drain_started >= args.residue_grace:
+                return 69
+            time.sleep(drain_interval)
+            drain_interval = min(args.drain_interval_max, drain_interval * 2)
+            continue
         if group.state == "empty" and descendants.state == "empty":
             break
         tagged_pids = {pid for pid, _start, _state in descendants.members}
@@ -424,7 +431,8 @@ def main(argv=None) -> int:
         default=30.0,
         help=(
             "seconds after leader exit before tagged survivors of an attempt "
-            "that already holds terminal evidence are sealed as residue"
+            "that already holds terminal evidence are sealed as residue, and "
+            "for which an unverifiable drain scan is looked at again"
         ),
     )
     args = parser.parse_args(argv)
