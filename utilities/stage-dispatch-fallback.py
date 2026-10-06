@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from model_config import ModelConfigError, resolve_config  # noqa: E402
-from route_authority import retry_predecessor, sealed_pin_harness  # noqa: E402
+from route_authority import retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -215,6 +215,7 @@ def load_node(route_path: Path, node_id: str, launch_phase: str) -> tuple[dict, 
     )
     if verify.returncode:
         raise ValueError((verify.stderr or verify.stdout).strip())
+    route = route_in_force(route)  # the sealed route verified above, with its parent's pin changes
     node = next((row for row in route.get("nodes", []) if row.get("id") == node_id), None)
     if not node:
         raise ValueError(f"unknown route node: {node_id}")

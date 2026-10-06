@@ -182,11 +182,130 @@ def pin_target(worker_type: str | None) -> str:
 
 
 def sealed_pin_harness(route, *, worker_type: str | None) -> str | None:
-    """The harness this route sealed for the launch's pin target, or None."""
+    """The harness pinned for the launch's pin target, or None: the sealed pin,
+    or the route parent's later recorded change (`route_in_force`)."""
 
-    pins = route.get("selection_pins") if isinstance(route, dict) else None
+    pins = route_in_force(route).get("selection_pins") if isinstance(route, dict) else None
     pin = pins.get(pin_target(worker_type)) if isinstance(pins, dict) else None
     return (pin.get("harness") or None) if isinstance(pin, dict) else None
+
+
+# A sealed route never changes; its parent may later move the owner pin to another harness
+# (`capability-route.py start --route <file> --pin owner=<harness>`). Each change is one
+# append-only row beside the route: the new pin, the pin it replaced, who changed it and
+# when, what the runtime knew about where the instruction came from, and the checked
+# launch tuples the runtime probed for the new owner harness at that moment. Launch
+# decisions read the sealed route through `route_in_force`, after its hash is verified.
+PIN_CHANGE_TARGETS = ("owner",)
+PIN_CHANGE_SCHEMA = 1
+
+
+def pin_changes_path(route) -> Path | None:
+    """`<artifact_root>/.runtime/routes/<route_id>.pin-changes.jsonl`, beside the route file."""
+    root = route.get("artifact_root") if isinstance(route, dict) else None
+    route_id = route.get("route_id") if isinstance(route, dict) else None
+    if not isinstance(root, str) or not root or not isinstance(route_id, str) \
+            or not re.fullmatch(r"rt-[0-9a-f]{8,64}", route_id):
+        return None
+    return Path(root).resolve() / ".runtime" / "routes" / f"{route_id}.pin-changes.jsonl"
+
+
+def pin_changes(route) -> list[dict]:
+    """This route's recorded pin changes, oldest first; rows for another route or hash are ignored."""
+    path = pin_changes_path(route)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path else []
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        pin = row.get("pin") if isinstance(row, dict) else None
+        if (isinstance(row, dict) and row.get("schema") == PIN_CHANGE_SCHEMA
+                and row.get("route_id") == route.get("route_id")
+                and row.get("route_hash") == route.get("route_hash")
+                and row.get("target") in PIN_CHANGE_TARGETS
+                and isinstance(pin, dict) and pin.get("harness") in PIN_HARNESSES):
+            rows.append(row)
+    return rows
+
+
+PIN_HARNESSES = ("claude", "codex", "opencode")
+
+
+def _tuple_key(row: dict) -> tuple:
+    return tuple(row.get(key) for key in (
+        "parent_harness", "parent_transport", "parent_sandbox", "child_harness", "launch_authority"))
+
+
+def route_in_force(route):
+    """The sealed route with its recorded pin changes applied: the pin in force, and the
+    checked tuples probed for the new owner harness added to the route's dispatch evidence,
+    each depth-2 node's same/cross-harness hops and the registered-headless candidates.
+
+    The sealed route is returned unchanged when nothing was recorded; otherwise a copy is
+    returned, so the caller's sealed dict (and its hash) is never touched."""
+
+    changes = pin_changes(route) if isinstance(route, dict) else []
+    if not changes:
+        return route
+    view = json.loads(json.dumps(route))
+    pins = dict(view.get("selection_pins") or {"contract_version": 1})
+    evidence = view.get("dispatch_evidence") if isinstance(view.get("dispatch_evidence"), dict) else None
+    tuples = evidence.setdefault("tuples", []) if evidence is not None else None
+    candidates = view.get("registered_headless_candidates")
+    for change in changes:
+        pins[change["target"]] = dict(change["pin"])
+        for row in change.get("tuples") or []:
+            if not isinstance(row, dict) or tuples is None:
+                continue
+            if all(_tuple_key(row) != _tuple_key(old) for old in tuples):
+                tuples.append(row)
+            if row.get("launch_authority") != "conductor":
+                continue
+            ordinal = 1 if row.get("child_harness") == row.get("parent_harness") else 2
+            for node in view.get("nodes") or []:
+                for hop in node.get("fallback_hops") or []:
+                    if hop.get("ordinal") == ordinal and isinstance(hop.get("candidates"), list) \
+                            and all(_tuple_key(row) != _tuple_key(old) for old in hop["candidates"]):
+                        hop["candidates"].append(dict(row))
+        for row in change.get("candidates") or []:
+            if isinstance(candidates, list) and isinstance(row, dict) and row not in candidates:
+                candidates.append(row)
+    view["selection_pins"] = pins
+    return view
+
+
+def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
+                      tuples: list, candidates: list, now: float | None = None) -> dict | None:
+    """Append one pin change for this route; None when the pin in force is already `pin`."""
+    import fcntl
+    import time
+    if target not in PIN_CHANGE_TARGETS or pin.get("harness") not in PIN_HARNESSES:
+        raise ValueError(f"pin-change-target-unsupported:{target}")
+    path = pin_changes_path(route)
+    if path is None:
+        raise ValueError("pin-change-route-unlocated")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        previous = (route_in_force(route).get("selection_pins") or {}).get(target)
+        if isinstance(previous, dict) and {k: previous.get(k) for k in ("harness", "model", "effort")} \
+                == {k: pin.get(k) for k in ("harness", "model", "effort")}:
+            return None
+        row = {"schema": PIN_CHANGE_SCHEMA, "route_id": route["route_id"], "route_hash": route["route_hash"],
+               "target": target, "pin": {k: pin.get(k) for k in ("harness", "model", "effort")},
+               "previous": previous, "by": dict(by), "source": source,
+               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+               "tuples": list(tuples), "candidates": list(candidates)}
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return row
 
 
 def pinned_launch_harness(route, *, worker_type: str | None, requested: str | None, available) -> tuple[str | None, str | None]:

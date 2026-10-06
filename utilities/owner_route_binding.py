@@ -1205,7 +1205,10 @@ def _derive_depth1_node_binding(route_file: str | Path, *, worktree: str | Path,
 
 
 def _supported_owner_harnesses(route: dict) -> set[str]:
-    """Read owner readiness for quick/single-owner routes, parent tuples otherwise."""
+    """Read owner readiness for quick/single-owner routes, parent tuples otherwise,
+    including those probed for an owner pin the route's parent changed later."""
+    from route_authority import route_in_force
+    route = route_in_force(route)
     if route.get("effective_intensity") == "quick" or route.get("registered_headless_candidates") is not None:
         rows, field = route.get("registered_headless_candidates") or [], "harness"
     else:

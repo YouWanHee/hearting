@@ -3322,6 +3322,82 @@ def _parse_selection_pins(values, owner=None):
     return pins
 
 
+def _turn_peer_source(harness, session, cwd):
+    """Where the current turn's instruction came from, as far as the runtime knows.
+
+    A peer message received at this session's latest prompt is `peer:<sender>·<ref>`.
+    Anything else is `unattributed`: a typed prompt is not recorded anywhere a launcher
+    can read, so it is never guessed to be the user's."""
+    try:
+        import calendar
+        import time
+        import session_tidy
+        turn = session_tidy.read_json(session_tidy._prompt_seq_path(
+            session_tidy.resolve_seat(harness, cwd or None, os.environ, session, "")))
+        if not isinstance(turn, dict) or turn.get("sid") != session:
+            return "unattributed"
+        started = float(turn["at"]) - 5.0
+        spec = importlib.util.spec_from_file_location("pin_change_peer_message", ROOT / "utilities/peer-message.py")
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        latest = None
+        for row in peer._iter_records(since_hours=24):
+            to = row.get("to") or {}
+            if (row.get("kind") != "notice" or (row.get("delivery") or {}).get("status") != "received"
+                    or (to.get("harness"), to.get("session_id")) != (harness, session)):
+                continue
+            stamp = calendar.timegm(time.strptime(row.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ"))
+            if stamp >= started and (latest is None or stamp >= latest[0]):
+                latest = (stamp, row)
+        if latest is None:
+            return "unattributed"
+        sender = latest[1].get("from") or {}
+        name = sender.get("name") or sender.get("session_id") or sender.get("harness") or "?"
+        return f"peer:{name}·{latest[1].get('transfer_ref') or latest[1].get('message_id') or '-'}"
+    except Exception:  # noqa: BLE001 -- an unknown source is recorded as unknown
+        return "unattributed"
+
+
+def _change_owner_pin(route, jobs, values):
+    """`start --pin owner=<harness>`: the route's parent moves the owner pin of a sealed route.
+
+    The runtime probes the checked launch tuples for the new owner harness now and records
+    them with the change (`route_authority.record_pin_change`); every launch decision reads
+    the route through `route_authority.route_in_force`. Frame and worker pins stay sealed."""
+    import route_authority as RA
+    from work_start import _rows
+    pins = _parse_selection_pins(values)
+    other = sorted(set(pins) - set(RA.PIN_CHANGE_TARGETS))
+    if other:
+        raise ValueError(f"start-pin-target-unsupported:{other[0]} (a sealed route changes only its owner pin; "
+                         "frame and worker pins stay as compose sealed them)")
+    pins, warnings = _filter_top_pins(pins)
+    pin = pins["owner"]
+    harness, session = RA.caller_identity()
+    owners = [meta for _status, meta in _rows(jobs).values()
+              if meta.get("worker_type") == "owner"
+              and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")}]
+    if owners and not RA.owns(owners[-1], session, jobs):
+        raise ValueError("start-pin-parent-only: only this route's parent session moves its owner pin")
+    quick = route.get("effective_intensity") == "quick" or route.get("registered_headless_candidates") is not None
+    children = sorted({row.get("child_harness") for row in (route.get("dispatch_evidence") or {}).get("tuples") or []
+                       if isinstance(row, dict) and row.get("child_harness")}) or list(_compose_default_children())
+    probe = _compose_readiness(route["cwd"], jobs, pin["harness"], children, gpu_route=route)
+    tuples = [] if quick else [row for row in probe.get("tuples") or [] if row.get("parent_harness") == pin["harness"]]
+    candidates = [row for row in probe.get("candidates") or [] if row.get("harness") == pin["harness"]] if quick else []
+    ready = (any(row.get("status") == "supported" for row in candidates) if quick else
+             any(row.get("status") == "supported" and row.get("launch_authority") == "conductor" for row in tuples))
+    if not ready:
+        raise ValueError(f"start-pin-owner-unready:{pin['harness']} (the runtime probed no supported launch "
+                         "from that owner harness in this worktree; the owner pin is unchanged)")
+    row = RA.record_pin_change(route, target="owner", pin=pin, by={"harness": harness, "session_id": session},
+                               source=_turn_peer_source(harness, session, route.get("cwd")),
+                               tuples=tuples, candidates=candidates)
+    current = (RA.route_in_force(route).get("selection_pins") or {}).get("owner")
+    return {"changed": row is not None, "owner": current, "previous": (row or {}).get("previous"),
+            "source": (row or {}).get("source"), "warnings": warnings}
+
+
 def _main_session_only_models(harness):
     """The harness's `CFG_MAIN_SESSION_ONLY_MODELS`, or "" when it declares none
     or its model config cannot be read (compose then leaves the pin alone; the
@@ -9561,6 +9637,9 @@ def main():
     start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
     start.add_argument("--answers",type=Path,help="actual native answers; runtime records intent and releases the gate")
     start.add_argument("--decision",choices=("proceed","revise","stop"),default="proceed")
+    start.add_argument("--pin",action="append",default=[],metavar="owner=HARNESS[:MODEL[@EFFORT]]",
+                       help="the route's parent moves its owner pin; the sealed route stays, the change is recorded "
+                            "beside it and applies from the next owner launch (frame and worker pins stay sealed)")
     finish=sub.add_parser("finish",help="finish one current-session direct route and seal its exact producer cycle")
     finish.add_argument("--route",required=True,type=Path)
     finish.add_argument("--evidence",required=True,type=Path)
@@ -9785,9 +9864,13 @@ def main():
     if a.command=="start":
         from work_start import start_work
         route=verify_route(json.loads(a.route.read_text()))
+        jobs=Path(a.jobs or _compose_default_jobs())
+        pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None
         _record_route_chain(route, str(Path(a.route).resolve()), "start")
-        print(json.dumps(start_work(route,a.route,Path(a.jobs or _compose_default_jobs()),wait=a.wait,
-                                   interview=a.interview,answers=a.answers,decision=a.decision),ensure_ascii=False))
+        result=start_work(route,a.route,jobs,wait=a.wait,interview=a.interview,answers=a.answers,decision=a.decision)
+        if pin_change is not None:
+            result={**result,"pin_change":pin_change}
+        print(json.dumps(result,ensure_ascii=False))
         return 0
     if a.command=="compile":
         spec_read=(compose_spec_read(a.cwd,a.artifact_root,None) if a.spec_read is None else

@@ -8,6 +8,8 @@ matching row here on purpose (ROUTE-AUTHORITY-DESIGN-REVIEW-1006.md §2).
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -106,7 +108,8 @@ class Case1ParentSessionTest(unittest.TestCase):
 
 
 class Case2SealedPinTest(unittest.TestCase):
-    """Case 2: `--pin owner=codex` stays on the route; a later owner cannot switch harness."""
+    """Case 2: `--pin owner=codex` stays sealed in the route; only the route's parent moves the
+    owner pin later, by a recorded change (RA-3, `OwnerPinChangeTest`), never by a new hash."""
 
     ROUTE = {"selection_pins": {"owner": {"harness": "codex"}, "worker": {"harness": "codex"}}}
 
@@ -122,6 +125,155 @@ class Case2SealedPinTest(unittest.TestCase):
         repinned = {"selection_pins": {"owner": {"harness": "claude"}, "worker": {"harness": "codex"}}}
         self.assertNotEqual(route_hash(self.ROUTE), route_hash(repinned))
         self.assertIn("harness", RA.REPLACEMENT_FIXED_KEYS)
+
+
+def _tuple(parent, child, sandbox="workspace-write", status="supported"):
+    return {"parent_harness": parent, "parent_transport": "headless", "parent_sandbox": sandbox,
+            "child_harness": child, "launch_authority": "conductor", "status": status,
+            "failure_class": "", "probe_source": "fixture", "checked_worktree": "/w",
+            "failure_scope": "none", "retry_on_isolated_worktree": 0}
+
+
+def _chain(tuples):
+    same = [row for row in tuples if row["child_harness"] == row["parent_harness"]]
+    cross = [row for row in tuples if row["child_harness"] != row["parent_harness"]]
+    return [{"ordinal": 1, "fallback_hop": "same-harness-headless", "candidates": same},
+            {"ordinal": 2, "fallback_hop": "cross-harness-headless", "candidates": cross},
+            {"ordinal": 3, "fallback_hop": "native-subagent", "candidates": [], "fleet_visibility": "degraded"},
+            {"ordinal": 4, "fallback_hop": "inline", "status": "eligible-after-prior-hop-exhaustion",
+             "reason_enum": "runtime-unavailable", "fleet_visibility": "none"}]
+
+
+class OwnerPinChangeTest(unittest.TestCase):
+    """RA-3 (stage 2): the BC route rt-96bab699 shape -- a Codex owner and Codex worker pin
+    with only Codex-parent tuples -- moves its next owner to Claude; the sealed route stays."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        tuples = [_tuple("codex", "codex"), _tuple("codex", "claude"), _tuple("codex", "opencode", status="unsupported")]
+        self.route = {"route_id": "rt-96bab699717dba8f", "route_hash": "sha256:sealed",
+                      "artifact_root": self.temp.name, "cwd": "/w", "effective_intensity": "standard",
+                      "dispatch_contract_version": 3,
+                      "selection_pins": {"contract_version": 1, "owner": {"harness": "codex", "model": None, "effort": None},
+                                         "worker": {"harness": "codex", "model": None, "effort": None}},
+                      "dispatch_evidence": {"tuples": tuples, "native_subagent": []},
+                      "nodes": [{"id": "test", "dispatch_depth": 2, "fallback_hops": _chain(tuples)}]}
+        self.sealed = json.loads(json.dumps(self.route))
+        self.probed = [_tuple("claude", "claude", sandbox="bypass"), _tuple("claude", "codex", sandbox="bypass")]
+
+    def change(self, harness="claude", **extra):
+        return RA.record_pin_change(self.route, target="owner",
+                                    pin={"harness": harness, "model": None, "effort": None},
+                                    by={"harness": "codex", "session_id": "codex-sid"}, source="unattributed",
+                                    tuples=self.probed if harness == "claude" else [], candidates=[], **extra)
+
+    def test_nothing_recorded_is_the_sealed_route_itself(self):
+        self.assertIs(RA.route_in_force(self.route), self.route)
+        self.assertEqual(RA.sealed_pin_harness(self.route, worker_type="owner"), "codex")
+
+    def test_the_parent_moves_the_owner_and_the_worker_pin_stays(self):
+        row = self.change()
+        self.assertEqual((row["previous"]["harness"], row["pin"]["harness"], row["source"]), ("codex", "claude", "unattributed"))
+        self.assertEqual(self.route, self.sealed)                 # the sealed dict and its hash are untouched
+        view = RA.route_in_force(self.route)
+        self.assertEqual(view["route_hash"], "sha256:sealed")
+        self.assertEqual(RA.sealed_pin_harness(self.route, worker_type="owner"), "claude")
+        self.assertEqual(RA.sealed_pin_harness(self.route, worker_type="stage"), "codex")
+        self.assertEqual(RA.pinned_launch_harness(self.route, worker_type="owner", requested="codex",
+                                                  available=lambda h: True), ("claude", "codex"))
+        hops = view["nodes"][0]["fallback_hops"]
+        self.assertIn(("claude", "claude"), {(r["parent_harness"], r["child_harness"]) for r in hops[0]["candidates"]})
+        self.assertIn(("claude", "codex"), {(r["parent_harness"], r["child_harness"]) for r in hops[1]["candidates"]})
+        self.assertEqual(len(view["dispatch_evidence"]["tuples"]), 5)
+        self.assertIsNone(self.change())                         # the pin in force already is claude
+        self.assertEqual(len(RA.pin_changes(self.route)), 1)
+        self.assertEqual(RA.route_in_force(view), view)          # applying twice changes nothing
+
+    def test_a_claude_owner_of_the_changed_route_launches_its_codex_worker(self):
+        self.change()
+        route_file = Path(self.temp.name) / "route.json"
+        route_file.write_text(json.dumps({**self.route, "schema_version": 2}))
+        policy = DC.headless_attempt_policy(
+            route_file=str(route_file), route_node="test", intensity="standard", harness="codex",
+            dispatch_depth=2, parent_slug="owner", execution_surface="registered-headless",
+            registered_worker=True, fallback_hop="cross-harness-headless", fallback_ordinal=2,
+            parent_harness="claude", parent_transport="headless", parent_sandbox="bypass",
+            launch_authority="conductor")
+        self.assertEqual(policy["fallback_hop"], "cross-harness-headless")
+        owner = _load("route_authority_dispatch_owner", "utilities/dispatch-owner.py")
+        self.assertIn("claude", owner._sealed_owner_context(route_file)["harnesses"])
+
+    def isolated_env(self):
+        base = Path(self.temp.name)
+        return {"HOME": str(base / "home"), "XDG_STATE_HOME": str(base / "xdg"),
+                "HARNESS_STATE_ROOT": str(base / "state"), "AGENT_PEER_LEDGER_ROOT": str(base / "peer"),
+                "AGENT_DISPATCH_JOBS": str(base / "state" / "jobs.log"), "HERDR_PANE_ID": "wB:p99",
+                "PATH": os.environ.get("PATH", "")}
+
+    def start_pin(self, values, *, caller=("codex", "codex-sid"), owner_parent="codex-sid", probed=None):
+        router = _load("route_authority_capability_route", "utilities/capability-route.py")
+        import work_start
+        rows = {"att-owner": ("done", {"worker_type": "owner", "owner_route_id": self.route["route_id"],
+                                       "parent_sid": owner_parent, "attempt_id": "att-owner"})}
+        probe = {"tuples": [_tuple("codex", "codex")] + (self.probed if probed is None else probed), "candidates": []}
+        with mock.patch.dict(os.environ, self.isolated_env(), clear=True), \
+             mock.patch.object(RA, "caller_identity", return_value=caller), \
+             mock.patch.object(work_start, "_rows", return_value=rows), \
+             mock.patch.object(router, "_compose_readiness", return_value=probe) as readiness:
+            result = router._change_owner_pin(self.route, Path(self.temp.name) / "jobs.log", values)
+        return result, readiness
+
+    def test_start_pin_probes_the_new_owner_and_records_the_change(self):
+        result, readiness = self.start_pin(["owner=claude"])
+        self.assertTrue(result["changed"])
+        self.assertEqual((result["owner"]["harness"], result["previous"]["harness"], result["source"]),
+                         ("claude", "codex", "unattributed"))
+        self.assertEqual(readiness.call_args.args[2], "claude")          # probed by the runtime, now
+        self.assertEqual(sorted(readiness.call_args.args[3]), ["claude", "codex", "opencode"])
+        (row,) = RA.pin_changes(self.route)
+        self.assertEqual({(t["parent_harness"], t["child_harness"]) for t in row["tuples"]},
+                         {("claude", "claude"), ("claude", "codex")})   # only the new owner's rows
+        self.assertEqual(row["by"], {"harness": "codex", "session_id": "codex-sid"})
+        again, _ = self.start_pin(["owner=claude"])
+        self.assertFalse(again["changed"])
+
+    def test_start_pin_refuses_what_it_cannot_do_and_records_nothing(self):
+        for values, kwargs, reason in (
+                (["owner=claude"], {"caller": ("claude", "another-sid")}, "start-pin-parent-only"),
+                (["worker=claude"], {}, "start-pin-target-unsupported:worker"),
+                (["owner=claude"], {"probed": [_tuple("claude", "codex", status="unsupported")]}, "start-pin-owner-unready:claude")):
+            with self.subTest(reason=reason), self.assertRaises(ValueError) as refused:
+                self.start_pin(values, **kwargs)
+            self.assertIn(reason, str(refused.exception))
+        self.assertEqual(RA.pin_changes(self.route), [])
+
+    def test_a_peer_message_at_this_turn_is_the_recorded_source(self):
+        router = _load("route_authority_capability_route_source", "utilities/capability-route.py")
+        peer = _load("route_authority_peer_message", "utilities/peer-message.py")
+        import argparse, session_tidy, time
+        with mock.patch.dict(os.environ, self.isolated_env(), clear=True):
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
+            seat = session_tidy.resolve_seat("codex", "/w", os.environ, "codex-sid", "")
+            session_tidy.bump_prompt_seq(seat, "codex", "codex-sid", time.time())
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "unattributed")
+            peer.cmd_record(argparse.Namespace(
+                from_harness="claude", from_session_id="sup-sid", from_name="hearting-4d", from_project="p",
+                to_harness="codex", to_session_id="codex-sid", to_name=None, kind="notice", surface="herdr",
+                status="received", receipt="exact-peer-ref", ref=["0123456789abcdef0123456789abcdef"], transfer_ref="0123456789abcdef0123456789abcdef",
+                body_file=None, body_stdin=False, body_text="herdr steer received"))
+            self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "peer:hearting-4d·0123456789abcdef0123456789abcdef")
+            self.assertEqual(router._turn_peer_source("codex", "other-sid", "/w"), "unattributed")
+
+    def test_only_the_owner_target_changes_and_other_routes_rows_are_ignored(self):
+        with self.assertRaises(ValueError):
+            RA.record_pin_change(self.route, target="worker", pin={"harness": "claude"}, by={}, source="x",
+                                 tuples=[], candidates=[])
+        path = RA.pin_changes_path(self.route)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "route_id": self.route["route_id"], "route_hash": "sha256:other",
+                                    "target": "owner", "pin": {"harness": "claude"}}) + "\nnot json\n")
+        self.assertIs(RA.route_in_force(self.route), self.route)
 
 
 class Case3TestRoundTest(unittest.TestCase):

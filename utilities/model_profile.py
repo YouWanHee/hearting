@@ -388,7 +388,7 @@ def require_top_route(route_file, *, profile: str, node: str | None = None) -> N
 # The pin targets and the harness a pin seals are route authority judgments;
 # the names stay here for importers.
 from route_authority import (  # noqa: E402,F401
-    PIN_TARGETS, pin_target, pinned_launch_harness, sealed_pin_harness,
+    PIN_TARGETS, pin_target, pinned_launch_harness, route_in_force, sealed_pin_harness,
 )
 
 
@@ -411,6 +411,7 @@ def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) ->
     except (OSError, ValueError) as exc:
         raise ModelProfileError(
             f"selection pin route unreadable: {exc}", "selection-pin-route-unreadable") from exc
+    route = route_in_force(route)  # a pin the route's parent changed later is the pin in force
     pins = route.get("selection_pins") if isinstance(route, dict) else None
     pin = pins.get(pin_target(worker_type)) if isinstance(pins, dict) else None
     if not isinstance(pin, dict):

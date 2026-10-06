@@ -1024,7 +1024,7 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
         getattr(args, "owner_route_binding", None), "route_file", None)
     if not route_file:
         return
-    route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    route = route_authority.route_in_force(json.loads(Path(route_file).read_text(encoding="utf-8")))
     cli_explicit = any(arg == "--sandbox" or arg.startswith("--sandbox=")
                        for arg in getattr(args, "replacement_input_argv", []))
     selection = GPU_SANDBOX.select(

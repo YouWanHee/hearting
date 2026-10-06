@@ -42,6 +42,7 @@ _GOVERNOR_WITNESS_HANDLES: dict[tuple[str, str], object] = {}
 
 # Sub-session standing is a route authority judgment; the name stays for its readers.
 from route_authority import linked_worktree_slice as is_linked_worktree_slice  # noqa: E402
+from route_authority import route_in_force  # noqa: E402
 
 
 def _governor_witness_key(root: Path, token: str) -> tuple[str, str]:
@@ -4053,7 +4054,7 @@ def replica_batch_expectation(
     if not route_file or not route_node:
         return None
     try:
-        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        route = route_in_force(json.loads(Path(route_file).read_text(encoding="utf-8")))
     except (OSError, ValueError) as exc:
         raise DispatchContractError("route-record-unreadable", str(exc)) from exc
     if not isinstance(route, dict) or not isinstance(route.get("nodes"), list):
@@ -5737,7 +5738,8 @@ def headless_attempt_policy(
             )
         return policy
     try:
-        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        # The sealed route with its parent's pin changes (`route_authority.route_in_force`).
+        route = route_in_force(json.loads(Path(route_file).read_text(encoding="utf-8")))
     except (OSError, ValueError) as exc:
         raise DispatchContractError("route-record-unreadable", str(exc)) from exc
     if route.get("schema_version") != 2:
