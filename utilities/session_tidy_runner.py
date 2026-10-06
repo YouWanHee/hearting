@@ -30,6 +30,10 @@ exact bytes in ``runs/<batch>``), ``prompt.md`` and the one ``actions.json`` it 
 ``<artifact root>/.runtime/session-tidy/<batch>/``.  The runner reads that file back (no symlink,
 size-capped), validates it, copies the checked result into ``runs/<batch>`` for ``mem tidy-apply``,
 and removes the conversation copy when the batch ends (the rest goes with the finished entry).
+The worker is registered under the session's own git worktree; a session outside any git project
+(``$HOME`` under a managed release, whose root is immutable and not a checkout) is registered under
+the seat's home worktree, ``${XDG_DATA_HOME:-~/.local/share}/hearting/home-worktree``, made once
+(:func:`home_worktree`); its artifact root is that folder's ``.agent_reports``.
 
 Reading is tail first (``tidy_transcripts.read_pending``): the newest unread range's last whole
 rows are the worker's input; only a successful apply removes that range from the unread ones, so a
@@ -507,16 +511,68 @@ def write_prompt(run_dir: Path, batch: str, bundle: Bundle) -> Path:
     return path
 
 
+HOME_WORKTREE_PARTS = ("hearting", "home-worktree")
+HOME_WORKTREE_README = (
+    "# hearting home worktree\n\n"
+    "The stand-in git worktree for sessions that run outside any git project (for example in $HOME).\n"
+    "The session-tidy memory worker is registered under it, and its exchange folder lives in\n"
+    "`.agent_reports/.runtime/session-tidy/` here; everything but this file is ignored by git.\n"
+    "Nothing else is written or committed. It is safe to delete; the next tidy makes it again.\n")
+HOME_WORKTREE_IGNORE = "*\n!.gitignore\n!README.md\n"
+
+
+def _is_git_worktree(path: str) -> bool:
+    try:
+        done = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and bool(done.stdout.strip())
+
+
+def data_home() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share"))
+
+
+def home_worktree() -> str:
+    """``${XDG_DATA_HOME:-~/.local/share}/hearting/home-worktree``: the seat's stand-in worktree for a
+    session that runs outside any git project, when the harness root is not one either (a managed release
+    is immutable and not a checkout).  Made once -- ``git init`` plus one commit, so the checked wrapper
+    can resolve a top level and a HEAD -- and ignored by git below its README, so the worker's exchange
+    folder under its artifact root never makes it dirty.  A folder that cannot be made ends the tidy with
+    its one failure line."""
+    path = data_home().joinpath(*HOME_WORKTREE_PARTS)
+    if _is_git_worktree(str(path)):
+        return str(path)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        git = ["git", "-C", str(path), "-c", "user.name=hearting", "-c", "user.email=hearting@localhost",
+               "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+        subprocess.run(git + ["init", "-q"], check=True, capture_output=True, text=True, timeout=30)
+        for name, text in (("README.md", HOME_WORKTREE_README), (".gitignore", HOME_WORKTREE_IGNORE)):
+            if not (path / name).exists():
+                (path / name).write_text(text, encoding="utf-8")
+        subprocess.run(git + ["add", "--", "README.md", ".gitignore"], check=True, capture_output=True,
+                       text=True, timeout=30)
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "hearting home worktree"],
+                       check=True, capture_output=True, text=True, timeout=30)
+    except subprocess.CalledProcessError as exc:
+        detail = ((exc.stderr or exc.stdout or "").strip().splitlines() or ["git failed"])[-1][:60]
+        raise RunnerFailure(f"cannot make the home worktree: {detail}") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerFailure(f"cannot make the home worktree: {type(exc).__name__}") from exc
+    if not _is_git_worktree(str(path)):
+        raise RunnerFailure(f"cannot make the home worktree: not a git worktree after init: {path}")
+    return str(path)
+
+
 def _git_worktree(cwd: str) -> str:
+    """The worktree the worker is registered under: the session's own project, else the harness checkout
+    (dev activation), else the seat's home worktree (``home_worktree``)."""
     for candidate in (cwd, str(ROOT)):
-        try:
-            done = subprocess.run(["git", "-C", candidate, "rev-parse", "--show-toplevel"],
-                                  capture_output=True, text=True, timeout=20)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if done.returncode == 0 and done.stdout.strip():
+        if _is_git_worktree(candidate):
             return candidate
-    raise RunnerFailure("no git worktree to register the worker under")
+    return home_worktree()
 
 
 def launch_worktree(item: dict) -> str:
