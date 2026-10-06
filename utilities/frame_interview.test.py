@@ -160,6 +160,19 @@ class ValidateTest(unittest.TestCase):
                 self.assertEqual([h for h in FI.jargon_hits(text) if h not in ("노드",)], [], text)
         self.assertEqual(FI.jargon_hits("노드 대신 마디라고 부를까요?"), ["노드"])
 
+    def test_code_names_in_backticks_are_names_and_ids_stay_hits(self):
+        """e5b72b: a file name with `route` in it was refused three times before it could be asked."""
+        ok = good_interview()
+        ok["questions"][0]["question"] = "Should the fix also cover `capability_route.test.py`?"
+        ok["brief"]["affected"] = "The checks in `utilities/route_plan.test.py` and the report."
+        self.assertEqual(FI.validate(ok), [])
+        self.assertEqual(FI.jargon_hits("Should the fix also cover capability_route.test.py?"), ["route"])
+        self.assertEqual(FI.jargon_hits("Keep `rt-da62cded` as it is?"), ["rt-da62cded"])
+        self.assertEqual(FI.jargon_hits("Should `route_plan.py` go to the owner?"), ["owner"])
+
+    def test_the_question_example_is_one_valid_question(self):
+        self.assertEqual(FI.validate(good_interview(questions=[copy.deepcopy(FI.QUESTION_EXAMPLE)])), [])
+
     def test_abbreviations_are_not_sentence_ends_and_two_questions_are_caught(self):
         ok = good_interview(understanding="You want approval in seconds, e.g. under five, with short questions.")
         self.assertEqual(FI.validate(ok), [])

@@ -103,6 +103,10 @@ def _jargon_pattern(term: str) -> "re.Pattern[str]":
 
 
 _JARGON_PATTERNS = [_jargon_pattern(term) for term in JARGON]
+# A name written as code (`capability_route.test.py`) is shown to the person as
+# a name, not as a word to decode, so harness terms inside backticks are not
+# hits. Internal ids stay hits anywhere: a person never needs `rt-…` to decide.
+_CODE_SPAN = re.compile(r"`[^`\n]+`")
 _ABBREVIATIONS = re.compile(r"\b(?:e\.g|i\.e|etc|vs|cf|Mr|Mrs|Ms|Dr|No)\.", re.I)
 _SENTENCE_END = re.compile(r"[.!?。？！]+(?:\s|$)")
 MAX_NOTE_CHARS = 500
@@ -129,6 +133,18 @@ MAX_ANSWERS_BYTES = (
 NONE_SENTINEL = "none"
 
 
+# One complete question as the validator accepts it, shown beside the empty interview
+# template so the shape is visible. It is an example only and never part of an interview.
+QUESTION_EXAMPLE = {
+    "id": "scope", "topic": "How much to change",
+    "question": "Should the fix cover only the approval step, or also the wording of the questions?",
+    "kind": "choice",
+    "options": [{"label": "Both", "means": "Fix the approval step and rewrite the questions in plain words."},
+                {"label": "Approval step only", "means": "Leave the question wording as it is for now."}],
+    "recommended": 0,
+    "why": "Only you can say whether the wording matters enough to be in scope.",
+}
+
 # An approval question marks its approving option with `"approves": true` (exactly one of its two
 # options); choosing the other option declines. Position carries no meaning.
 ROUTE_PROPOSAL_KEYS = frozenset({"question", "by_option"})
@@ -147,7 +163,8 @@ def _text(value) -> str:
 
 
 def jargon_hits(text: str) -> list[str]:
-    hits = [term for term, pattern in zip(JARGON, _JARGON_PATTERNS) if pattern.search(text)]
+    words = _CODE_SPAN.sub(" ", text)
+    hits = [term for term, pattern in zip(JARGON, _JARGON_PATTERNS) if pattern.search(words)]
     hits += [m.group(0) for m in JARGON_IDS.finditer(text)]
     return hits
 

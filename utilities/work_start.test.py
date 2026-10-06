@@ -1498,6 +1498,22 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(self.calls, ["gate"])
         self.assertEqual(self.resolution()["status"], "blocked")
 
+    def test_every_interview_error_is_reported_at_once(self):
+        needs = self.step()
+        import frame_interview as FI
+        self.assertEqual(needs["question_example"], FI.QUESTION_EXAMPLE)
+        bad = {**self.question, "questions": [
+            {"id": f"q-{index}", "topic": f"topic {index}", "question": "", "kind": "?", "options": [],
+             "recommended": None, "why": ""} for index in range(3)]}
+        self.question_file.write_text(json.dumps(bad))
+        with self.assertRaisesRegex(ValueError, "frame-input-invalid") as caught:
+            self.step(interview=self.question_file)
+        expected = FI.validate({**bad, "schema": FI.SCHEMA, "route_id": self.route["route_id"], "summary": "-"},
+                               intensity=self.route["effective_intensity"])
+        self.assertGreater(len(expected), 8)
+        self.assertEqual(str(caught.exception), "frame-input-invalid: " + "; ".join(expected))
+        self.assertEqual(self.calls, [])
+
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
         asked = self.step(interview=self.question_file)

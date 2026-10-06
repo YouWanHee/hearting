@@ -754,7 +754,7 @@ def cmd_gate(args):
                 errors = INTERVIEW.validate(
                     interview, intensity=str(route.get("effective_intensity") or "standard"))
                 if errors:
-                    raise SupervisorError("interview-invalid: " + "; ".join(errors[:8]))
+                    raise SupervisorError("interview-invalid: " + "; ".join(errors))
                 if interview.get("round", 1) != epoch + 1:
                     raise SupervisorError(
                         f"interview-round-mismatch: interview round {interview.get('round', 1)} "
@@ -1845,7 +1845,7 @@ def release_answers(ledger, gate, decision, answers_path):
         raise SupervisorError(f"interview-answers-unreadable: {answers_path}: {exc}") from exc
     errors = INTERVIEW.validate_answers(interview, answers)
     if errors:
-        raise SupervisorError("interview-answers-invalid: " + "; ".join(errors[:8]))
+        raise SupervisorError("interview-answers-invalid: " + "; ".join(errors))
     return answers
 
 

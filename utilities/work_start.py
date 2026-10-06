@@ -167,8 +167,11 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                 "interview_template": {"understanding": "", "brief": {
                     "problem": "", "outcome": "", "affected": "", "constraints": "", "open": ""},
                     "questions": []},
+                "question_example": FI.QUESTION_EXAMPLE,
                 "next_step": "Compare these exact frame results; fill this semantic interview template and "
                     "rerun resume_command with --interview <file> before displaying the native question. "
+                    "question_example shows one complete question; write yours in the person's language "
+                    "(code names in backticks are fine). "
                     "The runtime supplies route/cycle fields and registers the gate. If the user already "
                     "answered, supply that interview and --answers <file> together; do not ask again. "
                     + FI.ANSWERS_SHAPE}
@@ -228,7 +231,7 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
     if response is not None:
         errors += FI.validate_answers(question, response)
     if errors:
-        raise ValueError("frame-input-invalid: " + "; ".join(errors[:8]))
+        raise ValueError("frame-input-invalid: " + "; ".join(errors))
     if response is not None:
         # Check provenance before write-once answers/intent can occupy the
         # question. A refused machine reply must leave room for the real reply.
