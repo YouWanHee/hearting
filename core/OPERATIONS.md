@@ -115,7 +115,13 @@ different release fails closed. This exception never applies to cwd, artifact
 root, jobs registry, completion/log/heartbeat state, runtime home, or any other
 mutable or path-owned surface; the general agent-home/path equivalence helper
 remains resolved-path-only. Launch-tuple start validation keeps its exact
-sealed path and identity checks, and route close keeps its existing integrity
+sealed path and identity checks, except where the installed release moved from
+the managed release a route was sealed under to another verified managed release
+copy: that is where the launch runs, not the work, so its release roots and the
+registry's release fields are neither refused nor reported
+(`route_authority.release_moved`), and each launch row keeps the `launch_home`
+it ran from; a replacement on another release likewise follows the release in
+the values the runtime derives from it. Route close keeps its existing integrity
 and currentness policy. This compile-time exception changes neither lifecycle
 fence and cannot hide session-root drift.
 

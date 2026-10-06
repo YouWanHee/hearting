@@ -261,7 +261,8 @@ class CapacityResumeTest(unittest.TestCase):
             result = self.start()
         self.assertEqual(result["state"], "running", result)
         self.assertEqual(self.calls[0][1], str(R.ROOT / "adapters/claude/bin/dispatch-headless.py"))
-        self.assertIn("gate-off replacement-runtime-drift", stderr.getvalue())
+        # The release a launch ran from is where it ran: no diagnostic, and the evidence stays.
+        self.assertNotIn("replacement-runtime-drift", stderr.getvalue())
         replay = R.launch_input(self.jobs, "att-owner", self.rows()["att-owner"][1])
         self.assertEqual(Path(replay["launch_home"]).name, "vOLD")
 
@@ -274,14 +275,13 @@ class CapacityResumeTest(unittest.TestCase):
         self.assertIn(result["reason"], {"replacement-input-tuple-mismatch", "replacement-argv-mismatch"})
         self.assertFalse([a for a, (_, m) in self.rows().items() if m.get("automatic_retry_of")])
 
-    def test_gates_on_refuses_a_release_drift_before_any_claim(self):
+    def test_gates_on_a_release_drift_alone_still_replaces(self):
         self._drift_setup()
-        self.ready = True
         with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
             result = self.start()
-        self.assertEqual(result["reason"], "replacement-runtime-drift", result)
-        self.assertEqual((self.calls, self.claims()), ([], []))
-        self.assertFalse((R._directory(self.jobs) / "by-source").exists())
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.claims()), 1)
 
     # -- 4: a claim that never launched continues, and says why it stalled -----------
     def test_pending_replacement_claim_resumes_with_one_start(self):

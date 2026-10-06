@@ -1105,19 +1105,7 @@ def admission(jobs, lines, metadata):
 
 
 # What the installed runtime derives; a release change may move these, a different task may not.
-RUNTIME_DERIVED_KEYS = frozenset({'model', 'reasoning', 'resolved_model_settings',
-    'resolved_completion_delivery', 'parent_completion_delivery', 'execution_surface',
-    'fallback_hop', 'model_role', 'model_profile'})
-
-
-def _runtime_drift(replay):
-    """Sealed release vs. installed runtime: one same-work diagnostic, like the route-level check."""
-    old = str(Path(replay['launch_home']).resolve())
-    if old == str(ROOT.resolve()):
-        return []
-    from hearting_gates import same_work_or_refuse
-    same_work_or_refuse('replacement-runtime-drift', f'{old}->{ROOT}')
-    return ['launch_home']
+RUNTIME_DERIVED_KEYS = route_authority.RELEASE_DERIVED_VALUES
 
 
 # What a verified profile transition lets the candidate resolve differently from the sealed launch.
@@ -1130,10 +1118,8 @@ def _check_tuple(candidate, replay, transition=None):
     for key in route_authority.REPLACEMENT_FIXED_KEYS:
         if candidate.get(key) != replay.get(key):
             raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
+    # Each input keeps the release it ran from (`launch_home`); a different one is not a change of work.
     drift = candidate.get('launch_home') != replay.get('launch_home')
-    if drift:
-        from hearting_gates import same_work_or_refuse
-        same_work_or_refuse('replacement-runtime-drift', 'launch_home')
     old, new = replay.get('resolved') or {}, candidate.get('resolved') or {}
     for key in sorted(set(old) | set(new)):
         if old.get(key) != new.get(key):
@@ -1142,10 +1128,7 @@ def _check_tuple(candidate, replay, transition=None):
                     and (key != 'resolved_model_settings'
                          or (new.get(key) or {}).get('profile') == transition['to'])):
                 continue  # the one lower launch the frame rule allows
-            if drift and key in RUNTIME_DERIVED_KEYS:
-                from hearting_gates import same_work_or_refuse
-                same_work_or_refuse('replacement-runtime-drift', key)
-            else:
+            if not (drift and key in RUNTIME_DERIVED_KEYS):
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
     # Where the replacement's launcher runs is not a permission change (route_authority).
     if (route_authority.granted_permissions(candidate.get('applied_permissions'))
@@ -1240,7 +1223,6 @@ def _replacement_argv(record, source, replay):
 
 
 def _command(jobs, record, source, replay):
-    _runtime_drift(replay)
     root = ROOT.resolve()
     if replay['harness'] not in {'codex','claude','opencode'}:
         raise DC.DispatchContractError('replacement-runtime-mismatch')
@@ -1278,7 +1260,6 @@ def _moved_owner_command(jobs, record, source, replay):
     The source command belongs to another harness, so it is not replayed: the same work (task,
     route, worktree, access request, parent session) takes the ordinary owner launch path, which
     builds the new harness's own command from the route in force."""
-    _runtime_drift(replay)
     task = _replacement_task(record, source, replay)
     prompt = _directory(jobs)/'tasks'/(record['replacement_attempt_id']+'.txt')
     prompt.parent.mkdir(parents=True, exist_ok=True)
@@ -1453,7 +1434,6 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             hold = _capacity_hold(jobs, hold_source, None if moved else _retry_model(source, kind))
             if hold:
                 return _capacity_wait(jobs, aid, hold_source, hold)
-            _runtime_drift(launch_input(jobs, aid, source))
             _settle_terminal_cleanup(jobs, rows, aid, source)
         record = claim(Path(jobs), aid)
         rows = _rows(Path(jobs).read_text().splitlines())

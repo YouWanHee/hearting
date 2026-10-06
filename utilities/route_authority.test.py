@@ -520,5 +520,55 @@ class WrapperAdmissionTest(unittest.TestCase):
                 os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
                 self.assertIsNone(RA.bind_launch_access(args, runtime="opencode", default_roots=()))
 
+class ReleaseAxisTest(unittest.TestCase):
+    """Launch roots that differ only because the installed release moved, from one managed
+    release to another verified one, are where the launch runs, not the work."""
+
+    OLD, NEW = "/opt/hearting/releases/v1", "/opt/hearting/releases/v2"
+
+    @staticmethod
+    def identity(kind, path, release):
+        return {"kind": kind, "path": path, "release_id": release,
+                "content_digest": "sha256:c" + release, "binding_digest": "sha256:b" + release}
+
+    def roots(self, top, release, *, registry=None, jobs="/state/dispatch/jobs.log"):
+        return {"runtime_root": self.identity("runtime_root", top, release),
+                "launch_home": self.identity("launch_home", top, release),
+                "wrapper_root": self.identity("wrapper_root", top + "/adapters", release),
+                "registry_root": self.identity("registry_root", registry or top, release),
+                "jobs_path": self.identity("jobs_path", jobs, release),
+                "grounding_roots.cwd": self.identity("grounding_roots.cwd", "/work", "abc")}
+
+    def moved(self, sealed, current, verified=None):
+        return RA.release_moved(sealed, current, managed_release=lambda path: path == (verified or self.NEW))
+
+    def test_a_managed_release_move_relieves_the_release_roots_and_the_registry_s_release(self):
+        sealed = self.roots(self.OLD, "release:v1:" + "a" * 12)
+        current = self.roots(self.NEW, "release:v2:" + "b" * 12)
+        self.assertEqual(self.moved(sealed, current), RA.RELEASE_LAUNCH_ROOTS | {"jobs_path"})
+
+    def test_a_registry_or_work_root_that_moved_is_never_relieved(self):
+        sealed = self.roots(self.OLD, "release:v1:" + "a" * 12)
+        current = self.roots(self.NEW, "release:v2:" + "b" * 12, jobs="/other/jobs.log",
+                             registry="/home/me/checkout")
+        self.assertEqual(self.moved(sealed, current), RA.RELEASE_LAUNCH_ROOTS - {"registry_root"})
+
+    def test_a_projection_tree_a_checkout_or_a_malformed_root_is_never_a_release_move(self):
+        sealed = self.roots(self.OLD, "release:v1:" + "a" * 12)
+        projection = self.roots("/home/me/.claude", "release:v2:" + "b" * 12)
+        self.assertEqual(self.moved(sealed, projection), frozenset())        # not a verified release copy
+        checkout = self.roots(self.OLD, "0" * 40)
+        self.assertEqual(self.moved(checkout, self.roots(self.NEW, "release:v2:" + "b" * 12)), frozenset())
+        for broken in (None, 7, {"kind": "runtime_root", "path": "relative/root"},
+                       {"kind": "wrapper_root", "path": self.NEW}, {"kind": "runtime_root", "path": None}):
+            with self.subTest(broken=broken):
+                current = dict(self.roots(self.NEW, "release:v2:" + "b" * 12), runtime_root=broken)
+                self.assertEqual(self.moved(sealed, current), frozenset())
+
+    def test_the_replacement_keeps_the_runtime_derived_values_of_the_release(self):
+        import dispatch_replacement as R
+        self.assertIs(R.RUNTIME_DERIVED_KEYS, RA.RELEASE_DERIVED_VALUES)
+
+
 if __name__ == "__main__":
     unittest.main()

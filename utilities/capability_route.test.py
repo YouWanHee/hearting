@@ -4544,7 +4544,7 @@ class TestValidationBasis(unittest.TestCase):
    self.assertTrue(R.immutable_code_root_equivalent(left,right))
    self.assertFalse(D.agent_home_equivalent(left,right))
    self.assertFalse(D.agent_home_equivalent(left_jobs,right_jobs))
- def test_launch_revalidation_keeps_identical_replica_paths_exact(self):
+ def test_launch_revalidation_takes_another_release_as_where_it_runs(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)
    runtime_a=self._release(root/"runtime-a")
@@ -4566,9 +4566,10 @@ class TestValidationBasis(unittest.TestCase):
    with mock.patch.dict(os.environ,env,clear=False), \
         mock.patch.object(R,"resolve_agent_home",return_value=runtime_b):
     compatible,mismatches=R.revalidate_launch_compatibility(route)
-   self.assertFalse(compatible)
-   self.assertIn("runtime_root",mismatches)
-   self.assertEqual(mismatches["runtime_root"]["fields"],["binding_digest","path"])
+   # Two release copies are two places to run the same work (route_authority.release_moved);
+   # the registry that resolved under each keeps its own path, so nothing else differs.
+   self.assertEqual((compatible,mismatches),(True,{}))
+   self.assertNotEqual(sealed["runtime_root"]["path"],str(runtime_b.resolve()))
  def test_runtime_preflights_pin_bundle_with_release_copy_present(self):
   with tempfile.TemporaryDirectory() as tmp:
    base=Path(tmp); home=base/"home"; codex_home=home/".codex"

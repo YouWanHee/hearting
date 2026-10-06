@@ -642,6 +642,10 @@ def revalidate_launch_compatibility(route):
             mismatches[field]={"expected":sealed.get(field),"actual":fresh.get(field)}
     expected_roots=_launch_tuple_roots(sealed)
     actual_roots=_launch_tuple_roots(fresh)
+    release_moved=ROUTE_AUTHORITY.release_moved(
+        expected_roots,actual_roots,
+        managed_release=lambda path:_verified_immutable_release_identity(path) is not None,
+    )
     identity_fields=("kind","path","release_id","content_digest","binding_digest")
     for name,expected in expected_roots.items():
         actual=actual_roots[name]
@@ -668,6 +672,8 @@ def revalidate_launch_compatibility(route):
             and _jobs_path_alias_relieves_mismatch(route,expected,actual)
         ):
             changed={}
+        if changed and name in release_moved:
+            changed={}  # the installed release moved: where the launch runs, not the work
         if changed:
             mismatches[name]={
                 "expected":expected,"actual":actual,"fields":sorted(changed),

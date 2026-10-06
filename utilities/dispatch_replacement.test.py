@@ -1517,7 +1517,7 @@ class ReplacementTest(unittest.TestCase):
                 R._settle_terminal_cleanup(self.jobs,rows,'att-source',rows['att-source'][1])
             self.assertEqual(calls,expected,state)
 
-    def test_release_drift_is_a_diagnostic_and_identity_stays_strict(self):
+    def test_release_drift_follows_the_release_and_identity_stays_strict(self):
         replay=R.launch_input(self.jobs,'att-source',R._rows(self.jobs.read_text().splitlines())['att-source'][1])
         old={**replay,'launch_home':'/releases/v-old','resolved':{'model':'m1','permission_mode':'default'}}
         R._check_tuple(old,old)
@@ -1528,9 +1528,11 @@ class ReplacementTest(unittest.TestCase):
                 R._check_tuple({**newer,'resolved':{'model':'m2','permission_mode':'config'}},old)
             self.assertEqual((caught.exception.reason,caught.exception.detail),('replacement-input-tuple-mismatch','resolved'))
             with self.assertRaises(D.DispatchContractError):R._check_tuple({**newer,'harness':'claude'},old)
-        with mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}),self.assertRaises(D.DispatchContractError) as caught:
+        # The release is where the launch ran, not the work: no refusal with the gates on either.
+        with mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
             R._check_tuple(newer,old)
-        self.assertEqual(caught.exception.reason,'replacement-runtime-drift')
+            with self.assertRaises(D.DispatchContractError):
+                R._check_tuple({**newer,'resolved':{'model':'m2','permission_mode':'config'}},old)
         same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
         with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
 
