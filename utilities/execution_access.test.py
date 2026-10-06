@@ -963,6 +963,17 @@ class DerivedAccessTest(unittest.TestCase):
             "범위: /x/out (덮어쓰기 가능)": {"/x/out": "write"},
             "범위: /x/out에 결과 저장한다": {"/x/out": "write"},
             "범위: /x/store 저장소 확인": {"/x/store": "read"},
+            # An English write word after its path stands alone, and a question is no answer (PROBE5).
+            "Scope: /x/out (write), /x/raw (writes disabled)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out (write), /x/raw (edits blocked)": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write /x/out, /x/raw writes disabled": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out (write), /x/raw (write-locked)": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 저장, /x/raw 수정?": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 쓰기 가능, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: write results to /x/out, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: save outputs under /x/out, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "범위: /x/out 생성한다, /x/raw": {"/x/out": "write", "/x/raw": "read"},
+            "Scope: /x/out write": {"/x/out": "write"},
         }
         for line, expected in cases.items():
             with self.subTest(line=line):

@@ -425,24 +425,32 @@ _KOREAN_WRITE_TAIL = re.compile(
     r"(?:을|를|은|는|이|가|도|만|및)?\s*(?:가능|하다|한다|함|하기|하고|합니다|해요|하여|해서|해|할|됨|된다)?")
 
 
-def _affirmed_write(words: str, *, alone: bool = False) -> str | None:
+def _affirmed_write(clause: str, *, alone: bool = False) -> str | None:
     """The write word a clause affirms, by where it stands rather than which words
     surround it: a Korean one followed by nothing but a particle, `가능` or a plain
     ending (`…/out에 결과 저장`, `쓰기 가능`), an English one with no other word
-    before it (`write …/out`). With `alone` no other word may stand before it either
-    (a parenthesis right after a path: `(write)`, `(덮어쓰기 가능)`). Anything else
-    (`수정 대상 아님`, `nothing written to`) affirms nothing and stays read."""
+    before it (`write …/out`) and, once its path came first or in a parenthesis
+    right after a path, no word after it either (`…/out (write)`). With `alone` no
+    other word may stand before a Korean one either (`(덮어쓰기 가능)`). A question
+    mark or anything else (`수정 대상 아님`, `nothing written to`, `writes disabled`)
+    affirms nothing and stays read."""
 
-    for found in _SCOPE_WRITES.finditer(words):
+    paths = [match.span() for match in _TASK_PATH.finditer(clause)]
+    for found in _SCOPE_WRITES.finditer(clause):
+        if any(left < found.end() and found.start() < right for left, right in paths):
+            continue                                     # a path's own letters say nothing
         start = found.start()
-        while start > 0 and (words[start - 1].isalnum() or words[start - 1] == "_"):
+        while start > 0 and (clause[start - 1].isalnum() or clause[start - 1] == "_"):
             start -= 1                                   # the whole word the match sits in
-        before = re.findall(r"[\w가-힣]+", words[:start])
-        tail = re.sub(r"^[\W_]+|[\W_]+$", "", words[found.end():])
+        before = re.findall(r"[\w가-힣]+", _TASK_PATH.sub(" ", clause[:start]))
+        rest = _TASK_PATH.sub(" ", clause[found.end():])
+        if "?" in rest:
+            continue
+        tail = re.sub(r"^[\W_]+|[\W_]+$", "", rest)
         if re.search(r"[가-힣]", found.group(0)):
             if _KOREAN_WRITE_TAIL.fullmatch(tail) and not (alone and before):
                 return found.group(0)
-        elif not before:
+        elif not before and not ((alone or any(right <= start for _left, right in paths)) and tail):
             return found.group(0)
     return None
 
@@ -477,11 +485,11 @@ def _scope_access(clauses: list[str], parenthesized: list[bool] | None = None) -
                 (marks[index] if has_path else marks[owner] if owner is not None else leading
                  ).setdefault(kind, found.group(0))
         if has_path:
-            written = _affirmed_write(words)
+            written = _affirmed_write(clause)
             if written:
                 marks[index].setdefault("write", written)
         elif owner == index - 1 and parenthesized[index]:
-            written = _affirmed_write(words, alone=True)
+            written = _affirmed_write(clause, alone=True)
             if written:
                 marks[owner].setdefault("write", written)
         if excluded_from is None and owner is not None and "exclude" in marks[owner]:
