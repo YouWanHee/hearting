@@ -321,18 +321,16 @@ class TopProfileOptionalityTest(unittest.TestCase):
         _values, receipt = config.resolve_config("claude", runtime=home, source_root=root2)
         self.assertEqual(receipt.reason, "user-incomplete")
 
-    def test_opencode_declares_no_main_session_only_policy(self):
-        # guard review m1: opencode is the one adapter whose registered
-        # headless dispatch may still inherit the interactive model, and the
-        # reason is that its shipped config declares no main-session-only
-        # list -- there is nothing an inherited model could leak. Only a
-        # README sentence said so. Pin it here: the day opencode declares
-        # such a key, this reddens and the inherit allowance must be
-        # revisited (adapters/opencode/bin/dispatch-headless.py) rather than
-        # staying open silently.
-        shipped = config.parse_config(
-            config.shipped_path("opencode", source_root=config.repository_root()))
-        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS", shipped)
+    def test_inheritance_is_refused_exactly_when_a_main_only_model_is_declared(self):
+        # guard review m1 pinned that opencode declares no main-session-only
+        # list, because its wrapper allowed inheritance on that ground alone.
+        # The rule now reads the list itself on every adapter, so declaring
+        # the key closes inheritance with no wrapper edit.
+        for adapter in config.ADAPTERS:
+            shipped = config.parse_config(config.shipped_path(adapter, source_root=config.repository_root()))
+            with self.subTest(adapter=adapter):
+                refusal = config.inheritance_refusal(shipped, adapter)
+                self.assertEqual(refusal is None, not config.main_session_only_models(shipped))
 
     def test_restricted_model_matches_whole_ids_and_alias_tokens(self):
         self.assertTrue(config.restricted_model("claude-fable-5-1", "fable"))

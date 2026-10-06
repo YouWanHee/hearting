@@ -113,8 +113,9 @@ complete user copy at `$CLAUDE_CONFIG_DIR/agent-config/models.conf` (default
 or removes it. The wrapper may also receive the independently sealed
 `model_role`. A dispatch-depth-1 `_kernel/owner` is valid with a profile and no
 stage `worker_mode`. Non-route jobs retain explicit role/concrete-model
-selection. Registered inheritance and config-declared interactive-main-only
-models are rejected before launch. The shipped `CFG_MAIN_SESSION_ONLY_MODELS`
+selection. Config-declared interactive-main-only models are rejected before
+launch, and so is registered inheritance while that list names a model (one
+rule for every adapter, `utilities/model_config.py`). The shipped `CFG_MAIN_SESSION_ONLY_MODELS`
 list names `fable`, so a registered headless or native delegated launch of Fable
 is refused with a typed reason instead of being silently remapped; the deep tier
 launches `opus` there. A user copy with a different list replaces this one whole —

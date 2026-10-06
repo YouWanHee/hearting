@@ -146,7 +146,10 @@ from model_profile import (  # noqa: E402
     route_selection_pin,
     validate_registered_profile,
 )
-from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
+from model_config import (  # noqa: E402
+    ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
+    main_session_only_state, resolve_config, restricted_model,
+)
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt  # noqa: E402
 from foreground_terminal import settle_foreground_exit  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
@@ -528,15 +531,12 @@ def _model_policy() -> dict[str, str]:
 
 
 def _main_session_only_model(model: str) -> bool:
-    """Parity with the Claude adapter (2026-09-10): CFG_MAIN_SESSION_ONLY_MODELS
-    names the models a registered headless codex launch may not select. A
-    selected user copy that omits the key -- every copy written before this
-    date -- carries no restriction: failing closed there would have stopped
-    every codex dispatch until the copy was edited, and the shipped default
-    declares the key."""
+    """A selected user copy that omits CFG_MAIN_SESSION_ONLY_MODELS -- every
+    copy written before 2026-09-10 -- carries no restriction: failing closed
+    there would have stopped every codex dispatch until the copy was edited,
+    and the shipped default declares the key."""
 
-    policy = _model_policy()
-    return restricted_model(model, policy.get("CFG_MAIN_SESSION_ONLY_MODELS", ""))
+    return restricted_model(model, main_session_only_models(_model_policy()))
 
 
 def _main_session_only_policy_state() -> str:
@@ -544,17 +544,15 @@ def _main_session_only_policy_state() -> str:
     key is unrestricted, and that fact must be visible on the receipt."""
 
     try:
-        return "declared" if "CFG_MAIN_SESSION_ONLY_MODELS" in _model_policy() else "absent"
+        return main_session_only_state(_model_policy())
     except ModelSelectionError:
         return "unavailable"
 
 
 def _require_headless_model(model: str, source: str) -> None:
-    if _main_session_only_model(model):
-        raise ModelSelectionError(
-            "headless-main-session-only-model",
-            f"model selected by {source} is interactive dispatch-depth-0 main-session only",
-        )
+    refusal = headless_model_refusal(_model_policy(), model, source)
+    if refusal:
+        raise ModelSelectionError(*refusal)
 
 
 def _model_config_state() -> tuple[str, str]:
@@ -599,17 +597,16 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "invalid-dispatch-model-selection",
                 "--inherit-model-settings is mutually exclusive with --model-profile, --model-role, --model, and --reasoning",
             )
-        # Parity with the Claude adapter (top review M1, combined review B1):
-        # no headless Codex launch can prove the inherited interactive
-        # settings exclude a main-session-only model -- on this machine the
-        # interactive default IS the top model -- so inheritance is refused
-        # outright and the flag is off the documented surface. It stays in
-        # argparse so an old caller gets this typed reason instead of an
-        # unknown-argument error.
-        raise ModelSelectionError(
-            "headless-model-inheritance-ineligible",
-            "registered headless Codex dispatch cannot prove that inherited interactive settings exclude a main-only model; select --model-profile, --model-role, or --model with --reasoning",
-        )
+        # The shared rule (model_config.inheritance_refusal): refused while this
+        # adapter declares a main-session-only model -- on this machine the
+        # interactive default IS that model -- and off the documented surface.
+        refusal = inheritance_refusal(_model_policy(), "Codex")
+        if refusal:
+            raise ModelSelectionError(*refusal)
+        return {
+            "source": "inherit", "role": "inherit", "profile": "unsealed",
+            "tier": "inherit", "granularity": "legacy", "model": "inherit", "reasoning": "inherit",
+        }
     if args.model_profile:
         if not args.model_role and args.worker_type != "owner":
             raise ModelSelectionError(

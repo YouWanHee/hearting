@@ -4,8 +4,9 @@
 The claude and codex wrappers each have a suite pinning `top`; opencode's
 branch shipped without one, and it is the branch that differs -- `top`
 collapses onto the deep tier here, so the refusal reads the *requested*
-profile rather than the resolved one. This pins that behaviour and the one
-documented asymmetry (opencode may still inherit the interactive model).
+profile rather than the resolved one. This pins that behaviour, and that
+inheritance stays open while the shipped config declares no main-session-only
+model (`model_config.inheritance_refusal`, the same rule on every adapter).
 """
 from __future__ import annotations
 import importlib.util
@@ -137,10 +138,9 @@ class OpencodeDispatchModelEligibilityTest(unittest.TestCase):
         self.assertEqual(unknown.exception.reason, "profile-top-route-node-unknown")
 
     def test_inheritance_stays_allowed_because_nothing_here_is_main_only(self):
-        # the asymmetry claude and codex refuse: this adapter declares no
-        # main-session-only list, so an inherited model can leak nothing.
-        # `model_config.test.py::test_opencode_declares_no_main_session_only_policy`
-        # reddens the day that stops being true.
+        # the shipped config declares no main-session-only list, so an
+        # inherited model can leak nothing (`headless_model_policy.test.py`
+        # covers the declared case on all three adapters).
         result = WRAPPER.resolve_model_settings(selection(inherit=True))
         self.assertEqual(result["source"], "inherit")
         with self.assertRaises(WRAPPER.ModelSelectionError) as combined:
