@@ -127,7 +127,6 @@ from worker_bootstrap import (
     assigned_contract,
     profile_worker_type,
     render_worker_bootstrap,
-    route_node_commit_expected,
     runtime_progress_prompt,
     resolve_worker_type,
 )
@@ -146,6 +145,7 @@ from model_profile import (  # noqa: E402
     route_selection_pin,
     validate_registered_profile,
 )
+import commit_policy  # noqa: E402
 from model_config import (  # noqa: E402
     ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
     main_session_only_state, resolve_config, restricted_model,
@@ -757,6 +757,7 @@ def dispatch_prompt(
         "- An owner has no worker mode and must not load any unit persona.\n"
         "- Owner workers use the inherited registry, launch checked adapter wrappers directly, consume typed completion receipts, harvest artifacts, and close rows; stage/review/support workers do not dispatch.\n\n"
         f"{heartbeat}"
+        f"{commit_policy.prompt_clause(args)}"
         f"{stage_session_prompt(args)}"
         f"{released_task_prompt(args)}"
         f"{unit_bootstrap_prompt(args, task, os.environ)}"
@@ -1000,17 +1001,7 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
             mode, reason = "allowlist", "settings-disable-bypass"
     agent_home = Path(str(getattr(args, "agent_home", "") or ROOT))
     worker_type = getattr(args, "worker_type", None)
-    commit_expected = worker_type == "owner"
-    if worker_type == "stage" and getattr(args, "route_file", None) and getattr(args, "route_node", None):
-        try:
-            route = json.loads(Path(args.route_file).read_text(encoding="utf-8"))
-            commit_expected = route_node_commit_expected(
-                route, args.route_node, worker_type,
-                subsession_id=getattr(args, "subsession_id", None),
-                stage_authority=getattr(args, "stage_authority", 1),
-            )
-        except (OSError, ValueError, TypeError):
-            commit_expected = False
+    commit_expected = commit_policy.may_commit(args)
     allowed = _allowlist_rules(
         agent_home, worktree, getattr(args, "artifact_root", None), worker_type,
         commit_expected=commit_expected,
@@ -1617,6 +1608,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         pipe += f",broker_request_id={args.broker_request_id}"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     from review_input import registration_fragment
+    pipe += commit_policy.registry_fragment(args)
     pipe += registration_fragment(args)
     from dispatch_replacement import seal_launch_input
     pipe += seal_launch_input(args, 'claude', getattr(args, "replacement_raw_task", ""))

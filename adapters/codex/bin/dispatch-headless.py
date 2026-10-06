@@ -129,7 +129,6 @@ from worker_bootstrap import (
     render_worker_bootstrap,
     runtime_progress_prompt,
     resolve_worker_type,
-    stage_commit_enabled,
 )
 from stage_session_runtime import (  # noqa: E402
     add_arguments as add_stage_session_arguments,
@@ -146,6 +145,7 @@ from model_profile import (  # noqa: E402
     route_selection_pin,
     validate_registered_profile,
 )
+import commit_policy  # noqa: E402
 from model_config import (  # noqa: E402
     ModelConfigError, headless_model_refusal, inheritance_refusal, main_session_only_models,
     main_session_only_state, resolve_config, restricted_model,
@@ -738,30 +738,13 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     }
 
 
-def _worktree_mutating_write_scope(write_scope: str | None) -> bool:
-    if not write_scope:
-        return False
-    return any(
-        part.strip() in ("source/**", "source") or part.strip().startswith("source/")
-        for part in write_scope.split(";")
-    )
-
-
-def _worktree_git_dirs(worktree) -> tuple[Path, Path] | None:
-    """Resolve (git-dir, git-common-dir) for a worktree, or None if unprovable."""
-    try:
-        root = Path(worktree).resolve()
-        values = []
-        for flag in ("--git-dir", "--git-common-dir"):
-            result = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", flag],
-                text=True, capture_output=True, check=True,
-            )
-            value = Path(result.stdout.strip())
-            values.append(value.resolve() if value.is_absolute() else (root / value).resolve())
-        return values[0], values[1]
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+# Who may commit, decided once for every harness (commit_policy).
+_worktree_mutating_write_scope = commit_policy.worktree_mutating_write_scope
+_worktree_git_dirs = commit_policy.worktree_git_dirs
+_is_linked_worktree = commit_policy.is_linked_worktree
+is_no_commit_stage = commit_policy.no_commit_stage
+commit_grant_target = commit_policy.may_commit
+linked_worktree_git_writable_dirs = commit_policy.commit_git_metadata_dirs
 
 
 def owner_write_advisories(args):
@@ -790,61 +773,6 @@ def owner_write_advisories(args):
         git_writable_roots=linked_worktree_git_writable_dirs(args),
         explicit_writable_roots=getattr(grant, "writable_roots", ()),
         gpu_selection=getattr(args, "gpu_execution_selection", None))
-
-
-def _is_linked_worktree(worktree, agent_home) -> bool:
-    """Identify a real linked worktree from Git metadata, not path inequality."""
-    dirs = _worktree_git_dirs(worktree)
-    if dirs is None:
-        # A mutating stage whose Git topology cannot be proved is treated as
-        # linked/protected, preserving the no-commit safety boundary.
-        return True
-    git_dir, common_dir = dirs
-    return git_dir != common_dir
-
-
-def is_no_commit_stage(args: argparse.Namespace) -> bool:
-    """Enforce no-commit only for route nodes or slices that are not commit-expected."""
-    worker_type = getattr(args, "worker_type", None)
-    expected = stage_commit_enabled(args)
-    return (
-        worker_type == "stage" and not expected
-        and _worktree_mutating_write_scope(getattr(args, "write_scope", None))
-        and _is_linked_worktree(args.worktree, args.agent_home)
-    )
-
-
-def commit_grant_target(args: argparse.Namespace) -> bool:
-    """Who may commit: an owner, or a stage whose sealed node is commit-expected.
-
-    One rule for the linked-worktree grant and the primary-checkout profile.
-    """
-    return getattr(args, "worker_type", None) == "owner" or stage_commit_enabled(args)
-
-
-def linked_worktree_git_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
-    """Primary Git metadata dirs a commit-expected linked-worktree run needs.
-
-    Modern Codex protects resolved Git metadata even when legacy writable
-    roots include it. The command builders project these existing grants into
-    a native permissions profile when available. The wrapper grants the exact
-    directories a commit touches: the per-worktree git dir plus the common
-    dir's ``objects``/``refs``/``logs``. The common-dir root itself stays
-    ungranted so ``hooks/`` and ``config`` remain read-only — a worker must
-    not be able to plant code a later unsandboxed session would execute.
-    Owners retain their existing grant. A single-session stage gets the same
-    narrow grant only when its sealed route node is commit-expected; slices and
-    all other workers get no Git metadata grant.
-    """
-    if not commit_grant_target(args):
-        return ()
-    dirs = _worktree_git_dirs(getattr(args, "worktree", ""))
-    if dirs is None:
-        return ()
-    git_dir, common_dir = dirs
-    if git_dir == common_dir:
-        return ()
-    return (git_dir, common_dir / "objects", common_dir / "refs", common_dir / "logs")
 
 
 def diff_attribution_prompt(args: argparse.Namespace) -> str:
@@ -907,12 +835,7 @@ def dispatch_prompt(
         else "validated dispatch metadata"
     )
     heartbeat = runtime_progress_prompt()
-    no_commit_clause = (
-        "No-commit worker (SD-69):\n"
-        "- You are a no-commit worker: produce source diff, tests, and evidence; do NOT `git commit`.\n"
-        "- A trusted dispatch-depth-0/Claude boundary commits after this stage's own PASS gate and confirms diff attribution.\n\n"
-        if is_no_commit_stage(args) else ""
-    )
+    no_commit_clause = commit_policy.prompt_clause(args)
     completion_delivery = getattr(args, "resolved_completion_delivery", "poll-fallback")
     supervised = completion_delivery == "app-server-supervised"
     owner_standard_plus = (
@@ -1770,8 +1693,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         )
     if args.broker_request_id:
         pipe += f",broker_request_id={args.broker_request_id}"
-    if is_no_commit_stage(args):
-        pipe += ",no_commit=1"
+    pipe += commit_policy.registry_fragment(args)
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     from review_input import registration_fragment
     pipe += registration_fragment(args)
