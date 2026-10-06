@@ -938,6 +938,38 @@ def scoped_external_directory_config(
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
+def deny_commands(config_content: str, commands, selected_agent: str | None = None) -> str:
+    """Add `bash` deny rules for `commands` to an OpenCode config, globally and for the agent.
+
+    Native permissions apply in order and the last match wins, so the merged
+    `bash` entry moves last; a selected agent's permissions merge after the
+    global ones, so it receives the same rules.
+    """
+    config = json.loads(config_content) if config_content else {}
+
+    def with_denies(permission):
+        if isinstance(permission, str):
+            permission = {"*": permission}
+        permission = dict(permission or {})
+        bash = permission.pop("bash", None)
+        rules = {"*": bash} if isinstance(bash, str) else dict(bash or {})
+        for command in commands:
+            for pattern in (command, f"{command} *"):
+                rules.pop(pattern, None)
+                rules[pattern] = "deny"
+        permission["bash"] = rules
+        return permission
+
+    config["permission"] = with_denies(config.get("permission"))
+    if selected_agent:
+        agents = dict(config.get("agent") or {})
+        selected = dict(agents.get(selected_agent) or {})
+        selected["permission"] = with_denies(selected.get("permission"))
+        agents[selected_agent] = selected
+        config["agent"] = agents
+    return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+
+
 def diff_attribution_prompt(args: argparse.Namespace) -> str:
     """SD-156: `diff_base`/`pre_node_commits` lines for a node downstream of `execute`.
 
@@ -2061,6 +2093,10 @@ def main(argv: list[str]) -> int:
             detail=str(exc),
             child_spawned="0",
         )
+    if commit_policy.no_commit_stage(args):
+        # A no-commit worker (commit_policy) is refused `git commit` by the runtime too.
+        args.opencode_config_content = deny_commands(
+            args.opencode_config_content, commit_policy.COMMIT_COMMANDS, args.agent)
     args.nested_runtime_env = {}
     if action == "start" and args.dispatch_depth == 2 and args.parent_harness == "codex":
         try:
