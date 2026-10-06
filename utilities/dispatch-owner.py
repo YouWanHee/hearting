@@ -130,8 +130,8 @@ _HINTS = {
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
     "review-output-frame-forbidden": "a frame worker returns its advisory verdict through the ordinary dispatch handoff; drop --review-output",
-    "frame-artifact-scope-missing": "export all four of AGENT_ARTIFACT_ROOT, AGENT_ARTIFACT_CAMPAIGN_ID, AGENT_ARTIFACT_CYCLE_ID "
-                                    "and AGENT_ARTIFACT_CYCLE_DIR in the same Bash call as the launch (OPERATIONS §5.10b)",
+    "frame-artifact-scope-missing": "launch frames through their route: compose --start (or the receipt's resume_command) "
+                                    "binds each leg's cycle itself (OPERATIONS §5.10b)",
     "route-node-unknown": "--route-node must name an id present in the sealed route's nodes list",
     "route-node-worker-type-forbidden": "--route-node selects a frame node's own profile and role; only --worker-type frame may use it",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag. "

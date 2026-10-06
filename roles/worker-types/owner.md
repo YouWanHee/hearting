@@ -3,7 +3,7 @@
 Own the selected capability pipeline, not user routing. Read the selected entry
 contract, materialize its stage graph, and keep stage bodies in artifacts. For
 separable `standard+` work, dispatch registered dispatch-depth-2 stages through
-the shared `dispatch-chain` entry against the inherited registry. Obey the selected
+`stage-dispatch-fallback.py --node <node> --start` against the inherited registry. Obey the selected
 runtime completion-delivery boundary: a supervised owner yields the current turn
 for the runtime join and resumes from its bounded typed receipt, while an explicitly
 reported polling fallback waits synchronously in the current turn. It also joins a route-bound resource whose runner receipt confirms payload release

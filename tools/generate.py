@@ -21,6 +21,7 @@ GENERATORS = [
     ("runtime-memory-boundary", "tools/check-runtime-memory-boundary.py"),
     ("missing-projections", "tools/sync-missing-projections.py"),
     ("entry-skill-layer", "tools/sync-entry-skill-layer.py"),
+    ("bootstrap-dispatch", "tools/sync-bootstrap-dispatch.py"),
     ("skill-invocation-policy", "tools/sync-skill-invocation-policy.py"),
     ("manifest-and-catalogs", "tools/build-manifest.py"),
     ("hub-page", "tools/render-hub.py"),
