@@ -300,6 +300,8 @@ tool-deferred	smoke_attestation.test.py
 tool-deferred	stage-advance-census.py
 tool-deferred	stage_advance_census.test.py
 tool-deferred	surface-budget.json
+tool-deferred	sync-bootstrap-dispatch.py
+tool-deferred	sync_bootstrap_dispatch.test.py
 tool-deferred	sync-entry-skill-layer.py
 tool-deferred	sync-missing-projections.py
 tool-deferred	sync-missing-projections.sh

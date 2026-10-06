@@ -97,31 +97,52 @@ tool to claim Codex parity.
 ## Dispatch
 
 Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1; new non-direct work defaults to `framed`):
-`direct`/`solo`/`staged`/`framed` use `preflight.sh compose` (defaults fill the rest;
+`direct`/`solo`/`staged`/`framed` use `hearting run capability-route compose` (defaults fill the rest;
 `--graph` = stage subgraph); `preflight.sh route --capability …` only for the
 entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: the
 §0.4 card on user-authored turns; received peer envelopes use one `[경로]`
 line unless destructive or external-facing (§0.4 SD-136); else the
 §0.4 card unless approved. Close with §0.5.
 
-Ordinary execution uses `preflight.sh compose --campaign-key <stream> --start
---prompt-file <task>` (the stream key is required; `--unassigned` is the only
-keyless form);
-follow its receipt and reuse its `resume_command`. Runtime owns preparation,
-frame launches, exact attempt reuse, waiting and closure, at success or once idle. The parent
-compares completed frames and asks the native interview only at `needs-question`.
+<!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
+Ordinary execution is one command, the same in every harness:
 
-The low-level dispatch-depth-1 owner surface is `preflight.sh dispatch-owner
---start --route-evidence <route.json> --prompt-file <brief>` (the route fills the
-owner tuple); it delegates to the portable `utilities/dispatch-owner.py`
-selector, which prefers the user-owned
-`${XDG_CONFIG_HOME:-~/.config}/hearting/dispatch-defaults.yaml` and falls back
-to `profiles/dispatch-defaults.yaml`. `core/ADAPTATION.md` owns the selection
-cascade; capacity never crosses a quality band unless the relief threshold is
-met, and OpenCode is not a default deep peer.
+```
+hearting run capability-route compose --start --prompt-file <task> \
+  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+```
 
-The selector derives each route-bound frame's identity and artifact environment;
-manual tuple/environment assembly is only the legacy route-free interface.
+`hearting` is on PATH. `hearting run <utility>` runs that harness utility from
+`AGENT_HOME` when it is set (dev activation: that checkout), else from the
+installed release. The slug comes from the task. The stream defaults to this
+session's latest stream in the same artifact root; the first compose names one
+with `--campaign-key` (a folder name or close spelling joins the matching active
+stream, and a refusal lists the active keys) or opts out with `--unassigned`.
+The runtime prepares the cycle, picks each leg's harness from live usage within
+the sealed candidates, starts frames and the owner, reuses exact attempts, and
+closes the route and cycle at success or once idle.
+
+Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
+end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
+`parent_next_command` once. An absent directive is not `end-turn`, so never
+filter the command's stdout. After a wake or a correction, run
+`resume_command`; answer a BLOCKED owner with `correction_command
+--message-file <file>`. At `needs-question`, compare the two frame briefs and
+follow the receipt's `next_step`: `resume_command --interview <file>` registers
+the question, the person answers it once in the native question surface, and
+`resume_command --answers <file>` records the intent, releases the gate and
+starts the owner.
+
+Inside an owner, a stage is `python3 "$AGENT_HOME/utilities/stage-dispatch-fallback.py"
+--node <node> --start`: route, slug, parent and harness come from the owner's
+current route and environment, and a member of a sealed parallel group starts
+its whole group in one batch. Dispatch depth 3 is forbidden.
+<!-- END generated from core/fragments/bootstrap-dispatch.md -->
+
+Harness selection reads the user-owned `dispatch-defaults.yaml` over
+`profiles/dispatch-defaults.yaml`; `core/ADAPTATION.md` owns the cascade.
+Capacity never crosses a quality band unless the relief threshold is met, and
+OpenCode is not a default deep peer.
 
 Check `preflight.sh headless [--check] [--require-hook-trust] <worktree>`.
 Launch registered jobs only through `preflight.sh dispatch
@@ -134,26 +155,18 @@ completion by the parent runtime: a Codex parent uses its
 native queue and a Claude parent uses Claude resume. Parent identity is the
 calling native session; no launcher or gateway probe changes it. Native queue
 delivery does not force Stop/PreToolUse trust. Keep the parent
-conversational. Obey the receipt: `parent_next=end-turn` yields with no wait
-or poll; `parent_next=bounded-wait` runs its printed `parent_next_command` once —
-never an in-model `sleep`/liveness loop. An absent directive is not `end-turn`:
-never filter stdout. `--allow-unmanaged-parent-poll` stays operator-only.
+conversational; a wait is never an in-model `sleep`/liveness loop.
+`--allow-unmanaged-parent-poll` stays operator-only.
 Legacy stamped Stop state is recovery-only and permits one exact terminal
 `--status all --attempt-id` harvest, never raw output or a broad selector.
-Conductors use `dispatch-chain` for ordinary checked dispatch-depth-2 nodes. A sealed
-2–4-way `parallel_group` uses one `dispatch-batch --parallel-group` call so all
-absent first-start legs are admitted atomically and launched concurrently; do not
-serialize members through separate `dispatch-chain` calls. Dispatch contract v3 atomically claims one stable
+Dispatch contract v3 atomically claims one stable
 attempt row before spawn and starts no child for a duplicate claim. A standard+
 Codex dispatch-depth-1 owner receives workspace-write network access for this purpose;
 dispatch-depth-2 workers do not. The retired broker exposes only legacy `status`/`stop`.
 
 `standard+` uses a dispatch-depth-1 capability owner and, when separable, dispatch-depth-2
 `code-plan -> code-execute -> code-test -> code-report` stage workers.
-`direct` is inline; `quick` is one registered-headless dispatch-depth-1 one-shot conductor. Dispatch depth 3 is
-forbidden. Before an owner yields `runtime_wait: registered-children`, every child
-start receipt must contain `registered=1`, `started=1`, and `child_spawned=1`;
-dry-run or register-only output is not a wait receipt. Record an inline exception in plan metrics. After integration,
+`direct` is inline; `quick` is one registered-headless dispatch-depth-1 one-shot conductor. Record an inline exception in plan metrics. After integration,
 verification, and push, use `preflight.sh worktree-cleanup --check` before
 `--apply`; SessionEnd/Stop never cleans worktrees.
 

@@ -45,7 +45,7 @@ for bootstrap in (
 ):
     text = (ROOT / bootstrap).read_text(encoding="utf-8")
     routing = " ".join(text.split("Route by `core/WORKFLOW.md §0.2`", 1)[1].split())
-    compose = re.search(r"`(?:utilities/capability-route.py|preflight.sh) compose`", routing)
+    compose = re.search(r"`(?:utilities/capability-route.py|preflight.sh|hearting run capability-route) compose`", routing)
     assert compose is not None, f"{bootstrap} lost the compose route surface"
     shape_choice = routing[:compose.start()]
     assert "§0.2.1" in shape_choice and "shape" in shape_choice, (

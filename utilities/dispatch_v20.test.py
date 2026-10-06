@@ -444,8 +444,8 @@ class DispatchV20ConformanceTest(unittest.TestCase):
             ROOT / "hooks/stage-dispatch-reminder.sh"
         ).read_text(encoding="utf-8")
         for required in (
-            "dispatch-node.py --route <route-file>",
-            "--jobs <canonical-jobs.log>",
+            "stage-dispatch-fallback.py",
+            "--node ${node} --start",
             "attempt_id",
         ):
             self.assertIn(required, reminder)

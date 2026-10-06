@@ -235,7 +235,7 @@ shape and explicit choices determine the route; defaults only fill omissions:
 
 | Shape | When | Route |
 |---|---|---|
-| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --campaign-key <stream> --slug <slug>` — the inline node, dispatch depth 0 |
+| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
 | `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's parts (stage ids, summaries, inputs/outputs, units, human gates, `shareable`, `start_approval`, optional and borrowable parts) with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
 | `framed` | **the default for new non-direct work**; capability and stages are not yet chosen | `compose --shape framed` — two `top` frame legs propose the smallest route, one interview confirms it, and the runtime starts its first leg only (SD-164) |
@@ -288,9 +288,11 @@ started from its decision, so after the last leg it reports that leg's completio
 and no `next_leg`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
-<task>` with the selected shape/graph (the campaign choice is required:
-an existing or new stream key, `--parent-cycle`, or an explicit
-`--unassigned`; the refusal lists the root's active keys); `--profile light` or `--owner <harness>` is an explicit choice.
+<task>` with the selected shape/graph. The slug comes from the task; the
+campaign defaults to this session's latest stream in the same artifact root,
+and otherwise is an existing or new stream key, `--parent-cycle`, or an explicit
+`--unassigned` (the refusal lists the root's active keys; a folder name or close
+spelling of one active key joins it); `--profile light` or `--owner <harness>` is an explicit choice.
 The task file contains the requested work, not instructions for running the
 parent. The runtime seals it, prepares its cycle, starts the frame pair when
 declared, and returns one receipt. Reuse that receipt's `resume_command` after
@@ -558,8 +560,7 @@ itself, in this order, and never leaves it to a helper:
 4. Put the actual responses in the returned `answers_template` and submit
    `start --route <file> --answers <file>`. The runtime renders intent and
    records the release that authorizes owner launch. A repeated submission
-   reuses it. Legacy recovery: `workflow-supervisor.py
-   release --route <route file> --gate frame-review --decision proceed --answers <file>`.
+   reuses it.
 
 `OPERATIONS §5.10b` owns selector mechanics and the one-time `top`→`deep`
 demotion; the public work entry owns launch calls and artifact context. Both legs
