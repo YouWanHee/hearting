@@ -486,12 +486,21 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs):
     """
     import dispatch_resource_wait as OWNER_RESOURCE
     resolved_nodes = []
+    journal = ledger.journal()
     for node, armed in read_armed(ledger).items():
         stage = ledger.state()["nodes"].get(node, {})
-        evidence = stage.get("evidence") or {}
+        latest = next((entry for entry in reversed(journal) if entry.get("node") == node), {})
+        if stage.get("state") != "FAILED_RETRYABLE":
+            # A previous settlement can stop between legal journal transitions.
+            # Resume its same observation, never an owner's unrelated retry.
+            if (stage.get("state") not in {"READY", "RUNNING", "STAGE_SUCCEEDED"}
+                    or latest.get("actor") != "completion-controller"):
+                continue
+            latest = next((entry for entry in reversed(journal)
+                           if entry.get("node") == node and entry.get("state") == "FAILED_RETRYABLE"), {})
+        evidence = latest.get("evidence") or {}
         artifacts = evidence.get("artifacts") or {}
-        if (stage.get("state") != "FAILED_RETRYABLE"
-                or evidence.get("succeeded") is not True or evidence.get("exit_code") != 0
+        if (evidence.get("succeeded") is not True or evidence.get("exit_code") != 0
                 or artifacts.get("reason") != "declared-artifact-missing"
                 or not artifacts.get("missing") or armed.get("predecessor_kind") != "resource"):
             continue
@@ -511,7 +520,10 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs):
         except (OSError, ValueError, KeyError, TypeError):
             continue
         resolved = {**evidence, "artifacts": current_artifacts}
-        for state in ("READY", "RUNNING", "STAGE_SUCCEEDED"):
+        if stage.get("state") == "FAILED_RETRYABLE":
+            ledger.record(node, "READY", evidence=resolved, actor="completion-controller")
+        for state in WS.completion_transition_path(
+                ledger.state()["nodes"][node]["state"], "STAGE_SUCCEEDED", ledger.registry_path):
             ledger.record(node, state, evidence=resolved, actor="completion-controller")
         resolved_nodes.append(node)
     current = ledger.state()

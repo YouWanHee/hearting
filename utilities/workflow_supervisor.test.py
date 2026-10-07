@@ -456,6 +456,27 @@ class TestSupervisorAdvance(WorkflowFixture):
         self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "recoverable")
         self.assertEqual(ledger.journal_path.read_bytes(), journal)
 
+    def test_owner_settlement_retries_interrupted_resource_artifact_resolution(self):
+        for interrupted_state in ("READY", "RUNNING", "STAGE_SUCCEEDED"):
+            with self.subTest(interrupted_state=interrupted_state), \
+                    tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(self, "base", Path(directory)):
+                route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
+                failure_journal = ledger.journal_path.read_bytes()
+                producer.write_bytes(original)
+                record = WS.WorkflowLedger.record
+                def interrupted_record(instance, node, state, **kwargs):
+                    result = record(instance, node, state, **kwargs)
+                    if node == "full-run" and state == interrupted_state:
+                        raise OSError("fixture interruption after durable append")
+                    return result
+                with mock.patch.object(WS.WorkflowLedger, "record", interrupted_record):
+                    self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "recoverable")
+                self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "completed")
+                self.assertEqual(ledger.state()["workflow_state"], "COMPLETE")
+                self.assertTrue(ledger.journal_path.read_bytes().startswith(failure_journal))
+                self.assertEqual(ledger.claims(), {})
+
     def test_owner_settlement_preserves_changed_resource_and_other_failures(self):
         route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
         producer.write_bytes(original)
