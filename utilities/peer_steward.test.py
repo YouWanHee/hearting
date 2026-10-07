@@ -2271,6 +2271,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_agent_state", side_effect=[("blocked", "w1:pX"), ("idle", "w1:pX")]), \
              mock.patch.object(peer_steward, "_form_open", return_value=False), \
              mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as sent, \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward.main(["prompt", "child", "original body", "--no-verify"]), 3)
             refs.append(self._all_records()[-1]["transfer_ref"])
@@ -2278,11 +2279,115 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual(peer_steward.main(["prompt", "child", "original body"]), 0)
             refs.append(self._all_records()[-1]["transfer_ref"])
         self.assertEqual(refs[0], refs[1])
-        sent.assert_called_once()
-        text = sent.call_args.args[1]
+        # The receivable retry flushes the stranded row first, then the new
+        # send goes out with the same ref and text.
+        self.assertEqual(sent.call_count, 2)
+        flushed, resent = (call.args[1] for call in sent.call_args_list)
+        self.assertEqual(flushed, resent)
+        text = resent
         self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "pending")
         peer_steward.peer_message.receive_peer_message(text, {"harness": "claude", "session_id": "recipient"})
         self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received")
+
+    def test_idle_transcript_mentioning_a_form_stays_receivable(self):
+        """2026-10-07 supervisor stall: 13 idle sends queued on transcript
+        tokens with no live form. Quoted UI words without a bottom selection
+        UI must not withhold keystrokes."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        quoted = ("Review note: the old AskUserQuestion footer said esc to cancel "
+                  "when done\n❯ ")
+        calls = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", calls=calls, pane_text=quoted)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[steer] go"])
+        self.assertEqual(rc, 0)
+        self.assertTrue([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
+        line = print_mock.call_args[0][0]
+        self.assertIn("prompted=true", line)
+        self.assertNotIn("queued", line)
+
+    def test_live_bottom_ui_still_withholds_keystrokes(self):
+        """The narrowed gate must still catch a real form: options plus
+        footer as the trailing block, cursor included."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                "  2. Move to background and exit\n  3. Stay\n"
+                "Enter to confirm · Esc to cancel\n❯ ")
+        calls = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", calls=calls, pane_text=form)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[steer] go"])
+        self.assertEqual(rc, 3)
+        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
+        self.assertIn("prompted=queued", print_mock.call_args[0][0])
+
+    def test_flush_delivers_a_stranded_row_then_skips_it_once_acked(self):
+        """A later receivable prompt resends deferred rows first; the
+        receiver hook's ack stops any resend. No row is ever marked here."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("blocked", pane_text=form)), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "stranded body"]), 3)
+        ref = self._all_records()[-1]["transfer_ref"]
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
+            sent_texts = [c.args[0][4] for c in run_mock.call_args_list
+                          if c.args[0][:3] == ["herdr", "agent", "prompt"]]
+        self.assertTrue(any("stranded body" in text for text in sent_texts),
+                        "the stranded row text must go out before the new send")
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending",
+                         "no hook ack arrived, so nothing may be marked")
+        stranded = next(text for text in sent_texts if "stranded body" in text)
+        peer_steward.peer_message.receive_peer_message(
+            stranded, {"harness": "claude", "session_id": "sid-child"})
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock2, \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "third body"]), 0)
+            sent_texts2 = [" ".join(c[3:]) for c in run_mock2.call_args_list
+                           for c in [c.args[0]] if c[:3] == ["herdr", "agent", "prompt"]]
+        self.assertFalse(any("stranded body" in text for text in sent_texts2),
+                         "an acked row must never be resent")
+
+    def test_long_stuck_rows_warn_with_senders(self):
+        """Rows stranded over an hour name their senders on the next prompt
+        so the original sender learns without any new gate or input."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("blocked", pane_text=form)), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "old body"]), 3)
+        ref = self._all_records()[-1]["transfer_ref"]
+        row = peer_steward.peer_message._read_pending(ref)
+        with peer_steward.peer_message.pending_lock(ref):
+            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", pane_text="❯ ")), \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
+             mock.patch("builtins.print") as print_mock:
+            self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
+        stderr_lines = [call.args[0] for call in print_mock.call_args_list
+                        if call.kwargs.get("file") is sys.stderr]
+        self.assertTrue(any("pending-stuck" in line and "oldest=2.0h" in line for line in stderr_lines),
+                        stderr_lines)
 
     def test_form_unknown_target_keeps_private_unverified_without_attaching_sid(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sender"

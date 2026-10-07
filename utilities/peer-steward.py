@@ -2589,6 +2589,143 @@ def _form_open(target):
     return any(token in flat for token in _FORM_TOKENS)
 
 
+def _live_selection_ui(target):
+    """True only when the very bottom of the visible pane is a live selection UI.
+
+    Quoted dialog text up in the conversation history must never count: an
+    idle pane whose transcript merely mentions a form ("esc to cancel" in a
+    review, a pasted UI description) is receivable, and queuing against it
+    strands the message with no redelivery (2026-10-07 supervisor stall).
+    A real form always renders its option block last: consecutive numbered
+    options immediately above a confirm/cancel footer, with only a bare
+    prompt line allowed below. Anything else -- however form-like its words
+    -- is not a live form.
+    """
+    try:
+        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible"],
+                              capture_output=True, text=True, timeout=_herdr_get_timeout())
+    except (OSError, subprocess.SubprocessError):
+        return False
+    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    while lines and lines[-1] in ("❯", "›", ">"):
+        lines.pop()
+    if len(lines) < 3:
+        return False
+    foot = "".join(lines[-1].split()).lower()
+    if ("entertoselect" not in foot and "entertoconfirm" not in foot) or \
+            ("esctocancel" not in foot and "esccancel" not in foot):
+        return False
+
+    def _opt_number(text):
+        stripped = text.lstrip("❯›* ").strip()
+        low = "".join(stripped.split()).lower()
+        for number in (1, 2, 3, 4):
+            if low.startswith(f"{number}.") or low.startswith(f"{number}:"):
+                return number
+        return None
+
+    numbers = [_opt_number(text) for text in lines[-5:-1]]
+    numbers = [n for n in numbers if n is not None]
+    return numbers == list(range(1, len(numbers) + 1)) and len(numbers) >= 2
+
+
+def _prompt_form_open(target, state_before):
+    """Whether a prompt send must withhold keystrokes from `target`.
+
+    `blocked` is herdr's own verdict and always counts. A `working` target
+    keeps the conservative whole-buffer scan: a mid-turn permission prompt on
+    a narrow pane leaves no other trace, and typing into it destroys state.
+    An idle or finished pane needs the live selection UI at the very bottom;
+    transcript mentions of forms must not strand messages (2026-10-07).
+    """
+    if state_before == "blocked":
+        return True
+    if state_before == "working":
+        return _form_open(target)
+    return _live_selection_ui(target)
+
+
+_FLUSH_MAX_ROWS = 4
+_FLUSH_ROW_TIMEOUT_S = 12
+_FLUSH_STUCK_HOURS = 1.0
+
+
+def _flush_pending_for_target(target, t_harness, t_sid, entry_wait):
+    """Deliver this recipient's deferred rows before a new send.
+
+    Returns (flushed, stuck): flushed counts rows the receiver's hook marked
+    received after our resend; stuck lists (age_hours, from_name, ref) rows
+    still pending older than _FLUSH_STUCK_HOURS so their senders learn on
+    their next prompt. Only `pending` rows go out -- `queued` rows were
+    accepted somewhere already and `unverified` rows are ambiguous; neither
+    is retried. A row is never marked received here, never deleted, and no
+    key goes out once a form shows (conservative whole-buffer check per row).
+    Never raises; failures print to stderr and leave rows for a later prompt.
+    """
+    stuck = []
+    try:
+        rows = [row for row in peer_message._pending_rows()
+                if row.get("state") == "pending"
+                and (row.get("to") or {}).get("harness") == t_harness
+                and (row.get("to") or {}).get("session_id") == t_sid]
+    except (OSError, ValueError):
+        print("pending-flush-failed target=%s reason=pending-unreadable" % target, file=sys.stderr)
+        return 0, stuck
+    now = time.time()
+    for row in rows:
+        try:
+            age_h = (now - float(row.get("created") or now)) / 3600
+        except (TypeError, ValueError):
+            age_h = 0.0
+        if age_h >= _FLUSH_STUCK_HOURS:
+            sender = ((row.get("from") or {}).get("name")
+                      or (row.get("from") or {}).get("session_id") or "-")
+            stuck.append((age_h, sender, row.get("ref")))
+    if stuck:
+        oldest = max(stuck, key=lambda item: item[0])
+        senders = ",".join(sorted({item[1] for item in stuck}))
+        print("pending-stuck target=%s count=%d oldest=%.1fh senders=%s -- redelivers on a receivable prompt; senders see this on their next send"
+              % (target, len(stuck), oldest[0], senders), file=sys.stderr)
+    flushed = 0
+    rows.sort(key=lambda row: row.get("created") or 0)
+    for row in rows[:_FLUSH_MAX_ROWS]:
+        ref = row.get("ref")
+        try:
+            if _form_open(target):
+                print("pending-flush-stopped target=%s reason=form-open" % target, file=sys.stderr)
+                break
+            text = row.get("text")
+            if not text:
+                continue
+            rc, _payload = _herdr_prompt(target, text, wait=entry_wait,
+                                         timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+            if rc is None or rc != 0:
+                continue
+            deadline = time.monotonic() + _FLUSH_ROW_TIMEOUT_S
+            while time.monotonic() < deadline:
+                try:
+                    current = peer_message._read_pending(ref)
+                except (OSError, ValueError):
+                    break
+                if current is None or current.get("state") == "received":
+                    break
+                time.sleep(0.5)
+            try:
+                current = peer_message._read_pending(ref)
+            except (OSError, ValueError):
+                current = None
+            if current is None or current.get("state") == "received":
+                flushed += 1
+                try:
+                    age_h = (now - float(row.get("created") or now)) / 3600
+                except (TypeError, ValueError):
+                    age_h = 0.0
+                print("pending-flushed target=%s ref=%s age=%.1fh" % (target, ref, age_h), file=sys.stderr)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    return flushed, stuck
+
+
 def _send_enter(target):
     try:
         subprocess.run(["herdr", "agent", "send-keys", target, "Enter"],
@@ -2672,7 +2809,14 @@ def cmd_prompt(args):
     if not args.no_verify and state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
         _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
         state_before, target_pane = _agent_state(args.target)
-    form_open = state_before == "blocked" or _form_open(args.target)
+    flushed = 0
+    if state_before != "blocked" and not _form_open(args.target):
+        # Deferred rows go first: a target receivable now takes what an
+        # earlier form-open verdict stranded (2026-10-07). Never raises and
+        # never re-reads state here: the send path below verifies on its own.
+        flushed, _stuck = _flush_pending_for_target(
+            args.target, t_harness, t_sid, state_before in ("idle", "done"))
+    form_open = _prompt_form_open(args.target, state_before)
     if not args.no_trailer:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
@@ -2758,7 +2902,8 @@ def cmd_prompt(args):
     # exists for a pane prompt.
     receipt = (f"prompted={outcome} state_before={state_before} verify={verify} "
                f"herdr_rc={'-' if rc is None else rc} ms={elapsed_ms}"
-               + (f" reason={reason}" if reason else ""))
+               + (f" reason={reason}" if reason else "")
+               + (f" flushed={flushed}" if flushed else ""))
     _record(to_harness=t_harness or "unknown", to_name=args.target, kind=kind,
             summary_text=text, to_session_id=t_sid, to_pane=target_pane,
             ref=args.ref, status=ledger_status, receipt=receipt,
@@ -2768,6 +2913,8 @@ def cmd_prompt(args):
             f"state_before={state_before} verify={verify} ms={elapsed_ms}")
     if reason:
         line += f" reason={reason}"
+    if flushed:
+        line += f" flushed={flushed}"
     print(line)
     return _PROMPT_EXIT[outcome]
 
