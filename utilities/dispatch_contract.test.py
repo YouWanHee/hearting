@@ -4542,6 +4542,34 @@ class DrainReceiptDeniedEnvironTest(unittest.TestCase):
    residue=dict(self.sealed,attempt_descendant_proof=D.ATTEMPT_DESCENDANT_RESIDUE_PROOF)
    self.assertEqual(D.attempt_tagged_descendants(residue).state,"unverifiable")
 
+ def parent_uid(self,uid):
+  """The late process's live parent (this test process) reads as running under `uid`."""
+  real=Path.read_text
+  target=f"/proc/{os.getpid()}/status"
+  def read_text(path,*args,**kwargs):
+   text=real(path,*args,**kwargs)
+   if str(path)==target:
+    return "".join(f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n" if line.startswith("Uid:") else line+"\n"
+                   for line in text.splitlines())
+   return text
+  return mock.patch.object(Path,"read_text",read_text)
+
+ def test_an_unreadable_process_forked_across_a_uid_boundary_is_outside_the_attempt(self):
+  # A VS Code Remote-SSH session: root's `sshd [priv]` forks a non-dumpable `sshd: user@notty`.
+  with self.denied(),self.parent_uid(0):
+   self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
+   with D.process_table_scan_scope():                   # the batch scan reads the same judgement
+    self.assertEqual(D.attempt_tagged_descendants(self.plain).state,"empty")
+
+ def test_an_unreadable_process_under_a_same_uid_parent_stays_unverifiable(self):
+  # What an attempt's own descendant looks like: its parent runs as the attempt's user.
+  with self.denied(),self.parent_uid(os.getuid()):
+   probe=D.attempt_tagged_descendants(self.plain)
+   self.assertEqual((probe.state,probe.reason),
+                    ("unverifiable",f"procfs-environ:{self.late.pid}:same-uid-unobservable"))
+   self.assertEqual(D.attempt_process_quiescence(self.plain,terminal_receipt=True).reason,
+                    "attempt-descendant-unverifiable")
+
  def test_a_readable_tag_is_live_and_another_error_stays_unverifiable(self):
   tagged=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
                           env=dict(os.environ,**{D.ATTEMPT_DESCENDANT_ENV:self.sealed["attempt_id"]}))

@@ -915,20 +915,21 @@ class DrainScanRetryTest(unittest.TestCase):
         self.watcher = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.watcher)
 
-    def watch(self, scans, grace):
+    def watch(self, scans, grace, metadata=None):
         from contextlib import ExitStack
         from types import SimpleNamespace
-        metadata = {"attempt_id": "att-drain-retry", "pid_observer_ns": "pid:[1]"}
+        metadata = metadata or {"attempt_id": "att-drain-retry", "pid_observer_ns": "pid:[1]"}
         annotated = []
         patches = {
             "attempt_record": lambda jobs, aid: (["now", "open", "/r", "/w", "s", ""], metadata),
             "exact_binding": lambda *args: True,
-            "process_namespace_identity": lambda *args: "pid:[1]",
+            "process_namespace_identity": lambda *args: metadata.get("pid_observer_ns", "pid:[1]"),
             "attempt_scan_namespace_authority": lambda meta: True,
             "launched_attempt_identity": lambda fields: "identity",
             "process_start_ticks": lambda pid: "gone",
             "process_group_observation": lambda pgid: D.ProcessGroupObservation("empty"),
-            "attempt_tagged_descendants": mock.Mock(side_effect=scans),
+            "attempt_tagged_descendants": (mock.Mock(side_effect=scans) if scans is not None
+                                           else D.attempt_tagged_descendants),
             # Stop right after the receipt write: the rest of the watcher is not under test.
             "annotate_attempt_row": lambda jobs, aid, values: annotated.append(values) and False,
         }
@@ -953,6 +954,44 @@ class DrainScanRetryTest(unittest.TestCase):
         denied = D.ProcessGroupObservation("unverifiable", reason="procfs-environ:4242:same-uid-unobservable")
         code, annotated = self.watch([denied], grace=0.0)
         self.assertEqual((code, annotated), (69, []))
+
+    def test_an_unreadable_session_across_a_uid_boundary_lets_the_drain_seal(self):
+        """A process the attempt cannot have made (forked by a live parent under another UID, e.g.
+        root's `sshd [priv]` for a VS Code Remote-SSH session) does not hold an ended attempt open."""
+        import errno
+        import os
+        import subprocess
+        import sys
+        ended = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        metadata = dict(D.process_launch_identity(ended.pid), pgid=str(ended.pid),
+                        attempt_id="att-foreign-session", launch_lifecycle="detached")
+        ended.terminate()
+        ended.wait(timeout=5)
+        late = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(late.wait, 5)
+        self.addCleanup(late.terminate)
+        read_bytes, read_text = Path.read_bytes, Path.read_text
+
+        def denied(path):
+            if str(path) == f"/proc/{late.pid}/environ":
+                raise PermissionError(errno.EACCES, "denied")
+            return read_bytes(path)
+
+        def parent_as(uid):
+            def text(path, *args, **kwargs):
+                value = read_text(path, *args, **kwargs)
+                if str(path) == f"/proc/{os.getpid()}/status":
+                    value = "".join(f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n" if line.startswith("Uid:") else line + "\n"
+                                    for line in value.splitlines())
+                return value
+            return text
+        with mock.patch.object(Path, "read_bytes", denied), mock.patch.object(Path, "read_text", parent_as(0)):
+            code, annotated = self.watch(None, grace=0.0, metadata=metadata)
+        self.assertEqual(code, 65)   # the stubbed receipt write reports no change
+        self.assertEqual(annotated[0]["launch_outcome"], "governed-process-group-drained")
+        with mock.patch.object(Path, "read_bytes", denied), \
+                mock.patch.object(Path, "read_text", parent_as(os.getuid())):
+            self.assertEqual(self.watch(None, grace=0.0, metadata=metadata), (69, []))   # could be the attempt's own
 
 
 if __name__ == "__main__":
