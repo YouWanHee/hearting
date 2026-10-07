@@ -195,12 +195,12 @@ class UnusedGlyphContractTest(unittest.TestCase):
 
 
 class NameChainTest(unittest.TestCase):
-    """F-26: the ghost must render NAMED, never as an anonymous row."""
+    """A ghost's identity badge survives; failed generated titles stay blank."""
 
-    def test_registry_name_is_used_when_there_is_no_title(self):
+    def test_native_registry_name_does_not_replace_a_missing_title(self):
         s = Session(harness="claude", pid=1, cwd="/home/u/proj", slug="proj")
         s.registry_name = "agent-setting-17"
-        self.assertEqual(render._session_name(s), "agent-setting-17")
+        self.assertEqual(render._session_name(s), "")
 
     def test_title_still_outranks_registry_name(self):
         s = Session(harness="claude", pid=1, cwd="/home/u/proj", slug="proj",
@@ -208,13 +208,13 @@ class NameChainTest(unittest.TestCase):
         s.registry_name = "agent-setting-17"
         self.assertEqual(render._session_name(s), "Real work title")
 
-    def test_slug_remains_the_last_resort(self):
+    def test_slug_does_not_replace_a_missing_title(self):
         s = Session(harness="claude", pid=1, cwd="/home/u/proj", slug="proj")
-        self.assertEqual(render._session_name(s), "proj")
+        self.assertEqual(render._session_name(s), "")
 
-    def test_cwd_basename_when_even_slug_is_absent(self):
+    def test_cwd_basename_does_not_replace_a_missing_title(self):
         s = Session(harness="claude", pid=1, cwd="/home/u/proj")
-        self.assertEqual(render._session_name(s), "proj")
+        self.assertEqual(render._session_name(s), "")
 
 
 class UnusedRowRenderTest(unittest.TestCase):
@@ -222,7 +222,7 @@ class UnusedRowRenderTest(unittest.TestCase):
 
     def _row(self, name_width=None, **over):
         s = Session(harness="claude", pid=1168514, cwd="/home/alice/agent_setting",
-                    slug="agent-setting-17", liveness="unused", elapsed_min=225)
+                    slug="agent-setting-17", title="agent-setting-17", liveness="unused", elapsed_min=225)
         s.registry_name = "agent-setting-17"
         for k, v in over.items():
             setattr(s, k, v)
@@ -252,7 +252,7 @@ class UnusedRowRenderTest(unittest.TestCase):
 
     def test_two_line_row_keeps_badge_parity(self):
         s = Session(harness="claude", pid=1168514, cwd="/home/alice/agent_setting",
-                    slug="agent-setting-17", liveness="unused", elapsed_min=225)
+                    slug="agent-setting-17", title="agent-setting-17", liveness="unused", elapsed_min=225)
         s.registry_name = "agent-setting-17"
         l1, _l2 = render._session_row_2line(s, term_width=120)
         txt = "".join(t for t, _k in l1)
@@ -263,7 +263,7 @@ class UnusedRowRenderTest(unittest.TestCase):
     def test_narrow_row_drops_provenance_rather_than_starving_the_name(self):
         """A readable name outranks knowing who launched it."""
         s = Session(harness="claude", pid=1168514, cwd="/home/alice/agent_setting",
-                    slug="agent-setting-17", liveness="unused", elapsed_min=225)
+                    slug="agent-setting-17", title="agent-setting-17", liveness="unused", elapsed_min=225)
         s.registry_name = "agent-setting-17"
         s.provenance = "terminal"
         l1, _l2 = render._session_row_2line(s, term_width=60)
@@ -276,7 +276,7 @@ class DegradationLadderTest(unittest.TestCase):
     """The F-22 40-cell cap makes the name zone genuinely tight at EVERY width, so what
     yields first is a real design contract, not an edge case (design_critic_step2 §2):
         provenance → badge age → name.
-    The name yields last because F-26 exists to remove anonymous rows (prd.md:247).
+    An existing successful subject yields last; missing titles are covered separately.
     """
 
     def _ghost(self, **over):
@@ -286,6 +286,8 @@ class DegradationLadderTest(unittest.TestCase):
         s.provenance = "terminal"
         for k, v in over.items():
             setattr(s, k, v)
+        # These tests exercise width pressure with an existing successful title.
+        s.title = s.registry_name
         return s
 
     def _wide(self, term_width):
@@ -393,7 +395,7 @@ class UnusedVisibilityTest(unittest.TestCase):
         live = Session(harness="claude", pid=2, cwd="/home/u/proj", slug="proj",
                        liveness="working", title="Live work")
         ghost = Session(harness="claude", pid=1168514, cwd="/home/u/proj",
-                        slug="agent-setting-17", liveness="unused", elapsed_min=225)
+                        slug="agent-setting-17", title="agent-setting-17", liveness="unused", elapsed_min=225)
         ghost.registry_name = "agent-setting-17"
         return [live, ghost]
 

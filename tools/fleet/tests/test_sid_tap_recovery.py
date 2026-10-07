@@ -6,7 +6,8 @@ Root-cause pair, both fixed here and pinned by these tests:
       claude pid + /proc starttime, and enrich() recovers the sid from it (F-25 tier-2);
   (b) a sid-less row borrows the NEWEST neighbor .jsonl in the project dir for liveness and
       also adopted its ai-title — every registry-less same-cwd row collapsed onto one stale
-      title. Adoption is now own-`<sid>.jsonl` only (F-26 — misattribution over absence).
+      title. Native ai-title adoption is now disabled even for the owning sid;
+      successful Fleet sidecars alone provide generated session subjects.
 
 Hermetic: temp CLAUDE_CONFIG_DIR only; no real ~/.claude, no live process dependency.
 The statusline.sh injection tests drive the real script with a stub `claude` ancestor.
@@ -94,7 +95,7 @@ class TitleTheftGuardTest(_HomeMixin, unittest.TestCase):
         self._transcript("/proj/x", "neighbor-sid", ai_title="Stolen Neighbor Title")
         s = Session(harness="claude", pid=999942, cwd="/proj/x", slug="x")
         claude.enrich(s)
-        self.assertIsNone(s.title)                 # falls to registry name → slug in render
+        self.assertIsNone(s.title)                 # a title gap stays blank in Fleet
 
     def test_sidless_row_still_borrows_mtime_for_liveness(self):
         """Deliberately unchanged this cycle: the mtime borrow (liveness heuristic) stays."""
@@ -103,12 +104,12 @@ class TitleTheftGuardTest(_HomeMixin, unittest.TestCase):
         claude.enrich(s)
         self.assertIsNotNone(s.mtime)
 
-    def test_own_transcript_ai_title_still_adopted(self):
-        """Control: the F-14 chain is intact when the row knows its own sid."""
+    def test_own_transcript_ai_title_is_not_a_fleet_title(self):
+        """Knowing the sid cannot turn a native title into a Fleet subject."""
         self._transcript("/proj/x", "own-sid", ai_title="Own Honest Title")
         s = Session(harness="claude", pid=999942, cwd="/proj/x", slug="x", session_id="own-sid")
         claude.enrich(s)
-        self.assertEqual(s.title, "Own Honest Title")
+        self.assertIsNone(s.title)
 
 
 class TapSidRecoveryTest(_HomeMixin, unittest.TestCase):
@@ -121,13 +122,13 @@ class TapSidRecoveryTest(_HomeMixin, unittest.TestCase):
         s.proc_start = over.get("proc_start", "777")
         return s
 
-    def test_recovers_sid_and_own_title(self):
+    def test_recovers_sid_without_adopting_native_title(self):
         self._transcript("/proj/y", "own-sid", ai_title="Recovered Own Title")
         self._tap("own-sid", {"session_id": "own-sid", "pid": 994242, "proc_start": "777"})
         s = self._sess()
         claude.enrich(s)
         self.assertEqual(s.session_id, "own-sid")
-        self.assertEqual(s.title, "Recovered Own Title")
+        self.assertIsNone(s.title)
 
     def test_proc_start_mismatch_refuses(self):
         """PID reuse: same pid, different starttime → the tap belongs to a dead session."""

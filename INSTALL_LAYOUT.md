@@ -339,8 +339,12 @@ Title acquisition is best-effort. The shared refresher reads Claude and Codex
 transcripts and OpenCode transcripts/session data, and writes Fleet-owned sidecars under
 `${FLEET_TITLE_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/agent-fleet/titles}/<harness>/`.
 When refresh fails, each collector retains the last successful Fleet title;
-without one the title is blank. Native runtime titles and first messages do not
-replace it. The existing provider selection, quota and cadence remain unchanged.
+without one the title is blank. Native runtime titles, derived names, slugs,
+cwd basenames and first messages do not replace it in either Fleet layout.
+Explicit user names remain overrides; tags still identify blank rows. Codex's
+unmarked native thread_name cannot establish an explicit name, so Fleet only
+uses the existing Hearting name registry for that override. The existing
+provider selection, quota and cadence remain unchanged.
 `harness install` creates `${XDG_CONFIG_HOME:-~/.config}/hearting/fleet.json`
 once with `{"title_language": "auto"}` and preserves user edits on later installs
 and updates. `auto` uses the same operator-language selection as NOW:

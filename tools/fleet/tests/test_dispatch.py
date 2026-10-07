@@ -649,7 +649,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "plans", "2026-07-22_unresolved-parent", "execute"))
             session = Session(harness="claude", pid=500, proc_start="root", cwd=tmp,
                               session_id="sid-unresolved", slug="unresolved-parent",
-                              liveness="working")
+                              title="unresolved-parent", liveness="working")
             owner = DispatchJob(
                 key="code", slug="unresolved-owner", cwd="/work/repo",
                 parent_sid="sid-unresolved", is_child=True, harness="claude",
@@ -1205,13 +1205,13 @@ class OpenCodeContextTest(unittest.TestCase):
         con.close()
         return db
 
-    def test_opencode_enrich_fills_title_when_column_present(self):
+    def test_opencode_enrich_ignores_native_title_when_column_present(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = self._make_db(tmp, with_title_col=True)
             sess = Session(harness="opencode", pid=1, cwd="/repo")
             with mock.patch.dict(os.environ, {"OPENCODE_DB": db}, clear=True):
                 opencode.enrich(sess)
-        self.assertEqual(sess.title, "개발 서버 시작")
+        self.assertIsNone(sess.title)
         self.assertEqual(sess.slug, "shiny-wizard")
 
     def test_opencode_enrich_tolerates_missing_title_column(self):

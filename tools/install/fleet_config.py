@@ -1,11 +1,13 @@
 """Installer bridge to Fleet's single preference reader and create-once template."""
 import importlib.util
-import paths
+from pathlib import Path
 
 
 def _module():
     spec = importlib.util.spec_from_file_location(
-        "_hearting_fleet_config", paths.agent_home() / "tools/fleet/config.py")
+        # The running installer owns this reader. AGENT_HOME can instead name
+        # an activation target (including a minimal/older source without Fleet).
+        "_hearting_fleet_config", Path(__file__).resolve().parents[1] / "fleet/config.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

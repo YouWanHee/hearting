@@ -43,7 +43,7 @@ class SessionHandleTest(unittest.TestCase):
                                   slug="slug", cwd="/work/repo")
         self.assertEqual(render._session_name(session), "session summary")
         session.title = None
-        self.assertEqual(render._session_name(session), "registry")
+        self.assertEqual(render._session_name(session), "")
         self.assertNotIn("CX/", render._session_name(session))
 
     def test_json_owner_payload_is_not_rewritten(self):

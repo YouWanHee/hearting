@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fleet import config, refresh_title as rt, titles
-from fleet.collectors import opencode
+from fleet import config, refresh_title as rt, render, titles
+from fleet.collectors import codex, opencode
 from fleet.model import Session
 from fleet.tests.test_f17_title_refresh import _ConfigHomeMixin
 
@@ -101,6 +101,60 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
         row = user_config.status(["fleet"])[0]
         self.assertEqual((row["status"], row["path"]), ("valid", str(config.config_path())))
         self.assertIn("title_language=ko", row["detail"])
+
+    def test_installer_reader_belongs_to_running_package_not_activation_target(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "install"))
+        import fleet_config
+        target = Path(self._tmp.name) / "minimal-source"
+        (target / "core").mkdir(parents=True)
+        (target / "core/CORE.md").write_text("# activation target\n")
+        with mock.patch.dict(os.environ, {"AGENT_HOME": str(target)}):
+            self.assertEqual(fleet_config.ensure()["status"], "created")
+            self.assertEqual(fleet_config.validate()["status"], "valid")
+        self.assertFalse((target / "tools").exists())
+
+    def test_visible_title_gap_is_blank_in_both_layouts_for_three_harnesses(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                sess = Session(harness=harness, pid=99999999, cwd="/native-cwd-name",
+                               session_id="sid", slug="native-slug", registry_name="native-registry",
+                               session_tag="ab", model="fixture", title=None)
+                self.assertEqual(render._session_name(sess), "")
+                wide = "".join(text for text, _ in render._session_row(sess, narrow=False, name_width=40))
+                narrow = "".join(text for text, _ in render._session_row_2line(sess, term_width=100)[0])
+                for text in (wide, narrow):
+                    self.assertIn("[ab]", text)
+                    self.assertNotIn("native-", text)
+                sess.title = "세션 제목 일관성"
+                self.assertEqual(render._session_name(sess), sess.title)
+                sess.runtime_name = "사용자가 정한 이름"
+                self.assertEqual(render._session_name(sess), sess.runtime_name)
+
+    def test_codex_first_message_name_cannot_override_title_or_fill_gap(self):
+        path = self._transcript("codex")
+        sid = "codex-native-name"
+        home = Path(self._tmp.name) / "codex-name-home"
+        home.mkdir()
+        (home / "session_index.jsonl").write_text(json.dumps({
+            "id": sid, "thread_name": "이어서해", "updated_at": "2026-10-07T00:00:00Z"}) + "\n")
+        with mock.patch.object(codex, "_home", return_value=str(home)), \
+             mock.patch.object(codex.session_registry, "read", return_value=None), \
+             mock.patch.dict(codex._PROC_PATHS, {99999999: str(path)}), \
+             mock.patch("fleet.session_handle.resolve_display_inputs", return_value={"runtime_name": None}):
+            self.assertEqual(codex._thread_runtime_names(str(home))[sid], "이어서해")
+            sess = Session(harness="codex", pid=99999999, cwd="/fixture", session_id=sid)
+            codex.enrich(sess)
+            self.assertEqual(render._session_name(sess), "")
+            self.assertIsNone(sess.runtime_name)
+            titles.write(sid, "세션 제목 일관성", harness="codex", now=time.time() - 90000)
+            codex.enrich(sess)
+            self.assertEqual(render._session_name(sess), "세션 제목 일관성")
+        with mock.patch.object(codex, "_home", return_value=str(home)), \
+             mock.patch.object(codex.session_registry, "read", return_value=None), \
+             mock.patch.dict(codex._PROC_PATHS, {99999999: str(path)}), \
+             mock.patch("fleet.session_handle.resolve_display_inputs", return_value={"runtime_name": "직접 정한 이름"}):
+            codex.enrich(sess)
+            self.assertEqual(render._session_name(sess), "직접 정한 이름")
 
     def test_failed_refresh_keeps_title_or_blank_with_one_existing_call(self):
         for harness in ("claude", "codex", "opencode"):

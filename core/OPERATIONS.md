@@ -828,8 +828,11 @@ Admission recovery is bounded: only a global/class-cap refusal from `acquire` or
 Each registered dispatch attempt also owns its summary lifecycle. While the governed worker remains behind its launch fence, the selected adapter starts one non-model summary supervisor bound to the exact attempt id, log path, and worker PID/start identity; the same registry transaction publishes that owner identity before releasing the worker. The supervisor requests one early summary, at most one ordinary update per 600 seconds (off the priority lane) while the exact worker lives, and one final update after log quiescence, then exits without completion, signal, retry, or launch authority. Initial and final requests may each use one durable `(harness, session, phase)` admission ticket when the ordinary rolling refresh budget is exhausted, but never bypass the provider kill switch, per-session lock, governor, or global concurrency cap. `dispatch-reconcile --apply` may idempotently restore a missing supervisor only for one open, exact, live attempt. An extinct registered namespace-local row from a pre-receipt runtime may be removed from the active Fleet set only through `dispatch-reconcile --attempt <id> --cancel-receiptless-namespace --apply`: this exact operator action records `failure_class=cancelled`, writes no PASS, marker, or reap receipt, and deliberately leaves successor readiness fail-closed. Fleet's explicit kill path likewise closes only the selected exact attempt as a typed cancellation; its wrapper remains responsible for the genuine post-exit receipt. Fleet is otherwise a pure observer of registry and stored summary sidecars: starting, refreshing, or closing Fleet never creates provider work. Interactive sessions use their runtime lifecycle bridge as the summary producer and follow the same bounded admission rules.
 
 Fleet's session title is the last successful Fleet summary title, retained across
-refresh failures; without one the title is empty. Native runtime titles and the
-first prompt are not replacement titles. The title names the session's subject,
+refresh failures; without one the title is empty. Native runtime titles, derived
+names, slugs, cwd basenames and the first prompt are not replacement titles.
+Explicit user names remain valid overrides, and tags identify otherwise blank
+rows. Codex's unmarked thread_name is automatic/ambiguous, so only the existing
+explicit Hearting name registry overrides its Fleet title. The title names the session's subject,
 while NOW names its current activity. User-owned `hearting/fleet.json`
 `title_language` defaults to `auto`, using NOW's existing operator-language
 selection. This changes neither provider selection nor refresh admission/cadence.
