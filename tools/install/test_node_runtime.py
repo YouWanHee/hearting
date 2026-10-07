@@ -164,6 +164,34 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(result["status"], "warning")
         fetch.assert_not_called()
 
+    def test_dry_run_reports_the_install_without_network_or_files(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(node_runtime.os.environ, {
+                    "XDG_DATA_HOME": str(tmp / "data"),
+                    "HARNESS_BIN_DIR": str(tmp / "bin"),
+                }))
+                stack.enter_context(mock.patch.object(
+                    node_runtime.shutil, "which", return_value=None,
+                ))
+                stack.enter_context(mock.patch.object(
+                    node_runtime.platform, "system", return_value="Linux",
+                ))
+                stack.enter_context(mock.patch.object(
+                    node_runtime.platform, "machine", return_value="x86_64",
+                ))
+                fetch = stack.enter_context(mock.patch.object(node_runtime, "_fetch_bytes"))
+                download = stack.enter_context(mock.patch.object(
+                    node_runtime, "_download_verified",
+                ))
+                result = node_runtime.ensure_node(dry_run=True)
+            self.assertEqual(result["status"], "would-install", result["detail"])
+            self.assertIn(str(tmp / "bin"), result["detail"])
+            fetch.assert_not_called()
+            download.assert_not_called()
+            self.assertEqual(list(tmp.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

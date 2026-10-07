@@ -13,9 +13,12 @@ import installer  # noqa: E402
 
 class ReportBundleConfigTests(unittest.TestCase):
     def env(self, root):
+        # A cleared environment still needs its own HOME: without one,
+        # Path.home() falls back to the account's real home directory.
         return mock.patch.dict(
             os.environ,
-            {"XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data")},
+            {"HOME": str(root / "home"),
+             "XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data")},
             clear=True,
         )
 

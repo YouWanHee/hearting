@@ -192,6 +192,47 @@ class HostProbesWarnOnlyContractTest(unittest.TestCase):
             [],
         )
 
+    def test_dry_run_install_keeps_the_node_ensure_dry(self):
+        args = SimpleNamespace(
+            runtimes=["claude"], target=None, scope="global",
+            plugin=False, dry_run=True, report_bundle_root=None,
+        )
+        driver = mock.Mock()
+        driver.install.return_value = {"actions": [], "blocked": False}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                installer, "get_driver", return_value=driver
+            ))
+            stack.enter_context(mock.patch.object(
+                installer.routing_config, "ensure", return_value={
+                    "status": "would-create", "path": "/tmp/config",
+                    "enabled": ["claude"],
+                }))
+            stack.enter_context(mock.patch.object(
+                installer.report_bundle_config, "ensure", return_value={
+                    "status": "would-create", "path": "/tmp/report-bundle.json",
+                    "root": "/tmp/reports",
+                }))
+            stack.enter_context(mock.patch.object(
+                installer.compute_hosts_config, "ensure", return_value={
+                    "status": "would-create", "path": "/tmp/compute-hosts.yaml",
+                }))
+            stack.enter_context(mock.patch.object(
+                installer.bootstrap, "install_launchers", return_value=[]
+            ))
+            stack.enter_context(mock.patch.object(
+                installer.host_probes, "run", return_value=[]
+            ))
+            ensure = stack.enter_context(mock.patch.object(
+                installer.node_runtime, "ensure_node", return_value={
+                    "id": "host.node-runtime", "status": "would-install",
+                    "detail": "no node >= 20.9.0 on PATH",
+                }
+            ))
+            result = installer.cmd_install(args)
+        ensure.assert_called_once_with(dry_run=True)
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
