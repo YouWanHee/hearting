@@ -86,6 +86,16 @@ _RETIRED_SESSION_END_MEM_SYNC = re.compile(
 )
 
 
+# The installed harness root reached by path instead of through a runtime-home
+# hooks link: the `<runtime-home>/hearting` projection (and the `$HOME/hearting`
+# linked checkout), the managed `current` pointer, or one release directory.
+# Settings that called a guard this way still name an owned file after the guard
+# is retired, so the registration must retire with it.
+_OWNED_ROOT_HOOK_PATH = re.compile(
+    r"""/hearting/(?:current/|releases/[^/\s"']+/)?hooks/"""
+)
+
+
 def retire_hook_registrations(path: Path, *, dry_run: bool = False) -> dict:
     """Remove only retired Hearting commands, retaining user settings and hooks."""
     import safe_fs
@@ -125,7 +135,7 @@ def remove_retired_hooks(data: dict) -> bool:
                     '/.claude/hooks/', '/adapters/codex/hooks/',
                     '$AGENT_HOME/hooks/', '${AGENT_HOME}/hooks/',
                     '$root/adapters/codex/hooks/run-hook.sh',
-                ))
+                )) or bool(_OWNED_ROOT_HOOK_PATH.search(command))
                 retired = any(re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', command)
                               for name in _RETIRED_HOOKS)
                 retired = retired or ('worker-state-compact.py' in command and 'guard-write' in command)
