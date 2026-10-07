@@ -2271,7 +2271,6 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_agent_state", side_effect=[("blocked", "w1:pX"), ("idle", "w1:pX")]), \
              mock.patch.object(peer_steward, "_form_open", return_value=False), \
              mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as sent, \
-             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward.main(["prompt", "child", "original body", "--no-verify"]), 3)
             refs.append(self._all_records()[-1]["transfer_ref"])
@@ -2279,23 +2278,22 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual(peer_steward.main(["prompt", "child", "original body"]), 0)
             refs.append(self._all_records()[-1]["transfer_ref"])
         self.assertEqual(refs[0], refs[1])
-        # The receivable retry flushes the stranded row first, then the new
-        # send goes out with the same ref and text.
-        self.assertEqual(sent.call_count, 2)
-        flushed, resent = (call.args[1] for call in sent.call_args_list)
-        self.assertEqual(flushed, resent)
-        text = resent
+        # The retry carries the same content as the stranded row, so the
+        # flush leaves it to the normal path: exactly one send, same ref.
+        sent.assert_called_once()
+        text = sent.call_args.args[1]
         self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "pending")
         peer_steward.peer_message.receive_peer_message(text, {"harness": "claude", "session_id": "recipient"})
         self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received")
 
     def test_idle_transcript_mentioning_a_form_stays_receivable(self):
-        """2026-10-07 supervisor stall: 13 idle sends queued on transcript
-        tokens with no live form. Quoted UI words without a bottom selection
-        UI must not withhold keystrokes."""
+        """2026-10-07 supervisor stall: idle sends queued on transcript
+        tokens with no live form. Quoted UI words above the bottom window
+        must not withhold keystrokes (a quote inside the bottom window only
+        delays the send now; the flush redelivers it instead of stranding)."""
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         quoted = ("Review note: the old AskUserQuestion footer said esc to cancel "
-                  "when done\n❯ ")
+                  "when done\n" + "\n".join(f"filler line {i}" for i in range(20)) + "\n❯ ")
         calls = []
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
@@ -2324,6 +2322,41 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
         self.assertIn("prompted=queued", print_mock.call_args[0][0])
+
+    def test_narrow_wrapped_footer_still_withholds_keystrokes(self):
+        """A narrow pane wraps the footer across lines; joined bottom lines
+        still reassemble the tokens, so a real form is never typed into."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = ("Pick one?\n❯ 1. Allow\n  2. Deny\nEnter to\nselect · Esc to\ncancel\n❯ ")
+        calls = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", calls=calls, pane_text=form)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[steer] go"])
+        self.assertEqual(rc, 3)
+        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
+        self.assertIn("prompted=queued", print_mock.call_args[0][0])
+
+    def test_retry_with_same_content_sends_once(self):
+        """Retrying the stranded content goes through the normal path's row
+        reuse: the flush skips it, so the content arrives exactly once."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("blocked", pane_text=form)), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "same body"]), 3)
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "same body"]), 0)
+            prompts = [c.args[0] for c in run_mock.call_args_list
+                       if c.args[0][:3] == ["herdr", "agent", "prompt"]]
+        self.assertEqual(len(prompts), 1)
 
     def test_flush_delivers_a_stranded_row_then_skips_it_once_acked(self):
         """A later receivable prompt resends deferred rows first; the

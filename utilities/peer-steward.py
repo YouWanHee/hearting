@@ -2590,44 +2590,24 @@ def _form_open(target):
     return any(token in flat for token in _FORM_TOKENS)
 
 
-def _live_selection_ui(target):
-    """True only when the very bottom of the visible pane is a live selection UI.
+def _bottom_form_tokens(target, window=15):
+    """Whether form tokens show in the bottom `window` screen lines.
 
-    Quoted dialog text up in the conversation history must never count: an
-    idle pane whose transcript merely mentions a form ("esc to cancel" in a
-    review, a pasted UI description) is receivable, and queuing against it
-    strands the message with no redelivery (2026-10-07 supervisor stall).
-    A real form always renders its option block last: consecutive numbered
-    options immediately above a confirm/cancel footer, with only a bare
-    prompt line allowed below. Anything else -- however form-like its words
-    -- is not a live form.
+    A real form always renders at the bottom: even on a narrow pane its
+    wrapped footer words land in the trailing lines, and joining them
+    reassembles the tokens. Transcript quotes higher up never count. A quote
+    sitting in the bottom lines can still misfire, but that only delays the
+    send now (the flush redelivers later) instead of stranding it with no
+    redelivery (2026-10-07).
     """
     try:
         proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible"],
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
-    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
-    while lines and lines[-1] in ("❯", "›", ">"):
-        lines.pop()
-    if len(lines) < 3:
-        return False
-    foot = "".join(lines[-1].split()).lower()
-    if ("entertoselect" not in foot and "entertoconfirm" not in foot) or \
-            ("esctocancel" not in foot and "esccancel" not in foot):
-        return False
-
-    def _opt_number(text):
-        stripped = text.lstrip("❯›* ").strip()
-        low = "".join(stripped.split()).lower()
-        for number in (1, 2, 3, 4):
-            if low.startswith(f"{number}.") or low.startswith(f"{number}:"):
-                return number
-        return None
-
-    numbers = [_opt_number(text) for text in lines[-5:-1]]
-    numbers = [n for n in numbers if n is not None]
-    return numbers == list(range(1, len(numbers) + 1)) and len(numbers) >= 2
+    lines = (proc.stdout or "").splitlines()[-window:]
+    flat = "".join("".join(lines).split()).lower()
+    return any(token in flat for token in _FORM_TOKENS)
 
 
 def _prompt_form_open(target, state_before):
@@ -2636,14 +2616,14 @@ def _prompt_form_open(target, state_before):
     `blocked` is herdr's own verdict and always counts. A `working` target
     keeps the conservative whole-buffer scan: a mid-turn permission prompt on
     a narrow pane leaves no other trace, and typing into it destroys state.
-    An idle or finished pane needs the live selection UI at the very bottom;
+    Any other state needs the tokens at the very bottom of the screen;
     transcript mentions of forms must not strand messages (2026-10-07).
     """
     if state_before == "blocked":
         return True
     if state_before == "working":
         return _form_open(target)
-    return _live_selection_ui(target)
+    return _bottom_form_tokens(target)
 
 
 _FLUSH_MAX_ROWS = 4
@@ -2674,16 +2654,21 @@ def _flush_delay_banner(ref, created):
             % (sent_at, max(1, round(age_h)), str(ref or "")[:8]))
 
 
-def _flush_pending_for_target(target, t_harness, t_sid, entry_wait):
+def _flush_pending_for_target(target, t_harness, t_sid, entry_wait, skip_hash=None):
     """Deliver this recipient's deferred rows before a new send.
 
     Returns (flushed, stuck): flushed counts rows the receiver's hook marked
     received after our resend; stuck lists (age_hours, from_name, ref) rows
     still pending older than _FLUSH_STUCK_HOURS so their senders learn on
-    their next prompt. Only `pending` rows go out -- `queued` rows were
-    accepted somewhere already and `unverified` rows are ambiguous; neither
-    is retried. A row is never marked received here, never deleted, and no
-    key goes out once a form shows (conservative whole-buffer check per row).
+    their next prompt. Only `pending` rows without a live delivery claim go
+    out -- `queued` rows were accepted somewhere already, `unverified` rows
+    are ambiguous, and claimed rows may be moving on another path already
+    (native queue, plugin pull); none of those is retried. Rows carrying the
+    same content as this send (`skip_hash`) are left to the normal path,
+    which reuses their row for its single send -- otherwise the content
+    would arrive twice. Codex targets keep their native-queue path only. A
+    row is never marked received here, never deleted, and no key goes out
+    once a form shows (conservative whole-buffer check per row).
     Rows older than _FLUSH_STUCK_HOURS go out intact preceded by a delay
     banner prompt (the seal pins the row text, so the banner is separate).
     Never raises; failures print to stderr and leave rows for a later prompt.
@@ -2713,10 +2698,16 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_wait):
         print("pending-stuck target=%s count=%d oldest=%.1fh senders=%s -- redelivers on a receivable prompt; senders see this on their next send"
               % (target, len(stuck), oldest[0], senders), file=sys.stderr)
     flushed = 0
+    if t_harness == "codex":
+        return flushed, stuck
     rows.sort(key=lambda row: row.get("created") or 0)
     for row in rows[:_FLUSH_MAX_ROWS]:
         ref = row.get("ref")
         try:
+            if row.get("rpc_claim"):
+                continue
+            if skip_hash and row.get("source_sha256") == skip_hash:
+                continue
             if _form_open(target):
                 print("pending-flush-stopped target=%s reason=form-open" % target, file=sys.stderr)
                 break
@@ -2847,8 +2838,11 @@ def cmd_prompt(args):
         # Deferred rows go first: a target receivable now takes what an
         # earlier form-open verdict stranded (2026-10-07). Never raises and
         # never re-reads state here: the send path below verifies on its own.
+        # Rows carrying this send's content are skipped: the normal path
+        # reuses their row for its single send below.
         flushed, _stuck = _flush_pending_for_target(
-            args.target, t_harness, t_sid, state_before in ("idle", "done"))
+            args.target, t_harness, t_sid, state_before in ("idle", "done"),
+            skip_hash=hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest())
     form_open = _prompt_form_open(args.target, state_before)
     if not args.no_trailer:
         try:
