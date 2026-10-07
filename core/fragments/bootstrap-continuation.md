@@ -1,0 +1,1 @@
+Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run.
