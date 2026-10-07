@@ -2364,6 +2364,34 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertFalse(any("stranded body" in text for text in sent_texts2),
                          "an acked row must never be resent")
 
+    def test_late_flush_sends_delay_banner_before_row_text(self):
+        """A row stranded over an hour goes out intact preceded by a delay
+        banner prompt, so the recipient sees its age first."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("blocked", pane_text=form)), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "old body"]), 3)
+        ref = self._all_records()[-1]["transfer_ref"]
+        row = peer_steward.peer_message._read_pending(ref)
+        with peer_steward.peer_message.pending_lock(ref):
+            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
+            sent_texts = [c.args[0][4] for c in run_mock.call_args_list
+                          if c.args[0][:3] == ["herdr", "agent", "prompt"]]
+        banners = [text for text in sent_texts if text.startswith("[지연 전달")]
+        self.assertEqual(len(banners), 1)
+        self.assertIn(ref[:8], banners[0])
+        stranded = next(text for text in sent_texts if "old body" in text)
+        self.assertLess(sent_texts.index(banners[0]), sent_texts.index(stranded))
+
     def test_long_stuck_rows_warn_with_senders(self):
         """Rows stranded over an hour name their senders on the next prompt
         so the original sender learns without any new gate or input."""

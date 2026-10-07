@@ -18,6 +18,7 @@ its bounded-foreground semantics unchanged.
 """
 import argparse
 import calendar
+import datetime
 import fcntl
 import hashlib
 import importlib.util
@@ -2650,6 +2651,29 @@ _FLUSH_ROW_TIMEOUT_S = 12
 _FLUSH_STUCK_HOURS = 1.0
 
 
+def _flush_delay_banner(ref, created):
+    """The one line prefixed (as its own prompt) to a late redelivery.
+
+    A stranded row's sealed text can never be edited in place: the transfer
+    record pins its digest, and any changed byte unattaches the receipt.
+    So an old row goes out intact, preceded by this banner prompt carrying
+    the original send time and the delay. Returns None for fresh rows.
+    """
+    try:
+        age_h = (time.time() - float(created or time.time())) / 3600
+    except (TypeError, ValueError):
+        return None
+    if age_h < _FLUSH_STUCK_HOURS:
+        return None
+    try:
+        sent_at = datetime.datetime.fromtimestamp(
+            float(created), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return ("[지연 전달 — 원래 보낸 시각 %s, 약 %d시간 지연] (ref %s)"
+            % (sent_at, max(1, round(age_h)), str(ref or "")[:8]))
+
+
 def _flush_pending_for_target(target, t_harness, t_sid, entry_wait):
     """Deliver this recipient's deferred rows before a new send.
 
@@ -2660,6 +2684,8 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_wait):
     accepted somewhere already and `unverified` rows are ambiguous; neither
     is retried. A row is never marked received here, never deleted, and no
     key goes out once a form shows (conservative whole-buffer check per row).
+    Rows older than _FLUSH_STUCK_HOURS go out intact preceded by a delay
+    banner prompt (the seal pins the row text, so the banner is separate).
     Never raises; failures print to stderr and leave rows for a later prompt.
     """
     stuck = []
@@ -2697,6 +2723,13 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_wait):
             text = row.get("text")
             if not text:
                 continue
+            banner = _flush_delay_banner(ref, row.get("created"))
+            if banner:
+                try:
+                    _herdr_prompt(target, banner, wait=entry_wait,
+                                  timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
             rc, _payload = _herdr_prompt(target, text, wait=entry_wait,
                                          timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
             if rc is None or rc != 0:
