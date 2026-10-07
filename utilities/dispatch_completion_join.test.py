@@ -2421,6 +2421,27 @@ class FinishedChildClosure(unittest.TestCase):
         self.assertEqual(current.metadata["note"], "dead-worker-fail")
         success.assert_not_called()
 
+    def test_a_receipt_settles_only_an_open_stage_child_that_finished_with_a_readable_pass(self):
+        """A1 F17: the runtime, not the parent, closes a finished PASS still open at delivery."""
+        cases = {
+            "pass": (self.child(quiescent=True, attempt_id="att-pass"), 1),
+            "fail": (self.child(quiescent=True, verdict="FAIL", attempt_id="att-fail"), 0),
+            "live": (self.child(quiescent=False, attempt_id="att-live"), 0),
+            "no-artifact": (self.child(quiescent=True, artifact=None, attempt_id="att-noart"), 0),
+        }
+        owner = self.child(quiescent=True, attempt_id="att-owner")
+        owner_fields = owner.raw.split("\t")
+        owner_fields[5] += ",worker_type=owner"
+        rows = [row.raw for row, _ in cases.values()] + ["\t".join(owner_fields)]
+        self.jobs.write_text("\n".join(rows) + "\n")
+        for name, (row, calls) in {**cases, "owner": (owner, 0)}.items():
+            with self.subTest(name), mock.patch.object(
+                    JOIN, "settle_finished_attempt", return_value={"closed": True}) as settle:
+                JOIN.receipt_with_delivery_observability(
+                    {"children": [{"attempt_id": row.attempt_id, "required_action": "complete-open"}]},
+                    jobs=self.jobs)
+            self.assertEqual(settle.call_count, calls, name)
+
     def test_route_bound_child_is_closed_through_the_completion_path(self):
         calls: list[list[str]] = []
 
