@@ -777,20 +777,33 @@ class WorkStartTest(unittest.TestCase):
                 command, 73, f"check=failed\nreason={reason}\ndetail=admission lock busy\nchild_spawned=0\n", "")
         return run
 
-    def test_owner_that_did_not_start_says_run_start_later_not_harvest(self):
+    def _auto_resume(self):
+        """Record what start hands the automatic resume, without starting a detached process."""
+        self.armed = []
+
+        def arm(result, route_file, jobs, **kwargs):
+            self.armed.append(result["reason"])
+            return {"record": "/x.json", "resume_at": "2026-10-07T12:01:00Z", "state": "armed",
+                    "cause": "launch-not-started"}
+        return mock.patch("capacity_auto_resume.arm", side_effect=arm)
+
+    def test_owner_that_did_not_start_is_started_again_by_the_runtime_not_harvested(self):
         self.route["nodes"] = []
-        result = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
+        with self._auto_resume():
+            result = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
         self.assertEqual((result["state"], result["reason"], result["required_action"]),
-                         ("needs-attention", "owner-launch-not-started", "resume-later"), result)
+                         ("needs-attention", "owner-launch-not-started", "wait-for-auto-resume"), result)
+        self.assertEqual(self.armed, ["owner-launch-not-started"])
+        self.assertEqual(result["parent_next"], "end-turn")
         self.assertEqual(result["launch_reason"], "admission-busy")
         self.assertEqual(result["owner_attempt_id"], W.attempt_id(self.route, "owner"))
         self.assertIn("capability-route.py", result["recovery_command"])
         self.assertIn("start", result["recovery_command"])
         self.assertNotIn("harvest", result["recovery_command"])
-        self.assertIn("again later", result["next_step"])
+        self.assertIn("did not start and nothing ran", result["next_step"])
         self.assertEqual(len(self.calls), 1)   # one launch per start, however it ended
 
-    def test_owner_preparation_busy_with_no_row_says_run_start_later(self):
+    def test_owner_preparation_busy_with_no_row_is_started_again_by_the_runtime(self):
         """dispatch-owner failed before any row existed: the typed admission-busy error."""
         self.route["nodes"] = []
         calls = self.calls
@@ -800,18 +813,20 @@ class WorkStartTest(unittest.TestCase):
             return subprocess.CompletedProcess(
                 command, 65, "check=failed\nreason=admission-busy:admission lock held past 120s; "
                 "nothing started; run start again later\nchild_spawned=0\n", "")
-        result = W.start_work(self.route, self.path, self.jobs, run=run)
+        with self._auto_resume():
+            result = W.start_work(self.route, self.path, self.jobs, run=run)
         self.assertEqual((result["state"], result["reason"], result["required_action"]),
-                         ("needs-attention", "owner-launch-not-admitted", "resume-later"), result)
+                         ("needs-attention", "owner-launch-not-admitted", "wait-for-auto-resume"), result)
+        self.assertEqual((self.armed, result["parent_next"]), (["owner-launch-not-admitted"], "end-turn"))
         self.assertEqual(result["launch_reason"], "admission-busy")
         self.assertEqual(result["recovery_command"], result["resume_command"])
         self.assertIn("capability-route.py", result["recovery_command"])
         self.assertNotIn("harvest", result["recovery_command"])
-        self.assertIn("Nothing ran", result["next_step"])
-        self.assertIn("again later", result["next_step"])
+        self.assertIn("nothing ran", result["next_step"])
         self.assertEqual(len(calls), 1)
-        # no row exists, so the next start launches the same owner again
-        again = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
+        # no row exists, so the next start (the automatic one) launches the same owner again
+        with self._auto_resume():
+            again = W.start_work(self.route, self.path, self.jobs, run=self._unstarted_run())
         self.assertEqual(again["reason"], "owner-launch-not-started", again)
         self.assertEqual(len(calls), 2)
 

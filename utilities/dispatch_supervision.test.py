@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -160,8 +161,11 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         preview = subprocess.run(cli, capture_output=True, text=True, timeout=10)
         self.assertEqual(preview.returncode, 0, preview.stdout+preview.stderr)
         self.assertEqual(self.jobs.read_text().splitlines()[1], raw)
-        applied = subprocess.run(cli + ["--expected-row-sha256", hashlib.sha256(raw.encode()).hexdigest(),
-            "--review-evidence", str(review), "--apply"], capture_output=True, text=True, timeout=10)
+        # The preview prints the apply command with this row's digest; the review is the one input.
+        apply_command = json.loads(preview.stdout.split("\n", 1)[1])["apply_command"]
+        self.assertIn(hashlib.sha256(raw.encode()).hexdigest(), apply_command)
+        applied = subprocess.run(shlex.split(apply_command.replace("<review report>", shlex.quote(str(review)))),
+                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(applied.returncode, 0, applied.stdout+applied.stderr)
         self.assertEqual(contract.completion_attempt_readiness(route, node, marker, self.jobs).state, "ready")
         self.assertTrue(observe()["passed"])

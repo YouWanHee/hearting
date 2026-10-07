@@ -3309,6 +3309,29 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                 ingress.assert_not_called()
                 self.assertIn("started=false reason=pane-split-failed", printed.call_args[0][0])
 
+    def test_start_with_no_pane_named_opens_beside_the_calling_pane_in_the_calling_cwd(self):
+        response = _herdr_json({"error": {"code": "pane_not_found"}})   # stop right after the split
+        with tempfile.TemporaryDirectory() as cwd, \
+             mock.patch.dict(peer_steward.os.environ, {"HERDR_PANE_ID": "w1:pMe"}), \
+             mock.patch.object(peer_steward.os, "getcwd", return_value=cwd), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", return_value=response) as run, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["start", "new", "--kind", "codex"]), 1)
+            split = run.call_args_list[0][0][0]
+            self.assertEqual(split[:5], ["herdr", "pane", "split", "--pane", "w1:pMe"])
+            self.assertEqual(split[split.index("--cwd") + 1], os.path.realpath(cwd))
+
+    def test_start_outside_a_herdr_pane_with_no_pane_named_says_so_and_runs_nothing(self):
+        env = {k: v for k, v in os.environ.items() if k != "HERDR_PANE_ID"}
+        with mock.patch.dict(peer_steward.os.environ, env, clear=True), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run") as run, \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["start", "new", "--kind", "claude"]), 1)
+        run.assert_not_called()
+        self.assertIn("started=false reason=pane-unknown", printed.call_args[0][0])
+
     def test_non_json_start_failure_has_bounded_reason_and_closes_only_owned_empty_split(self):
         calls = []
 

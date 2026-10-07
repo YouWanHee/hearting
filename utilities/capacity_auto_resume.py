@@ -8,6 +8,11 @@ record per route and reset time and starts one detached process that sleeps
 until then and runs the same `start` once, from the parent's own environment,
 so the resumed owner is the parent's as before.
 
+An owner whose launch did not start (`resume-later`: the admission lock stayed
+busy, or the launcher closed the row before spawning) is the same kind of pause:
+its receipt's own remedy is to run `resume_command` again after about a minute,
+so the same record runs it `LATER_SECONDS` from now.
+
 Bounded on purpose: one resume per record, a sleep of at most `MAX_SLEEP_SECONDS`,
 and at most `MAX_CHAIN` automatic resumes in a row for one route (a resume that
 pauses again arms the next one). A pause without a known reset time arms
@@ -30,6 +35,8 @@ MAX_SLEEP_SECONDS = 7 * 24 * 3600
 MAX_CHAIN = 3
 SLACK_SECONDS = 60
 POLL_SECONDS = 60
+LATER_SECONDS = 60
+LATER_REASONS = ("owner-launch-not-admitted", "owner-launch-not-started")
 CHAIN_ENV = "AGENT_CAPACITY_RESUME_CHAIN"
 
 
@@ -45,13 +52,23 @@ def record_path(jobs: Path, route_id: str, retry_at: str) -> Path:
     return Path(jobs).resolve().parent / "capacity-resume" / f"{route_id}-{key}.json"
 
 
+def _pause(result: dict, now) -> tuple[str | None, str] | None:
+    """`(retry_at, cause)` for a pause this module resumes, else None."""
+    if (result.get("state") == "waiting-capacity" and result.get("reason") == "owner-capacity-wait"
+            and result.get("required_action") == "resume-after-capacity"):
+        return result.get("retry_at"), "capacity"
+    if result.get("required_action") == "resume-later" and result.get("reason") in LATER_REASONS:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() + LATER_SECONDS)), "launch-not-started"
+    return None
+
+
 def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen, now=time.time) -> dict | None:
-    """Arm one automatic resume for a usage-limit pause; `None` when it does not apply."""
+    """Arm one automatic resume for a pause `_pause` names; `None` when it does not apply."""
     env = dict(os.environ if environ is None else environ)
-    if (result.get("state") != "waiting-capacity" or result.get("reason") != "owner-capacity-wait"
-            or result.get("required_action") != "resume-after-capacity"):
+    pause = _pause(result, now)
+    if pause is None:
         return None
-    retry_at = result.get("retry_at")
+    retry_at, cause = pause
     epoch = _epoch(retry_at)
     try:
         chain = int(env.get(CHAIN_ENV) or 0)
@@ -62,14 +79,14 @@ def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen,
     path = record_path(Path(jobs), result.get("route_id") or "", retry_at)
     record = {"schema": "capacity-resume-v1", "route_id": result.get("route_id"),
               "route_file": str(Path(route_file).resolve()), "jobs": str(Path(jobs).resolve()),
-              "retry_at": retry_at, "chain": chain + 1, "state": "armed",
+              "retry_at": retry_at, "chain": chain + 1, "state": "armed", "cause": cause,
               "armed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("x", encoding="utf-8") as handle:
             json.dump(record, handle, sort_keys=True)
     except FileExistsError:
-        return {"record": str(path), "resume_at": retry_at, "state": "already-armed"}
+        return {"record": str(path), "resume_at": retry_at, "state": "already-armed", "cause": cause}
     except OSError:
         return None
     log = path.with_suffix(".log")
@@ -77,7 +94,7 @@ def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen,
         spawn([sys.executable, str(Path(__file__).resolve()), "run", "--record", str(path)],
               stdin=stdin, stdout=out, stderr=subprocess.STDOUT, env={**env, CHAIN_ENV: str(chain + 1)},
               start_new_session=True, close_fds=True)
-    return {"record": str(path), "resume_at": retry_at, "state": "armed"}
+    return {"record": str(path), "resume_at": retry_at, "state": "armed", "cause": cause}
 
 
 def _write(path: Path, record: dict) -> None:
@@ -129,7 +146,9 @@ def _notify(record: dict, receipt: dict) -> None:
             return
         state = receipt.get("state") or "unknown"
         again = state == "waiting-capacity"
-        text = (f"route {record['route_id']} resumed after the usage limit reset: state {state}"
+        why = ("started again after a launch that did not start" if record.get("cause") == "launch-not-started"
+               else "resumed after the usage limit reset")
+        text = (f"route {record['route_id']} {why}: state {state}"
                 + (f", owner {receipt['owner_attempt_id']}" if receipt.get("owner_attempt_id") else "")
                 + (f"; paused again until {receipt.get('retry_at', 'an unknown time')}" if again else ""))
         notify(caller.harness, caller.session_id, key=f"capacity-resume:{record['route_id']}:{record['retry_at']}",

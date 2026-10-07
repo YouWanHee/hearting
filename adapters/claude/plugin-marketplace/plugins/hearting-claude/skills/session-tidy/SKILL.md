@@ -23,7 +23,7 @@ Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 
 work, then pass the card to a peer session; only this calling window is cleared, never the
 target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
 
-For a new successor at this seat, replace the clear sequence below with `peer-steward.py start --beside "$HERDR_PANE_ID"` → `handoff` → `enqueue --no-clear`; after its ACK and the predecessor's final idle result, the successor uses `peer-steward.py retire <predecessor>` (§5.14).
+For a new successor at this seat, replace the clear sequence below with `peer-steward.py start <name> --kind <harness>` (beside this pane by default) → `handoff` → `enqueue --no-clear`; after its ACK and the predecessor's final idle result, the successor uses `peer-steward.py retire <predecessor>` (§5.14).
 
 ## Steps
 
