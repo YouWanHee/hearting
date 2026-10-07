@@ -554,6 +554,13 @@ def cmd_verify(args):
         ok = ok and smoke_ok
     elif not launcher_skipped:
         ok = False
+    node_launchers = node_runtime.launcher_status()
+    all_checks.append({
+        "id": "environment.node-launchers",
+        "ok": node_launchers["status"] == "ok",
+        "detail": node_launchers["detail"],
+    })
+    ok = ok and node_launchers["status"] == "ok"
     lines = [("✓" if c["ok"] else "✗") + f" {c['id']} {c['detail']}" for c in all_checks]
     return {"runtime": runtimes, "channel": "plugin" if args.plugin else "dev", "checks": all_checks,
             "drift": [], "exit": EXIT_OK if ok else EXIT_VERIFY_FAIL, "lines": lines}
@@ -642,6 +649,15 @@ def cmd_update(args):
             skipped_hints[runtime] = hint
             checks.append({"id": f"update.skipped.{runtime}", "ok": False,
                            "detail": f"{reason}: {hint}"})
+        # Launcher-dir hygiene runs on every update outcome, including
+        # `pinned` and `up-to-date`: this process is the installed release's
+        # own code, so a same-version update is still a repair pass.
+        node_launchers = node_runtime.reconcile_launchers()
+        if node_launchers["status"] != "ok":
+            lines.append(
+                f"environment: {node_launchers['id']} -> {node_launchers['status']} "
+                f"({node_launchers['detail']})"
+            )
         payload = {
             "runtime": result.get("runtimes", []),
             "channel": "managed-release",
@@ -650,6 +666,7 @@ def cmd_update(args):
             "drift": [],
             "exit": EXIT_OK,
             "lines": lines,
+            "environment": [node_launchers],
         }
         if skipped_hints:
             payload["skipped_hints"] = skipped_hints
@@ -1286,6 +1303,20 @@ def cmd_runtime(args):
             )
             for report in reports:
                 report["report_bundle_config"] = bundle_config
+            # A managed update activates runtimes through the NEW release's
+            # harness.sh, so this is the first code of a new version that
+            # runs on the host; sweeping here lets an update repair launcher
+            # links left by an older installer in the same transaction.
+            # `reconcile_launchers` never raises, so it cannot trigger the
+            # rollback below.
+            node_launchers = node_runtime.reconcile_launchers()
+            if node_launchers["status"] != "ok":
+                lines.append(
+                    f"environment: {node_launchers['id']} -> {node_launchers['status']} "
+                    f"({node_launchers['detail']})"
+                )
+            for report in reports:
+                report["node_launchers"] = node_launchers
     except runtime_activation.ActivationError as exc:
         rollback_errors = []
         for snapshot in reversed(snapshots):

@@ -193,6 +193,27 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
         self.assertFalse(status["installed"])
         self._assert_protected_surfaces_untouched()
 
+    def test_activate_removes_dangling_managed_node_links(self):
+        # HARNESS_BIN_DIR is unset in this fixture, so the launcher dir is the
+        # private HOME's ~/.local/bin -- the same fallback a real host uses.
+        bin_dir = self.home / ".local" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        stale = bin_dir / "npx"
+        stale.symlink_to(
+            Path(self._tmp.name) / "gone" / "hearting" / "node" / "current" / "bin" / "npx"
+        )
+        with _stubbed_runtime_projection():
+            result = installer.cmd_runtime(self._args("activate"))
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+        self.assertFalse(stale.is_symlink())
+        self.assertEqual(result["node_launchers"]["status"], "repaired")
+        self.assertIn(
+            "environment: host.node-launchers -> repaired "
+            f"(removed dangling managed npx from {bin_dir})",
+            result["lines"],
+        )
+        self._assert_protected_surfaces_untouched()
+
     def test_reinstall_after_activate_is_idempotent_at_installer_level(self):
         self._install_legacy_launcher()
         with _stubbed_runtime_projection():
@@ -318,6 +339,15 @@ class StatusVersionSkewTest(unittest.TestCase):
 
 
 class UpdateSkipHintTest(unittest.TestCase):
+    def setUp(self):
+        # `cmd_update` now sweeps the launcher dir; keep that inside the case.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.bin_dir = Path(tmp.name) / "bin"
+        env = mock.patch.dict(os.environ, {"HARNESS_BIN_DIR": str(self.bin_dir)})
+        env.start()
+        self.addCleanup(env.stop)
+
     def _update_args(self):
         return Namespace(dry_run=False, scope="global", plugin=False, reapply=False,
                          version="latest", runtimes=["claude", "codex", "opencode"],
@@ -362,6 +392,34 @@ class UpdateSkipHintTest(unittest.TestCase):
             result = installer.cmd_update(self._update_args())
         self.assertIn("skipped: claude (some-new-reason)", result["lines"])
         self.assertNotIn("skipped_hints", result)
+
+    def test_sound_launcher_dir_adds_a_row_but_no_line(self):
+        with mock.patch.object(installer.distribution, "is_managed", return_value=True), \
+             mock.patch.object(installer.distribution, "update", return_value=self._managed_result({})):
+            result = installer.cmd_update(self._update_args())
+        self.assertEqual(result["environment"], [{
+            "id": "host.node-launchers", "status": "ok",
+            "detail": f"no dangling managed node links in {self.bin_dir}",
+        }])
+        self.assertFalse([line for line in result["lines"] if line.startswith("environment:")])
+
+    def test_update_removes_dangling_managed_node_links(self):
+        self.bin_dir.mkdir(parents=True)
+        stale = self.bin_dir / "node"
+        stale.symlink_to(
+            self.bin_dir.parent / "gone" / "hearting" / "node" / "current" / "bin" / "node"
+        )
+        with mock.patch.object(installer.distribution, "is_managed", return_value=True), \
+             mock.patch.object(installer.distribution, "update", return_value=self._managed_result({})):
+            result = installer.cmd_update(self._update_args())
+        self.assertFalse(stale.is_symlink())
+        self.assertEqual(result["environment"][0]["status"], "repaired")
+        self.assertIn(
+            "environment: host.node-launchers -> repaired "
+            f"(removed dangling managed node from {self.bin_dir})",
+            result["lines"],
+        )
+        self.assertEqual(result["exit"], installer.EXIT_OK)
 
 
 if __name__ == "__main__":

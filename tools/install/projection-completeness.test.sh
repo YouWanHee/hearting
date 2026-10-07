@@ -203,6 +203,7 @@ assert {item["id"] for item in row["checks"]} == {
     "memory-sync-config.policy",
     "host.pyyaml",
     "bootstrap.launcher.compute-hosts",
+    "environment.node-launchers",
 }, row
 PY
 
