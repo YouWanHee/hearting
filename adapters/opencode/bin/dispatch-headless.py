@@ -1197,9 +1197,53 @@ def bind_internal_eligibility_probe(args: argparse.Namespace) -> None:
 
 
 def validate_route_record(args: argparse.Namespace) -> int:
-    return WRAPPER_COMMON.validate_route_record(
-        args, marker_gate=completion_marker_gate,
-    )
+    routed=any((args.route_id,args.route_hash,args.route_node,args.registry_digest))
+    if routed and not args.route_file: return fail("route-record-required",65,route_id=args.route_id or "-")
+    if not args.route_file: return 0
+    required=("route_id","route_hash","route_node","registry_digest","write_scope")
+    missing=[name for name in required if not getattr(args,name)]
+    if missing: return fail("route-metadata-missing",65,fields=",".join(missing))
+    try:
+        route_record=json.loads(Path(args.route_file).read_text(encoding="utf-8"))
+    except (OSError,ValueError):
+        route_record={}
+    if route_record.get("schema_version") != 2 or "broker_contract_version" in route_record:
+        return fail("legacy-broker-route-read-only",65,route_file=args.route_file,child_spawned="0")
+    try:
+        validate_runtime_requirements(route_record, args.route_node)
+    except OwnerRouteBindingError as exc:
+        return fail(str(exc),69,child_spawned="0",fallback="inline-or-main")
+    try:
+        validate_route_mode_axes(args, route_record)
+    except DispatchModeContractError as exc:
+        return fail(exc.reason, 65, **exc.fields, child_spawned="0")
+    command=[sys.executable,str(ROOT/"utilities"/"worker-route-guard.py"),"validate",
+        "--route",args.route_file,"--node",args.route_node,"--cwd",args.worktree,
+        "--artifact-root",args.artifact_root,"--capability",args.capability,
+        "--intensity",args.intensity,"--write-scope",args.write_scope,
+        "--route-id",args.route_id,"--route-hash",args.route_hash,
+        "--registry-digest",args.registry_digest,"--unit",args.unit,
+        "--launch-phase",args.action,
+        "--model-role",args.model_role or "","--model-profile",args.model_profile or ""]
+    if args.attempt_id:
+        command += ["--current-attempt", args.attempt_id]
+    result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if result.returncode:
+        if result.stdout: print(result.stdout,end="")
+        if result.stderr: print(result.stderr,end="",file=sys.stderr)
+        return fail(
+            "worker-route-validation-failed", result.returncode,
+            route_file=args.route_file, registered="0", started="0",
+            child_spawned="0",
+        )
+    args.route_validation=result.stdout.strip()
+    refusal = route_authority.completion_gate(
+        args, args.action, args.agent_home, route_authority.prelaunch_registry(args),
+        gate=completion_marker_gate)
+    if refusal:
+        reason, code, fields = refusal
+        return fail(reason, code, **fields)
+    return 0
 
 
 def main(argv: list[str]) -> int:
