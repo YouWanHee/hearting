@@ -6280,7 +6280,11 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
                 if slot < last:
                     used = sum(_dw(t) for t, _k in cell)
                     row.append((" " * (widths[slot] - used + 3), None))
-        out.append(_clip_segs(row, term_width)[0] if term_width is not None else row)
+        # Only quota columns use the viewport fit; source-absence/error messages
+        # keep their existing plain output (F-101 ledger-absent goldens).
+        if cells is not None and term_width is not None:
+            row = _clip_segs(row, term_width)[0]
+        out.append(row)
     return out
 
 
