@@ -3653,11 +3653,11 @@ def export_profile(apply=False):
 
 
 # ---------- profile (read-only) ----------
-def profile(aspect, list_mode=False):
-    """Print a profile aspect body without writing records.
+def _lookup_profile_aspect(aspect):
+    """Resolve a profile aspect to (stem, meta, body), newest-wins.
 
-    Resolve by exact stem, two-digit numeric prefix, then collision-checked alias.
-    Ambiguous or missing matches exit 2.
+    Same resolution as `profile`: exact stem, two-digit numeric prefix, then
+    collision-checked alias. Ambiguous or missing matches exit 2.
     """
     # Query rowid explicitly because db_iter_records selects only RECORD_COLS.
     cols = ", ".join(RECORD_COLS)
@@ -3722,7 +3722,7 @@ def profile(aspect, list_mode=False):
                 break
 
     # --list mode.
-    if list_mode:
+    if aspect == "__list__":
         for stem in stems:
             alias_label = stem_to_alias.get(stem, "-")
             _, body = lookup[stem]
@@ -3772,7 +3772,65 @@ def profile(aspect, list_mode=False):
             sys.stderr.write(f"  {stem}  [{alias_label}]\n")
         sys.exit(2)
 
-    _, body = lookup[resolved]
+    meta, body = lookup[resolved]
+    return resolved, meta, body
+
+
+MANUAL_MEMO_HEADING = "## 사용자 수동 메모"
+
+
+def _append_manual_memo(body, text):
+    """Append one item under the exact `## 사용자 수동 메모` block.
+
+    The heading is created at the end when absent. The rest of the body is
+    byte-identical, so this is the only safe partial write to a profile.
+    """
+    item = text.strip()
+    lines = body.splitlines()
+    try:
+        head = next(i for i, line in enumerate(lines) if line.strip() == MANUAL_MEMO_HEADING)
+    except StopIteration:
+        head = None
+    if head is None:
+        base = body.rstrip("\n")
+        return f"{base}\n\n{MANUAL_MEMO_HEADING}\n- {item}\n" if base else f"{MANUAL_MEMO_HEADING}\n- {item}\n"
+    insert = head + 1
+    while insert < len(lines) and not lines[insert].strip().startswith("## "):
+        insert += 1
+    lines.insert(insert, f"- {item}")
+    return "\n".join(lines) + "\n"
+
+
+def profile_append(aspect, text):
+    """Append one item to a profile aspect's manual-memo block, preserving the rest.
+
+    This is the only supported partial write to a user profile: the current
+    body is read newest-wins, the item lands under `## 사용자 수동 메모`,
+    and the whole body goes through the normal source upsert (same record id;
+    the replaced body stays in `mem history`). A raw
+    `mem add --source user-profile:<stem>` with a partial body would overwrite.
+    """
+    if not (text or "").strip():
+        sys.stderr.write("[profile-append] empty text; nothing appended\n")
+        sys.exit(2)
+    stem, _meta, body = _lookup_profile_aspect(aspect)
+    new_body = _append_manual_memo(body, text)
+    if new_body == body:
+        print(f"[profile-append] already present in user-profile:{stem}")
+        return
+    write_record("durable", "global", "profile", new_body,
+                 cwd_origin="global", source=f"user-profile:{stem}")
+
+
+def profile(aspect, list_mode=False):
+    """Print a profile aspect body without writing records.
+
+    Resolve by exact stem, two-digit numeric prefix, then collision-checked alias.
+    Ambiguous or missing matches exit 2.
+    """
+    if list_mode:
+        _lookup_profile_aspect("__list__")
+    _, _, body = _lookup_profile_aspect(aspect)
     print(body)
     sys.exit(0)
 
@@ -9998,6 +10056,11 @@ def _cli_main():
     pf.add_argument("aspect", nargs="?", help="Stem '07_coding_convention', number '07', or alias 'coding'")
     pf.add_argument("--list", action="store_true", help="List available aspects with labels and body lengths")
 
+    pa = sub.add_parser("profile-append",
+                        help="Append one item under a profile aspect's manual-memo block, preserving the rest")
+    pa.add_argument("aspect", help="Stem '07_coding_convention', number '07', or alias 'coding'")
+    pa.add_argument("text", help="One item to append under '## 사용자 수동 메모'")
+
     sub.add_parser("orphans", help="Show unresolved cwd_origin values (read-only)")
 
     lg = sub.add_parser("log", help="Show the recent write-events journal tail")
@@ -10175,6 +10238,8 @@ def _cli_main():
         import_dump(args.path, recovery=args.recovery)
     elif args.cmd == "profile":
         profile(args.aspect, list_mode=args.list)
+    elif args.cmd == "profile-append":
+        profile_append(args.aspect, args.text)
     elif args.cmd == "orphans":
         orphans()
     elif args.cmd == "log":
