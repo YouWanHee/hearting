@@ -1997,6 +1997,18 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
     """F-100c — the steward send is `prompt`: herdr resolves the target's exact session
     id, the sender's registry name rides the record, and the body gets the trailer."""
 
+    def setUp(self):
+        super().setUp()
+        # These transport fixtures now also provide a readable empty input box.
+        # Draft parsing/races use actual ANSI reads in PromptDraftGuardTest below.
+        for key in ("AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
+                    "CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID"):
+            os.environ.pop(key, None)
+        empty = peer_steward._screen_lines("❯\n────────────\n┃  Ask anything...\n┃  Build model\n")
+        patch = mock.patch.object(peer_steward, "_read_screen", return_value=empty)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def _fake_run(self, get_payload, prompt_rc=0, calls=None):
         def run(argv, **kw):
             if calls is not None:
@@ -2189,7 +2201,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_prompt_timeout_with_our_text_still_in_the_box_is_queued(self):
         """herdr `timeout` (state changed, no `working` within the bound) and a
-        *read* box still showing our first line after one Enter: `queued`."""
+        *read* box still showing our first line: `queued`, without Enter."""
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         calls = []
         timeout = json.dumps({"error": {"code": "timeout"}})
@@ -2203,7 +2215,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             rc = peer_steward.main(["prompt", "child", "[handoff] all done, merge it, then release the gate"])
         self.assertEqual(rc, 3)
         self.assertEqual([c for c in calls if c[:3] == ["herdr", "agent", "send-keys"]],
-                         [["herdr", "agent", "send-keys", "child", "Enter"]])
+                         [])
         line = print_mock.call_args[0][0]
         self.assertIn("prompted=queued", line)
         self.assertIn("reason=prompt-box-residue", line)
@@ -2657,6 +2669,157 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertFalse(peer_steward._prompt_box_residue('"❯[handoff] all done, m…"', "[handoff] all done, merge it"))
         self.assertTrue(peer_steward._prompt_box_residue(
             '"❯[handoff] all done, merge it, then release …"', "[handoff] all done, merge it, then release the gate"))
+
+
+class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
+    """Actual 0.8 CLI/screen fixtures: user input survives; exact payload goes once."""
+
+    def setUp(self):
+        super().setUp()
+        for key in ("AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
+                    "CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID"):
+            os.environ.pop(key, None)
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        os.environ["HERDR_PANE_ID"] = "w1:pX"
+        self.harness, self.sid, self.status = "claude", "sid-child", "idle"
+        self.screen, self.messages, self.keys = CLAUDE_EMPTY, [], []
+        self.enterContext(mock.patch.object(peer_steward.shutil, "which", return_value="/fixture/herdr"))
+        self.enterContext(mock.patch.object(peer_steward.subprocess, "run", side_effect=self.run_herdr))
+        self.enterContext(mock.patch("builtins.print"))
+
+    def run_herdr(self, argv, **kwargs):
+        if argv[:3] in (["herdr", "agent", "get"], ["herdr", "agent", "wait"]):
+            return _herdr_json(_agent_json(self.harness, self.sid, "child", self.status))
+        if argv[:3] == ["herdr", "agent", "read"]:
+            return subprocess.CompletedProcess(argv, 1 if self.screen is None else 0,
+                                               stdout=self.screen or "", stderr="")
+        if argv[:3] == ["herdr", "agent", "prompt"]:
+            self.messages.append(argv[4])
+        if argv[:3] == ["herdr", "agent", "send-keys"]:
+            self.keys.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    def prompt(self, body="peer body"):
+        return peer_steward.main(["prompt", "child", body])
+
+    def idle(self):
+        # Run the actual existing receive callback entry, with native identity
+        # isolated to this fixture. Its internal claims/acks are not mocked.
+        with mock.patch("fleet.herdr_projection.may_report", return_value=True):
+            peer_steward.peer_message.retry_receiver_idle({"harness": self.harness, "session_id": self.sid})
+
+    def test_today_two_collision_shapes_after_preparation_preserve_draft_and_deliver_once(self):
+        prepare = peer_steward.peer_message.prepare_peer_message
+        for draft in ("그리고 토큰 효율을 위해서 좀 50% 넘으면 작업 세션들 주기적으로",
+                      "산출물 이동 하나 하는게 왜이렇게 오래 걸리는거임?"):
+            with self.subTest(draft=draft):
+                self.screen = CLAUDE_EMPTY
+                before = len(self.messages)
+                def user_types(*args, **kwargs):
+                    result = prepare(*args, **kwargs)
+                    self.screen = RULE + "\n❯ " + draft + "\n" + RULE + "\n"
+                    return result
+                with mock.patch.object(peer_steward.peer_message, "prepare_peer_message", side_effect=user_types):
+                    self.assertEqual(self.prompt("peer " + draft), 3)
+                original = self.screen
+                ref = self._all_records()[-1]["transfer_ref"]
+                row = peer_steward.peer_message._read_pending(ref)
+                self.assertEqual((row["state"], row["receipt"]), ("pending", "target-draft"))
+                self.assertEqual(len(self.messages), before)
+                self.idle()                   # Still a draft: no input, no Enter.
+                self.assertEqual(self.screen, original)
+                self.assertEqual(self.keys, [])
+                self.assertEqual(len(self.messages), before)
+                self.screen = CLAUDE_EMPTY
+                self.idle()
+                self.idle()                   # No duplicate after acknowledgement.
+                self.assertEqual(self.messages[before:], [row["text"]])
+                self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+
+    def test_claude_and_opencode_draft_or_unreadable_box_wait_but_empty_box_sends(self):
+        for harness, draft, empty in (("claude", CLAUDE_DRAFT, CLAUDE_EMPTY),
+                                      ("opencode", OPENCODE_DRAFT, OPENCODE_HOME)):
+            for screen in (draft, None, NO_BOX):
+                with self.subTest(harness=harness, screen=screen):
+                    self.harness, self.screen = harness, screen
+                    before = len(self.messages)
+                    body = harness + str(screen)
+                    self.assertEqual(self.prompt(body), 3)
+                    ref = self._all_records()[-1]["transfer_ref"]
+                    row = peer_steward.peer_message._read_pending(ref)
+                    self.assertEqual(row["state"], "pending")
+                    self.assertEqual(len(self.messages), before)
+                    self.screen = empty
+                    self.idle()
+                    self.assertEqual(self.messages[before:], [row["text"]])
+            self.screen = empty
+            before = len(self.messages)
+            self.assertEqual(self.prompt(harness + " direct"), 0)
+            self.assertEqual(len(self.messages), before + 1)
+
+    def test_draft_after_pending_claim_releases_only_unsent_claim(self):
+        self.screen = CLAUDE_DRAFT
+        self.assertEqual(self.prompt(), 3)
+        ref = self._all_records()[-1]["transfer_ref"]
+        row = peer_steward.peer_message._read_pending(ref)
+        claim = peer_steward.peer_message.claim_pending_herdr
+        self.screen = CLAUDE_EMPTY
+        def user_types(*args, **kwargs):
+            result = claim(*args, **kwargs)
+            self.screen = CLAUDE_DRAFT
+            return result
+        with mock.patch.object(peer_steward.peer_message, "claim_pending_herdr", side_effect=user_types):
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", self.sid, "idle")[0], 0)
+        held = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual((held["state"], held["rpc_claim"]), ("pending", None))
+        self.assertEqual(self.messages, [])
+        self.screen = CLAUDE_EMPTY
+        self.idle()
+        self.assertEqual(self.messages, [row["text"]])
+
+    def test_foreign_callback_and_changed_sid_cannot_drain_pending(self):
+        self.screen = CLAUDE_DRAFT
+        self.assertEqual(self.prompt(), 3)
+        self.screen = CLAUDE_EMPTY
+        with mock.patch("fleet.herdr_projection.may_report", return_value=False):
+            peer_steward.peer_message.retry_receiver_idle({"harness": "claude", "session_id": self.sid})
+        self.sid = "another-session"
+        self.idle()
+        with mock.patch("fleet.herdr_projection.may_report", return_value=True):
+            peer_steward.peer_message.retry_receiver_idle({"harness": "claude", "session_id": "sid-child"})
+        self.assertEqual(self.messages, [])
+
+    def test_existing_claude_stop_hook_waits_for_empty_box_and_delivers_once(self):
+        import io
+        path = _HERE.parent / "hooks" / "herdr-session-projection.py"
+        spec = importlib.util.spec_from_file_location("_draft_guard_stop_hook", path)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        payload = json.dumps({"session_id": self.sid, "hook_event_name": "Stop"})
+        self.screen = CLAUDE_DRAFT
+        self.assertEqual(self.prompt(), 3)
+        ref = self._all_records()[-1]["transfer_ref"]
+        text = peer_steward.peer_message._read_pending(ref)["text"]
+        with mock.patch("fleet.herdr_projection.project"), \
+             mock.patch("fleet.herdr_projection.may_report", return_value=True):
+            for screen in (CLAUDE_DRAFT, CLAUDE_EMPTY, CLAUDE_EMPTY):
+                self.screen = screen
+                with mock.patch.object(sys, "stdin", io.StringIO(payload)):
+                    self.assertEqual(hook.main(), 0)
+                if screen == CLAUDE_DRAFT:
+                    self.assertEqual(self.messages, [])
+        self.assertEqual(self.messages, [text])
+        self.assertEqual(self.keys, [])
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+
+    def test_codex_native_queue_is_not_subject_to_draft_reads(self):
+        self.harness, self.status, self.screen = "codex", "blocked", CLAUDE_DRAFT
+        with mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("native queue needs no box")), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                               return_value={"status": "queued", "reason": "native-queue-accepted"}) as queue:
+            self.assertEqual(self.prompt(), 3)
+            queue.assert_called_once()
+        self.assertEqual((self.messages, self.keys), ([], []))
 
 
 class F100cStewardModeTest(_TmpRootMixin, unittest.TestCase):
@@ -3270,6 +3433,41 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
         rc, line = self.continue_cmd(world)                                  # asked again: nothing more
         self.assertEqual((rc, "reason=superseded" in line, len(world.typed())), (3, True, 1), line)
 
+    def test_draft_after_continue_claim_stays_pending_then_idle_sends_once(self):
+        self.cleared()
+        world = _ContinueWorld()
+        claim = self.clear.claim_continue
+        def user_types(*args, **kwargs):
+            result = claim(*args, **kwargs)
+            world.screens = [CLAUDE_DRAFT]
+            return result
+        with mock.patch.object(self.clear, "claim_continue", side_effect=user_types):
+            rc, line = self.continue_cmd(world)
+        self.assertEqual(rc, 3, line)
+        self.assertIn("continued=queued", line)
+        self.assertEqual(world.typed(), [])
+        self.assertEqual(self.booking()["continued"]["state"], "pending")
+        self.clear._finish_continue(self.seat_obj.key, "n0nce", "queued", "draft")
+        world.screens = [CLAUDE_EMPTY]
+        os.environ["HERDR_PANE_ID"] = world.pane
+        def resume(path, nonce, target):
+            code, receipt = self.continue_cmd(world)
+            return dict(part.split("=", 1) for part in receipt.split() if "=" in part)
+        with mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "sid-B", "w")), \
+             mock.patch.object(peer_steward, "_agent_state", return_value=("idle", world.pane)), \
+             mock.patch.object(self.clear, "_run_continue", side_effect=resume):
+            peer_steward.receiver_idle({"harness": "claude", "session_id": "sid-B"}, world.pane)
+            peer_steward.receiver_idle({"harness": "claude", "session_id": "sid-B"}, world.pane)
+        self.assertEqual(len(world.typed()), 1)
+        self.assertEqual(self.booking()["continued"]["state"], "sent")
+
+    def test_late_queued_result_cannot_rewind_a_newer_continue_claim(self):
+        self.cleared()
+        claim, reason = self.clear.claim_continue(self.path, "n0nce")
+        self.assertEqual(reason, "")
+        self.assertFalse(self.clear._finish_continue(self.seat_obj.key, "n0nce", "queued", "draft"))
+        self.assertEqual(self.booking()["continued"], claim["continued"])
+
     def test_the_claude_session_is_the_process_one_when_herdr_still_names_the_cleared_one(self):
         for process, expect in (("sid-B", "continued=true"), ("sid-A", "reason=target-changed"),
                                 (None, "reason=target-changed")):
@@ -3380,7 +3578,7 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
                 rc, line = self.continue_cmd(world)
                 self.assertEqual(len(world.typed()), typed, line)
                 if not typed:
-                    self.assertIn("reason=target-changed", line)
+                    self.assertIn("reason=draft" if screen == OPENCODE_DRAFT else "reason=target-changed", line)
 
     # -- after the send: evidence, never a second one ------------------------------------------
 

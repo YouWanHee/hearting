@@ -41,6 +41,14 @@ def main() -> int:
             # `report-agent-session` stays herdr's own integration's job — reporting it
             # from two sources would race two `seq` claims for one pane.
             project("claude", session_id, report_session=False)
+            if payload.get("hook_event_name") in {"Stop", "UserPromptSubmit"}:
+                # Reuse the existing idle/receive callback and shared draft guard.
+                import importlib.util
+                utility = tools.parent / "utilities" / "peer-message.py"
+                spec = importlib.util.spec_from_file_location("_peer_idle_message", utility)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.retry_receiver_idle({"harness": "claude", "session_id": session_id})
             break
     except Exception:
         pass
