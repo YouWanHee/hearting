@@ -41,6 +41,7 @@ from dispatch_completion_join import (
     receipt_with_stage_advance,
     remove_supervisor_state,
     runtime_wait_requested,
+    cancel_unstarted_chain_successors,
     settle_runtime_wait_children,
     start_retry_prompt,
     validate_delivery_timing,
@@ -1049,6 +1050,19 @@ def main(argv: list[str] | None = None) -> int:
                     **delivery_timing,
                 })
             wait_requested = runtime_wait_requested(final_text)
+            if cancel_unstarted_chain_successors(
+                    Path(args.jobs), delivered, [current[attempt] for attempt in new_attempts],
+                    final_text):
+                current = {row.attempt_id: row for row in current_children(
+                    Path(args.jobs), args.parent_attempt_id,
+                    route_id=args.route_id, route_hash=args.route_hash)}
+                new_attempts = set(current).difference(delivered)
+                partition = partition_runtime_wait_children(
+                    Path(args.jobs), args.parent_attempt_id,
+                    [current[attempt] for attempt in new_attempts], new_attempts,
+                )
+                unstarted = set(partition.unstarted)
+                park_attempts = set(partition.joinable)
             if unstarted or (wait_requested and not new_attempts):
                 rows, settled = settle_runtime_wait_children(
                     Path(args.jobs), args.parent_attempt_id, delivered, join_interval=args.join_interval,

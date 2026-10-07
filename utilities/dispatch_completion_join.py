@@ -53,6 +53,7 @@ from dispatch_contract import (  # noqa: E402
     validate_review_output_binding,
     close_attempt_row,
     close_attempt_row_if,
+    close_refused_chain_rows,
     marker_bound_delivery_transaction,
     marker_bound_process_identity,
     observed_attempt_liveness,
@@ -1158,6 +1159,39 @@ def partition_runtime_wait_children(
         unstarted = frozenset(set(unstarted) | set(chain_pending))
         chain_pending = frozenset()
     return RuntimeWaitPartition(joinable, chain_pending, unstarted, refusal_settled, tuple(frontiers))
+
+
+def cancel_unstarted_chain_successors(
+    jobs: Path, delivered: set[str], rows: list[ChildRow], final_text: object,
+) -> frozenset[str]:
+    """Close the serial sub-sessions a finished owner never started.
+
+    An owner whose turn ends with its final handoff (PASS, FAIL or BLOCKED) -- after a
+    correction stopped its chain, say -- is done with the chain. The successors registered up
+    front and never started have no process to wait for or clean up, so they close as
+    cancelled and never launched (the refused-chain close), and the owner's result ends the
+    work instead of a demand to start them (BC rt-96bab699, 2026-10-07). Every owner
+    supervisor asks here; a turn without a handoff changes nothing.
+    """
+
+    from route_authority import HANDOFF_RE
+
+    if not isinstance(final_text, str) or HANDOFF_RE.search(final_text.strip()) is None:
+        return frozenset()
+    attempts = [
+        row.attempt_id for row in rows
+        if row.attempt_id not in delivered
+        and row.metadata.get("session_chain_id")
+        and row.metadata.get("subsession_mode") == "serial"
+        and subsession_advance.row_is_registered_only(row.status, row.metadata)
+    ]
+    if not attempts:
+        return frozenset()
+    closed = close_refused_chain_rows(
+        Path(jobs), attempts, note="subsession-chain-owner-finished",
+        reconcile_reason="owner-final-handoff",
+    )
+    return frozenset(closed.cancelled)
 
 
 def settle_runtime_wait_children(

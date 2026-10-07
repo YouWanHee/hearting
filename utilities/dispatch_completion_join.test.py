@@ -144,6 +144,34 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.live.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.live.chmod(0o755)
 
+    def test_a_finished_owner_closes_only_the_chain_successors_it_never_started(self):
+        # BC rt-96bab699: a correction stopped a serial chain, the owner reported BLOCKED, and the
+        # successors registered up front were then demanded to start, twice, until the owner died.
+        chain = ",session_chain_id=ssc-fixture,subsession_mode=serial,launch_claimed=0"
+        self.jobs.write_text(
+            row("open", "att-s2", "att-parent", "s2", process_metadata={"subsession_index": "2"}).replace("\n", chain + "\n")
+            + row("open", "att-s3", "att-parent", "s3", process_metadata={"subsession_index": "3"}).replace("\n", chain + "\n")
+            + row("open", "att-seen", "att-parent", "seen").replace("\n", chain + "\n")
+            + row("open", "att-plain", "att-parent", "plain").replace("\n", ",launch_claimed=0\n")
+            + row("open", "att-running", "att-parent", "running", process_metadata={
+                "launch_claimed": "1", "launch_started": "1"}).replace("\n", chain + "\n").replace(
+                    ",launch_claimed=0\n", "\n"),
+            encoding="utf-8")
+        rows = JOIN.current_children(self.jobs, "att-parent")
+        handoff = "artifact: -\nverdict: BLOCKED\nblocker: the user reduced verification"
+        for text in ("runtime_wait: registered-children", "Stopping the chain.", None):
+            self.assertEqual(JOIN.cancel_unstarted_chain_successors(self.jobs, set(), rows, text), frozenset())
+        self.assertEqual(JOIN.cancel_unstarted_chain_successors(self.jobs, {"att-seen"}, rows, handoff),
+                         frozenset({"att-s2", "att-s3"}))
+        after = {child.attempt_id: child for child in JOIN.current_children(self.jobs, "att-parent")}
+        for attempt in ("att-s2", "att-s3"):
+            self.assertEqual(after[attempt].status, "done")
+            self.assertEqual(after[attempt].metadata["launch_outcome"], "never-launched")
+            self.assertEqual(after[attempt].metadata["failure_class"], "cancelled")
+            self.assertEqual(D.attempt_process_quiescence(after[attempt].metadata).state, "quiescent")
+        for attempt in ("att-seen", "att-plain", "att-running"):
+            self.assertEqual(after[attempt].status, "open")
+
     def test_required_action_matches_receipt_and_harvest_contract(self):
         self.assertEqual(
             JOIN.required_action_for_attempt("open", {}), "complete-open"
