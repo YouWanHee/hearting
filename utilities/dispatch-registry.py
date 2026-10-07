@@ -3088,6 +3088,14 @@ def main(argv):
             except (OSError, DispatchContractError) as exc:
                 print(f"check=failed\nreason={exc}"); return 65
             result.update(pending=False, applied=True)
+        elif result["pending"]:
+            # The digest pins this exact row; only the review report is the parent's to supply.
+            import shlex
+            from parent_next_directive import entrypoint
+            result["apply_command"] = shlex.join([
+                sys.executable, entrypoint(ROOT, "utilities/dispatch-registry.py"), "resolve-terminal-conflict",
+                "--jobs", str(args.jobs), "--attempt", args.attempt,
+                "--expected-row-sha256", result["row_sha256"], "--apply"]) + " --review-evidence <review report>"
         print("check=ok\n" + json.dumps(result, sort_keys=True))
         return 0
     if args.operation not in ("liveness", "orphan-scan") and not any((args.session, args.route, args.node, args.attempt, args.job)):

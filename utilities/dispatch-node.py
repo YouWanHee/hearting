@@ -556,6 +556,13 @@ def requested_launch_lifecycle(adapter_args, environ=None):
     return select_launch_lifecycle(environ)
 
 
+def dry_run_notice(action):
+    """The default action launches nothing: its receipt says so first, before the wrapper's long one."""
+    if action == "dry-run":
+        print("started=0", flush=True)
+        print("next_step=dry run: nothing was registered or started; rerun with --start to launch", flush=True)
+
+
 def run_launcher(argv, action, lifecycle):
     """Run the wrapper (or owner selector) this node hands its launch to.
 
@@ -775,6 +782,7 @@ def main():
   if requested_jobs: argv += ["--jobs",requested_jobs]
   if a.attempt_id: argv += ["--attempt-id",a.attempt_id]
   argv += strip_leading_separator(a.adapter_args)
+  dry_run_notice(a.action)
   raise SystemExit(run_launcher(argv,a.action,lifecycle))
  try:
   registry=resolve_global_registry(
@@ -838,6 +846,7 @@ def main():
    print("child_spawned=0")
    raise SystemExit(64)
   launch_worktree=sealed_worktree
+ dry_run_notice(a.action)
  print("completion_marker="+str(ROUTE.completion_dir(route["route_id"],jobs=registry.path)/(node["id"]+".json")))
  try:
   worker_type=worker_type_for_kind(node["kind"])

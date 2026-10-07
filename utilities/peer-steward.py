@@ -1112,6 +1112,18 @@ def _seat_handover(ident, own_sid, own_harness):
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
+    if not args.pane and not args.beside:
+        # Beside the calling pane, the way a session starts its own peer.
+        args.beside = os.environ.get("HERDR_PANE_ID", "").strip() or None
+        if not args.beside:
+            print(f"started=false reason=pane-unknown agent={args.kind} name={args.name} "
+                  "pane=- detail=name --pane or --beside outside a herdr pane")
+            return 1
+    if args.beside and not args.cwd:
+        try:
+            args.cwd = os.getcwd()
+        except OSError:
+            args.cwd = None
 
     pane_cwd = None
     cwd_flag = []
@@ -3310,10 +3322,10 @@ def build_parser():
     p_start = sub.add_parser("start")
     p_start.add_argument("name")
     p_start.add_argument("--kind", required=True, choices=("claude", "codex", "opencode"))
-    pane_choice = p_start.add_mutually_exclusive_group(required=True)
+    pane_choice = p_start.add_mutually_exclusive_group()
     pane_choice.add_argument("--pane")
-    pane_choice.add_argument("--beside")
-    p_start.add_argument("--cwd", default=None)
+    pane_choice.add_argument("--beside", help="default: the calling pane (HERDR_PANE_ID)")
+    p_start.add_argument("--cwd", default=None, help="default for a new pane: the calling cwd")
     p_start.add_argument("--permission-mode", choices=("bypass", "inherit"), default=None)
     p_start.set_defaults(func=cmd_start)
 

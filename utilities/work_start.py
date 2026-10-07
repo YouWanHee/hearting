@@ -1881,7 +1881,8 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
 
 
 def _arm_capacity_resume(result, path, jobs):
-    """A usage-limit pause with a known reset time resumes itself once (audit §4 #17)."""
+    """A usage-limit pause with a known reset time, or an owner launch that did not start,
+    resumes itself once (audit §4 #17)."""
     import capacity_auto_resume as capacity_resume
     try:
         armed = capacity_resume.arm(result, path, jobs)
@@ -1889,6 +1890,12 @@ def _arm_capacity_resume(result, path, jobs):
         armed = None
     if not armed:
         return result
+    if armed.get("cause") == "launch-not-started":
+        return {**result, "auto_resume": armed, "required_action": "wait-for-auto-resume",
+                "parent_next": "end-turn", "parent_next_reason": "launch-auto-resume",
+                "next_step": f"The owner did not start and nothing ran. The runtime runs resume_command once "
+                    f"at {armed['resume_at']} and then leaves this session one notice of the result. "
+                    "resume_command stays valid to try earlier."}
     return {**result, "auto_resume": armed, "required_action": "wait-for-auto-resume",
             "parent_next": "end-turn", "parent_next_reason": "capacity-auto-resume",
             "next_step": f"The runtime runs resume_command once at {armed['resume_at']} and then leaves "

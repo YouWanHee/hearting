@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""A usage-limit pause with a known reset time resumes itself once and tells its session."""
+"""A usage-limit pause with a known reset time, or an owner launch that did not start,
+resumes itself once and tells its session."""
 import json
 import sys
 import tempfile
@@ -47,6 +48,23 @@ class ArmTest(unittest.TestCase):
                 self.assertIsNone(self.arm(result))
         self.assertIsNone(self.arm(env={C.CHAIN_ENV: str(C.MAX_CHAIN)}))  # bounded chain
         self.assertEqual(self.spawned, [])
+
+
+    def test_a_launch_that_did_not_start_is_run_again_a_minute_later(self):
+        for index, reason in enumerate(C.LATER_REASONS):
+            with self.subTest(reason=reason):
+                result = {"state": "needs-attention", "reason": reason, "required_action": "resume-later",
+                          "route_id": f"rt-{index}"}
+                armed = self.arm(result)
+                self.assertEqual((armed["state"], armed["cause"]), ("armed", "launch-not-started"))
+                self.assertEqual(C._epoch(armed["resume_at"]), RETRY_EPOCH - 3600 + C.LATER_SECONDS)
+                self.assertEqual(json.loads(Path(armed["record"]).read_text())["cause"], "launch-not-started")
+        # The same reason without the resume-later remedy is a diagnostic, not a pause.
+        self.assertIsNone(self.arm({"state": "needs-attention", "reason": "owner-launch-not-admitted",
+                                    "route_id": "rt-x"}))
+        self.assertIsNone(self.arm({"state": "needs-attention", "reason": "owner-launch-not-started",
+                                    "required_action": "resume-later", "route_id": "rt-y"},
+                                   env={C.CHAIN_ENV: str(C.MAX_CHAIN)}))
 
 
 class RunTest(unittest.TestCase):
@@ -106,6 +124,18 @@ class ReceiptAndNoticeTest(unittest.TestCase):
         with mock.patch.object(C, "arm", return_value=None):
             self.assertEqual(work_start._arm_capacity_resume(dict(PAUSE), "/r", "/j"), PAUSE)
 
+    def test_a_launch_resume_receipt_ends_the_turn_and_says_nothing_ran(self):
+        import work_start
+        pause = {"state": "needs-attention", "reason": "owner-launch-not-started",
+                 "required_action": "resume-later", "route_id": PAUSE["route_id"]}
+        armed = {"record": "/x.json", "resume_at": "2026-10-07T12:01:00Z", "state": "armed",
+                 "cause": "launch-not-started"}
+        with mock.patch.object(C, "arm", return_value=armed):
+            result = work_start._arm_capacity_resume(dict(pause), "/r/route.json", "/j/jobs.log")
+        self.assertEqual((result["parent_next"], result["required_action"], result["parent_next_reason"]),
+                         ("end-turn", "wait-for-auto-resume", "launch-auto-resume"))
+        self.assertIn("did not start and nothing ran", result["next_step"])
+
     def test_the_owning_session_gets_one_notice(self):
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp) / "jobs.log"
@@ -119,6 +149,13 @@ class ReceiptAndNoticeTest(unittest.TestCase):
             self.assertEqual(len(claimed), 1)
             text = sweep.delivery_context([(jobs.parent, claimed)])
             self.assertIn("paused again until 2026-10-08T00:00:00Z", text)
+            self.assertIn("resumed after the usage limit reset", text)
+            with mock.patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "sid-9"}, clear=True):
+                C._notify({**record, "retry_at": "2026-10-07T12:01:00Z", "cause": "launch-not-started"},
+                          {"state": "running", "owner_attempt_id": "att-2"})
+            claimed, _ = sweep.sweep_deliver(jobs.parent, "claude-parent-runtime", "sid-9")
+            self.assertIn("started again after a launch that did not start",
+                          sweep.delivery_context([(jobs.parent, claimed)]))
 
 
 if __name__ == "__main__":

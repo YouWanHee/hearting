@@ -423,6 +423,9 @@ class DryRunCompletionMarkerPathTest(unittest.TestCase):
                     / (node["id"] + ".json")
                 )
         lines = captured_stdout.getvalue().splitlines()
+        # The default action launches nothing, and its receipt says so first.
+        self.assertEqual(lines[0], "started=0", lines)
+        self.assertIn("nothing was registered or started", lines[1])
         marker_lines = [line for line in lines if line.startswith("completion_marker=")]
         self.assertEqual(len(marker_lines), 1, lines)
         printed = marker_lines[0][len("completion_marker="):]

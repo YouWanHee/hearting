@@ -2023,6 +2023,9 @@ class DispatchBatchTest(unittest.TestCase):
         rc, receipt = self._degraded_dry_run_receipt(output)
         self.assertEqual(rc, 0)
         self.assertEqual(receipt["state"], "validated")
+        # The default action launches nothing, and the receipt says so.
+        self.assertEqual((receipt["registered"], receipt["started"], receipt["child_spawned"]), (0, 0, 0))
+        self.assertIn("rerun with --start", receipt["next_step"])
         self.assertEqual(receipt["degradation_reason"], "")
         self.assertEqual(receipt["selection_diagnostics"]["degradation_cause"], "")
 
