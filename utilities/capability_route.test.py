@@ -5088,6 +5088,37 @@ class GroundingCwdLineageTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError,"grounding-cwd-revision-unverifiable"):
      R._launch_root_identity("grounding_cwd",root)
     scan.assert_not_called()
+ def test_non_git_cwd_is_unversioned_without_reading_its_files(self):
+  activation=R._runtime_activation_module(); scan=AssertionError("cwd content scan")
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"GIT_CEILING_DIRECTORIES":tmp}):
+   home=Path(tmp)/"home"; (home/"files").mkdir(parents=True)
+   for n in range(100): (home/"files"/str(n)).write_text("user data")
+   R._forget_launch_path(home)
+   with mock.patch.object(R,"_launch_source_revision",side_effect=scan), \
+        mock.patch.object(activation,"source_revision",side_effect=scan), \
+        mock.patch.object(activation,"_tree_digest",side_effect=scan):
+    identity=R._launch_root_identity("grounding_cwd",home)
+   self.assertEqual(identity["release_id"],"unversioned")
+   self.assertEqual(identity["release_id"],R._git_commit(home))
+   # No lineage to compare, so its files changing is not cwd drift.
+   route={"artifact_root":str(Path(tmp)/"artifacts"),"cwd":str(home)}
+   route["launch_compatibility_tuple"]={"contract_version":1,**R.launch_compatibility_tuple(artifact_root=route["artifact_root"],cwd=home)}
+   (home/"files"/"new").write_text("changed"); R._forget_launch_path(home)
+   _,mismatches=R.revalidate_launch_compatibility(route)
+   self.assertNotIn("grounding_roots.cwd",mismatches)
+ def test_non_git_code_root_cwd_keeps_its_complete_identity(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"GIT_CEILING_DIRECTORIES":tmp}):
+   release=Path(tmp)/"release"; release.mkdir(); (release/"RELEASE_VERSION").write_text("v9.9.9\n")
+   R._forget_launch_path(release)
+   cwd=R._launch_root_identity("grounding_cwd",release)["release_id"]
+   R._forget_launch_path(release)
+   self.assertEqual(cwd,R._launch_root_identity("runtime_root",release)["release_id"])
+   self.assertTrue(cwd.startswith("release:v9.9.9:"))
+   dev=Path(tmp)/"dev"; dev.mkdir(); (dev/"code.py").write_text("code")
+   R._forget_launch_path(dev)
+   runtime=R._launch_root_identity("runtime_root",dev)
+   self.assertEqual(R._launch_root_identity("grounding_cwd",dev)["release_id"],runtime["release_id"])
+   self.assertTrue(runtime["release_id"].startswith("tree:"))
  def test_same_head_with_dirty_suffix_is_accepted(self):
   with tempfile.TemporaryDirectory() as tmp:
    root,_,base=self._repo(tmp)
