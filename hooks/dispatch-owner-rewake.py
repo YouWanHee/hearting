@@ -790,7 +790,15 @@ def wait_for_attempt(
                 timeout=30,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "bridge-error", "TimeoutExpired"
+            # A slow registry/filesystem read is not the awaited owner's end.
+            # Keep this same carrier armed within its original finite window.
+            time.sleep(min(interval, remaining))
+            continue
+        except OSError as exc:
             return "bridge-error", type(exc).__name__
         if result.returncode == 0:
             return "ready", "terminal-quiescent"

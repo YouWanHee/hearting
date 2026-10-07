@@ -348,6 +348,36 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertEqual(command[-2:], ["--attempt-id", "att-owner-1"])
         self.assertIn(str(self.jobs), command)
 
+    def test_probe_timeout_keeps_the_exact_owner_wait_armed(self) -> None:
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        for code, expected in ((0, ("ready", "terminal-quiescent")),
+                               (3, ("attention", "terminal-failure-or-unclosed"))):
+            with self.subTest(code=code), mock.patch.object(
+                    rewake.subprocess, "run", side_effect=[
+                        subprocess.TimeoutExpired("readiness", 30),
+                        subprocess.CompletedProcess([], code)]
+                ) as run, mock.patch.object(rewake.time, "sleep") as sleep, \
+                    mock.patch.object(rewake.time, "monotonic", side_effect=[0.0, 31.0]), \
+                    mock.patch.dict(os.environ, {"AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "3",
+                                                 "AGENT_CLAUDE_REWAKE_MAX_SECONDS": "60"}):
+                self.assertEqual(rewake.wait_for_attempt(launch, self.root / "ready.py"), expected)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_args_list[0].args, run.call_args_list[1].args)
+                sleep.assert_called_once_with(3)
+
+    def test_probe_timeout_preserves_the_original_wait_deadline(self) -> None:
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        with mock.patch.object(rewake.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("readiness", 30)) as run, \
+                mock.patch.object(rewake.time, "sleep") as sleep, \
+                mock.patch.object(rewake.time, "monotonic", return_value=60.0):
+            self.assertEqual(rewake.wait_for_attempt(launch, self.root / "ready.py", deadline=60.0),
+                             ("bridge-error", "TimeoutExpired"))
+        self.assertEqual(run.call_count, 1)
+        sleep.assert_not_called()
+
     def test_receipt_forbids_visible_monitor_rearming(self) -> None:
         launch = rewake.parse_launch(self.payload())
         assert launch is not None
