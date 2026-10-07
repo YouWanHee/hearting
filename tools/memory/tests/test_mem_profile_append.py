@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""`mem profile-append` must splice one item into the manual-memo block only.
+
+The full body goes through the normal source upsert (same record id, prior
+body in history). A raw partial `mem add --source user-profile:<stem>` would
+overwrite the structured sections instead.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from helpers import MEMORY_DIR
+
+
+MEM = MEMORY_DIR / "mem.py"
+
+SEED = """aspect: 06_collaboration_style
+
+## 협업 방식
+- 먼저 방향을 짧게 확인한다.
+
+## 사용자 수동 메모
+- 기존 메모 하나.
+"""
+
+
+class ProfileAppendTest(unittest.TestCase):
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.store = self.root / "store"
+        self.projects = self.root / "projects"
+        self.profile_dir = self.root / "profile"
+        for path in (self.store, self.projects, self.profile_dir,
+                     self.root / "home", self.root / "state"):
+            path.mkdir()
+        config = self.root / "config" / "hearting"
+        config.mkdir(parents=True)
+        (config / "memory-sync.json").write_text('{"enabled": false}\n')
+        self.mem("add", "durable", "profile", SEED, "--scope", "global",
+                 "--source", "user-profile:06_collaboration_style")
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def env(self, **extra):
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("MEM_", "AGENT_", "CODEX_", "OPENCODE_"))
+        }
+        env.update({
+            "HOME": str(self.root / "home"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_DATA_HOME": str(self.root / "data"),
+            "MEM_STORE": str(self.store),
+            "MEM_PROJECTS": str(self.projects),
+            "MEM_PROFILE": str(self.profile_dir),
+            "MEM_DUMP_COMMIT": "0",
+            "MEM_EXCHANGE_AUTO": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        env.update(extra)
+        return env
+
+    def mem(self, *args, check=True):
+        result = subprocess.run(
+            [sys.executable, str(MEM), *args],
+            cwd=self.project,
+            env=self.env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        return result
+
+    def test_append_keeps_structured_sections_and_id(self):
+        first = self.mem("profile", "06_collaboration_style").stdout
+        self.assertIn("먼저 방향을 짧게 확인한다.", first)
+        done = self.mem("profile-append", "06_collaboration_style", "새 메모 한 줄.")
+        self.assertIn("[upsert]", done.stdout)
+        body = self.mem("profile", "06_collaboration_style").stdout
+        self.assertIn("먼저 방향을 짧게 확인한다.", body)
+        self.assertIn("기존 메모 하나.", body)
+        self.assertIn("새 메모 한 줄.", body)
+
+    def test_append_by_number_and_alias(self):
+        self.mem("profile-append", "06", "번호로 덧붙이기.")
+        self.mem("profile-append", "collaboration", "별칭으로 덧붙이기.")
+        body = self.mem("profile", "06_collaboration_style").stdout
+        self.assertIn("번호로 덧붙이기.", body)
+        self.assertIn("별칭으로 덧붙이기.", body)
+
+    def test_prior_body_stays_in_history(self):
+        self.mem("profile-append", "06_collaboration_style", "기록 남기기.")
+        shown = self.mem("history", self._profile_id(), "--show", "1").stdout
+        self.assertIn("기존 메모 하나.", shown)
+        self.assertNotIn("기록 남기기.", shown)
+
+    def test_missing_aspect_and_empty_text_are_refused(self):
+        self.assertEqual(self.mem("profile-append", "no-such-aspect", "x", check=False).returncode, 2)
+        self.assertEqual(self.mem("profile-append", "06_collaboration_style", "  ", check=False).returncode, 2)
+
+    def _profile_id(self):
+        shown = self.mem("recall", "기존 메모 하나.", "--full").stdout
+        for line in shown.splitlines():
+            if "profile-aspect-06-collaboration" in line:
+                token = line.strip().split()[-1].rstrip(":")
+                if token:
+                    return token
+        raise AssertionError(f"no profile id in recall output: {shown!r}")
+
+
+if __name__ == "__main__":
+    unittest.main()
