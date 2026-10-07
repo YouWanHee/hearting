@@ -446,7 +446,7 @@ function fixture(options = {}) {
   const scope = {path, Buffer, process: {pid: 123, env: Object.assign(
       {HERDR_PANE_ID: "fixture-pane", OPENCODE_SESSION_ID: "ses_foreign"}, options.env || {})},
     isWorkerSession: () => !!options.worker, existsSync: fsExistsSync, readFileSync: fsReadFileSync,
-    root: options.root || "fixture-root", herdrProjection: options.herdrProjection || "fixture-projector",
+    root: options.root || "fixture-root", herdrProjection: options.herdrProjection || "fixture-root/tools/fleet/herdr_projection.py",
     Date: {now: () => now}, AbortController,
     openSync: file => {reads.push(file);if (!files[file]) throw Error("foreign proc read");return file},
     readSync: (fd, buffer, offset, size) => files[fd].copy(buffer, offset, 0, size), closeSync: () => {},
@@ -535,7 +535,7 @@ console.log(JSON.stringify({before, gets, commands: f.commands, unavailable: una
 ''')
         self.assertEqual(result["before"], [0, 0])
         self.assertEqual(result["gets"], 1)
-        self.assertEqual(result["commands"], [["fixture-projector", "--harness", "opencode", "--session-id", "ses_A",
+        self.assertEqual(result["commands"], [["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
                                               "--seq", "1000001", "--session-start-source", "startup"]])
         self.assertEqual(result["unavailable"], [])
         self.assertEqual(result["reads"], ["/proc/self/cmdline", "/proc/self/stat"])
@@ -554,9 +554,9 @@ for (const response of [{data: {id: "ses_A"}}, {id: "ses_A", parentID: null},
 }
 console.log(JSON.stringify(commands));
 ''')
-        startup = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A",
+        startup = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
                    "--seq", "1000001", "--session-start-source", "startup"]
-        metadata = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
+        metadata = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
         self.assertEqual(result, [startup, startup] + [metadata] * 6)
 
     def test_opencode_normal_tool_retry_retains_actual_sdk_identity_and_observes_timeout(self):
@@ -576,8 +576,8 @@ console.log(JSON.stringify({gets, commands: f.commands, sdk}));
 ''')
         self.assertEqual(result["gets"], 2)
         self.assertEqual(result["commands"], [
-            ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"],
-            ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A",
+            ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"],
+            ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
              "--seq", "1000001", "--session-start-source", "startup"]])
         self.assertEqual(result["sdk"], [["sdk-timeout", False], ["verified", True]])
 
@@ -597,7 +597,7 @@ console.log(JSON.stringify({whileAlive, commands: f.commands,
  timeout: f.logs.some(row => row.extra.reason === "publisher-stale-observation")}));
 ''')
         self.assertEqual(result["whileAlive"], 1)
-        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
         self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
             prefix + ["--seq", "1000002"], prefix + ["--seq", "1000003"], prefix + ["--no-report-session"]])
         self.assertTrue(result["timeout"])
@@ -616,7 +616,7 @@ await f.scope.projectPane("ses_B", third); // A later fork is not the native lau
 console.log(JSON.stringify({commands: f.commands,
  sdk: f.logs.filter(row => row.extra.stage === "sdk").map(row => row.extra.reason)}));
 ''')
-        metadata = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
+        metadata = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
         self.assertEqual(result["commands"], [metadata, metadata])
         self.assertEqual(result["sdk"], ["verified", "sdk-stale-callback", "verified"])
 
@@ -633,7 +633,7 @@ await noPid.scope.projectPane("ses_A", other);noPid.children[0].emit("error", Er
 await noPid.scope.projectPane("ses_A", other);
 console.log(JSON.stringify({commands: f.commands, noPid: noPid.commands}));
 ''')
-        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
         self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
             prefix + ["--seq", "1000002", "--session-start-source", "startup"], prefix + ["--seq", "1000003"]])
         self.assertEqual(result["noPid"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
@@ -654,7 +654,7 @@ await thrown.scope.projectPane("ses_A", other);await thrown.scope.projectPane("s
 console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs,
  thrown: {commands: thrown.commands, sync: thrown.sync, logs: thrown.logs}}));
 ''')
-        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
         startup = prefix + ["--seq", "1000001", "--session-start-source", "startup"]
         refresh = prefix + ["--seq", "1000002"]
         for record in [result, result["thrown"]]:
@@ -819,7 +819,7 @@ f.children[0].stdout.write(observation);
 await new Promise(resolve => setImmediate(resolve)); f.exit(0);
 console.log(JSON.stringify({commands: f.commands, logs: f.logs}));
 '''.replace("%%STATE%%", str(self.state)))
-        prefix = ["fixture-projector", "--harness", "opencode", "--session-id", "ses_A"]
+        prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
         self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"]])
         finished = [row["extra"] for row in result["logs"] if row["extra"]["reason"] == "report-attempts-finished"]
         self.assertEqual(len(finished), 1)

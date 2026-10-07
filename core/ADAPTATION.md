@@ -163,6 +163,12 @@ native route and bound to the same TUI process lifecycle; it is never estimated
 from a callback session id, an SDK-first root, timing, pane labels, or daemon
 environment.
 
+OpenCode identity and completion helpers resolve a live harness root at invocation
+time if their import-time release has been removed, using the existing core root
+order. They preserve the exact session and inherited dispatch registry across that
+fallback. Carrier logs name a missing helper or directory, claim and prompt result;
+consecutive identical skip observations remain one line.
+
 On OpenCode, non-route deep roles use a deep tier when the selected whole-file model configuration declares one, and otherwise retain the existing balanced-deep fallback. Explicit role edits target that same resolved tier. Registered jobs continue to resolve their sealed model profile independently of role families.
 
 ## 4. Capability Model
