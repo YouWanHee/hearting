@@ -19,6 +19,7 @@ const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
+const frameNativeAnswer = path.join(root, "utilities", "frame_native_answer.py")
 const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_patch", "bash"])
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 const promptBySession = new Map()
@@ -1155,6 +1156,15 @@ export const AgentHarnessGuards = async (ctx) => {
     if (toolName === "read") {
       const readFile = normalizeFile(ctx, args.filePath || args.path || args.file)
       if (readFile) collectPreflight("read", [readFile, input.sessionID || "opencode-plugin"])
+    }
+    // The person's reply to a registered frame question is kept for the next start
+    // (utilities/frame_native_answer.py). Non-blocking, like the read marker.
+    if (toolName === "question") {
+      spawnSync("python3", [frameNativeAnswer, "--opencode"], {
+        input: JSON.stringify({ tool: toolName, sessionID: input.sessionID || "", args,
+                                answers: output?.metadata?.answers || [] }),
+        encoding: "utf8",
+      })
     }
   },
   })

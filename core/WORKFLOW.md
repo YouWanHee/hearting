@@ -579,7 +579,10 @@ itself, in this order, and never leaves it to a helper:
    (권장), each option with its one-line meaning; never paraphrase a question
    into harness vocabulary, and never add questions the interview does not
    carry. A tired reader must be able to answer without opening the plan.
-4. Put the actual responses in the returned `answers_template` and submit
+4. The native tool's reply is kept by the harness's post-tool hook beside the
+   registered question (`answers.native.json`; the restatement asked verbatim,
+   its first option confirming it), so `resume_command` alone continues. A
+   reply given in conversation goes into the returned `answers_template` and
    `start --route <file> --answers <file>`. The runtime renders intent and
    records the release that authorizes owner launch. A repeated submission
    reuses it.

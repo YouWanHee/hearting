@@ -1557,6 +1557,22 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(str(caught.exception), "frame-input-invalid: " + "; ".join(expected))
         self.assertEqual(self.calls, [])
 
+    def test_the_interview_template_is_drafted_from_the_request_and_the_frame_brief(self):
+        brief = self.output / "shards/frame/direction-brief.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("## 1. Problem Statement\n\nThe report loses the second result.\n\n"
+                         "## 4. Direction Verdict\n\nKeep both results in one report.\n\n"
+                         "## 6. Open Risks\n\nNone known.\n", encoding="utf-8")
+        route = {**self.route, "work_request": {"text": "Run the two commands and keep both results. Then report."}}
+        template = W.frame_interview_step(route, self.path, self.jobs, run=self.run_command)["interview_template"]
+        self.assertEqual(template["understanding"], "Run the two commands and keep both results.")
+        self.assertEqual(template["brief"], {"problem": "The report loses the second result.",
+                                             "outcome": "Keep both results in one report.", "affected": "",
+                                             "constraints": "", "open": "None known."})
+        brief.unlink()                                       # no brief yet: empty fields, as before
+        self.assertEqual(self.step()["interview_template"]["brief"]["problem"], "")
+        self.assertEqual(self.calls, [])                     # a draft registers nothing
+
     def test_register_before_question_then_actual_answers_release_once(self):
         self.assertEqual(self.step()["state"], "needs-interview")
         asked = self.step(interview=self.question_file)
@@ -1903,6 +1919,39 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
             "recommended": 0, "why": "Only you can weigh the wording against the schedule."}]}
         self.question_file.write_text(json.dumps(question))
         return question
+
+    def test_the_persons_native_reply_is_recorded_and_the_next_start_takes_it(self):
+        question = self.scope_question()
+        self.assertEqual(self.step(interview=self.question_file)["state"], "needs-question")
+        shown = lambda scope_answer, restatement="예": [
+            {"question": "제가 이해한 내용: " + question["understanding"], "options": ["예 (권장)", "아니오(고쳐 말하기)"],
+             "answer": restatement},
+            {"question": question["questions"][0]["question"], "options": ["Both (recommended)", "Approval only"],
+             "answer": scope_answer}]
+        self.assertIsNone(W.record_native_answer(self.route, self.jobs, shown("Both", restatement="아니오(고쳐 말하기)")))
+        self.assertIsNone(W.record_native_answer(self.route, self.jobs, shown("")))          # nothing picked
+        self.assertIsNone(W.record_native_answer(self.route, self.jobs, [{"question": "unrelated", "answer": "x"}]))
+        recorded = W.record_native_answer(self.route, self.jobs, shown("Approval only (keep the wording)"))
+        answers = json.loads(recorded.read_text())
+        self.assertEqual((answers["actor_kind"], answers["understanding_confirmed"]), ("user", True))
+        self.assertEqual(answers["answers"]["q-scope"], {"choice": "none", "note": "Approval only (keep the wording)"})
+        recorded = W.record_native_answer(self.route, self.jobs, shown("Approval only"))     # the latest reply
+        self.assertEqual(json.loads(recorded.read_text())["answers"]["q-scope"], {"choice": 1, "note": ""})
+        released = self.step()                                     # a bare resume: no answers file to write
+        self.assertEqual(released["state"], "released", released)
+        self.assertEqual(self.calls, ["gate", "release"])
+        self.assertIsNone(W.record_native_answer(self.route, self.jobs, shown("Both")))     # answered: nothing waits
+
+    def test_a_typed_correction_is_the_restatements_answer(self):
+        question = self.scope_question()
+        self.step(interview=self.question_file)
+        import frame_interview as FI
+        interview = json.loads(Path(self.step()["interview_file"]).read_text())
+        answers = FI.answers_from_native(interview, [
+            {"question": question["understanding"], "options": ["예", "아니오"], "answer": "Only the approval step."},
+            {"question": question["questions"][0]["question"], "options": [], "answer": "Both"}])
+        self.assertEqual((answers["understanding_confirmed"], answers["correction"]), (False, "Only the approval step."))
+        self.assertEqual(FI.validate_answers(interview, answers), [])
 
     def answers_for_scope(self):
         path = self.base / "scope-answers.json"
