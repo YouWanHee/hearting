@@ -504,14 +504,10 @@ def owner_inline_marker_prompt(args) -> str:
         return ""
     if not stages:
         return ""
-    aid = getattr(args, "attempt_id", None) or "<owner attempt>"
-    depths = sorted({n["dispatch_depth"] for n in stages})
-    command = (f"python3 {Path(__file__).resolve().with_name('capability-route.py')} complete --route {route_file} "
-               f"--node <node> --evidence <stage terminal artifact> --attempt-id {aid}-<node>-inline "
-               f"--dispatch-depth {depths[0] if len(depths) == 1 else '<node dispatch_depth>'} --transport headless "
-               "--execution-surface inline --registered-worker 0 --fallback-hop inline")
+    command = (f"python3 {Path(__file__).resolve().with_name('capability-route.py')} complete --inline "
+               f"--node <node> --reason \"<one line>\"")
     return (f"A declared stage ({', '.join(str(n['id']) for n in stages)}) you run yourself instead of dispatching "
-            f"still publishes its completion marker: `{command}` (no --jobs). Without it the route never settles.\n\n")
+            f"still publishes its completion marker: `{command}` (route and attempt axes are derived; --evidence is only needed when the stage produced a file). Without it the route never settles.\n\n")
 
 
 def plan_leg_prompt(route, node_id=None) -> str:
