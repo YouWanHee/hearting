@@ -37,7 +37,10 @@ import dispatch_parent_completion as parent_completion
 from dispatch_mode_contract import DispatchModeContractError, validate_route_mode_axes
 from execution_access import receipt_fragment as execution_access_receipt_fragment
 from stage_session_runtime import metadata as stage_session_metadata
-from model_config import ModelConfigError, headless_model_refusal, resolve_config
+from model_config import (
+    ModelConfigError, headless_model_refusal, main_session_only_models,
+    main_session_only_state, resolve_config, restricted_model,
+)
 from owner_route_binding import OwnerRouteBindingError, validate_runtime_requirements
 import route_authority
 from route_authority import scan_anchored_death
@@ -842,3 +845,20 @@ def require_headless_model(model: str, source: str, *, policy, error) -> None:
     refusal = headless_model_refusal(policy(), model, source)
     if refusal:
         raise error(*refusal)
+
+
+def main_session_only_model(model: str, policy) -> bool:
+    """Whether the selected model is restricted to the main session. The
+    wrapper passes its own `_model_policy` looked up at call time (the
+    eligibility tests patch the wrapper's name)."""
+    return restricted_model(model, main_session_only_models(policy()))
+
+
+def main_session_only_policy_state(policy, *, error) -> str:
+    """`declared`/`absent`/`unavailable` for the receipt. The wrapper passes its
+    own `_model_policy` and its `ModelSelectionError` class, so each adapter
+    keeps catching its own class."""
+    try:
+        return main_session_only_state(policy())
+    except error:
+        return "unavailable"

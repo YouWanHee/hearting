@@ -458,17 +458,14 @@ def _main_session_only_model(model: str) -> bool:
     there would have stopped every codex dispatch until the copy was edited,
     and the shipped default declares the key."""
 
-    return restricted_model(model, main_session_only_models(_model_policy()))
+    return WRAPPER_COMMON.main_session_only_model(model, _model_policy)
 
 
 def _main_session_only_policy_state() -> str:
     """`declared` or `absent` (review R1 M3): a selected user copy without the
     key is unrestricted, and that fact must be visible on the receipt."""
 
-    try:
-        return main_session_only_state(_model_policy())
-    except ModelSelectionError:
-        return "unavailable"
+    return WRAPPER_COMMON.main_session_only_policy_state(_model_policy, error=ModelSelectionError)
 
 
 def _require_headless_model(model: str, source: str) -> None:
