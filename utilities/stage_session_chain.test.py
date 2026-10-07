@@ -65,6 +65,38 @@ class StageSessionChainLaunchPhaseTest(unittest.TestCase):
 
 
 class StageSessionChainStartTest(unittest.TestCase):
+    def test_phase_execution_is_not_replaced_by_verification_for_any_adapter(self):
+        # LIVE Codex children treated "Run only: <verify>" as a prohibition
+        # on producing the file assigned by the phase brief.
+        session = {
+            "subsession_id": "ss-live", "index": 1, "count": 2,
+            "slug": "live", "phase_brief": "/work/phase.md",
+            "narrow_verify": "python3 check.py /work/result.json",
+            "expected_round_trips": 1, "attempt_id": "att-live",
+            "fixed_files": ["/work/result.json"],
+        }
+        manifest = {
+            "route_file": "/route.json", "route_node": "execute",
+            "chain_id": "ssc-live", "mode": "serial", "worktree": "/work",
+        }
+        for mode in ("serial", "parallel"):
+            builder = (CHAIN.dispatch_command if mode == "serial"
+                       else CHAIN.SUBDIVISION_ADMISSION.dispatch_command)
+            for adapter in ("claude", "codex", "opencode"):
+                with self.subTest(mode=mode, adapter=adapter):
+                    command = builder({**manifest, "mode": mode},
+                                      {**session, "adapter": adapter},
+                                      "start", "owner", Path("/jobs.log"))
+                    prompt = command[command.index("--prompt-text") + 1]
+                    self.assertIn("Execute sub-session ss-live from phase brief /work/phase.md", prompt)
+                    self.assertIn("within the fixed files. Then verify only with:", prompt)
+                    self.assertNotIn("Run only:", prompt)
+                    for flag, expected in (("--phase-brief", session["phase_brief"]),
+                                           ("--narrow-verify", session["narrow_verify"]),
+                                           ("--fixed-file", session["fixed_files"][0]),
+                                           ("--stage-authority", "0")):
+                        self.assertEqual(command[command.index(flag) + 1], expected)
+
     def _manifest(self, base: Path, session_count: int = 3) -> dict:
         sessions = [
             {
