@@ -3751,5 +3751,25 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIsNone(result)
 
 
+class RetireBackgroundDialogTest(unittest.TestCase):
+    def _cells(self, text):
+        return [(ch, False) for ch in text]
+
+    def test_detects_claude_background_confirm(self):
+        lines = [self._cells("Background work is running"),
+                 self._cells("1. Exit and stop tasks"),
+                 self._cells("2. Move to background and exit"),
+                 self._cells("3. Stay")]
+        tasks = peer_steward._retire_background_dialog_lines(lines)
+        self.assertIsNotNone(tasks)
+
+    def test_ignores_other_forms(self):
+        lines = [self._cells("Do you want to proceed?"),
+                 self._cells("Enter to confirm")]
+        self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
+        self.assertIsNone(peer_steward._retire_background_dialog_lines([]))
+        self.assertIsNone(peer_steward._retire_background_dialog_lines(None))
+
+
 if __name__ == "__main__":
     unittest.main()

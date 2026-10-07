@@ -1448,11 +1448,17 @@ def cmd_retire(args):
     target = args.target
     ident = {"harness": "-", "session_id": "-", "name": target, "pane": "-"}
 
-    def finish(reason, retired=False, handover=None):
+    def finish(reason, retired=False, handover=None, detail=None):
         tail = f" handover={handover}" if handover else ""
+        summary = f"[retire] {target} {reason}{tail}"
+        receipt = reason
+        if detail:
+            summary += f" {detail}"
+            receipt += f" {detail}"
+            print(detail, file=sys.stderr)
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=ident["pane"],
-                summary_text=f"[retire] {target} {reason}{tail}", receipt=reason,
+                summary_text=summary, receipt=receipt,
                 status="sent" if retired else "failed")
         print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
               f"name={ident['name']} pane={ident['pane']}{tail}")
@@ -1518,7 +1524,84 @@ def cmd_retire(args):
                 return finish("pane-close-failed", handover=handover)
             return finish("normal-exit", True, handover=handover)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    if harness == "claude":
+        return _retire_claude_background_confirm(
+            target, pane, harness, ident, identity, finish,
+            own_sid, own_harness)
     return finish("agent-still-running")
+
+
+def _retire_background_dialog_lines(lines):
+    """Detect Claude's exit-time background-work confirm; return its task lines or None.
+
+    The dialog reads "Background work is running … 1. Exit and stop tasks /
+    2. Move to background and exit / 3. Stay". Anything else with a form
+    footer is not this dialog and stays `agent-still-running`.
+    """
+    if not lines:
+        return None
+    texts = [_plain(cells) for cells in lines]
+    flat = "".join("".join(texts).split()).lower()
+    if "backgroundworkisrunning" not in flat:
+        return None
+    if "exitandstoptasks" not in flat and "movetobackground" not in flat:
+        return None
+    tasks = [text.strip() for text in texts
+             if text.strip() and "background work is running" not in text
+             and not text.strip().startswith(("1.", "2.", "3.", "❯", "Enter", "Esc"))]
+    seen, unique = set(), []
+    for task in tasks:
+        if task not in seen:
+            seen.add(task)
+            unique.append(task)
+    return unique[:5]
+
+
+def _retire_claude_background_confirm(target, pane, harness, ident, identity, finish,
+                                      own_sid, own_harness):
+    """Finish one normal retire path through Claude's background-work confirm.
+
+    A handed-over retire owns the predecessor's work, so the default picks
+    1 (exit and stop tasks) and leaves the stopped lines in the receipt.
+    When the choice is ambiguous the dialog is closed with a typed 3 (Stay)
+    and the reason is returned; the pane is left usable, never stuck open.
+    """
+    lines = _read_screen(target)
+    tasks = _retire_background_dialog_lines(lines)
+    if tasks is None:
+        return finish("agent-still-running")
+    stopped = " stopped-background=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
+    if _retire_foreground(pane, harness) != identity:
+        return finish("foreground-changed")
+    try:
+        subprocess.run(["herdr", "pane", "send-text", pane, "1"],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return finish("exit-send-failed")
+    deadline = time.monotonic() + _RETIRE_SECONDS
+    while time.monotonic() < deadline:
+        info = _retire_pane_info(pane, timeout=max(.1, deadline - time.monotonic()))
+        if info is None:
+            return finish("shell-return-unverified")
+        if _retire_shell_returned(info, identity):
+            if not _retire_shell_returned(_retire_pane_info(pane), identity):
+                return finish("shell-changed")
+            handover = _seat_handover(ident, own_sid, own_harness)
+            if not _close_pane(pane):
+                return finish("pane-close-failed", handover=handover)
+            return finish("normal-exit", True, handover=handover,
+                          detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    try:
+        subprocess.run(["herdr", "pane", "send-text", pane, "3"],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return finish("agent-still-running")
+    return finish("retire-declined-background-work" + (stopped or ""))
 
 
 # ---------------------------------------------------------------------------
