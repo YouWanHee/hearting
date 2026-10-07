@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -460,6 +461,65 @@ class Case6UncappedAndEnvelopeTest(unittest.TestCase):
         self.assertIsNone(RA.pass_blocker_violation("PASS", "none"))
         self.assertIsNone(RA.pass_blocker_violation("FAIL", "G1 incomplete"))
         self.assertIsNone(RA.HANDOFF_RE.search("verdict: PASS\nblocker: none"))
+
+    def test_a_fence_or_two_trailing_sentences_leave_the_verdict(self):
+        # G1: the envelope plus a code fence and/or up to two sentences is
+        # still that envelope. The captured fields never include the tail.
+        base = "artifact: -\nverdict: {verdict}\nblocker: {blocker}"
+        tails = [
+            "",
+            "\n",
+            "\nAll done.",
+            "\nAll done.\nClosing out.",
+            "\n```log\nsome output\n```",
+            "\n```log\nsome output\n```\nAll done.",
+            "\n```log\nsome output\n```\nAll done.\nClosing out.",
+            "\n\nAll done.",
+        ]
+        for verdict, blocker in (("PASS", "none"), ("FAIL", "real"), ("BLOCKED", "waiting")):
+            for tail in tails:
+                with self.subTest(verdict=verdict, tail=tail[:20]):
+                    handoff = RA.HANDOFF_RE.search(base.format(verdict=verdict, blocker=blocker) + tail)
+                    self.assertIsNotNone(handoff)
+                    self.assertEqual(
+                        handoff.groupdict(),
+                        {"artifact": "-", "verdict": verdict, "blocker": blocker},
+                    )
+        # Three sentences, an envelope-shaped tail, or no envelope still fail closed.
+        for text in (
+            "artifact: -\nverdict: PASS\nblocker: none\nOne.\nTwo.\nThree.",
+            "artifact: -\nverdict: PASS\nblocker: none\nverdict: FAIL",
+            "artifact: -\nverdict: PASS\nblocker: none\nartifact: -",
+            "artifact: -\nverdict: PASS\nblocker: none\n```\nverdict: FAIL\n```",
+            "see artifact: -\nverdict: PASS\nblocker: none",
+        ):
+            with self.subTest(text=text[:40]):
+                self.assertIsNone(RA.HANDOFF_RE.search(text))
+        # Two envelopes still resolve to the last one.
+        last = RA.HANDOFF_RE.search(
+            "artifact: -\nverdict: PASS\nblocker: none\n\nartifact: -\nverdict: FAIL\nblocker: real"
+        )
+        self.assertEqual(last.group("verdict"), "FAIL")
+
+    def test_an_envelope_inside_a_fence_never_hides_the_later_one(self):
+        # PR #281 review round 1: a fenced later envelope must not be swallowed
+        # by an earlier decoy; the later block is the one read (or the tail
+        # fails closed when only a field line sits in the fence).
+        decoy = ("Contract example:\nartifact: <path>\nverdict: PASS\nblocker: none\n"
+                 "```\nartifact: /r.md\nverdict: FAIL\nblocker: 3 tests fail\n```")
+        handoff = RA.HANDOFF_RE.search(decoy)
+        self.assertIsNotNone(handoff)
+        self.assertEqual(handoff.group("verdict"), "FAIL")
+        self.assertEqual(handoff.group("artifact"), "/r.md")
+
+    def test_a_long_failing_tail_stays_linear(self):
+        # PR #281 review round 1: optional newlines between tail elements made
+        # the failing search cubic (4k chars did not finish in 250s); a
+        # required newline keeps it linear.
+        text = "artifact: -\nverdict: BLOCKED\nblocker: " + "a" * 100_000 + "\nx\ny\nz"
+        start = time.monotonic()
+        self.assertIsNone(RA.HANDOFF_RE.search(text))
+        self.assertLess(time.monotonic() - start, 5.0)
 
 
 class DeathPatternTest(unittest.TestCase):

@@ -716,10 +716,32 @@ gate_unmet = _ROUND.gate_unmet
 # The worker's final three lines. Every terminal reader parses them with this
 # one pattern, so no surface reads a child as finished while another calls it
 # malformed.
+#
+# G1: a fenced code block and/or up to two plain sentences may follow the block
+# (the fence attaches to the envelope; closing sentences follow the fence).
+# The verdict still comes from the block alone.
+#
+# Envelope-shaped lines are excluded both from the tail and from inside the
+# fence, so an earlier decoy can never swallow a later envelope; the search
+# then either skips the decoy for the later block or fails closed. Every tail
+# element starts at a required newline (`_TAIL_GAP`), which keeps the
+# failing-search cost linear instead of cubic (PR #281 review round 1).
+_TAIL_GAP = r"(?:\n[ \t]*)+"
+_TAIL_BLANK = r"(?:\n[ \t]*)*"
+_TAIL_LINE = r"(?![ \t]*(?:artifact|verdict|blocker): )[^\n]+"
+_TAIL_FENCE_BODY = r"(?:(?![ \t]*(?:artifact|verdict|blocker):)[^\n]*\n)*?"
+_TAIL_FENCE = r"```[^\n]*\n" + _TAIL_FENCE_BODY + r"[ \t]*```"
 HANDOFF_RE = re.compile(
     r"(?:\A|\n)artifact: (?P<artifact>[^\n]+)\n"
     r"verdict: (?P<verdict>PASS|FAIL|BLOCKED)\n"
-    r"blocker: (?P<blocker>[^\n]+)\Z"
+    r"blocker: (?P<blocker>[^\n]+)"
+    + r"(?:" + _TAIL_GAP
+    + r"(?:" + _TAIL_FENCE + r"(?:" + _TAIL_GAP + _TAIL_LINE + r"(?:" + _TAIL_GAP + _TAIL_LINE + r")?)?"
+    + r"|" + _TAIL_LINE + r"(?:" + _TAIL_GAP + _TAIL_LINE + r")?"
+    + r")"
+    + r")?"
+    + _TAIL_BLANK
+    + r"\Z"
 )
 
 

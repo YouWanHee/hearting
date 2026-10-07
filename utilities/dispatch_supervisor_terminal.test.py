@@ -205,6 +205,39 @@ class OpencodeGap1TerminalClassificationTest(unittest.TestCase):
         refused = SUPERVISOR.classify_codex_result("artifact: /a.md\nverdict: PASS\nblocker: G1 skipped")
         self.assertEqual((refused.note, refused.reconcile_reason), ("dead-contract", "pass-blocker-not-none"))
 
+    def test_a_fence_or_two_trailing_sentences_keep_the_verdict(self):
+        # G1: the supervisor reader agrees with the other two readers — the
+        # verdict comes from the block alone.
+        def terminal(text):
+            return SUPERVISOR._handoff_terminal(text, event="stop", process_exit=0)
+        for verdict, blocker, note in (("PASS", "none", "completed-supervisor"),
+                                       ("FAIL", "x", "dead-worker-fail"),
+                                       ("BLOCKED", "x", "dead-worker-blocked")):
+            base = f"artifact: -\nverdict: {verdict}\nblocker: {blocker}"
+            for tail in ("", "\nAll done.", "\n```log\nx\n```",
+                         "\n```log\nx\n```\nAll done.\nClosing out."):
+                with self.subTest(verdict=verdict, tail=tail[:16]):
+                    self.assertEqual(terminal(base + tail).note, note)
+        for text in ("artifact: -\nverdict: PASS\nblocker: none\nOne.\nTwo.\nThree.",
+                     "artifact: -\nverdict: PASS\nblocker: none\nverdict: FAIL"):
+            with self.subTest(text=text[:40]):
+                result = terminal(text)
+                self.assertEqual((result.note, result.reconcile_reason),
+                                 ("dead-contract", "final-handoff-invalid"))
+
+    def test_a_fenced_later_envelope_is_read_not_the_decoy(self):
+        # PR #281 round 1: the fenced later FAIL block is the one read; a bare
+        # field line inside a fence fails closed.
+        decoy = ("Contract example:\nartifact: <path>\nverdict: PASS\nblocker: none\n"
+                 "```\nartifact: /r.md\nverdict: FAIL\nblocker: 3 tests fail\n```")
+        result = SUPERVISOR._handoff_terminal(decoy, event="stop", process_exit=0)
+        self.assertEqual((result.note, result.reconcile_reason),
+                         ("dead-worker-fail", "worker-reported-fail"))
+        fenced_line = "artifact: -\nverdict: PASS\nblocker: none\n```\nverdict: FAIL\n```"
+        result = SUPERVISOR._handoff_terminal(fenced_line, event="stop", process_exit=0)
+        self.assertEqual((result.note, result.reconcile_reason),
+                         ("dead-contract", "final-handoff-invalid"))
+
     def test_broken_stream_still_classifies_as_dead_protocol(self):
         result = SUPERVISOR.classify_supervisor_log(
             str(FIXTURES / "broken-stream.jsonl"), "opencode"

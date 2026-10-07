@@ -122,7 +122,8 @@ def _api_status(value: object) -> str:
 
 def _handoff_terminal(text: object, *, event: str, process_exit: int) -> SupervisorTerminal:
     # search, not fullmatch — the pattern anchors the block to the end of the
-    # message, so a prepended sentence is ignored rather than fatal.
+    # message, so a prepended sentence is ignored rather than fatal. A
+    # trailing fence or up to two sentences are tolerated the same way (G1).
     match = _HANDOFF_RE.search(text.strip()) if isinstance(text, str) else None
     if match is None:
         return SupervisorTerminal(
