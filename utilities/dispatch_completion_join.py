@@ -890,13 +890,38 @@ def _completed_next_leg(jobs: Path, attempt_id: str):
         return None
 
 
+def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
+    """Close an open stage child whose process has exited and whose own envelope is a
+    readable PASS, through the runtime's own settlement (`settle_finished_attempt`), so a
+    receipt reports its result instead of a harvest command. Anything else is left as it
+    is: an owner or frame row, a live process, or an envelope that is not a readable PASS."""
+    try:
+        row = exact_attempt_row(Path(jobs), attempt_id)
+    except (JoinContractError, OSError):
+        return False
+    metadata = row.metadata
+    if row.status not in OPEN_STATES or metadata.get("worker_type") in {"owner", "frame"}:
+        return False
+    if attempt_process_quiescence(metadata).state != "quiescent":
+        return False
+    terminal = inspect_terminal_attempt(
+        metadata.get("log_file"), worktree=_row_worktree(row),
+        artifact_root_metadata=metadata.get("artifact_root"))
+    if (terminal.get("state") != "valid" or str(terminal.get("verdict")) != "PASS"
+            or terminal.get("artifact_state") != "readable"):
+        return False
+    return bool(settle_finished_attempt(Path(jobs), row).get("closed"))
+
+
 def receipt_with_delivery_observability(
     receipt: dict[str, object],
     *,
     jobs: Path,
     timing: dict[str, int | None] | None = None,
 ) -> dict[str, object]:
-    """Attach shared per-attempt classification and one timing vocabulary."""
+    """Attach shared per-attempt classification and one timing vocabulary.
+
+    A child still open with a finished readable PASS is settled first (`settle_open_pass`)."""
 
     raw_children = receipt.get("children")
     if not isinstance(raw_children, list):
@@ -926,6 +951,8 @@ def receipt_with_delivery_observability(
             state = current_delivery_state(
                 jobs, attempt_id, parent_attempt_id=attempt_id
             )
+            if state.status in OPEN_STATES and settle_open_pass(jobs, attempt_id):
+                state = current_delivery_state(jobs, attempt_id, parent_attempt_id=attempt_id)
         except (DispatchContractError, OSError) as exc:
             reason = exc.reason if isinstance(exc, DispatchContractError) else type(exc).__name__
             raise JoinContractError(f"delivery-transaction-failed:{reason}") from exc

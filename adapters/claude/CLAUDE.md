@@ -28,7 +28,9 @@ another adapter.
   harness files are symlinks; do not use it as the managed `AGENT_HOME`.
 - Resolve the canonical artifact root with `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - Use portable model roles, never vendor model names, in shared artifacts.
+<!-- BEGIN generated from core/fragments/bootstrap-compute-hosts.md by tools/sync-bootstrap-dispatch.py; edit the source -->
 - Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
+<!-- END generated from core/fragments/bootstrap-compute-hosts.md -->
 - Repo-root `skills/` is the canonical Skill authoring tree; `tools/sync-entry-skill-layer.py` projects it into `adapters/claude/skills/` (generated — do not hand-edit the projection). Claude-native hooks, commands, settings, and kernel helper agents live under `adapters/claude/`; behavior personas live in the portable unit catalog `roles/units/`.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
 - Run harness utilities as `hearting run <utility>` (Routing and Execution); a checkout-relative call is for dev activation only (`AGENT_HOME` is that checkout itself).
@@ -114,13 +116,11 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 terminal. A graph that breaks this is refused at `capability-route.py compile`
 and at launch.
 
-Do not end a turn while a tracked workflow has a stage with no registered
-continuation. Arm the shared supervisor
-(`utilities/workflow-supervisor.py arm|poll|watch|status|complete`), dispatch the
-next stage, or record the human gate in the same turn; when none is possible,
-say so plainly and name the checked fallback. Report state from PID identity,
-sentinel/exit evidence, log modification time, and declared artifacts, never from
-a registry status word alone. `OPERATIONS §5.12` owns the mechanics.
+<!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
+Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run.
+<!-- END generated from core/fragments/bootstrap-continuation.md -->
+
+`OPERATIONS §5.12` owns the mechanics.
 
 ## Runtime Lifecycle
 

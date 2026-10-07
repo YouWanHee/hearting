@@ -32,7 +32,9 @@ local projection, and parity gaps; plan a checked fallback.
 
 - `AGENT_HOME` is the installed harness root. Resolve artifacts through `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - Portable model roles remain vendor-neutral. Resolve them with `preflight.sh role <portable-role|role-profile|pipeline-stage>`.
+<!-- BEGIN generated from core/fragments/bootstrap-compute-hosts.md by tools/sync-bootstrap-dispatch.py; edit the source -->
 - Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
+<!-- END generated from core/fragments/bootstrap-compute-hosts.md -->
 - Capabilities come from `capabilities/`; Codex-native generated Skills/plugin, agents, and modes live under `adapters/codex/`. Expose them through `codex_setting/codex-plugin-marketplace`, `codex_setting/codex-agents`, and `codex_setting/codex-modes`.
 - Hooks are Codex bridges under `codex_setting/codex-hooks`; never project Claude settings, commands, hooks, or allowedTools.
 - Before using a capability or mode, run `adapters/codex/bin/preflight.sh capability-info <capability>` or `preflight.sh mode-info <family/mode>` and obey named `tool_contract`, `tool_contract_check`, `runtime_surface`, and `fallback`.
@@ -183,15 +185,13 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 `monitor`; a detached resource run must be `supervised` and can never be
 terminal, and a graph that breaks this is refused at route compile and at launch.
 
-Do not end a turn while a tracked workflow has a stage with no registered
-continuation. Arm the shared supervisor
-(`utilities/workflow-supervisor.py arm|poll|watch|status|complete`), dispatch the
-next stage, or record the human gate in the same turn; when none is possible, say
-so plainly and name the checked fallback. The native queue carries
-the exact completion batch and never substitutes for a stage continuation. Report
-state from PID identity, sentinel/exit evidence, log modification time, and
-declared artifacts, never from a registry status word alone. `OPERATIONS §5.12`
-owns the mechanics.
+<!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
+Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run.
+<!-- END generated from core/fragments/bootstrap-continuation.md -->
+
+The native queue carries
+the completion batch and never substitutes for a continuation. `OPERATIONS §5.12`
+owns mechanics.
 
 ## Memory and Context
 

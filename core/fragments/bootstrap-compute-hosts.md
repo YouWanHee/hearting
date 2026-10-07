@@ -1,0 +1,1 @@
+- Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.

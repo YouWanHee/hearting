@@ -142,7 +142,7 @@ jobs:
       # Every shard reports even when a sibling fails, so one run shows all causes.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Check out the source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -170,7 +170,7 @@ jobs:
         run: |
           mkdir -p "${{ runner.temp }}/shard-out"
           python3 tools/run-tests.py --retries 1 \
-            --shard ${{ matrix.shard }}/4 \
+            --shard ${{ matrix.shard }}/8 \
             --suite-list ${{ runner.temp }}/shard-out/suite-list.tsv \
             --xpass-nonfatal \
             --strict-leak-sweep \
@@ -182,7 +182,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: run-tests-report-shard-${{ matrix.shard }}-of-4
+          name: run-tests-report-shard-${{ matrix.shard }}-of-8
           path: ${{ runner.temp }}/shard-out
           if-no-files-found: ignore
           # A re-run of a failed shard replaces the earlier attempt's artifact.
@@ -218,7 +218,7 @@ jobs:
         if: needs.adaptation-boundary.outputs.full_tests == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: run-tests-report-shard-*-of-4
+          pattern: run-tests-report-shard-*-of-8
           path: ${{ runner.temp }}/shards
 
       - name: Verify the shards add up to the census
