@@ -1585,24 +1585,27 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
                                       own_sid, own_harness):
     """Finish one normal retire path through Claude's background-work confirm.
 
-    Running work is protected: the default picks 2 (move to background and
-    exit) and leaves the backgrounded lines in the receipt so a successor or
-    the supervisor can stop them later. 1 (exit and stop tasks) is never
-    used. When the window is ambiguous the dialog is closed with a typed 3
-    (Stay) and the reason is returned; the pane is left usable, never stuck
-    open. No keys go out unless the live selection UI is certain.
+    The default picks 1 (exit and stop tasks): retire closes a handed-over
+    session, and registered hearting work and compute-hosts runs live apart
+    from the session, so only the session's own shell, reservations and
+    monitors stop. 2 (move to background) is never used -- it forks the
+    session itself into the background, where it keeps running and can
+    collide with its successor. The stopped lines stay in the receipt. When
+    the window is ambiguous the dialog is closed with a typed 3 (Stay) and
+    the reason is returned; the pane is left usable, never stuck open. No
+    keys go out unless the live selection UI is certain.
     """
     lines = _read_screen(target)
     tasks = _retire_background_dialog_lines(lines)
     if tasks is None:
         return finish("agent-still-running")
-    moved = " backgrounded=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
+    stopped = " stopped-background=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
     if _retire_foreground(pane, harness) != identity:
         return finish("foreground-changed")
     if _retire_background_dialog_lines(_read_screen(target)) is None:
         return finish("agent-still-running")
     try:
-        subprocess.run(["herdr", "pane", "send-text", pane, "2"],
+        subprocess.run(["herdr", "pane", "send-text", pane, "1"],
                        capture_output=True, text=True, timeout=5)
         subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
                        capture_output=True, text=True, timeout=5)
@@ -1620,7 +1623,7 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
             if not _close_pane(pane):
                 return finish("pane-close-failed", handover=handover)
             return finish("normal-exit", True, handover=handover,
-                          detail=(f"backgrounded:{moved.strip()}") if moved else None)
+                          detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
     try:
         subprocess.run(["herdr", "pane", "send-text", pane, "3"],
@@ -1629,7 +1632,7 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return finish("agent-still-running")
-    return finish("retire-declined-background-work" + (moved or ""))
+    return finish("retire-declined-background-work" + (stopped or ""))
 
 
 # ---------------------------------------------------------------------------
