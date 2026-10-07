@@ -4314,6 +4314,36 @@ def route_start_approvals(route, registry=None):
     return rows
 
 
+def compose_observations(route):
+    """Display facts already known by compose; never changes routing or approval."""
+    from session_identity import identity
+    who = identity()
+    origin = _turn_peer_source(who.harness, who.session_id, route.get("cwd")) if who.known and who.session_id else "unattributed"
+    shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
+    peer = origin.startswith("peer:") and shape in {"direct", "solo"}
+    external = route.get("capability") == "autopilot-ship" and route.get("entry_execution_scope") != "report"
+    confirmation = {"method": "peer-notice" if peer and not external else "user-card", "origin": origin,
+                    "meaning": "display only; existing approval and destructive/external/user-requested card exceptions remain"}
+    nodes = [n for n in route.get("nodes", []) if not _frame_node(n)]
+    lab = route.get("capability") == "autopilot-lab" or any(str(n.get("part", "")).startswith("autopilot-lab:") for n in nodes)
+    selection = route.get("selection") or {}
+    evidence = route.get("dispatch_evidence") or {}
+    native = evidence.get("native_subagent")
+    native_label = "관측됨" if native else "미확인"
+    headless = bool(evidence.get("tuples") or route.get("registered_headless_candidates"))
+    answers = [
+        ("주 capability", route["capability"]),
+        ("새 실측", "예 (lab 경로)" if lab else "미확인 (작업 의미에 따름)"),
+        ("standard+", "예" if route["effective_intensity"] in {"standard", "strong", "thorough", "adversarial"} else "아니오"),
+        ("분리 단계", f"{len(nodes)}개 선언됨" if shape == "staged" else "frame 결정 대기" if shape == "framed" else "없음 (단일 실행)"),
+        ("inline 예외", str(selection.get("inline_reason") or selection.get("selection_basis") or "미확인") if shape == "direct" else "해당 없음"),
+        ("위임 표면", f"native {native_label} / headless {'관측됨' if headless else '미확인'}"),
+        ("lineage·RUNLOG", "미확인 (기존 lineage·append-only RUNLOG 유지 계약)"),
+    ]
+    return {"confirmation": confirmation,
+            "pre_execution_answers": [{"question": i, "name": name, "answer": value} for i, (name, value) in enumerate(answers, 1)]}
+
+
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
                  campaign_selection=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
@@ -4329,6 +4359,10 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
         + _compose_campaign_line(campaign_selection if campaign_selection is not None
                                  else compose_campaign_selection(route))
     )
+    observed = compose_observations(route)
+    card += f"\n  확인 방식 {observed['confirmation']['method']} · 출처 {observed['confirmation']['origin']}"
+    for answer in observed["pre_execution_answers"]:
+        card += f"\n  {answer['question']}. {answer['name']}: {answer['answer']}"
     if framed:
         pair = len([n for n in route.get("nodes", []) if _frame_node(n)]) == 2
         card += ("\n  frame이 방향과 경로를 조립해 제안합니다"
@@ -10352,7 +10386,8 @@ def main():
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "campaign":_campaign_for_card,
                               "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_pin),
-                              "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
+                              "tracked_gate_evidence":route.get("tracked_gate_evidence"),
+                              **compose_observations(route)},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
         if a.start:
@@ -10364,7 +10399,7 @@ def main():
                 started={**started,"access_change":access_change}
             if worktree is not None and worktree.get("cwd"):
                 started={**started,"worktree":worktree}
-            print(json.dumps(started,ensure_ascii=False),flush=True)
+            print(json.dumps({**started, **compose_observations(route)},ensure_ascii=False),flush=True)
         # Bookkeeping runs after the work has started: the start does not depend on it (the sweep
         # never closes this route, and a cycle it seals is never the one this route begins or continues).
         _route_autoclose(artifact_root,"compose",route)
@@ -10417,7 +10452,7 @@ def main():
             result={**result,"pin_change":pin_change}
         if access_change is not None:
             result={**result,"access_change":access_change}
-        print(json.dumps(result,ensure_ascii=False))
+        print(json.dumps({**result, **compose_observations(route)},ensure_ascii=False))
         return 0
     if a.command=="compile":
         spec_read=(compose_spec_read(a.cwd,a.artifact_root,None) if a.spec_read is None else
