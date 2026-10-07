@@ -67,7 +67,8 @@ class StartReceiptTest(unittest.TestCase):
                     cmd = [sys.executable, str(ROOT/'utilities/start_receipt.py'), '--harness', harness, '--session-id', 'own']
                     payload = ''
                 else:
-                    cmd = [sys.executable, str(ROOT/f'adapters/{harness}/hooks/start-receipt-context.py')]
+                    cmd = (['sh', str(ROOT/'adapters/codex/hooks/run-hook.sh'), 'start-receipt-context.py']
+                           if harness == 'codex' else [sys.executable, str(ROOT/f'adapters/{harness}/hooks/start-receipt-context.py')])
                     if harness == 'codex': cmd.append('--codex')
                     payload = json.dumps({'hook_event_name': 'PostToolUse', 'session_id': 'own', 'tool_response': 'FILTERED'})
                 proc = subprocess.run(cmd, env=env, input=payload, text=True, capture_output=True)
