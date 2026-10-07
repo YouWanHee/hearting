@@ -896,7 +896,7 @@ def _writer_census():
 
     found = set()
     for name in ("artifact_producer.py", "artifact_campaign.py", "artifact_cutover.py",
-                "artifact_relayout.py", "artifact_residue.py", "artifact_resplit.py"):
+                "artifact_relayout.py", "artifact_residue.py", "artifact_resplit.py", "artifact_cross_root_move.py"):
         path = Path(__file__).with_name(name)
         if not path.is_file():
             continue
@@ -919,6 +919,7 @@ def _writer_census():
 # prepare_index_update/update_indexes (verified structurally is out of scope
 # here; this table is the enumeration half of the guard -- LE §5).
 _EXPECTED_WRITER_CENSUS = {
+    ("artifact_cross_root_move.py", "move"): "incremental",
     ("artifact_producer.py", "_begin_cycle_record"): "incremental",
     ("artifact_producer.py", "_remove_empty_cycle"): "incremental",
     ("artifact_producer.py", "_commit_sealed"): "incremental",
@@ -941,6 +942,7 @@ _EXPECTED_WRITER_CENSUS = {
     ("artifact_producer.py", "backfill_cycle_bindings"): "full",
     ("artifact_campaign.py", "_commit_event"): "incremental",
     ("artifact_campaign.py", "_materialize"): "incremental",
+    ("artifact_campaign.py", "supersede_locked"): "incremental",
     ("artifact_cutover.py", "seal_legacy_cycle"): "out-of-band-legacy",
     ("artifact_cutover.py", "adopt_campaign"): "out-of-band-legacy",
 }

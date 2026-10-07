@@ -794,5 +794,30 @@ class AccessChangeTest(unittest.TestCase):
         self.assertEqual(RA.access_changes(self.route), [])
 
 
+class RelocationAuthorityTest(unittest.TestCase):
+    def test_no_live_history_does_not_grant_parent_ownership(self):
+        observed = SimpleNamespace(resource_paths=set(), open_paths=set(), kept=lambda *args: None)
+        with tempfile.TemporaryDirectory() as directory:
+            result = RA.relocation_admission(Path(directory), [{"route_id": "rt-history"}], [], evidence=observed)
+        self.assertTrue(result.allowed)
+        self.assertFalse(RA.owns({"parent_sid": "old-parent"}, "supervisor-without-ack", None))
+
+    def test_existing_live_unknown_lease_resource_reasons_protect_history(self):
+        for reason in ["owner-live", "lease-held", "resource-run", "finish-pending", "human-gate"]:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                observed = SimpleNamespace(resource_paths=set(), open_paths=set(), kept=lambda *args: reason)
+                result = RA.relocation_admission(Path(directory), [{"route_id": "rt-source"}], [], evidence=observed)
+                self.assertFalse(result.allowed)
+                self.assertEqual(result.reason, reason)
+        with mock.patch("route_autoclose._Evidence", side_effect=PermissionError("unknown process")):
+            self.assertFalse(RA.relocation_admission(Path("/missing"), [], []).allowed)
+
+    def test_cycle_holder_without_route_and_target_unrelated_work(self):
+        observed = SimpleNamespace(resource_paths={"/source/cycle/log"}, open_paths=set(), kept=lambda *args: None)
+        self.assertFalse(RA.relocation_admission(Path("/source"), [], [Path("/source/cycle")], evidence=observed).allowed)
+        observed.resource_paths = {"/target/unrelated/log"}
+        self.assertTrue(RA.relocation_admission(Path("/source"), [], [Path("/source/cycle")], evidence=observed).allowed)
+
+
 if __name__ == "__main__":
     unittest.main()

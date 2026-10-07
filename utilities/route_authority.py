@@ -23,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import re
+from typing import NamedTuple
 
 from dispatch_attempt_policy import committed_outcome, readable_result
 import review_round_cap as _ROUND
@@ -958,3 +959,57 @@ def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
         return (error.reason, 78 if error.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
                 completion_gate_fail_fields(error, args.route_file, args.route_node))
     return None
+
+
+class RelocationDecision(NamedTuple):
+    allowed: bool
+    reason: str | None
+    route_ids: tuple[str, ...]
+
+
+def relocation_admission(root, records, directories, *, evidence=None) -> RelocationDecision:
+    """Read-only no-live history decision; never grants continuation ownership.
+
+    Unknown evidence protects the source. Target unrelated work is outside this scope.
+    Uses autoclose's existing process, attempt, lease and resource observations.
+    """
+    import route_autoclose as ac
+    import artifact_producer as producer
+    route_ids = set()
+    def ids(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"route_id", "owner_route_id", "batch_route_id", "parent_route_id"} and isinstance(item, str):
+                    route_ids.add(item)
+                else:
+                    ids(item)
+        elif isinstance(value, list):
+            for item in value:
+                ids(item)
+    for record in records:
+        ids(record)
+    try:
+        observed = evidence or ac._Evidence(Path(root), producer)
+        # Check payload holders even when a cycle has no route metadata.
+        for directory in directories:
+            if any(ac._under(item, directory) for item in observed.resource_paths):
+                return RelocationDecision(False, "resource-run", tuple(sorted(route_ids)))
+            if any(ac._under(item, directory) for item in observed.open_paths):
+                return RelocationDecision(False, "cycle-in-use", tuple(sorted(route_ids)))
+        pending = list(route_ids)
+        checked = set()
+        while pending:
+            route_id = pending.pop()
+            if route_id in checked:
+                continue
+            checked.add(route_id)
+            path = Path(root) / ".runtime/routes" / (route_id + ".json")
+            route = json.loads(path.read_bytes()) if path.exists() else None
+            ids(route)
+            pending.extend(route_ids - checked)
+            reason = observed.kept(route_id, lambda: None, route)
+            if reason:
+                return RelocationDecision(False, reason, tuple(sorted(route_ids)))
+    except Exception as exc:
+        return RelocationDecision(False, "evidence-unreadable:" + str(exc), tuple(sorted(route_ids)))
+    return RelocationDecision(True, None, tuple(sorted(route_ids)))
