@@ -360,6 +360,35 @@ def _upgrade_controls(journal):
     journal["controls_policy"] = 2
 
 
+def _rename_locked(source, target):
+    """Publish a directory while the caller holds the root admission locks.
+
+    NFSv3 can reject RENAME_NOREPLACE although ordinary rename is supported.
+    Use producer admission's existing absence-check/rename protocol there.
+    """
+    if os.path.lexists(target):
+        _error("destination appeared before publication: " + str(target))
+    try:
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        code = errno.ENOSYS
+    else:
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1) == 0:
+            return
+        code = ctypes.get_errno()
+    if code in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+        # Recheck after the unsupported syscall too: never adopt a foreign path.
+        if os.path.lexists(target):
+            _error("destination appeared before publication: " + str(target))
+        os.rename(source, target)
+        return
+    if code == errno.EEXIST:
+        _error("destination appeared before publication: " + str(target))
+    raise OSError(code, os.strerror(code), str(target))
+
+
 def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_raw=None, prepare=None, roots=()):
     _safe(target.parent, target)
     published_inventory = dict(inventory)
@@ -394,21 +423,13 @@ def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_ra
         if os.path.lexists(target):
             _error("destination appeared during copy: " + str(target))
         P._ensure_dir(target.parent)
-        libc = ctypes.CDLL(None, use_errno=True)
-        rename = libc.renameat2
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        if rename(-100, os.fsencode(stage), -100, os.fsencode(target), 1):
-            code = ctypes.get_errno()
-            if code == errno.EEXIST:
-                _error("destination appeared during publication: " + str(target))
-            raise OSError(code, os.strerror(code), str(target))
+        _rename_locked(stage, target)
         P._fsync_dir(target.parent)
     _fault("publish")
 
 
 def _rename_tree(source, target, item, *, binding=None, manifest_raw=None, prepare=None, roots=(), admit=None):
-    """No-replace rename; exact inode ownership reconciles a lost rename response."""
+    """Locked rename; exact inode ownership reconciles a lost rename response."""
     if not os.path.lexists(target):
         inventory, identities = listing(source)
         if inventory != item["inventory"] or identities != item["source_identities"]:
@@ -420,15 +441,7 @@ def _rename_tree(source, target, item, *, binding=None, manifest_raw=None, prepa
             if [info.st_dev, info.st_ino, info.st_mode] != item["source_identities"][""]:
                 _error("source replaced before rename: " + str(source))
             P._ensure_dir(target.parent)
-            libc = ctypes.CDLL(None, use_errno=True)
-            rename = libc.renameat2
-            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-            rename.restype = ctypes.c_int
-            if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1):
-                code = ctypes.get_errno()
-                if code == errno.EEXIST:
-                    _error("destination appeared before rename: " + str(target))
-                raise OSError(code, os.strerror(code), str(target))
+            _rename_locked(source, target)
             P._fsync_dir(source.parent)
             P._fsync_dir(target.parent)
         _fault("rename")

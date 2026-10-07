@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cross-root moves on isolated roots; no real TF registries or payloads."""
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ def snapshot(root):
             for p in [root, *sorted(root.rglob("*"))]}
 
 
-class CrossRootMoveTest(F.ProducerTestBase):
+class CrossRootMoveFixture:
     def setUp(self):
         super().setUp()
         transfer = mock.patch.object(X, "_same_device", return_value=False)
@@ -63,6 +64,8 @@ class CrossRootMoveTest(F.ProducerTestBase):
         return P.cycle_move(self.source, source_campaign=self.src["campaign_id"],
                             target_artifact_root=self.target, campaign=self.dst["campaign_id"], **kwargs)
 
+
+class CrossRootMoveTest(CrossRootMoveFixture, F.ProducerTestBase):
     def test_eight_cycles_merge_snapshots_support_ids_and_target_work(self):
         second = self.make(self.source, "second-collision", closed=True)
         target_second = self.make(self.target, "second-collision")
@@ -518,12 +521,63 @@ class CorrectionMoveTest(CrossRootMoveTest):
 
 
 
-class RenameMoveTest(CorrectionMoveTest):
+class RenameMoveTest(CrossRootMoveFixture, F.ProducerTestBase):
+    logs = CorrectionMoveTest.logs
+
     def setUp(self):
         super().setUp()
         transfer = mock.patch.object(X, "_same_device", return_value=True)
         transfer.start()
         self.addCleanup(transfer.stop)
+
+    def test_nfs_rename_fallback_moves_cycles_and_logs_without_hashing(self):
+        _, logs, args = self.logs(nested=True)
+        source = Path(self.src["cycle_dir"])
+        inode = source.stat().st_ino
+        library = mock.Mock(renameat2=mock.Mock(return_value=-1))
+        with mock.patch.object(X.ctypes, "CDLL", return_value=library), \
+             mock.patch.object(X.ctypes, "get_errno", return_value=errno.EINVAL), \
+             mock.patch.object(X, "tree", side_effect=AssertionError("payload hash")), \
+             mock.patch.object(X.shutil, "copytree", side_effect=AssertionError("copy")):
+            out = self.move(attach_logs=args)
+            self.assertEqual(self.move(attach_logs=args)["operation_id"], out["operation_id"])
+        self.assertEqual(out["status"], "moved")
+        self.assertEqual((self.target / out["cycles"][0]["target"]).stat().st_ino, inode)
+        self.assertFalse(source.exists())
+        self.assertFalse(logs.exists())
+
+    def test_nfs_fallback_preserves_foreign_destination_created_during_syscall(self):
+        foreign = []
+        def unsupported(*args):
+            path = Path(os.fsdecode(args[3]))
+            path.mkdir()
+            foreign.append((path, path.stat().st_ino))
+            return -1
+        library = mock.Mock(renameat2=mock.Mock(side_effect=unsupported))
+        with mock.patch.object(X.ctypes, "CDLL", return_value=library), \
+             mock.patch.object(X.ctypes, "get_errno", return_value=errno.EINVAL), \
+             self.assertRaises(P.ProducerError):
+            self.move()
+        self.assertTrue(Path(self.src["cycle_dir"]).exists())
+        self.assertEqual(foreign[0][0].stat().st_ino, foreign[0][1])
+
+    def test_rename_exdev_keeps_source_and_is_not_treated_as_unsupported_flag(self):
+        library = mock.Mock(renameat2=mock.Mock(return_value=-1))
+        with mock.patch.object(X.ctypes, "CDLL", return_value=library), \
+             mock.patch.object(X.ctypes, "get_errno", return_value=errno.EXDEV), \
+             self.assertRaises(OSError) as caught:
+            self.move()
+        self.assertEqual(caught.exception.errno, errno.EXDEV)
+        self.assertTrue(Path(self.src["cycle_dir"]).exists())
+
+    def test_nfs_copy_publication_uses_the_same_locked_fallback(self):
+        library = mock.Mock(renameat2=mock.Mock(return_value=-1))
+        with mock.patch.object(X, "_same_device", return_value=False), \
+             mock.patch.object(X.ctypes, "CDLL", return_value=library), \
+             mock.patch.object(X.ctypes, "get_errno", return_value=errno.EINVAL):
+            out = self.move()
+        self.assertEqual(out["status"], "moved")
+        self.assertEqual(out["cycles"][0]["transfer"], "copy")
 
     def test_rename_preview_merge_no_payload_hash_or_copy(self):
         folder, logs, args = self.logs(nested=True)

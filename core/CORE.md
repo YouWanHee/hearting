@@ -465,6 +465,9 @@ A new current manifest names the target root and campaign while preserving
 origin-qualified route rows and every earlier manifest snapshot.
 Same-filesystem moves use atomic rename and file-list/size inventories;
 cross-device moves use durable copies and byte digests.
+Directory publication holds the ordered root admission locks. On filesystems
+without no-replace rename support, it checks the destination remains absent
+under those same locks and uses ordinary atomic rename, as producer admission does.
 
 ## 4. Workflow Invariants
 
