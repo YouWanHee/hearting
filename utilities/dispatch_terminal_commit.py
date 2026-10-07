@@ -1672,11 +1672,10 @@ def owner_completion_state(jobs, status, metadata) -> CompletionState:
         publication = _publication_observation(request, route, binding)
         if publication is not None and publication["status"] == "pending":
             return CompletionState("pending", "shared-spec-publication-pending")
-        import workflow_state as workflow
-        ledger = workflow.WorkflowLedger(state["route_id"], state["route_hash"], jobs=Path(jobs))
-        if ledger.state()["workflow_state"] == "COMPLETE":
-            return CompletionState("complete")
-        return CompletionState("pending", "workflow-not-complete")
+        # The exact closed outcome, finalized producer and sealed handoff above
+        # are the completion proof. A progress ledger can be absent or lag after
+        # settlement; reclassifying those facts by its status strands closed work.
+        return CompletionState("complete")
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
         return CompletionState("unknown", str(getattr(exc, "code", type(exc).__name__)))
 
