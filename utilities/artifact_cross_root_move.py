@@ -6,8 +6,10 @@ lookups stay root-local; only the separate historical reader follows this journa
 from __future__ import annotations
 
 from datetime import datetime
+from contextlib import contextmanager
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -62,10 +64,19 @@ def tree(path):
             rows[rel] = {"kind": "symlink", "target": os.readlink(node)}
         elif stat.S_ISREG(mode):
             digest = hashlib.sha256()
-            with node.open("rb") as stream:
+            before = node.lstat()
+            fd = os.open(node, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    _error("payload replaced during read: " + str(node))
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
-            rows[rel] = {"kind": "file", "bytes": node.stat().st_size, "sha256": digest.hexdigest()}
+                after = os.fstat(stream.fileno())
+            signature = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if signature(before) != signature(node.lstat()) or signature(opened) != signature(after):
+                _error("payload changed during read: " + str(node))
+            rows[rel] = {"kind": "file", "bytes": after.st_size, "sha256": digest.hexdigest()}
         elif stat.S_ISDIR(mode):
             rows[rel] = {"kind": "directory"}
             for child in sorted(node.iterdir()):
@@ -145,7 +156,19 @@ def _supports(root, records, campaign_path, route_ids):
 def _decision(root, journal):
     paths = [root / item["source"] for item in journal["cycles"] if (root / item["source"]).exists()]
     paths += [Path(item["source"]) for item in journal["attachments"] if Path(item["source"]).exists()]
-    result = authority.relocation_admission(root, [item["record"] for item in journal["cycles"]], paths)
+    selected = set(journal.get("historical_routes", ()))
+    for item in journal["cycles"]:
+        record = _json(_safe(root, P.cycle_record_path(root, item["cycle_id"])))
+        if record.get("route_id"):
+            selected.add(record["route_id"])
+        selected.update(row["route_id"] for row in record.get("route_bindings", []) if row.get("route_id"))
+        current = P._read_manifest_raw(root / item["source"])
+        if current:
+            selected.update(row["route_id"] for row in current[1].get("routes", []) if row.get("route_id"))
+    if selected != set(journal.get("historical_routes", ())):
+        _error("source route membership changed")
+    result = authority.relocation_admission(root, [item["record"] for item in journal["cycles"]], paths,
+                                            selected_route_ids=selected)
     if not result.allowed:
         raise P.ProducerError("relocation-live-work", result.reason or "unknown")
     return result
@@ -194,16 +217,20 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
         used.add(name)
         destination = _safe(target, target_path.parent / name)
         cycles.append({"cycle_id": cid, "record": record, "source": str(directory.relative_to(source)),
-                       "target": str(destination.relative_to(target)), "inventory": tree(directory), "state": "planned"})
+                       "target": str(destination.relative_to(target)), "inventory": tree(directory), "source_identities": _identities(directory), "state": "planned"})
         records.append(record)
     attach = []
     used_names = set()
     for address, cid in attachments:
         directory = Path(address).absolute()
         _safe(source, directory)
-        _safe(source, directory / "dev_logs")
-        if not directory.is_dir() or not (directory / "dev_logs").is_dir() or any(
-                p.name != "dev_logs" for p in directory.iterdir()):
+        logs = directory / "dev_logs"
+        if directory.is_dir() and {p.name for p in directory.iterdir()} == {"artifacts"}:
+            logs = directory / "artifacts/dev_logs"
+            if {p.name for p in (directory / "artifacts").iterdir()} != {"dev_logs"}:
+                _error("attachment artifacts must contain only dev_logs: " + str(directory))
+        _safe(source, logs)
+        if not directory.is_dir() or not logs.is_dir() or {p.name for p in directory.iterdir()} != {logs.relative_to(directory).parts[0]}:
             _error("attachment must contain only unregistered dev_logs: " + str(directory))
         item = next((item for item in cycles if item["cycle_id"] == cid), None)
         if item is None:
@@ -217,16 +244,14 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
         while str(dest) in used_names or os.path.lexists(dest) or os.path.lexists(source / item["source"] / dest.relative_to(target / item["target"])):
             dest = dest.parent / (name + "-" + str(index)); index += 1
         used_names.add(str(dest))
-        attach.append({"source": str(directory), "target": str(dest.relative_to(target)), "cycle_id": cid,
-                       "inventory": tree(directory / "dev_logs"), "state": "planned"})
+        attach.append({"source": str(directory), "logs_source": str(logs), "target": str(dest.relative_to(target)), "cycle_id": cid,
+                       "inventory": tree(logs), "source_identities": _identities(logs), "state": "planned"})
     journal = {"schema": "artifact-cross-root-move/v1", "operation_id": operation_id, "state": "planned",
                "source_root": str(source), "target_root": str(target), "source_campaign": source_row["campaign_id"],
                "target_campaign": target_row["campaign_id"], "source_campaign_path": str(source_path.relative_to(source)),
                "target_campaign_path": str(target_path.relative_to(target)), "merge": bool(source_campaign),
                "cycles": cycles, "attachments": attach, "at": P._rfc3339(now),
                "history_actor": P._history_actor("human")}
-    result = _decision(source, journal)
-    journal["route_ids"] = list(result.route_ids)
     owned_routes = set()
     for item in cycles:
         record = item["record"]
@@ -237,6 +262,8 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
         if current:
             owned_routes.update(row["route_id"] for row in current[1].get("routes", []) if row.get("route_id"))
     journal["historical_routes"] = sorted(owned_routes)
+    result = _decision(source, journal)
+    journal["route_ids"] = list(result.route_ids)
     journal["support_inventory"] = _supports(source, records, source_path, result.route_ids)
     jobs = os.environ.get("AGENT_DISPATCH_JOBS")
     rows = []
@@ -246,10 +273,35 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
                 rows.append(raw.decode("utf-8"))
     journal["registry_support"] = {"original_path": jobs, "rows": rows,
         "sha256": hashlib.sha256("".join(rows).encode()).hexdigest(), "count": len(rows)}
+    controls = {}
+    history = Path(JOURNALS) / operation_id / "historical"
+    for rel, expected in journal["support_inventory"].items():
+        raw = (source / rel).read_bytes()
+        if len(raw) != expected["bytes"] or hashlib.sha256(raw).hexdigest() != expected["sha256"]:
+            _error("support changed while planning: " + rel)
+        controls[str(history / rel)] = raw.hex()
+        prefix = ".runtime/artifact-producer/v1/"
+        remainder = rel.removeprefix(prefix)
+        # Campaign-wide support is archived intact, but only the selected
+        # cycles' controls are reissued into the target's active namespaces.
+        selected_control = any(item["cycle_id"] in rel or item["cycle_id"].encode() in raw
+                               for item in cycles)
+        if not selected_control:
+            continue
+        if rel.startswith(prefix) and remainder.startswith(("manifests/", "history/")):
+            controls[rel] = raw.hex()
+        elif rel.startswith(prefix) and remainder.startswith((P.OPEN_MANIFEST_DIR + "/", P.CHECKPOINT_DIR + "/")) and rel.endswith(".json"):
+            data = _retarget(json.loads(raw), source, target, journal)
+            if data.get("manifest_kind"):
+                data = relocate_document(target, data, {"operation_id": operation_id, "original_root": str(source)})
+            controls[rel] = P._json_bytes(data).hex()
+    if rows:
+        controls[str(history / "dispatch/selected-jobs.log")] = "".join(rows).encode().hex()
+    journal["target_controls"] = controls
     return journal
 
 
-def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_raw=None, prepare=None):
+def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_raw=None, prepare=None, roots=()):
     _safe(target.parent, target)
     published_inventory = dict(inventory)
     if binding is not None:
@@ -276,23 +328,23 @@ def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_ra
         P._write_atomic(stage / locator.CYCLE_BINDING, binding)
     if tree(source) != inventory:
         _error("source changed before publication: " + str(source))
-    if prepare:
-        prepare(stage)
-    # Admission locks serialize cooperating writers; do not replace an occupied slot.
-    if os.path.lexists(target):
-        _error("destination appeared during copy: " + str(target))
-    P._ensure_dir(target.parent)
-    # Linux renameat2 is an atomic no-replace publication on the target filesystem.
-    libc = ctypes.CDLL(None, use_errno=True)
-    rename = libc.renameat2
-    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    rename.restype = ctypes.c_int
-    if rename(-100, os.fsencode(stage), -100, os.fsencode(target), 1):
-        code = ctypes.get_errno()
-        if code == errno.EEXIST:
-            _error("destination appeared during publication: " + str(target))
-        raise OSError(code, os.strerror(code), str(target))
-    P._fsync_dir(target.parent)
+    with admission.lock_roots(roots):
+        if prepare:
+            prepare(stage)
+        # Only manifest/control CAS and the atomic rename hold admission locks.
+        if os.path.lexists(target):
+            _error("destination appeared during copy: " + str(target))
+        P._ensure_dir(target.parent)
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = libc.renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(stage), -100, os.fsencode(target), 1):
+            code = ctypes.get_errno()
+            if code == errno.EEXIST:
+                _error("destination appeared during publication: " + str(target))
+            raise OSError(code, os.strerror(code), str(target))
+        P._fsync_dir(target.parent)
     _fault("publish")
 
 
@@ -335,41 +387,123 @@ def relocate_document(target, document, provenance):
     return document
 
 
+def _verify_controls(target, journal):
+    for rel, encoded in journal["target_controls"].items():
+        path = _safe(target, target / rel)
+        if not path.is_file() or path.is_symlink() or path.read_bytes() != bytes.fromhex(encoded):
+            _error("target control changed; source retained: " + rel)
+
+
 def _support_copy(source, target, journal):
-    history = target / JOURNALS / journal["operation_id"] / "historical"
-    if journal["registry_support"]["rows"]:
-        destination = _safe(target, history / "dispatch/selected-jobs.log")
-        data = "".join(journal["registry_support"]["rows"]).encode()
-        if destination.exists() and destination.read_bytes() != data:
-            _error("historical registry support changed")
-        if not destination.exists():
-            P._ensure_dir(destination.parent)
-            P._write_exclusive(destination, data)
-    for rel, expected in journal["support_inventory"].items():
-        old, new = source / rel, history / rel
-        _safe(source, old); _safe(target, new)
-        # Historical inventory is fixed on first admission. Replay reads its durable copy.
-        if not new.exists():
-            raw = old.read_bytes()
-            if hashlib.sha256(raw).hexdigest() != expected["sha256"]:
-                _error("support changed during copy: " + rel)
-            _copy_exact(old, new)
-        elif hashlib.sha256(new.read_bytes()).hexdigest() != expected["sha256"]:
-            _error("historical support changed: " + rel)
-        producer_prefix = ".runtime/artifact-producer/v1/"
-        if not rel.startswith(producer_prefix):
+    # Expected archive, snapshot and reissued reservation bytes are fixed before
+    # any target publication. No existing destination is silently adopted.
+    for rel, encoded in journal["target_controls"].items():
+        path = _safe(target, target / rel)
+        raw = bytes.fromhex(encoded)
+        with admission.lock_roots([source, target]):
+            if os.path.lexists(path):
+                if path.is_symlink() or not path.is_file() or path.read_bytes() != raw:
+                    _error("target control collision: " + rel)
+            elif journal.get("controls_published"):
+                _error("target control lost; source retained: " + rel)
+            else:
+                P._ensure_dir(path.parent)
+                P._write_exclusive(path, raw)
+                P._fsync_dir(path.parent)
+    journal["controls_published"] = True
+    _save(source, journal)
+
+
+@contextmanager
+def _operation_lock(source, op):
+    # Serialize only exact-operation replay. Unrelated producers never acquire
+    # this lock. Process death releases it without a recovery command.
+    path = _safe(source, source / JOURNALS / (op + ".lock"))
+    P._ensure_dir(path.parent)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _identities(path):
+    result = {}
+    def visit(node, rel):
+        info = node.lstat()
+        result[rel] = [info.st_dev, info.st_ino, info.st_mode]
+        if stat.S_ISDIR(info.st_mode):
+            for child in sorted(node.iterdir()):
+                visit(child, str(Path(rel) / child.name) if rel else child.name)
+    visit(path, "")
+    return result
+
+
+def _source_survivors(old, item):
+    if not os.path.lexists(old):
+        if item["state"] not in {"cleaning", "cleaned"}:
+            _error("source disappeared before cleanup: " + str(old))
+        return
+    survivors = tree(old)
+    if item["state"] not in {"cleaning", "cleaned"} and survivors != item["inventory"]:
+        _error("source changed before cleanup: " + str(old))
+    identities = _identities(old)
+    for rel, expected in survivors.items():
+        if item["inventory"].get(rel) != expected or item["source_identities"].get(rel) != identities[rel]:
+            _error("foreign source survivor; copies retained: " + str(old / rel))
+
+
+def _cleanup(source, target, journal, old, item):
+    _verify_controls(target, journal)
+    _verify_landed(target, journal, item)
+    _source_survivors(old, item)
+    item["state"] = "cleaning"
+    _save(source, journal)  # durable before the first unlink, not after rmtree
+    # Delete only original inventory entries. New foreign children make rmdir
+    # fail and survive; replay also refuses any changed/replaced survivor.
+    for rel in sorted(item["inventory"], key=lambda r: (len(Path(r).parts), r), reverse=True):
+        node = old / rel
+        if not os.path.lexists(node):
             continue
-        remainder = rel[len(producer_prefix):]
-        if remainder.startswith(("manifests/", "history/")) and new.suffix in {".json", ".jsonl"}:
-            _copy_exact(new, _safe(target, target / rel))
-        elif remainder.startswith((P.OPEN_MANIFEST_DIR + "/", P.CHECKPOINT_DIR + "/")) and new.suffix == ".json":
-            destination = _safe(target, target / rel)
-            data = _retarget(_json(new), source, target, journal)
-            if data.get("manifest_kind"):
-                data = relocate_document(target, data, {"operation_id": journal["operation_id"], "original_root": str(source)})
-            if not destination.exists():
-                P._ensure_dir(destination.parent)
-                P._write_exclusive(destination, P._json_bytes(data))
+        info = node.lstat()
+        if item["source_identities"][rel] != [info.st_dev, info.st_ino, info.st_mode]:
+            _error("source identity changed during cleanup: " + str(node))
+        if item["inventory"][rel]["kind"] == "directory":
+            node.rmdir()
+        else:
+            if tree(node)[""] != item["inventory"][rel]:
+                _error("source bytes changed during cleanup: " + str(node))
+            node.unlink()
+    P._fsync_dir(old.parent)
+    item["state"] = "cleaned"
+    _save(source, journal)
+
+
+def _verify_landed(target, journal, item):
+    directory = _safe(target, target / item["target"])
+    if not os.path.lexists(directory):
+        _error("target payload missing; source retained: " + item["target"])
+    landed = tree(directory)
+    if "logs_source" in item:
+        if landed != item["inventory"]:
+            _error("target logs changed; source retained: " + item["target"])
+        return
+    expected_inventory = dict(item["inventory"])
+    binding = locator.cycle_binding_bytes(journal["target_campaign"], item["cycle_id"],
+                                           started_on=item["record"].get("started_on"))
+    expected_inventory[locator.CYCLE_BINDING] = {"kind": "file", "bytes": len(binding),
+                                                "sha256": hashlib.sha256(binding).hexdigest()}
+    if item.get("prepared_manifest"):
+        raw = P.artifact_manifest.canonical_bytes(item["prepared_manifest"])
+        expected_inventory["manifest.json"] = {"kind": "file", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        snapshot = _safe(target, P.artifact_lifecycle.manifest_snapshot_path(target, item["cycle_id"],
+                                                  item["prepared_manifest"]["manifest_revision_id"]))
+        if not snapshot.is_file() or snapshot.is_symlink() or snapshot.read_bytes() != raw:
+            _error("required target snapshot changed; source retained: " + item["cycle_id"])
+    for rel, expected in expected_inventory.items():
+        if landed.get(rel) != expected:
+            _error("target payload changed; source retained: " + item["cycle_id"] + "/" + rel)
 
 
 def _pointer(source, destination, operation_id):
@@ -441,7 +575,7 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
         journal = journal or _plan(source, target, operation_id=op, cycle_id=cycle_id,
             source_campaign=source_campaign, campaign=campaign, attachments=attachments, now=now)
         return dict(_receipt(journal), dry_run=True)
-    with admission.lock_roots([source, target], now=now):
+    with _operation_lock(source, op):
         journal = _json(path) if path.exists() else _plan(source, target, operation_id=op, cycle_id=cycle_id,
             source_campaign=source_campaign, campaign=campaign, attachments=attachments, now=now)
         if journal["state"] == "committed":
@@ -451,23 +585,24 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
         _save(source, journal)
         _support_copy(source, target, journal)
         staging = _safe(target, target / JOURNALS / op / "staging")
-        # Seed selected records before manifest publication for internal parent references.
-        for item in journal["cycles"]:
-            cid = item["cycle_id"]
-            target_record_path = P.cycle_record_path(target, cid)
-            _safe(target, target_record_path)
-            existing = P.read_cycle_record(target, cid)
-            if existing and (existing.get("relocation") or {}).get("operation_id") != op:
-                _error("target cycle identity collision: " + cid)
-            if not existing:
-                record = dict(item["record"], campaign_id=journal["target_campaign"],
-                    locator=Path(item["target"]).name, relocation={"operation_id": op, "original_root": str(source),
-                    "original_campaign_id": journal["source_campaign"], "original_locator": item["source"],
-                    "original_repository_id": P.artifact_lifecycle.read_root_identity(source).repository_id,
-                    "external_parent_root": str(source) if item["record"].get("parent_cycle_id") not in
-                        {c["cycle_id"] for c in journal["cycles"]} else None})
-                P._write_cycle_record(target, record, exclusive=True)
-            P._edit_campaign_members(target, (target / journal["target_campaign_path"]).parent, cid, joining=True)
+        with admission.lock_roots([source, target], now=now):
+            # Seed selected records before manifest publication for internal parent references.
+            for item in journal["cycles"]:
+                cid = item["cycle_id"]
+                target_record_path = P.cycle_record_path(target, cid)
+                _safe(target, target_record_path)
+                existing = P.read_cycle_record(target, cid)
+                if existing and (existing.get("relocation") or {}).get("operation_id") != op:
+                    _error("target cycle identity collision: " + cid)
+                if not existing:
+                    record = dict(item["record"], campaign_id=journal["target_campaign"],
+                        locator=Path(item["target"]).name, relocation={"operation_id": op, "original_root": str(source),
+                        "original_campaign_id": journal["source_campaign"], "original_locator": item["source"],
+                        "original_repository_id": P.artifact_lifecycle.read_root_identity(source).repository_id,
+                        "external_parent_root": str(source) if item["record"].get("parent_cycle_id") not in
+                            {c["cycle_id"] for c in journal["cycles"]} else None})
+                    P._write_cycle_record(target, record, exclusive=True)
+                P._edit_campaign_members(target, (target / journal["target_campaign_path"]).parent, cid, joining=True)
         for item in journal["cycles"]:
             if item["state"] == "planned":
                 _safe(source, source / item["source"])
@@ -501,106 +636,97 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
                 _publish_tree(source / item["source"], target / item["target"], staging / item["cycle_id"], item["inventory"],
                     binding=locator.cycle_binding_bytes(journal["target_campaign"], item["cycle_id"],
                                                        started_on=item["record"].get("started_on")),
-                    manifest_raw=raw, prepare=prepare)
+                    manifest_raw=raw, prepare=prepare, roots=[source, target])
                 item["state"] = "published"; _save(source, journal)
         for index, item in enumerate(journal["attachments"]):
             if item["state"] == "planned":
-                _safe(source, Path(item["source"]) / "dev_logs")
+                _safe(source, Path(item["logs_source"]))
                 _safe(target, target / item["target"])
                 _safe(target, staging / ("logs-" + str(index)))
-                _publish_tree(Path(item["source"]) / "dev_logs", target / item["target"], staging / ("logs-" + str(index)), item["inventory"])
+                _publish_tree(Path(item["logs_source"]), target / item["target"], staging / ("logs-" + str(index)), item["inventory"], roots=[source, target])
                 item["state"] = "published"; _save(source, journal)
         _decision(source, journal)
-        for item in journal["cycles"]:
-            cid = item["cycle_id"]
-            if item["state"] == "published":
-                record = P.read_cycle_record(target, cid)
-                # A crash after publication can replay with an already adopted record.
-                record, _ = P._adopt_location_locked(target, record, target / item["target"],
-                    command="cycle-move", stamp=op, reason=reason, now=now, by="human")
-                P._edit_campaign_members(target, (target / journal["target_campaign_path"]).parent, cid, joining=True)
-                item["state"] = "adopted"; _save(source, journal)
-        locator.update_indexes(target, [journal["target_campaign"]])
+        with admission.lock_roots([source, target], now=now):
+            for item in journal["cycles"]:
+                cid = item["cycle_id"]
+                if item["state"] == "published":
+                    record = P.read_cycle_record(target, cid)
+                    # A crash after publication can replay with an already adopted record.
+                    record, _ = P._adopt_location_locked(target, record, target / item["target"],
+                        command="cycle-move", stamp=op, reason=reason, now=now, by="human")
+                    P._edit_campaign_members(target, (target / journal["target_campaign_path"]).parent, cid, joining=True)
+                    item["state"] = "adopted"; _save(source, journal)
+            locator.update_indexes(target, [journal["target_campaign"]])
         _fault("metadata")
         canonical = {"artifact_root": str(target), "campaign_id": journal["target_campaign"], "operation_id": op}
         source_campaign_path = source / journal["source_campaign_path"]
-        if journal["merge"]:
-            row = campaigns.fold_campaign(source, source_campaign_path, _json(source_campaign_path))
-            row["relocation"] = canonical
-            P._write_campaign(source, row, exclusive=False)
-            campaigns.supersede_locked(source, source_campaign_path, operation_id=op,
-                target_root=target, target_campaign=journal["target_campaign"])
+        with admission.lock_roots([source, target], now=now):
+            if journal["merge"]:
+                row = campaigns.fold_campaign(source, source_campaign_path, _json(source_campaign_path))
+                row["relocation"] = canonical
+                P._write_campaign(source, row, exclusive=False)
+                campaigns.supersede_locked(source, source_campaign_path, operation_id=op,
+                    target_root=target, target_campaign=journal["target_campaign"])
         _fault("closure")
         # Re-observe liveness and source content before the source-last destructive step.
         _decision(source, journal)
         for item in journal["cycles"]:
-            landed = tree(target / item["target"])
-            binding = locator.cycle_binding_bytes(journal["target_campaign"], item["cycle_id"],
-                                                   started_on=item["record"].get("started_on"))
-            if (target / item["target"] / locator.CYCLE_BINDING).read_bytes() != binding:
-                _error("target binding changed; source retained: " + item["cycle_id"])
-            if item.get("prepared_manifest") and (target / item["target"] / "manifest.json").read_bytes() != P.artifact_manifest.canonical_bytes(item["prepared_manifest"]):
-                _error("target manifest changed; source retained: " + item["cycle_id"])
-            for rel, expected in item["inventory"].items():
-                if rel not in {locator.CYCLE_BINDING, "manifest.json"} and landed.get(rel) != expected:
-                    _error("target payload changed; source retained: " + item["cycle_id"] + "/" + rel)
-            old = source / item["source"]
-            if old.exists() and tree(old) != item["inventory"]:
-                _error("source payload changed; copies retained: " + str(old))
+            _verify_landed(target, journal, item)
+            _source_survivors(source / item["source"], item)
         for item in journal["attachments"]:
-            old = Path(item["source"]) / "dev_logs"
-            if old.exists() and tree(old) != item["inventory"]:
-                _error("source logs changed; copies retained: " + str(old))
+            _verify_landed(target, journal, item)
+            _source_survivors(Path(item["logs_source"]), item)
+        _verify_controls(target, journal)
         for item in journal["cycles"]:
             cid = item["cycle_id"]
             old, new = source / item["source"], target / item["target"]
             _safe(source, old); _safe(target, new)
-            record = P.read_cycle_record(source, cid)
-            record["relocation"] = dict(canonical, cycle_id=cid, locator=item["target"])
-            P._write_cycle_record(source, record, exclusive=False)
-            _pointer(old, new, op)
-            P._edit_campaign_members(source, source_campaign_path.parent, cid, joining=False)
-            if old.exists():
-                shutil.rmtree(old); P._fsync_dir(old.parent)
-            item["state"] = "cleaned"; _save(source, journal)
+            with admission.lock_roots([source], now=now):
+                record = P.read_cycle_record(source, cid)
+                record["relocation"] = dict(canonical, cycle_id=cid, locator=item["target"])
+                P._write_cycle_record(source, record, exclusive=False)
+                _pointer(old, new, op)
+                P._edit_campaign_members(source, source_campaign_path.parent, cid, joining=False)
+                _cleanup(source, target, journal, old, item)
             _fault("source-cleanup")
         for item in journal["attachments"]:
             old, new = Path(item["source"]), target / item["target"]
             _safe(source, old); _safe(target, new)
-            _pointer(old / "dev_logs", new, op)
-            _pointer(old, new, op)
-            if (old / "dev_logs").exists():
-                shutil.rmtree(old / "dev_logs"); P._fsync_dir(old)
-            item["state"] = "cleaned"; _save(source, journal)
-        P._retire_rows(source, [item["cycle_id"] for item in journal["cycles"]])
-        locator.update_indexes(source, [journal["source_campaign"]])
-        for item in journal["cycles"]:
-            cid = item["cycle_id"]
-            line = P._command_line(command="cycle-move", stamp=op, target_type="cycle", target_id=cid,
-                target_path=item["target"], operation="move", field="path",
-                before={"value": {"root": str(source), "path": item["source"]}},
-                after={"value": {"root": str(target), "path": item["target"]}}, reason=reason, now=now, by="human")
-            for key in ("actor", "actor_by", "session", "harness", "route", "attempt"):
-                line.pop(key, None)
-            line.update(journal["history_actor"])
-            record = P.read_cycle_record(target, cid)
-            P._write_cycle_record(target, P._with_cycle_lines(record, [line]), exclusive=False)
-            P._flush_cycle_pending_locked(target, cid)
-        for item in journal["attachments"]:
-            cid = item["cycle_id"]
-            payload_digest = hashlib.sha256(P._json_bytes(item["inventory"])).hexdigest()
-            line = P._command_line(command="cycle-move", stamp=op + item["source"], target_type="cycle", target_id=cid,
-                target_path=item["target"], operation="move", field="path",
-                before={"value": {"root": str(source), "path": str(Path(item["source"]).relative_to(source)),
-                                   "payload_sha256": payload_digest}},
-                after={"value": {"root": str(target), "path": item["target"], "cycle_id": cid}},
-                reason="attach relocated logs", now=now, by="human")
-            for key in ("actor", "actor_by", "session", "harness", "route", "attempt"):
-                line.pop(key, None)
-            line.update(journal["history_actor"])
-            record = P.read_cycle_record(target, cid)
-            P._write_cycle_record(target, P._with_cycle_lines(record, [line]), exclusive=False)
-            P._flush_cycle_pending_locked(target, cid)
+            logs = Path(item["logs_source"])
+            with admission.lock_roots([source], now=now):
+                _pointer(logs, new, op)
+                _pointer(old, new, op)
+                _cleanup(source, target, journal, logs, item)
+        with admission.lock_roots([source, target], now=now):
+            P._retire_rows(source, [item["cycle_id"] for item in journal["cycles"]])
+            locator.update_indexes(source, [journal["source_campaign"]])
+            for item in journal["cycles"]:
+                cid = item["cycle_id"]
+                line = P._command_line(command="cycle-move", stamp=op, target_type="cycle", target_id=cid,
+                    target_path=item["target"], operation="move", field="path",
+                    before={"value": {"root": str(source), "path": item["source"]}},
+                    after={"value": {"root": str(target), "path": item["target"]}}, reason=reason, now=now, by="human")
+                for key in ("actor", "actor_by", "session", "harness", "route", "attempt"):
+                    line.pop(key, None)
+                line.update(journal["history_actor"])
+                record = P.read_cycle_record(target, cid)
+                P._write_cycle_record(target, P._with_cycle_lines(record, [line]), exclusive=False)
+                P._flush_cycle_pending_locked(target, cid)
+            for item in journal["attachments"]:
+                cid = item["cycle_id"]
+                payload_digest = hashlib.sha256(P._json_bytes(item["inventory"])).hexdigest()
+                line = P._command_line(command="cycle-move", stamp=op + item["source"], target_type="cycle", target_id=cid,
+                    target_path=item["target"], operation="move", field="path",
+                    before={"value": {"root": str(source), "path": str(Path(item["source"]).relative_to(source)),
+                                       "payload_sha256": payload_digest}},
+                    after={"value": {"root": str(target), "path": item["target"], "cycle_id": cid}},
+                    reason="attach relocated logs", now=now, by="human")
+                for key in ("actor", "actor_by", "session", "harness", "route", "attempt"):
+                    line.pop(key, None)
+                line.update(journal["history_actor"])
+                record = P.read_cycle_record(target, cid)
+                P._write_cycle_record(target, P._with_cycle_lines(record, [line]), exclusive=False)
+                P._flush_cycle_pending_locked(target, cid)
         _fault("history")
         journal["state"] = "committed"
         _save(source, journal)

@@ -285,6 +285,234 @@ class CrossRootMoveTest(F.ProducerTestBase):
         self.assertTrue(Path(self.src["cycle_dir"]).exists())
 
 
+class CorrectionMoveTest(CrossRootMoveTest):
+    """Closed Round 1 delta; select this class's named cases, never inherited suite."""
+
+    def logs(self, name="correction", nested=False, cycle=None):
+        folder = self.source / "campaigns" / name
+        logs = folder / ("artifacts/dev_logs" if nested else "dev_logs")
+        (logs / "sub").mkdir(parents=True)
+        (logs / "sub/a.md").write_bytes(b"original a")
+        (logs / "sub/b.md").write_bytes(b"original b")
+        return folder, logs, [str(folder) + "=" + (cycle or self.src)["cycle_id"]]
+
+    def interrupted(self, point="metadata", **kwargs):
+        def fault(phase):
+            if phase == point:
+                raise RuntimeError("response lost at " + point)
+        with mock.patch.object(X, "_fault", side_effect=fault), self.assertRaises(RuntimeError):
+            self.move(**kwargs)
+        return json.loads(next((self.source / X.JOURNALS).glob("*.json")).read_bytes())
+
+    def test_correction_two_logs_shapes_and_old_nested_paths(self):
+        for nested in [False, True]:
+            cycle = self.make(self.source, "shape-" + str(nested), closed=True)
+            folder, logs, args = self.logs("shape-" + str(nested), nested, cycle)
+            def run():
+                return P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target,
+                                    campaign=self.dst["campaign_id"], attach_logs=args)
+            out = run()
+            landed = self.target / out["attachments"][0]["target"]
+            self.assertEqual(out["attachments"][0]["logs_source"], str(logs))
+            self.assertEqual(Reader.resolve_path(self.source, str((logs / "sub/a.md").relative_to(self.source)))["absolute"],
+                             str(landed / "sub/a.md"))
+            self.assertEqual(Reader.resolve_path(self.source, str(folder.relative_to(self.source)))["absolute"], str(landed))
+            self.assertEqual(run()["operation_id"], out["operation_id"])
+            (folder / "foreign-empty").mkdir()
+            self.assertEqual(Reader.resolve_path(self.source, str(folder.relative_to(self.source)))["absolute"], str(folder))
+            (folder / "foreign-empty").rmdir()
+            (folder / "foreign.txt").write_text("successor")
+            self.assertEqual(Reader.resolve_path(self.source, str(folder.relative_to(self.source)))["absolute"], str(folder))
+
+    def test_correction_registered_attachment_refused(self):
+        folder, logs, args = self.logs(nested=True)
+        (folder / "artifacts/manifest.json").write_text("{}")
+        with self.assertRaises(P.ProducerError):
+            self.move(attach_logs=args)
+        self.assertTrue((logs / "sub/a.md").exists())
+
+    def test_correction_partial_cycle_and_logs_unlink_replay(self):
+        for kind in ["cycle", "logs"]:
+            cycle = self.make(self.source, "partial-" + kind, closed=True)
+            folder, logs, args = self.logs("partial-" + kind, True, cycle)
+            selected = Path(cycle["cycle_dir"]) if kind == "cycle" else logs
+            original = Path.unlink
+            deleted = []
+            def partial(path, *a, **kw):
+                result = original(path, *a, **kw)
+                if selected in path.parents and not deleted:
+                    deleted.append(str(path))
+                    raise OSError("partial unlink response loss")
+                return result
+            def run():
+                return P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target,
+                                    campaign=self.dst["campaign_id"], attach_logs=args)
+            with mock.patch.object(Path, "unlink", partial), self.assertRaises(OSError):
+                run()
+            self.assertEqual(len(deleted), 1)
+            journal = next(row for path in (self.source / X.JOURNALS).glob("*.json")
+                           if (row := json.loads(path.read_bytes()))["cycles"][0]["cycle_id"] == cycle["cycle_id"])
+            item = journal["cycles"][0] if kind == "cycle" else journal["attachments"][0]
+            self.assertEqual(item["state"], "cleaning")
+            self.assertEqual(run()["status"], "moved")
+            record_before = P.cycle_record_path(self.target, cycle["cycle_id"]).read_bytes()
+            self.assertEqual(run()["status"], "moved")
+            self.assertEqual(P.cycle_record_path(self.target, cycle["cycle_id"]).read_bytes(), record_before)
+            self.assertFalse(selected.exists())
+
+    def test_correction_foreign_survivors_after_partial_cleanup_preserved(self):
+        for change in ["new", "bytes", "identity"]:
+            cycle = self.make(self.source, "foreign-" + change, closed=True)
+            selected = Path(cycle["cycle_dir"])
+            (selected / "artifacts/survivor.md").write_bytes(b"keep me")
+            original = Path.unlink
+            deleted = []
+            def partial(path, *a, **kw):
+                result = original(path, *a, **kw)
+                if selected in path.parents and not deleted:
+                    deleted.append(str(path))
+                    raise OSError("partial cleanup")
+                return result
+            def run():
+                return P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target,
+                                    campaign=self.dst["campaign_id"])
+            with mock.patch.object(Path, "unlink", partial), self.assertRaises(OSError):
+                run()
+            survivor = selected / "artifacts/survivor.md"
+            self.assertTrue(survivor.exists())
+            if change == "new":
+                survivor = selected / "artifacts/new-writer.md"
+                survivor.write_bytes(b"foreign")
+            elif change == "bytes":
+                survivor.write_bytes(b"changed")
+            else:
+                temporary = survivor.with_name("replacement")
+                temporary.write_bytes(survivor.read_bytes())
+                temporary.replace(survivor)
+            before = survivor.read_bytes()
+            with self.assertRaises(P.ProducerError):
+                run()
+            self.assertEqual(survivor.read_bytes(), before)
+
+    def test_correction_attachment_target_drift_keeps_source(self):
+        for change in ["bytes", "delete", "symlink"]:
+            cycle = self.make(self.source, "logs-drift-" + change, closed=True)
+            folder, logs, args = self.logs("logs-drift-" + change, True, cycle)
+            def mutate(phase):
+                if phase == "metadata":
+                    journals = [json.loads(p.read_bytes()) for p in (self.source / X.JOURNALS).glob("*.json")]
+                    row = next(j for j in journals if j["cycles"][0]["cycle_id"] == cycle["cycle_id"])
+                    path = self.target / row["attachments"][0]["target"] / "sub/a.md"
+                    if change == "bytes":
+                        path.write_bytes(b"wrong")
+                    else:
+                        path.unlink()
+                        if change == "symlink":
+                            path.symlink_to(logs / "sub/a.md")
+            def run():
+                return P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target,
+                                    campaign=self.dst["campaign_id"], attach_logs=args)
+            with mock.patch.object(X, "_fault", side_effect=mutate), self.assertRaises(P.ProducerError):
+                run()
+            self.assertEqual((logs / "sub/a.md").read_bytes(), b"original a")
+            with self.assertRaises(P.ProducerError):
+                run()
+            self.assertTrue(Path(cycle["cycle_dir"]).exists())
+
+    def test_correction_manifest_only_routes_admitted_before_hash_support(self):
+        manifest = Path(self.src["cycle_dir"]) / "manifest.json"
+        doc = json.loads(manifest.read_bytes())
+        doc["routes"].append(dict(doc["routes"][0], route_id="rt-manifest-only"))
+        manifest.write_text(json.dumps(doc))
+        for reason in ["owner-live", "resource-run", "human-gate", "finish-pending"]:
+            observed = type("Evidence", (), {"resource_paths": set(), "open_paths": set(),
+                "kept": lambda self, rid, *args: reason if rid == "rt-manifest-only" else None})()
+            with mock.patch.object(X.authority, "relocation_admission", wraps=X.authority.relocation_admission), \
+                 mock.patch("route_autoclose._Evidence", return_value=observed), self.assertRaises(P.ProducerError):
+                self.move(dry_run=True)
+        self.assertTrue(Path(self.src["cycle_dir"]).exists())
+
+    def checkpoint_cycle(self, slug):
+        marker = Path(os.environ["AGENT_HOME"]) / P.INTERIM_SUPPORT_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("fixture interim support")
+        cycle = self.make(self.source, slug)
+        self.assertEqual(P.checkpoint(self.source, cycle_id=cycle["cycle_id"], trigger="explicit")["status"], "emitted")
+        return cycle
+
+    def test_correction_preexisting_reservation_collision(self):
+        cycle = self.checkpoint_cycle("preexisting-control")
+        path = P.reservation_path(self.target, cycle["cycle_id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"artifacts": ["foreign-reservation"]}')
+        before = path.read_bytes()
+        with self.assertRaises(P.ProducerError):
+            P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target, campaign=self.dst["campaign_id"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(Path(cycle["cycle_dir"]).exists())
+
+    def test_correction_controls_drift_and_exact_replay(self):
+        for control in ["reservation", "open-manifest", "snapshot", "archive"]:
+            for change in ["bytes", "delete"]:
+                cycle = self.checkpoint_cycle("control-" + control + "-" + change) if control in {"reservation", "open-manifest"} else self.make(self.source, "control-" + control + "-" + change, closed=True)
+                def run():
+                    return P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target, campaign=self.dst["campaign_id"])
+                def stop(phase):
+                    if phase == "metadata":
+                        raise RuntimeError("before cleanup")
+                with mock.patch.object(X, "_fault", side_effect=stop), self.assertRaises(RuntimeError):
+                    run()
+                row = next(j for p in (self.source / X.JOURNALS).glob("*.json")
+                           if (j := json.loads(p.read_bytes()))["cycles"][0]["cycle_id"] == cycle["cycle_id"])
+                if control == "reservation":
+                    path = P.reservation_path(self.target, cycle["cycle_id"])
+                elif control == "open-manifest":
+                    path = P.open_manifest_path(self.target, cycle["cycle_id"])
+                elif control == "snapshot":
+                    path = P.artifact_lifecycle.manifest_snapshot_path(self.target, cycle["cycle_id"], row["cycles"][0]["prepared_manifest"]["manifest_revision_id"])
+                else:
+                    path = self.target / next(rel for rel in row["target_controls"] if "/historical/.runtime/routes/" in rel)
+                original = path.read_bytes()
+                if change == "bytes":
+                    path.write_bytes(b"changed control")
+                else:
+                    path.unlink()
+                with self.assertRaises(P.ProducerError):
+                    run()
+                self.assertTrue(Path(cycle["cycle_dir"]).exists())
+                path.write_bytes(original)
+                self.assertEqual(run()["status"], "moved")
+
+    def test_correction_target_producer_progress_during_prepare_and_copy(self):
+        progress = []
+        original_tree, original_copy = X.tree, X.shutil.copytree
+        source = Path(self.src["cycle_dir"])
+        def inventory(path):
+            if Path(path) == source and "hash" not in progress:
+                extra = self.make(self.target, "during-hash")
+                progress.append("hash")
+                progress.append(extra["cycle_id"])
+            return original_tree(path)
+        def copy(*args, **kwargs):
+            if "copy" not in progress:
+                extra = self.make(self.target, "during-copy")
+                progress.append("copy")
+                progress.append(extra["cycle_id"])
+            return original_copy(*args, **kwargs)
+        with mock.patch.object(X, "tree", side_effect=inventory), mock.patch.object(X.shutil, "copytree", side_effect=copy):
+            out = self.move()
+        self.assertEqual(out["status"], "moved")
+        members = P.read_campaign(self.target, self.dst["campaign_id"])["cycles"]
+        self.assertIn(progress[1], members)
+        self.assertIn(progress[3], members)
+
+    def test_correction_history_response_loss_replay(self):
+        self.interrupted("history")
+        out = self.move()
+        self.assertEqual(out["status"], "moved")
+        self.assertEqual(self.move()["operation_id"], out["operation_id"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

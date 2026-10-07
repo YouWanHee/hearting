@@ -819,5 +819,68 @@ class RelocationAuthorityTest(unittest.TestCase):
         self.assertTrue(RA.relocation_admission(Path("/source"), [], [Path("/source/cycle")], evidence=observed).allowed)
 
 
+class RelocationCorrectionTest(unittest.TestCase):
+    def test_missing_historical_completion_keeps_history_without_closing(self):
+        import route_autoclose as ac
+        import dispatch_terminal_commit as terminal
+        import inline_finish
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_path = root / ".runtime/routes/rt-stale.json"
+            route_path.parent.mkdir(parents=True)
+            raw = b'{"route_id":"rt-stale", "cwd":"/old/missing/root"}'
+            route_path.write_bytes(raw)
+            observed = ac._Evidence.__new__(ac._Evidence)
+            observed.root = root
+            observed.held = set()
+            observed.owners = {"rt-stale": [{"jobs": "/old/missing/jobs.log", "status": "done", "metadata": {}}]}
+            observed.resource_paths = observed.resource_routes = observed.open_paths = set()
+            observed.gate_roots = []
+            with mock.patch.object(terminal, "owner_completion_state", return_value=terminal.CompletionState("unknown", "FileNotFoundError")), \
+                 mock.patch.object(inline_finish, "pending_state", return_value=None):
+                result = RA.relocation_admission(root, [{"route_id": "rt-stale"}], [], evidence=observed)
+            self.assertTrue(result.allowed, result.reason)
+            self.assertEqual(route_path.read_bytes(), raw)
+            self.assertFalse(route_path.with_suffix(".outcome.json").exists())
+            self.assertFalse(RA.owns({"parent_sid": "old-parent"}, "without-ack", None))
+
+    def test_positive_pending_and_unknown_execution_still_protected(self):
+        import route_autoclose as ac
+        import dispatch_terminal_commit as terminal
+        import inline_finish
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observed = ac._Evidence.__new__(ac._Evidence)
+            observed.root = root
+            observed.resource_paths = observed.open_paths = set()
+            observed.gate_roots = []
+            observed.owners = {"rt-selected": [{"jobs": "/old/jobs.log", "status": "done", "metadata": {}}]}
+            for state, held, resources, pending, reason in [
+                (terminal.CompletionState("pending", "workflow-not-complete"), set(), set(), None, "owner-settlement-pending"),
+                (terminal.CompletionState("unknown", "ValueError"), set(), set(), None, "owner-settlement-pending"),
+                (terminal.CompletionState("unknown", "FileNotFoundError"), {"rt-selected"}, set(), None, "owner-live"),
+                (terminal.CompletionState("unknown", "FileNotFoundError"), set(), {"rt-selected"}, None, "resource-run"),
+                (terminal.CompletionState("unknown", "FileNotFoundError"), set(), set(), {"state": "sealing"}, "finish-pending")]:
+                observed.held, observed.resource_routes = held, resources
+                with self.subTest(reason=reason), mock.patch.object(terminal, "owner_completion_state", return_value=state), \
+                     mock.patch.object(inline_finish, "pending_state", return_value=pending):
+                    result = RA.relocation_admission(root, [], [], selected_route_ids=["rt-selected"], evidence=observed)
+                self.assertFalse(result.allowed)
+                self.assertEqual(result.reason, reason)
+
+    def test_selected_manifest_route_and_external_parent_support_are_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / ".runtime/routes/rt-selected.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"route_id": "rt-selected", "parent_route_id": "rt-external"}))
+            seen = []
+            evidence = SimpleNamespace(resource_paths=set(), open_paths=set(), kept=lambda rid, *args: seen.append(rid))
+            result = RA.relocation_admission(root, [], [], selected_route_ids=["rt-selected"], evidence=evidence)
+            self.assertTrue(result.allowed)
+            self.assertEqual(set(result.route_ids), {"rt-selected", "rt-external"})
+            self.assertEqual(set(seen), set(result.route_ids))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6904,7 +6904,8 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                     f"manifest digest mismatch for {cycle_id}; manual inspection required"
                 )
     for record in list_cycle_records(root):
-        if record.get("state") != "open" or record.get("deleted_at"):
+        if (record.get("state") != "open" or record.get("deleted_at")
+                or (record.get("relocation") or {}).get("artifact_root")):
             continue
         try:
             directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)

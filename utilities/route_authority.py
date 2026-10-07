@@ -967,7 +967,7 @@ class RelocationDecision(NamedTuple):
     route_ids: tuple[str, ...]
 
 
-def relocation_admission(root, records, directories, *, evidence=None) -> RelocationDecision:
+def relocation_admission(root, records, directories, *, selected_route_ids=(), evidence=None) -> RelocationDecision:
     """Read-only no-live history decision; never grants continuation ownership.
 
     Unknown evidence protects the source. Target unrelated work is outside this scope.
@@ -975,7 +975,7 @@ def relocation_admission(root, records, directories, *, evidence=None) -> Reloca
     """
     import route_autoclose as ac
     import artifact_producer as producer
-    route_ids = set()
+    route_ids = set(selected_route_ids)
     def ids(value):
         if isinstance(value, dict):
             for key, item in value.items():
@@ -1007,7 +1007,23 @@ def relocation_admission(root, records, directories, *, evidence=None) -> Reloca
             route = json.loads(path.read_bytes()) if path.exists() else None
             ids(route)
             pending.extend(route_ids - checked)
-            reason = observed.kept(route_id, lambda: None, route)
+            if hasattr(observed, "owners"):
+                # Closure settlement and intact history relocation have different
+                # authority. A missing old absolute completion path is not live
+                # work. Keep positive pending settlement and every other guard.
+                import copy
+                from dispatch_terminal_commit import owner_completion_state
+                relocation = copy.copy(observed)
+                owners = []
+                for row in observed.owners.get(route_id, ()):
+                    state = owner_completion_state(Path(row["jobs"]), row["status"], row["metadata"])
+                    if state.state == "unknown" and state.reason == "FileNotFoundError":
+                        continue
+                    owners.append(row)
+                relocation.owners = {route_id: owners}
+                reason = relocation.kept(route_id, lambda: None, route)
+            else:
+                reason = observed.kept(route_id, lambda: None, route)
             if reason:
                 return RelocationDecision(False, reason, tuple(sorted(route_ids)))
     except Exception as exc:

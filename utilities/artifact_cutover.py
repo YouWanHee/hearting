@@ -1954,7 +1954,16 @@ def resolve_legacy(root: Path, rel: str) -> Dict[str, Any]:
     root = Path(root).resolve()
     rel = rel.strip("/")
     direct = root / rel
-    if direct.exists() and not os.path.islink(str(direct)):
+    # Cleanup may retain a directory solely to hold nested relocation pointers.
+    # A real successor payload still wins over a stale sibling pointer.
+    pointer_wrapper = (direct.is_dir() and not direct.is_symlink()
+                       and _relocated_pointer_target(direct.parent / (direct.name + _RELOCATED_SUFFIX)) is not None
+                       and all(not p.is_symlink() and ((p.is_dir() and any(
+                                   _relocated_pointer_target(q) is not None
+                                   for q in p.rglob("*" + _RELOCATED_SUFFIX))) or
+                               (p.name.endswith(_RELOCATED_SUFFIX) and _relocated_pointer_target(p) is not None))
+                               for p in direct.rglob("*")))
+    if direct.exists() and not os.path.islink(str(direct)) and not pointer_wrapper:
         return {"path": rel, "resolution": "present", "target": rel, "absolute": str(direct)}
     maps = _load_maps(root)
     missed: List[str] = [os.path.normpath(str(direct))]
