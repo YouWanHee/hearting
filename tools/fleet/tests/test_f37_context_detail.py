@@ -472,6 +472,38 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         self.assertEqual(job.context_window_tokens, 2000)
         self.assertEqual(job.ctx_pct, 8)
 
+    def test_owner_and_worker_show_the_model_recorded_in_the_exact_attempt(self):
+        for depth, alias, model, shown in (
+                (1, "opus", "claude-opus-5-5", "Opus 5.5"),
+                (2, "sonnet", "claude-sonnet-5-5", "Sonnet 5.5"),
+                (2, "opus", "claude-opus-4-8", "Opus 4.8")):
+            with self.subTest(depth=depth, model=model):
+                job = self._job("att-model-%s-%s" % (depth, alias))
+                job.model, job.depth, job.effort = alias, depth, "xhigh"
+                job.resolved_model = "claude-opus-5"
+                self._write_log(job, [self._assistant("sid-child", model, 160)])
+                dispatch_collector._enrich_claude_stream_session(job)
+                self.assertEqual(job.resolved_model, model)
+                self.assertEqual(job.model, alias)
+                self.assertEqual(render._job_display_model(job), shown)
+                row = render._dispatch_row(job, name_width=40)
+                self.assertIn(shown, "".join(t for t, _k in row))
+                self.assertIn(shown, "".join(t for t, _k in render._route_job_row(job)))
+
+    def test_model_alias_is_kept_until_a_real_model_is_logged(self):
+        job = self._job("att-model-startup")
+        job.model = "opus"
+        self._write_log(job, [{"type": "system", "session_id": "sid-child"},
+                              self._assistant("sid-child", "<synthetic>", 160)])
+        dispatch_collector._enrich_claude_stream_session(job)
+        self.assertIsNone(job.resolved_model)
+        self.assertEqual(render._job_display_model(job), "Opus")
+        self._write_log(job, [{"type": "system", "subtype": "init",
+                              "session_id": "sid-child", "model": "claude-opus-5-5"},
+                             self._assistant("sid-child", "<synthetic>", 160)])
+        dispatch_collector._enrich_claude_stream_session(job, fast_first=True)
+        self.assertEqual(render._job_display_model(job), "Opus 5.5")
+
     def test_stream_usage_and_same_attempt_model_window_create_context(self):
         job = self._job()
         self._write_log(job, [
@@ -538,6 +570,7 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         self.assertFalse(hasattr(job, "_runtime_session_id"))
         self.assertEqual(job.association_ambiguity, "multiple-stream-session-ids")
         self.assertIsNone(job.subagents)
+        self.assertIsNone(job.resolved_model)
 
         foreign = self._job("att-foreign")
         foreign._log_file = os.path.join(self.tmp.name, "foreign.att-foreign.claude.jsonl")
@@ -545,6 +578,7 @@ class ClaudeStreamSessionTest(unittest.TestCase):
             stream.write(json.dumps(self._assistant("sid-x", "claude-fable-5", 160)) + "\n")
         dispatch_collector._enrich_claude_stream_session(foreign)
         self.assertFalse(hasattr(foreign, "_runtime_session_id"))
+        self.assertIsNone(foreign.resolved_model)
 
     def test_supervisor_receipt_resolves_exact_worktree_session_transcript(self):
         cwd = os.path.join(self.tmp.name, "worktree")
@@ -572,6 +606,7 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         self.assertEqual(job.ctx_pct, 20)
         self.assertEqual(job.exec_tool, {"name": "python3"})
         self.assertEqual(job._context_evidence.source, "claude-session-transcript")
+        self.assertEqual(job.resolved_model, "claude-fable-5")
 
     def test_supervisor_missing_transcript_does_not_borrow_neighbor(self):
         cwd = os.path.join(self.tmp.name, "worktree")

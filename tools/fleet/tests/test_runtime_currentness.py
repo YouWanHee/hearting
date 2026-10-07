@@ -92,7 +92,8 @@ class RenderDynamicWindowTest(unittest.TestCase):
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
-        self.assertIn("7d", text)
+        self.assertIn("week", text)
+        self.assertNotIn("7d", text)
         self.assertIn("10%", text)
         self.assertNotIn("5h", text)
         self.assertNotIn("99%", text)

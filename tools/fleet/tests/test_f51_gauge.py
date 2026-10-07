@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import re
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -68,18 +69,12 @@ class F51GaugeTest(unittest.TestCase):
                     self.assertTrue(any(FULL in value or EMPTY in value or "·" in value
                                         for value, _key in headers[0]))
 
-    def test_header_row_is_layout_independent_and_costs_six_more_cells_per_meter(self):
-        """A3, re-stated for F-59. The old form asserted "never wider than the pre-F51 8/12
-        cell gauge"; at `_GAUGE_W`=12 that bound holds only with equality, so it no longer
-        asserts anything and is retired.
+    def test_header_row_is_layout_independent_and_keeps_the_meter_shape(self):
+        """Without an explicit viewport, layouts share the same aligned header.
 
-        What is worth locking in instead is the shape of the surface. `_usage_header_rows`
-        accepts `layout` but never reads it and is never handed a terminal width, so there is
-        no drop or abbreviate ladder here at all: the row is byte-identical in wide, narrow
-        and stack, and each meter simply costs six more cells than it did at `_GAUGE_W`=6.
-        A two-window claude row measures 69 cells (was 57) — inside every wide/narrow
-        terminal, past the 60-column stack layout, where `_addline` clips it at the right
-        edge. F-59 deliberately adds no rule for that (see the cycle report)."""
+        Normalizing 7d to week adds two cells to the historical 69-cell row;
+        the twelve-cell gauge and its quantization remain unchanged.
+        """
         session = Session(harness="claude", pid=1, cwd="/x", liveness="idle",
                           rl_5h=92, rl_7d=30, mtime=1000)
         texts = set()
@@ -93,8 +88,62 @@ class F51GaugeTest(unittest.TestCase):
         text = texts.pop()
         n_meters = text.count("[")
         self.assertEqual(n_meters, 2)
-        self.assertEqual(render._dw(text), 45 + n_meters * render._GAUGE_W)
+        self.assertEqual(render._dw(text), 47 + n_meters * render._GAUGE_W)
         self.assertIn("[" + render._BAR_FULL * 11 + render._BAR_EMPTY, text)
+
+    def test_usage_slots_align_across_accounts_in_plain_and_curses(self):
+        now = 1000
+        snapshots = {
+            "claude": {"payload": {
+                "windows": [["5h", 12, now + 175 * 60],
+                            ["7d", 59, now + 8639 * 60]],
+                "rl_ms": [["fable", 0]]}},
+            "codex": {"payload": {
+                "windows": [["7d", 12, now + 9738 * 60]]}},
+            "opencode": {"payload": {
+                "windows": [["5h", 0, now + 281 * 60],
+                            ["wk", 74, now + 6675 * 60],
+                            ["mo", 70, now + 29959 * 60]]}},
+        }
+
+        class Screen:
+            def __init__(self):
+                self.calls = []
+
+            def addstr(self, row, col, text, attr):
+                self.calls.append((col, text))
+
+        for width in (168, 100, 60):
+            with self.subTest(width=width), mock.patch.object(render.time, "time", return_value=now):
+                lines = render._build_lines([], [], "fleet", False, 0,
+                                            layout=render._layout_mode(width), term_width=width,
+                                            usage_snapshots=snapshots)
+                rows = [line for line in lines if line and
+                        any(key in ("hb_claude", "hb_codex", "hb_opencode") for _t, key in line)]
+                self.assertEqual(len(rows), 3)
+                visible = [render._snapshot_line(row) for row in rows]
+                self.assertTrue(all(render._dw(row) <= width for row in visible))
+                self.assertEqual(visible[0].index("5h "), visible[2].index("5h "))
+                self.assertNotIn("5h", visible[1])
+                week_cols = [render._dw(row[:row.index("week ")])
+                             for row in visible if "week " in row]
+                self.assertLessEqual(len(set(week_cols)), 1)
+                if width >= 100:
+                    self.assertEqual(len(week_cols), 3)
+                    self.assertIn("↻ 2h 55m", visible[0])
+                    self.assertIn("↻ 6d 18h", visible[1])
+                if width == 168:
+                    self.assertEqual(render._dw(visible[0].split("fable ", 1)[0]),
+                                     render._dw(visible[2].split("month ", 1)[0]))
+                    self.assertIn("↻ 20d 19h", visible[2])
+                    self.assertIn("[" + FULL + EMPTY * 11 + "  12%]", visible[0])
+                self.assertNotRegex("\n".join(visible), r"\b(?:7d|wk|mo) \[")
+                for row, plain in zip(rows, visible):
+                    screen = Screen()
+                    render._addline(screen, 0, row, width)
+                    self.assertEqual("".join(part for _col, part in screen.calls),
+                                     render._clip_w(plain, width - 1, ellipsis=""))
+                    self.assertEqual(render._snapshot_line(row, colored=True), plain)
 
     def test_stale_window_keeps_dotted_track_but_preserves_fill_and_pct_colors(self):
         """A5: a stale usage window shows an empty `·` track while the fill segment and the
@@ -159,7 +208,7 @@ class F51GaugeTest(unittest.TestCase):
         }
         self.assertEqual([], render._usage_header_rows([], usage_snapshots=snapshots))
 
-    def test_codex_account_window_keeps_its_runtime_duration_label(self):
+    def test_codex_week_label_keeps_its_runtime_window_and_blank_5h_slot(self):
         snapshots = {
             "codex": {
                 "payload": {
@@ -174,7 +223,8 @@ class F51GaugeTest(unittest.TestCase):
         rows = render._usage_header_rows([], now=1000, usage_snapshots=snapshots)
         visible = "\n".join("".join(value for value, _key in row) for row in rows)
         self.assertIn("codex", visible)
-        self.assertIn("7d", visible)
+        self.assertIn("week", visible)
+        self.assertNotIn("7d", visible)
         self.assertIn("48%", visible)
         self.assertNotIn("5h", visible)
 
