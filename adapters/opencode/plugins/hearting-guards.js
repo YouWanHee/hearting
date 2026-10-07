@@ -20,6 +20,7 @@ const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
 const frameNativeAnswer = path.join(root, "utilities", "frame_native_answer.py")
+const startReceipt = path.join(root, "utilities", "start_receipt.py")
 const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_patch", "bash"])
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 const promptBySession = new Map()
@@ -1192,6 +1193,11 @@ export const AgentHarnessGuards = async (ctx) => {
   },
   "tool.execute.after": async (input, output) => {
     observePaneCallback(ctx, "tool.execute.after", input.sessionID || "")
+    if (input.sessionID && typeof output?.output === "string") {
+      const receipt = spawnSync("python3", [startReceipt, "--harness", "opencode", "--session-id", input.sessionID],
+        { encoding: "utf8", timeout: 1000 })
+      if (receipt.status === 0 && receipt.stdout?.trim()) output.output += "\n" + receipt.stdout.trim()
+    }
     const args = input.args || output.args || {}
     const files = targetFiles(ctx, input.tool || {}, args)
     for (const file of files) {

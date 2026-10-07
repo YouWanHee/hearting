@@ -214,6 +214,16 @@
             "timeout": 21600
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/start-receipt-context.py\"",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
