@@ -1023,6 +1023,11 @@ remain command-based. Multiple processes on one GPU share that GPU item, and
 registered jobs/runs keep their existing presentation. An expired probe sample
 loses its session GPU items. This read-only projection neither creates a
 resource-run registry entry nor changes the process lifecycle.
+An observed remote GPU process whose exact job owner is a resource child's
+`parent_attempt_id` joins that child's owner GPU line, like an exact run id.
+GPU processes already drawn under a dispatch owner are omitted from parent
+session GPU lines in every harness; other processes and resources still
+waiting to acquire a GPU remain visible.
 A live GPU process that no working registered resource run (same pid and start,
 or same process group on the Fleet host) and no drawn GPU line (session or
 dispatch job row) shows appears once under its `project_of(cwd)` project card,
