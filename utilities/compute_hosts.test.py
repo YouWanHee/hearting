@@ -5,6 +5,7 @@ launch, log, exit code, listing — is exercised without a network.
 """
 
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -121,6 +122,86 @@ class SSHNamespacePrefixTest(unittest.TestCase):
     def test_local_host_never_probes_ssh_configuration(self):
         self.assertEqual(self.module.ssh_prefix({"ssh_host": "local"}), [])
         self.path.assert_not_called()
+
+
+class RunGPUObservationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run_root = Path(self.tmp.name) / "runs"
+        self.module = load_module()
+        self.host = {"ssh_host": "local"}
+        self.config = {"run_root": self.run_root, "hosts": {"here": self.host}}
+
+    def run_receipt(self, row, *, dry_run=False, json_output=False):
+        args = SimpleNamespace(host="here", command=["true"], name="headroom",
+                               cwd=None, env=None, gpus="2", dry_run=dry_run,
+                               json=json_output)
+        output = io.StringIO()
+        with mock.patch.object(self.module, "load_config", return_value=self.config), \
+                mock.patch.object(self.module, "probe_host", side_effect=row if isinstance(row, Exception)
+                                  else None, return_value=row) as probe, \
+                mock.patch.object(self.module, "remote", return_value=subprocess.CompletedProcess(
+                    [], 0, "started", "")) as launch, \
+                mock.patch.object(self.module, "_launcher_provenance", return_value={}), \
+                mock.patch.object(self.module, "_launcher_route", return_value=None), \
+                mock.patch.object(self.module, "_spawn_completion_watch", return_value=False), \
+                mock.patch("sys.stdout", output):
+            rc = self.module.cmd_run(args)
+        self.assertEqual(rc, 0)
+        probe.assert_called_once_with("here", self.host, ssh_session_bridges=[])
+        return output.getvalue(), launch
+
+    def test_run_receipt_keeps_headroom_and_only_suggests_measured_idle_gpus(self):
+        row = {"reachable": True, "observed_at": 1728000000, "gpus": [
+            {"index": 0, "name": "idle", "free_mib": 9000, "total_mib": 10000,
+             "utilization_gpu_pct": 0, "processes": []},
+            {"index": 1, "name": "busy", "free_mib": 24000, "total_mib": 24000,
+             "utilization_gpu_pct": 70, "processes": []},
+            {"index": 2, "name": "unknown", "free_mib": 24000, "total_mib": 24000,
+             "utilization_gpu_pct": None, "processes": []},
+            {"index": 3, "name": "allocated", "free_mib": 20000, "total_mib": 24000,
+             "utilization_gpu_pct": 0, "processes": [{"pid": 123}]},
+        ]}
+        text, launch = self.run_receipt(row, json_output=True)
+        receipt = json.loads(text)
+        observed = receipt["gpu_observation"]
+        self.assertEqual(observed["observed_at"], row["observed_at"])
+        self.assertEqual(observed["suggested_gpu"], 0)
+        self.assertEqual(observed["gpus"][2]["utilization_gpu_pct"], None)
+        self.assertEqual(receipt["gpus"], "2")
+        self.assertIn("CUDA_VISIBLE_DEVICES=2", launch.call_args.args[1])
+        meta = json.loads((self.run_root / receipt["run_id"] / "meta.json").read_text())
+        self.assertEqual(meta["gpu_observation"], observed)
+
+    def test_dry_run_shows_measurement_without_launch_or_run_state(self):
+        row = {"reachable": True, "observed_at": 1728000000, "gpus": [
+            {"index": 0, "name": "idle", "free_mib": 5000, "total_mib": 6000,
+             "utilization_gpu_pct": 0, "processes": []}]}
+        text, launch = self.run_receipt(row, dry_run=True)
+        self.assertIn("5000/6000 MiB free, 0% util", text)
+        self.assertIn("suggested: gpu0", text)
+        self.assertIn("2024-10-04T00:00:00+00:00", text)
+        launch.assert_not_called()
+        self.assertFalse(self.run_root.exists())
+
+    def test_failed_probe_preserves_launch_and_unknown_receipt(self):
+        for row in ({"reachable": False, "observed_at": 1728000000,
+                     "detail": "timed out", "gpus": []}, OSError("probe unavailable")):
+            with self.subTest(row=row):
+                text, launch = self.run_receipt(row)
+                self.assertIn("started ", text)
+                self.assertIn("GPU headroom: unknown", text)
+                self.assertNotIn("suggested:", text)
+                launch.assert_called_once()
+
+    def test_missing_process_measurement_never_claims_an_idle_gpu(self):
+        row = {"reachable": True, "observed_at": 1728000000,
+               "process_detail": "compute process query unavailable", "gpus": [
+                   {"index": 0, "free_mib": 8000, "utilization_gpu_pct": 0,
+                    "processes": []}]}
+        text, _ = self.run_receipt(row, json_output=True)
+        self.assertIsNone(json.loads(text)["gpu_observation"]["suggested_gpu"])
 
 
 class ComputeHostsTest(unittest.TestCase):

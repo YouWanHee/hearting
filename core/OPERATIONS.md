@@ -1020,6 +1020,14 @@ row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
+`run` measures the selected host through the existing bounded probe before
+launch, including for `--dry-run`. Its receipt and run metadata carry the
+observation time, GPU free memory and utilization. When the probe observes a
+GPU with zero utilization and no compute processes, it suggests the one with
+the most free memory. This is a snapshot, not a reservation: the caller's host
+and `--gpus` choice remain unchanged. An unavailable probe is reported as
+unknown and never blocks launch; no separate pre-launch `probe` is required.
+
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
 may end long before it finishes and any later session on any host that mounts
