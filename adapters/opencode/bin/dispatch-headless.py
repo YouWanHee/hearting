@@ -157,6 +157,7 @@ from model_config import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
+    frame_rule_top_launch,
     require_top_route,
     resolve_runtime_profile,
     route_selection_pin,
@@ -427,8 +428,15 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "the top exception profile admits no concrete --model override, capacity retry included",
             )
         try:
+            # Only a frame leg whose `top` the frame rule assigned may run a `top` the user file
+            # does not declare: the copy's own deep tier, collapsed (model_config._derive_top_values).
+            # A `top` the person chose (explicit profile, model/effort pin) and every other launch
+            # keep the contract that an undeclared `top` refuses typed.
             resolved, _receipt = resolve_runtime_profile(
-                "opencode", args.model_profile, source_root=ROOT
+                "opencode", args.model_profile, source_root=ROOT,
+                collapse_top=frame_rule_top_launch(
+                    getattr(args, "route_file", None) or getattr(binding, "route_file", None),
+                    worker_type=args.worker_type, node=getattr(args, "route_node", None)),
             )
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc

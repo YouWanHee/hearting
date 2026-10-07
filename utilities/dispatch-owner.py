@@ -116,9 +116,12 @@ _HINTS = {
     "no-eligible-route-evidence-candidate": "no sealed candidate is usable: it is usage-limited, gated, or has no positive capacity score "
                                             "(see eligibility.* and capacity_headroom.* above). Resume the same route after the reported reset, "
                                             "or select an available candidate already sealed in this profile; changing the candidate set requires recomposition",
-    "frame-harness-unavailable": "no candidate harness declares the top profile in its runtime model config "
-                                 "(CFG_MODEL_PROFILE_TOP in the selected models.conf; top_undeclared= above names the ones "
-                                 "left out). Declare it for a harness the route sealed, or name a harness with --pin frame=<harness>",
+    "frame-harness-unavailable": "no candidate harness can resolve the top profile from its runtime model config "
+                                 "(top_undeclared= above names the ones left out). A complete user models.conf without "
+                                 "CFG_MODEL_PROFILE_TOP collapses top onto its own deep profile, so this means the selected "
+                                 "config is unreadable or declares no deep profile. Declare top with "
+                                 "`hearting model set <harness> profile/top <model>@<budget>` for a harness the route sealed, "
+                                 "or name a harness with --pin frame=<harness>",
     "no-eligible-candidate": "no configured owner harness is usable: usage-limited, gated, or no positive capacity score "
                              "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
     "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
@@ -564,18 +567,49 @@ def _eligible(state):
     return state != "limited" and not state.startswith("limited(")
 
 
-def _declares_top(harness):
-    """Whether the harness's selected runtime model config declares the `top` profile.
+def _top_declaration(harness, *, collapse):
+    """How the harness's selected runtime model config comes to resolve the `top` profile.
 
-    Only an automatic frame-leg assignment asks: a harness the user named keeps the
-    wrapper's own typed `profile-top-undeclared`, and a config that cannot be read
-    is not a place a `top` leg could run."""
-    from model_profile import ModelProfileError, resolve_runtime_profile
+    "explicit" when the selected file declares it (its own row or the shipped file); with
+    `collapse` (the frame rule assigned this leg's `top`, see `model_profile.frame_rule_top_node`)
+    a "derived-from-user-<tier>" string when a complete legacy copy without `top` collapses it
+    onto its own deep tier (`model_config._derive_top_values`; the frame then runs on that
+    model, which the audit names as `top_collapsed=`); and None when `top` does not resolve --
+    a config that cannot be read, no row and no collapse, or a collapsed model the copy
+    reserves for the main session (a collapsed `top` is not the door to that model, and the
+    wrapper would refuse the launch) -- which is not a place a `top` leg could run. The config
+    is read once so the model and the restriction list come from the same selection. Only an
+    automatic frame-leg assignment asks: a harness the user named keeps the wrapper's own
+    typed `profile-top-undeclared`."""
+    from model_config import ModelConfigError, resolve_config, restricted_model
+    from model_profile import ModelProfileError, resolve_profile_values
     try:
-        resolve_runtime_profile(harness, "top")
-    except ModelProfileError:
-        return False
-    return True
+        values, receipt = resolve_config(harness, collapse_top=collapse)
+        resolved = resolve_profile_values(harness, values, "top")
+    except (ModelConfigError, ModelProfileError):
+        return None
+    provenance = getattr(receipt, "top_provenance", None) or "explicit"
+    if provenance.startswith("derived") and restricted_model(
+            resolved.get("model") or "", values.get("CFG_MAIN_SESSION_ONLY_MODELS", "")):
+        return None
+    return provenance
+
+
+def _declares_top(harness):
+    """Whether a frame-rule `top` leg can run on this harness: its selected config declares `top`,
+    or (a complete legacy copy) collapses it onto its own deep tier."""
+    return _top_declaration(harness, collapse=True) is not None
+
+
+def _declares_top_explicitly(harness):
+    """Whether a `top` the person chose can run on this harness: only a declared row counts."""
+    return _top_declaration(harness, collapse=False) is not None
+
+
+def _top_collapsed(harness):
+    """Whether a frame-rule `top` leg on this harness would run collapsed (see `_top_declaration`)."""
+    declaration = _top_declaration(harness, collapse=True)
+    return bool(declaration) and declaration.startswith("derived")
 
 
 def _usage(jobs, profile=None):
@@ -681,6 +715,7 @@ def _audit(
     status, adapter, source, configured, explicit, states, *, allocation=None,
     counts=None, rejected=(), fallback=None, reason="none", capacity=None,
     quality_band=None, relief_promoted=False, capacity_sources=None, top_excluded=(),
+    top_collapsed=(),
 ):
     lines = [
         f"status={status}", f"adapter={adapter or '-'}", f"selection_source={source}",
@@ -717,6 +752,10 @@ def _audit(
         lines.append(f"quality_band={quality_band}")
     if top_excluded:
         lines.append(f"top_undeclared={','.join(top_excluded)}")
+    if top_collapsed:
+        # These candidates stay in: their user models.conf declares no `top`, so the
+        # frame leg runs on the copy's own deep tier (receipt top_provenance=derived-…).
+        lines.append(f"top_collapsed={','.join(top_collapsed)}")
     warning = _explicit_capacity_warning(source, adapter, capacity, allocation)
     if warning:
         # Explicit targets bypass the capacity cascade by design (the user
@@ -852,8 +891,19 @@ def main(argv):
                 },
             }
         top_excluded = []
+        top_collapsed = []
         if profile == "top" and values["--worker-type"] == "frame" and explicit is None:
-            top_excluded = sorted(h for h in _defaults.DISPATCHABLE_HARNESSES if not _declares_top(h))
+            # A `top` the frame rule assigned may stand on a legacy copy's collapsed `top`;
+            # a `top` the person chose for this leg (explicit profile, or a pin carrying a
+            # model or effort) is theirs and needs a declared row -- the same judgment the
+            # wrappers make before launching (`model_profile.frame_rule_top_launch`).
+            from model_profile import frame_rule_top_launch
+            frame_rule = frame_rule_top_launch(route_evidence, worker_type="frame",
+                                               node=values.get("--route-node"))
+            declares = _declares_top if frame_rule else _declares_top_explicitly
+            top_excluded = sorted(h for h in _defaults.DISPATCHABLE_HARNESSES if not declares(h))
+            top_collapsed = sorted(h for h in _defaults.DISPATCHABLE_HARNESSES
+                                   if frame_rule and h not in top_excluded and _top_collapsed(h))
             dropped = [h for h in configured if h in top_excluded]
             if dropped:
                 configured = [h for h in configured if h not in top_excluded]
@@ -960,7 +1010,7 @@ def main(argv):
             print("\n".join(_audit(
                 "unavailable", None, "none", configured, requested, states,
                 allocation=allocation, counts=counts, rejected=rejected,
-                capacity=capacity, relief_promoted=relief_promoted, top_excluded=top_excluded,
+                capacity=capacity, relief_promoted=relief_promoted, top_excluded=top_excluded, top_collapsed=top_collapsed,
             )))
             if dropped and not configured:
                 # Every candidate was left out for not declaring `top`; say that
@@ -1010,7 +1060,7 @@ def main(argv):
                                       fallback=selected if source == "eligibility-fallback" else None,
                                       reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                       quality_band=quality_band,
-                                      relief_promoted=relief_promoted, top_excluded=top_excluded)))
+                                      relief_promoted=relief_promoted, top_excluded=top_excluded, top_collapsed=top_collapsed)))
             print("check=failed\nreason=wrapper-unavailable\nchild_spawned=0")
             return 65
         print("\n".join(_audit("eligible", selected, source, configured, requested, states,
@@ -1019,7 +1069,7 @@ def main(argv):
                                   fallback=selected if source == "eligibility-fallback" else None,
                                   reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                   quality_band=quality_band,
-                                  relief_promoted=relief_promoted, top_excluded=top_excluded)), flush=True)
+                                  relief_promoted=relief_promoted, top_excluded=top_excluded, top_collapsed=top_collapsed)), flush=True)
         if explicit_policy and source == "explicit":
             print(f"explicit_policy={explicit_policy}", flush=True)
         print(f"route_defaults={','.join(derived) or 'none'}", flush=True)

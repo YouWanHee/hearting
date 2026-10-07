@@ -222,29 +222,117 @@ class TopProfileOptionalityTest(unittest.TestCase):
         shipped_path.write_text(shipped, encoding="utf-8")
         return root
 
-    def test_a_user_copy_without_the_top_profile_stays_valid_and_has_no_top(self):
-        shipped = (BASE + 'CFG_TIER_TOP_MODEL=shipped-top\nCFG_TIER_TOP_EFFORT=max\n'
-                   'CFG_MODEL_PROFILE_TOP=top:max\nCFG_MODEL_PROFILE_GRANULARITY_TOP=full\n'
-                   'CFG_MAIN_SESSION_ONLY_MODELS="shipped-top"\n')
+    SHIPPED_WITH_TOP = (BASE + 'CFG_TIER_TOP_MODEL=shipped-top\nCFG_TIER_TOP_EFFORT=max\n'
+                        'CFG_MODEL_PROFILE_TOP=top:max\nCFG_MODEL_PROFILE_GRANULARITY_TOP=full\n'
+                        'CFG_MAIN_SESSION_ONLY_MODELS="shipped-top"\n')
+
+    def test_a_user_copy_without_the_top_profile_stays_valid_and_collapses_top_onto_its_own_deep_tier(self):
+        # 2026-10-06: the framed default shape seals its frame legs at `top`, so a
+        # legacy copy that simply "had no top" refused every new piece of work
+        # (`frame-harness-unavailable`, `top_undeclared=claude,codex,opencode`).
+        # The copy stays the selected whole file and `top` is derived in memory as
+        # a collapse onto the copy's OWN deep tier -- the shipped top model (which
+        # the user never opted into) is not pulled in, and nothing is written back.
         legacy_user = BASE + 'CFG_MAIN_SESSION_ONLY_MODELS="fable"\n'
-        root = self.make_root(shipped=shipped)
+        root = self.make_root(shipped=self.SHIPPED_WITH_TOP)
         home = root / "home"
         user = home / "agent-config" / "models.conf"
         user.parent.mkdir(parents=True)
         user.write_text(legacy_user, encoding="utf-8")
-        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
-        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
-        self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_TOP_EFFORT,CFG_TIER_TOP_MODEL")
-        self.assertNotIn("CFG_MODEL_PROFILE_TOP", values)  # never derived
-        # a copy that opts in without declaring the tier stays selected whole-file,
-        # and resolving `top` on it refuses typed instead (top review B2 (iii))
-        user.write_text(legacy_user + "CFG_MODEL_PROFILE_TOP=top:max\n", encoding="utf-8")
-        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
-        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
         from model_profile import ModelProfileError, resolve_profile_values
+        # An ordinary resolution keeps the contract: no `top`, refused typed.
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason, receipt.top_provenance), ("user", "user-valid", "absent"))
+        self.assertNotIn("CFG_MODEL_PROFILE_TOP", values)
         with self.assertRaises(ModelProfileError) as refused:
             resolve_profile_values("claude", values, "top")
         self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+        # The automatic frame path opts in, and only it sees the collapse.
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root, collapse_top=True)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_TOP_EFFORT,CFG_TIER_TOP_MODEL")
+        self.assertEqual(receipt.top_provenance, "derived-from-user-deep")
+        self.assertEqual(values["CFG_MODEL_PROFILE_TOP"], "deep:xhigh")
+        self.assertEqual(values["CFG_MODEL_PROFILE_GRANULARITY_TOP"], "collapsed-top-to-deep")
+        self.assertNotIn("CFG_TIER_TOP_MODEL", values)  # whole-file: the shipped top tier never merges in
+        resolved = resolve_profile_values("claude", values, "top")
+        self.assertEqual((resolved["tier"], resolved["model"], resolved["budget"], resolved["granularity"]),
+                         ("deep", "shipped-model", "xhigh", "collapsed-top-to-deep"))
+        self.assertEqual(user.read_text(encoding="utf-8"), legacy_user)  # never written back
+        self.assertEqual(json.loads(json.dumps(receipt.as_dict()))["top_provenance"], "derived-from-user-deep")
+        # a copy that opts in without declaring the tier stays selected whole-file,
+        # and resolving `top` on it refuses typed instead (top review B2 (iii)):
+        # an explicit row is the user's declaration, never second-guessed by a collapse.
+        user.write_text(legacy_user + "CFG_MODEL_PROFILE_TOP=top:max\n", encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root, collapse_top=True)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertEqual(receipt.top_provenance, "explicit")
+        with self.assertRaises(ModelProfileError) as refused:
+            resolve_profile_values("claude", values, "top")
+        self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+
+    def test_the_shipped_file_and_an_explicit_user_top_report_explicit_provenance(self):
+        root = self.make_root(shipped=self.SHIPPED_WITH_TOP)
+        home = root / "home"
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason, receipt.top_provenance), ("shipped", "user-missing", "explicit"))
+        self.assertEqual(values["CFG_MODEL_PROFILE_TOP"], "top:max")
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(self.SHIPPED_WITH_TOP, encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.top_provenance), ("user", "explicit"))
+        self.assertEqual(values["CFG_MODEL_PROFILE_GRANULARITY_TOP"], "full")
+
+    def test_a_legacy_opencode_copy_collapses_top_onto_its_own_deep_and_the_fallback_is_balanced_deep(self):
+        # A complete OpenCode copy seeded before the shipped file declared `top` keeps its own
+        # deep profile, so the collapse lands there. The balanced-deep rung is the fallback for
+        # values with no deep profile at all -- unreachable for a *complete* copy (the deep profile
+        # row is required), so it is exercised on the pure function.
+        shipped_text = (ROOT / "adapters" / "opencode" / "config" / "models.conf").read_text(encoding="utf-8")
+        legacy = "\n".join(
+            line for line in shipped_text.splitlines()
+            if not line.startswith(("CFG_MODEL_PROFILE_TOP=", "CFG_MODEL_PROFILE_GRANULARITY_TOP="))
+        ) + "\n"
+        root = self.make_root("opencode", shipped_text)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy, encoding="utf-8")
+        values, receipt = config.resolve_config("opencode", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.top_provenance), ("user", "absent"), receipt)
+        values, receipt = config.resolve_config("opencode", runtime=home, source_root=root, collapse_top=True)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"), receipt)
+        self.assertEqual(receipt.top_provenance, "derived-from-user-deep")
+        self.assertEqual(values["CFG_MODEL_PROFILE_TOP"], values["CFG_MODEL_PROFILE_DEEP"])
+        # the record names the tier the collapse lands on; the shipped OpenCode deep profile
+        # is itself collapsed onto balanced-deep, so that is where `top` lands too
+        deep_tier = values["CFG_MODEL_PROFILE_DEEP"].split(":", 1)[0]
+        self.assertEqual(values["CFG_MODEL_PROFILE_GRANULARITY_TOP"], f"collapsed-top-to-{deep_tier}")
+        from model_profile import resolve_profile_values
+        self.assertEqual(resolve_profile_values("opencode", values, "top")["tier"], deep_tier)
+        without_deep = {k: v for k, v in values.items()
+                        if k not in {"CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP",
+                                     "CFG_MODEL_PROFILE_DEEP", "CFG_TIER_DEEP_MODEL", "CFG_TIER_DEEP_VARIANT"}}
+        derived, provenance = config._derive_top_values("opencode", without_deep)
+        self.assertEqual(provenance, "derived-from-user-balanced-deep")
+        self.assertEqual(derived["CFG_MODEL_PROFILE_TOP"], values["CFG_MODEL_PROFILE_BALANCED_DEEP"])
+        self.assertEqual(derived["CFG_MODEL_PROFILE_GRANULARITY_TOP"], "collapsed-top-to-balanced-deep")
+        self.assertEqual(resolve_profile_values("opencode", derived, "top")["tier"], "balanced-deep")
+
+    def test_the_collapse_prefers_the_copies_own_deep_profile_and_a_copy_with_neither_stays_absent(self):
+        shipped = self.SHIPPED_WITH_TOP
+        root = self.make_root(shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(BASE + 'CFG_MODEL_PROFILE_BALANCED_DEEP=deep:medium\nCFG_MAIN_SESSION_ONLY_MODELS=" "\n', encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root, collapse_top=True)
+        self.assertEqual((receipt.top_provenance, values["CFG_MODEL_PROFILE_TOP"]), ("derived-from-user-deep", "deep:xhigh"))
+        # the derivation is a pure function of the values: nothing to collapse onto -> absent, unchanged
+        bare = {"CFG_MODEL_PROFILE_LIGHT": "light:medium", "CFG_TIER_LIGHT_MODEL": "m", "CFG_TIER_LIGHT_EFFORT": "medium"}
+        derived, provenance = config._derive_top_values("claude", bare)
+        self.assertEqual((derived, provenance), (bare, "absent"))
 
     def test_an_opencode_copy_without_the_deep_granularity_key_stays_selected(self):
         # 2026-09-30: the shipped OpenCode file started naming its deep collapse

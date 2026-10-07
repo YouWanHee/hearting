@@ -42,6 +42,13 @@ class ModelConfigReceipt:
     # SD-145): a complete legacy copy stays selected whole-file instead of being
     # silently replaced by the shipped policy when a release adds a tier.
     unreferenced_tier_keys: str = ""
+    # How the selected file comes to have a `top` profile: "explicit" (its own
+    # row, or the shipped file), "derived-from-user-deep" /
+    # "derived-from-user-balanced-deep" (a complete copy without one, collapsed
+    # onto its own tier because the caller asked with `collapse_top=True`; see
+    # `_derive_top_values`), or "absent" (no row and no collapse -- `top`
+    # refuses typed on these values).
+    top_provenance: str = "explicit"
 
     def as_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -74,9 +81,18 @@ WRAPPER_FALLBACK_TIERS: dict[str, dict[str, str]] = {
 
 TIER_REFERENCE_KEYS = ("CFG_TIER_DEEP_FAILOVER", "CFG_NATIVE_SUBAGENT", "CFG_LIFECYCLE_NUDGE", "CFG_LIFECYCLE_CURATE")
 # Profile keys a complete user copy may omit. `balanced` is derived from light
-# in memory (below); `top` is never derived -- a copy without it simply has no
-# top exception profile, and its TOP tier keys become unreferenced like any
-# other tier a release added (SD-145). Nothing here writes to the user file.
+# in memory (below). `top` is never derived for an ordinary resolution -- a copy
+# without it has no top exception profile and `top` refuses typed -- but the
+# automatic frame path may ask for `collapse_top=True`, which derives `top` in
+# memory as a collapse onto the deepest tier the copy itself declares
+# (`_derive_top_values`): the shipped top model is never pulled in -- the user
+# never opted into that cost -- and the copy's TOP tier keys stay unreferenced
+# like any other tier a release added (SD-145). Until 2026-10-06 a copy without
+# `top` simply had none everywhere; once the framed shape became the default for
+# new work, its frame legs (sealed at `top`) refused every legacy copy with
+# `frame-harness-unavailable` / `top_undeclared=claude,codex,opencode`, and the
+# only remedy was to edit the user file by hand. Nothing here writes to the user
+# file.
 # `CFG_MODEL_PROFILE_GRANULARITY_DEEP` (2026-09-30) is receipt metadata only: the
 # resolver falls back to the global granularity when it is absent, so a copy seeded
 # before the shipped OpenCode file started naming its deep collapse stays selected.
@@ -231,6 +247,46 @@ def _derive_balanced_values(adapter: str, values: dict[str, str]) -> dict[str, s
     return values
 
 
+TOP_COLLAPSE_BASES = ("deep", "balanced-deep")
+
+
+def _derive_top_values(adapter: str, values: Mapping[str, str]) -> tuple[dict[str, str], str]:
+    """Derive only the optional `top` profile in memory, as a collapse onto the copy's own tier.
+
+    A complete copy that declares no `CFG_MODEL_PROFILE_TOP` gets `top` pointed at the same
+    `tier:budget` its `deep` profile names (`balanced-deep` when the copy has no `deep`, the
+    OpenCode shape), with `CFG_MODEL_PROFILE_GRANULARITY_TOP=collapsed-top-to-<tier the spec lands on>` -- the
+    same record the shipped OpenCode file uses for an account with no model above balanced-deep.
+    The result is `(values, provenance)`; `provenance` is "explicit" when the copy declares `top`
+    itself, "derived-from-user-<base>" for a collapse, and "absent" when nothing resolves (the
+    values are then returned unchanged and `top` keeps refusing typed, `profile-top-undeclared`).
+
+    The user file remains the selected whole file; this is deliberately not a merge with the
+    shipped values (whose top model the user never chose) and never writes back.
+    """
+    if "CFG_MODEL_PROFILE_TOP" in values:
+        return dict(values), "explicit"
+    from model_profile import resolve_profile_values
+    for base in TOP_COLLAPSE_BASES:
+        spec = values.get("CFG_MODEL_PROFILE_" + base.upper().replace("-", "_"))
+        if not spec:
+            continue
+        # The record names the TIER the collapse lands on (the shipped OpenCode file's
+        # own `collapsed-top-to-balanced-deep`), which is not always the base profile's
+        # name: a deep profile may itself be collapsed (`CFG_MODEL_PROFILE_DEEP=balanced-deep:…`).
+        tier = spec.split(":", 1)[0].strip()
+        landing = base if tier.startswith("model/") else tier.lower().replace("_", "-")
+        candidate = dict(values)
+        candidate["CFG_MODEL_PROFILE_TOP"] = spec
+        candidate["CFG_MODEL_PROFILE_GRANULARITY_TOP"] = f"collapsed-top-to-{landing}"
+        try:
+            resolve_profile_values(adapter, candidate, "top")
+        except ValueError:
+            continue
+        return candidate, f"derived-from-user-{base}"
+    return dict(values), "absent"
+
+
 def repository_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -354,7 +410,16 @@ def resolve_config(
     runtime: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
     source_root: str | Path | None = None,
+    collapse_top: bool = False,
 ) -> tuple[dict[str, str], ModelConfigReceipt]:
+    """Select the complete configuration for `adapter`: the user's whole file, else the shipped one.
+
+    `collapse_top` is the automatic frame path's opt-in (`_derive_top_values`): with it, a
+    complete user copy that declares no `top` gets one derived in memory as a collapse onto its
+    own deep tier. Every other caller keeps the contract as it was -- an undeclared `top` stays
+    absent and `resolve_profile_values` refuses it typed -- so an explicit `top` request, the
+    shell bridge, the native-agent renderers and the capacity gauges never see a `top` the file
+    does not declare."""
     _check_adapter(adapter)
     shipped = shipped_path(adapter, source_root=source_root)
     selected_user = user_path(adapter, runtime=runtime, environ=environ)
@@ -390,12 +455,17 @@ def resolve_config(
             except ValueError:
                 reason = "user-incomplete"
             else:
+                if collapse_top:
+                    selected, top_provenance = _derive_top_values(adapter, selected)
+                else:
+                    top_provenance = "explicit" if "CFG_MODEL_PROFILE_TOP" in selected else "absent"
                 return selected, ModelConfigReceipt(
                     "hearting.model-config/v1", adapter, "user",
                     "user-valid-derived-balanced" if deriving else "user-valid",
                     str(selected_user), str(selected_user), str(shipped),
                     "derived-from-user-light" if deriving else "explicit",
                     ",".join(sorted(unreferenced_tier)),
+                    top_provenance,
                 )
 
     return shipped_values, ModelConfigReceipt(
@@ -406,6 +476,7 @@ def resolve_config(
         str(shipped),
         str(selected_user),
         str(shipped),
+        top_provenance="explicit" if "CFG_MODEL_PROFILE_TOP" in shipped_values else "absent",
     )
 
 

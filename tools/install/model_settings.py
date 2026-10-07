@@ -57,6 +57,11 @@ def _resolve_target(adapter: str, raw: str, values: dict[str, str], *,
                 and not key.startswith("CFG_MODEL_PROFILE_GRANULARITY_")]
     if "CFG_MODEL_PROFILE_BALANCED" not in values and "balanced" not in profiles:
         profiles.append("balanced")
+    if "CFG_MODEL_PROFILE_TOP" not in values and "top" not in profiles:
+        # The opt-in exception profile: a copy without it resolves `top` as a collapse onto
+        # its own deep tier (model_config._derive_top_values); `profile/top` is how the person
+        # declares one explicitly, which is the one write the install path never makes (SD-145).
+        profiles.append("top")
     role_matches = []
     for key, text in values.items():
         if key.startswith("CFG_ROLES_"):
@@ -166,6 +171,18 @@ def _edit_bytes(raw: bytes, changed: dict[str, str]) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
+def _current_profile(adapter: str, values: dict[str, str], profile: str) -> dict[str, str]:
+    """The profile as the runtime resolves it today, including the two read-time derivations
+    (`balanced` from light, `top` collapsed onto the copy's deep tier) when the copy declares
+    no row of its own. Raises ValueError when nothing resolves."""
+    profile_values = values
+    if profile == "balanced" and "CFG_MODEL_PROFILE_BALANCED" not in values:
+        profile_values = model_config._derive_balanced_values(adapter, values)
+    elif profile == "top" and "CFG_MODEL_PROFILE_TOP" not in values:
+        profile_values, _provenance = model_config._derive_top_values(adapter, values)
+    return model_profile.resolve_profile_values(adapter, profile_values, profile)
+
+
 def _candidate(adapter: str, values: dict[str, str], target: dict[str, str],
                model: str, budget: str | None) -> tuple[dict[str, str], dict[str, str]]:
     changed: dict[str, str] = {}
@@ -178,13 +195,14 @@ def _candidate(adapter: str, values: dict[str, str], target: dict[str, str],
             changed[f"CFG_TIER_{tier}_{suffix}"] = budget
     else:
         profile = target["profile"]
-        profile_values = values
-        if profile == "balanced" and "CFG_MODEL_PROFILE_BALANCED" not in values:
-            profile_values = model_config._derive_balanced_values(adapter, values)
         try:
-            current = model_profile.resolve_profile_values(adapter, profile_values, profile)
+            current = _current_profile(adapter, values, profile)
         except ValueError as exc:
-            raise ModelSettingsError(f"cannot resolve current {profile} profile: {exc}") from exc
+            if budget is None:
+                raise ModelSettingsError(
+                    f"cannot resolve current {profile} profile: {exc}; name the budget explicitly "
+                    f"(<model>@<budget>)") from exc
+            current = None
         selected_budget = budget if budget is not None else current["budget"]
         changed[f"CFG_MODEL_PROFILE_{_key_name(profile)}"] = f"model/{model}:{_profile_budget(adapter, selected_budget)}"
     return dict(values), changed
@@ -282,19 +300,28 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
         tier = target["tier"]
         if not parsed.get(f"CFG_TIER_{tier}_MODEL"):
             raise ModelSettingsError(f"candidate does not declare tier {tier}")
-    old_profile_values = values
-    if target.get("profile") == "balanced" and "CFG_MODEL_PROFILE_BALANCED" not in values:
-        old_profile_values = model_config._derive_balanced_values(adapter, values)
-    old_model = (values.get(f"CFG_TIER_{target['tier']}_MODEL") if "tier" in target else
-                 model_profile.resolve_profile_values(adapter, old_profile_values, target["profile"])["model"])
-    old_budget = (values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}") if "tier" in target else
-                  model_profile.resolve_profile_values(adapter, old_profile_values, target["profile"])["budget"])
+    if "tier" in target:
+        old_model = values.get(f"CFG_TIER_{target['tier']}_MODEL")
+        old_budget = values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}")
+    else:
+        try:
+            old_resolved = _current_profile(adapter, values, target["profile"])
+        except ValueError:
+            # `top` on a copy with nothing to collapse onto: there is no current model; the
+            # explicit declaration being written is the first one.
+            old_resolved = {"model": None, "budget": None}
+        old_model, old_budget = old_resolved["model"], old_resolved["budget"]
     new_values = parsed
     new_model = (new_values.get(f"CFG_TIER_{target['tier']}_MODEL") if "tier" in target else
                  model_profile.resolve_profile_values(adapter, new_values, target["profile"])["model"])
     new_budget = (new_values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}") if "tier" in target else
                   model_profile.resolve_profile_values(adapter, new_values, target["profile"])["budget"])
-    if old_model == new_model and (explicit_budget is None or old_budget == new_budget):
+    # A requested profile the file does not declare is written even when the values it would
+    # record equal what the read-time derivation already yields: the person asked for an explicit
+    # row, and only a row pins the choice when the base profile later changes (adversarial review
+    # 2026-10-06, finding 2: `profile/top <current deep>@<budget>` ended as a no-op).
+    declaring = target["kind"] == "profile" and f"CFG_MODEL_PROFILE_{_key_name(target['profile'])}" not in values
+    if not declaring and old_model == new_model and (explicit_budget is None or old_budget == new_budget):
         return {"operation": "model-set", "status": "unchanged", "exit": 0,
                 "runtime": adapter, "config_path": str(path), "target": target,
                 "requested_model": requested, "old_model": old_model, "new_model": new_model,

@@ -144,7 +144,7 @@ class FrameTopDeclarationTest(unittest.TestCase):
 
     HARNESSES = ("claude", "codex", "opencode")
 
-    def run_selector(self, *, declared, explicit=None, profile="top", scores=None):
+    def run_selector(self, *, declared, explicit=None, profile="top", scores=None, explicit_profiles=None):
         import artifact_producer
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -154,7 +154,8 @@ class FrameTopDeclarationTest(unittest.TestCase):
                      "effective_intensity": "standard",
                      "dispatch_evidence": {"tuples": [{"status": "supported", "child_harness": h}
                                                       for h in self.HARNESSES]},
-                     "nodes": [{"id": n, "model_profile": profile} for n in ("frame", "frame-alternative")]}
+                     "nodes": [{"id": n, "model_profile": profile} for n in ("frame", "frame-alternative")],
+                     **({"explicit_profiles": explicit_profiles} if explicit_profiles else {})}
             route_file.write_text(json.dumps(route))
             jobs.write_text("")
             policy = {"primary": list(self.HARNESSES), "relief": [], "last_resort": [],
@@ -206,7 +207,8 @@ class FrameTopDeclarationTest(unittest.TestCase):
         self.assertIn("reason=frame-harness-unavailable", out)
         self.assertIn("child_spawned=0", out)
         self.assertIn("top_undeclared=claude,codex,opencode", out)
-        self.assertRegex(out, r"(?m)^hint=no candidate harness declares the top profile")
+        self.assertRegex(out, r"(?m)^hint=no candidate harness can resolve the top profile")
+        self.assertIn("hearting model set <harness> profile/top <model>@<budget>", out)
         launch.assert_not_called()
 
     def test_a_named_harness_keeps_the_wrappers_own_typed_diagnostic(self):
@@ -241,21 +243,81 @@ class FrameTopDeclarationTest(unittest.TestCase):
             with self.assertRaises(model_profile.ModelProfileError) as refused:
                 resolve_profile("codex", config, "top")
             self.assertEqual(refused.exception.reason, "profile-top-undeclared")
-            with mock.patch.object(model_profile, "resolve_runtime_profile",
-                                   side_effect=lambda adapter, profile: (resolve_profile(adapter, config, profile), None)):
+            import model_config
+            values = model_profile.load_config(config)
+            with mock.patch.object(model_config, "resolve_config",
+                                   return_value=(values, SimpleNamespace(top_provenance="absent"))):
                 self.assertFalse(OWNER._declares_top("codex"))
+                self.assertFalse(OWNER._declares_top_explicitly("codex"))
 
     def test_the_declaration_is_read_from_the_selected_runtime_config(self):
-        import model_profile
-        missing = model_profile.ModelProfileError("not declared", "profile-top-undeclared")
-        with mock.patch.object(model_profile, "resolve_runtime_profile", side_effect=missing) as resolve:
+        import model_config
+        shipped = model_config.parse_config(ROOT / "adapters/codex/config/models.conf")
+        without_top = {k: v for k, v in shipped.items()
+                       if k not in {"CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP"}}
+        absent = SimpleNamespace(top_provenance="absent")
+        with mock.patch.object(model_config, "resolve_config", return_value=(without_top, absent)) as resolve:
             self.assertFalse(OWNER._declares_top("codex"))
-        resolve.assert_called_once_with("codex", "top")
-        with mock.patch.object(model_profile, "resolve_runtime_profile", return_value=({"profile": "top"}, None)):
-            self.assertTrue(OWNER._declares_top("opencode"))
-        with mock.patch.object(model_profile, "resolve_runtime_profile", side_effect=RuntimeError("boom")):
+        resolve.assert_called_once_with("codex", collapse_top=True)  # the frame rule's path opts in
+        with mock.patch.object(model_config, "resolve_config", return_value=(without_top, absent)) as resolve:
+            self.assertFalse(OWNER._declares_top_explicitly("codex"))
+        resolve.assert_called_once_with("codex", collapse_top=False)  # a chosen top never collapses
+        with mock.patch.object(model_config, "resolve_config",
+                               return_value=(shipped, SimpleNamespace(top_provenance="explicit"))):
+            self.assertTrue(OWNER._declares_top("codex"))
+            self.assertTrue(OWNER._declares_top_explicitly("codex"))
+        with mock.patch.object(model_config, "resolve_config", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 OWNER._declares_top("claude")
+
+    def test_a_legacy_copy_whose_top_collapses_onto_its_deep_tier_stays_a_candidate_and_is_named(self):
+        # 2026-10-06: three user copies seeded before the `top` profile existed made the
+        # framed default shape refuse every new piece of work. model_config derives `top` for
+        # such a copy -- on the frame rule's path only -- as a collapse onto its own deep tier;
+        # the selector keeps the harness and the audit says which legs run collapsed.
+        import model_config
+        shipped = model_config.parse_config(ROOT / "adapters/claude/config/models.conf")
+        legacy = {k: v for k, v in shipped.items() if not k.startswith(("CFG_MODEL_PROFILE_TOP",
+                  "CFG_MODEL_PROFILE_GRANULARITY_TOP", "CFG_TIER_TOP_"))}
+        collapsed, provenance = model_config._derive_top_values("claude", legacy)
+        self.assertEqual(provenance, "derived-from-user-deep")
+        receipt = SimpleNamespace(top_provenance=provenance)
+        with mock.patch.object(model_config, "resolve_config", return_value=(collapsed, receipt)):
+            self.assertEqual(OWNER._top_declaration("claude", collapse=True), "derived-from-user-deep")
+            self.assertTrue(OWNER._declares_top("claude"))
+            self.assertTrue(OWNER._top_collapsed("claude"))
+        # A collapsed top is not the door to the main-session-only model: a deep tier the
+        # copy reserves for the main session is no place for a frame leg (review finding 1).
+        reserved = {**collapsed, "CFG_MAIN_SESSION_ONLY_MODELS": collapsed["CFG_TIER_DEEP_MODEL"]}
+        with mock.patch.object(model_config, "resolve_config", return_value=(reserved, receipt)):
+            self.assertIsNone(OWNER._top_declaration("claude", collapse=True))
+            self.assertFalse(OWNER._declares_top("claude"))
+        with mock.patch.object(model_config, "resolve_config",
+                               return_value=(shipped, SimpleNamespace(top_provenance="explicit"))):
+            self.assertEqual(OWNER._top_declaration("claude", collapse=True), "explicit")  # the row is the door
+            self.assertFalse(OWNER._top_collapsed("codex"))
+        with mock.patch.object(OWNER, "_top_collapsed", side_effect=lambda harness: harness == "claude"):
+            code, out, launch, _probe = self.run_selector(declared=set(self.HARNESSES))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "claude")
+        self.assertIn("top_collapsed=claude", out)
+        self.assertNotIn("top_undeclared=", out)
+
+    def test_a_top_the_person_chose_for_the_leg_needs_a_declared_row(self):
+        # The frame rule's collapse never reaches a `top` the person selected: a per-node
+        # explicit profile (or a pin carrying a model/effort) keeps the declared-row contract,
+        # and the selector asks the explicit question instead of the collapsing one.
+        explicit_probe = mock.Mock(side_effect=lambda harness: harness == "codex")
+        with mock.patch.object(OWNER, "_declares_top_explicitly", explicit_probe), \
+             mock.patch.object(OWNER, "_top_collapsed", side_effect=lambda harness: True):
+            code, out, launch, probe = self.run_selector(
+                declared=set(self.HARNESSES), explicit_profiles={"frame": "top"})
+        self.assertEqual(code, 0, out)
+        probe.assert_not_called()  # the collapsing question was never asked
+        self.assertEqual(sorted(c.args[0] for c in explicit_probe.call_args_list), sorted(self.HARNESSES))
+        self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "codex")
+        self.assertIn("top_undeclared=claude,opencode", out)
+        self.assertNotIn("top_collapsed=", out)
 
 
 class DispatchOwnerTests(unittest.TestCase):

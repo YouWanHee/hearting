@@ -282,6 +282,35 @@ class FramedRouteCompileTest(FramedBase):
             dispatch_evidence={"tuples": [T.nested("claude", "codex")]})
         self.assertNotIn("frame이 방향과 경로를 조립해", R.compose_card(staged))
 
+    def test_the_card_names_the_harnesses_whose_frames_run_on_a_collapsed_top(self):
+        # A user models.conf seeded before the `top` profile existed resolves `top` as a
+        # collapse onto its own deep tier (model_config._derive_top_values). The cost line
+        # above would then overstate the frames, so the card names each such harness and
+        # the one command that declares `top`; explicit copies add nothing.
+        from unittest import mock
+        receipts = {"claude": "explicit", "codex": "derived-from-user-deep", "opencode": "derived-from-user-balanced-deep"}
+        resolved = {"claude": ("top", "fable", "max"), "codex": ("deep", "gpt-6-astra", "ultra"),
+                    "opencode": ("balanced-deep", "opencode-go/glm-5.2", "runtime-default")}
+
+        def fake(harness, profile, **kw):
+            self.assertTrue(kw.get("collapse_top"), "the card must ask for the frame path's collapse")
+            tier, model, budget = resolved[harness]
+            return ({"profile": profile, "tier": tier, "model": model, "budget": budget},
+                    SimpleNamespace(top_provenance=receipts[harness]))
+        route = self.compose()
+        with mock.patch.object(R.PROFILE, "resolve_runtime_profile", side_effect=fake):
+            card = R.compose_card(route)
+        self.assertIn("  frame 모델 codex top→deep gpt-6-astra@ultra · opencode top→balanced-deep opencode-go/glm-5.2@runtime-default", card)
+        self.assertIn("hearting model set <runtime> profile/top <model>@<budget>", card)
+        self.assertIn("  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회", card)
+        explicit = {h: "explicit" for h in receipts}
+        with mock.patch.object(R.PROFILE, "resolve_runtime_profile",
+                               side_effect=lambda h, p, **kw: (fake(h, p, **kw)[0], SimpleNamespace(top_provenance="explicit"))):
+            self.assertNotIn("frame 모델", R.compose_card(route))
+        # a config that does not resolve is simply not listed; the launch reports that itself
+        with mock.patch.object(R.PROFILE, "resolve_runtime_profile", side_effect=R.PROFILE.ModelProfileError("x", "profile-top-undeclared")):
+            self.assertNotIn("frame 모델", R.compose_card(route))
+
     def test_the_internal_capability_is_reachable_only_through_the_framed_shape(self):
         for shape, graph in (("direct", None), ("solo", None), ("staged", None), ("staged", "frame,route-decision")):
             with self.subTest(shape=shape, graph=graph), self.assertRaises(ValueError) as refused:

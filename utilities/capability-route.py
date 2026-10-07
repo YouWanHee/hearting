@@ -4351,6 +4351,29 @@ def compose_observations(route):
             "pre_execution_answers": [{"question": i, "name": name, "answer": value} for i, (name, value) in enumerate(answers, 1)]}
 
 
+def _frame_top_collapse_note():
+    """One card line naming the harnesses whose selected model config declares no `top` of its own.
+
+    A frame leg there runs on the copy's deepest declared tier (`model_config._derive_top_values`,
+    receipt `top_provenance=derived-…`), not on a top model, so the "최상위 모델" cost line above
+    would overstate it. Read-only, and never a compile failure: a config that does not resolve is
+    simply not listed -- the launch reports that itself (`frame-harness-unavailable`)."""
+    parts = []
+    for harness in ("claude", "codex", "opencode"):
+        try:
+            resolved, receipt = PROFILE.resolve_runtime_profile(harness, "top", collapse_top=True)
+        except Exception:  # noqa: BLE001 -- a card line reads the runtime homes best-effort
+            continue
+        provenance = getattr(receipt, "top_provenance", None) or "explicit"
+        if provenance.startswith("derived"):
+            parts.append(f"{harness} top→{resolved['tier']} {resolved['model']}@{resolved['budget']}")
+    if not parts:
+        return ""
+    return ("frame 모델 " + " · ".join(parts)
+            + " (사용자 models.conf에 top 미선언 → 자기 deep 티어로 collapse;"
+            " 선언: hearting model set <runtime> profile/top <model>@<budget>)")
+
+
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
                  campaign_selection=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
@@ -4375,6 +4398,9 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
         card += ("\n  frame이 방향과 경로를 조립해 제안합니다"
                  + ("\n  비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회" if pair
                     else "\n  비용: frame 한 갈래 · 방향 확인 질문 1회"))
+        collapse = _frame_top_collapse_note() if pair else ""
+        if collapse:
+            card += "\n  " + collapse
     sourced = {}
     for node in route["nodes"]:
         for name, source in (node.get("input_sources") or {}).items():

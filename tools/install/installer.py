@@ -29,6 +29,7 @@ import manifest
 import verifier
 import bootstrap
 import runtime_activation
+import model_config  # utilities/, on sys.path once runtime_activation has imported
 import extensions
 import distribution
 import codex_launcher
@@ -175,7 +176,9 @@ def build_parser():
     # Explicit user-owned portable model selection; native runtime settings are separate.
     p_model = sub.add_parser("model", help="Edit a runtime's user-owned Hearting model selection")
     model_sub = p_model.add_subparsers(dest="model_command", required=True, parser_class=_UsageExitParser)
-    p_model_set = model_sub.add_parser("set", help="Set a declared tier, role alias, or profile model")
+    p_model_set = model_sub.add_parser(
+        "set", help="Set a declared tier, role alias, or profile model; profile/top also declares the opt-in "
+                    "top profile in a user copy that lacks it")
     p_model_set.add_argument("harness", choices=RUNTIMES)
     p_model_set.add_argument("target", help="tier/profile/role name; optionally prefix tier/, profile/, or role/")
     p_model_set.add_argument("model", help="Model identifier with optional @effort or @variant")
@@ -458,6 +461,29 @@ def cmd_install(args):
             "user_config": user_config_rows}
 
 
+def _model_config_check(rt, scope):
+    """One read-only verify row: which model configuration `rt` selects and how its `top` profile
+    comes about -- the copy's own row, a collapse onto the copy's deep tier (a complete legacy copy
+    without `CFG_MODEL_PROFILE_TOP`), or absent. A legacy copy is a complete policy (SD-145), so the
+    row never fails verify; it names the opt-in command instead of leaving the person to find the
+    file (2026-10-06: the framed default shape refused on three such copies and the only remedy
+    was a hand edit the agent could not make)."""
+    try:
+        _, receipt = model_config.resolve_config(rt, runtime=paths.runtime_home(rt, scope), collapse_top=True)
+    except model_config.ModelConfigError as exc:
+        return {"id": f"{rt}.model-config", "ok": False, "detail": f"unusable: {exc}"}
+    detail = f"{receipt.source} ({receipt.reason}) top={receipt.top_provenance}: {receipt.selected_path}"
+    if receipt.top_provenance.startswith("derived-from-user-"):
+        tier = receipt.top_provenance[len("derived-from-user-"):]
+        detail += (f" — no CFG_MODEL_PROFILE_TOP in the user copy; frame legs run on its own {tier} tier."
+                   f" Opt in with: hearting model set {rt} profile/top <model>@<budget>")
+    elif receipt.top_provenance == "absent":
+        detail += " — no top profile and no deep profile to collapse onto; frame legs cannot run here"
+    if receipt.unreferenced_tier_keys:
+        detail += f"; shipped tier keys this copy never references: {receipt.unreferenced_tier_keys}"
+    return {"id": f"{rt}.model-config", "ok": True, "detail": detail}
+
+
 def cmd_verify(args):
     runtimes = resolve_runtimes(args)
     all_checks = []
@@ -465,6 +491,10 @@ def cmd_verify(args):
     for rt in runtimes:
         activation_state = paths.harness_state_dir(rt, args.scope) / "activation.json"
         if activation_state.exists() or activation_state.is_symlink():
+            model_check = _model_config_check(rt, args.scope)
+            all_checks.append(model_check)
+            if not model_check["ok"]:
+                ok = False
             try:
                 report = runtime_activation.doctor(rt, strict=True, scope=args.scope)
                 status = report["status"]

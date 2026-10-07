@@ -253,7 +253,11 @@ earlier keeps the frame nodes it was sealed with). A `framed` route's one leg
 is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own
 frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered
 automatically; a frame-rule `top` that stops at a usage limit is retried once at
-`deep` through the SD-157 replacement lineage, and the lowering is recorded.
+`deep` through the SD-157 replacement lineage, and the lowering is recorded. A
+frame-rule `top` on a user models.conf that declares no `top` runs collapsed onto
+that copy's own deep tier (recorded `collapsed-top-to-<tier>`, named
+`top_collapsed=` in the owner audit and on the card; the main-session-only model
+stays out of it), so a copy seeded before the profile existed still runs a two-leg or recipe frame.
 The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를
 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or,
 with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
