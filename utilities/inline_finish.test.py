@@ -940,8 +940,46 @@ class LastLegFinishTest(NextLegFinishTest):
         self.assertNotIn("next_leg", status.stdout)
 
 
+class LegacyInlineFinishTest(PublicInlineFinishTest):
+    """A single-inline-node route with a non-direct intensity (e.g. resplit-seal)
+    finishes through the one `finish` command via the legacy path."""
+
+    def _legacy_args(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+
+    def test_legacy_shaped_route_finishes_through_the_legacy_path(self):
+        import unittest.mock
+        route = dict(self.route, effective_intensity="standard")
+        with unittest.mock.patch.dict(os.environ, self.env):
+            receipt = CAP._legacy_inline_finish(self._legacy_args(), route, str(self.route_file), CAP,
+                                                entry_error=inline_finish.InlineFinishError("finish-route-not-direct"))
+        self.assertEqual(receipt.get("state"), "legacy-finished")
+        self.assertTrue(receipt.get("legacy"))
+        self.assertTrue(CAP.outcome_path(self.route_file).exists())
+
+    def test_second_finish_reports_already_closed(self):
+        import unittest.mock
+        route = dict(self.route, effective_intensity="standard")
+        with unittest.mock.patch.dict(os.environ, self.env):
+            CAP._legacy_inline_finish(self._legacy_args(), route, str(self.route_file), CAP,
+                                      entry_error=inline_finish.InlineFinishError("finish-route-not-direct"))
+            with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-route-already-closed"):
+                CAP._legacy_inline_finish(self._legacy_args(), route, str(self.route_file), CAP,
+                                          entry_error=inline_finish.InlineFinishError("finish-route-not-direct"))
+
+    def test_multi_node_shape_reraises_the_entry_refusal(self):
+        import unittest.mock
+        route = dict(self.route, effective_intensity="standard",
+                     nodes=[dict(self.route["nodes"][0]), dict(self.route["nodes"][0], id="extra")])
+        with unittest.mock.patch.dict(os.environ, self.env):
+            with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-route-not-direct"):
+                CAP._legacy_inline_finish(self._legacy_args(), route, str(self.route_file), CAP,
+                                          entry_error=inline_finish.InlineFinishError("finish-route-not-direct"))
+
+
 # The plan subclasses only add their own tests: do not run the inherited ones a second time.
-for _klass in (NextLegFinishTest, LastLegFinishTest):
+for _klass in (NextLegFinishTest, LastLegFinishTest, LegacyInlineFinishTest):
     for _name in dir(PublicInlineFinishTest):
         if _name.startswith("test_") and _name not in _klass.__dict__:
             setattr(_klass, _name, None)

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Every wrapper prints the same shared receipt lines; only its translations differ."""
+import os
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -53,6 +55,32 @@ class SharedReceiptTest(unittest.TestCase):
                 self.assertEqual(source.count("launch_receipt.completion_lines(args)"), 1)
                 self.assertNotIn('print(f"registry_lock=', source)
                 self.assertNotIn('print(f"terminal_verdict=', source)
+
+    def test_pre_carrier_opencode_parent_gets_relaunch_notice(self):
+        old = args(parent_harness="opencode", parent_completion_delivery="poll-fallback",
+                   parent_completion_reason="parent-identity-unmatched")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_PARENT_COMPLETION_CARRIER", None)
+            lines = L.attempt_lines(old, jobs="/s/jobs.log", registry_source="inherited",
+                                    action="start", launch_state="claimed")
+        self.assertTrue(any(line.startswith("opencode_carrier_notice=") for line in lines))
+
+    def test_carrier_opencode_parent_gets_no_notice(self):
+        new = args(parent_harness="opencode", parent_completion_delivery="opencode-turn",
+                   parent_completion_reason="opencode-plugin-turn")
+        with mock.patch.dict(os.environ, {"AGENT_PARENT_COMPLETION_CARRIER": "opencode-turn:ses_x"}):
+            lines = L.attempt_lines(new, jobs="/s/jobs.log", registry_source="inherited",
+                                    action="start", launch_state="claimed")
+        self.assertFalse(any(line.startswith("opencode_carrier_notice=") for line in lines))
+
+    def test_non_opencode_parent_gets_no_notice(self):
+        other = args(parent_harness="claude", parent_completion_delivery="poll-fallback",
+                     parent_completion_reason="parent-identity-unmatched")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_PARENT_COMPLETION_CARRIER", None)
+            lines = L.attempt_lines(other, jobs="/s/jobs.log", registry_source="inherited",
+                                    action="start", launch_state="claimed")
+        self.assertFalse(any(line.startswith("opencode_carrier_notice=") for line in lines))
 
 
 if __name__ == "__main__":

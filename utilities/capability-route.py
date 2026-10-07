@@ -9944,7 +9944,7 @@ def _close_route_argument(a):
     artifact root. Without one, `finish` takes this session's latest route there."""
     import artifact_producer
     route=a.route
-    if route and (not artifact_producer._ROUTE_ID_RE.fullmatch(route) or Path(route).exists()):
+    if route and (not artifact_producer._ROUTE_ID_RE.fullmatch(str(route)) or Path(route).exists()):
         return route
     root=getattr(a,"artifact_root",None) or os.environ.get("AGENT_ARTIFACT_ROOT") or _compose_artifact_root(os.getcwd())
     if not route:
@@ -9956,6 +9956,91 @@ def _close_route_argument(a):
     if not path.is_file():
         raise ValueError(f"route-not-found: {route} under {root}/.runtime/routes")
     return str(path)
+
+
+def _legacy_inline_finish(a, route, route_file, api, entry_error=None):
+    """Close a legacy inline-shaped route with the one `finish` command.
+
+    The gate is the shape, not the intensity: one inline depth-0
+    unregistered terminal node has no stages to skip, so any intensity with
+    that shape is safe here. Anything else re-raises the entry refusal.
+    The caller's identity, registry, cycle-local evidence and
+    already-closed checks run here exactly as `inline_finish.finish` runs
+    them -- this path adds no bypass. Old explicit steps keep working.
+    """
+    import artifact_producer
+    import inline_finish
+    nodes = [n for n in (route.get("nodes") or []) if isinstance(n, dict) and n.get("id")]
+    if (len(nodes) != 1 or nodes[0].get("execution_surface") != "inline"
+            or nodes[0].get("dispatch_depth") != 0
+            or nodes[0].get("registered_worker") is not False
+            or nodes[0].get("terminal") is not True):
+        if entry_error is not None:
+            raise entry_error
+        raise inline_finish.InlineFinishError("finish-inline-owner-sentinel-required")
+    node, node_id = nodes[0], nodes[0].get("id")
+    from dispatch_parent_completion import interactive_parent_identity
+    from dispatch_contract import DispatchContractError, resolve_global_registry
+    try:
+        _harness, sid = interactive_parent_identity(os.environ)
+    except DispatchContractError as exc:
+        if str(exc) == "caller-harness-ambiguous":
+            raise inline_finish.InlineFinishError("finish-caller-harness-ambiguous") from exc
+        raise inline_finish.InlineFinishError("finish-caller-harness-invalid") from exc
+    if not sid:
+        raise inline_finish.InlineFinishError("finish-current-session-missing")
+    if not sid or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
+        raise inline_finish.InlineFinishError("finish-registered-caller-ineligible")
+    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
+    try:
+        for line in inline_finish._registry_lines(jobs, bool(os.environ.get("AGENT_DISPATCH_JOBS"))):
+            fields = line.split("\t")
+            from dispatch_contract import parse_registry_metadata
+            metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
+            if route["route_id"] in {metadata.get("route_id"), metadata.get("owner_route_id")}:
+                raise inline_finish.InlineFinishError("finish-registered-route-ineligible")
+    except inline_finish.InlineFinishError:
+        raise
+    except Exception as exc:
+        raise inline_finish.InlineFinishError("finish-registry-unreadable") from exc
+    if api.outcome_path(Path(route_file)).exists():
+        raise inline_finish.InlineFinishError("finish-route-already-closed")
+    evidence = Path(a.evidence).resolve()
+    if not (evidence.is_file() or evidence.is_dir()):
+        raise SystemExit("completion evidence missing")
+    try:
+        artifact_producer.require_cycle_output(Path(route["artifact_root"]), evidence,
+                                               route_id=route["route_id"])
+    except artifact_producer.ProducerError as exc:
+        raise ValueError(f"{exc.code}: {exc.detail}") from exc
+    try:
+        summary_text = Path(a.summary_file).read_text(encoding="utf-8").strip().splitlines()
+    except OSError:
+        raise SystemExit("completion summary missing")
+    summary = (summary_text[0].strip() if summary_text and summary_text[0].strip() else f"legacy inline {node_id}")[:200]
+    if not summary:
+        raise SystemExit("completion summary missing")
+    attempt_id = None
+    explicit = None
+    marker, _row = complete_node(route, node, node_id, evidence, jobs=None,
+                                 attempt_id=attempt_id, explicit_attempt_metadata=explicit)
+    outcome, _created = close_route(route, str(route_file), a.commit if getattr(a, "commit", None) else None,
+                                    summary, allow_unproven=True)
+    root = Path(route.get("artifact_root") or _compose_artifact_root(os.getcwd()))
+    cycle = None
+    try:
+        cycle = artifact_producer.route_cycle_for(root, route)
+    except Exception:
+        cycle = None
+    cycle_id = (cycle or {}).get("cycle_id") if isinstance(cycle, dict) else None
+    finalized = None
+    if cycle_id:
+        finalized = artifact_producer.finalize(root, cycle_id=cycle_id, state="completed",
+                                               allow_open_route=True)
+    print(f"legacy-inline-finish node={node_id} outcome={bool(outcome)} finalized={bool(finalized)}", file=sys.stderr)
+    return {"schema": "finish_receipt_v1", "route_id": route.get("route_id"),
+            "route_hash": route.get("route_hash"), "state": "legacy-finished", "legacy": True,
+            "node": node_id, "marker": marker, "outcome": outcome, "finalized": finalized}
 
 def _route_autoclose(artifact_root, trigger, route=None):
     """The runtime closes routes nobody works on any more (utilities/route_autoclose.py).
@@ -10510,7 +10595,12 @@ def main():
             if output is not None:
                 _require_entry_scope_review_preview(route, {"id": "one-shot"}, output)
         import inline_finish
-        receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
+        try:
+            receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
+        except inline_finish.InlineFinishError as exc:
+            if str(exc) not in {"finish-route-not-direct", "finish-inline-owner-sentinel-required"}:
+                raise
+            receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__], entry_error=exc)
         print(json.dumps(receipt,sort_keys=True))
     else:
         if a.command=="close":
