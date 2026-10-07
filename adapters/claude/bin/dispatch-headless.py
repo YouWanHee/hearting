@@ -1195,37 +1195,13 @@ def _effective_parent_cwd(args):
 def acquire_review_lease_after_claim(
     args, jobs: Path, identity: dict[str, str]
 ) -> dict[str, str]:
-    if not args.review_output:
-        return {}
-    binding = args.review_output_binding
-    budget = getattr(args, "watchdog_budget", None)
-    if budget is None:
-        raise ProducerError("review-watchdog-budget-missing")
-    witness_metadata = {
-        "attempt_id": args.attempt_id,
-        "review_cycle_id": binding["cycle_id"],
-        "review_governed_lease": "summary-flock-v1",
-        "review_governed_lease_nonce": args.review_governed_lease_nonce,
-    }
-    witness_unlocked = lambda: not review_governed_lease_is_held(
-        Path(args.artifact_root), witness_metadata
-    )
-    if args.launch_lifecycle == DETACHED:
-        handle = getattr(args, "review_watchdog_handle", None)
-        if handle is None:
-            raise ProducerError("review-watchdog-handle-missing")
-        return acquire_review_admission(
-            handle=handle, budget=budget, identity=identity,
-            root=Path(args.artifact_root), cycle_id=binding["cycle_id"],
-            attempt_id=args.attempt_id, review_output=binding["output_path"],
-            binding=binding, jobs=jobs, nonce=args.review_governed_lease_nonce,
-            lease_acquire=review_lease_acquire, witness_probe=witness_unlocked,
-        )
-    return acquire_foreground_review_admission(
-        budget=budget, identity=identity, root=Path(args.artifact_root),
-        cycle_id=binding["cycle_id"], attempt_id=args.attempt_id,
-        review_output=binding["output_path"], binding=binding, jobs=jobs,
-        lease_acquire=review_lease_acquire, witness_probe=witness_unlocked,
+    return WRAPPER_COMMON.acquire_review_lease_after_claim(
+        args, jobs, identity,
+        detached=DETACHED,
+        lease_held=lambda *a, **k: review_governed_lease_is_held(*a, **k),
+        acquire_admission=acquire_review_admission,
+        acquire_foreground_admission=acquire_foreground_review_admission,
+        lease_acquire=review_lease_acquire,
     )
 
 

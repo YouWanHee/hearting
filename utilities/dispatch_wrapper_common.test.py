@@ -306,6 +306,38 @@ class ParentCompletionTest(unittest.TestCase):
                     wrapper.launch_parent_completion_sidecar(args, Path("/tmp/jobs"))
                     self.assertIs(sidecar.call_args.kwargs["launch"], launch)
                     self.assertIs(sidecar.call_args.kwargs["annotate"], annotate)
+class ReviewLeaseTest(unittest.TestCase):
+    def args(self, lifecycle):
+        return argparse.Namespace(
+            review_output="/out.md",
+            review_output_binding={"cycle_id": "cyc", "output_path": "/out.md"},
+            watchdog_budget=60, attempt_id="att-1",
+            review_governed_lease_nonce="n" * 8, artifact_root="/art",
+            launch_lifecycle=lifecycle, review_watchdog_handle=object(),
+        )
+
+    def test_every_wrapper_injects_its_admission_hooks_at_call_time(self):
+        # reviewer_report_binding patches the wrapper's acquire_* and witness
+        # names; the delegation must look them up when called, not imported.
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            for lifecycle, name in (
+                (wrapper.DETACHED, "acquire_review_admission"),
+                (wrapper.FOREGROUND_SCOPED, "acquire_foreground_review_admission"),
+            ):
+                with self.subTest(harness=harness, admission=name):
+                    with mock.patch.object(wrapper, name, return_value="admission") as acquire:
+                        result = wrapper.acquire_review_lease_after_claim(
+                            self.args(lifecycle), Path("/tmp/jobs"),
+                            {"pid": "1", "pid_start": "2"})
+                    self.assertEqual(result, "admission")
+                    self.assertIs(acquire.call_args.kwargs["lease_acquire"], wrapper.review_lease_acquire)
+                    self.assertIs(acquire.call_args.kwargs["budget"], self.args(lifecycle).watchdog_budget)
+                    # The witness probe resolves the wrapper's name when it is
+                    # called (the reviewer_report_binding pattern).
+                    with mock.patch.object(wrapper, "review_governed_lease_is_held", return_value=True):
+                        self.assertFalse(acquire.call_args.kwargs["witness_probe"]())
 
 
 class RegistrationFenceTest(unittest.TestCase):
