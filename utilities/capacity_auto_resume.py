@@ -146,8 +146,10 @@ def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run) -> 
 
 
 def _notify(record: dict, receipt: dict) -> None:
-    """One notice to the session that owns the route; a resume that paused again says so."""
+    """One notice to the session that owns the route; a resume that paused again says so, and
+    one whose `start` failed or left no receipt carries the command to run it again."""
     try:
+        from parent_next_directive import resume_command
         from session_identity import identity
         from session_notice import notify
         caller = identity()
@@ -155,15 +157,19 @@ def _notify(record: dict, receipt: dict) -> None:
             return
         state = receipt.get("state") or "unknown"
         again = state == "waiting-capacity"
+        failed = not again and (record.get("exit_code") not in (None, 0) or not receipt.get("state"))
         why = {"launch-not-started": "started again after a launch that did not start",
                "answer": "continued with the answer another session sent"}.get(
                    record.get("cause"), "resumed after the usage limit reset")
         text = (f"route {record['route_id']} {why}: state {state}"
                 + (f", owner {receipt['owner_attempt_id']}" if receipt.get("owner_attempt_id") else "")
-                + (f"; paused again until {receipt.get('retry_at', 'an unknown time')}" if again else ""))
+                + (f"; paused again until {receipt.get('retry_at', 'an unknown time')}" if again else "")
+                + (f"; start exited {record.get('exit_code')}, run it again: "
+                   f"{resume_command(record['route_file'], record['jobs'], agent_home=ROOT)}" if failed else ""))
+        action = "report-pause" if again else "run-resume-command" if failed else "report-to-user"
         notify(caller.harness, caller.session_id, key=f"capacity-resume:{record['route_id']}:{record['retry_at']}",
                subject="capacity resume", text=text, route_id=record["route_id"], jobs=record["jobs"],
-               required_action="report-to-user" if not again else "report-pause")
+               required_action=action)
     except Exception:  # noqa: BLE001 -- the resume itself already happened and is recorded
         return
 
