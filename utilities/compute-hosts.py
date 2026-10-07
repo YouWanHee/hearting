@@ -423,18 +423,34 @@ def _unique_session_owner(values):
     return {"kind": "session", "harness": harness, "id": session_id}
 
 
-def _launcher_session_setup(values=None):
+def _launcher_session_owner(values=None):
+    """The same canonical session reading the route-chain writer uses."""
+    from session_identity import identity
+    found = identity(os.environ if values is None else values)
+    sid = found.session_id
+    if (not found.known or found.harness not in CANONICAL_SESSION_KEY
+            or not isinstance(sid, str) or not sid or len(sid) > 256
+            or sid != sid.strip() or any(ord(char) < 32 or ord(char) == 127 for char in sid)):
+        return None
+    return {"kind": "session", "harness": found.harness, "id": sid}
+
+
+_LAUNCHER_OWNER_UNSET = object()
+
+
+def _launcher_session_setup(values=None, *, owner=_LAUNCHER_OWNER_UNSET):
     """Pin one exact launcher session and discard inherited remote ambiguity.
 
     A remote tmux server may retain environment from whichever client created or
     last updated it.  Start every managed run from an empty session-identity set,
-    then add back only the launcher's unique, validated identity.  This also
+    then add back only the launcher's canonical, validated identity.  This also
     keeps the SSH boundary allowlisted instead of forwarding arbitrary env.
     """
     values = os.environ if values is None else values
     keys = tuple(key for key, _harness in SESSION_ENV_KEYS)
     setup = ["unset " + " ".join(keys)]
-    owner = _unique_session_owner(values)
+    if owner is _LAUNCHER_OWNER_UNSET:
+        owner = _launcher_session_owner(values)
     if owner is None:
         return setup
     canonical_key = CANONICAL_SESSION_KEY[owner["harness"]]
@@ -993,11 +1009,11 @@ def same_euid(pid):
 
 COMMAND_BYTES_MAX = 4096
 COMMAND_ARGV_MAX = 32
-COMMAND_CELLS_MAX = 160
+COMMAND_CELLS_MAX = COMMAND_BYTES_MAX
 
 
 def command_text(values, cells_max=COMMAND_CELLS_MAX):
-    # One control-free, display-bounded line from already bounded argv bytes.
+    # Retain the byte-bounded source; Fleet owns terminal-width clipping.
     words = []
     for raw in list(values)[:COMMAND_ARGV_MAX]:
         if isinstance(raw, bytes):
@@ -1652,13 +1668,13 @@ def cmd_run(args):
     rendered = " ".join(shlex.quote(part) for part in command)
 
     provenance = _launcher_provenance()
-    owner = _unique_session_owner(os.environ)
+    owner = _launcher_session_owner()
     # Provenance rides the same preamble as the compute identity, so it
     # crosses the local/SSH/tmux/setsid boundary together. Both keys are
     # always set -- to the validated value, or to "" when it is unknown here --
     # so a stale tmux server or remote shell cannot leak a foreign value and a
     # strict read in the payload finds the key.
-    setup = (_launcher_session_setup()
+    setup = (_launcher_session_setup(owner=owner)
              + ["export %s=%s" % (key, shlex.quote(provenance.get(key, "")))
                 for key in PROVENANCE_CLEAR_KEYS]
              + [

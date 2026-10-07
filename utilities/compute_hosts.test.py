@@ -133,6 +133,44 @@ class RunGPUObservationTest(unittest.TestCase):
         self.host = {"ssh_host": "local"}
         self.config = {"run_root": self.run_root, "hosts": {"here": self.host}}
 
+    def session_receipt(self, values):
+        args = SimpleNamespace(host="here", command=["true"], name="identity",
+                               cwd=None, env=None, gpus=None, dry_run=False, json=True)
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, values, clear=True), \
+                mock.patch.object(self.module, "load_config", return_value=self.config), \
+                mock.patch.object(self.module, "_run_gpu_observation", return_value={}), \
+                mock.patch.object(self.module, "remote", return_value=subprocess.CompletedProcess(
+                    [], 0, "started", "")) as launch, \
+                mock.patch.object(self.module, "_launcher_provenance", return_value={}), \
+                mock.patch.object(self.module, "_launcher_route", return_value=None), \
+                mock.patch.object(self.module, "_spawn_completion_watch", return_value=False), \
+                mock.patch("sys.stdout", output):
+            self.assertEqual(self.module.cmd_run(args), 0)
+        receipt = json.loads(output.getvalue())
+        meta = json.loads((self.run_root / receipt["run_id"] / "meta.json").read_text())
+        self.assertEqual(meta["provenance"]["session"], receipt["provenance"]["session"])
+        return receipt["provenance"]["session"], launch.call_args.args[1]
+
+    def test_clear_alias_conflict_records_and_exports_the_route_writer_session(self):
+        tools = str(ROOT.parent / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet import route_chain
+        values = {"CLAUDE_CODE_SESSION_ID": "sid-current", "CLAUDE_SESSION_ID": "sid-before-clear"}
+        harness, sid = route_chain.writer_identity(values)
+        owner, launch = self.session_receipt(values)
+        self.assertEqual(owner, {"harness": harness, "id": sid})
+        self.assertIn("export CLAUDE_CODE_SESSION_ID=sid-current", launch)
+        self.assertNotIn("sid-before-clear", launch)
+
+    def test_launch_without_a_session_keeps_none_and_exports_no_session_id(self):
+        owner, launch = self.session_receipt({})
+        self.assertIsNone(owner)
+        self.assertIn("unset CLAUDE_CODE_SESSION_ID CLAUDE_SESSION_ID", launch)
+        for key, _harness in self.module.SESSION_ENV_KEYS:
+            self.assertNotIn("export " + key + "=", launch)
+
     def run_receipt(self, row, *, dry_run=False, json_output=False):
         args = SimpleNamespace(host="here", command=["true"], name="headroom",
                                cwd=None, env=None, gpus="2", dry_run=dry_run,
