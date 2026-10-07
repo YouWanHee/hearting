@@ -307,6 +307,27 @@ class OwnerGrantStartTest(unittest.TestCase):
                 parent = load_parent_effective_grant(jobs=self.jobs, parent_attempt_id=attempt, context=self.context)
                 self.assertIn(self.data, parent.writable_roots)
 
+    def test_each_owner_tree_runs_on_the_release_its_launch_resolved(self):
+        # Launched through a moving pointer (`<share>/hearting/current`), the owner gets the
+        # release the pointer named at launch, as the row records it (OPERATIONS §5.9a), so a
+        # later install moves neither. Before, the child inherited the pointer itself.
+        pointer = self.root / "current"
+        pointer.symlink_to(ROOT)
+        self.env["AGENT_HOME"] = str(pointer)
+        self.worker.write_text(
+            "import os,pathlib,sys,time\n"
+            "pathlib.Path(sys.argv[1] + '.home').write_text(os.environ.get('AGENT_HOME', ''))\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+            "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(.01)\n")
+        for adapter in ("claude", "codex", "opencode"):
+            with self.subTest(adapter=adapter):
+                attempt = "att-" + hashlib.sha256(("pin-" + adapter).encode()).hexdigest()[:32]
+                result, output = self.start(adapter, attempt, None, route=self.route(adapter))
+                self.assertEqual(0, result, output)
+                _, row = self.row(attempt)
+                self.assertEqual(str(ROOT.resolve()), row["launch_home"])
+                self.assertEqual(str(ROOT.resolve()), (self.root / (attempt + ".started.home")).read_text())
+
     def test_owner_without_request_keeps_default_grants(self):
         route = self.route("codex")
         result, output = self.start("codex", DEFAULT, None, route=route)

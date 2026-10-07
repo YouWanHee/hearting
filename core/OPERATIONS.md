@@ -100,11 +100,18 @@ Linked activation is an explicit debug-only exception and must report that it
 cannot guarantee session consistency. An update publishes and verifies a new
 root, then atomically changes only the pointer used by new sessions.
 
-At process entry each runtime resolves that pointer once, exports the exact
-real `AGENT_HOME` and its runtime identity, and passes both unchanged to hooks,
-managed-entry, and registered children. A running session never follows a
-later pointer change. Runtime-owned credentials, sessions, logs, caches,
-databases, and Codex `config.toml` remain outside this activation boundary.
+A registered dispatch tree runs on the release its root launch resolved: the
+adapter wrapper resolves `AGENT_HOME` once to the real release path
+(`sealed_launch_home`) and passes that one value to every descendant, the row's
+`launch_home`, its allow rules, its owner Codex home, and its hooks (Claude hook
+commands run `hooks/run-hook.sh`, which takes the hook from `AGENT_HOME` when set, as
+the Codex hook commands do); a later pointer change moves none of them. An
+interactive depth-0 session resolves the installed release per call
+(`hearting run`, printed commands), so each new route starts on the release
+installed when it starts. Instructions, skills and plugins are what each runtime
+loaded when its process started. Runtime-owned credentials, sessions, logs,
+caches, databases, and Codex `config.toml` remain outside this activation
+boundary.
 
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
