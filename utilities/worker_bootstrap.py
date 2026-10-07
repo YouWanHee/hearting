@@ -507,7 +507,7 @@ def owner_inline_marker_prompt(args) -> str:
     command = (f"python3 {Path(__file__).resolve().with_name('capability-route.py')} complete --inline "
                f"--node <node> --reason \"<one line>\"")
     return (f"A declared stage ({', '.join(str(n['id']) for n in stages)}) you run yourself instead of dispatching "
-            f"still publishes its completion marker: `{command}` (route and attempt axes are derived; --evidence is only needed when the stage produced a file). Without it the route never settles.\n\n")
+            f"still publishes its completion marker: `{command}` (route and attempt axes are derived; pass --evidence with a cycle-local file when the stage produced one or the route has no bound cycle). Without it the route never settles.\n\n")
 
 
 def plan_leg_prompt(route, node_id=None) -> str:

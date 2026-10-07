@@ -10548,17 +10548,25 @@ def main():
                     if not getattr(a, "evidence", None) and getattr(a, "reason", None):
                         try:
                             import artifact_producer as _ap
+                            import hashlib as _hl
                             artifact_root = Path(route.get("artifact_root") or "")
                             record = _ap.route_cycle_for(artifact_root, route)
                             if record is None:
-                                raise ValueError("inline-evidence-no-bound-cycle")
+                                raise ValueError("inline-evidence-no-bound-cycle: pass --evidence with a cycle-local file")
                             out_dir = _ap.cycle_dir(artifact_root, record["campaign_id"],
                                                     record["cycle_id"], record) / "artifacts"
                             out_dir.mkdir(parents=True, exist_ok=True)
-                            synth_path = out_dir / f"{route.get('route_id')}.{a.node}.inline.md"
-                            synth_path.write_text(f"# inline {a.node}\n\n{str(a.reason).strip()}\n", encoding="utf-8")
+                            reason_text = f"# inline {a.node}\n\n{str(a.reason).strip()}\n"
+                            digest = _hl.sha1(str(a.reason).strip().encode("utf-8")).hexdigest()[:8]
+                            synth_path = out_dir / f"{route.get('route_id')}.{a.node}.{digest}.inline.md"
+                            if synth_path.is_file():
+                                if synth_path.read_text(encoding="utf-8") != reason_text:
+                                    raise ValueError("inline-evidence-path-collision: retry with --evidence")
+                                a._synthesized_evidence = None
+                            else:
+                                synth_path.write_text(reason_text, encoding="utf-8")
+                                a._synthesized_evidence = str(synth_path)
                             a.evidence = str(synth_path)
-                            a._synthesized_evidence = str(synth_path)
                         except (OSError, ValueError, KeyError) as exc:
                             if isinstance(exc, ValueError) and str(exc).startswith(("inline-evidence-",)):
                                 raise
