@@ -1414,7 +1414,7 @@ for _name in dir(F.FramedStartTest):
 
 
 class NonFramedClosedRouteTest(T.ProducerTestBase):
-    """A closed route that is not the framed shape takes the path it always took: same keys, same values."""
+    """A closed direct route keeps its values; only the observation receipt reference is additive."""
 
     def test_a_closed_direct_route_replays_completed_with_its_old_fields_and_no_framed_or_plan_fields(self):
         with mock.patch.dict(os.environ, F.clean_environment(), clear=True):
@@ -1429,8 +1429,9 @@ class NonFramedClosedRouteTest(T.ProducerTestBase):
             first = W.start_work(route, route_file, self.jobs)
             again = W.start_work(route, route_file, self.jobs)
         self.assertEqual(first, again)
-        self.assertEqual(set(first), {"route_file", "route_id", "launches", "owner_started", "advisories",
+        self.assertEqual(set(first) - {"receipt_file"}, {"route_file", "route_id", "launches", "owner_started", "advisories",
                                       "resume_command", "state", "required_action", "outcome"})
+        self.assertEqual(Path(first["receipt_file"]).parent, self.jobs.parent / "start-receipts")
         self.assertEqual((first["state"], first["required_action"]), ("completed", "advance-completed"))
         self.assertIs(first["outcome"]["terminal_gate_proven"], True)
         for new in ("next_leg", "route_decision", "record_file", "selected"):
