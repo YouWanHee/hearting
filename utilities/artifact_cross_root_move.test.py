@@ -576,5 +576,31 @@ class RenameMoveTest(CorrectionMoveTest):
         self.assertTrue(Path(self.src["cycle_dir"]).exists())
         self.assertEqual(foreign[0].read_bytes(), b"foreign")
 
+
+    def test_rename_root_cursor_stays_foreign_and_old_journal_retries(self):
+        rel = ".runtime/artifact-producer/v1/checkpoints/refresh/cursor.json"
+        old = self.source / rel
+        old.parent.mkdir(parents=True, exist_ok=True)
+        raw = json.dumps({"cycle_id": self.src["cycle_id"], "cursor": "source"}).encode()
+        old.write_bytes(raw)
+        new = self.target / rel
+        new.parent.mkdir(parents=True, exist_ok=True)
+        new.write_bytes(b'{"cursor":"target-live"}')
+        self.move(dry_run=True)
+        original = X._support_copy
+        def old_journal(source, target, journal):
+            journal["controls_policy"] = 1
+            journal["target_controls"][rel] = raw.hex()
+            X._save(source, journal)
+            raise RuntimeError("old cursor collision")
+        with mock.patch.object(X, "_support_copy", side_effect=old_journal), self.assertRaises(RuntimeError):
+            self.move()
+        out = self.move()
+        self.assertEqual(out["status"], "moved")
+        self.assertEqual(new.read_bytes(), b'{"cursor":"target-live"}')
+        archive = self.target / X.JOURNALS / out["operation_id"] / "historical" / rel
+        self.assertEqual(archive.read_bytes(), raw)
+        self.assertNotIn(rel, out["active_cycle_controls"])
+
 if __name__ == "__main__":
     unittest.main()

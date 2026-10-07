@@ -332,8 +332,7 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
         remainder = rel.removeprefix(prefix)
         # Campaign-wide support is archived intact, but only the selected
         # cycles' controls are reissued into the target's active namespaces.
-        selected_control = any(item["cycle_id"] in rel or item["cycle_id"].encode() in raw
-                               for item in cycles)
+        selected_control = any(item["cycle_id"] in rel for item in cycles)
         if not selected_control:
             continue
         if rel.startswith(prefix) and remainder.startswith(("manifests/", "history/")):
@@ -346,7 +345,19 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
     if rows:
         controls[str(history / "dispatch/selected-jobs.log")] = "".join(rows).encode().hex()
     journal["target_controls"] = controls
+    journal["controls_policy"] = 2
     return journal
+
+
+def _upgrade_controls(journal):
+    """Resume older journals without importing another root's shared cursors."""
+    if journal.get("controls_policy", 1) >= 2:
+        return
+    prefix = ".runtime/artifact-producer/v1/"
+    ids = [item["cycle_id"] for item in journal["cycles"]]
+    journal["target_controls"] = {rel: raw for rel, raw in journal["target_controls"].items()
+        if not rel.startswith(prefix) or "/historical/" in rel or any(cid in rel for cid in ids)}
+    journal["controls_policy"] = 2
 
 
 def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_raw=None, prepare=None, roots=()):
@@ -628,6 +639,9 @@ def _receipt(journal):
             "historical_routes": journal["historical_routes"], "support_route_ids": journal["route_ids"],
             "support_inventory": journal["support_inventory"],
             "registry_support": journal["registry_support"],
+            "active_cycle_controls": [rel for rel in journal["target_controls"]
+                                      if rel.startswith(".runtime/artifact-producer/v1/")
+                                      and "/historical/" not in rel],
             "cycles": [dict({key: item[key] for key in ("cycle_id", "source", "target")},
                             transfer=item.get("transfer", "copy")) for item in journal["cycles"]],
             "attachments": journal["attachments"]}
@@ -681,12 +695,14 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
     if dry_run:
         journal = journal or _plan(source, target, operation_id=op, cycle_id=cycle_id,
             source_campaign=source_campaign, campaign=campaign, attachments=attachments, now=now)
+        _upgrade_controls(journal)
         return dict(_receipt(journal), dry_run=True)
     with _operation_lock(source, op):
         journal = _json(path) if path.exists() else _plan(source, target, operation_id=op, cycle_id=cycle_id,
             source_campaign=source_campaign, campaign=campaign, attachments=attachments, now=now)
         if journal["state"] == "committed":
             return _receipt(journal)
+        _upgrade_controls(journal)
         now = datetime.fromisoformat(journal["at"].replace("Z", "+00:00")).timestamp()
         _decision(source, journal)
         _save(source, journal)
