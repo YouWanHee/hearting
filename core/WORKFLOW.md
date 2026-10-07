@@ -492,7 +492,7 @@ for `direct` or `solo` (`quick`). A received peer envelope (the existing
 of scope and proceeds in the same turn; a steward cannot approve for the user.
 Compose's notice and receipt name this confirmation method from the current
 turn's existing peer-receive observation. Unknown origin uses the card method;
-the label never grants approval or changes the selected route.
+the label is observational, with existing approval and routing unchanged.
 `confirmation.small_work` and its sealed value retain their existing route
 metadata meaning, without changing this distinction. The card stays blocking,
 whatever the sealed value, when the work is destructive (data, history, or
