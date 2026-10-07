@@ -95,8 +95,9 @@ closes the route and cycle at success or once idle.
 
 Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
 end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
-`parent_next_command` once. An absent directive is not `end-turn`, so never
-filter the command's stdout. After a wake or a correction, run
+`parent_next_command` once. An absent directive is not `end-turn`. Start saves
+the receipt named by `receipt_file`; the post-tool hook republishes its new
+`parent_next`, and when that hook is unavailable read the saved receipt. After a wake or a correction, run
 `resume_command`; answer a BLOCKED owner with `correction_command
 --message-file <file>`. At `needs-question`, compare the two frame briefs and
 follow the receipt's `next_step`: `resume_command --interview <file>` registers
