@@ -3046,6 +3046,27 @@ def _commit_forced_prune_gap_record(candidate: Path, environ: dict[str, str], re
                 pass
 
 
+def _release_keep_message(candidate: Path, why: str) -> str:
+    """The one line `_cleanup_releases` prints for a release it keeps on `_release_in_use` evidence.
+
+    `_release_in_use` returns several kinds of reason, and only `open-attempt:` (or a legacy open
+    row) is a live dispatch attempt. Until 2026-10-06 every kind was announced as "still referenced
+    by a live dispatch attempt" -- four releases on one machine were kept for weeks by route records
+    with no attempt row anywhere, and the line sent the reader looking for processes that did not
+    exist. Name what the evidence actually is, and for a route say what settles it."""
+    kind = why.split(":", 1)[0]
+    if kind in {"open-attempt", "legacy-open-row-in-release-registry"}:
+        return (f"harness release: {candidate} is still referenced by a live dispatch attempt ({why}); "
+                "keeping it instead of deleting it")
+    if kind == "open-route":
+        return (f"harness release: {candidate} is named by a route record that has no closing outcome "
+                f"({why}); no attempt row proves anything runs from it, but an unclosed route may still "
+                "resume there, so it is kept. Close the route once its work is settled "
+                "(capability-route.py close --route <route-file> --summary ...) and the next update prunes it")
+    return (f"harness release: {candidate} cannot be proved unused ({why}); keeping it instead of "
+            "deleting it")
+
+
 # destructive-ok: reason=prune only retention-proved version directories; boundary=canonical children of the managed releases root
 def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) -> None:
     releases = data_root() / "releases"
@@ -3071,11 +3092,7 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
             continue
         in_use, why = _release_in_use(candidate, stable_snapshot, route_snapshot)
         if in_use:
-            print(
-                f"harness release: {candidate} is still referenced by a live dispatch "
-                f"attempt ({why}); keeping it instead of deleting it",
-                file=sys.stderr,
-            )
+            print(_release_keep_message(candidate, why), file=sys.stderr)
             continue
         # A runtime activation is a reference this loop never consulted. That was
         # survivable while a packaged bundle held its own copy; once a bundle

@@ -57,6 +57,29 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
             distribution._restore_bytes(state, state_pre, state_post, None)
         self.assertEqual(state.read_bytes(), payload)
 
+    def test_release_keep_message_names_the_actual_evidence(self) -> None:
+        # Only an open attempt row is a "live dispatch attempt". A route record without a
+        # closing outcome, or evidence that could not be read, must be named as what it is,
+        # and the route line says what settles it (2026-10-06: four releases kept for weeks by
+        # route records with no attempt row anywhere, announced as live attempts).
+        release = Path("/releases/v9")
+        attempt = distribution._release_keep_message(release, "open-attempt:att-123")
+        self.assertIn("still referenced by a live dispatch attempt (open-attempt:att-123)", attempt)
+        legacy = distribution._release_keep_message(release, "legacy-open-row-in-release-registry")
+        self.assertIn("live dispatch attempt", legacy)
+        route = distribution._release_keep_message(release, "open-route:rt-abc")
+        self.assertNotIn("live dispatch attempt", route)
+        self.assertIn("route record that has no closing outcome (open-route:rt-abc)", route)
+        self.assertIn("capability-route.py close", route)
+        for why in ("registry-unreadable:/x/jobs.log", "registry-row-unparsable:/x/jobs.log",
+                    "route-launch-home-unresolvable:rt-abc", "route-discovery-unreliable:/x/bindings"):
+            with self.subTest(why=why):
+                line = distribution._release_keep_message(release, why)
+                self.assertNotIn("live dispatch attempt", line)
+                self.assertIn(f"cannot be proved unused ({why})", line)
+        for line in (attempt, legacy, route):
+            self.assertTrue(line.startswith(f"harness release: {release} "), line)
+
     def test_target_lock_domain_ignores_runtime_homes(self) -> None:
         target = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "shared" / "current"
         target.parent.mkdir()
