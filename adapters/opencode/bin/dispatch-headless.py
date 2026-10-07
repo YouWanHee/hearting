@@ -343,14 +343,11 @@ def _model_policy() -> dict[str, str]:
 
 
 def _main_session_only_model(model: str) -> bool:
-    return restricted_model(model, main_session_only_models(_model_policy()))
+    return WRAPPER_COMMON.main_session_only_model(model, _model_policy)
 
 
 def _main_session_only_policy_state() -> str:
-    try:
-        return main_session_only_state(_model_policy())
-    except ModelSelectionError:
-        return "unavailable"
+    return WRAPPER_COMMON.main_session_only_policy_state(_model_policy, error=ModelSelectionError)
 
 
 def _require_headless_model(model: str, source: str) -> None:

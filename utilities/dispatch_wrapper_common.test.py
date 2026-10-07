@@ -366,6 +366,33 @@ class ModelPolicyTest(unittest.TestCase):
                     wrapper._require_headless_model("m", "src")
                 policy.assert_called_once_with()
 
+    def test_main_session_only_model_uses_the_wrappers_policy(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(wrapper, "_model_policy", return_value={"a": "b"}) as policy, \
+                     mock.patch.object(C, "main_session_only_models", return_value="m") as models, \
+                     mock.patch.object(C, "restricted_model", return_value=True) as restricted:
+                    self.assertTrue(wrapper._main_session_only_model("m"))
+                policy.assert_called_once_with()
+                self.assertEqual(models.call_args.args, ({"a": "b"},))
+                self.assertEqual(restricted.call_args.args, ("m", "m"))
+
+    def test_main_session_only_policy_state_uses_the_wrappers_policy_and_error(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(wrapper, "_model_policy", return_value={}) as policy, \
+                     mock.patch.object(C, "main_session_only_state", return_value="declared"):
+                    self.assertEqual(wrapper._main_session_only_policy_state(), "declared")
+                policy.assert_called_once_with()
+                with mock.patch.object(wrapper, "_model_policy",
+                                       side_effect=wrapper.ModelSelectionError("r", "x")) as policy:
+                    self.assertEqual(wrapper._main_session_only_policy_state(), "unavailable")
+                policy.assert_called_once_with()
+
 
 class RegistrationFenceTest(unittest.TestCase):
     def test_every_wrapper_registers_behind_the_terminal_claim_fence(self):
