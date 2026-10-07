@@ -7252,11 +7252,13 @@ class ComposeRouteTest(TestRoute):
    def capture(**kwargs):
     seen.append(kwargs); return route
    base=[str(P),"compose","--shape","direct","--cwd",str(R.ROOT),"--artifact-root",tmp,"--prompt-file",str(prompt),"--explain"]
-   for extra,session,note in ((["--campaign-key","2026-09-14_tts-v6-release"],None,"campaign_key_resolved=tts-v6-release"),
-                              ([],"tts-v6-release","campaign_key_default=tts-v6-release")):
+   for extra,session,folder,note in ((["--campaign-key","2026-09-14_tts-v6-release"],None,[],"campaign_key_resolved=tts-v6-release"),
+                                     ([],"tts-v6-release",[],"campaign_key_default=tts-v6-release"),
+                                     ([],None,["tts-v6-release"],"campaign_key_default=tts-v6-release source=this-folder-only-active-stream")):
     err=io.StringIO()
     with mock.patch.object(sys,"argv",base+extra), mock.patch.object(R,"compose_route",side_effect=capture), \
          mock.patch.object(R,"_session_campaign_key",return_value=session), \
+         mock.patch.object(R,"cwd_campaign_keys",return_value=folder), \
          contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
      self.assertEqual(R.main(),0)
     self.assertEqual((seen[-1]["slug"],seen[-1]["campaign_key"]),("fix-the-streaming-window","tts-v6-release"))
@@ -7560,6 +7562,24 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["effective_intensity"],"strong")
   self.assertEqual(sorted(g["id"] for g in route["parallel_groups"]),["plan","plan-check"])
   R.verify_route(route,R.ROOT)
+ def test_a_folders_active_streams_come_from_the_routes_sealed_for_it(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)/"reports"; routes=R.canonical_routes_dir(root); routes.mkdir(parents=True)
+   here,other=Path(tmp)/"here",Path(tmp)/"other"; here.mkdir(); other.mkdir()
+   def route(name,cwd,key,age):
+    path=routes/f"rt-{name*16}.json"
+    path.write_text(json.dumps({"route_id":f"rt-{name*16}","cwd":str(cwd),"campaign_key":key}),encoding="utf-8")
+    os.utime(path,(time.time()-age,time.time()-age))
+   rows=[{"key":"alpha","state":"active","cycle_count":2},{"key":"beta","state":"active","cycle_count":1},
+         {"key":"done","state":"closed","cycle_count":4}]
+   route("a",here,"alpha",30); route("b",other,"beta",20); route("c",here,"done",10); route("d",here,"alpha",5)
+   with mock.patch.object(R,"compose_campaign_summaries",return_value=rows):
+    self.assertEqual(R.cwd_campaign_keys(root,here),["alpha"])          # one active stream: compose joins it
+    self.assertIn("this folder's streams: alpha; ",R.compose_campaign_hint(root,here))
+    route("e",here,"beta",1)
+    self.assertEqual(R.cwd_campaign_keys(root,here),["beta","alpha"])   # newest first; several: suggested only
+    self.assertEqual(R.cwd_campaign_keys(root,Path(tmp)),[])
+    self.assertNotIn("this folder",R.compose_campaign_hint(root,Path(tmp)))
  def test_spec_read_auto_refuses_when_a_spec_exists(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp); (root/"spec").mkdir(); (root/"spec"/"prd.md").write_text("# prd\n",encoding="utf-8")

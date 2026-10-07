@@ -306,9 +306,10 @@ budget and start approval) and writing under
 For execution, use `compose --campaign-key <stream> --start --prompt-file
 <task>` with the selected shape/graph. The slug comes from the task; the
 campaign defaults to this session's latest stream in the same artifact root,
-and otherwise is an existing or new stream key, `--parent-cycle`, or an explicit
-`--unassigned` (the refusal lists the root's active keys; a folder name or close
-spelling of one active key joins it); `--profile light` or `--owner <harness>` is an explicit choice.
+else to the one active stream of the routes sealed for this folder, and otherwise
+is an existing or new stream key, `--parent-cycle`, or an explicit `--unassigned`
+(the refusal names this folder's streams first, then the root's active keys; a
+folder name or close spelling of one active key joins it); `--profile light` or `--owner <harness>` is an explicit choice.
 The task file contains the requested work, not instructions for running the
 parent. The runtime seals it, prepares its cycle, starts the frame pair when
 declared, and returns one receipt. Reuse that receipt's `resume_command` after

@@ -8,9 +8,9 @@ hearting run capability-route compose --start --prompt-file <task> \
 `hearting` is on PATH. `hearting run <utility>` runs that harness utility from
 `AGENT_HOME` when it is set (dev activation: that checkout), else from the
 installed release. The slug comes from the task. The stream defaults to this
-session's latest stream in the same artifact root; the first compose names one
-with `--campaign-key` (a folder name or close spelling joins the matching active
-stream, and a refusal lists the active keys) or opts out with `--unassigned`.
+session's latest one in the artifact root, else this folder's only active one;
+otherwise name it with `--campaign-key` (a folder name or close spelling joins
+that active stream; a refusal lists the keys) or opt out with `--unassigned`.
 The runtime prepares the cycle, picks each leg's harness from live usage within
 the sealed candidates, starts frames and the owner, reuses exact attempts, and
 closes the route and cycle at success or once idle.
