@@ -84,6 +84,27 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         self.assertEqual(distribution._capture_leaf(service), before)
         self.assertEqual(service.read_text(encoding="utf-8"), "foreign\n")
 
+    def test_systemd_probe_reads_the_last_result_from_the_service(self) -> None:
+        # The timer only schedules the run; Result and ExecMainStatus of the
+        # last update belong to the service it starts.
+        service, timer = distribution._systemd_paths()
+        replies = {
+            timer.name: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n"
+                        "LastTriggerUSec=Wed 2026-10-07 03:06:00 KST\n",
+            service.name: "Result=exit-code\nExecMainCode=1\nExecMainStatus=1\n",
+        }
+        asked = []
+
+        def probe(command):
+            asked.append(command[3])
+            return True, replies[command[3]]
+
+        with mock.patch.object(distribution, "_probe_command", side_effect=probe):
+            result = distribution._probe_systemd()
+        self.assertEqual(asked, [timer.name, service.name])
+        self.assertEqual(result["last_result"], "exit-code")
+        self.assertEqual(result["exit_status"], 1)
+
 
 class ActivationFailureDiagnosticTest(unittest.TestCase):
     def test_stdout_json_precedence_and_last_lines_entry(self) -> None:
