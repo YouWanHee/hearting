@@ -1511,21 +1511,21 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         return {**result, "state": "inline", "required_action": "execute-inline",
                 "task": request["text"],
                 "artifact_env": prepare_route_artifact_env(path, start=True, jobs=jobs)}
-    if RP.is_framed_route(route) and not RP.yaml_available():
-        # Only PyYAML reads a frame proposal. Without it the frame legs would run and every
-        # proposal would then be read as `yaml-unavailable`, so the route stops before either.
-        python = shlex.quote(sys.executable)
-        return {**result, "state": "needs-attention", "reason": "yaml-unavailable",
-                "required_action": "install-pyyaml",
-                "next_step": f"A framed route reads its frame proposals with PyYAML, which {python} cannot "
-                    "import, so this start launched no frame leg and read no proposal. Install it for that "
-                    f"Python (e.g. `{python} -m pip install --user pyyaml`) and run resume_command, or "
-                    "compose the work again with a non-framed shape (--shape direct, solo or staged)."}
     rows = _rows(jobs)
     existing_owner = _slot(route, "owner", rows, jobs)
     frames = ([] if existing_owner in rows and not (interview or answers) else
               [n for n in route["nodes"] if n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1])
     if frames:
+        if RP.is_framed_route(route) and not RP.yaml_available():
+            # Only frame/proposal processing needs PyYAML. A registered owner above
+            # skips this branch and can still be observed or resumed without it.
+            python = shlex.quote(sys.executable)
+            return {**result, "state": "needs-attention", "reason": "yaml-unavailable",
+                    "required_action": "install-pyyaml",
+                    "next_step": f"A framed route reads its frame proposals with PyYAML, which {python} cannot "
+                        "import, so this start launched no frame leg and read no proposal. Install it for that "
+                        f"Python (e.g. `{python} -m pip install --user pyyaml`) and run resume_command, or "
+                        "compose the work again with a non-framed shape (--shape direct, solo or staged)."}
         in_force = route_authority.route_in_force(route)   # with the parent's later pin changes
         candidates = (in_force.get("registered_headless_candidates") or []) if route["effective_intensity"] == "quick" else (in_force.get("dispatch_evidence") or {}).get("tuples", [])
         key = "harness" if route["effective_intensity"] == "quick" else "child_harness"
