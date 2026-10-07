@@ -616,12 +616,17 @@ class WrapperAdmissionTest(unittest.TestCase):
     WRAPPERS = ("claude", "codex", "opencode")
 
     def test_the_three_wrappers_call_the_one_admission(self):
+        # validate_route_record is shared in dispatch_wrapper_common now: the
+        # admission's gate call lives there, once, plus the main() call in
+        # each wrapper (PR #299 review).
+        common = (ROOT / "utilities" / "dispatch_wrapper_common.py").read_text(encoding="utf-8")
+        self.assertEqual(common.count("route_authority.completion_gate("), 1)
         for harness in self.WRAPPERS:
             with self.subTest(harness=harness):
                 wrapper = _load(f"route_authority_{harness}_wrapper", f"adapters/{harness}/bin/dispatch-headless.py")
                 self.assertIs(wrapper.completion_gate_fail_fields, RA.completion_gate_fail_fields)
                 source = (ROOT / f"adapters/{harness}/bin/dispatch-headless.py").read_text(encoding="utf-8")
-                self.assertEqual(source.count("route_authority.completion_gate("), 2)
+                self.assertEqual(source.count("route_authority.completion_gate("), 1)
                 self.assertEqual(source.count("route_authority.bind_launch_access("), 1)
                 self.assertNotIn("load_parent_effective_grant(", source)
                 self.assertNotIn("recover_preview_gate_after_refusal(", source)
