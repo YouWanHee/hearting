@@ -287,6 +287,22 @@ class NodeScopeTest(unittest.TestCase):
             self.assertIn("no open cycle is bound", prompt)
             self.assertNotIn(str(root / "artifact_root"), prompt)
 
+    def test_inputs_compose_took_from_an_earlier_cycle_are_named_by_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            route_file = root / "route.json"
+            node = {"id": "execute", "outputs": ["dev_logs/execute.md"], "write_scope": ["dev_logs/**"],
+                    "inputs": ["plan.md", "task"],
+                    "input_sources": {"plan.md": {"cycle_id": "cyc_1", "path": "campaigns/c/cyc_1/artifacts/plan.md"}}}
+            route_file.write_text(json.dumps({"route_id": "rt-src", "cwd": str(root), "artifact_root": str(root / "reports"),
+                                              "nodes": [node, {"id": "test", "outputs": [], "write_scope": []}]}),
+                                  encoding="utf-8")
+            args = SimpleNamespace(worker_type="stage", route_file=str(route_file), route_node="execute")
+            prompt = W.assignment_prompt(args, "edit module", {})
+            self.assertIn("plan.md=" + str(root / "reports/campaigns/c/cyc_1/artifacts/plan.md"), prompt)
+            args.route_node = "test"                                     # a node with no earlier-cycle input
+            self.assertNotIn("earlier cycle", W.assignment_prompt(args, "run tests", {}))
+
     def test_source_and_test_scope_stay_in_worktree_while_reports_use_cycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

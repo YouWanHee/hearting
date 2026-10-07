@@ -358,6 +358,18 @@ def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
     return artifact, source
 
 
+def input_sources_prompt(route, node_id) -> str:
+    """The inputs compose filled from an earlier cycle (`input_sources`), as absolute paths to read."""
+    node = next((n for n in route.get("nodes") or [] if n.get("id") == node_id), None) if node_id else None
+    sources = (node or {}).get("input_sources")
+    if not isinstance(sources, dict) or not sources or not route.get("artifact_root"):
+        return ""
+    rows = [f"{name}={Path(route['artifact_root']) / source['path']}" for name, source in sources.items()
+            if isinstance(source, dict) and isinstance(source.get("path"), str)]
+    return ("Inputs from an earlier cycle (read them; they are not this cycle's outputs): "
+            + ", ".join(rows) + "\n") if rows else ""
+
+
 def node_scope_prompt(scope: "NodeScope") -> str:
     artifact_scope, source_scope = _resolved_write_scopes(scope)
     if scope.output_dir:
@@ -572,7 +584,7 @@ def assignment_prompt(args, task: str, environ) -> str:
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
         )
         return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
-                f"{node_scope_prompt(scope)}\n"
+                f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
                 f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}")
     outputs = []
     route_file = getattr(args, "route_file", None)
