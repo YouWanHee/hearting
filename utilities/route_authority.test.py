@@ -489,12 +489,19 @@ class Case6UncappedAndEnvelopeTest(unittest.TestCase):
         for text in (
             "artifact: -\nverdict: PASS\nblocker: none\nOne.\nTwo.\nThree.",
             "artifact: -\nverdict: PASS\nblocker: none\nverdict: FAIL",
+            "artifact: -\nverdict: PASS\nblocker: none\nVerdict: FAIL",
+            "artifact: -\nverdict: PASS\nblocker: none\n## 평결: FAIL",
             "artifact: -\nverdict: PASS\nblocker: none\nartifact: -",
             "artifact: -\nverdict: PASS\nblocker: none\n```\nverdict: FAIL\n```",
             "see artifact: -\nverdict: PASS\nblocker: none",
         ):
             with self.subTest(text=text[:40]):
                 self.assertIsNone(RA.HANDOFF_RE.search(text))
+        # A prose sentence that merely mentions the word stays a sentence.
+        mentioned = RA.HANDOFF_RE.search(
+            "artifact: -\nverdict: PASS\nblocker: none\nThe verdict: all good after review."
+        )
+        self.assertEqual(mentioned.group("verdict"), "PASS")
         # Two envelopes still resolve to the last one.
         last = RA.HANDOFF_RE.search(
             "artifact: -\nverdict: PASS\nblocker: none\n\nartifact: -\nverdict: FAIL\nblocker: real"

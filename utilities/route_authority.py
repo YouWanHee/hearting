@@ -723,13 +723,17 @@ gate_unmet = _ROUND.gate_unmet
 #
 # Envelope-shaped lines are excluded both from the tail and from inside the
 # fence, so an earlier decoy can never swallow a later envelope; the search
-# then either skips the decoy for the later block or fails closed. Every tail
+# then either skips the decoy for the later block or fails closed. The check
+# ignores case and strips leading decorations (`#`, `*`, `-`) and accepts the
+# Korean `평결:` mirror, so a dressed opposite verdict in the tail fails
+# closed instead of reading as prose (PR #281 review round 2). Every tail
 # element starts at a required newline (`_TAIL_GAP`), which keeps the
-# failing-search cost linear instead of cubic (PR #281 review round 1).
+# failing-search cost linear instead of cubic (round 1).
 _TAIL_GAP = r"(?:\n[ \t]*)+"
 _TAIL_BLANK = r"(?:\n[ \t]*)*"
-_TAIL_LINE = r"(?![ \t]*(?:artifact|verdict|blocker): )[^\n]+"
-_TAIL_FENCE_BODY = r"(?:(?![ \t]*(?:artifact|verdict|blocker):)[^\n]*\n)*?"
+_ENVELOPE_SHAPED = r"(?![ \t#*\-]*(?i:artifact|verdict|blocker|평결)[ \t]*:)"
+_TAIL_LINE = _ENVELOPE_SHAPED + r"[^\n]+"
+_TAIL_FENCE_BODY = r"(?:" + _ENVELOPE_SHAPED + r"[^\n]*\n)*?"
 _TAIL_FENCE = r"```[^\n]*\n" + _TAIL_FENCE_BODY + r"[ \t]*```"
 HANDOFF_RE = re.compile(
     r"(?:\A|\n)artifact: (?P<artifact>[^\n]+)\n"
