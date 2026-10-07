@@ -104,8 +104,8 @@ def _bounded_receipt_text(record: dict) -> str:
 
     receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
     if receipt.get("kind") == "supervision":
-        from dispatch_supervision import render_text
-        return render_text(receipt)
+        from dispatch_supervision import CONTINUED_KEY, render_text
+        return render_text(receipt, continued=record.get(CONTINUED_KEY))
     if receipt.get("kind") == "human-gate":
         return (f"delivery_id={record.get('delivery_id', '-')} route_id={receipt.get('route_id', '-')} "
                 f"route_file={receipt.get('route_file', '-')} attempt_id={receipt.get('owner_attempt_id', '-')} "
@@ -214,7 +214,10 @@ def sweep_deliver(
                     continue
             except OSError:
                 continue
-            claimed.append({**record, STORAGE_KEY: storage_key})
+            # An answer another session sent: this session is the parent, so its carrier continues the route.
+            from dispatch_supervision import CONTINUED_KEY, continue_for_parent
+            continued = continue_for_parent(record, session_id=session_id, recipient_kind=recipient_kind)
+            claimed.append({**record, STORAGE_KEY: storage_key, **({CONTINUED_KEY: continued} if continued else {})})
     elapsed_ns = time.monotonic_ns() - start_ns
     _append_self_instrumentation(root, elapsed_ns, len(entries), len(claimed))
     return claimed, len(entries)

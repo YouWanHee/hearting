@@ -9757,8 +9757,9 @@ def _continue_after_answer(jobs, attempt_id, correction):
             from dispatch_supervision import ANSWER_AWAITING_PARENT, materialize
             materialize(jobs, {attempt_id}, reason=ANSWER_AWAITING_PARENT)
             receipt["parent_notified"] = True
-            receipt["next_step"] = ("The answer is kept and this route's parent session was notified; it "
-                "continues the work and its new owner receives the answer first. Nothing else to run here.")
+            receipt["next_step"] = ("The answer is kept and this route's parent session was notified; its "
+                "runtime starts the continuation when the notice reaches it, and the new owner receives the "
+                "answer first. Nothing else to run here.")
         except Exception:  # noqa: BLE001 -- the kept answer and the plain instruction remain
             receipt["parent_notified"] = False
             receipt["next_step"] = ("The answer is kept. Only the session that started this route may launch its "

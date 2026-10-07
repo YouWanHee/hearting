@@ -268,6 +268,48 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
                 for path in (self.root / "pending-delivery").rglob("*.json"):
                     path.unlink()
 
+    def test_the_parents_carrier_starts_the_answered_route_itself(self):
+        # D1: the carrier that hands the parent this notice runs the start it used to ask for.
+        from session_identity import session_env
+        kept = [{"id": "input-1", "digest": "d1", "text": "use the smaller batch"}]
+        cases = [("claude-parent-runtime", "claude", {"state": "armed", "cause": "answer"}),
+                 ("codex-native-queue", "codex", {"state": "armed", "cause": "answer"}),
+                 ("opencode-turn", "opencode", {"state": "armed", "cause": "answer"}),
+                 ("claude-parent-runtime", "claude", None)]
+        for kind, harness, outcome in cases:
+            with self.subTest(kind=kind, armed=bool(outcome)):
+                self.jobs.write_text(row("att-owner", status="done", dispatch_depth="1", parent_attempt_id="",
+                    parent_sid="parent-test", parent_completion_delivery=kind, worker_type="owner",
+                    note="dead-worker-blocked"))
+                armed = []
+                with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=kept), \
+                     mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+                     mock.patch("dispatch_replacement._route", return_value=(Path("/r/route.json"), {"route_id": "rt-answer"})), \
+                     mock.patch.object(supervision, "_resume_text", return_value="python3 capability-route.py start --route /r/route.json"), \
+                     mock.patch("capacity_auto_resume.arm",
+                                side_effect=lambda result, route_file, jobs, environ: armed.append(
+                                    (result, route_file, environ)) or outcome):
+                    supervision.materialize(self.jobs, {"att-owner"}, reason=supervision.ANSWER_AWAITING_PARENT)
+                    records, _ = sweep.sweep_deliver(self.jobs.parent, kind, "parent-test")
+                    text = sweep.delivery_context([(self.jobs.parent, records)])
+                self.assertEqual(len(armed), 1)
+                result, route_file, env = armed[0]
+                self.assertEqual((result["reason"], result["route_id"], route_file),
+                                 (supervision.ANSWER_AWAITING_PARENT, "rt-answer", Path("/r/route.json")))
+                self.assertEqual((env[session_env()[harness][0]], env["AGENT_DISPATCH_CALLER_HARNESS"]),
+                                 ("parent-test", harness))
+                if outcome:
+                    self.assertIn("started the route's continuation", text)
+                    self.assertNotIn("start --route", text)
+                else:  # nothing could be armed: the notice keeps the start command
+                    self.assertIn("start --route /r/route.json", text)
+                for path in (self.root / "pending-delivery").rglob("*.json"):
+                    path.unlink()
+        other = {"receipt": {"kind": "supervision", "reason": "no-progress"}}
+        self.assertIsNone(supervision.continue_for_parent(other, session_id="parent-test",
+                                                          recipient_kind="claude-parent-runtime",
+                                                          arm=lambda *a, **k: self.fail("armed")))
+
     def test_notice_is_idempotent_after_controller_restart_and_never_closes_rows(self):
         self._notice_rows()
         before = self.jobs.read_bytes()
