@@ -472,11 +472,13 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         self.assertEqual(prefixed["state"], "valid")
         self.assertEqual(prefixed["verdict"], "FAIL")
         self.assertNotIn("RAW_AGENT_SENTINEL", repr(prefixed))
-        # A block that is not at the end is still not a handoff.
+        # G1: one trailing sentence is tolerated — the verdict still stands,
+        # but nothing outside the captured fields may reach the result.
         trailing_prose = self.inspect(
             self.write_log(final_text="artifact: -\nverdict: PASS\nblocker: none\nRAW_AGENT_SENTINEL")
         )
-        self.assertEqual(trailing_prose["reason"], "malformed-handoff")
+        self.assertEqual(trailing_prose["state"], "valid")
+        self.assertEqual(trailing_prose["verdict"], "PASS")
         self.assertNotIn("RAW_AGENT_SENTINEL", repr(trailing_prose))
         # An in-message decoy never outranks the trailing block.
         two_blocks = self.inspect(
@@ -488,6 +490,25 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             )
         )
         self.assertEqual((two_blocks["state"], two_blocks["verdict"]), ("valid", "FAIL"))
+        # PR #281 round 1: a fenced later envelope is not swallowed by an
+        # earlier decoy; a bare field line inside a fence fails closed.
+        fenced_real = self.inspect(self.write_log(final_text=(
+            "Contract example:\nartifact: <path>\nverdict: PASS\nblocker: none\n"
+            "```\nartifact: -\nverdict: FAIL\nblocker: real\n```"
+        )))
+        self.assertEqual((fenced_real["state"], fenced_real["verdict"]), ("valid", "FAIL"))
+        fenced_decoy = self.inspect(self.write_log(final_text=(
+            "artifact: -\nverdict: PASS\nblocker: none\n```\nverdict: FAIL\n```"
+        )))
+        self.assertEqual(fenced_decoy["reason"], "malformed-handoff")
+        # PR #281 rounds 2-3: a dressed or prose-carrying opposite verdict in
+        # the tail fails closed.
+        for tail in ("## 평결: FAIL", "The verdict: FAIL."):
+            with self.subTest(tail=tail):
+                dressed = self.inspect(self.write_log(final_text=(
+                    "artifact: -\nverdict: PASS\nblocker: none\n" + tail
+                )))
+                self.assertEqual(dressed["reason"], "malformed-handoff")
         # A line that merely ends with the field name does not open a block.
         glued = self.inspect(
             self.write_log(final_text="see artifact: -\nverdict: PASS\nblocker: none")

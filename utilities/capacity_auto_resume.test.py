@@ -176,6 +176,17 @@ class ReceiptAndNoticeTest(unittest.TestCase):
             claimed, _ = sweep.sweep_deliver(jobs.parent, "claude-parent-runtime", "sid-9")
             self.assertIn("started again after a launch that did not start",
                           sweep.delivery_context([(jobs.parent, claimed)]))
+            # A start that failed (here: refused, no receipt) hands the parent the command again.
+            route = Path(tmp) / f"{PAUSE['route_id']}.json"
+            with mock.patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "sid-9"}, clear=True):
+                C._notify({**record, "retry_at": "2026-10-07T12:02:00Z", "cause": "answer", "exit_code": 2,
+                           "route_file": str(route)}, {})
+            claimed, _ = sweep.sweep_deliver(jobs.parent, "claude-parent-runtime", "sid-9")
+            text = sweep.delivery_context([(jobs.parent, claimed)])
+            self.assertIn("continued with the answer another session sent: state unknown", text)
+            self.assertIn("start exited 2, run it again: ", text)
+            self.assertIn(f"capability-route.py start --route {route}", text)
+            self.assertIn("required_action=run-resume-command", text)
 
 
 if __name__ == "__main__":

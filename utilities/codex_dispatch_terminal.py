@@ -356,7 +356,8 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
             reason="missing-final-agent-message",
         )
     # search, not fullmatch: the pattern itself anchors the block to the end of
-    # the message, so anything before it is ignored rather than fatal.
+    # the message, so anything before it is ignored rather than fatal. A
+    # trailing fence or up to two sentences are tolerated the same way (G1).
     match = _HANDOFF_RE.search(final_message.strip())
     if match is None:
         return _result(
