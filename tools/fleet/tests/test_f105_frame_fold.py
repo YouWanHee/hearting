@@ -105,9 +105,11 @@ class FoldFinishedFrameChildTest(unittest.TestCase):
 class FrameFoldRenderTest(unittest.TestCase):
 
     def test_finished_pair_folds_together(self):
-        joined = _render(_parent(), [_frame("f105-frame", "frame", "done", afterglow=True),
-                                     _frame("f105-frame-alt", "frame-alternative",
-                                            "done", afterglow=True)])
+        parent = _parent()
+        parent.title = "f105-parent"
+        joined = _render(parent, [_frame("f105-frame", "frame", "done", afterglow=True),
+                                 _frame("f105-frame-alt", "frame-alternative",
+                                        "done", afterglow=True)])
         self.assertNotIn("f105-frame", joined)
         self.assertNotIn("f105-frame-alt", joined)
         self.assertIn("f105-parent", joined)

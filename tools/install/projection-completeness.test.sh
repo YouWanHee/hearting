@@ -200,6 +200,7 @@ assert {item["id"] for item in row["checks"]} == {
     "routing-config.user-policy",
     "report-bundle-config.root",
     "compute-hosts-config.inventory",
+    "fleet-config.language",
     "memory-sync-config.policy",
     "host.pyyaml",
     "bootstrap.launcher.compute-hosts",

@@ -71,7 +71,7 @@ class WorkProjectionTest(unittest.TestCase):
         rid = record["route_id"]
         owner = Session(harness="codex", pid=90, proc_start="main-start",
                         cwd="/owner", slug="main", session_id="sid-main",
-                        liveness="idle")
+                        title="main", liveness="idle")
         evidence = {rid: {
             node["id"]: dict({
                 "status": "done", "parent": owner.session_id,

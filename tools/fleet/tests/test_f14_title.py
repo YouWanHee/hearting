@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F-14 — session display title (harness title/ai-title → render name zone, slug fallback).
+"""F-14 — successful Fleet title in the name zone; missing titles stay blank.
 Display layer only: Session.slug is never overwritten, title is additive. Hermetic — no
 real filesystem/process access; transcript reads use tempfile-backed .jsonl fixtures.
 """
@@ -55,11 +55,12 @@ class SessionRowTitleTest(unittest.TestCase):
         self.assertIn("개발 서버 시작", text)
         self.assertNotIn("repo-ab12cd34", text)
 
-    def test_session_row_title_absent_falls_back_to_slug(self):
+    def test_session_row_title_absent_stays_blank_without_slug(self):
         sess = Session(harness="claude", pid=1, cwd="",
                         slug="repo-ab12cd34", title=None, liveness="idle")
         text, _segs = self._row_text_and_width(sess)
-        self.assertIn("repo-ab12cd34", text)
+        self.assertEqual(render._session_name(sess), "")
+        self.assertNotIn("repo-ab12cd34", text)
 
     def test_session_row_name_zone_width_is_display_width_aligned(self):
         # Hangul title (2-cell chars) must not overrun the shared name-zone width — the
