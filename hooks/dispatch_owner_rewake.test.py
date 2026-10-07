@@ -2288,6 +2288,23 @@ class GateCarrierTest(unittest.TestCase):
         self.assertNotIn("human gate", message)
         self.assertNotIn("your decision", message)
 
+    def test_an_answer_awaiting_this_parent_is_started_by_the_wake_that_carries_it(self):
+        # D1: the parent's rewake starts the route instead of asking the parent to.
+        import dispatch_supervision as supervision
+        kept = [{"id": "input-1", "digest": "d1", "text": "use the smaller batch"}]
+        armed = []
+        with mock.patch("dispatch_owner_input.blocked_owner_answers", return_value=kept), \
+             mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+             mock.patch("dispatch_replacement._route", return_value=(self.root / "route.json", {"route_id": "rt-gate"})), \
+             mock.patch("capacity_auto_resume.arm", side_effect=lambda result, route_file, jobs, environ:
+                        armed.append(environ) or {"state": "armed", "cause": "answer"}):
+            supervision.materialize(self.jobs, {"att-gate-owner"}, reason=supervision.ANSWER_AWAITING_PARENT)
+            rewake._RECIPIENT_KEY_CACHE.clear()
+            notices = rewake._gate_notices(self._launch())
+        self.assertEqual(len(notices), 1)
+        self.assertIn("started the route's continuation", notices[0])
+        self.assertEqual([env["AGENT_DISPATCH_CALLER_HARNESS"] for env in armed], ["claude"])
+
     def test_gate_notices_survives_an_expired_claim(self):
         """The regression, executed rather than inspected. `reclaim` is
         keyword-only in `now_ns`; omitting it raised TypeError, which is not a
