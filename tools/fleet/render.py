@@ -4741,7 +4741,9 @@ def _gpu_process_rows(gpu, indent, width):
         if not command:
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
         prefix = [(indent + "    ", None), ("↳ ", "dim")]
-        room = max(0, width - sum(_dw(text) for text, _key in prefix))
+        # Curses' _addline reserves the rightmost cell; do not let its final
+        # clipping remove the suffix we deliberately kept here.
+        room = max(0, width - 1 - sum(_dw(text) for text, _key in prefix))
         row = prefix + [(_gpu_clip_command(command, room), "dim")]
         rows.append(_clip_segs(row, width)[0])
     return rows
@@ -4879,7 +4881,7 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
 def _gpu_work_row(entry, term_width=None):
     """F-104 card row for a live GPU process no run registry or session line shows."""
     indent = _conn_indent(0, False)
-    width = max(20, int(term_width or 200))
+    width = max(20, int(term_width or 200)) - 1
     command = _gpu_safe_text(entry.get("command"))
     command_label = False
     if command:

@@ -602,7 +602,7 @@ class GpuCommandDisplayTest(unittest.TestCase):
                 self.assertIn("python train.py", shown)
                 self.assertIn("…", shown)
                 self.assertTrue(shown.endswith("x.yaml"), shown)
-                self.assertLessEqual(render._dw(shown), width)
+                self.assertLess(render._dw(shown), width)
 
     def test_unicode_and_malformed_commands_stay_bounded(self):
         commands = ["python /work/학습.py --설명 " + "가" * 80 + " --config /cfg/실험.yaml",
