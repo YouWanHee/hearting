@@ -286,13 +286,19 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
             text = [render._plain(row) for row in rows]
             self.assertTrue(all(render._dw(line) <= width for line in text))
             joined = "\n".join(text)
-            self.assertEqual(joined.count("GPU moving4:0 (M6 학습)"), 1)
-            self.assertEqual(joined.count("GPU moving4:1 (M3_9 학습)"), 1)
+            self.assertEqual(len(text), 1)
+            self.assertEqual(joined.count("GPU moving4:0"), 1)
+            self.assertEqual(joined.count("GPU moving4:1"), 1)
+            if width >= 100:
+                self.assertIn("(M6 학습)", joined)
+                self.assertIn("(M3_9 학습)", joined)
             self.assertNotIn("other.py", "\n".join(text))
         narrow = [render._plain(row) for row in render._gpu_resource_strip(linked, 60)]
-        self.assertEqual(len(narrow), 2)
-        self.assertIn("12 GB", narrow[0])
-        self.assertIn("9.8 GB", narrow[1])
+        self.assertEqual(len(narrow), 1)
+        self.assertNotIn(" GB", narrow[0])
+        wide = render._plain(render._gpu_resource_strip(linked, 168)[0])
+        self.assertIn("12 GB", wide)
+        self.assertIn("9.8 GB", wide)
         for lines in (
             render._build_lines([codex, old], [], "both", False, 0,
                                 layout="wide", term_width=120),
@@ -311,6 +317,75 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                                           layout="wide", term_width=120)
         self.assertFalse(any("GPU moving4:" in render._plain(line)
                              for line in stale_lines if line))
+
+    def test_confirmed_clear_keeps_gpu_under_the_current_same_pane_session(self):
+        from tools.fleet.collectors import herdr, procscan
+        utilities = str(ROOT / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import session_tidy
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+            pane = "w1:pFixture"
+            key = session_tidy._digest("pane", pane)
+            folder = Path(tmp) / "hearting/session-tidy/clear"
+            folder.mkdir(parents=True)
+            path = folder / (key + ".json")
+            for harness in ("claude", "codex", "opencode"):
+                with self.subTest(harness=harness):
+                    current = Session(harness=harness, pid=101, proc_start="11",
+                                      cwd="/tmp/f88-project", session_id="sid-new",
+                                      title="current", liveness="working")
+                    neighbor = Session(harness=harness, pid=102, proc_start="12",
+                                       cwd=current.cwd, session_id="sid-neighbor",
+                                       title="neighbor", liveness="working")
+                    record = {"schema": 1, "harness": harness, "sid": "sid-old",
+                              "new_session": "sid-new", "status": "cleared",
+                              "seat": {"kind": "pane", "pane": pane},
+                              "observed": {"harness": harness, "sid": "sid-new"}}
+                    path.write_text(json.dumps(record))
+                    agents = [{"agent": harness, "pane_id": pane,
+                               "agent_session": {"agent": harness, "value": "sid-old"}}]
+                    with mock.patch.object(procscan, "read_proc_start", return_value="11"), \
+                         mock.patch.object(herdr, "pid_in_panes", return_value=False):
+                        herdr.enrich([current, neighbor], agents=agents, pids=(set(), {101}),
+                                     pane_bindings={101: {pane}})
+                    self.assertEqual(current._gpu_session_aliases, ["sid-old"])
+                    self.assertEqual(neighbor._gpu_session_aliases, [])
+                    claimed = {"kind": "session", "harness": harness, "id": "sid-old",
+                               "source": "persistent-claim+ancestry"}
+                    snapshot = {"configured": True, "hosts": [{
+                        "host": "moving4", "self": True, "reachable": True, "gpus": [{
+                            "index": 1, "name": "NVIDIA A100", "processes": [{
+                                "pid": 300, "proc_start": 42, "pgid": 300,
+                                "command": "python run.py --engine_mode train --config _m6.yaml",
+                                "cwd": current.cwd, "owner": claimed, "session_owner": claimed,
+                            }],
+                        }],
+                    }]}
+                    raw = json.dumps(snapshot, sort_keys=True)
+                    render.set_compute_hosts(snapshot)
+                    index = render._gpu_session_resources()
+                    self.assertEqual(render._gpu_resources_for_session(neighbor, index), [])
+                    self.assertEqual(render._gpu_strip_keys([current, neighbor], index),
+                                     {(harness, "sid-old")})
+                    rows = [render._plain(row) for row in render._build_lines(
+                        [current, neighbor], [], "both", False, 0, term_width=120) if row]
+                    gpu_rows = [row for row in rows if "● GPU" in row]
+                    self.assertEqual(len(gpu_rows), 1)
+                    self.assertNotIn("미등록", gpu_rows[0])
+                    self.assertLess(next(i for i, row in enumerate(rows) if "current" in row),
+                                    next(i for i, row in enumerate(rows) if "● GPU" in row))
+                    self.assertEqual(json.dumps(snapshot, sort_keys=True), raw)
+                    for bad in ({**record, "status": "reserved"},
+                                {**record, "seat": {"kind": "pane", "pane": "w1:else"}}):
+                        path.write_text(json.dumps(bad))
+                        self.assertEqual(herdr._clear_gpu_session_aliases(harness, "sid-new", pane), [])
+                    path.write_text(json.dumps(record))
+                    with mock.patch.object(procscan, "read_proc_start", return_value="reused"):
+                        herdr.enrich([current], agents=agents, pids=(set(), {101}),
+                                     pane_bindings={101: {pane}})
+                    self.assertEqual(current._gpu_session_aliases, [])
 
     def test_gpu_labels_require_exact_claim_and_keep_multiple_processes_on_one_gpu(self):
         claimed = {"kind": "session", "harness": "codex", "id": "sid-exact",

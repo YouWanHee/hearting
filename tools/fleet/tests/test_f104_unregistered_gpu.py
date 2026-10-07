@@ -211,6 +211,30 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         self.assertIn("19 GB", rows[0])
         self.assertNotIn("● GPU", "\n".join(self.lines(snapshot, section="fleet")))
 
+    def test_remote_runs_and_unattached_processes_share_one_compact_card_strip(self):
+        cnn = _snapshot((0, [_process(pid=500, command="python train.py --config UMA_7ch_fix_2spk_v2_1.yaml",
+                                     owner={"kind": "run", "label": "run:one"})]),
+                        (1, [_process(pid=600, command="python train.py --config AMI_8ch_varying_0_3spk_v2_rirfix.yaml",
+                                     owner={"kind": "run", "label": "run:two"})]),
+                        host="cnn", is_self=False)
+        moving = _snapshot((1, [_process(pid=700, command="python train.py --config 1ch_fix_2spk_v2.yaml")]))
+        snapshot = {**cnn, "hosts": cnn["hosts"] + moving["hosts"]}
+        original = json.dumps(snapshot, sort_keys=True)
+        entries = compute_hosts.unregistered_gpu(snapshot)
+        self.assertEqual(len(entries), 3)
+        for width in (168, 100, 60, 40):
+            with self.subTest(width=width):
+                rows = [line for line in self.lines(snapshot, width=width) if "● GPU" in line]
+                self.assertEqual(len(rows), 1)
+                self.assertLessEqual(render._dw(rows[0]), width)
+                if width >= 60:
+                    for identity in ("GPU cnn:0", "GPU cnn:1", "GPU moving4:1"):
+                        self.assertIn(identity, rows[0])
+                if width <= 60:
+                    self.assertNotIn(" GB", rows[0])
+                self.assertEqual(json.dumps(snapshot, sort_keys=True), original)
+                self.assertEqual(compute_hosts.unregistered_gpu(snapshot), entries)
+
     def test_group_with_gpu_session_never_folds_and_shows_gpu_once(self):
         owner = _session_owner()
         snapshot = _snapshot((0, [_process(owner=owner, session_owner=owner)]))
@@ -396,7 +420,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         render.set_compute_hosts(snapshot)
         with_gpu, built = build()
         text = [render._plain(line) for line in built if line is not None]
-        self.assertEqual(sum(line.count("● GPU") for line in text), 480)
+        self.assertEqual(sum("● GPU" in line for line in text), 5)
         self.assertEqual(len(compute_hosts.unregistered_gpu(snapshot)), 480)
         # Generous ceiling for slow CI; the plan's target is ~50 ms of added work.
         self.assertLess(with_gpu - baseline, 0.5)
