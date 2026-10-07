@@ -1045,7 +1045,15 @@ def emit_liveness(rows, args):
 
 def observed_status_rows(rows, args):
     """Read-only bounded status projection using the existing exact classifier."""
-    selected = current([row for row in rows if matches(row, args)])
+    # Normalize owner identity only here, before filtering and classification.
+    # Other registry operations keep their existing scope.
+    projected = []
+    for row in rows:
+        meta = row["meta"]
+        if not meta.get("route_id") and meta.get("owner_route_id"):
+            row = {**row, "meta": {**meta, "route_id": meta["owner_route_id"], "route_node": "_owner"}}
+        projected.append(row)
+    selected = current([row for row in projected if matches(row, args)])
     filtered = any((args.session, args.route, args.node, args.attempt, args.job))
     if not filtered:
         pending = [row for row in selected if row["status"] not in PARENT_EXTINCTION_TERMINAL_STATUSES]
