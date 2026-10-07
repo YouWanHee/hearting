@@ -3805,7 +3805,7 @@ def _probe_systemd() -> dict:
     if last_trigger is None:
         result["detail"] = "systemd user timer inspected; no recorded trigger"
         return result
-    _, service = _systemd_paths()
+    service, _ = _systemd_paths()
     service_cmd = [
         "systemctl", "--user", "show", service.name,
         "--property=Result,ExecMainCode,ExecMainStatus",
