@@ -1467,21 +1467,20 @@ def _retire_shell_returned(info, identity):
     if info is None or info["shell_pid"] != identity["shell_pid"]:
         return False
     shell = identity["shell_pid"]
-    processes = info["foreground_processes"]
-    if (info["foreground_process_group_id"] != shell or len(processes) != 1
-            or not isinstance(processes[0], dict) or type(processes[0].get("pid")) is not int
-            or processes[0]["pid"] != shell
+    if (info["foreground_process_group_id"] != shell
             or _proc_start_ticks(shell) != identity["shell_start"]):
         return False
-    # A shell foreground alone cannot authorize closing over a still-live
-    # predecessor that detached itself. Absence is distinct from unreadability.
+    # Prompt helpers can share the original shell's foreground group. The
+    # recorded agent's lifetime, not the number of foreground processes, decides
+    # whether it exited. Unreadability is distinct from absence or PID reuse.
     try:
         os.stat(f"/proc/{identity['pid']}")
     except FileNotFoundError:
         return True
     except OSError:
-        pass
-    return False
+        return False
+    start = _proc_start_ticks(identity["pid"])
+    return start is not None and start != identity["start"]
 
 
 def _retire_target(target):

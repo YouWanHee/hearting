@@ -4202,6 +4202,28 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((rc, line), (0, handed_line + " handover=skipped:successor-unverified"))
         handed.assert_not_called()
 
+    def test_prompt_git_helpers_after_exit_are_not_live_agents(self):
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness)
+                normal_info = world.info
+
+                def prompt_info():
+                    value = normal_info()
+                    if world.sent:
+                        value["foreground_processes"] += [
+                            {"pid": 102, "argv": ["zsh"]},
+                            {"pid": 103, "argv": ["git", "status", "--porcelain",
+                                                  "--ignore-submodules=dirty"]},
+                        ]
+                    return value
+
+                world.info = prompt_info
+                rc, line = self.retire(world)
+                self.assertEqual(rc, 0)
+                self.assertIn("retired=true reason=normal-exit", line)
+                self.assertEqual(world.actions()[-1], ["herdr", "pane", "close", "w1:pOld"])
+
     def test_only_opencode_waits_for_a_slow_normal_exit(self):
         for harness in ("opencode", "codex", "claude"):
             with self.subTest(harness=harness):
@@ -4341,17 +4363,23 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             self.assertIn("retired=false reason=herdr-not-found", printed.call_args[0][0])
 
     def test_shell_return_requires_original_birth_and_absent_predecessor(self):
-        identity = {"pid": 4242, "shell_pid": 101, "shell_start": "700"}
+        identity = {"pid": 4242, "start": "800", "shell_pid": 101, "shell_start": "700"}
         info = {"shell_pid": 101, "foreground_process_group_id": 101, "foreground_processes": [{"pid": 101}]}
         with mock.patch.object(peer_steward, "_proc_start_ticks", return_value="701"):
             self.assertFalse(peer_steward._retire_shell_returned(info, identity))
         for error in (None, PermissionError()):
-            with mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+            with mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else "800"), \
                  mock.patch.object(peer_steward.os, "stat", return_value=object(), side_effect=error):
                 self.assertFalse(peer_steward._retire_shell_returned(info, identity))
         with mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
              mock.patch.object(peer_steward.os, "stat", side_effect=FileNotFoundError()):
             self.assertTrue(peer_steward._retire_shell_returned(info, identity))
+
+        for birth, expected in (("800", False), ("801", True), (None, False)):
+            with self.subTest(birth=birth), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else birth), \
+                 mock.patch.object(peer_steward.os, "stat", return_value=object()):
+                self.assertEqual(peer_steward._retire_shell_returned(info, identity), expected)
 
     def test_kernel_record_refuses_unreadable_namespace_or_reused_birth(self):
         stat = "4242 (codex) " + " ".join(["S", "101", "4242"] + ["0"] * 16 + ["800"])
