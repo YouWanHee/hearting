@@ -410,17 +410,14 @@ class OwnerInlineMarkerPromptTest(OPA.OwnerRefineBase):
         self.assertIn("first finish stage review", text)
         self.assertLess(text.index("first finish stage review"), text.index("--gate preview-disposition --block"))
         command = re.search(r"`([^`]*capability-route\.py complete[^`]*)`", text).group(1)
-        for token in ("--execution-surface inline", "--registered-worker 0", "--fallback-hop inline",
-                      "--dispatch-depth 2", f"--route {self.path}"):
+        for token in ("--inline", "--node", "--reason"):
             self.assertIn(token, command)
         self.assertNotIn("--jobs", command)
         # the rendered command, run as written, publishes the marker settlement asks for
-        verdict = self.write_output(self.cycle, rel="reviews/refine-verdict.md", data=b"verdict: PASS\n")
-        argv = [a.replace("<node>", "review") for a in shlex.split(
-            command.replace("<stage terminal artifact>", str(verdict)))]
+        argv = [a.replace("<node>", "review").replace("<one line>", "review done") for a in shlex.split(command)]
         env = {**os.environ, "AGENT_ARTIFACT_ROOT": str(self.root), "AGENT_DISPATCH_JOBS": str(self.jobs),
                "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_ATTEMPT_ID": self.owner}
-        done = subprocess.run([sys.executable, *argv[1:]], text=True, capture_output=True, env=env)
+        done = subprocess.run([sys.executable, *argv[1:]], text=True, capture_output=True, env=env, cwd=str(OPA.R.ROOT))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         node = next(n for n in self.route["nodes"] if n["id"] == "transaction")
         with self.env():

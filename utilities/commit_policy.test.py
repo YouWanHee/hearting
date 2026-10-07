@@ -24,6 +24,13 @@ def calls(harness: str) -> set[str]:
             and isinstance(node.func.value, ast.Name) and node.func.value.id == "commit_policy"}
 
 
+def common_calls() -> set[str]:
+    tree = ast.parse((ROOT / "utilities" / "dispatch_wrapper_common.py").read_text(encoding="utf-8"))
+    return {node.func.attr for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "commit_policy"}
+
+
 class CommitPolicyTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -69,9 +76,13 @@ class CommitPolicyTest(unittest.TestCase):
         self.assertEqual(commit_policy.commit_git_metadata_dirs(self.args("owner", worktree=self.primary)), ())
 
     def test_every_wrapper_asks_the_same_module(self):
+        # append_job is shared in dispatch_wrapper_common: the registry
+        # fragment lives there now, reached through each wrapper's append_job.
+        shared = common_calls()
+        self.assertIn("registry_fragment", shared)
         for harness in HARNESSES:
             with self.subTest(harness=harness):
-                used = calls(harness)
+                used = calls(harness) | shared
                 self.assertLessEqual({"prompt_clause", "registry_fragment"}, used)
         # the allowlist realization asks the shared answer instead of re-deriving it
         self.assertIn("may_commit", calls("claude"))

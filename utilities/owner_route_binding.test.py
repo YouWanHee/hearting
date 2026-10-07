@@ -178,14 +178,20 @@ class OwnerRouteBindingTest(unittest.TestCase):
             M.validate_runtime_requirements(route, "gate")
 
     def test_three_wrappers_project_owner_binding(self):
+        # append_job is shared in dispatch_wrapper_common: the owner-route row
+        # fields live there now, reached through each wrapper's append_job.
+        common = (ROOT / "utilities" / "dispatch_wrapper_common.py").read_text(encoding="utf-8")
+        self.assertIn("AGENT_OWNER_ROUTE_FILE", (ROOT / "utilities" / "owner_route_binding.py").read_text(encoding="utf-8"))
+        for pin in ("args.owner_route_binding.route_file",
+                    'f",owner_route_file={args.owner_route_binding.route_file}"'):
+            self.assertIn(pin, common)
         for adapter in ("codex", "claude", "opencode"):
             text = (
                 ROOT / "adapters" / adapter / "bin" / "dispatch-headless.py"
             ).read_text(encoding="utf-8")
-            self.assertIn("AGENT_OWNER_ROUTE_FILE", (ROOT / "utilities" / "owner_route_binding.py").read_text(encoding="utf-8"))
-            self.assertIn("args.owner_route_binding.route_file", text)
-            self.assertIn('f",owner_route_file={args.owner_route_binding.route_file}"', text)
-            self.assertIn('"AGENT_ROUTE_NODE": args.route_node or ""', text)
+            with self.subTest(adapter=adapter):
+                self.assertIn("WRAPPER_COMMON.append_job", text)
+                self.assertIn('"AGENT_ROUTE_NODE": args.route_node or ""', text)
 
 
 class OwnerRouteAdvanceTest(unittest.TestCase):
