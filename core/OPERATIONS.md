@@ -1189,7 +1189,9 @@ Uncertain readiness leaves the new pane retained with its reuse command in the r
 The predecessor hands over its card and documents, receives the successor's ACK,
 leaves its last result and becomes idle; the successor then uses `retire <predecessor>` to send
 one normal exit action (Claude `/exit` + Enter; Codex/OpenCode Ctrl+D) and close
-that pane only after its original shell returns. A refused start closes
+that pane only after its original shell returns and the recorded agent PID/start
+identity is gone. Prompt helpers in that shell's foreground group do not count
+as a live agent; unreadable identity remains unconfirmed. A refused start closes
 its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
 Retirement refuses busy sessions, open forms, drafts, unknown process identity
