@@ -559,6 +559,48 @@ def cmd_verify(args):
             "drift": [], "exit": EXIT_OK if ok else EXIT_VERIFY_FAIL, "lines": lines}
 
 
+# Removing a copied bundle costs three passes over its tree (about a second
+# for a release-sized tree). A managed update runs `runtime activate` under a
+# fixed timeout, so that path removes a few per runtime and leaves the rest;
+# `update` itself has no such bound and finishes the job.
+ACTIVATION_COPY_BUDGET = 8
+
+
+def _collect_retired_bundles(runtimes, scope, lines, *, copy_budget):
+    """Collect retired runtime bundles; return one report row per runtime.
+
+    Runs after a command has already committed, so it never raises and never
+    changes an exit code: a bundle that cannot be judged is kept with its
+    reason in the row. A line is printed only when something was removed.
+    """
+
+    def external():
+        # Read under the collector's lock and again before each removal, so
+        # neither the launcher targets nor the dispatch snapshot is older
+        # than the decision it supports.
+        return distribution.launcher_destinations(), distribution.reference_checker()
+
+    rows = {}
+    for runtime in runtimes:
+        try:
+            row = runtime_activation.collect_retired_bundles(
+                runtime, scope, external=external, copy_budget=copy_budget
+            )
+        except Exception as exc:  # noqa: BLE001 -- hygiene after a committed command
+            row = {
+                "runtime": runtime, "status": "skipped",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "removed": [], "kept": {}, "deferred": 0,
+            }
+        rows[runtime] = row
+        if row["removed"]:
+            lines.append(
+                f"{runtime}: retired-bundles removed={len(row['removed'])} "
+                f"kept={len(row['kept'])} deferred={row['deferred']}"
+            )
+    return rows
+
+
 def cmd_update(args):
     try:
         managed = distribution.is_managed()
@@ -642,6 +684,12 @@ def cmd_update(args):
             skipped_hints[runtime] = hint
             checks.append({"id": f"update.skipped.{runtime}", "ok": False,
                            "detail": f"{reason}: {hint}"})
+        # Release pruning has just run inside `distribution.update`, so the
+        # linked bundles of the releases it removed are retired now; this is
+        # also the unbounded pass over whatever an activation deferred.
+        retired_bundles = _collect_retired_bundles(
+            runtime_activation.RUNTIMES, "global", lines, copy_budget=None
+        )
         payload = {
             "runtime": result.get("runtimes", []),
             "channel": "managed-release",
@@ -650,6 +698,7 @@ def cmd_update(args):
             "drift": [],
             "exit": EXIT_OK,
             "lines": lines,
+            "retired_bundles": list(retired_bundles.values()),
         }
         if skipped_hints:
             payload["skipped_hints"] = skipped_hints
@@ -1345,6 +1394,18 @@ def cmd_runtime(args):
         except Exception as exc:
             mem_result = {"action": "failed", "detail": str(exc)}
         lines.append(f"bootstrap: mem-store -> {mem_result['action']} ({mem_result['detail']})")
+        # Only here: every selected runtime has committed and its rollback
+        # snapshot -- which backs up the whole `bundles/` container -- is
+        # discarded, so no restore can ask for a retired bundle back. A managed
+        # update reaches this through the new release's `harness.sh`, so the
+        # first update that ships the collector already runs it.
+        retired_bundles = _collect_retired_bundles(
+            targets, args.scope, lines, copy_budget=ACTIVATION_COPY_BUDGET
+        )
+        for report in reports:
+            row = retired_bundles.get(report.get("runtime"))
+            if row is not None:
+                report["retired_bundles"] = row
 
     return _runtime_emit_shape(args.runtime_command, reports, exit_code, lines)
 

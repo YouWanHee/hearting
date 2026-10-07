@@ -11,6 +11,7 @@ a failure can be injected precisely after legacy launcher removal
 (`HARNESS_INSTALLER_FAIL_AFTER_LAUNCHER=1`) and asserts the launcher state is
 restored to its exact pre-transaction bytes.
 """
+import json
 import os
 import stat
 import sys
@@ -31,6 +32,33 @@ import fixture_env  # noqa: E402
 def _write_executable(path: Path) -> None:
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _dangling_linked_bundle(home: Path, runtime: str) -> Path:
+    """A linked bundle whose release is gone -- what release pruning leaves behind."""
+    bundle = home / ".harness" / "bundles" / "release-v1.0.0-aaaaaaaaaaaa"
+    bundle.mkdir(parents=True)
+    # The collector leaves a home without an activation record alone.
+    (home / ".harness" / "activation.json").write_text(
+        json.dumps({"active_root": str(home / "active"), "source_root": str(home / "active")}),
+        encoding="utf-8",
+    )
+    (bundle / "source").symlink_to(home / "pruned-release", target_is_directory=True)
+    # The two newest bundle directories are never collected; make this one older.
+    for name in ("newer-1", "newer-2"):
+        (bundle.parent / name).mkdir()
+    (bundle / "bundle.json").write_text(
+        json.dumps({
+            "schema": runtime_activation.SCHEMA,
+            "runtime": runtime,
+            "source_revision": "release:v1.0.0:aaaaaaaaaaaa",
+            "source_link": True,
+            "checksum": "0" * 64,
+        }),
+        encoding="utf-8",
+    )
+    os.utime(bundle, (0, 0))
+    return bundle
 
 
 @contextmanager
@@ -193,6 +221,89 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
         self.assertFalse(status["installed"])
         self._assert_protected_surfaces_untouched()
 
+    def test_activate_collects_retired_bundles_after_commit(self):
+        bundle = _dangling_linked_bundle(self.codex_home, "codex")
+        with _stubbed_runtime_projection():
+            result = installer.cmd_runtime(self._args("activate"))
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+        self.assertEqual(result["retired_bundles"]["removed"], [bundle.name])
+        self.assertIn("codex: retired-bundles removed=1 kept=2 deferred=0", result["lines"])
+        self.assertFalse(bundle.exists())
+        self._assert_protected_surfaces_untouched()
+
+    def test_collection_runs_only_after_the_rollback_snapshot_is_discarded(self):
+        order = []
+
+        def collect(runtime, *_args, **_kwargs):
+            order.append("collect")
+            return {"runtime": runtime, "status": "ok", "removed": [], "kept": {}, "deferred": 0}
+
+        with _stubbed_runtime_projection() as mocks:
+            mocks["discard_runtime_state"].side_effect = lambda _snapshot: order.append("discard")
+            with mock.patch.object(
+                runtime_activation, "collect_retired_bundles", side_effect=collect
+            ) as collector:
+                result = installer.cmd_runtime(self._args("activate"))
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+        self.assertEqual(order, ["discard", "collect"])
+        self.assertEqual(
+            collector.call_args.kwargs["copy_budget"], installer.ACTIVATION_COPY_BUDGET
+        )
+
+    def test_a_rolled_back_invocation_collects_nothing(self):
+        self._install_legacy_launcher()
+        with _stubbed_runtime_projection():
+            first = installer.cmd_runtime(self._args("activate"))
+        self.assertEqual(first["exit"], installer.EXIT_OK)
+        self._install_legacy_launcher()
+        bundle = _dangling_linked_bundle(self.codex_home, "codex")
+        os.environ["HARNESS_INSTALLER_FAIL_AFTER_LAUNCHER"] = "1"
+        with _stubbed_runtime_projection():
+            second = installer.cmd_runtime(self._args("refresh"))
+        self.assertEqual(second["exit"], installer.EXIT_BLOCKED)
+        self.assertNotIn("retired_bundles", second)
+        self.assertTrue(bundle.is_dir())
+
+    def test_a_later_runtime_that_blocks_rolls_back_before_any_collection(self):
+        bundle = _dangling_linked_bundle(self.codex_home, "codex")
+        args = self._args("activate")
+        args.runtime = ["codex", "claude"]
+        with _stubbed_runtime_projection() as mocks:
+            mocks["activate"].side_effect = [
+                {"runtime": "codex", "freshness": "fresh", "next_action": "none"},
+                runtime_activation.ActivationError("claude blocked"),
+            ]
+            with mock.patch.object(
+                runtime_activation, "collect_retired_bundles"
+            ) as collector:
+                result = installer.cmd_runtime(args)
+            restored = mocks["restore_runtime_state"].call_count
+        self.assertEqual(result["exit"], installer.EXIT_BLOCKED)
+        self.assertEqual(restored, 2)  # the runtime that had already committed, too
+        collector.assert_not_called()
+        self.assertTrue(bundle.is_dir())
+
+    def test_collection_trouble_never_changes_a_committed_exit_code(self):
+        bundle = _dangling_linked_bundle(self.codex_home, "codex")
+        # Another runtime's record is a reference source; unreadable bytes
+        # there used to escape as UnicodeDecodeError after the commit.
+        other = Path(os.environ["CLAUDE_CONFIG_DIR"]) / ".harness" / "activation.json"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"\xff")
+        with _stubbed_runtime_projection():
+            result = installer.cmd_runtime(self._args("activate"))
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+        self.assertEqual(result["retired_bundles"]["status"], "skipped")
+        self.assertTrue(bundle.is_dir())
+        with _stubbed_runtime_projection(), mock.patch.object(
+            runtime_activation, "collect_retired_bundles",
+            side_effect=ValueError("relative runtime home"),
+        ):
+            result = installer.cmd_runtime(self._args("refresh"))
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+        self.assertEqual(result["retired_bundles"]["status"], "skipped")
+        self.assertIn("ValueError", result["retired_bundles"]["detail"])
+
     def test_reinstall_after_activate_is_idempotent_at_installer_level(self):
         self._install_legacy_launcher()
         with _stubbed_runtime_projection():
@@ -318,6 +429,18 @@ class StatusVersionSkewTest(unittest.TestCase):
 
 
 class UpdateSkipHintTest(unittest.TestCase):
+    def setUp(self):
+        # `cmd_update` collects retired bundles in every runtime home, so the
+        # whole environment stays inside the case.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patched = fixture_env.patched_environment(
+            Path(tmp.name), Path(__file__).resolve().parents[2]
+        )
+        env = patched.__enter__()
+        self.addCleanup(patched.__exit__, None, None, None)
+        self.codex_home = Path(env["CODEX_HOME"])
+
     def _update_args(self):
         return Namespace(dry_run=False, scope="global", plugin=False, reapply=False,
                          version="latest", runtimes=["claude", "codex", "opencode"],
@@ -362,6 +485,85 @@ class UpdateSkipHintTest(unittest.TestCase):
             result = installer.cmd_update(self._update_args())
         self.assertIn("skipped: claude (some-new-reason)", result["lines"])
         self.assertNotIn("skipped_hints", result)
+
+
+    def test_update_collects_retired_bundles_in_every_runtime_home(self):
+        bundle = _dangling_linked_bundle(self.codex_home, "codex")
+        with mock.patch.object(installer.distribution, "is_managed", return_value=True), \
+             mock.patch.object(installer.distribution, "update", return_value=self._managed_result({})):
+            result = installer.cmd_update(self._update_args())
+        self.assertFalse(bundle.exists())
+        rows = {row["runtime"]: row for row in result["retired_bundles"]}
+        self.assertEqual(set(rows), {"claude", "codex", "opencode"})
+        self.assertEqual(rows["codex"]["removed"], [bundle.name])
+        self.assertEqual(rows["claude"]["removed"], [])
+        self.assertIn("codex: retired-bundles removed=1 kept=2 deferred=0", result["lines"])
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+
+    def test_a_failed_reference_setup_skips_collection_and_keeps_the_update(self):
+        bundle = _dangling_linked_bundle(self.codex_home, "codex")
+        with mock.patch.object(installer.distribution, "is_managed", return_value=True), \
+             mock.patch.object(installer.distribution, "update", return_value=self._managed_result({})), \
+             mock.patch.object(installer.distribution, "reference_checker",
+                               side_effect=RuntimeError("registry vanished")):
+            result = installer.cmd_update(self._update_args())
+        self.assertTrue(bundle.is_dir())
+        rows = {row["runtime"]: row for row in result["retired_bundles"]}
+        self.assertEqual(rows["codex"]["status"], "skipped")
+        self.assertIn("registry vanished", rows["codex"]["detail"])
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+
+
+class BundleReferenceSurfaceTest(unittest.TestCase):
+    """What the distribution layer hands the bundle collector."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        patched = fixture_env.patched_environment(
+            self.root, Path(__file__).resolve().parents[2]
+        )
+        env = patched.__enter__()
+        self.addCleanup(patched.__exit__, None, None, None)
+        self.bin_dir = Path(env["HARNESS_BIN_DIR"])
+
+    def test_launcher_destinations_name_the_link_and_what_it_resolves_to(self):
+        release = self.root / "release"
+        (release / "tools" / "fleet").mkdir(parents=True)
+        (release / "tools" / "fleet" / "fleet.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        bundle = self.root / "bundle"
+        bundle.mkdir()
+        (bundle / "source").symlink_to(release, target_is_directory=True)
+        literal = bundle / "source" / "tools" / "fleet" / "fleet.sh"
+        self.bin_dir.mkdir(parents=True)
+        (self.bin_dir / "fleet").symlink_to(literal)
+        found = installer.distribution.launcher_destinations()
+        # Resolving alone would land in the release and hide the bundle passed through.
+        self.assertIn(literal, found)
+        self.assertIn(release / "tools" / "fleet" / "fleet.sh", found)
+
+    def test_reference_checker_fails_closed_and_names_an_open_route(self):
+        dist = installer.distribution
+        with mock.patch.object(
+            dist, "_stable_registry_snapshot",
+            side_effect=dist.DistributionError("registry-unreadable:jobs.log"),
+        ):
+            check = dist.reference_checker()
+        self.assertEqual(
+            check(self.root / "anything"),
+            (True, "reference-scan-failed:registry-unreadable:jobs.log"),
+        )
+        held = self.root / "held"
+        free = self.root / "free"
+        (held / "utilities").mkdir(parents=True)
+        free.mkdir()
+        with mock.patch.object(dist, "_stable_registry_snapshot", return_value=[]), \
+             mock.patch.object(dist, "_open_route_launch_homes",
+                               return_value=([("rt-1", str(held / "utilities"))], "")):
+            check = dist.reference_checker()
+        self.assertEqual(check(held), (True, "open-route:rt-1"))
+        self.assertEqual(check(free), (False, ""))
 
 
 if __name__ == "__main__":

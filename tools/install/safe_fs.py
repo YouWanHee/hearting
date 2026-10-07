@@ -399,9 +399,10 @@ class TargetLock:
     waiter retain an old locked inode while another process locks a new inode.
     """
 
-    def __init__(self, target: Path | str):
+    def __init__(self, target: Path | str, *, blocking: bool = True):
         self.target = _canonical_leaf(target, reject_leaf_symlink=False)
         _assert_fixture_boundary(self.target)
+        self.blocking = blocking
         self.path: Path | None = None
         self._handle = None
 
@@ -419,7 +420,13 @@ class TargetLock:
         self._handle = os.fdopen(descriptor, "r+b", buffering=0)
         try:
             if fcntl is not None:
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+                mode = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                try:
+                    fcntl.flock(self._handle.fileno(), mode)
+                except BlockingIOError as exc:
+                    raise SafetyError(
+                        "target-busy", self.target, "lock is held by another invocation"
+                    ) from exc
             opened = os.fstat(self._handle.fileno())
             current = os.lstat(self.path)
             if (
@@ -448,22 +455,31 @@ class TargetLock:
 
 
 class TargetLocks:
-    """Acquire a deterministic, duplicate-free set of target locks."""
+    """Acquire a deterministic, duplicate-free set of target locks.
 
-    def __init__(self, targets: Iterable[Path | str]):
+    With ``blocking=False`` the set is all or nothing and never waits: the
+    first target somebody else holds raises ``target-busy`` and every lock
+    already taken is released. A caller that can simply skip its work may
+    therefore take locks that other invocations acquire in a different order
+    -- one runtime's set after another's -- without any risk of the two
+    waiting on each other.
+    """
+
+    def __init__(self, targets: Iterable[Path | str], *, blocking: bool = True):
         self.targets = sorted(
             {_canonical_leaf(item, reject_leaf_symlink=False) for item in targets},
             key=os.fspath,
         )
         for target in self.targets:
             _assert_fixture_boundary(target)
+        self.blocking = blocking
         self._stack: ExitStack | None = None
 
     def __enter__(self) -> "TargetLocks":
         stack = ExitStack()
         try:
             for target in self.targets:
-                stack.enter_context(TargetLock(target))
+                stack.enter_context(TargetLock(target, blocking=self.blocking))
         except Exception:
             stack.close()
             raise

@@ -3450,6 +3450,662 @@ def surface_skew(release_root: Optional[Path] = None, scope: str = "global") -> 
     }
 
 
+# --- retired bundle collection ----------------------------------------------
+#
+# `_build_bundle` publishes one bundle per activated revision and nothing ever
+# took a superseded one away: only `deactivate` removes the whole container.
+# Every update therefore left the previous bundle behind -- a full copy until
+# 2026-09-08, a link since -- and the invocation rollback snapshot backs up
+# the entire `bundles/` container, so each later activation also copied all of
+# them once more.
+#
+# A bundle is removed only when every statement below holds; anything else is
+# kept and named. Nothing here raises, and nothing here is a gate: a kept
+# bundle costs disk, never a refused command.
+
+# `_bundle_ignore` strips every `_IGNORE_NAMES` entry from a copied bundle and
+# `_tree_digest` skips the same names, so the recorded checksum cannot see
+# them: a matching checksum says the published files are intact, not that
+# nothing was added. Bytecode caches and the per-route grounding markers are
+# rewritten on demand and describe sessions that no longer run from a retired
+# bundle. Every other name may be the only copy of real work (`.dispatch`
+# registries, report roots) and keeps the bundle.
+_DISPOSABLE_BUNDLE_NAMES = frozenset({
+    "__pycache__",
+    ".capability-grounding",
+    ".core-grounding",
+    ".route-grounding",
+    ".spec-grounding",
+})
+_BUNDLE_RESIDUE_NAMES = frozenset(_IGNORE_NAMES) - _DISPOSABLE_BUNDLE_NAMES
+
+
+def _bundle_residue(source: Path) -> Optional[str]:
+    """First path inside a copied bundle that publish never writes, else None."""
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        for name in sorted((*dirnames, *filenames)):
+            if name in _BUNDLE_RESIDUE_NAMES:
+                return str((Path(directory) / name).relative_to(source))
+        dirnames[:] = [name for name in dirnames if name not in _DISPOSABLE_BUNDLE_NAMES]
+    return None
+
+
+_VIA_PROJECTION = "*"
+
+
+def _process_started_at(pid: str) -> Optional[float]:
+    """Epoch seconds at which `pid` started, or None when it cannot be read."""
+    try:
+        with open("/proc/stat", encoding="utf-8") as handle:
+            boot = next(
+                int(line.split()[1]) for line in handle if line.startswith("btime")
+            )
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _path_crosses(path: str, links: frozenset) -> bool:
+    """Whether resolving the absolute `path` passes through one of `links`.
+
+    Read one component at a time, and each prefix is tested before a later
+    `..` can drop it: `hearting/../source/x.py` went through the pointer
+    although its normalised form no longer shows it. Nothing is resolved -- a
+    pointer an activation has since moved is matched by where it sits, never
+    followed to where it points now.
+    """
+    parts: List[str] = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+        if "/" + "/".join(parts) in links:
+            return True
+    return False
+
+
+def _bundle_process_holders(bundles: Path, projections: Optional[dict] = None) -> Optional[dict]:
+    """`{bundle name: pid}` for this user's processes that name a path under `bundles`.
+
+    Reads `environ`, `cmdline`, and `cwd`. The release-side scan
+    (`distribution._release_held_by_live_process`) reads only the first two; a
+    process that merely sits in a bundle directory holds it just as surely, so
+    the bundle scan adds the third. Matching is by substring, which also
+    catches a bundle path inside a `PATH`-style list.
+
+    A process started *through a projection* never shows a bundle path at all:
+    `python3 ~/.codex/hearting/utilities/x.py` keeps the pointer in its argv
+    while it runs code from whichever bundle the pointer named at the time.
+    Once an activation has moved the pointer, nothing can tell which bundle
+    that was. `projections` maps each runtime to its projected destinations
+    and the time of its last activation; a process whose argv goes through
+    one of them and that started before that activation is reported under
+    `_VIA_PROJECTION`, and the caller keeps every copied bundle while it
+    lives.
+
+    An argv written relative to a directory -- `cd ~/.codex; python3
+    hearting/utilities/x.py` -- names neither a bundle nor a projection until
+    it is read from where the process stood. That is its `cwd` now, and also
+    the `PWD` it was started with, which a later `chdir` leaves behind.
+
+    Returns None when `/proc` itself cannot be enumerated: undecidable is held.
+    A single process that denies its files is skipped, exactly as the release
+    scan does -- failing closed on `(sd-pam)` would keep every bundle forever.
+    """
+    prefixes = {str(bundles).rstrip("/") + "/"}
+    try:
+        prefixes.add(os.path.realpath(bundles).rstrip("/") + "/")
+    except OSError:
+        pass
+    try:
+        entries = [entry for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+    except OSError:
+        return None
+    uid = os.getuid()
+    holders: dict = {}
+    for entry in entries:
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+        except OSError:
+            continue
+        values: List[str] = []
+        argv: List[str] = []
+        bases: List[str] = []
+        for name in ("environ", "cmdline"):
+            try:
+                blob = (entry / name).read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            fields = [field for field in blob.split("\0") if field]
+            values.extend(fields)
+            if name == "cmdline":
+                argv = fields
+            else:
+                bases.extend(
+                    field[4:] for field in fields if field.startswith("PWD=/")
+                )
+        try:
+            cwd = os.readlink(entry / "cwd")
+            values.append(cwd + "/")
+            bases.append(cwd)
+        except OSError:
+            pass
+        located = [token for token in argv if token.startswith("/")]
+        located.extend(
+            os.path.join(base, token)
+            for token in argv if not token.startswith(("/", "-"))
+            for base in bases
+        )
+        values.extend(os.path.normpath(path) for path in located if path not in argv)
+        for value in values:
+            for prefix in prefixes:
+                start = value.find(prefix)
+                while start != -1:
+                    name = re.split(r"[/:]", value[start + len(prefix):], maxsplit=1)[0]
+                    if name:
+                        holders.setdefault(name, entry.name)
+                    start = value.find(prefix, start + len(prefix))
+        if _VIA_PROJECTION in holders or not projections:
+            continue
+        for destinations, activated_at in projections.values():
+            if not any(_path_crosses(path, destinations) for path in located):
+                continue
+            started = _process_started_at(entry.name)
+            if activated_at is None or started is None or started < activated_at:
+                holders[_VIA_PROJECTION] = entry.name
+                break
+    return holders
+
+
+# Every directory under a runtime home that activation projects entries into,
+# for any runtime and in any version: a surface one runtime has retired
+# (Claude's `agent-modes`) keeps its links on disk. An entry sits directly in
+# one of these or one level down (`agent-modes/<group>/<mode>.md`).
+_DISCOVERY_DIRECTORIES = ("agent-modes", "agents", "commands", "hooks", "plugins", "skills", "tui")
+
+
+# What `_build_bundle` puts in a bundle directory. Anything beside these was
+# put there by someone else, and removing the bundle would take it along.
+_BUNDLE_ROOT_ENTRIES = frozenset({"bundle.json", "source"})
+
+
+def _activation_evidence(runtime: str, scope: str) -> Optional[str]:
+    """Why this runtime's bundles cannot be judged at all, or None.
+
+    The activation record is the evidence of which bundle the runtime runs
+    from. Without a usable one the home may still be projected into a bundle
+    (links survive a lost or reset record), and nothing here can tell which,
+    so the whole container is left alone.
+    """
+    state = _load_json(_state_path(runtime, scope))
+    if not state:
+        return "no activation record"
+    for key in ("active_root", "source_root"):
+        value = state.get(key)
+        if not isinstance(value, str) or not value:
+            return f"activation record has no {key}"
+    return None
+
+
+def _pending_transaction(scope: str) -> Optional[str]:
+    """Name a runtime whose activation transaction was never recovered, or None.
+
+    `capture_runtime_state` recovers a crashed transaction before it locks,
+    and recovery may point a home back at the bundle it had before. Until
+    that has run, the records and links below do not say which bundle that is.
+    """
+    for runtime in RUNTIMES:
+        transactions = paths.harness_state_dir(runtime, scope) / "transactions"
+        if transactions.is_dir() and any(transactions.iterdir()):
+            return f"{runtime} has an unrecovered activation transaction"
+    return None
+
+
+def _guard_paths(values: Iterable) -> set:
+    """Each value as written and as it resolves."""
+    guarded: set = set()
+    for value in values:
+        text = os.fspath(value)
+        if not text:
+            continue
+        guarded.add(os.path.abspath(text))
+        try:
+            guarded.add(os.path.realpath(text))
+        except OSError:
+            pass
+    return guarded
+
+
+def _activated_epoch(state: dict) -> Optional[float]:
+    value = state.get("activated_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def _activation_guard(scope: str) -> tuple:
+    """`(paths, projections)` for every runtime's activation and projection.
+
+    `paths` holds what the activations and projections name, as written and
+    as resolved. Every runtime is read, not only the collected one: `refresh`
+    re-activates from `source_root`, and one runtime may have been activated
+    from a path inside another runtime's bundle. The recorded roots are not
+    the whole reference set either. What a runtime actually runs through is
+    its projection -- the links activation placed in the runtime home -- and
+    a home can still be projected into a bundle after its record was lost,
+    reset, or written by a version that listed fewer paths. So the links are
+    read from disk three ways: every destination a record lists, every
+    destination the layout defines for that runtime, and every link that is
+    actually sitting in the runtime home or in one of its discovery
+    directories -- which is where a skill, command, or mode that a later
+    version no longer ships stays behind, known to no record and no layout.
+    Those directories are looked at by name: the layout is generated from the
+    current source, and a surface that source has stopped filling leaves no
+    destination to find the directory by.
+
+    `projections` maps each runtime to `(destinations, activated_at)` for the
+    process scan. A destination is listed as written and with its directory
+    resolved, since a process `cwd` is always the resolved one; the link
+    itself is never followed.
+
+    The caller holds every runtime's activation lock, so this is read once:
+    no activation can move a root or a link while the pass runs.
+    """
+    values: List = []
+    roots: List[Path] = []
+    records = {}
+    projections = {}
+    for runtime in RUNTIMES:
+        state = _load_json(_state_path(runtime, scope)) or {}
+        records[runtime] = state
+        for key in ("active_root", "source_root"):
+            value = state.get(key)
+            if isinstance(value, str) and value:
+                values.append(value)
+                roots.append(Path(value))
+    try:
+        roots.append(paths.agent_home())
+    except (OSError, RuntimeError, ValueError):
+        pass
+    for runtime in RUNTIMES:
+        state = records[runtime]
+        destinations = set()
+        for item in state.get("owned_paths") or []:
+            if isinstance(item, dict):
+                if isinstance(item.get("dest"), str):
+                    destinations.add(item["dest"])
+                if isinstance(item.get("source"), str):
+                    values.append(item["source"])
+        for item in state.get("discovery_paths") or []:
+            if isinstance(item, str):
+                destinations.add(item)
+        for root in roots:
+            try:
+                destinations.update(
+                    str(item["dest"]) for item in _linked_entries(runtime, root, scope)
+                )
+            except (ActivationError, OSError, ValueError):
+                continue
+        home = str(paths.runtime_home(runtime, scope)).rstrip("/")
+        directories = {home}
+        for dest in destinations:
+            parent = os.path.dirname(dest)
+            if parent.startswith(home + "/"):
+                directories.add(parent)
+        for name in _DISCOVERY_DIRECTORIES:
+            discovery = os.path.join(home, name)
+            directories.add(discovery)
+            try:
+                with os.scandir(discovery) as listing:
+                    directories.update(
+                        item.path for item in listing if item.is_dir(follow_symlinks=False)
+                    )
+            except OSError:
+                continue
+        for directory in directories:
+            try:
+                with os.scandir(directory) as listing:
+                    destinations.update(item.path for item in listing if item.is_symlink())
+            except OSError:
+                continue
+        for dest in destinations:
+            try:
+                raw = os.readlink(dest)
+            except OSError:
+                continue
+            values.append(raw if os.path.isabs(raw) else os.path.join(os.path.dirname(dest), raw))
+        for dest in list(destinations):
+            parent, name = os.path.split(dest)
+            try:
+                destinations.add(os.path.join(os.path.realpath(parent), name))
+            except OSError:
+                continue
+        projections[runtime] = (frozenset(destinations), _activated_epoch(state))
+    return _guard_paths(values), projections
+
+
+def _contains_guarded(entry: Path, guarded: set) -> bool:
+    roots = {os.path.abspath(entry)}
+    try:
+        roots.add(os.path.realpath(entry))
+    except OSError:
+        pass
+    for root in roots:
+        prefix = root.rstrip("/") + "/"
+        if any(path == root or path.startswith(prefix) for path in guarded):
+            return True
+    return False
+
+
+def _retired_bundle_keep_reason(
+    runtime: str,
+    entry: Path,
+    guarded: set,
+    holders: Optional[dict],
+    in_use: Optional[Callable],
+) -> tuple:
+    """`(reason, metadata)`: why `entry` stays, or `(None, metadata)` when it may go.
+
+    Every statement here is a reason to keep, so it may be evaluated on a
+    bundle that is not sealed: keeping is always safe. A verdict of "may go"
+    only selects a candidate; it counts once it is reached again on the sealed
+    directory (`_remove_retired_bundle`).
+
+    Ownership is what `_build_bundle` wrote, where it writes it: a real
+    directory directly under this runtime's `bundles/` holding exactly
+    `bundle.json` and `source`, whose metadata names this runtime and schema.
+    A dangling link, an old name, or a familiar layout proves nothing alone.
+
+    A linked bundle is retired once its release is gone. While the release
+    exists the link is kept -- it costs a few kilobytes and a session may
+    still hold the pointer form. A release can also vanish without pruning
+    having proved it unused, so the dispatch references are asked about the
+    release the link names.
+
+    A copied bundle answers for itself: nothing written into it after
+    publish, no live process, no open dispatch reference.
+    """
+    if entry.name.startswith(".staging-"):
+        return "staging", {}
+    if entry.is_symlink() or not entry.is_dir():
+        return "not-a-bundle-directory", {}
+    try:
+        children = sorted(os.listdir(entry))
+    except OSError:
+        return "unreadable", {}
+    unexpected = [name for name in children if name not in _BUNDLE_ROOT_ENTRIES]
+    if unexpected:
+        return f"unexpected-entry:{unexpected[0]}", {}
+    metadata_path = entry / "bundle.json"
+    source = entry / "source"
+    if metadata_path.is_symlink() or not metadata_path.is_file():
+        return "metadata-missing", {}
+    try:
+        metadata = json.loads(metadata_path.read_bytes().decode("utf-8"))
+    except (OSError, ValueError):
+        return "metadata-unreadable", {}
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema") != SCHEMA
+        or metadata.get("runtime") != runtime
+        or not isinstance(metadata.get("checksum"), str)
+        or not isinstance(metadata.get("source_revision"), str)
+    ):
+        return "metadata-foreign", {}
+    if _contains_guarded(entry, guarded):
+        return "referenced", metadata
+    if metadata.get("source_link"):
+        if not source.is_symlink():
+            return "metadata-mismatch", metadata
+        if source.exists():
+            return "release-present", metadata
+        try:
+            raw = os.readlink(source)
+        except OSError:
+            return "unreadable", metadata
+        candidate = Path(raw if os.path.isabs(raw) else os.path.join(entry, raw))
+    else:
+        if source.is_symlink() or not source.is_dir():
+            return "metadata-mismatch", metadata
+        residue = _bundle_residue(source)
+        if residue is not None:
+            return f"runtime-state:{residue}", metadata
+        candidate = source
+    if holders is None:
+        return "proc-unreadable", metadata
+    pid = holders.get(entry.name)
+    if pid is not None:
+        return f"live-process:{pid}", metadata
+    if not metadata.get("source_link") and holders.get(_VIA_PROJECTION) is not None:
+        return f"live-process-via-projection:{holders[_VIA_PROJECTION]}", metadata
+    if in_use is not None:
+        try:
+            used, why = in_use(candidate)
+        except Exception as exc:  # noqa: BLE001 -- the caller's predicate; undecidable is in use
+            return f"reference-check-failed:{type(exc).__name__}", metadata
+        if used:
+            return why or "in-use", metadata
+    return None, metadata
+
+
+def _remove_retired_bundle(
+    runtime: str, bundles: Path, entry: Path, references: Callable
+) -> Optional[str]:
+    """Seal `entry`, reach the verdict again on the sealed tree, remove exactly that.
+
+    The first verdict only chose a candidate, and nothing it read is trusted
+    here. The directory is sealed first -- kind, device, inode, and a digest
+    over every entry in it, a link recorded by its target and never by what it
+    points at. Then the whole verdict is taken again with the references read
+    afresh, and a copy is hashed against the checksum publish recorded.
+    `remove_exact` re-reads the seal before it deletes, so anything that
+    arrived after the seal, inside `source/` or beside it, stops the removal,
+    and a directory swapped in under the same name is a different inode with
+    its own metadata. `shutil.rmtree` never follows the `source` link of a
+    linked bundle into its release.
+    """
+    try:
+        state = safe_fs.capture_state(entry)
+        if state.kind != "directory":
+            return "not-a-bundle-directory"
+        guarded, holders, in_use = references()
+        reason, metadata = _retired_bundle_keep_reason(
+            runtime, entry, guarded, holders, in_use
+        )
+        if reason is not None:
+            return reason
+        if not metadata.get("source_link"):
+            if _tree_digest(entry / "source") != metadata.get("checksum"):
+                return "checksum-mismatch"
+        authority = safe_fs.authority(
+            entry,
+            owner=f"runtime-activation:retired-bundle:{runtime}",
+            allowed_roots=(bundles,),
+            allow_leaf_symlink=False,
+            expected=state,
+        )
+        safe_fs.remove_exact(authority, recursive=True)
+    except safe_fs.SafetyError as exc:
+        return f"remove-refused:{exc.code}"
+    except OSError as exc:
+        return f"remove-failed:{type(exc).__name__}"
+    return None
+
+
+_COLLECT_CURSOR = ".collect-cursor.json"
+
+
+def _after_cursor(copies: List[Path], bundles: Path) -> List[Path]:
+    """`copies` rotated to start behind the copy the last budgeted call stopped at."""
+    try:
+        data = json.loads((bundles / _COLLECT_CURSOR).read_bytes().decode("utf-8"))
+        after = data.get("after") if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        after = None
+    if not isinstance(after, str):
+        return copies
+    later = [entry for entry in copies if entry.name > after]
+    return later + [entry for entry in copies if entry.name <= after]
+
+
+def collect_retired_bundles(
+    runtime: str,
+    scope: str = "global",
+    *,
+    external: Optional[Callable] = None,
+    copy_budget: Optional[int] = None,
+    keep_recent: int = 2,
+    dry_run: bool = False,
+) -> dict:
+    """Remove the bundles of `runtime` that nothing can use any more.
+
+    Call it only after an invocation has fully committed: the rollback
+    snapshot owns `bundles/` until `discard_runtime_state`, and a bundle that
+    disappears between seal and discard breaks the snapshot's own postimage
+    check.
+
+    The pass holds this runtime's `bundles/` lock and every runtime's
+    activation-record lock -- the locks any activation of any runtime takes
+    -- as one non-blocking set. If one of them is held, an activation is in
+    progress somewhere and the pass steps aside instead of waiting, so it can
+    never join a lock-order cycle with an invocation that activates runtimes
+    in a different order. While it holds them no activation can start naming
+    a bundle, which is what makes the activation guard readable once.
+
+    `external() -> (protected_paths, in_use)` supplies the references that
+    live in the distribution layer this module does not import: the launcher
+    targets, and `in_use(path) -> (bool, reason)` over the dispatch registries
+    and route records. Those writers do not take the locks above, so it is
+    called again before every removal, together with a fresh process scan. A
+    launch that registers between that last read and the delete is not
+    excluded by any lock here.
+
+    A process that started through a pointer before an activation moved it
+    shows the pointer, never the bundle, and the process scan is what keeps
+    the copies while one lives (see `_bundle_process_holders`). On top of
+    that the `keep_recent` newest bundle directories are never collected, the
+    floor `_cleanup_releases` keeps for releases. It is ranked by directory
+    age, so it holds the bundle an activation just retired only when that
+    bundle is also among the newest built -- re-activating an older bundle
+    retires one the floor may not reach, and the scan alone answers for it.
+
+    `copy_budget` bounds the work on copied bundles: each one examined costs
+    up to three passes over its tree, kept or removed, and a managed update
+    runs activation under a fixed timeout. The call examines that many,
+    reports the rest as `deferred`, and records where it stopped so the next
+    budgeted call resumes behind it -- copies that keep being kept cannot
+    hold up the ones after them. Linked bundles are never budgeted.
+
+    Never raises. Returns `{runtime, status, removed, kept, deferred}` where
+    `kept` maps each surviving bundle to the reason it survived.
+    """
+    report = {"runtime": runtime, "status": "ok", "removed": [], "kept": {}, "deferred": 0}
+    if dry_run:
+        report["status"] = "planned"
+    held = None
+    try:
+        if runtime not in RUNTIMES:
+            raise ActivationError(f"unsupported runtime: {runtime}")
+        _validate_scope(runtime, scope)
+        _validate_state_dir(runtime, scope)
+        bundles = paths.harness_state_dir(runtime, scope) / "bundles"
+        if not bundles.is_dir():
+            return report
+        targets = [bundles, *(_state_path(name, scope) for name in RUNTIMES)]
+        try:
+            held = safe_fs.TargetLocks(targets, blocking=False).__enter__()
+        except safe_fs.SafetyError as exc:
+            if exc.code != "target-busy":
+                raise
+            report["status"] = "skipped"
+            report["detail"] = "an activation is in progress"
+            return report
+        blocked = _activation_evidence(runtime, scope) or _pending_transaction(scope)
+        if blocked is not None:
+            report["status"] = "skipped"
+            report["detail"] = blocked
+            return report
+        activation_guard, projections = _activation_guard(scope)
+
+        def references() -> tuple:
+            protected, in_use = external() if external is not None else ((), None)
+            return (
+                activation_guard | _guard_paths(protected),
+                _bundle_process_holders(bundles, projections),
+                in_use,
+            )
+
+        def attempt(entry: Path, metadata: dict) -> None:
+            if not dry_run:
+                reason = _remove_retired_bundle(runtime, bundles, entry, references)
+            elif not metadata.get("source_link") and (
+                _tree_digest(entry / "source") != metadata.get("checksum")
+            ):
+                reason = "checksum-mismatch"
+            else:
+                reason = None
+            if reason is None:
+                report["removed"].append(entry.name)
+            else:
+                report["kept"][entry.name] = reason
+
+        guarded, holders, in_use = references()
+        entries = [
+            entry for entry in sorted(bundles.iterdir(), key=lambda item: item.name)
+            if entry.name != _COLLECT_CURSOR
+        ]
+        directories = [
+            entry for entry in entries
+            if entry.is_dir() and not entry.is_symlink()
+            and not entry.name.startswith(".staging-")
+        ]
+        directories.sort(key=lambda item: item.lstat().st_mtime, reverse=True)
+        recent = {entry.name for entry in directories[:max(0, keep_recent)]}
+        linked, copies, facts = [], [], {}
+        for entry in entries:
+            reason, metadata = _retired_bundle_keep_reason(
+                runtime, entry, guarded, holders, in_use
+            )
+            if reason is None and entry.name in recent:
+                reason = "recent"
+            if reason is not None:
+                report["kept"][entry.name] = reason
+                continue
+            facts[entry.name] = metadata
+            (linked if metadata.get("source_link") else copies).append(entry)
+        for entry in linked:
+            attempt(entry, facts[entry.name])
+        if copy_budget is not None:
+            copies = _after_cursor(copies, bundles)
+        last = None
+        for index, entry in enumerate(copies):
+            if copy_budget is not None and index >= copy_budget:
+                report["deferred"] = len(copies) - index
+                break
+            attempt(entry, facts[entry.name])
+            last = entry.name
+        if report["deferred"] and last is not None and not dry_run:
+            _atomic_json(bundles / _COLLECT_CURSOR, {"after": last})
+        report["removed"].sort()
+    except Exception as exc:  # noqa: BLE001 -- cleanup after a committed command never fails it
+        report["status"] = "skipped"
+        report["detail"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if held is not None:
+            held.__exit__(None, None, None)
+    return report
+
+
 BUNDLE_STATE_DIR_NAMES = (".agent_reports", ".claude_reports")
 BUNDLE_STATE_MAX_FINDINGS = 8
 

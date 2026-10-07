@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Iterable, NamedTuple, Optional
+from typing import Callable, Iterable, NamedTuple, Optional
 
 
 DEFAULT_REPOSITORY = "dmlguq456/hearting"
@@ -3044,6 +3044,61 @@ def _commit_forced_prune_gap_record(candidate: Path, environ: dict[str, str], re
                     sys.modules["fcntl"].flock(handle.fileno(), sys.modules["fcntl"].LOCK_UN)
             except OSError:
                 pass
+
+
+def launcher_destinations() -> set[Path]:
+    """Where the shared launchers and the `current` pointer lead right now.
+
+    Activation advances before an update repoints these (see
+    `_managed_runtime_bundle_roots`), so one of them can still name the bundle
+    a runtime just left. The collector of retired runtime bundles lives below
+    this layer and cannot see them, so it is handed this set. Both the literal
+    link target and its fully resolved form are returned: a launcher that goes
+    through a linked bundle resolves into the release and would otherwise hide
+    the bundle it passes through.
+    """
+    found: set[Path] = set()
+    candidates = [launcher_path(), legacy_launcher_path(), current_path()]
+    candidates.extend(bin_dir() / name for name, _relative in TOOL_LAUNCHERS)
+    for path in candidates:
+        if not path.is_symlink():
+            continue
+        try:
+            raw = Path(os.readlink(path))
+        except OSError:
+            continue
+        found.add(raw if raw.is_absolute() else path.parent / raw)
+        destination = _launcher_destination(path)
+        if destination is not None:
+            found.add(destination)
+    return found
+
+
+def reference_checker() -> Callable[[Path], tuple[bool, str]]:
+    """`candidate -> (in_use, reason)` over one snapshot of the dispatch references.
+
+    The registry and route sources `_cleanup_releases` consults for a release
+    answer the same question for any root a launch could have sealed, and a
+    copied runtime bundle is one. The snapshots are taken once here, as
+    `_cleanup_releases` takes them once outside its loop. A snapshot that
+    cannot be taken answers in-use for every candidate, and the predicate
+    itself never raises: the caller is cleaning up after a command that
+    already succeeded.
+    """
+    try:
+        stable_snapshot = _stable_registry_snapshot(os.environ)
+        route_snapshot = _open_route_launch_homes(os.environ)
+    except DistributionError as exc:
+        reason = f"reference-scan-failed:{exc}"
+        return lambda _candidate: (True, reason)
+
+    def _check(candidate: Path) -> tuple[bool, str]:
+        try:
+            return _release_in_use(Path(candidate), stable_snapshot, route_snapshot)
+        except (OSError, ValueError, DistributionError) as exc:
+            return True, f"reference-check-failed:{exc}"
+
+    return _check
 
 
 # destructive-ok: reason=prune only retention-proved version directories; boundary=canonical children of the managed releases root

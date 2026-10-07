@@ -190,6 +190,23 @@ class SafeFsTest(unittest.TestCase):
         self.assertTrue(replaced)
 
     @unittest.skipIf(safe_fs.fcntl is None, "POSIX flock required")
+    def test_nonblocking_lock_set_is_all_or_nothing_and_never_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first, second, third = (root / name for name in ("a", "b", "c"))
+            with safe_fs.TargetLock(second):
+                started = time.monotonic()
+                with self.assertRaises(safe_fs.SafetyError) as caught:
+                    with safe_fs.TargetLocks([first, second, third], blocking=False):
+                        self.fail("a busy set must not be entered")
+                self.assertEqual(caught.exception.code, "target-busy")
+                self.assertLess(time.monotonic() - started, 1.0)
+                # `a` was taken before `b` refused; it must have been let go.
+                with safe_fs.TargetLocks([first], blocking=False):
+                    pass
+            with safe_fs.TargetLocks([first, second, third], blocking=False):
+                pass
+
     def test_target_lock_is_shared_and_pathname_remains_stable(self) -> None:
         target = self.root / "shared"
         marker = self.root / "marker"
