@@ -244,6 +244,7 @@ class OwnerWriteAdvisoryTest(unittest.TestCase):
                  mock.patch.object(R, "_compose_campaign_line", return_value="campaign fixture"), \
                  mock.patch.object(R, "_emit_compiled_route", return_value=path), \
                  mock.patch.object(W, "_advance", side_effect=advance), \
+                 mock.patch("start_receipt.save", side_effect=lambda result, jobs: result), \
                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(R.main(), 0)
             self.assertEqual(json.loads(out.getvalue())["advisories"][0]["owner_harness"], "codex")

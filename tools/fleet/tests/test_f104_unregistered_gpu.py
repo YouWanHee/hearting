@@ -160,7 +160,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
             self.assertIn("GPU moving4:0", row)
             self.assertNotIn("/home/test/envs/xxx/bin/python", row)
             if width == 168:
-                self.assertIn("python run.py  --flag '/keep/full path'", row)
+                self.assertIn("python run.py --flag 'full path'", row)
             self.assertEqual(json.dumps(entry, sort_keys=True), original)
 
         quoted = compute_hosts.unregistered_gpu(_snapshot((0, [_process(
@@ -174,8 +174,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
     def test_long_argv_tail_survives_available_width(self):
         # Original case (C-PR176 live observation on cnn): a long env python
         # plus a long script path with no --run-id/--name/--config identifier.
-        # The old fixed 48-cell clamp cut the tail to `TF-Rehance…` even on a
-        # wide terminal; the name now earns the real available width instead.
+        # Path prefixes must not hide the script, even in the narrower row.
         entry = compute_hosts.unregistered_gpu(_snapshot((0, [_process(
             command="/home/nas/user/Uihyeop/NN_Zoo/TF-Rehancer_artifacts/envs/"
                      "private_cnn_cu128_20261006/bin/python "
@@ -186,18 +185,17 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         original = json.dumps(entry, sort_keys=True)
         wide = render._plain(render._gpu_work_row(entry, 168))
         self.assertLessEqual(render._dw(wide), 168)
-        self.assertIn("python /home/nas/user/Uihyeop/NN_Zoo/TF-Rehancer_artifacts/"
-                      "envs/private_cnn_train.py", wide)
+        self.assertIn("python private_cnn_train.py", wide)
         self.assertNotIn("…", wide)
         # Identifier-based labels (M6/config) keep their existing short form.
         m6 = render._plain(render._gpu_work_row(
             compute_hosts.unregistered_gpu(_snapshot((0, [_process()])))[0], 168))
         self.assertIn("M6 학습", m6)
-        # A genuinely narrow terminal still clips honestly with a marker.
+        # Filename compaction leaves the script visible at the narrower width.
         narrow = render._plain(render._gpu_work_row(entry, 60))
         self.assertLessEqual(render._dw(narrow), 60)
         self.assertIn("GPU moving4:0", narrow)
-        self.assertIn("…", narrow)
+        self.assertIn("private_cnn_train.py", narrow)
         self.assertEqual(json.dumps(entry, sort_keys=True), original)
 
     def test_multi_gpu_process_is_one_row_and_dispatch_section_only(self):
@@ -212,6 +210,30 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         self.assertEqual(len(rows), 1)
         self.assertIn("19 GB", rows[0])
         self.assertNotIn("● GPU", "\n".join(self.lines(snapshot, section="fleet")))
+
+    def test_remote_runs_and_unattached_processes_share_one_compact_card_strip(self):
+        cnn = _snapshot((0, [_process(pid=500, command="python train.py --config UMA_7ch_fix_2spk_v2_1.yaml",
+                                     owner={"kind": "run", "label": "run:one"})]),
+                        (1, [_process(pid=600, command="python train.py --config AMI_8ch_varying_0_3spk_v2_rirfix.yaml",
+                                     owner={"kind": "run", "label": "run:two"})]),
+                        host="cnn", is_self=False)
+        moving = _snapshot((1, [_process(pid=700, command="python train.py --config 1ch_fix_2spk_v2.yaml")]))
+        snapshot = {**cnn, "hosts": cnn["hosts"] + moving["hosts"]}
+        original = json.dumps(snapshot, sort_keys=True)
+        entries = compute_hosts.unregistered_gpu(snapshot)
+        self.assertEqual(len(entries), 3)
+        for width in (168, 100, 60, 40):
+            with self.subTest(width=width):
+                rows = [line for line in self.lines(snapshot, width=width) if "● GPU" in line]
+                self.assertEqual(len(rows), 1)
+                self.assertLessEqual(render._dw(rows[0]), width)
+                if width >= 60:
+                    for identity in ("GPU cnn:0", "GPU cnn:1", "GPU moving4:1"):
+                        self.assertIn(identity, rows[0])
+                if width <= 60:
+                    self.assertNotIn(" GB", rows[0])
+                self.assertEqual(json.dumps(snapshot, sort_keys=True), original)
+                self.assertEqual(compute_hosts.unregistered_gpu(snapshot), entries)
 
     def test_group_with_gpu_session_never_folds_and_shows_gpu_once(self):
         owner = _session_owner()
@@ -398,7 +420,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         render.set_compute_hosts(snapshot)
         with_gpu, built = build()
         text = [render._plain(line) for line in built if line is not None]
-        self.assertEqual(sum(line.count("● GPU") for line in text), 480)
+        self.assertEqual(sum("● GPU" in line for line in text), 5)
         self.assertEqual(len(compute_hosts.unregistered_gpu(snapshot)), 480)
         # Generous ceiling for slow CI; the plan's target is ~50 ms of added work.
         self.assertLess(with_gpu - baseline, 0.5)

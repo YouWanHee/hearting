@@ -100,6 +100,8 @@ read_launch_fence_failure = WRAPPER_COMMON.read_launch_fence_failure
 resolve_artifact_root = WRAPPER_COMMON.resolve_artifact_root
 resolve_report_bundle_root = WRAPPER_COMMON.resolve_report_bundle_root
 seed_launch_heartbeat = WRAPPER_COMMON.seed_launch_heartbeat
+_registered_owner = WRAPPER_COMMON.registered_owner
+completion_state_path = WRAPPER_COMMON.completion_state_path
 from dispatch_summary import launch_summary_owner  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
@@ -923,17 +925,14 @@ def _read_only_projection(args: argparse.Namespace) -> tuple[list[str], list[str
 
 
 def _async_wait_policy(args: argparse.Namespace) -> str:
-    if getattr(args, "resolved_completion_delivery", "") == "session-resume-supervised":
-        return "runtime-supervised"
-    return "deny-proven" if _async_deny_tools(args) else "unsupported"
-
-
-def _registered_owner(args: argparse.Namespace) -> bool:
-    return args.dispatch_depth == 1 and args.worker_type == "owner"
+    return WRAPPER_COMMON.async_wait_policy(
+        args, supervised=getattr(args, "resolved_completion_delivery", "") == "session-resume-supervised",
+        deny_tools=_async_deny_tools,
+    )
 
 
 def _completion_owner(args: argparse.Namespace) -> bool:
-    return _registered_owner(args) and args.intensity in _STANDARD_PLUS_INTENSITY
+    return WRAPPER_COMMON.completion_owner(args, registered=_registered_owner)
 
 
 # SD-OPEN-63: `claude --help` piped through a PIPE truncates at a buffer boundary
@@ -1071,19 +1070,6 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
 def initialize_supervised_owner_input(args: argparse.Namespace, jobs: Path) -> None:
     WRAPPER_COMMON.initialize_owner_input_when(
         args, jobs, supervised=args.resolved_completion_delivery == "session-resume-supervised", input_kind="claude-next-turn")
-
-
-def completion_state_path(args: argparse.Namespace) -> Path:
-    state_root = dispatch_state_root(args.jobs_path)
-    if not args.attempt_id:
-        return state_root / "supervisor-state" / "preview-only.json"
-    attempt_id = args.attempt_id
-    if re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", attempt_id) is None:
-        raise DispatchContractError(
-            "completion-state-attempt-invalid",
-            "supervised completion requires a path-safe exact attempt id",
-        )
-    return state_root / "supervisor-state" / f"{attempt_id}.json"
 
 
 def completion_lease_path(args: argparse.Namespace) -> Path:
@@ -1337,7 +1323,10 @@ def main(argv: list[str]) -> int:
     _bind_runtime_parent(args)
     if args.broker_request_id or args.launch_authority == "ancestor-broker":
         return fail("launch-broker-retired", 76, child_spawned="0")
-    args.agent_home = resolve_agent_home()
+    # The whole tree runs on the release this launch resolves (OPERATIONS §5.9a): one real
+    # path reaches the child environment, its allow rules and the row, whichever spelling
+    # (`hearting run`, a `current` pointer) the caller exported.
+    args.agent_home = sealed_launch_home(resolve_agent_home())
     bind_parent_completion_delivery(args)
     worktree = Path(args.worktree)
     if not worktree.is_dir():

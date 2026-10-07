@@ -394,6 +394,69 @@ class ModelPolicyTest(unittest.TestCase):
                 policy.assert_called_once_with()
 
 
+class CompletionPolicyTest(unittest.TestCase):
+    def test_owner_classification_preserves_depth_type_and_intensity(self):
+        for harness in ("claude", "codex"):
+            wrapper = load(harness)
+            self.assertIs(wrapper._registered_owner, C.registered_owner)
+            for depth in (0, 1, 2):
+                for worker_type in ("owner", "stage", "review", "support"):
+                    for intensity in ("direct", "quick", "standard", "strong", "thorough", "adversarial"):
+                        args = argparse.Namespace(dispatch_depth=depth, worker_type=worker_type, intensity=intensity)
+                        with self.subTest(harness=harness, depth=depth, worker_type=worker_type, intensity=intensity):
+                            owner = depth == 1 and worker_type == "owner"
+                            self.assertEqual(wrapper._registered_owner(args), owner)
+                            self.assertEqual(wrapper._completion_owner(args), owner and intensity in {
+                                "standard", "strong", "thorough", "adversarial"})
+
+    def test_completion_owner_looks_up_the_wrappers_classifier_at_call_time(self):
+        from unittest import mock
+        for harness in ("claude", "codex"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness), \
+                 mock.patch.object(wrapper, "_registered_owner", return_value=False) as registered:
+                args = argparse.Namespace()  # no intensity access after the false classifier
+                self.assertFalse(wrapper._completion_owner(args))
+                registered.assert_called_once_with(args)
+
+    def test_async_policy_preserves_deny_dependency_and_supervised_short_circuit(self):
+        from unittest import mock
+        wrapper = load("claude")
+        for delivery in (None, "one-shot", "poll-fallback", "session-resume-supervised"):
+            for denied in ((), ("Monitor",)):
+                args = argparse.Namespace()
+                if delivery is not None:
+                    args.resolved_completion_delivery = delivery
+                with self.subTest(delivery=delivery, denied=denied), \
+                     mock.patch.object(wrapper, "_async_deny_tools", return_value=denied) as deny:
+                    expected = ("runtime-supervised" if delivery == "session-resume-supervised"
+                                else "deny-proven" if denied else "unsupported")
+                    self.assertEqual(wrapper._async_wait_policy(args), expected)
+                    if delivery == "session-resume-supervised":
+                        deny.assert_not_called()
+                    else:
+                        deny.assert_called_once_with(args)
+
+    def test_completion_state_remains_below_the_exact_registry_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "custom-state" / "jobs.log"
+            for harness in ("claude", "codex"):
+                wrapper = load(harness)
+                self.assertIs(wrapper.completion_state_path, C.completion_state_path)
+                for attempt in (None, "", "att-exact_1.2-3"):
+                    args = argparse.Namespace(jobs_path=jobs, attempt_id=attempt)
+                    filename = f"{attempt}.json" if attempt else "preview-only.json"
+                    with self.subTest(harness=harness, attempt=attempt):
+                        self.assertEqual(wrapper.completion_state_path(args),
+                                         jobs.parent / "supervisor-state" / filename)
+                for attempt in ("att-../../outside", "att-", "foreign", "att-" + "x" * 241):
+                    with self.subTest(harness=harness, attempt=attempt), \
+                         self.assertRaises(C.DispatchContractError) as error:
+                        wrapper.completion_state_path(argparse.Namespace(jobs_path=jobs, attempt_id=attempt))
+                    self.assertEqual(error.exception.reason, "completion-state-attempt-invalid")
+            self.assertFalse(jobs.parent.exists())  # path selection does not write state
+
+
 class RegistrationFenceTest(unittest.TestCase):
     def test_every_wrapper_registers_behind_the_terminal_claim_fence(self):
         import ast

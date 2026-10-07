@@ -270,8 +270,8 @@ OLD_MEM_SYNC = (
     "|| [ \"${FLEET_TITLE_REFRESH:-}\" = 1 ] || [ \"${MEM_DISTILL:-}\" = 1 ]; then exit 0; fi; "
     "exec python3 \"$HOME/.claude/tools/memory/mem.py\" sync --json >/dev/null'"
 )
-FLEET_END = 'python3 "$HOME/.claude/hooks/fleet-interaction-state.py" clear'
-HERDR_END = 'bash "$HOME/.claude/hooks/herdr-agent-state.sh" release'
+FLEET_END = 'sh "$HOME/.claude/hooks/run-hook.sh" python3 fleet-interaction-state.py clear'
+HERDR_END = 'sh "$HOME/.claude/hooks/run-hook.sh" bash herdr-agent-state.sh release'
 
 
 class SessionEndMemorySyncRetirementTests(unittest.TestCase):

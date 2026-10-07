@@ -100,11 +100,18 @@ Linked activation is an explicit debug-only exception and must report that it
 cannot guarantee session consistency. An update publishes and verifies a new
 root, then atomically changes only the pointer used by new sessions.
 
-At process entry each runtime resolves that pointer once, exports the exact
-real `AGENT_HOME` and its runtime identity, and passes both unchanged to hooks,
-managed-entry, and registered children. A running session never follows a
-later pointer change. Runtime-owned credentials, sessions, logs, caches,
-databases, and Codex `config.toml` remain outside this activation boundary.
+A registered dispatch tree runs on the release its root launch resolved: the
+adapter wrapper resolves `AGENT_HOME` once to the real release path
+(`sealed_launch_home`) and passes that one value to every descendant, the row's
+`launch_home`, its allow rules, its owner Codex home, and its hooks (Claude hook
+commands run `hooks/run-hook.sh`, which takes the hook from `AGENT_HOME` when set, as
+the Codex hook commands do); a later pointer change moves none of them. An
+interactive depth-0 session resolves the installed release per call
+(`hearting run`, printed commands), so each new route starts on the release
+installed when it starts. Instructions, skills and plugins are what each runtime
+loaded when its process started. Runtime-owned credentials, sessions, logs,
+caches, databases, and Codex `config.toml` remain outside this activation
+boundary.
 
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
@@ -131,6 +138,14 @@ and currentness policy. This compile-time exception changes neither lifecycle
 fence and cannot hide session-root drift.
 
 ### §5.10. Work Isolation and Parallel Dispatch
+
+The shared `status` snapshot displays exact-attempt observations alongside
+registry words: PID/start identity, exit/sentinel evidence, log modification
+time, and the declared result artifact. It reuses the Fleet classifier and
+does not reconcile or mutate work. An exited process without verified
+completion is `exited`, not workflow success; missing evidence is unknown.
+Large snapshots name their sampled scope, so a bounded display never implies
+that omitted jobs have ended.
 
 Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
 enforces sealed-versus-current route, parent, lineage, runtime and review
@@ -451,7 +466,7 @@ A legacy hash collision is diagnostic
      A hand-written manifest names, per session, the leg it runs as, with `node` (the realized leg's route node id) or `leg_index`; a session that names neither is refused rather than matched by list position. A subdivision that cannot be proven disjoint and in-scope does not raise — the batch prints a typed receipt `{"state": "single-session-required", "reason": "subdivision-disjointness-unproven"}`, exits 0, leaves one SD-93 ledger row, and the owner then runs the node as one ordinary session. That state is the owner's signal to stop treating the stage as split; nothing else consumes it.
 
      Admission records a worktree baseline keyed by the manifest hash, and the stage gate measures against it. This is what makes the post-hoc diff-scope audit a statement about the slices rather than about the whole worktree, and it is why the same manifest can be re-admitted and re-completed idempotently. The gate refuses with `subdivision-baseline-missing` when no admission baseline exists, `subdivision-commit-attempted` when `HEAD` left the baseline commit's first-parent line or a lineage-clean commit carries a slice's `fixed_files` (parallel slices are no-commit workers), and `subdivision-scope-violation` when a change outside the declared union appeared after admission, whether it is still uncommitted or already in a commit. Each refusal writes an SD-93 ledger row and no marker. **The order is fixed: the owner closes the stage gate first and commits after.** Committing the slices' work before the gate is refused, because at the gate that commit is indistinguishable from a slice having committed; committing after it is ordinary, and replaying the same gate on the same manifest and evidence then resumes the published marker instead of re-auditing a worktree that has legitimately moved on. **Declared limit of that judgement:** the gate tells an owner commit from a slice commit by what the commit carries, so a pre-gate commit that carries no slice's `fixed_files` and leaves every file's content identical to the admission baseline is judged neither — not a slice commit, because it carries none of the declared union, and not a scope violation, because its content still matches the baseline — and it passes. In that one shape SD-103's no-commit rule is stated but not enforced. It is the accepted cost of not judging by HEAD movement alone, which refused the owner's own commit against a write-once baseline and an unrewindable HEAD, with no recovery path. After a failed slice, the owner derives the gap-retry chain from the failed slices alone (`stage_session_contract.derive_gap_retry_manifest`); it carries exactly those slices' `fixed_files` and their leg binding, and never re-opens a successful sibling's. When a serial chain stops, the runtime writes its rest itself (`dispatch_subsession_advance.chain_continuation`): a session that ran and did not pass runs again as a gap-retry whose brief adds how that attempt ended, what its handoff recorded as done and the leg's done-when items it left unmet, the never-started sessions follow, and a passed session is not repeated. The owner's chain notice names that manifest and the one `stage-session-chain.py start --manifest <file>` command (the owner is its own `--parent`).
-   - **Phase brief, state ledger, and scope stop:** each sub-session reads a compact phase brief plus the previous bounded handoff instead of reloading the full specification by default. A parallel slice's brief names the plan, the worktree, the fixed files, its verify command and the rule that it makes no git writes (no add/commit/checkout/restore/stash/reset/rollback; git reads run with `GIT_OPTIONAL_LOCKS=0`, which the launch also exports), leaving `checklist.md` and the dev log to the owner. It persists `_internal/state/<attempt_id>.md` with the current slice, completed items, exact next command, invariants, and forbidden files. The ledger is flushed at least every three material edits and after every verification round trip. Pre-compact must validate and flush it; post-compact must re-read it before another edit. A missing or stale required ledger fails closed. The fixed file list is an execution fence: discovering a necessary file outside it stops the session with a handoff to the owner, which may create another sub-session. Wide mechanical edits use a codemod plus bounded diff verification instead of expanding an individual session ad hoc.
+   - **Phase brief, state ledger, and scope stop:** each sub-session reads a compact phase brief plus the previous bounded handoff instead of reloading the full specification by default. The phase brief assigns the work; `narrow_verify` limits its verification command, not the execution of that work. A parallel slice's brief names the plan, the worktree, the fixed files, its verify command and the rule that it makes no git writes (no add/commit/checkout/restore/stash/reset/rollback; git reads run with `GIT_OPTIONAL_LOCKS=0`, which the launch also exports), leaving `checklist.md` and the dev log to the owner. It persists `_internal/state/<attempt_id>.md` with the current slice, completed items, exact next command, invariants, and forbidden files. The ledger is flushed at least every three material edits and after every verification round trip. Pre-compact must validate and flush it; post-compact must re-read it before another edit. A missing or stale required ledger fails closed. The fixed file list is an execution fence: discovering a necessary file outside it stops the session with a handoff to the owner, which may create another sub-session. Wide mechanical edits use a codemod plus bounded diff verification instead of expanding an individual session ad hoc.
    - **Separability under SD-17:** dispatch is mandatory when the stage output contract is complete and its edit surface is not boundary-coupled through shared semantic anchors or sequential boundary assertions. A non-separable stage may run inline only if the reason is recorded in `plans/<slug>/_internal/metrics.md`; missing evidence is a contract violation. Parallelize separable census or independent file groups in-session. `hooks/stage-dispatch-reminder.sh` only reminds a dispatch-depth-1 conductor of this; it does not deny an in-session stage on any harness.
    - Dispatch-depth-2 review helpers are read-only by default. The code route opens framing at width two for `standard`, widens framing to three and opens width-two plan/implementation-review groups at `strong+`, and adds declared third implementation-risk/failure-mode legs at `thorough+`. Other capability groups stay at their registry-declared width. Every leg is a sibling under the same owner, has a sealed role/profile/perspective and disjoint write scope, and joins before continuation. No worker fan-out, undeclared breadth, or dispatch depth 3 is permitted. Stage-worker ownership remains disjoint: `code-plan` owns plan artifacts; `code-execute` alone mutates source; `code-test` owns test evidence while source stays read-only; `code-report` owns the final report and locked summary.
    - The number of concurrent workers is set by the model-worker governor's `dispatch` class limit (`utilities/model-worker-governor.py`, `CLASS_LIMITS`); there is no separate per-conductor process cap. Each stage pipeline is sequential, and in-session implementation-team workers do not count. Dispatches beyond the governor limit are queued or refused by the governor.
@@ -537,7 +552,7 @@ A legacy hash collision is diagnostic
      OpenCode `session.idle` do not prove merge/push completion and must never
      perform destructive cleanup. They may expose diagnostics only.
 4. **Shared artifacts:** route writes to shared artifact-root files through the §5.8 lock. `plans/<slug>/` remains path-separated and noncontending.
-5. **Context:** when coordination records pressure the main context, propose a post-it handoff under the global continuity rule.
+5. **Context:** when coordination records pressure the main context, propose a session-tidy handoff card under the global continuity rule.
 
 **SD-91 current Codex override:** the projected Codex Stop bridge silently reads
 only enough payload to clear one exact interaction marker. It reads no registry,
@@ -624,6 +639,9 @@ than the REPORT used to prove terminal PASS. Pending closure preserves
 PASS and carries a supervision notice with exact transaction recovery. Carrier mechanics — the Claude `asyncRewake` hook, the Codex native
 queue and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
 and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
+Runtime completion carriers report a bounded native log line for skipped delivery,
+claims and prompt admission, with the session and reason. Observing transport never
+changes the settled result or grants another execution.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
@@ -1031,6 +1049,14 @@ state, success/skip breakdown and progress age remain in full JSON; the primary
 row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
+
+`run` measures the selected host through the existing bounded probe before
+launch, including for `--dry-run`. Its receipt and run metadata carry the
+observation time, GPU free memory and utilization. When the probe observes a
+GPU with zero utilization and no compute processes, it suggests the one with
+the most free memory. This is a snapshot, not a reservation: the caller's host
+and `--gpus` choice remain unchanged. An unavailable probe is reported as
+unknown and never blocks launch; no separate pre-launch `probe` is required.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work

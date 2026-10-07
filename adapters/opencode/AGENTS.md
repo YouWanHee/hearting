@@ -31,7 +31,7 @@ adapter.
 - `preflight.sh` is a shorthand, not a PATH command: it resolves to `<AGENT_HOME>/adapters/opencode/bin/preflight.sh` and no shim is installed at the harness root. Run it by that absolute path — for example `AGENT_HOME="$AGENT_HOME" bash "$AGENT_HOME/adapters/opencode/bin/preflight.sh" capability-info <capability>` — and read every `preflight.sh <command>` below as that path. Export `AGENT_HOME` to the installed root for release behavior, or to a checkout/worktree to use that tree as the active runtime.
 - Portable model roles stay vendor-neutral in shared artifacts; never use vendor model names as portable semantics.
 <!-- BEGIN generated from core/fragments/bootstrap-compute-hosts.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-- Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
+- Reach compute hosts through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`). `run` receipts include measured GPU headroom; `probe` remains available for host comparison.
 <!-- END generated from core/fragments/bootstrap-compute-hosts.md -->
 - Capabilities come from `capabilities/`. OpenCode-native generated Skills, commands, agents, and plugins live under `adapters/opencode/` and project through `opencode_setting/opencode-skills`, `opencode_setting/opencode-commands`, `opencode_setting/opencode-agents`, and `opencode_setting/opencode-plugins`.
 - Validate native discovery with `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`; Claude compatibility autoload must not mask missing OpenCode output.
@@ -93,11 +93,11 @@ The runtime prepares the cycle, picks each leg's harness from live usage within
 the sealed candidates, starts frames and the owner, reuses exact attempts, and
 closes the route and cycle at success or once idle.
 
-Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
-end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
-`parent_next_command` once. An absent directive is not `end-turn`, so never
-filter the command's stdout. After a wake or a correction, run
-`resume_command`; answer a BLOCKED owner with `correction_command
+Follow the receipt. `parent_next=end-turn`: end with no wait, poll or recap;
+a runtime carrier owns it. `parent_next=bounded-wait`: run `parent_next_command`
+once. Start saves `receipt_file`; read it if hooks omit `parent_next`.
+No directive is not `end-turn`; never filter stdout.
+After wake/correction, run `resume_command`; answer a BLOCKED owner with `correction_command
 --message-file <file>`. At `needs-question`, compare the two frame briefs and
 follow the receipt's `next_step`: `resume_command --interview <file>` registers
 the question, the person answers it once in the native question surface, and

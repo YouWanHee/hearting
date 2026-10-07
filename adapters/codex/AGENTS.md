@@ -31,7 +31,7 @@ local projection, and parity gaps; plan a checked fallback.
 - `AGENT_HOME` is the installed harness root. Resolve artifacts through `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - Portable model roles remain vendor-neutral. Resolve them with `preflight.sh role <portable-role|role-profile|pipeline-stage>`.
 <!-- BEGIN generated from core/fragments/bootstrap-compute-hosts.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-- Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
+- Reach compute hosts through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`). `run` receipts include measured GPU headroom; `probe` remains available for host comparison.
 <!-- END generated from core/fragments/bootstrap-compute-hosts.md -->
 - Capabilities come from `capabilities/`; Codex-native generated Skills/plugin, agents, and modes live under `adapters/codex/`. Expose them through `codex_setting/codex-plugin-marketplace`, `codex_setting/codex-agents`, and `codex_setting/codex-modes`.
 - Hooks are Codex bridges under `codex_setting/codex-hooks`; never project Claude settings, commands, hooks, or allowedTools.
@@ -122,11 +122,11 @@ The runtime prepares the cycle, picks each leg's harness from live usage within
 the sealed candidates, starts frames and the owner, reuses exact attempts, and
 closes the route and cycle at success or once idle.
 
-Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
-end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
-`parent_next_command` once. An absent directive is not `end-turn`, so never
-filter the command's stdout. After a wake or a correction, run
-`resume_command`; answer a BLOCKED owner with `correction_command
+Follow the receipt. `parent_next=end-turn`: end with no wait, poll or recap;
+a runtime carrier owns it. `parent_next=bounded-wait`: run `parent_next_command`
+once. Start saves `receipt_file`; read it if hooks omit `parent_next`.
+No directive is not `end-turn`; never filter stdout.
+After wake/correction, run `resume_command`; answer a BLOCKED owner with `correction_command
 --message-file <file>`. At `needs-question`, compare the two frame briefs and
 follow the receipt's `next_step`: `resume_command --interview <file>` registers
 the question, the person answers it once in the native question surface, and

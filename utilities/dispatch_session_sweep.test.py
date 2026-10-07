@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 import sys
@@ -445,17 +446,18 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
 import { pathToFileURL } from "node:url";
 const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
 const prompts = [];
+const logs = [];
 const session = {
   messages: async () => ({data: []}), prompt: async () => ({data: null}),
   promptAsync: async (request) => { prompts.push(request); return MODE === "accept" ? {data: undefined, response: {ok: true, status: 204}} : {error: {name: "NotFound"}, response: {ok: false, status: 404}} },
 };
 if (MODE === "absent") delete session.promptAsync;
 process.env.HERDR_PANE_ID = "";
-const hooks = await AgentHarnessGuards({client: {app: {log: async () => {}}, session}, directory: process.cwd()});
+const hooks = await AgentHarnessGuards({client: {app: {log: async (entry) => { logs.push(entry.body); }}, session}, directory: process.cwd()});
 const settle = async () => { for (let i = 0; i < 100 && !globalThis.done; i++) await new Promise(r => setTimeout(r, 50)); };
 BODY
 hooks.dispose();
-console.log(JSON.stringify({prompts}));
+console.log(JSON.stringify({prompts, logs}));
 '''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body)
         run = subprocess.run(["node", "--input-type=module", "-e", js], env=self.env(), cwd=str(self.root),
                              capture_output=True, text=True, timeout=60)
@@ -481,12 +483,80 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
         self.assertNotIn("noReply", request["body"])      # a turn, not a silent insert
         self.assertIn("att-0000000000000000000000000000bbbb", request["body"]["parts"][0]["text"])
         self.assertEqual(self.state(), "acked")
+        carrier = [item["extra"] for item in result["logs"] if item["service"] == "hearting-completion-carrier"]
+        self.assertIn(("claim", "claimed"), [(item["stage"], item["reason"]) for item in carrier])
+        self.assertIn(("prompt", "accepted"), [(item["stage"], item["reason"]) for item in carrier])
+        self.assertTrue(all("text" not in item for item in carrier))
 
     def test_a_turn_opencode_did_not_take_is_released_for_the_next_pass(self):
         self.seed_turn()
         result = self.run_plugin(self.IDLE_THEN_WAIT, prompt_async="refuse")
         self.assertEqual(len(result["prompts"]), 1)
         self.assertEqual(self.state(), "pending")
+        self.assertIn("not-accepted", [item["extra"]["reason"] for item in result["logs"]
+                                       if item["service"] == "hearting-completion-carrier"])
+
+    def test_a_pruned_import_root_keeps_the_exact_registry_and_wakes_the_parent(self):
+        for cached_roots in (False, True):
+            with self.subTest(cached_roots=cached_roots):
+                # Import the plugin as a managed release, then retire that release
+                # while the parent is idle. The current release and registry stay live.
+                frozen = self.root.parent / ("imported-warm" if cached_roots else "imported-cold")
+                plugin = frozen / "adapters/opencode/plugins/hearting-guards.js"
+                plugin.parent.mkdir(parents=True)
+                shutil.copyfile(ROOT / "adapters/opencode/plugins/hearting-guards.js", plugin)
+                (frozen / "package.json").write_text('{"type":"module"}')
+                for folder in ("core", "utilities", "tools", "hooks"):
+                    (frozen / folder).symlink_to(ROOT / folder, target_is_directory=True)
+                (frozen / "adapters/opencode/bin").symlink_to(ROOT / "adapters/opencode/bin", target_is_directory=True)
+                data_home = frozen.parent / (frozen.name + "-data")
+                current = data_home / "hearting/current"
+                current.parent.mkdir(parents=True)
+                current.symlink_to(ROOT, target_is_directory=True)
+                env = self.env()
+                env.update(AGENT_HOME=str(frozen), XDG_DATA_HOME=str(data_home))
+                script = r'''
+import { pathToFileURL } from "node:url";
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
+const prompts = [], logs = [];
+process.env.HERDR_PANE_ID = "";
+const session = {messages: async () => ({data: []}), promptAsync: async (request) => {
+  prompts.push(request); return {response: {ok: true, status: 204}};
+}};
+const hooks = await AgentHarnessGuards({client: {app: {log: async (entry) => {logs.push(entry.body)}}, session}, directory: process.cwd()});
+await hooks["shell.env"]({sessionID: "ses-oc-parent"}, {env: {}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses-oc-parent"}}});
+await new Promise(r => setTimeout(r, WAIT));
+console.log("ready");
+for (let i = 0; i < 200 && !prompts.length; i++) await new Promise(r => setTimeout(r, 100));
+await new Promise(r => setTimeout(r, 1000));
+hooks.dispose();
+console.log(JSON.stringify({prompts, logs}));
+'''.replace("WAIT", "5500" if cached_roots else "0")
+                node = subprocess.Popen(["node", "--input-type=module", "-e", script],
+                                        env=env, cwd=self.root, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertEqual(node.stdout.readline().strip(), "ready")
+                    frozen.rename(frozen.with_name(frozen.name + "-retired"))
+                    self.seed_turn()
+                    out, err = node.communicate(timeout=40)
+                finally:
+                    if node.poll() is None:
+                        node.kill()
+                self.assertEqual(node.returncode, 0, err)
+                result = json.loads(out.strip().splitlines()[-1])
+                self.assertEqual(len(result["prompts"]), 1)
+                self.assertEqual(result["prompts"][0]["path"], {"id": self.SID})
+                self.assertEqual(self.state(), "acked")
+                fallbacks = [item["extra"] for item in result["logs"]
+                             if item["service"] == "hearting-completion-carrier"
+                             and item["extra"]["reason"] == "root-fallback"]
+                self.assertIn("deliver", [item["action"] for item in fallbacks])
+                self.assertIn("ack", [item["action"] for item in fallbacks])
+                self.assertTrue(all(item["sessionID"] == self.SID for item in fallbacks))
+                self.assertTrue(all(item["root"] == str(current) for item in fallbacks))
+                shutil.rmtree(PD.record_directory(self.root, self.SID))
 
     def test_a_record_written_after_the_parent_went_idle_arrives_by_the_interval_look(self):
         # The usual order: the parent yields first, the owner finishes later. Only the

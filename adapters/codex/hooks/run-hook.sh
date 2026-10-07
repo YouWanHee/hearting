@@ -4,7 +4,7 @@ set -eu
 
 script="${1:-}"
 case "$script" in
-  sessionstart-lifecycle.py|sessionend-lifecycle.py|stop-lifecycle.py|userprompt-lifecycle.py|permissionrequest-lifecycle.py|posttooluse-interaction-clear.py|posttooluse-design-check.py|posttooluse-read-marker.py|posttooluse-frame-answer.py|worker-state-compact.py|core-write-guard.py|route-presence-gate.py)
+  sessionstart-lifecycle.py|sessionend-lifecycle.py|stop-lifecycle.py|userprompt-lifecycle.py|permissionrequest-lifecycle.py|posttooluse-interaction-clear.py|posttooluse-design-check.py|posttooluse-read-marker.py|posttooluse-frame-answer.py|worker-state-compact.py|core-write-guard.py|route-presence-gate.py|start-receipt-context.py)
     ;;
   *)
     printf '%s\n' "unsupported Codex hook bridge: ${script:-<empty>}" >&2
@@ -15,8 +15,11 @@ esac
 valid_root() {
   root="$1"
   [ -n "$root" ] \
-    && [ -f "$root/core/CORE.md" ] \
-    && [ -x "$root/adapters/codex/hooks/$script" ]
+    && [ -f "$root/core/CORE.md" ]
+}
+
+available_bridge() {
+  valid_root "$1" && [ -x "$1/adapters/codex/hooks/$script" ]
 }
 
 if [ -n "${AGENT_HOME:-}" ] && valid_root "$AGENT_HOME"; then
@@ -24,13 +27,13 @@ if [ -n "${AGENT_HOME:-}" ] && valid_root "$AGENT_HOME"; then
 else
   script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
   local_root="$(CDPATH= cd -- "$script_dir/../../.." && pwd)"
-  if valid_root "$local_root"; then
+  if available_bridge "$local_root"; then
     agent_root="$local_root"
-  elif valid_root "${HOME:-}/.codex/hearting"; then
+  elif available_bridge "${HOME:-}/.codex/hearting"; then
     agent_root="$HOME/.codex/hearting"
-  elif valid_root "${HOME:-}/hearting"; then
+  elif available_bridge "${HOME:-}/hearting"; then
     agent_root="$HOME/hearting"
-  elif valid_root "${HOME:-}/agent_setting"; then
+  elif available_bridge "${HOME:-}/agent_setting"; then
     agent_root="$HOME/agent_setting"
   else
     printf '%s\n' "agent harness root not found for Codex hook bridge: $script" >&2

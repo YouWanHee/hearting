@@ -215,6 +215,9 @@ def _parse_hook_command(cmd):
     toks = toks[i:]
     if toks and toks[0] in ("bash", "sh", "zsh", "python3", "python", "node"):
         toks = toks[1:]
+    # `run-hook.sh <interpreter|exec> <hook> [arg...]` names the hook after its interpreter.
+    if toks and os.path.basename(toks[0]) == "run-hook.sh":
+        toks = toks[2:]
     if not toks:
         return None
     base = os.path.basename(toks[0])
