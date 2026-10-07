@@ -621,7 +621,7 @@ __HUB_DATA_JSON__
   // tolerate an already-wrapped var()/hex/rgb value defensively.
   function cssToken(tok, fallback) {
     if (!tok) return fallback || "var(--text-3)";
-    return /^(var\(|#|rgb)/.test(tok) ? tok : "var(" + tok + ")";
+    return /^(var\\(|#|rgb)/.test(tok) ? tok : "var(" + tok + ")";
   }
   // manifest tracks[].color_token is a generic --cat-N hue (not AA-tuned for light
   // mode: e.g. --cat-5 (library) label text on white is ~2.7:1, sub-AA). the companion worklog app's own
