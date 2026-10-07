@@ -602,7 +602,7 @@ and a dead unstarted fence is retryable only after exact group quiescence.
 Standard+ dispatch-depth-1 Codex owners run with
 `sandbox_workspace_write.network_access=true` and
 `AGENT_NESTED_HEADLESS_NETWORK=1`. Their writable `CODEX_HOME` lives at
-`homes/codex/<worktree-key>` beneath the canonical dispatch state root,
+`homes/codex/<worktree-key>.<release-key>` beneath the canonical dispatch state root,
 outside the source worktree. These homes
 link existing auth/config without copying or mutating credentials and keep
 nested session/app-server state inside the owner sandbox. The home is linked to
