@@ -7610,8 +7610,14 @@ class ComposeRouteTest(TestRoute):
    jobs=Path(tmp)/"jobs.log"
    in_cwd,in_env,in_jobs,in_ledger=record(here,"a"),record(env,"b"),record(owned,"c"),record(chained,"e")
    jobs.write_text("now\topen\t1\tp\tt\tworker_type=owner,owner_route_id=rt-"+"c"*16+",owner_route_file="+str(in_jobs)+"\n")
-   chain=mock.Mock(writer_identity=lambda: ("claude","s"),
-                   read_tail=lambda h,sid: [{"route_id":"rt-"+"e"*16,"route_file":str(in_ledger)}])
+   from types import SimpleNamespace
+   in_other=record(Path(tmp)/"other-session","9")
+   state=Path(tmp)/"state"; (state/"claude").mkdir(parents=True)
+   (state/"claude"/"s.jsonl").touch(); (state/"claude"/"other.jsonl").touch()
+   tails={"s":[{"route_id":"rt-"+"e"*16,"route_file":str(in_ledger)}],
+          "other":[{"route_id":"rt-"+"9"*16,"route_file":str(in_other)}]}
+   chain=SimpleNamespace(HARNESSES=("claude",),ANCHOR_SCAN_FILES=64,state_root=lambda: str(state),
+                         writer_identity=lambda: ("claude","s"),read_tail=lambda h,sid: tails.get(sid,[]))
    with mock.patch.object(R,"_compose_artifact_root",return_value=str(here)), \
         mock.patch.object(R,"_route_chain_module",return_value=chain), \
         mock.patch.dict(os.environ,{"AGENT_ARTIFACT_ROOT":str(env)}):
@@ -7621,6 +7627,7 @@ class ComposeRouteTest(TestRoute):
     self.assertEqual(resolve("rt-"+"b"*16),in_env)
     self.assertEqual(resolve("rt-"+"c"*16),in_jobs)
     self.assertEqual(resolve("rt-"+"e"*16),in_ledger)
+    self.assertEqual(resolve("rt-"+"9"*16),in_other)                    # another session's ledger, from any cwd
     with self.assertRaisesRegex(ValueError,"route-id-unresolved:rt-"+"f"*16): resolve("rt-"+"f"*16)
  def test_a_bare_start_finds_this_sessions_open_route_else_the_one_open_route_of_the_cwd(self):
   with tempfile.TemporaryDirectory() as tmp:

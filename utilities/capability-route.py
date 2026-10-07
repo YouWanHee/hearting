@@ -9439,8 +9439,9 @@ ROUTE_ID_FORM = re.compile(r"rt-[0-9a-f]{16}")
 def resolve_route_argument(value, jobs=None):
     """`--route` as given: a route file, or a route ID (`rt-<16 hex>`, the form `resume_command`
     prints) looked up as the canonical record under the cwd's artifact root, then under
-    `AGENT_ARTIFACT_ROOT`, then by the file the jobs registry or a session's route-chain ledger
-    names for it. An ID that names no route file is refused (`route-id-unresolved:<id>`)."""
+    `AGENT_ARTIFACT_ROOT`, then by the file the jobs registry or a route-chain ledger names for it
+    (this session's, then the newest ledgers of every session). An ID that names no route file is
+    refused (`route-id-unresolved:<id>`)."""
     text = str(value)
     if not ROUTE_ID_FORM.fullmatch(text) or Path(text).is_file():
         return Path(text)
@@ -9462,9 +9463,20 @@ def resolve_route_argument(value, jobs=None):
         pass
     rc = _route_chain_module()
     if rc is not None:
-        anchor = rc.writer_identity() or rc.composing_anchor(text)
-        named += [line["route_file"] for line in (rc.read_tail(*anchor) if anchor else [])
-                  if line.get("route_id") == text]
+        # This session's ledger first, then the newest ledgers of every session (any event).
+        own = rc.writer_identity()
+        ledgers = [own] if own else []
+        for harness in rc.HARNESSES:
+            try:
+                directory = Path(rc.state_root()) / harness
+                ledgers += [(harness, path.stem) for path in sorted(
+                    directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:rc.ANCHOR_SCAN_FILES]]
+            except OSError:
+                continue
+        for anchor in ledgers:
+            named += [line["route_file"] for line in rc.read_tail(*anchor) if line.get("route_id") == text]
+            if any(Path(path).is_file() for path in named):
+                break
     for path in named:
         if Path(path).is_file():
             return Path(path)
