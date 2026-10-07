@@ -502,7 +502,9 @@ Ordinary same-session continuation does not enable SD-110 deterministic
 advance or SD-119 serial-chain owner support. The adapter exposes neither
 `--enable-stage-advance` nor stage-advance receipt negotiation. Those surfaces
 retain their checked single-session/registered-headless fallback. Interactive
-OpenCode depth-0 delivery also remains an explicit bounded wait.
+OpenCode depth-0 stage advance also remains an explicit bounded wait; parent
+completion instead follows the `opencode-turn` carrier (bounded wait only for
+a parent running the pre-carrier plugin).
 
 ## Execution access request
 

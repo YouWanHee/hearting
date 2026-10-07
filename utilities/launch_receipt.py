@@ -11,9 +11,31 @@ the sidecar fields because each wrapper kept its own copy (audit §4 #8, A21).
 """
 from __future__ import annotations
 
+import os
 from typing import Iterable
 
+from harness_capabilities import CARRIER_ENV
 from parent_next_directive import receipt_lines as parent_next_receipt_lines
+
+
+def _opencode_pre_carrier_notice(args) -> str | None:
+    """One line when an old OpenCode session launches an owner without the wake carrier.
+
+    Sessions on the plugin predating `opencode-turn` (`hearting-guards.js`)
+    print only the bounded-wait fallback, which reads as a hang. The line
+    names the cause and the one-step fix; it adds no gate or input.
+    """
+    if getattr(args, "parent_harness", None) != "opencode":
+        return None
+    if getattr(args, "parent_completion_delivery", "") != "poll-fallback":
+        return None
+    if getattr(args, "parent_completion_reason", "") != "parent-identity-unmatched":
+        return None
+    carrier = os.environ.get(CARRIER_ENV) or ""
+    if carrier.startswith("opencode-turn:"):
+        return None
+    return ("opencode_carrier_notice=이 OpenCode 세션은 깨움 장치 이전 플러그인으로 돌고 있다 — "
+            "세션을 다시 띄우면 완료 때 자동으로 깨운다")
 
 
 def completion_lines(args) -> list[str]:
@@ -86,6 +108,9 @@ def attempt_lines(args, *, jobs, registry_source: str, action: str, launch_state
         # carry the completion-delivery taxonomy in its own instructions.
         lines += parent_next_receipt_lines(getattr(args, "parent_completion_delivery", ""),
                                            args.attempt_id, agent_home=args.agent_home)
+        notice = _opencode_pre_carrier_notice(args)
+        if notice:
+            lines.append(notice)
     lines += [
         f"child_pid={getattr(args, 'child_pid', None) or '-'}",
         f"child_pid_start={getattr(args, 'child_pid_start', None) or '-'}",
