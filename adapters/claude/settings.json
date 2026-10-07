@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/hooks/worker-state-compact.py\" compact-before",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" exec worker-state-compact.py compact-before",
             "timeout": 10
           }
         ]
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/hooks/worker-state-compact.py\" compact-after",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" exec worker-state-compact.py compact-after",
             "timeout": 10
           }
         ]
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/herdr-agent-state.sh\" blocked",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh blocked",
             "timeout": 10
           }
         ]
@@ -59,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" set --kind permission",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py set --kind permission",
             "timeout": 10
           }
         ]
@@ -71,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/herdr-agent-state.sh\" working",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh working",
             "timeout": 10
           }
         ]
@@ -81,7 +81,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/core-write-guard.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 core-write-guard.py",
             "timeout": 10
           }
         ]
@@ -91,7 +91,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/route-presence-gate.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 route-presence-gate.py",
             "timeout": 30
           }
         ]
@@ -101,7 +101,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" set --kind decision",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py set --kind decision",
             "timeout": 10
           }
         ]
@@ -111,7 +111,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/stage-dispatch-reminder.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" sh stage-dispatch-reminder.sh",
             "timeout": 10
           }
         ]
@@ -121,7 +121,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/subagent-model-default.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash subagent-model-default.sh",
             "timeout": 15
           }
         ]
@@ -133,7 +133,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" clear",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
           }
         ]
@@ -143,12 +143,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/design-postwrite.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash design-postwrite.sh",
             "timeout": 20
           },
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/spec-sync-nudge.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash spec-sync-nudge.sh",
             "timeout": 10
           }
         ]
@@ -158,7 +158,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/spec-read-marker.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" sh spec-read-marker.sh",
             "timeout": 10
           }
         ]
@@ -168,7 +168,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/capability-grounding-marker.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" sh capability-grounding-marker.sh",
             "timeout": 10
           }
         ]
@@ -178,7 +178,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/frame-native-answer.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 frame-native-answer.py",
             "timeout": 30
           }
         ]
@@ -188,7 +188,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/peer-message-record.py\" post-tool",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 peer-message-record.py post-tool",
             "timeout": 10
           }
         ]
@@ -198,7 +198,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/dispatch-owner-rewake.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 dispatch-owner-rewake.py",
             "asyncRewake": true,
             "timeout": 21600
           }
@@ -209,7 +209,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/peer-steward-rewake.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 peer-steward-rewake.py",
             "asyncRewake": true,
             "timeout": 21600
           }
@@ -222,7 +222,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" clear",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
           }
         ]
@@ -234,7 +234,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" clear",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
           }
         ]
@@ -244,7 +244,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/herdr-agent-state.sh\" release",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh release",
             "timeout": 10
           }
         ]
@@ -256,12 +256,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/herdr-agent-state.sh\" idle",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh idle",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/herdr-session-projection.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",
             "timeout": 5
           }
         ]
@@ -279,7 +279,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/local-evidence-inject.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash local-evidence-inject.sh",
             "timeout": 5
           }
         ]
@@ -288,7 +288,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/session-card-inject.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash session-card-inject.sh",
             "timeout": 5
           }
         ]
@@ -297,7 +297,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/dispatch-session-sweep.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 dispatch-session-sweep.py",
             "timeout": 10
           }
         ]
@@ -309,7 +309,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" clear",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
           }
         ]
@@ -319,17 +319,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/herdr-agent-state.sh\" idle",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh idle",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/herdr-session-projection.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/open-cycle-checkpoint.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 open-cycle-checkpoint.py",
             "timeout": 5
           }
         ]
@@ -341,7 +341,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/fleet-interaction-state.py\" clear",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
           }
         ]
@@ -351,12 +351,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/herdr-agent-state.sh\" working",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh working",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/herdr-session-projection.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",
             "timeout": 30,
             "async": true
           }
@@ -366,7 +366,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/mem-recall-inject.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash mem-recall-inject.sh",
             "timeout": 10
           }
         ]
@@ -375,7 +375,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/session-card-inject.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash session-card-inject.sh",
             "timeout": 5
           }
         ]
@@ -384,7 +384,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/dispatch-session-sweep.py\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 dispatch-session-sweep.py",
             "timeout": 10
           }
         ]
@@ -393,7 +393,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/mem-briefing-inject.sh\"",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash mem-briefing-inject.sh",
             "timeout": 10
           }
         ]
@@ -402,7 +402,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/peer-message-record.py\" prompt",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 peer-message-record.py prompt",
             "timeout": 10
           }
         ]

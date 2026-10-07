@@ -2133,6 +2133,50 @@ def _run_id(host_name, label, now, run_root=None):
     return candidate
 
 
+def _run_gpu_observation(name, host):
+    """Use the normal bounded probe; a snapshot never grants or denies a run."""
+    try:
+        row = probe_host(name, host, ssh_session_bridges=[])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        row = {"reachable": False, "detail": str(exc)[:120], "gpus": [],
+               "observed_at": datetime.datetime.now().timestamp()}
+    gpus = [{key: gpu.get(key) for key in
+             ("index", "name", "free_mib", "total_mib", "utilization_gpu_pct")}
+            for gpu in row.get("gpus", [])]
+    idle = [gpu for gpu in row.get("gpus", [])
+            if row.get("reachable") and not row.get("process_detail")
+            and gpu.get("utilization_gpu_pct") == 0
+            and gpu.get("processes") == []
+            and type(gpu.get("free_mib")) is int and gpu["free_mib"] > 0]
+    suggested = max(idle, key=lambda gpu: (gpu["free_mib"], -gpu["index"]),
+                    default=None)
+    return {"observed_at": row.get("observed_at"),
+            "reachable": row.get("reachable"), "detail": row.get("detail"),
+            "process_detail": row.get("process_detail"), "gpus": gpus,
+            "suggested_gpu": suggested["index"] if suggested is not None else None}
+
+
+def _print_run_gpu_observation(observation):
+    observed_at = observation.get("observed_at")
+    observed_time = (datetime.datetime.fromtimestamp(observed_at, datetime.timezone.utc)
+                     .isoformat(timespec="seconds")
+                     if isinstance(observed_at, (int, float)) else "unknown")
+    print(f"  GPUs observed at: {observed_time}")
+    if not observation.get("reachable") or observation.get("detail"):
+        print(f"  GPU headroom: unknown ({observation.get('detail') or 'probe unavailable'})")
+    elif not observation["gpus"]:
+        print("  GPU headroom: no GPUs observed")
+    for gpu in observation["gpus"]:
+        free, total, util = (gpu.get(key) for key in
+                             ("free_mib", "total_mib", "utilization_gpu_pct"))
+        print(f"  gpu{gpu['index']}: {free if free is not None else '—'}/"
+              f"{total if total is not None else '—'} MiB free, "
+              f"{util if util is not None else '—'}% util")
+    if observation.get("suggested_gpu") is not None:
+        print(f"  suggested: gpu{observation['suggested_gpu']} "
+              "(idle at probe time)")
+
+
 def cmd_run(args):
     config = load_config()
     (name, host), = _select(config, [args.host])
@@ -2191,9 +2235,11 @@ def cmd_run(args):
         f"else setsid nohup bash -lc {shlex.quote(inner)} "
         f">/dev/null 2>&1 < /dev/null & fi; echo started"
     )
+    gpu_observation = _run_gpu_observation(name, host)
     if args.dry_run:
         print(f"run_id: {run_id}\nrun_dir: {run_dir}\nhost: {name}\n"
               f"would run: {rendered}\nsetup: {preamble}")
+        _print_run_gpu_observation(gpu_observation)
         return 0
 
     result = remote(host, launch)
@@ -2203,6 +2249,7 @@ def cmd_run(args):
         return 1
     meta = {"run_id": run_id, "host": name, "command": command,
             "cwd": workdir, "env": env, "gpus": args.gpus,
+            "gpu_observation": gpu_observation,
             "provenance": {"agent_home": provenance.get("AGENT_HOME"),
                            "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
                            "session": ({"harness": owner["harness"], "id": owner["id"]}
@@ -2221,6 +2268,7 @@ def cmd_run(args):
         print(json.dumps(meta, ensure_ascii=False, sort_keys=True))
     else:
         print(f"started {run_id} on {name}")
+        _print_run_gpu_observation(gpu_observation)
         if watching:
             print("  done: " + ("the route's parent session" if (meta.get("provenance") or {}).get("notify")
                                 else "this session") + " gets one notice when it ends")

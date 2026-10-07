@@ -1359,14 +1359,14 @@ def resolve_agent_home() -> Path:
 
 
 def child_runtime_homes(args: argparse.Namespace, profile_home: Path | None) -> dict[str, str]:
-    """The Codex home a child runs with, and the harness root a pinned home projects.
+    """The Codex home a child runs with.
 
-    The owner-only home is linked to the release this launch resolved, so the child runs
-    that release too (OPERATIONS §5.9a): after a later pointer change the home and
-    `AGENT_HOME` still agree, and the child's own starts pass the projection check.
+    The owner-only home is linked to the release this launch resolved, the same release the
+    child gets as `AGENT_HOME` (OPERATIONS §5.9a): after a later pointer change the two still
+    agree, and the child's own starts pass the projection check.
     """
     if args.nested_codex_home is not None:
-        return {"CODEX_HOME": str(args.nested_codex_home), "AGENT_HOME": str(args.nested_codex_root)}
+        return {"CODEX_HOME": str(args.nested_codex_home)}
     if profile_home is not None:
         return {"CODEX_HOME": str(profile_home)}
     return {}
@@ -1511,7 +1511,10 @@ def main(argv: list[str]) -> int:
         args.attempt_id = None
     if args.broker_request_id or args.launch_authority == "ancestor-broker":
         return fail("launch-broker-retired", 76, child_spawned="0")
-    args.agent_home = resolve_agent_home()
+    # The whole tree runs on the release this launch resolves (OPERATIONS §5.9a): one real
+    # path reaches the child environment, its allow rules and the row, whichever spelling
+    # (`hearting run`, a `current` pointer) the caller exported.
+    args.agent_home = sealed_launch_home(resolve_agent_home())
     bind_parent_completion_delivery(args)
     worktree = Path(args.worktree)
     if not worktree.is_dir():
@@ -1878,19 +1881,16 @@ def main(argv: list[str]) -> int:
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     args.nested_codex_home = None
-    args.nested_codex_root = None
     try:
-        # The home projects the release this launch resolved, and the child runs that same
-        # release (OPERATIONS §5.9a): a later pointer change moves neither of them.
-        release_root = sealed_launch_home(args.agent_home) if args.nested_headless_network else None
+        # The home projects the release this launch resolved (`args.agent_home`), the release
+        # the child runs: a later pointer change moves neither of them.
         args.nested_codex_home_path = (
-            nested_codex_home_path(worktree, args.jobs_path, release_root)
+            nested_codex_home_path(worktree, args.jobs_path, args.agent_home)
             if args.nested_headless_network else None
         )
         if action == "start" and args.nested_headless_network:
-            args.nested_codex_root = release_root
             args.nested_codex_home = prepare_nested_codex_home(
-                worktree, jobs=args.jobs_path, projection_root=args.nested_codex_root)
+                worktree, jobs=args.jobs_path, projection_root=args.agent_home)
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     prompt_name = (

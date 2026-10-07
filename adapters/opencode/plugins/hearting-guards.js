@@ -464,9 +464,8 @@ function observePanePublisher(child, ctx, sid, generation, onSpawnError = () => 
   })
 }
 
-// Publication-time root for the identity publisher only (core/CORE.md §2,
-// core/ADAPTATION.md identity-publisher row: bounded launch errors, one bounded
-// fallback with the same invocation, never a second child for a live launch).
+// Invocation-time root for identity and completion helpers (core/CORE.md §2,
+// core/ADAPTATION.md): preserve the session and inherited registry after pruning.
 // The module-time root/helper freeze the release the plugin was imported from;
 // a managed release pruned afterwards leaves a deleted cwd and a missing
 // helper, so both the async spawn and the sync fallback fail with ENOENT
@@ -477,8 +476,7 @@ function observePanePublisher(child, ctx, sid, generation, onSpawnError = () => 
 // invocation (session argv, sequence, identity) stays identical. With no live
 // root the frozen pair is kept and the existing bounded error logs describe
 // the failure as before.
-function resolvePublisherTarget() {
-  const helperRel = path.join("tools", "fleet", "herdr_projection.py")
+function resolveRuntimeTarget(helperRel) {
   const live = (dir, helper) => {
     try {
       return !!dir && existsSync(path.join(dir, "core", "CORE.md"))
@@ -486,7 +484,8 @@ function resolvePublisherTarget() {
         && existsSync(helper)
     } catch { return false }
   }
-  if (live(root, herdrProjection)) return { root, helper: herdrProjection }
+  const frozenHelper = path.join(root, helperRel)
+  if (live(root, frozenHelper)) return { root, helper: frozenHelper }
   // Portable order only (core/CORE.md §2 minus adapter-specific compat keys,
   // which this adapter must not reference): active AGENT_HOME, managed
   // current, linked fallbacks.
@@ -505,7 +504,11 @@ function resolvePublisherTarget() {
     const helper = path.join(dir, helperRel)
     if (live(dir, helper)) return { root: dir, helper }
   }
-  return { root, helper: herdrProjection }
+  return { root, helper: frozenHelper }
+}
+
+function resolvePublisherTarget() {
+  return resolveRuntimeTarget(path.join("tools", "fleet", "herdr_projection.py"))
 }
 
 // TUI current-selection provenance (core/ADAPTATION.md): the TUI-only entry
@@ -742,26 +745,41 @@ const CARRIER_ENV = "AGENT_PARENT_COMPLETION_CARRIER"
 const CARRIER_KIND = "opencode-turn"
 const CARRIER_INTERVAL_MS = 5000
 const CARRIER_ROOTS_RETRY_MS = 60000
-const sweepTool = path.join(root, "utilities", "dispatch_session_sweep.py")
+const sweepRel = path.join("utilities", "dispatch_session_sweep.py")
 const OWED_STATES = new Set(["pending", "claimed", "sent-ambiguous"])
 
 // One bounded sweep step off the server's event loop; any failure is null.
-function carrierCommand(action, sid, handed) {
+function carrierCommand(action, sid, handed, observe = () => {}) {
   return new Promise((resolve) => {
     let out = ""
     let child
-    const finish = (value) => { clearTimeout(timer); resolve(value) }
-    const timer = setTimeout(() => { try { child?.kill("SIGKILL") } catch {} ; finish(null) }, 10000)
+    let finished = false
+    const target = resolveRuntimeTarget(sweepRel)
+    const detail = { action, root: target.root, helper: target.helper }
+    const finish = (value, reason, extra = {}) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      if (reason) observe(reason, { ...detail, ...extra })
+      resolve(value)
+    }
+    const timer = setTimeout(() => {
+      try { child?.kill("SIGKILL") } catch {}
+      finish(null, "helper-timeout")
+    }, 10000)
+    if (!existsSync(target.root)) { finish(null, "directory-missing"); return }
+    if (!existsSync(target.helper)) { finish(null, "helper-missing"); return }
+    if (target.root !== root) observe("root-fallback", detail)
     try {
-      child = spawn("python3", [sweepTool, action, "--recipient-kind", CARRIER_KIND, "--session", sid || ""], {
-        cwd: root, env: { ...process.env, AGENT_HOME: root }, stdio: ["pipe", "pipe", "ignore"],
+      child = spawn("python3", [target.helper, action, "--recipient-kind", CARRIER_KIND, "--session", sid || ""], {
+        cwd: target.root, env: { ...process.env, AGENT_HOME: target.root }, stdio: ["pipe", "pipe", "ignore"],
       })
-    } catch { finish(null); return }
-    child.on("error", () => finish(null))
+    } catch (error) { finish(null, "spawn-error", { code: error?.code || "" }); return }
+    child.on("error", (error) => finish(null, "spawn-error", { code: error?.code || "" }))
     child.stdout.on("data", (chunk) => { out += chunk })
     child.on("close", (code) => {
-      if (code !== 0) { finish(null); return }
-      try { finish(JSON.parse(out || "null")) } catch { finish(null) }
+      if (code !== 0) { finish(null, "helper-exit", { code }); return }
+      try { finish(JSON.parse(out || "null")) } catch { finish(null, "invalid-output") }
     })
     child.stdin.on("error", () => {})
     child.stdin.end(handed ? JSON.stringify(handed) : "")
@@ -777,13 +795,29 @@ function createCompletionCarrier(ctx) {
   let timer = null
   const prompter = () => ctx.client?.session
   const available = () => !isWorkerSession() && typeof prompter()?.promptAsync === "function"
+  const skips = new Map()
+  const command = (action, sid, handed) => carrierCommand(action, sid, handed,
+    (reason, extra) => log("command", sid, reason, extra))
+  function log(stage, sid, reason, extra = {}) {
+    if (stage === "skip" && skips.get(sid) === reason) return
+    if (stage === "skip") skips.set(sid, reason)
+    else skips.delete(sid)
+    try {
+      Promise.resolve(ctx.client?.app?.log({ body: { service: "hearting-completion-carrier",
+        level: "info", message: "hearting-completion-carrier",
+        extra: { module: "hearting-completion-carrier", stage, reason, sessionID: sid || "",
+          pid: process.pid, directory: baseDir(ctx), ...extra },
+      }})).catch(() => {})
+    } catch {}
+  }
 
   // A cheap look at this session's own records, so an idle tick spawns nothing.
   async function owed(sid) {
     // Known roots are kept; none known yet (no state root, or the lookup failed) is asked again later.
     if (!roots?.length && Date.now() - rootsAt >= CARRIER_ROOTS_RETRY_MS) {
       rootsAt = Date.now()
-      roots = (await carrierCommand("roots")) || []
+      roots = (await command("roots", sid)) || []
+      log("roots", sid, roots.length ? "resolved" : "unavailable", { roots })
     }
     const digest = createHash("sha256").update(sid).digest("hex")
     for (const base of roots) {
@@ -801,25 +835,39 @@ function createCompletionCarrier(ctx) {
   }
 
   async function deliver(sid, look = true) {
-    if (!sid || busy.has(sid) || !available()) return
-    if (status.get(sid) === "busy" || status.get(sid) === "retry") return
+    if (!sid) return
+    if (busy.has(sid)) { log("skip", sid, "delivery-in-flight"); return }
+    if (!available()) { log("skip", sid, isWorkerSession() ? "worker-session" : "promptAsync-unavailable"); return }
+    if (status.get(sid) === "busy" || status.get(sid) === "retry") {
+      log("skip", sid, `session-${status.get(sid)}`); return
+    }
     busy.add(sid)
     let timeout
     try {
-      if (look && !(await owed(sid))) return
-      const claimed = await carrierCommand("deliver", sid)
-      if (!claimed?.text || !Array.isArray(claimed.records) || !claimed.records.length) return
+      if (look && !(await owed(sid))) { log("skip", sid, "no-owed-record"); return }
+      const claimed = await command("deliver", sid)
+      if (!claimed?.text || !Array.isArray(claimed.records) || !claimed.records.length) {
+        log("skip", sid, claimed === null ? "claim-unavailable" : "nothing-claimed"); return
+      }
+      log("claim", sid, "claimed", { deliveries: claimed.records.map(record => record.delivery_id) })
       let taken = false
+      let promptReason = "not-accepted"
+      let httpStatus
       try {
         const result = await Promise.race([
           prompter().promptAsync({ path: { id: sid }, body: { parts: [{ type: "text", text: claimed.text }] } }),
           new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("carrier-timeout")), 5000) }),
         ])
         taken = Boolean(result) && result.error == null && result.response?.ok !== false
-      } catch { taken = false }
+        httpStatus = result?.response?.status
+        promptReason = taken ? "accepted" : "not-accepted"
+      } catch (error) { promptReason = error?.message === "carrier-timeout" ? "timeout" : "error" }
+      log("prompt", sid, promptReason, { httpStatus })
       // Taken: the session's next turn holds the receipt. Not taken: the next pass claims it again.
-      await carrierCommand(taken ? "ack" : "release", sid, claimed)
-    } catch {
+      const settled = await command(taken ? "ack" : "release", sid, claimed)
+      log("settle", sid, taken ? "ack" : "release", { count: settled?.count ?? null })
+    } catch (error) {
+      log("skip", sid, "delivery-error", { error: String(error?.message || error).slice(0, 180) })
     } finally {
       clearTimeout(timeout)
       busy.delete(sid)
@@ -835,13 +883,14 @@ function createCompletionCarrier(ctx) {
         timer = setInterval(() => { for (const id of sessions) deliver(id).catch(() => {}) }, CARRIER_INTERVAL_MS)
         timer.unref?.()
       }
+      log("env", sid, "carrier-armed")
       return `${CARRIER_KIND}:${sid}`
     },
     status(sid, type) { if (sid && type) status.set(sid, type) },
     // A finished turn also looks past its own records (a seat handover stores them elsewhere).
     async idle(sid) { if (!sid) return; status.set(sid, "idle"); if (sessions.has(sid)) await deliver(sid, false) },
     forget(sid) { sessions.delete(sid); status.delete(sid) },
-    dispose() { if (timer) clearInterval(timer); timer = null; sessions.clear() },
+    dispose() { log("dispose", "", "context-disposed", { sessions: [...sessions] }); if (timer) clearInterval(timer); timer = null; sessions.clear() },
   }
 }
 

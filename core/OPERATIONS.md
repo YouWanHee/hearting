@@ -100,11 +100,18 @@ Linked activation is an explicit debug-only exception and must report that it
 cannot guarantee session consistency. An update publishes and verifies a new
 root, then atomically changes only the pointer used by new sessions.
 
-At process entry each runtime resolves that pointer once, exports the exact
-real `AGENT_HOME` and its runtime identity, and passes both unchanged to hooks,
-managed-entry, and registered children. A running session never follows a
-later pointer change. Runtime-owned credentials, sessions, logs, caches,
-databases, and Codex `config.toml` remain outside this activation boundary.
+A registered dispatch tree runs on the release its root launch resolved: the
+adapter wrapper resolves `AGENT_HOME` once to the real release path
+(`sealed_launch_home`) and passes that one value to every descendant, the row's
+`launch_home`, its allow rules, its owner Codex home, and its hooks (Claude hook
+commands run `hooks/run-hook.sh`, which takes the hook from `AGENT_HOME` when set, as
+the Codex hook commands do); a later pointer change moves none of them. An
+interactive depth-0 session resolves the installed release per call
+(`hearting run`, printed commands), so each new route starts on the release
+installed when it starts. Instructions, skills and plugins are what each runtime
+loaded when its process started. Runtime-owned credentials, sessions, logs,
+caches, databases, and Codex `config.toml` remain outside this activation
+boundary.
 
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
@@ -624,6 +631,9 @@ than the REPORT used to prove terminal PASS. Pending closure preserves
 PASS and carries a supervision notice with exact transaction recovery. Carrier mechanics — the Claude `asyncRewake` hook, the Codex native
 queue and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
 and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
+Runtime completion carriers report a bounded native log line for skipped delivery,
+claims and prompt admission, with the session and reason. Observing transport never
+changes the settled result or grants another execution.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
@@ -1025,6 +1035,14 @@ state, success/skip breakdown and progress age remain in full JSON; the primary
 row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
+
+`run` measures the selected host through the existing bounded probe before
+launch, including for `--dry-run`. Its receipt and run metadata carry the
+observation time, GPU free memory and utilization. When the probe observes a
+GPU with zero utilization and no compute processes, it suggests the one with
+the most free memory. This is a snapshot, not a reservation: the caller's host
+and `--gpus` choice remain unchanged. An unavailable probe is reported as
+unknown and never blocks launch; no separate pre-launch `probe` is required.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
