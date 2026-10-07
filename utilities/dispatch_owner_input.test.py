@@ -560,6 +560,8 @@ class OwnerFinishCorrectionRegressionTest(OwnerInputTest):
         self.assertIn('next owner turn', notice)
         self.assertIn('delay', notice)
         self.assertIn('does not wake or cancel', notice)
+        # BC rt-96bab699: read as "after the whole chain"; the chain stops at the running sub-session.
+        self.assertIn('starts no further sub-session', notice)
         self.assertNotIn('private correction text', json.dumps(result))
 
     def test_codex_active_turn_without_exact_phase_reports_unavailable_timing(self):

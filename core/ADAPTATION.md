@@ -324,9 +324,12 @@ prompt carries the carrier taxonomy (dispatch-complexity diagnosis
 
 Owner corrections are accepted independently of delivery. Codex active-turn
 steering is only accepted after a matching turn response; Claude and OpenCode
-next-turn transports deliver on a later owner turn. A parked owner may not
-receive a queued correction until its joined children finish or require
-attention. The shared `correct` response must describe this delay and state
+next-turn transports deliver on a later owner turn. A parked owner receives a
+queued correction once the children running now finish or require attention;
+a serial sub-session chain starts no further sub-session while a correction
+waits (`drive_serial_chain` `allow_advance`), so the wait is the running
+sub-session, not the rest of the chain. The shared `correct` response must
+describe this delay and state
 that it does not wake or cancel the owner; acceptance is not proof of delivery
 or application.
 
