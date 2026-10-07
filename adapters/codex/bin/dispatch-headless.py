@@ -1261,8 +1261,13 @@ def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
     )
 
 
-def nested_codex_home_path(worktree: Path, jobs: Path | None = None) -> Path:
-    """Select the external canonical runtime-home scope for this worktree."""
+def nested_codex_home_path(worktree: Path, jobs: Path | None = None,
+                           release_root: Path | None = None) -> Path:
+    """Select the external canonical runtime-home scope for this worktree and release.
+
+    The home links one release, so owners of two releases in one worktree each get their
+    own: a later owner re-linking a shared home would fail the earlier owner's next child
+    start (`codex-runtime-projection-mismatch`)."""
     def owned_directory_or_ancestor(path):
         while not path.exists() and not path.is_symlink():
             path = path.parent
@@ -1273,6 +1278,8 @@ def nested_codex_home_path(worktree: Path, jobs: Path | None = None) -> Path:
     if canonical_jobs.is_absolute():
         state_root = dispatch_state_root(canonical_jobs)
         key = hashlib.sha256(str(worktree).encode()).hexdigest()[:32]
+        if release_root is not None:
+            key += "." + hashlib.sha256(str(Path(release_root).resolve()).encode()).hexdigest()[:12]
         fallback = state_root / "homes" / "codex" / key
         if (fallback.resolve().is_relative_to(state_root)
                 and owned_directory_or_ancestor(fallback)):
@@ -1294,15 +1301,15 @@ def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None,
     """
 
     source = (source_home or Path(os.environ.get("CODEX_HOME", "~/.codex"))).expanduser().resolve()
-    destination = nested_codex_home_path(worktree, jobs)
-    destination.mkdir(parents=True, exist_ok=True)
-    destination.chmod(0o700)
-
     # Runtime projection identity follows the installed/canonical AGENT_HOME,
     # not the source-only task worktree containing this wrapper. Otherwise a
     # nested eligibility check compares a worktree-linked local CODEX_HOME with
     # the inherited canonical AGENT_HOME and rejects a valid recursive launch.
     projection_root = Path(projection_root or resolve_agent_home().resolve())
+    destination = nested_codex_home_path(worktree, jobs, projection_root)
+    destination.mkdir(parents=True, exist_ok=True)
+    destination.chmod(0o700)
+
     installer = projection_root / "adapters" / "codex" / "bin" / "install-runtime-projection.sh"
     env = {**os.environ, "AGENT_HOME": str(projection_root), "CODEX_HOME": str(destination)}
     result = subprocess.run(
@@ -1901,14 +1908,15 @@ def main(argv: list[str]) -> int:
     args.nested_codex_home = None
     args.nested_codex_root = None
     try:
+        # The home projects the release this launch resolved, and the child runs that same
+        # release (OPERATIONS §5.9a): a later pointer change moves neither of them.
+        release_root = sealed_launch_home(args.agent_home) if args.nested_headless_network else None
         args.nested_codex_home_path = (
-            nested_codex_home_path(worktree, args.jobs_path)
+            nested_codex_home_path(worktree, args.jobs_path, release_root)
             if args.nested_headless_network else None
         )
         if action == "start" and args.nested_headless_network:
-            # The home projects the release this launch resolved, and the child runs that same
-            # release (OPERATIONS §5.9a): a later pointer change moves neither of them.
-            args.nested_codex_root = sealed_launch_home(args.agent_home)
+            args.nested_codex_root = release_root
             args.nested_codex_home = prepare_nested_codex_home(
                 worktree, jobs=args.jobs_path, projection_root=args.nested_codex_root)
     except DispatchContractError as e:
