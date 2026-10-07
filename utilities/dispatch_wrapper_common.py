@@ -29,7 +29,8 @@ from dispatch_contract import (
     REPLICA_RESERVATION_ROW_KEYS, SUPERVISOR_LEASE_KIND, DispatchContractError, diff_attribution_lines,
     dispatch_state_root, dispatch_state_roots, resolve_dispatch_state_root, runtime_ancestry_binding,
     sealed_launch_home, source_lineage_row_fields, supervisor_lease_path, workflow_completion_receipt,
-    ensure_terminal_claim_absent,
+    ensure_terminal_claim_absent, _atomic_registry_replace, close_attempt_row,
+    parse_registry_metadata,
 )
 import commit_policy
 import dispatch_parent_completion as parent_completion
@@ -635,3 +636,51 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
         mutation_precheck=mutation_precheck,
         preclaim=preclaim,
     )
+
+
+def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str,
+                  attempt_id: str | None = None, *, materialize) -> bool:
+    """Flip this dispatch's own open row to done with a dead-<reason> note.
+
+    The wrapper passes what is its own: looked up in its own module at call
+    time, the terminal-close materialization its tests patch in place.
+    """
+    if attempt_id:
+        evidence = {"reset": reset} if reset else {}
+        if reason == "capacity":
+            evidence.update(failure_class="capacity", detected_by="anchored-early-exit")
+        closed = close_attempt_row(jobs, attempt_id, f"dead-{reason}", evidence=evidence)
+        if closed:
+            materialize(jobs, attempt_id)
+        return closed
+    if not jobs.is_file():
+        return False
+    with jobs_lock(jobs):
+        lines = jobs.read_text(encoding="utf-8").splitlines(keepends=True)
+        changed = False
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 6:
+                continue
+            ts, status, repo, wt, row_slug, pipe = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+            if status != "open" or row_slug != slug or wt != worktree:
+                continue
+            metadata = parse_registry_metadata(pipe)
+            if metadata.get("attempt_schema_version") != "2":
+                continue
+            if attempt_id and f"attempt_id={attempt_id}" not in pipe.split(","):
+                continue
+            pipe += f",note=dead-{reason}"
+            if reason == "capacity":
+                pipe += ",failure_class=capacity,detected_by=anchored-early-exit"
+            if reset:
+                pipe += f",reset={reset}"
+            lines[i] = f"{ts}\tdone\t{repo}\t{wt}\t{row_slug}\t{pipe}\n"
+            changed = True
+            break
+        if changed:
+            # Lock-free readers (join, owner input) must never see a truncated registry.
+            _atomic_registry_replace(jobs, "".join(lines).splitlines())
+        return changed
