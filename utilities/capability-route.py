@@ -10547,13 +10547,21 @@ def main():
                             a.attempt_id = f"{owner_attempt}-{a.node}-inline"
                     if not getattr(a, "evidence", None) and getattr(a, "reason", None):
                         try:
+                            import artifact_producer as _ap
                             artifact_root = Path(route.get("artifact_root") or "")
-                            synth_dir = artifact_root / "artifacts"
-                            synth_dir.mkdir(parents=True, exist_ok=True)
-                            synth_path = synth_dir / f"{a.node}.inline.md"
+                            record = _ap.route_cycle_for(artifact_root, route)
+                            if record is None:
+                                raise ValueError("inline-evidence-no-bound-cycle")
+                            out_dir = _ap.cycle_dir(artifact_root, record["campaign_id"],
+                                                    record["cycle_id"], record) / "artifacts"
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            synth_path = out_dir / f"{route.get('route_id')}.{a.node}.inline.md"
                             synth_path.write_text(f"# inline {a.node}\n\n{str(a.reason).strip()}\n", encoding="utf-8")
                             a.evidence = str(synth_path)
-                        except OSError as exc:
+                            a._synthesized_evidence = str(synth_path)
+                        except (OSError, ValueError, KeyError) as exc:
+                            if isinstance(exc, ValueError) and str(exc).startswith(("inline-evidence-",)):
+                                raise
                             raise ValueError(f"inline-evidence-unwritable:{exc}") from exc
                     if getattr(a, "reason", None):
                         print(f"inline-reason={a.reason}", file=sys.stderr)
@@ -10625,13 +10633,22 @@ def main():
                         route,node,a.node,evidence,a.subsession_manifest,jobs,
                     )
                 else:
-                    marker,row=complete_node(
-                        route,node,a.node,evidence,
-                        jobs=jobs,
-                        attempt_id=attempt_id,
-                        explicit_attempt_metadata=explicit_attempt_metadata,
-                        review_claim=review_claim,
-                    )
+                    try:
+                        marker,row=complete_node(
+                            route,node,a.node,evidence,
+                            jobs=jobs,
+                            attempt_id=attempt_id,
+                            explicit_attempt_metadata=explicit_attempt_metadata,
+                            review_claim=review_claim,
+                        )
+                    except Exception:
+                        synth = getattr(a, "_synthesized_evidence", None)
+                        if synth:
+                            try:
+                                Path(synth).unlink()
+                            except OSError:
+                                pass
+                        raise
                 if a.output: atomic_write(a.output, marker)
                 print(json.dumps(marker,sort_keys=True))
                 if row: print(json.dumps(row,sort_keys=True))

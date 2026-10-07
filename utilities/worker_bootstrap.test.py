@@ -398,12 +398,10 @@ class OwnerInlineMarkerPromptTest(OPA.OwnerRefineBase):
             self.assertIn(token, command)
         self.assertNotIn("--jobs", command)
         # the rendered command, run as written, publishes the marker settlement asks for
-        verdict = self.write_output(self.cycle, rel="reviews/refine-verdict.md", data=b"verdict: PASS\n")
         argv = [a.replace("<node>", "review").replace("<one line>", "review done") for a in shlex.split(command)]
-        argv += ["--evidence", str(verdict), "--route", str(self.path)]
         env = {**os.environ, "AGENT_ARTIFACT_ROOT": str(self.root), "AGENT_DISPATCH_JOBS": str(self.jobs),
                "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_ATTEMPT_ID": self.owner}
-        done = subprocess.run([sys.executable, *argv[1:]], text=True, capture_output=True, env=env)
+        done = subprocess.run([sys.executable, *argv[1:]], text=True, capture_output=True, env=env, cwd=str(OPA.R.ROOT))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         node = next(n for n in self.route["nodes"] if n["id"] == "transaction")
         with self.env():
