@@ -24,6 +24,8 @@ ALIASES = {
     "_route_node_leg_fields": "route_node_leg_fields", "_supervisor_route": "supervisor_route",
     "prepare_review_output_request": "prepare_review_output_request",
     "watch_early_death": "watch_early_death",
+    "write_reset_cache": "write_reset_cache",
+    "diff_attribution_prompt": "diff_attribution_prompt",
 }
 
 
@@ -81,6 +83,34 @@ class WrapperCommonTest(unittest.TestCase):
             init.assert_not_called()
             C.initialize_owner_input_when(args, Path("/j"), supervised=True, input_kind="k")
             init.assert_called_once_with(Path("/j"), "att-1", "k")
+
+    def test_diff_attribution_reads_the_exact_registry_it_was_given(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Path(tmp) / "route.json"
+            route.write_text(json.dumps({"nodes": [{"id": "test"}]}), encoding="utf-8")
+            custom = Path(tmp) / "custom-registry.log"
+            args = argparse.Namespace(route_file=str(route), route_node="test", jobs=str(custom),
+                                      agent_home=Path(tmp))
+            with mock.patch.object(C, "diff_attribution_lines", return_value=["diff_base: x"]) as lines:
+                self.assertEqual(C.diff_attribution_prompt(args), "- diff_base: x\n")
+            self.assertEqual(lines.call_args.args[2], custom)
+            args.jobs = None
+            with mock.patch.dict("os.environ", {}, clear=False), \
+                 mock.patch.dict("os.environ", {"AGENT_DISPATCH_JOBS": ""}), \
+                 mock.patch.object(C, "resolve_dispatch_state_root",
+                                   side_effect=C.DispatchContractError("registry-ambiguous", "x")):
+                self.assertEqual(C.diff_attribution_prompt(args), "")
+
+    def test_the_reset_cache_is_best_effort(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "state" / "jobs.log"
+            C.write_reset_cache(Path(tmp), "codex", "usage-limit", "12:00", jobs)
+            self.assertTrue((jobs.parent / "usage-reset.codex").read_text().endswith(" usage-limit 12:00\n"))
+            with mock.patch.object(C, "dispatch_state_roots",
+                                   side_effect=C.DispatchContractError("registry-ambiguous", "x")):
+                C.write_reset_cache(Path(tmp), "claude", "usage-limit", "12:00")  # no raise
 
 if __name__ == "__main__":
     unittest.main()

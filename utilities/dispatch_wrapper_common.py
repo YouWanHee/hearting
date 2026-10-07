@@ -21,9 +21,14 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from artifact_producer import ProducerError, prepare_review_output_binding
+from dispatch_contract import (
+    DispatchContractError, diff_attribution_lines, dispatch_state_root, dispatch_state_roots,
+    resolve_dispatch_state_root,
+)
 from model_config import ModelConfigError, resolve_config
 from route_authority import scan_anchored_death
 
@@ -351,3 +356,54 @@ def bind_internal_eligibility_probe(args: argparse.Namespace, harness: str) -> N
     args.nested_eligibility = row["status"]
     args.eligibility_source = row.get("probe_source") or ""
     args.eligibility_failure_class = row.get("failure_class") or ""
+
+
+def write_reset_cache(agent_home: Path, harness: str, reason: str, reset: str, jobs: Path | None = None) -> None:
+    """SD-15↔SD-16: cache the last known limit reset for usage-check.sh to read.
+
+    File `.dispatch/usage-reset.<harness>` holds one line: `<iso-ts> <reason> <reset>`.
+    Best-effort — a cache write failure never blocks dispatch bookkeeping.
+    """
+    try:
+        state_root = dispatch_state_root(jobs) if jobs else dispatch_state_roots(agent_home)[0]
+        cache = state_root / f"usage-reset.{harness}"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        cache.write_text(f"{ts} {reason} {reset}\n", encoding="utf-8")
+    except (OSError, DispatchContractError):
+        # Best effort: the reset cache is an observation, never a launch condition.
+        pass
+
+
+def diff_attribution_prompt(args: argparse.Namespace) -> str:
+    """SD-156: `diff_base`/`pre_node_commits` lines for a node downstream of `execute`.
+
+    One shared computation (`dispatch_contract.diff_attribution_lines`), added
+    to the "Dispatch metadata:" block the three wrappers already assemble --
+    the only place prompt text is composed for every registered launch surface
+    (`stage-dispatch-fallback.py` forwards a prompt file built here, not its
+    own).
+    """
+    route_file = getattr(args, "route_file", None) or getattr(
+        getattr(args, "owner_route_binding", None), "route_file", None,
+    )
+    route_node = getattr(args, "route_node", None)
+    if not route_file or not route_node:
+        return ""
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    node = next((row for row in route.get("nodes", []) if row.get("id") == route_node), None)
+    if node is None:
+        return ""
+    # The exact registry the launch was given or inherited; otherwise the
+    # canonical one. A registry that cannot be resolved adds no lines.
+    explicit_or_inherited_jobs = getattr(args, "jobs", None) or os.environ.get("AGENT_DISPATCH_JOBS", "")
+    try:
+        jobs = (Path(explicit_or_inherited_jobs) if explicit_or_inherited_jobs
+                else resolve_dispatch_state_root(args.agent_home) / "jobs.log")
+    except DispatchContractError:
+        return ""
+    lines = diff_attribution_lines(route, node, jobs)
+    return "".join(f"- {line}\n" for line in lines)

@@ -88,6 +88,8 @@ _is_report_bundle_publish_stage = WRAPPER_COMMON.is_report_bundle_publish_stage
 _route_node_leg_fields = WRAPPER_COMMON.route_node_leg_fields
 _supervisor_route = WRAPPER_COMMON.supervisor_route
 watch_early_death = WRAPPER_COMMON.watch_early_death
+write_reset_cache = WRAPPER_COMMON.write_reset_cache
+diff_attribution_prompt = WRAPPER_COMMON.diff_attribution_prompt
 fail = WRAPPER_COMMON.fail
 jobs_lock = WRAPPER_COMMON.jobs_lock
 prepare_review_output_request = WRAPPER_COMMON.prepare_review_output_request
@@ -870,38 +872,6 @@ def deny_commands(config_content: str, commands, selected_agent: str | None = No
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
-def diff_attribution_prompt(args: argparse.Namespace) -> str:
-    """SD-156: `diff_base`/`pre_node_commits` lines for a node downstream of `execute`.
-
-    One shared computation (`dispatch_contract.diff_attribution_lines`), added
-    to the "Dispatch metadata:" block the three wrappers already assemble --
-    the only place prompt text is composed for every registered launch surface
-    (`stage-dispatch-fallback.py` forwards a prompt file built here, not its
-    own).
-    """
-    route_file = getattr(args, "route_file", None) or getattr(
-        getattr(args, "owner_route_binding", None), "route_file", None,
-    )
-    route_node = getattr(args, "route_node", None)
-    if not route_file or not route_node:
-        return ""
-    try:
-        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    node = next((row for row in route.get("nodes", []) if row.get("id") == route_node), None)
-    if node is None:
-        return ""
-    explicit_or_inherited_jobs = getattr(args, "jobs", None) or os.environ.get("AGENT_DISPATCH_JOBS", "")
-    jobs = (
-        Path(explicit_or_inherited_jobs)
-        if explicit_or_inherited_jobs
-        else dispatch_state_roots(args.agent_home)[0] / "jobs.log"
-    )
-    lines = diff_attribution_lines(route, node, jobs)
-    return "".join(f"- {line}\n" for line in lines)
-
-
 def prompt(args: argparse.Namespace) -> tuple[str, str]:
     if args.prompt_file and args.prompt_text:
         raise ValueError("--prompt-file and --prompt-text are mutually exclusive")
@@ -1358,22 +1328,6 @@ def annotate_job_row(jobs: Path, slug: str, worktree: str, extra_kv: str, attemp
             _atomic_registry_replace(jobs, "".join(lines).splitlines())
             return True
     return False
-
-
-def write_reset_cache(agent_home: Path, harness: str, reason: str, reset: str, jobs: Path | None = None) -> None:
-    """SD-15↔SD-16: cache the last known limit reset for usage-check.sh to read.
-
-    File `.dispatch/usage-reset.<harness>` holds one line: `<iso-ts> <reason> <reset>`.
-    Best-effort — a cache write failure never blocks dispatch bookkeeping.
-    """
-    try:
-        state_root = dispatch_state_root(jobs) if jobs else dispatch_state_roots(agent_home)[0]
-        cache = state_root / f"usage-reset.{harness}"
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        cache.write_text(f"{ts} {reason} {reset}\n", encoding="utf-8")
-    except OSError:
-        pass
 
 
 def resolve_agent_home() -> Path:
