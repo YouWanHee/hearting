@@ -9569,28 +9569,33 @@ def _resolve_compose_plan(a, route_plan=None):
         return None, None
 
 
-def _session_campaign_key(artifact_root):
-    """The campaign key of this session's latest route in the same artifact root, or None.
-
-    Only that latest route counts: when it named no campaign (a parent cycle or an
-    explicit `--unassigned`), nothing older is reached for."""
+def _session_latest_route(artifact_root, event="compose"):
+    """This session's latest route-chain line in the same artifact root, or None."""
     rc = _route_chain_module()
     if rc is None:
         return None
     try:
-        identity = _route_chain_identity("compose", None)
+        identity = _route_chain_identity(event, None)
         if identity is None:
             return None
         harness, sid, _depth, _by = identity
         root = os.path.realpath(artifact_root)
         for line in reversed(rc.read_tail(harness, sid)):
-            if os.path.realpath(str(line.get("artifact_root") or "")) != root:
-                continue
-            key = line.get("campaign_key")
-            return key if isinstance(key, str) and key else None
+            if os.path.realpath(str(line.get("artifact_root") or "")) == root:
+                return line
     except Exception:
         return None
     return None
+
+
+def _session_campaign_key(artifact_root):
+    """The campaign key of this session's latest route in the same artifact root, or None.
+
+    Only that latest route counts: when it named no campaign (a parent cycle or an
+    explicit `--unassigned`), nothing older is reached for."""
+    line = _session_latest_route(artifact_root) or {}
+    key = line.get("campaign_key")
+    return key if isinstance(key, str) and key else None
 
 
 def _emit_compiled_route(a,route,artifact_root,output=None):
@@ -9656,14 +9661,21 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
     return output_path.resolve()
 
 def _close_route_argument(a):
-    """`close --route` takes a route file or an `rt-...` id; an id is looked up under the artifact root."""
+    """`close`/`finish --route` take a route file or an `rt-...` id; an id is looked up under the
+    artifact root. Without one, `finish` takes this session's latest route there."""
     import artifact_producer
-    if not artifact_producer._ROUTE_ID_RE.fullmatch(a.route) or Path(a.route).exists():
-        return a.route
-    root=a.artifact_root or os.environ.get("AGENT_ARTIFACT_ROOT") or _compose_artifact_root(os.getcwd())
-    path=artifact_producer.resolve_route_argument(Path(root),a.route)
+    route=a.route
+    if route and (not artifact_producer._ROUTE_ID_RE.fullmatch(route) or Path(route).exists()):
+        return route
+    root=getattr(a,"artifact_root",None) or os.environ.get("AGENT_ARTIFACT_ROOT") or _compose_artifact_root(os.getcwd())
+    if not route:
+        latest=(_session_latest_route(root,a.command) or {}).get("route_file")
+        if not latest:
+            raise ValueError(f"route-required: this session has no route under {root}; pass --route")
+        return latest
+    path=artifact_producer.resolve_route_argument(Path(root),route)
     if not path.is_file():
-        raise ValueError(f"route-not-found: {a.route} under {root}/.runtime/routes")
+        raise ValueError(f"route-not-found: {route} under {root}/.runtime/routes")
     return str(path)
 
 def _route_autoclose(artifact_root, trigger, route=None):
@@ -9769,7 +9781,7 @@ def main():
                        help="the route's parent moves its owner pin; the sealed route stays, the change is recorded "
                             "beside it and applies from the next owner launch (frame and worker pins stay sealed)")
     finish=sub.add_parser("finish",help="finish one current-session direct route and seal its exact producer cycle")
-    finish.add_argument("--route",required=True,type=Path)
+    finish.add_argument("--route",help="route file or route id (rt-...); defaults to this session's latest route here")
     finish.add_argument("--evidence",required=True,type=Path)
     finish.add_argument("--summary-file",required=True,type=Path)
     finish.add_argument("--commit",help="full result commit; defaults to current HEAD on first claim")
@@ -9783,7 +9795,7 @@ def main():
     co.add_argument("--resume-from-node",required=True)
     co.add_argument("--requested-boundary",required=True)
     co.add_argument("--reason",required=True)
-    co.add_argument("--artifact-root",required=True)
+    co.add_argument("--artifact-root",help="defaults to the source route's own artifact root")
     co.add_argument("--output")
     co.add_argument("--dispatch-evidence",help="optional checked nested evidence for this continuation; source evidence stays unchanged")
     co.add_argument("--lineage-operation",choices=("resume","fork"),default="resume")
@@ -10052,7 +10064,7 @@ def main():
         # sealed route object, and a filesystem locator is runtime context,
         # not route identity.  Adding it here made valid owner-closure proof
         # markers fail their downstream currentness check.
-        artifact=Path(a.artifact_root).resolve(strict=False)
+        artifact=Path(a.artifact_root or source["artifact_root"]).resolve(strict=False)
         if artifact != Path(source["artifact_root"]).resolve(strict=False):
             print(
                 "route_file_written=0 predecessor_attempts=0 registered=0 "
@@ -10169,6 +10181,7 @@ def main():
         if a.open_only: rows=[row for row in rows if not row["closed"]]
         print(json.dumps(rows,sort_keys=True,indent=2))
     elif a.command=="finish":
+        a.route=Path(_close_route_argument(a))
         raw=json.loads(a.route.read_text(encoding="utf-8"))
         route=verify_route(raw, raw.get("cwd"))
         if (route.get("capability") == "autopilot-refine"
