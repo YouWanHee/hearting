@@ -449,13 +449,7 @@ class ModelSelectionError(ValueError):
 
 
 def _model_policy() -> dict[str, str]:
-    try:
-        values, _receipt = resolve_config("codex", source_root=ROOT)
-    except ModelConfigError as exc:
-        raise ModelSelectionError(
-            "dispatch-model-policy-unavailable", str(exc)
-        ) from exc
-    return values
+    return WRAPPER_COMMON.model_policy("codex", error=ModelSelectionError)
 
 
 def _main_session_only_model(model: str) -> bool:
@@ -478,9 +472,9 @@ def _main_session_only_policy_state() -> str:
 
 
 def _require_headless_model(model: str, source: str) -> None:
-    refusal = headless_model_refusal(_model_policy(), model, source)
-    if refusal:
-        raise ModelSelectionError(*refusal)
+    return WRAPPER_COMMON.require_headless_model(
+        model, source, policy=_model_policy, error=ModelSelectionError,
+    )
 
 
 def _model_config_state() -> tuple[str, str]:

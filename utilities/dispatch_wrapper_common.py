@@ -37,7 +37,7 @@ import dispatch_parent_completion as parent_completion
 from dispatch_mode_contract import DispatchModeContractError, validate_route_mode_axes
 from execution_access import receipt_fragment as execution_access_receipt_fragment
 from stage_session_runtime import metadata as stage_session_metadata
-from model_config import ModelConfigError, resolve_config
+from model_config import ModelConfigError, headless_model_refusal, resolve_config
 from owner_route_binding import OwnerRouteBindingError, validate_runtime_requirements
 import route_authority
 from route_authority import scan_anchored_death
@@ -823,3 +823,22 @@ def acquire_review_lease_after_claim(
         review_output=binding["output_path"], binding=binding, jobs=jobs,
         lease_acquire=lease_acquire, witness_probe=witness_unlocked,
     )
+
+
+def model_policy(harness: str, *, error) -> dict[str, str]:
+    """This launch's model policy; the wrapper passes its own harness name and
+    its `ModelSelectionError` class, so each adapter keeps raising its own."""
+    try:
+        values, _receipt = resolve_config(harness, source_root=ROOT)
+    except ModelConfigError as exc:
+        raise error("dispatch-model-policy-unavailable", str(exc)) from exc
+    return values
+
+
+def require_headless_model(model: str, source: str, *, policy, error) -> None:
+    """Refuse a main-session-only model on a headless launch. The wrapper passes
+    its own `_model_policy` looked up at call time (the eligibility tests patch
+    the wrapper's name) and its `ModelSelectionError` class."""
+    refusal = headless_model_refusal(policy(), model, source)
+    if refusal:
+        raise error(*refusal)
