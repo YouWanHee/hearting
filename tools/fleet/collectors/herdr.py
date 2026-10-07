@@ -86,7 +86,7 @@ def list_panes(runner=subprocess.run, which=shutil.which):
     return [p for p in panes if isinstance(p, dict)]
 
 
-def pane_evidence(panes, runner=subprocess.run):
+def pane_evidence(panes, runner=subprocess.run, bindings=None):
     """Return shell PIDs, foreground PIDs, and exact Codex PID → thread IDs.
 
     A pane's session metadata alone can outlive its foreground process. Only a live
@@ -116,6 +116,8 @@ def pane_evidence(panes, runner=subprocess.run):
                 if isinstance(proc_rec, dict) and proc_rec.get("pid"):
                     pid = int(proc_rec["pid"])
                     fg.add(pid)
+                    if bindings is not None and proc_rec.get("name") == pane.get("agent"):
+                        bindings.setdefault(pid, set()).add(str(pane_id))
                     agent_session = pane.get("agent_session") or {}
                     if (pane.get("agent") == "codex"
                             and isinstance(agent_session, dict)
@@ -129,9 +131,9 @@ def pane_evidence(panes, runner=subprocess.run):
                         if len(sids) == 1}
 
 
-def pane_pids(panes, runner=subprocess.run):
+def pane_pids(panes, runner=subprocess.run, bindings=None):
     """F-100c — ``(shell_pids, foreground_pids)`` for agent panes."""
-    shells, fg, _identities = pane_evidence(panes, runner=runner)
+    shells, fg, _identities = pane_evidence(panes, runner=runner, bindings=bindings)
     return shells, fg
 
 
@@ -223,11 +225,50 @@ def _eligible(session):
     return True
 
 
-def enrich(sessions, agents=None, lineage=None, panes=None, pids=None):
+def _clear_gpu_session_aliases(harness, sid, pane):
+    """Display-only ids linked by this pane's confirmed native /clear."""
+    if harness not in {"claude", "codex", "opencode"} or not sid or not pane:
+        return []
+    try:
+        import sys
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import session_tidy
+        seat = session_tidy.Seat("pane", session_tidy._digest("pane", pane), pane, harness)
+        record = session_tidy.read_json(session_tidy.state_root() / "clear" / (seat.key + ".json"))
+        if (not isinstance(record, dict) or record.get("schema") != 1
+                or record.get("status") != "cleared" or record.get("harness") != harness
+                or record.get("new_session") != sid
+                or (record.get("seat") or {}).get("kind") != "pane"
+                or (record.get("seat") or {}).get("pane") != pane
+                or (record.get("observed") or {}).get("harness") != harness
+                or (record.get("observed") or {}).get("sid") != sid):
+            return []
+        older = record.get("sid")
+        if not isinstance(older, str) or not older or older == sid:
+            return []
+        aliases = [older]
+        starts = [row for row in session_tidy._read_ledger_lines(seat)
+                  if row.get("harness") == harness and row.get("event") == "start"]
+        if len(starts) >= 2 and starts[-1].get("sid") == sid and starts[-2].get("sid") == older:
+            for index in range(len(starts) - 2, 0, -1):
+                if starts[index].get("source") != "clear":
+                    break
+                aliases.append(starts[index - 1]["sid"])
+        return list(dict.fromkeys(aliases))[:8]
+    except (OSError, ValueError, TypeError, AttributeError, ImportError):
+        return []
+
+
+def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
     = pre-fetched pane list / ``pane_pids()`` result (``None`` → probe once here);
     ``lineage`` = ``pid -> provenance`` callable used only when herdr is absent."""
+    for session in sessions:
+        session._gpu_session_aliases = []
     if agents is None:
         agents = list_agents()
     if agents is None:
@@ -246,10 +287,11 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None):
                 s.herdr_attached = None
         return
     index = attached_index(agents)
+    bindings = {} if pane_bindings is None else pane_bindings
     if pids is None:
         if panes is None:
             panes = list_panes()
-        pids = pane_pids(panes) if panes is not None else None
+        pids = pane_pids(panes, bindings=bindings) if panes is not None else None
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None
     for s in sessions:
@@ -267,3 +309,16 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None):
             s.herdr_attached = False
         else:
             s.herdr_attached = None
+        # Herdr may still name the pre-/clear id. Its exact foreground PID identifies
+        # the same pane; the native clear receipt identifies the current session there.
+        matching_panes = bindings.get(s.pid, set())
+        if not matching_panes and sid and (harness, sid) in index:
+            pane = index[(harness, sid)].get("pane_id")
+            matching_panes = {pane} if pane else set()
+        if len(matching_panes) == 1:
+            aliases = _clear_gpu_session_aliases(harness, sid, next(iter(matching_panes)))
+            if aliases:
+                from . import procscan
+                if getattr(s, "proc_start", None) and procscan.read_proc_start(s.pid) == s.proc_start:
+                    live = {(other.harness, other.session_id) for other in sessions}
+                    s._gpu_session_aliases = [old for old in aliases if (harness, old) not in live]

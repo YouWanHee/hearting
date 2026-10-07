@@ -4821,23 +4821,59 @@ def _gpu_session_resources(snapshot=None):
     }
 
 
-def _gpu_resources_for_session(session, resource_index):
+def _gpu_session_keys(session):
     harness = getattr(session, "harness", None)
     session_id = (getattr(session, "session_id", None)
                   or getattr(session, "_runtime_session_id", None))
     if harness not in {"claude", "codex", "opencode"} or not session_id:
         return []
-    return list(resource_index.get((harness, session_id), ()))
+    ids = [session_id] + list(getattr(session, "session_aliases", None) or ())
+    ids += list(getattr(session, "_gpu_session_aliases", None) or ())
+    return [(harness, sid) for sid in dict.fromkeys(ids) if isinstance(sid, str) and sid]
+
+
+def _gpu_resources_for_session(session, resource_index):
+    resources = {}
+    for session_key in _gpu_session_keys(session):
+        for source in resource_index.get(session_key, ()):
+            key = (source["host"], source["index"])
+            if key not in resources:
+                resources[key] = {**source, "processes": list(source.get("processes") or ())}
+                continue
+            resource = resources[key]
+            resource["process_count"] += source["process_count"]
+            resource["used_memory_mib"] += source["used_memory_mib"]
+            resource["has_memory"] |= source["has_memory"]
+            resource["processes"].extend(source.get("processes") or ())
+    return [resources[key] for key in sorted(resources)]
 
 
 def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
-    """Exact-session GPU resources with claim-backed process names in place."""
+    """One compact GPU line; optional telemetry and names yield before identities."""
     if not resources:
         return []
     indent = _conn_indent(depth, in_card)
-    width = max(20, int(term_width or 200))
+    width = max(20, int(term_width or 200)) - 1
 
-    def build(shown, show_model, show_memory):
+    labels = {}
+    for resource in resources:
+        names = []
+        seen = set()
+        for process in resource.get("processes") or ():
+            exact = (process["pid"], process["proc_start"])
+            if exact in seen:
+                continue
+            seen.add(exact)
+            command = process["command"]
+            name = _gpu_process_label(command)
+            if name == command:
+                name = _gpu_display_command(command)
+            if name not in names:
+                names.append(name)
+        labels[id(resource)] = ", ".join(names)
+
+    def build(shown, show_model=False, show_memory=False, show_time=False,
+              show_tag=False, name_width=None, remaining=0):
         segs = [(indent, None)]
         for position, resource in enumerate(shown):
             if position:
@@ -4845,18 +4881,11 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
             identity = "GPU %s:%s" % (resource["host"], resource["index"])
             pulse_key = "g_work" if _BLINK_ON else "g_work_off"
             segs += [("●", pulse_key), (" ", None), (identity, "name_dim")]
-            labels = []
-            seen = set()
-            for process in resource.get("processes") or ():
-                exact = (process["pid"], process["proc_start"])
-                if exact in seen:
-                    continue
-                seen.add(exact)
-                label = _gpu_process_label(process["command"])
-                if label not in labels:
-                    labels.append(label)
-            if labels:
-                segs += [(" (", "dim"), (", ".join(labels), "name_dim"), (")", "dim")]
+            label = labels[id(resource)]
+            if name_width is not None:
+                label = (_gpu_clip_command(label, name_width) if name_width > 0 else "")
+            if label:
+                segs += [(" (", "dim"), (label, "name_dim"), (")", "dim")]
             if show_model and resource.get("model"):
                 model = _gpu_display_model(resource["model"])
                 segs += [(" · ", "dim"),
@@ -4864,18 +4893,54 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
             if show_memory and resource.get("has_memory"):
                 segs += [(" · " + _gpu_gib(resource.get("used_memory_mib", 0))
                           + " GB", "dim")]
+            elapsed = resource.get("elapsed_s")
+            if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
+                segs += [(" · " + fmt_min(elapsed // 60), "dim")]
+            if show_tag and resource.get("owner_label"):
+                segs += [(" · ", "dim"), (resource["owner_label"], "lvl_y")]
+        if remaining:
+            segs += [(" · +%d GPU" % remaining, "dim")]
         return segs
 
-    def fit(shown):
-        return _fit_strip([lambda: build(shown, True, True),
-                           lambda: build(shown, False, True),
-                           lambda: build(shown, False, False)], width)
+    for model, memory, elapsed, tag in ((True, True, True, True),
+                                       (False, True, True, False),
+                                       (False, False, False, False)):
+        segs = build(resources, model, memory, elapsed, tag)
+        if sum(_dw(text) for text, _key in segs) <= width:
+            return [segs]
+    shown = list(resources)
+    while len(shown) > 1 and sum(_dw(text) for text, _key in
+            build(shown, name_width=0, remaining=len(resources) - len(shown))) > width:
+        shown.pop()
+    remaining = len(resources) - len(shown)
+    bare = build(shown, name_width=0, remaining=remaining)
+    named = sum(bool(labels[id(resource)]) for resource in shown)
+    room = width - sum(_dw(text) for text, _key in bare)
+    name_width = max(0, room // max(1, named) - 3)
+    return [_clip_segs(build(shown, name_width=name_width, remaining=remaining), width)[0]]
 
-    # Keep the usual compact strip when every GPU's name fits. At narrow
-    # widths, split GPUs so the next one's label is not lost to clipping.
-    if sum(_dw(text) for text, _key in build(resources, False, False)) <= width:
-        return [fit(resources)]
-    return [fit([resource]) for resource in resources]
+
+def _gpu_work_strip(entries, term_width=None):
+    """F-104 processes retain their raw JSON, but share one card GPU line."""
+    grouped = {}
+    for entry in entries:
+        key = (entry["host"], tuple(entry["gpu_indexes"]))
+        resource = grouped.setdefault(key, {
+            "host": entry["host"], "index": ",".join(map(str, entry["gpu_indexes"])),
+            "model": _gpu_safe_text(entry.get("gpu_name")).replace("NVIDIA ", ""),
+            "processes": [], "used_memory_mib": 0, "has_memory": False,
+            "elapsed_s": None, "owner_label": entry.get("owner_label") or "미등록",
+        })
+        resource["processes"].append({
+            "pid": entry["pid"], "proc_start": entry.get("proc_start"),
+            "command": entry.get("command") or entry.get("process_name") or "process",
+        })
+        if entry.get("used_memory_mib") is not None:
+            resource["used_memory_mib"] += entry["used_memory_mib"]
+            resource["has_memory"] = True
+        if entry.get("elapsed_s") is not None:
+            resource["elapsed_s"] = max(resource["elapsed_s"] or 0, entry["elapsed_s"])
+    return _gpu_resource_strip([grouped[key] for key in sorted(grouped)], term_width)
 
 
 def _gpu_work_row(entry, term_width=None):
@@ -6279,7 +6344,7 @@ def _gpu_strip_keys(shown, gpu_resources, drawn_jobs=(), session_by_identity=Non
         if getattr(s, "mem_worker", False):
             continue  # a mem row is drawn by _mem_row alone, without a GPU strip
         if _gpu_resources_for_session(s, gpu_resources):
-            keys.add((s.harness, s.session_id or getattr(s, "_runtime_session_id", None)))
+            keys.update(key for key in _gpu_session_keys(s) if gpu_resources.get(key))
     for job in drawn_jobs:
         owner = job if _gpu_resources_for_session(job, gpu_resources) else None
         if owner is None and session_by_identity:
@@ -6287,9 +6352,7 @@ def _gpu_strip_keys(shown, gpu_resources, drawn_jobs=(), session_by_identity=Non
             if job_session is not None and _gpu_resources_for_session(job_session, gpu_resources):
                 owner = job_session
         if owner is not None:
-            keys.add((owner.harness,
-                      getattr(owner, "session_id", None)
-                      or getattr(owner, "_runtime_session_id", None)))
+            keys.update(key for key in _gpu_session_keys(owner) if gpu_resources.get(key))
     return keys
 
 
@@ -7059,8 +7122,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             _emit_dispatch_tree(gj, orphan=False)
 
         # F-104: live GPU work that no registry run or session GPU strip shows.
-        for entry in emission["gpu"]:
-            lines.append(_gpu_work_row(entry, term_width))
+        lines.extend(_gpu_work_strip(emission["gpu"], term_width))
 
         # F-19 repo rows (사용자 확정 2026-07-16): this card's own today-mem events, below a
         # subtle in-band divider — entirely silent when the repo has none (healthy-silent,
