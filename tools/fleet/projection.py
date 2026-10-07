@@ -171,11 +171,86 @@ def _record_view(record, route_id, jobs, node_evidence=None, now=None, degradati
         {route_id: record}, jobs=jobs,
         node_evidence={route_id: node_evidence or {}},
     ).get(route_id)
-    return route._record_view(record, route_id, jobs, node_evidence or {},
-                              time.time() if now is None else now,
-                              gate_marks_for_route=marks,
-                              degradations_for_route=(degradations or {}).get(route_id, ()),
-                              round_scope=_ROUND_SCOPE.get())
+    view = route._record_view(record, route_id, jobs, node_evidence or {},
+                             time.time() if now is None else now,
+                             gate_marks_for_route=marks,
+                             degradations_for_route=(degradations or {}).get(route_id, ()),
+                             round_scope=_ROUND_SCOPE.get())
+    # Detached resources are not model dispatches. Project their already-classified
+    # working evidence into the same route view without manufacturing a job row.
+    scope = _ROUND_SCOPE.get()
+    resources = _working_resources_for_record(record, scope.jobs if scope else jobs)
+    for node in view.get("nodes", ()):
+        children = resources.get(node["id"], ())
+        if not children:
+            continue
+        if node["state"] != "active":
+            node["state"] = "active"
+            elapsed = [r.elapsed_min for r in children if r.elapsed_min is not None]
+            node["elapsed_min"] = max(elapsed) if elapsed else None
+        node["resource_run_ids"] = [r.run_id for r in children]
+    view["progress"]["done"] = sum(n["state"] == "done" for n in view.get("nodes", ()))
+    return view
+
+
+def _working_resources_for_record(record, jobs):
+    """Exact parent and declared route only; legacy route/node are valid inputs."""
+    by_node = {}
+    for job in jobs:
+        rid = _field(job, "owner_route_id") or _field(job, "route_id")
+        path = _field(job, "owner_route_file") or _field(job, "route_file")
+        expected_hash = _field(job, "owner_route_hash") or _field(job, "route_hash")
+        if (rid != record.get("route_id") or not path
+                or expected_hash != record.get("route_hash")):
+            continue
+        for child in _field(job, "resource_children", ()):
+            if child.liveness != "working" or child.parent_attempt_id != _field(job, "attempt_id"):
+                continue
+            declared_path = child.route_file or child.route
+            if not declared_path or _realpath(declared_path) != _realpath(path):
+                continue
+            if ((child.route and _realpath(child.route) != _realpath(path))
+                    or (child.route_id and child.route_id != rid)
+                    or (child.route_hash and child.route_hash != record.get("route_hash"))
+                    or (child.route_node and child.node and child.route_node != child.node)):
+                continue
+            node = child.route_node or child.node
+            if node:
+                by_node.setdefault(node, []).append(child)
+    return by_node
+
+
+def _attach_resource_children(jobs, resources):
+    by_attempt = {}
+    for job in jobs:
+        job.resource_children = []
+        job.resource_wait = None
+        attempt = _field(job, "attempt_id")
+        if attempt and attempt != "-":
+            by_attempt.setdefault(attempt, []).append(job)
+    for resource in resources or ():
+        parents = by_attempt.get(resource.parent_attempt_id, ())
+        # Duplicate exact rows are ambiguous; cwd/slug never break the tie.
+        if len(parents) == 1:
+            parents[0].resource_children.append(resource)
+
+
+def _attach_resource_wait(job):
+    projection = job.work_projection
+    if not projection or projection.source != "route-exact" or projection.ambiguity:
+        return
+    observed = ((_field(job, "state_evidence") or {}).get("inputs") or {}).get(
+        "observed_liveness") or {}
+    if job.liveness != "idle" or observed.get("state") != "parked-supervised":
+        return
+    record = (projection._route_view or {}).get("record") or {}
+    resources = _working_resources_for_record(record, [job])
+    active_ids = {node.id for node in projection.active_nodes}
+    nodes = [node["id"] for node in record.get("nodes", ())
+             if node.get("id") in resources and node.get("id") in active_ids]
+    if nodes:
+        job.resource_wait = {"state": "resource-parked", "nodes": nodes,
+                             "run_ids": [r.run_id for node in nodes for r in resources[node]]}
 
 
 def _record_nodes(record, route_id, jobs, node_evidence=None, now=None, degradations=None):
@@ -1572,9 +1647,10 @@ def resolve_projection(*args, **kwargs):
 def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                       route_records=None, node_evidence=None, artifact_root=None, now=None,
                       spec_markers=None, spec_marker_home=None,
-                      capability_groundings=None, degradations=None):
+                      capability_groundings=None, degradations=None, resources=None):
     """Attach work to every row and exact-owned context to live cards."""
     sessions, jobs = list(sessions), list(jobs)
+    _attach_resource_children(jobs, resources)
     route_records = _load_evidence_records(node_evidence, route_records, sessions + jobs)
     home = spec_marker_home or _grounding_home()
     if spec_markers is None:
@@ -1631,6 +1707,8 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                 degradations=degradations)
             entity.stage = (entity.work_projection.stage_label
                             if isinstance(entity, DispatchJob) else getattr(entity, "stage", None))
+            if isinstance(entity, DispatchJob):
+                _attach_resource_wait(entity)
     finally:
         _ROUND_SCOPE.reset(round_token)
     return sessions, jobs

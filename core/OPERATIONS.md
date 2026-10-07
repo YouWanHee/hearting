@@ -769,7 +769,13 @@ notice tells a human to inspect and recover it.
 **Visibility is a requirement, not a nicety.** Independently of capability,
 Fleet and the status surfaces expose the workflow, its current stage, its child
 resource jobs, resource class and identity, last update, next stage, and
-failure reason. A worker card shows its assigned work, not every node in the
+failure reason. Fleet connects resource children by exact `parent_attempt_id`,
+including existing `route`/`node` registries. A verified working resource lights
+its declared route node; a supervised parked owner shows that node and
+`resource-parked` instead of presenting an old model summary as current work.
+Resource liveness stays independent of the owner's model activity, and a missing
+progress declaration leaves only elapsed time and liveness (2026-10-07 SR eval-run).
+A worker card shows its assigned work, not every node in the
 route: a depth-1 frame owns only its exact frame node; the later owner owns the
 execution stages, excluding the separate pre-owner frame pair. Depth alone does
 not confer ownership of a pipeline. Card progress uses the same assigned scope;
