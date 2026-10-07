@@ -10,7 +10,7 @@ interpreter=$1
 hook=$2
 shift 2
 dir=$(dirname -- "$0")
-if [ -n "${AGENT_HOME:-}" ] && [ -f "$AGENT_HOME/core/CORE.md" ] && [ -e "$AGENT_HOME/hooks/$hook" ]; then
+if [ -n "${AGENT_HOME:-}" ] && [ -f "$AGENT_HOME/core/CORE.md" ]; then
   dir=$AGENT_HOME/hooks
 fi
 if [ "$interpreter" = exec ]; then
