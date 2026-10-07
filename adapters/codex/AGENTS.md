@@ -9,10 +9,8 @@ are siblings and none is another's reference implementation. Edit core first.
 Codex has already loaded this file through the global instruction chain. Resolve
 `<agent-home>` from the active `AGENT_HOME`, falling back to
 `${CODEX_HOME:-$HOME/.codex}/hearting` and the shared `utilities/agent-home.sh`
-resolver. Interpret every harness path below relative to that root; a working
-repository supplies runtime code only when explicitly activated as `AGENT_HOME`.
-Don't probe `<cwd>/core/CORE.md` or report it missing. Mention root resolution
-only when it fails or materially changes the task.
+resolver. Interpret every harness path below relative to that root.
+Don't probe `<cwd>/core/CORE.md` or report it missing.
 
 Read `<agent-home>/core/CORE.md` first; load the remaining documents only when
 the task touches the named domain.
@@ -186,12 +184,10 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 terminal, and a graph that breaks this is refused at route compile and at launch.
 
 <!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run.
+Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed via `utilities/workflow-supervisor.py arm|poll|watch|status|complete`, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run. Report state from PID identity, sentinel/exit evidence, log modification time, and declared artifacts, never from a registry status word alone.
 <!-- END generated from core/fragments/bootstrap-continuation.md -->
 
-The native queue carries
-the completion batch and never substitutes for a continuation. `OPERATIONS §5.12`
-owns mechanics.
+The native queue never substitutes for a continuation.
 
 ## Memory and Context
 
