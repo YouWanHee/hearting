@@ -1059,17 +1059,9 @@ def acquire_review_lease_after_claim(
 
 
 def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
-    review = args.review_output_binding
-    return launch_summary_owner(
-        attempt_id=args.attempt_id,
-        harness="opencode",
-        transcript=log_path,
-        prompt_path=prompt_path,
-        target_pid=int(identity["pid"]),
-        target_start=identity["pid_start"],
-        review_artifact_root=review["artifact_root"] if review else None,
-        review_cycle_id=review["cycle_id"] if review else None,
-        review_lease_nonce=args.review_governed_lease_nonce if review else None,
+    return WRAPPER_COMMON.attach_summary_owner(
+        args, log_path, prompt_path, identity,
+        harness="opencode", summary_launcher=launch_summary_owner,
     )
 
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:

@@ -164,6 +164,47 @@ class CloseJobRowTest(unittest.TestCase):
                     delivery.assert_called_once_with(jobs, "att-1")
 
 
+class AttachSummaryOwnerTest(unittest.TestCase):
+    def args(self, attempt_id="att-1", review=None):
+        return argparse.Namespace(
+            attempt_id=attempt_id,
+            review_output_binding=review,
+            review_governed_lease_nonce="n" * 8,
+        )
+
+    def test_review_binding_rides_along_or_stays_empty(self):
+        from unittest import mock
+        launcher = mock.Mock(return_value={"summary_owner": "s"})
+        identity = {"pid": "4242", "pid_start": "900"}
+        result = C.attach_summary_owner(
+            self.args(), Path("/t.jsonl"), Path("/p.txt"), identity,
+            harness="codex", summary_launcher=launcher)
+        self.assertEqual(result, {"summary_owner": "s"})
+        kwargs = launcher.call_args.kwargs
+        self.assertEqual((kwargs["harness"], kwargs["target_pid"], kwargs["target_start"]),
+                         ("codex", 4242, "900"))
+        self.assertIsNone(kwargs["review_artifact_root"])
+        review = {"artifact_root": "/a", "cycle_id": "cyc", "producer_id": "p"}
+        C.attach_summary_owner(
+            self.args(review=review), Path("/t.jsonl"), Path("/p.txt"), identity,
+            harness="claude", summary_launcher=launcher)
+        kwargs = launcher.call_args.kwargs
+        self.assertEqual((kwargs["review_artifact_root"], kwargs["review_cycle_id"]),
+                         ("/a", "cyc"))
+        self.assertEqual(kwargs["review_lease_nonce"], "n" * 8)
+
+    def test_every_wrapper_injects_its_launcher_at_call_time(self):
+        from unittest import mock
+        identity = {"pid": "4242", "pid_start": "900"}
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(wrapper, "launch_summary_owner", return_value={}) as launch:
+                    wrapper.attach_summary_owner(self.args(), Path("/t"), Path("/p"), identity)
+                self.assertEqual(launch.call_args.kwargs["harness"], harness)
+                self.assertEqual(launch.call_args.kwargs["attempt_id"], "att-1")
+
+
 class RegistrationFenceTest(unittest.TestCase):
     def test_every_wrapper_registers_behind_the_terminal_claim_fence(self):
         import ast
