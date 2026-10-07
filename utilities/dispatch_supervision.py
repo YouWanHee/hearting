@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -305,9 +306,48 @@ def _resume_text(receipt: dict) -> str:
         return ""
 
 
-def render_text(receipt: dict) -> str:
+# Set on a delivered record (not its receipt) when its carrier started the continuation.
+CONTINUED_KEY = "parent_continuation"
+
+
+def continue_for_parent(record: dict, *, session_id: str, recipient_kind: str,
+                        environ=None, arm=None) -> dict | None:
+    """Start an answered BLOCKED owner's continuation from the carrier that hands its parent the notice.
+
+    Only the route's parent launches it (`route_authority.require_replacement_parent`). The carrier
+    that kept its claim on an `answer-awaiting-parent` record for `session_id` runs for that session,
+    so it arms the route's `start` once under this session's own identity (`capacity_auto_resume`)
+    instead of asking the parent to run it. None when the record is another notice or nothing could
+    be armed; the notice then keeps its start command."""
+    receipt = record.get("receipt") if isinstance(record, dict) else None
+    if (not session_id or not isinstance(receipt, dict) or receipt.get("kind") != KIND
+            or receipt.get("reason") != ANSWER_AWAITING_PARENT):
+        return None
+    try:
+        from dispatch_replacement import _route
+        from session_identity import session_env
+        harness = recipient_kind.split("-", 1)[0]
+        jobs = Path(receipt["job_registry"])
+        owner = receipt["owner_attempt_id"]
+        route_file, route = _route(jobs, owner, _rows(jobs)[owner][1])
+        env = {**(os.environ if environ is None else environ),
+               session_env()[harness][0]: session_id, "AGENT_DISPATCH_CALLER_HARNESS": harness}
+        if arm is None:
+            from capacity_auto_resume import arm
+        return arm({"reason": ANSWER_AWAITING_PARENT, "route_id": route.get("route_id")},
+                   route_file, jobs, environ=env)
+    except Exception:  # noqa: BLE001 -- the notice still carries the start command
+        return None
+
+
+def render_text(receipt: dict, *, continued: dict | None = None) -> str:
     receipt = validate(receipt)
     if receipt["reason"] == ANSWER_AWAITING_PARENT:
+        if continued:
+            return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "
+                    "the answer is kept. This session's runtime started the route's continuation, and its "
+                    "new owner receives the answer first; the result arrives here as a notice. Tell the user "
+                    "in one line; there is nothing to run and no answer to ask for again.")
         command = _resume_text(receipt)
         return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "
                 "the answer is kept. Only this route's parent session launches its continuation, so "

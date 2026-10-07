@@ -13,6 +13,11 @@ busy, or the launcher closed the row before spawning) is the same kind of pause:
 its receipt's own remedy is to run `resume_command` again after about a minute,
 so the same record runs it `LATER_SECONDS` from now.
 
+A BLOCKED owner whose answer another session sent (`answer-awaiting-parent`) is
+paused the same way: only the route's parent launches its continuation, so the
+parent's own carrier arms a record when it hands that notice over, and the
+record runs `start` at once.
+
 Bounded on purpose: one resume per record, a sleep of at most `MAX_SLEEP_SECONDS`,
 and at most `MAX_CHAIN` automatic resumes in a row for one route (a resume that
 pauses again arms the next one). A pause without a known reset time arms
@@ -37,6 +42,7 @@ SLACK_SECONDS = 60
 POLL_SECONDS = 60
 LATER_SECONDS = 60
 LATER_REASONS = ("owner-launch-not-admitted", "owner-launch-not-started")
+ANSWER_REASON = "answer-awaiting-parent"
 CHAIN_ENV = "AGENT_CAPACITY_RESUME_CHAIN"
 
 
@@ -59,6 +65,8 @@ def _pause(result: dict, now) -> tuple[str | None, str] | None:
         return result.get("retry_at"), "capacity"
     if result.get("required_action") == "resume-later" and result.get("reason") in LATER_REASONS:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() + LATER_SECONDS)), "launch-not-started"
+    if result.get("reason") == ANSWER_REASON:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now())), "answer"
     return None
 
 
@@ -108,7 +116,8 @@ def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run) -> 
     epoch = _epoch(record.get("retry_at"))
     if record.get("state") != "armed" or epoch is None:
         return 0
-    deadline = now() + min(MAX_SLEEP_SECONDS, max(0.0, epoch + SLACK_SECONDS - now()))
+    slack = 0 if record.get("cause") == "answer" else SLACK_SECONDS
+    deadline = now() + min(MAX_SLEEP_SECONDS, max(0.0, epoch + slack - now()))
     while now() < deadline:
         # Short steps: a record removed (or disarmed) meanwhile ends the wait.
         sleep(min(POLL_SECONDS, max(0.0, deadline - now())))
@@ -146,8 +155,9 @@ def _notify(record: dict, receipt: dict) -> None:
             return
         state = receipt.get("state") or "unknown"
         again = state == "waiting-capacity"
-        why = ("started again after a launch that did not start" if record.get("cause") == "launch-not-started"
-               else "resumed after the usage limit reset")
+        why = {"launch-not-started": "started again after a launch that did not start",
+               "answer": "continued with the answer another session sent"}.get(
+                   record.get("cause"), "resumed after the usage limit reset")
         text = (f"route {record['route_id']} {why}: state {state}"
                 + (f", owner {receipt['owner_attempt_id']}" if receipt.get("owner_attempt_id") else "")
                 + (f"; paused again until {receipt.get('retry_at', 'an unknown time')}" if again else ""))

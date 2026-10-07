@@ -1094,7 +1094,10 @@ continues its route in the same call through a replacement owner that receives i
 (see the SD-157 replacement rule in §5.10). When the answer comes from a session
 that is not the route's parent, only the parent may launch that replacement: the
 answer stays kept and the parent receives one `answer-awaiting-parent` supervision
-notice naming the route's start command. Other ended owners still report
+notice. The parent's carrier that delivers it (the shared prompt sweep or the
+Claude rewake) starts the route once under that session's identity
+(`dispatch_supervision.continue_for_parent`) and the notice says so; only when
+nothing could be started does it name the route's start command. Other ended owners still report
 `owner-input-unavailable-retain-correction`. An answer sent with an older attempt id
 follows the replacement lineage to the owner doing the work now.
 Corrections preserve route, completion and cleanup evidence; completed-prefix

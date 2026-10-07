@@ -66,6 +66,12 @@ class ArmTest(unittest.TestCase):
                                     "required_action": "resume-later", "route_id": "rt-y"},
                                    env={C.CHAIN_ENV: str(C.MAX_CHAIN)}))
 
+    def test_an_answer_awaiting_the_parent_is_started_at_once(self):
+        armed = self.arm({"reason": C.ANSWER_REASON, "route_id": "rt-answer"})
+        self.assertEqual((armed["state"], armed["cause"]), ("armed", "answer"))
+        self.assertEqual(C._epoch(armed["resume_at"]), RETRY_EPOCH - 3600)
+        self.assertEqual(len(self.spawned), 1)
+
 
 class RunTest(unittest.TestCase):
     def setUp(self):
@@ -104,6 +110,20 @@ class RunTest(unittest.TestCase):
             C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0],
                   call=lambda argv, **kw: calls.append(argv) or done)
         self.assertEqual(calls[0][1], "/data/hearting/current/utilities/capability-route.py")
+
+    def test_an_answer_record_runs_start_without_the_reset_slack(self):
+        record = json.loads(self.path.read_text())
+        self.path.write_text(json.dumps({**record, "cause": "answer", "retry_at": PAUSE["retry_at"]}))
+        self.clock[0] = RETRY_EPOCH
+        calls = []
+        done = SimpleNamespace(returncode=0, stdout=json.dumps({"state": "running", "owner_attempt_id": "att-2"}) + "\n")
+        with mock.patch.object(C, "_notify") as notify:
+            C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0],
+                  call=lambda argv, **kw: calls.append(argv) or done)
+        self.assertEqual(self.clock[0], RETRY_EPOCH)  # no wait
+        self.assertEqual(calls[0][2:5], ["start", "--route", "/r/route.json"])
+        self.assertEqual(json.loads(self.path.read_text())["owner_attempt_id"], "att-2")
+        notify.assert_called_once()
 
     def test_a_removed_record_ends_the_wait(self):
         def sleep(seconds):

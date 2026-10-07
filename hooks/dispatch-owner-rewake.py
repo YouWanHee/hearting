@@ -1345,7 +1345,10 @@ def _gate_notices(
         from dispatch_notice_state import keep_claim
         if not keep_claim(root, recipient_key, delivery_id, record, claim_owner, jobs=launch.jobs):
             continue
-        notices.append(_bounded_receipt_text(record))
+        from dispatch_supervision import CONTINUED_KEY, continue_for_parent
+        continued = continue_for_parent(record, session_id=launch.session_id,
+                                        recipient_kind="claude-parent-runtime")
+        notices.append(_bounded_receipt_text({**record, CONTINUED_KEY: continued} if continued else record))
         if announced is not None:
             announced.append(delivery_id)
         try:
