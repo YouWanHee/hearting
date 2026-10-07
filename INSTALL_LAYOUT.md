@@ -308,7 +308,7 @@ the Fleet COMPUTE RESOURCES panel, never as an error.
 Every user-owned configuration file the harness reads is registered in
 `tools/install/user_config.py`: the compute-host inventory, the dispatch
 routing policy, the report bundle root, the memory exchange policy, and each
-runtime's `agent-config/models.conf`. `harness install` prints this registry
+runtime's `agent-config/models.conf`, plus Fleet title preferences. `harness install` prints this registry
 at the end of a run, `harness verify` checks the surfaces that can be invalid,
 and `harness config status [--verbose] [--json]` repeats the same view on
 demand with the path, the current state (`ok`, `template`, `absent`,
@@ -335,17 +335,22 @@ ln -sfn "$AGENT_HOME/tools/fleet/fleet.sh" "$HOME/.local/bin/fleet"   # needs ~/
 No install step at all still works — run it by path: `bash "$AGENT_HOME/tools/fleet/fleet.sh"`. Zero-dep
 (stdlib python3 + curses); nothing to build.
 
-Title acquisition is best-effort and runtime-specific. Fleet reads native title
-state where available: for example, Codex's state DB with the JSONL
-`thread_name` index as a compatibility fallback, and OpenCode's session DB.
-The optional live refresher currently supports active Claude Code and Codex
-transcripts and writes Fleet-owned sidecars under
+Title acquisition is best-effort. The shared refresher reads Claude and Codex
+transcripts and OpenCode transcripts/session data, and writes Fleet-owned sidecars under
 `${FLEET_TITLE_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/agent-fleet/titles}/<harness>/`.
-That refresher is not runtime-neutral today: its implementation defaults to the
-Claude CLI with the no-tools `haiku` model as a compatibility provider. This is
-an implementation fallback, not a portable Fleet requirement; when the provider
-is absent or fails, the dashboard continues with native titles or slugs. To use
-another small provider, point `FLEET_TITLE_COMMAND` at a no-tools wrapper. The
+When refresh fails, each collector retains the last successful Fleet title;
+without one the title is blank. Native runtime titles and first messages do not
+replace it. The existing provider selection, quota and cadence remain unchanged.
+`harness install` creates `${XDG_CONFIG_HOME:-~/.config}/hearting/fleet.json`
+once with `{"title_language": "auto"}` and preserves user edits on later installs
+and updates. `auto` uses the same operator-language selection as NOW:
+`FLEET_NOW_LANG`, a non-English locale, then the conversation's language.
+Change this single value to `ko`/`Korean` or `en`/`English` to override only the
+title; NOW keeps its existing language. Korean/Japanese/Chinese titles use at
+most 20 characters, English titles at most 40 characters and 3–6 words.
+Absent or invalid preferences use `auto`; `harness config status` reports the file.
+
+To use another small provider, point `FLEET_TITLE_COMMAND` at a no-tools wrapper. The
 value is parsed as an argv template, never through a shell:
 
 ```bash

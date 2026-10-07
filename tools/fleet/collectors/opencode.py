@@ -52,7 +52,7 @@ def _attempt_sidecar_fallback(sess):
     if not attempt_sid:
         return
     if not getattr(sess, "title", None):
-        sess.title = titles.fresh_title(attempt_sid, harness="opencode")
+        sess.title = titles.last_title(attempt_sid, harness="opencode")
     if not getattr(sess, "summary", None):
         sess.summary, sess.summary_ts = titles.fresh_summary_with_ts(
             attempt_sid, harness="opencode")
@@ -517,13 +517,6 @@ def enrich(sess, tick=None):
                 "observed_cursor": cursor,
             }
             last_ctx = _last_request_context(con, row[0])
-            try:
-                tr = con.execute(
-                    "SELECT title FROM session WHERE id=? LIMIT 1", (row[0],)).fetchone()
-                if tr and tr[0] and str(tr[0]).strip():
-                    sess.title = str(tr[0]).strip()
-            except Exception:
-                pass   # older DB without a title column → title stays None (tolerant, F-3)
             # R3-2: only query children when `row` is genuinely top-level (parent_id IS NULL,
             # row[-1] here) — the `_query` fallback clause can hand back a CHILD session, and
             # querying ITS children would surface grandchildren under the wrong parent.
@@ -538,11 +531,10 @@ def enrich(sess, tick=None):
         _attempt_sidecar_fallback(sess)
         return
     sid, slug, agent, model_j, cost, ti, to, tr, tupd, _parent = row
-    sidecar_title = titles.fresh_title(sid, harness="opencode")
+    sidecar_title = titles.last_title(sid, harness="opencode")
     sidecar_summary, sidecar_summary_ts = titles.fresh_summary_with_ts(
         sid, harness="opencode")
-    if sidecar_title:
-        sess.title = sidecar_title
+    sess.title = sidecar_title
     if sidecar_summary:
         sess.summary = sidecar_summary
         sess.summary_ts = sidecar_summary_ts

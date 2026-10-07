@@ -625,28 +625,17 @@ def enrich(sess):
                 observed_at=st.st_mtime, fresh_until=st.st_mtime + 900)
         except OSError:
             pass
-    # 3a) A fresh neutral sidecar overrides the AI title; failures pass through safely.
+    # The Fleet producer owns the subject; stale success survives refresh failures.
     from fleet import titles                      # Deferred import; no cycle, standard library only.
-    st = titles.fresh_title(sid, harness="claude") if sid else None
+    st = titles.last_title(sid, harness="claude") if sid else None
     # 3a') Exact-attempt fallback: a registered dispatch session (depth-1 owner or
     # depth-2 worker) runs no statusline producer, so its runtime sid has no
     # sidecar — the SD-95 dispatch summary owner writes under the attempt sid
     # instead. attempt_id is exact env/registry identity, never a cwd/pid guess.
     attempt_sid = titles.attempt_sid(sess.attempt_id)
     if not st and attempt_sid:
-        st = titles.fresh_title(attempt_sid, harness="claude")
-    if st:
-        sess.title = st
-    # 3b) F-14 ai-title fallback — own `<sid>.jsonl` only. A sid-less row's `path` is the
-    # newest NEIGHBOR transcript (liveness heuristic), and adopting its ai-title stamps
-    # another session's name onto this row (observed 2026-07-20: every registry-less
-    # same-cwd row wore the incident session's Korean title). The name falls to registry
-    # name → slug instead (F-26 chain); the mtime borrow above is deliberately unchanged.
-    elif path and sid:
-        t = _tail_ai_title(path)
-        if t:
-            sess.title = t
-    # Otherwise render falls back from a missing title to the registry name, then the slug.
+        st = titles.last_title(attempt_sid, harness="claude")
+    sess.title = st
     # 3c) F-16/F-17 merge — live one-sentence subtitle from the same sidecar/haiku call.
     sess.summary, sess.summary_ts = (
         titles.fresh_summary_with_ts(sid, harness="claude") if sid else (None, None))

@@ -110,27 +110,27 @@ class CodexCollectorTitleTest(_EnvMixin, unittest.TestCase):
             codex._proc_rollout = original
         return session
 
-    def test_native_thread_name_is_used(self):
+    def test_native_thread_name_is_not_a_fleet_title(self):
         rollout = self._fixture()
         session = self._enrich(rollout)
-        self.assertEqual(session.title, "Native Codex Title")
+        self.assertIsNone(session.title)
         self.assertEqual(session.session_id, self.SID)
         self.assertEqual(session._transcript_path, rollout)
 
-    def test_state_db_title_beats_session_index_fallback(self):
+    def test_state_db_title_is_not_a_fleet_title(self):
         rollout = self._fixture(native_title="Older Index Title")
         self._state_db_title("Current State DB Title")
-        self.assertEqual(self._enrich(rollout).title, "Current State DB Title")
+        self.assertIsNone(self._enrich(rollout).title)
 
     def test_fresh_sidecar_beats_native_thread_name(self):
         rollout = self._fixture()
         titles.write(self.SID, "Live Shared Title", harness="codex", now=time.time())
         self.assertEqual(self._enrich(rollout).title, "Live Shared Title")
 
-    def test_stale_sidecar_falls_back_to_native_thread_name(self):
+    def test_stale_success_is_retained_over_native_thread_name(self):
         rollout = self._fixture()
         titles.write(self.SID, "Stale", harness="codex", now=time.time() - 25 * 3600)
-        self.assertEqual(self._enrich(rollout).title, "Native Codex Title")
+        self.assertEqual(self._enrich(rollout).title, "Stale")
 
     def test_synthetic_adapter_bootstrap_native_title_is_hidden(self):
         rollout = self._fixture(native_title="Codex Adapter Bootstrap")

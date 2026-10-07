@@ -111,6 +111,13 @@ def fresh_title(sid, now=None, max_age=_FRESH_SEC, harness="claude"):
     return title if isinstance(title, str) and title.strip() else None
 
 
+def last_title(sid, harness="claude"):
+    """Keep the last successful subject even when refresh is unavailable or stale."""
+    data = read(sid, harness=harness) or {}
+    title = data.get("title")
+    return title if isinstance(title, str) and title.strip() else None
+
+
 def fresh_summary(sid, harness="claude", now=None, max_age=_FRESH_SUMMARY_SEC,
                   after_offset=None):
     """Return a non-empty summary only while the sidecar timestamp is fresh.
