@@ -3428,6 +3428,120 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
 
 
 class BesideStartTest(_TmpRootMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.resolve_primary = peer_steward.INSTALL_PATHS.primary_checkout
+        patch = mock.patch.object(peer_steward.INSTALL_PATHS, "primary_checkout",
+                                  side_effect=lambda cwd: Path(cwd))
+        self.primary_mock = patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_default_cwd_resolves_a_real_linked_worktree_subfolder_to_primary(self):
+        primary, linked = self.tmp_root / "primary", self.tmp_root / "linked"
+        native_run = subprocess.run
+        for argv in (["git", "init", "-q", str(primary)],
+                     ["git", "-C", str(primary), "-c", "user.name=Fixture", "-c",
+                      "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture"],
+                     ["git", "-C", str(primary), "worktree", "add", "-q", "-b", "linked", str(linked)]):
+            native_run(argv, check=True, capture_output=True, text=True)
+        subfolder = linked / "nested"
+        subfolder.mkdir()
+        self.primary_mock.side_effect = self.resolve_primary
+        calls = []
+
+        def run(argv, **kw):
+            if argv[0] == "git":
+                return native_run(argv, **kw)
+            calls.append(argv)
+            if argv[:3] == ["herdr", "pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+            if argv[:3] == ["herdr", "agent", "start"]:
+                self.assertEqual(kw["cwd"], str(primary))
+                return _herdr_json({"result": {"agent": {"agent": "codex", "name": "new"}}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.os, "getcwd", return_value=str(subfolder)), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
+             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["start", "new", "--kind", "codex", "--beside", "w1:pOld"]), 0)
+        self.assertEqual(calls[0][-2:], ["--cwd", str(primary)])
+        self.assertEqual(calls[1][-2:], ["--cd", str(primary)])
+        self.assertIn("cwd=" + str(primary), printed.call_args[0][0])
+
+    def test_opencode_late_bootstrap_waits_for_stable_shell_before_one_native_start(self):
+        clock, events = {"now": 0.0}, []
+
+        def export(pane):
+            events.append("export")
+            return "exported"
+
+        def snapshot(pane, shell, deadline=None):
+            self.assertEqual(deadline, 15)
+            events.append("snapshot")
+            return "settled" if clock["now"] >= .05 else None
+
+        def run(argv, **kw):
+            if argv[:3] == ["herdr", "pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+            if argv[:3] == ["herdr", "agent", "start"]:
+                self.assertGreaterEqual(clock["now"], .05)
+                events.append("native start")
+                return _herdr_json({"result": {"agent": {"agent": "opencode", "name": "new"}}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_export_opencode_tui_scoped", side_effect=export), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", side_effect=snapshot), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch.object(peer_steward.time, "sleep", side_effect=lambda n: clock.update(now=clock["now"] + n)), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["start", "new", "--kind", "opencode", "--beside", "w1:pOld",
+                                               "--cwd", str(self.tmp_root)]), 0)
+        self.assertEqual(events, ["export", "snapshot", "snapshot", "native start"])
+        self.assertIn("started=true", printed.call_args[0][0])
+        self.primary_mock.assert_not_called()
+
+    def test_unstable_bootstrap_uses_original_deadline_and_offers_retained_pane_reuse(self):
+        import shlex
+        clock = {"now": 0.0}
+        split = _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", return_value=split) as run, \
+             mock.patch.object(peer_steward, "_BESIDE_READY_SECONDS", .1), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value="exported"), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value=None), \
+             mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch.object(peer_steward.time, "sleep", side_effect=lambda n: clock.update(now=clock["now"] + n)), \
+             mock.patch.object(peer_steward, "_close_pane") as close, mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["start", "new", "--kind", "opencode", "--beside", "w1:pOld",
+                                               "--cwd", str(self.tmp_root), "--permission-mode", "inherit",
+                                               "--", "--model", "user/model"]), 1)
+        self.assertEqual(clock["now"], .1)
+        self.assertEqual(run.call_count, 1)
+        close.assert_not_called()
+        line = printed.call_args[0][0]
+        self.assertIn("reason=beside-shell-readiness-timeout", line)
+        self.assertIn("pane_cleanup=retained", line)
+        reuse = next(v.split("=", 1)[1] for v in shlex.split(line) if v.startswith("reuse_command="))
+        self.assertEqual(shlex.split(reuse), ["hearting", "run", "peer-steward", "start", "new",
+                         "--kind", "opencode", "--pane", "w1:pN", "--cwd", str(self.tmp_root),
+                         "--permission-mode", "inherit", "--", "--model", "user/model"])
+
     def test_same_tab_right_no_focus_split_reuses_start_with_new_pane_and_cwd(self):
         calls = []
         cwd = str(self.tmp_root)
@@ -3490,7 +3604,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                     "pane_id": "w1:pN", "agent_session": {"value": "new-native-sid"}}}})
             raise AssertionError(argv)
 
-        def snapshot(pane, shell):
+        def snapshot(pane, shell, deadline=None):
             self.assertGreaterEqual(clock["now"], .2)
             self.assertEqual((pane, shell), ("w1:pN", (101, "700")))
             events.append("snapshot")
@@ -3587,6 +3701,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
             split = run.call_args_list[0][0][0]
             self.assertEqual(split[:5], ["herdr", "pane", "split", "--pane", "w1:pMe"])
             self.assertEqual(split[split.index("--cwd") + 1], os.path.realpath(cwd))
+        self.assertEqual(self.resolve_primary(cwd), Path(cwd))
 
     def test_start_outside_a_herdr_pane_with_no_pane_named_says_so_and_runs_nothing(self):
         env = {k: v for k, v in os.environ.items() if k != "HERDR_PANE_ID"}

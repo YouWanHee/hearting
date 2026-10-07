@@ -54,6 +54,12 @@ _DEFAULTS_SPEC = importlib.util.spec_from_file_location(
 DEFAULTS = importlib.util.module_from_spec(_DEFAULTS_SPEC)
 _DEFAULTS_SPEC.loader.exec_module(DEFAULTS)
 
+_PATHS_SPEC = importlib.util.spec_from_file_location(
+    "hearting_install_paths", str(_UTILITIES_DIR.parent / "tools/install/paths.py")
+)
+INSTALL_PATHS = importlib.util.module_from_spec(_PATHS_SPEC)
+_PATHS_SPEC.loader.exec_module(INSTALL_PATHS)
+
 _PERMISSION_FLAGS = {
     "claude": ["--permission-mode", "bypassPermissions"],
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
@@ -923,12 +929,12 @@ def _start_pane_screen(pane):
         return None
 
 
-def _start_shell_snapshot(pane, original_shell):
+def _start_shell_snapshot(pane, original_shell, deadline=None):
     """Two equal observations before native start, within one second."""
     if original_shell is None:
         return None
     previous = None
-    deadline = time.monotonic() + 1
+    deadline = min(time.monotonic() + 1, deadline) if deadline is not None else time.monotonic() + 1
     while time.monotonic() < deadline:
         if (_pane_has_agent(pane) is not None
                 or _start_shell_identity(pane) != original_shell):
@@ -1122,7 +1128,7 @@ def cmd_start(args):
             return 1
     if args.beside and not args.cwd:
         try:
-            args.cwd = os.getcwd()
+            args.cwd = str(INSTALL_PATHS.primary_checkout(os.getcwd()))
         except OSError:
             args.cwd = None
 
@@ -1142,8 +1148,21 @@ def cmd_start(args):
     created_pane = False
 
     def cleanup():
-        return (f" pane_cleanup={_failed_start_cleanup(args.pane, created_shell, created_screen)}"
-                if created_pane else "")
+        if not created_pane:
+            return ""
+        result = _failed_start_cleanup(args.pane, created_shell, created_screen)
+        note = f" pane_cleanup={result}"
+        if result in {"retained", "close-failed"}:
+            retry = ["hearting", "run", "peer-steward", "start", args.name,
+                     "--kind", args.kind, "--pane", args.pane]
+            if pane_cwd:
+                retry += ["--cwd", pane_cwd]
+            if args.permission_mode:
+                retry += ["--permission-mode", args.permission_mode]
+            if getattr(args, "agent_args", None):
+                retry += ["--"] + list(args.agent_args)
+            note += " reuse_command=" + shlex.quote(shlex.join(retry))
+        return note
 
     if getattr(args, "beside", None):
         cmd = ["herdr", "pane", "split", "--pane", args.beside,
@@ -1226,13 +1245,22 @@ def cmd_start(args):
         cmd += ["--"] + full_agent_args
 
     if created_pane:
-        readiness, created_shell = _wait_for_created_shell(
-            args.pane, pane_cwd, created_shell, created_deadline)
-        if readiness:
+        readiness = "beside-shell-readiness-timeout"
+        while time.monotonic() < created_deadline:
+            readiness, created_shell = _wait_for_created_shell(
+                args.pane, pane_cwd, created_shell, created_deadline)
+            if readiness:
+                break
+            created_screen = _start_shell_snapshot(
+                args.pane, created_shell, deadline=created_deadline)
+            if created_screen is not None:
+                break
+            time.sleep(min(.05, max(0, created_deadline - time.monotonic())))
+        if readiness or created_screen is None:
+            readiness = readiness or "beside-shell-readiness-timeout"
             print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
                   f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
             return 1
-        created_screen = _start_shell_snapshot(args.pane, created_shell)
 
     try:
         # `cwd=` here moves only this CLI process, never the launched agent — the agent
