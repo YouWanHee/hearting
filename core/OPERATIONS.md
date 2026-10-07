@@ -1169,11 +1169,12 @@ attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
 which with no `--pane` or `--beside` opens the successor to the right of the
-calling pane (`HERDR_PANE_ID`) in the same tab without focus, in the calling cwd
-unless `--cwd` names another. The new pane's
+calling pane (`HERDR_PANE_ID`) in the same tab without focus, in the Git primary
+checkout (the calling cwd outside Git) unless `--cwd` names another. The new pane's
 split-cwd and launcher preparation finish under one fixed
-monotonic deadline before its single start request; caller-provided panes keep
-their existing path, and uncertain readiness leaves the new pane retained.
+monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
+before its single start request; caller-provided panes keep their existing path.
+Uncertain readiness leaves the new pane retained with its reuse command in the receipt.
 The predecessor hands over its card and documents, receives the successor's ACK,
 leaves its last result and becomes idle; the successor then uses `retire <predecessor>` to send
 one normal exit action (Claude `/exit` + Enter; Codex/OpenCode Ctrl+D) and close
