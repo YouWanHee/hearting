@@ -61,6 +61,25 @@ _PATHS_SPEC = importlib.util.spec_from_file_location(
 INSTALL_PATHS = importlib.util.module_from_spec(_PATHS_SPEC)
 _PATHS_SPEC.loader.exec_module(INSTALL_PATHS)
 
+# herdr runs one server per session (`herdr session list`), each with its own
+# socket and its own pane namespace -- `w1:p1` names a different pane in every
+# one of them. A bare `herdr ...` call always reaches the default server, so on
+# a machine running more than one session every steward surface either reports
+# `agent_not_found` for a pane that plainly exists, or resolves the id against
+# the wrong server. Every herdr invocation below therefore carries the selected
+# session, and the environment variable is what a detached watcher re-armed
+# from a hook inherits.
+_HERDR_SESSION = os.environ.get("AGENT_HERDR_SESSION") or None
+
+
+def _herdr_argv(*args):
+    """`herdr [--session <name>] <args...>` for the selected herdr session."""
+    argv = ["herdr"]
+    if _HERDR_SESSION:
+        argv += ["--session", _HERDR_SESSION]
+    return argv + list(args)
+
+
 _PERMISSION_FLAGS = {
     "claude": ["--permission-mode", "bypassPermissions"],
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
@@ -316,7 +335,7 @@ def _resolve_target(target):
     if _herdr_missing():
         return None, None, None
     try:
-        proc = subprocess.run(["herdr", "agent", "get", target], capture_output=True,
+        proc = subprocess.run(_herdr_argv("agent", "get", target), capture_output=True,
                               text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
     except Exception:
@@ -392,7 +411,7 @@ def _unavailable(reason):
 
 
 def _run_herdr_wait(target, until, timeout_ms):
-    cmd = ["herdr", "agent", "wait", target]
+    cmd = _herdr_argv("agent", "wait", target)
     for state in until or []:
         cmd += ["--until", state]
     if timeout_ms is not None:
@@ -559,7 +578,7 @@ def _pane_has_agent(pane):
     only declines to act where the start itself is going to refuse.
     """
     try:
-        proc = subprocess.run(["herdr", "pane", "get", pane], capture_output=True,
+        proc = subprocess.run(_herdr_argv("pane", "get", pane), capture_output=True,
                               text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
     except Exception:
@@ -577,9 +596,9 @@ def _wait_for_shell_prompt(pane, timeout_ms=None):
     timeout_ms = int(_herdr_get_timeout() * 1000 if timeout_ms is None else timeout_ms)
     try:
         proc = subprocess.run(
-            ["herdr", "pane", "wait-output", pane, "--regex",
-             r"(?m)(?:^|[ ])(?:[$#%❯])\s*(?-m:$)",
-             "--source", "visible", "--timeout", str(timeout_ms)],
+            _herdr_argv("pane", "wait-output", pane, "--regex",
+                        r"(?m)(?:^|[ ])(?:[$#%❯])\s*(?-m:$)",
+                        "--source", "visible", "--timeout", str(timeout_ms)),
             capture_output=True, text=True, timeout=max(1, timeout_ms / 1000 + 1))
     except (OSError, subprocess.SubprocessError):
         return False
@@ -589,7 +608,7 @@ def _wait_for_shell_prompt(pane, timeout_ms=None):
 def _pane_foreground_shell(pane):
     """Observe the actual shell, not an old prompt left by a foreground job."""
     try:
-        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+        proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -640,11 +659,11 @@ def _ensure_pane_ingress(pane, kind, cwd=None):
         commands.append('export PATH="%s:$PATH"' % directory)
     line = " && ".join(commands)
     try:
-        text = subprocess.run(["herdr", "pane", "send-text", pane, line],
+        text = subprocess.run(_herdr_argv("pane", "send-text", pane, line),
                               capture_output=True, text=True, timeout=5)
         if text.returncode != 0:
             return "ingress-send-failed"
-        enter = subprocess.run(["herdr", "pane", "send-keys", pane, "Enter"],
+        enter = subprocess.run(_herdr_argv("pane", "send-keys", pane, "Enter"),
                                capture_output=True, text=True, timeout=5)
         if enter.returncode != 0:
             return "ingress-send-failed"
@@ -668,7 +687,7 @@ def _pane_is_managed(pane):
     entry sets that variable for its CHILDREN, not for itself.
     """
     try:
-        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+        proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
         info = (payload.get("result") or {}).get("process_info") or {}
@@ -738,7 +757,7 @@ def _fleet_codex_collector():
 def _pane_codex_pid(pane):
     """Pid of the pane's foreground `codex` process, from `herdr pane process-info`."""
     try:
-        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+        proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
         info = (payload.get("result") or {}).get("process_info") or {}
@@ -900,7 +919,7 @@ def _start_shell_identity(pane):
 
 def _close_pane(pane):
     try:
-        proc = subprocess.run(["herdr", "pane", "close", pane],
+        proc = subprocess.run(_herdr_argv("pane", "close", pane),
                               capture_output=True, text=True, timeout=5)
         payload = json.loads(proc.stdout or "")
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -913,8 +932,8 @@ def _close_pane(pane):
 def _start_pane_screen(pane):
     """Return the visible screen verbatim; never interpret it as a prompt."""
     try:
-        proc = subprocess.run(["herdr", "pane", "read", pane, "--source", "visible",
-                               "--format", "ansi"],
+        proc = subprocess.run(_herdr_argv("pane", "read", pane, "--source", "visible",
+                                          "--format", "ansi"),
                               capture_output=True, text=True, timeout=5)
         if (proc.returncode or not isinstance(proc.stdout, str)
                 or len(proc.stdout.encode("utf-8")) > 65536):
@@ -1051,11 +1070,11 @@ def _export_opencode_tui_scoped(pane):
     line = ("export OPENCODE_TUI_CONFIG=${OPENCODE_TUI_CONFIG:-%s}"
             % shlex.quote(scoped))
     try:
-        text = subprocess.run(["herdr", "pane", "send-text", pane, line],
+        text = subprocess.run(_herdr_argv("pane", "send-text", pane, line),
                               capture_output=True, text=True, timeout=5)
         if text.returncode != 0:
             return "send-failed"
-        enter = subprocess.run(["herdr", "pane", "send-keys", pane, "Enter"],
+        enter = subprocess.run(_herdr_argv("pane", "send-keys", pane, "Enter"),
                                capture_output=True, text=True, timeout=5)
         if enter.returncode != 0:
             return "send-failed"
@@ -1166,8 +1185,8 @@ def cmd_start(args):
         return note
 
     if getattr(args, "beside", None):
-        cmd = ["herdr", "pane", "split", "--pane", args.beside,
-               "--direction", "right", "--no-focus"]
+        cmd = _herdr_argv("pane", "split", "--pane", args.beside,
+                          "--direction", "right", "--no-focus")
         if pane_cwd:
             cmd += ["--cwd", pane_cwd]
         try:
@@ -1241,7 +1260,7 @@ def cmd_start(args):
     # herdr `agent start <NAME> --kind --pane` — the display name is a required
     # positional (herdr 0.8+ prints `unknown option: <kind>` and starts nothing when
     # it is missing; measured 2026-09-03, F-100 comms test).
-    cmd = ["herdr", "agent", "start", args.name, "--kind", args.kind, "--pane", args.pane]
+    cmd = _herdr_argv("agent", "start", args.name, "--kind", args.kind, "--pane", args.pane)
     if full_agent_args:
         cmd += ["--"] + full_agent_args
 
@@ -1405,7 +1424,7 @@ def _retire_process_record(pid):
 
 def _retire_pane_info(pane, timeout=5):
     try:
-        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+        proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=timeout)
         payload = json.loads(proc.stdout or "")
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -1528,7 +1547,7 @@ def cmd_retire(args):
         for index, (operation, value) in enumerate(_RETIRE_ACTIONS[harness]):
             if index and _retire_foreground(pane, harness) != identity:
                 return finish("foreground-changed")
-            sent = subprocess.run(["herdr", "pane", operation, pane, value],
+            sent = subprocess.run(_herdr_argv("pane", operation, pane, value),
                                   capture_output=True, text=True, timeout=5)
             send_error = False
             if (sent.stdout or sent.stderr).strip():
@@ -1638,9 +1657,9 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
     if _retire_background_dialog_lines(_read_screen(target)) is None:
         return finish("agent-still-running")
     try:
-        subprocess.run(["herdr", "pane", "send-text", pane, "1"],
+        subprocess.run(_herdr_argv("pane", "send-text", pane, "1"),
                        capture_output=True, text=True, timeout=5)
-        subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
+        subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return finish("exit-send-failed")
@@ -1659,9 +1678,9 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
                           detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
     try:
-        subprocess.run(["herdr", "pane", "send-text", pane, "3"],
+        subprocess.run(_herdr_argv("pane", "send-text", pane, "3"),
                        capture_output=True, text=True, timeout=5)
-        subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
+        subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return finish("agent-still-running")
@@ -1889,7 +1908,7 @@ def _herdr_get_timeout():
 def _run_herdr_get(target):
     try:
         proc = subprocess.run(
-            ["herdr", "agent", "get", target], capture_output=True, text=True,
+            _herdr_argv("agent", "get", target), capture_output=True, text=True,
             timeout=_herdr_get_timeout(),   # a wedged socket is `herdr-unavailable`, not a hang (M3)
         )
     except (OSError, subprocess.SubprocessError):
@@ -2457,7 +2476,7 @@ def _prompt_box_evidence(target):
     `rule: none` with no evidence line at all -- neither is a box read, and a
     box that was not read is never "clear" (review round 1, B2/B3)."""
     try:
-        proc = subprocess.run(["herdr", "agent", "explain", target],
+        proc = subprocess.run(_herdr_argv("agent", "explain", target),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return None, False
@@ -2575,7 +2594,7 @@ def _transcript_arrival(t_harness, t_sid, first_line, since_epoch):
 
 
 def _herdr_prompt(target, text, *, wait, timeout_ms):
-    cmd = ["herdr", "agent", "prompt", target, text]
+    cmd = _herdr_argv("agent", "prompt", target, text)
     if wait:
         cmd += ["--wait", "--until", "working", "--timeout", str(timeout_ms)]
     try:
@@ -2617,7 +2636,7 @@ def _form_open(target):
     permission prompt), hence this whitespace-free scan of the whole visible
     buffer, run for every state (review round 1, M3/minor 5)."""
     try:
-        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible"],
+        proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible"),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
@@ -2636,7 +2655,7 @@ def _bottom_form_tokens(target, window=15):
     redelivery (2026-10-07).
     """
     try:
-        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible"],
+        proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible"),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
@@ -3213,7 +3232,7 @@ def _codex_rollout_exists(thread_id):
 def _read_screen(target):
     """The visible pane (ANSI) as screen lines, or None when it could not be read."""
     try:
-        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible", "--format", "ansi"],
+        proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible", "--format", "ansi"),
                               capture_output=True, text=True, errors="replace", timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return None
@@ -3245,7 +3264,7 @@ def _process_session(pane, harness):
     the previous session for good (live panes 2026-10-01), so a second tidy in the same
     window would otherwise never clear it."""
     try:
-        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+        proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
         payload = json.loads(proc.stdout or "")
         processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
@@ -3322,8 +3341,8 @@ def _wait_for_home(target, bound_ms):
     `_settle` would return at once. Waits (bounded) for the home screen's placeholder to show;
     the answer is not used -- the caller looks at the screen itself."""
     try:
-        subprocess.run(["herdr", "pane", "wait-output", target, "--match", "Ask anything",
-                        "--source", "visible", "--timeout", str(int(bound_ms))],
+        subprocess.run(_herdr_argv("pane", "wait-output", target, "--match", "Ask anything",
+                                   "--source", "visible", "--timeout", str(int(bound_ms))),
                        capture_output=True, text=True, timeout=bound_ms / 1000.0 + 5)
     except (OSError, subprocess.SubprocessError):
         pass
@@ -3720,6 +3739,9 @@ def cmd_steward(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="peer-steward")
+    parser.add_argument("--herdr-session", default=None,
+                        help="herdr session holding the target pane "
+                             "(default: AGENT_HERDR_SESSION, else herdr's default session)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_wait = sub.add_parser("wait")
@@ -3841,6 +3863,12 @@ def main(argv=None):
     parsed_argv, agent_args = _split_agent_args(argv)
     args = build_parser().parse_args(parsed_argv)
     args.agent_args = agent_args
+    if args.herdr_session:
+        global _HERDR_SESSION
+        _HERDR_SESSION = args.herdr_session
+        # A detached watcher is re-execed without this argv, so carry the
+        # selection in the environment it inherits.
+        os.environ["AGENT_HERDR_SESSION"] = args.herdr_session
     return args.func(args)
 
 
