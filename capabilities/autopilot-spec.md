@@ -54,11 +54,9 @@ options, one recommended, no harness vocabulary, only decisions the user alone
 can make; `utilities/frame_interview.py validate` is the bar and `gate --block`
 refuses what fails it). For this capability the restatement names the product
 intent in the user's own words, which is the claim the PRD is later measured
-against. Depth-0 puts those questions to the user, records the answers with
-`workflow-supervisor.py release --gate frame-review --decision
-proceed|revise|stop --answers <file>`, and renders
-`spec/_internal/research/frame/intent.md` with `frame_interview.py
-render-intent`.
+against. Depth-0 puts those questions to the user;
+the receipt's `resume_command --answers <file>` validates the answers, renders
+the intent, releases the gate and starts the owner.
 
 The owner **receives** `intent.md`'s path as an input. It raises no gate,
 waits on no release, and renders no intent of its own — all of that is

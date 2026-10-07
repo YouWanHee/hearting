@@ -68,10 +68,9 @@ most `frame_interview.py`'s `QUESTION_CAP` short questions — one topic each,
 alone can make; `utilities/frame_interview.py validate` is the bar and
 `gate --block` refuses what fails it). For this capability the restatement
 names the target artifact and the scope of change the user is authorizing.
-Depth-0 puts those questions to the user, records the answers with
-`workflow-supervisor.py release --gate frame-review --decision
-proceed|revise|stop --answers <file>`, and renders `shards/frame/intent.md`
-with `frame_interview.py render-intent`.
+Depth-0 puts those questions to the user;
+the receipt's `resume_command --answers <file>` validates the answers, renders
+`shards/frame/intent.md`, releases the gate and starts the owner.
 
 The owner **receives** `intent.md`'s path as an input. Depth-0 has already
 finished the frame interview and rendered intent. The owner later raises and

@@ -148,12 +148,9 @@ Capacity never crosses a quality band unless the relief threshold is met, and
 OpenCode is not a default deep peer.
 
 Check `preflight.sh headless [--check] [--require-hook-trust] <worktree>`.
-Launch registered jobs only through `preflight.sh dispatch
---dry-run|--register|--start [--require-hook-trust]` with the complete tuple in
-`core/OPERATIONS.md`. Keep `capability_mode` separate from a non-owner
-`worker_mode`, which must equal its portable `unit`; a dispatch-depth-1 owner is
-`_kernel/owner` with no worker mode. `worker_role` and legacy `mode` are
-read-only metadata, not bootstrap identity. A direct interactive launch selects
+`preflight.sh dispatch --dry-run|--register|--start [--require-hook-trust]`
+runs the raw wrapper; the route commands above reach it with the sealed tuple.
+A direct interactive launch selects
 completion by the parent runtime: a Codex parent uses its
 native queue and a Claude parent uses Claude resume. Native queue
 delivery does not force Stop/PreToolUse trust. Keep the parent
