@@ -2073,6 +2073,23 @@ class CarrierExitRecordTest(unittest.TestCase):
         self.assertEqual([(r["arms"], r["holder"][0]) for r in self.rows()], [(1, "7"), (2, "9")])
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_two_replacements_record_all_earlier_arms(self):
+        self.path.parent.mkdir()
+        first = rewake.ArmClaim(self.path, "att-owner-1", "session-1", 1, ("7", "8", "ns"))
+        second = replace(first, path=self.path.with_name("att-owner-2.json"),
+                         attempt_id="att-owner-2", predecessors=(first,))
+        third = replace(first, path=self.path.with_name("att-owner-3.json"),
+                        attempt_id="att-owner-3", predecessors=(second,))
+        for claim in (first, second, third):
+            claim.path.write_text("original arm")
+        with mock.patch.object(rewake, "_run_carrier", return_value=2):
+            self.assertEqual(rewake._observe_carrier(
+                rewake.Launch(third.attempt_id, self.fixture.jobs, third.session_id), third, {}), 2)
+        for claim in (first, second, third):
+            row, = [json.loads(line) for line in claim.path.with_suffix(".exits.jsonl").read_text().splitlines()]
+            self.assertEqual((row["attempt_id"], row["exit_code"]), (claim.attempt_id, 2))
+            self.assertEqual(claim.path.read_text(), "original arm")
+
     def test_exception_is_recorded_and_still_raised(self):
         self.path.parent.mkdir()
         claim = rewake.ArmClaim(self.path, "att-owner-1", "session-1", 1, ("7", "8", "ns"))
@@ -2092,6 +2109,21 @@ class CarrierExitRecordTest(unittest.TestCase):
         with mock.patch.object(rewake, "_run_carrier", return_value=2):
             self.assertEqual(rewake._observe_carrier(rewake.Launch(claim.attempt_id, self.fixture.jobs, claim.session_id), claim, {}), 2)
         self.assertEqual(foreign.read_text(), "keep me")
+
+    def test_append_failure_preserves_completed_claim_and_folded_gate_ack(self):
+        self.fixture._open_row()
+        record_path = self.fixture._close_and_materialize()
+        gate_id = self.fixture._gate()
+        self.path.parent.mkdir(exist_ok=True)
+        self.path.with_suffix(".exits.jsonl").symlink_to(self.fixture.root / "missing-target")
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.fixture.ANCESTRY):
+            code, out, err = self.fixture._run_main()
+        self.assertEqual(code, 2)
+        self.assertTrue(out)
+        self.assertIn("required_action=human-gate:frame-review", err)
+        self.assertEqual(json.loads(record_path.read_text())["state"], "sent-ambiguous")
+        self.assertEqual(rewake.pending_delivery.read(self.fixture.root, "session-1", gate_id)["state"], "acked")
+        self.assertEqual(rewake._read_arm(self.path)["state"], "ended")
 
     def test_term_and_hup_record_then_keep_native_signal_exit(self):
         import select

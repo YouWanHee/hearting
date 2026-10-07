@@ -1445,7 +1445,10 @@ def no_arm_notice(payload: object, *, reason: str | None = None) -> int:
 
 def _record_carrier_exit(claim: ArmClaim, observation: dict[str, Any]) -> None:
     """Append diagnostics only; never replace an arm or affect its decision."""
-    for held in (claim, *claim.predecessors):
+    pending = [claim]
+    while pending:
+        held = pending.pop()
+        pending.extend(held.predecessors)
         fd = -1
         try:
             row = {"schema": "carrier-exit/v1", "ended_at": datetime.now(timezone.utc).isoformat(),
