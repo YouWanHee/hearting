@@ -1616,6 +1616,23 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     self.assertEqual(row["evidence_digest"], ROUTE.evidence_digest(report))
                     self.assertFalse((ROUTE.completion_dir(route["route_id"], jobs=jobs) / "prd-transaction.json").exists())
 
+    def test_settled_completion_does_not_depend_on_progress_ledger(self):
+        import workflow_state
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture, terminal, route, path, jobs, owner, report, meta = self._settled(harness, "owner-report.md")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                    request = terminal._completion_request(jobs, "done", meta)
+                    # Seal the real outcome, cycle and envelope before the
+                    # workflow controller has published its COMPLETE suffix.
+                    self.assertEqual(terminal.settle_terminal_commit(request).result, "completed")
+                    ledger = workflow_state.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
+                    self.assertNotEqual(ledger.read_only_state()["workflow_state"], "COMPLETE")
+                    before = ledger.journal()
+                    self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+                    self.assertEqual(ledger.journal(), before)
+                    self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+
     def test_a_report_already_in_its_bucket_is_unchanged(self):
         fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "spec/_internal/owner-report.md")
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):

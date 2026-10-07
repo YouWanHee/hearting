@@ -129,8 +129,13 @@ def _public(value, *, live=False, reachable=None, owner_phase=None):
     timing = ("active-turn" if value["transport"] == "codex-active-turn" and phase == "running-turn"
               else "phase-unavailable" if value["transport"] == "codex-active-turn" and phase == "unknown"
               else "next-owner-turn")
-    notice = ("Queued corrections may wait for the next owner turn; a parked owner may be delayed "
-              "until joined children finish or require attention. This command does not wake or cancel the owner.")
+    lead = {"active-turn": ("A queued correction goes into the owner's running turn; if that turn "
+                            "refuses it, it waits for the next owner turn."),
+            "phase-unavailable": "Queued corrections may wait for the next owner turn."}.get(
+                timing, "Queued corrections are delayed until the next owner turn.")
+    notice = (lead + " A parked owner gets its next turn once the children running now finish or "
+              "require attention; a serial sub-session chain starts no further sub-session while a "
+              "correction waits. This command does not wake or cancel the owner.")
     if timing == "phase-unavailable":
         notice = ("Delivery timing is unknown because the exact owner phase is unavailable. " + notice)
     return {"attempt_id": value["attempt_id"], "thread_id": value["thread_id"],

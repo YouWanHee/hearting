@@ -1040,6 +1040,22 @@ class WorkStartTest(unittest.TestCase):
             self.assertEqual(self.start()["reason"], "workflow-completion-pending")
         self.assertEqual(self.calls, [])
 
+    def test_closed_completion_reports_parent_delivery_as_information(self):
+        import dispatch_terminal_commit as terminal
+        self.path.with_suffix(".outcome.json").write_text(json.dumps({
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+            "terminal_gate_proven": True, "terminal_owner_attempt_id": "att-owner"}))
+        meta = {"workflow_completion": "runtime-v1", "owner_route_id": self.route["route_id"],
+                "parent_completion_delivery": "poll-fallback",
+                "parent_completion_reason": "parent-identity-unmatched"}
+        with mock.patch.object(W, "_rows", return_value={"att-owner": ("done", meta)}), \
+                mock.patch.object(terminal, "owner_completion_state", return_value=terminal.CompletionState("complete")):
+            result = self.start()
+        self.assertEqual((result["state"], result["required_action"]), ("completed", "advance-completed"))
+        self.assertEqual(result["completion_delivery"], [{"attempt_id": "att-owner", "carrier": "poll-fallback",
+                                                        "reason": "parent-identity-unmatched"}])
+        self.assertEqual(self.calls, [])
+
     def test_a_replaced_owner_with_nothing_to_settle_does_not_hold_a_closed_route(self):
         # The first owner stopped at a gate and was replaced; its BLOCKED row is `not-applicable`,
         # and the replacement settled the route (Claude r4 leg1, defect 2).

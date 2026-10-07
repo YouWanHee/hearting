@@ -37,7 +37,10 @@ import dispatch_parent_completion as parent_completion
 from dispatch_mode_contract import DispatchModeContractError, validate_route_mode_axes
 from execution_access import receipt_fragment as execution_access_receipt_fragment
 from stage_session_runtime import metadata as stage_session_metadata
-from model_config import ModelConfigError, resolve_config
+from model_config import (
+    ModelConfigError, headless_model_refusal, main_session_only_models,
+    main_session_only_state, resolve_config, restricted_model,
+)
 from owner_route_binding import OwnerRouteBindingError, validate_runtime_requirements
 import route_authority
 from route_authority import scan_anchored_death
@@ -782,3 +785,80 @@ def bind_parent_completion_delivery(args: argparse.Namespace, *, probe) -> None:
 
 def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path, *, launch, annotate) -> None:
     parent_completion.launch_parent_completion_sidecar(args, jobs, launch=launch, annotate=annotate)
+
+
+def acquire_review_lease_after_claim(
+    args, jobs: Path, identity: dict[str, str], *,
+    detached, lease_held, acquire_admission, acquire_foreground_admission, lease_acquire,
+) -> dict[str, str]:
+    """The review lease for a just-claimed attempt; the wrapper passes its own
+    lifecycle constant and admission/probe/acquire functions, looked up in its
+    module at call time so the reviewer_report_binding mocks keep working."""
+    if not args.review_output:
+        return {}
+    binding = args.review_output_binding
+    budget = getattr(args, "watchdog_budget", None)
+    if budget is None:
+        raise ProducerError("review-watchdog-budget-missing")
+    witness_metadata = {
+        "attempt_id": args.attempt_id,
+        "review_cycle_id": binding["cycle_id"],
+        "review_governed_lease": "summary-flock-v1",
+        "review_governed_lease_nonce": args.review_governed_lease_nonce,
+    }
+    witness_unlocked = lambda: not lease_held(
+        Path(args.artifact_root), witness_metadata
+    )
+    if args.launch_lifecycle == detached:
+        handle = getattr(args, "review_watchdog_handle", None)
+        if handle is None:
+            raise ProducerError("review-watchdog-handle-missing")
+        return acquire_admission(
+            handle=handle, budget=budget, identity=identity,
+            root=Path(args.artifact_root), cycle_id=binding["cycle_id"],
+            attempt_id=args.attempt_id, review_output=binding["output_path"],
+            binding=binding, jobs=jobs, nonce=args.review_governed_lease_nonce,
+            lease_acquire=lease_acquire, witness_probe=witness_unlocked,
+        )
+    return acquire_foreground_admission(
+        budget=budget, identity=identity, root=Path(args.artifact_root),
+        cycle_id=binding["cycle_id"], attempt_id=args.attempt_id,
+        review_output=binding["output_path"], binding=binding, jobs=jobs,
+        lease_acquire=lease_acquire, witness_probe=witness_unlocked,
+    )
+
+
+def model_policy(harness: str, *, error) -> dict[str, str]:
+    """This launch's model policy; the wrapper passes its own harness name and
+    its `ModelSelectionError` class, so each adapter keeps raising its own."""
+    try:
+        values, _receipt = resolve_config(harness, source_root=ROOT)
+    except ModelConfigError as exc:
+        raise error("dispatch-model-policy-unavailable", str(exc)) from exc
+    return values
+
+
+def require_headless_model(model: str, source: str, *, policy, error) -> None:
+    """Refuse a main-session-only model on a headless launch. The wrapper passes
+    its own `_model_policy` looked up at call time (the eligibility tests patch
+    the wrapper's name) and its `ModelSelectionError` class."""
+    refusal = headless_model_refusal(policy(), model, source)
+    if refusal:
+        raise error(*refusal)
+
+
+def main_session_only_model(model: str, policy) -> bool:
+    """Whether the selected model is restricted to the main session. The
+    wrapper passes its own `_model_policy` looked up at call time (the
+    eligibility tests patch the wrapper's name)."""
+    return restricted_model(model, main_session_only_models(policy()))
+
+
+def main_session_only_policy_state(policy, *, error) -> str:
+    """`declared`/`absent`/`unavailable` for the receipt. The wrapper passes its
+    own `_model_policy` and its `ModelSelectionError` class, so each adapter
+    keeps catching its own class."""
+    try:
+        return main_session_only_state(policy())
+    except error:
+        return "unavailable"

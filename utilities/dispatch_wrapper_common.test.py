@@ -306,6 +306,92 @@ class ParentCompletionTest(unittest.TestCase):
                     wrapper.launch_parent_completion_sidecar(args, Path("/tmp/jobs"))
                     self.assertIs(sidecar.call_args.kwargs["launch"], launch)
                     self.assertIs(sidecar.call_args.kwargs["annotate"], annotate)
+class ReviewLeaseTest(unittest.TestCase):
+    def args(self, lifecycle):
+        return argparse.Namespace(
+            review_output="/out.md",
+            review_output_binding={"cycle_id": "cyc", "output_path": "/out.md"},
+            watchdog_budget=60, attempt_id="att-1",
+            review_governed_lease_nonce="n" * 8, artifact_root="/art",
+            launch_lifecycle=lifecycle, review_watchdog_handle=object(),
+        )
+
+    def test_every_wrapper_injects_its_admission_hooks_at_call_time(self):
+        # reviewer_report_binding patches the wrapper's acquire_* and witness
+        # names; the delegation must look them up when called, not imported.
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            for lifecycle, name in (
+                (wrapper.DETACHED, "acquire_review_admission"),
+                (wrapper.FOREGROUND_SCOPED, "acquire_foreground_review_admission"),
+            ):
+                with self.subTest(harness=harness, admission=name):
+                    with mock.patch.object(wrapper, name, return_value="admission") as acquire:
+                        result = wrapper.acquire_review_lease_after_claim(
+                            self.args(lifecycle), Path("/tmp/jobs"),
+                            {"pid": "1", "pid_start": "2"})
+                    self.assertEqual(result, "admission")
+                    self.assertIs(acquire.call_args.kwargs["lease_acquire"], wrapper.review_lease_acquire)
+                    self.assertIs(acquire.call_args.kwargs["budget"], self.args(lifecycle).watchdog_budget)
+                    # The witness probe resolves the wrapper's name when it is
+                    # called (the reviewer_report_binding pattern).
+                    with mock.patch.object(wrapper, "review_governed_lease_is_held", return_value=True):
+                        self.assertFalse(acquire.call_args.kwargs["witness_probe"]())
+class ModelPolicyTest(unittest.TestCase):
+    def test_model_policy_reads_the_wrappers_harness_and_error(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(C, "resolve_config", return_value=({"a": "b"}, None)) as resolve:
+                    self.assertEqual(wrapper._model_policy(), {"a": "b"})
+                self.assertEqual(resolve.call_args.args[0], harness)
+                with mock.patch.object(C, "resolve_config", side_effect=C.ModelConfigError("x")):
+                    with self.assertRaises(wrapper.ModelSelectionError) as caught:
+                        wrapper._model_policy()
+                self.assertEqual(caught.exception.reason, "dispatch-model-policy-unavailable")
+
+    def test_require_headless_model_uses_the_wrappers_policy_and_error(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(C, "headless_model_refusal", return_value=("r", "m")):
+                    with self.assertRaises(wrapper.ModelSelectionError) as caught:
+                        wrapper._require_headless_model("m", "src")
+                self.assertEqual((caught.exception.reason, caught.exception.args[0]), ("r", "m"))
+                with mock.patch.object(wrapper, "_model_policy", return_value={}) as policy, \
+                     mock.patch.object(C, "headless_model_refusal", return_value=None):
+                    wrapper._require_headless_model("m", "src")
+                policy.assert_called_once_with()
+
+    def test_main_session_only_model_uses_the_wrappers_policy(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(wrapper, "_model_policy", return_value={"a": "b"}) as policy, \
+                     mock.patch.object(C, "main_session_only_models", return_value="m") as models, \
+                     mock.patch.object(C, "restricted_model", return_value=True) as restricted:
+                    self.assertTrue(wrapper._main_session_only_model("m"))
+                policy.assert_called_once_with()
+                self.assertEqual(models.call_args.args, ({"a": "b"},))
+                self.assertEqual(restricted.call_args.args, ("m", "m"))
+
+    def test_main_session_only_policy_state_uses_the_wrappers_policy_and_error(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(wrapper, "_model_policy", return_value={}) as policy, \
+                     mock.patch.object(C, "main_session_only_state", return_value="declared"):
+                    self.assertEqual(wrapper._main_session_only_policy_state(), "declared")
+                policy.assert_called_once_with()
+                with mock.patch.object(wrapper, "_model_policy",
+                                       side_effect=wrapper.ModelSelectionError("r", "x")) as policy:
+                    self.assertEqual(wrapper._main_session_only_policy_state(), "unavailable")
+                policy.assert_called_once_with()
 
 
 class RegistrationFenceTest(unittest.TestCase):
