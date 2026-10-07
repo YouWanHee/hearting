@@ -102,6 +102,8 @@ read_launch_fence_failure = WRAPPER_COMMON.read_launch_fence_failure
 resolve_artifact_root = WRAPPER_COMMON.resolve_artifact_root
 resolve_report_bundle_root = WRAPPER_COMMON.resolve_report_bundle_root
 seed_launch_heartbeat = WRAPPER_COMMON.seed_launch_heartbeat
+_registered_owner = WRAPPER_COMMON.registered_owner
+completion_state_path = WRAPPER_COMMON.completion_state_path
 from dispatch_summary import launch_summary_owner, owner_root  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
@@ -944,12 +946,8 @@ def validate_nested_owner_registry_projection(args: argparse.Namespace) -> None:
         )
 
 
-def _registered_owner(args: argparse.Namespace) -> bool:
-    return args.dispatch_depth == 1 and args.worker_type == "owner"
-
-
 def _completion_owner(args: argparse.Namespace) -> bool:
-    return _registered_owner(args) and args.intensity in _STANDARD_PLUS_INTENSITY
+    return WRAPPER_COMMON.completion_owner(args, registered=_registered_owner)
 
 
 def codex_app_server_available() -> bool:
@@ -1003,19 +1001,6 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
         return "one-shot"
     args.completion_delivery_reason = "codex-app-server-unavailable"
     return "poll-fallback"
-
-
-def completion_state_path(args: argparse.Namespace) -> Path:
-    state_root = dispatch_state_root(args.jobs_path)
-    if not args.attempt_id:
-        return state_root / "supervisor-state" / "preview-only.json"
-    attempt_id = args.attempt_id
-    if re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", attempt_id) is None:
-        raise DispatchContractError(
-            "completion-state-attempt-invalid",
-            "supervised completion requires a path-safe exact attempt id",
-        )
-    return state_root / "supervisor-state" / f"{attempt_id}.json"
 
 
 def completion_lease_path(args: argparse.Namespace) -> Path:
