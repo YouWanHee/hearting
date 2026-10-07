@@ -721,10 +721,40 @@ gate_unmet = _ROUND.gate_unmet
 # The worker's final three lines. Every terminal reader parses them with this
 # one pattern, so no surface reads a child as finished while another calls it
 # malformed.
+#
+# G1: a fenced code block and/or up to two plain sentences may follow the block
+# (the fence attaches to the envelope; closing sentences follow the fence).
+# The verdict still comes from the block alone.
+#
+# A tail line is ambiguous when it mentions a verdict at all -- `verdict`/
+# `평결` anywhere (any case), or a bare uppercase PASS/FAIL/BLOCKED -- so
+# those fail closed, as do lines shaped like envelope fields; `Done.` and
+# `All tests pass.` stay ordinary sentences. The same check guards the
+# fence body, so an earlier decoy can never swallow a later envelope
+# (PR #281 review rounds 1-3). Tail elements start at newlines only
+# (`_TAIL_GAP`; the fence's own indentation is part of the fence element),
+# which keeps the failing search linear.
+_TAIL_EDGE = (
+    r"(?![ \t#*\-]*(?i:artifact|verdict|blocker|평결)[ \t]*:)"
+    r"(?![^\n]*(?i:verdict|평결))"
+    r"(?![^\n]*\b(?:PASS|FAIL|BLOCKED)\b)"
+)
+_TAIL_GAP = r"\n+"
+_TAIL_BLANK = r"(?:\n[ \t]*)*"
+_TAIL_LINE = _TAIL_EDGE + r"[^\n]+"
+_TAIL_FENCE_BODY = r"(?:" + _TAIL_EDGE + r"[^\n]*\n)*?"
+_TAIL_FENCE = r"[ \t]*```[^\n]*\n" + _TAIL_FENCE_BODY + r"[ \t]*```"
 HANDOFF_RE = re.compile(
     r"(?:\A|\n)artifact: (?P<artifact>[^\n]+)\n"
     r"verdict: (?P<verdict>PASS|FAIL|BLOCKED)\n"
-    r"blocker: (?P<blocker>[^\n]+)\Z"
+    r"blocker: (?P<blocker>[^\n]+)"
+    + r"(?:" + _TAIL_GAP
+    + r"(?:" + _TAIL_FENCE + r"(?:" + _TAIL_GAP + _TAIL_LINE + r"(?:" + _TAIL_GAP + _TAIL_LINE + r")?)?"
+    + r"|" + _TAIL_LINE + r"(?:" + _TAIL_GAP + _TAIL_LINE + r")?"
+    + r")"
+    + r")?"
+    + _TAIL_BLANK
+    + r"\Z"
 )
 
 
