@@ -442,7 +442,7 @@ def cmd_install(args):
                 lr["status"] == "skipped-collision" for lr in launcher_results
             )
 
-    environment = [node_runtime.ensure_node()]
+    environment = [node_runtime.ensure_node(dry_run=args.dry_run)]
     environment.extend(host_probes.run())
     for probe in environment:
         lines.append(f"environment: {probe['id']} -> {probe['status']} ({probe['detail']})")
