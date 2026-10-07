@@ -4372,6 +4372,10 @@ def _resource_gpu_resources(child, snapshot):
                     "process_count": len(matched), "processes": [],
                     "_process_keys": [(host.get("host") or "?", process.get("pid"),
                                        str(process.get("proc_start"))) for process in matched],
+                    "_process_memory": {(host.get("host") or "?", process.get("pid"),
+                                         str(process.get("proc_start"))):
+                        process.get("used_memory_mib") if type(process.get("used_memory_mib")) is int else None
+                        for process in matched},
                     "has_memory": bool(used), "used_memory_mib": sum(max(0, value) for value in used)})
     return resources
 
@@ -4407,7 +4411,15 @@ def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width
         if matched:
             linked.append(child)
             for resource in matched:
-                combined.setdefault((resource["host"], resource["index"]), resource)
+                key = (resource["host"], resource["index"])
+                if key not in combined:
+                    combined[key] = resource
+                    continue
+                current = combined[key]
+                memory = {**current.get("_process_memory", {}), **resource["_process_memory"]}
+                current.update(_process_memory=memory, _process_keys=list(memory),
+                               process_count=len(memory), has_memory=any(v is not None for v in memory.values()),
+                               used_memory_mib=sum(max(0, v) for v in memory.values() if v is not None))
     gpu_rows = _gpu_resource_strip([combined[key] for key in sorted(combined)],
         term_width=term_width, depth=depth, in_card=in_card, resource_children=linked)
     cpu_rows = _resource_child_rows(job, term_width=term_width, depth=depth,
@@ -4959,10 +4971,12 @@ def _gpu_session_resources(snapshot=None, excluded_processes=()):
                     "host": host_name, "index": gpu_index,
                     "model": _gpu_safe_text(gpu.get("name")).replace("NVIDIA ", ""),
                     "process_count": 0, "used_memory_mib": 0,
-                    "has_memory": False, "processes": [], "_process_keys": [],
+                    "has_memory": False, "processes": [], "_process_keys": [], "_process_memory": {},
                 })
                 resource["process_count"] += 1
                 resource["_process_keys"].append(process_key)
+                resource["_process_memory"][process_key] = (
+                    process.get("used_memory_mib") if type(process.get("used_memory_mib")) is int else None)
                 pid, proc_start = process.get("pid"), process.get("proc_start")
                 primary = process.get("owner")
                 if (isinstance(primary, dict) and primary.get("kind") == "session"
@@ -5004,7 +5018,8 @@ def _gpu_resources_for_session(session, resource_index):
             key = (source["host"], source["index"])
             if key not in resources:
                 resources[key] = {**source, "processes": list(source.get("processes") or ()),
-                                  "_process_keys": list(source.get("_process_keys") or ())}
+                                  "_process_keys": list(source.get("_process_keys") or ()),
+                                  "_process_memory": dict(source.get("_process_memory") or {})}
                 continue
             resource = resources[key]
             resource["process_count"] += source["process_count"]
@@ -5012,6 +5027,7 @@ def _gpu_resources_for_session(session, resource_index):
             resource["has_memory"] |= source["has_memory"]
             resource["processes"].extend(source.get("processes") or ())
             resource["_process_keys"].extend(source.get("_process_keys") or ())
+            resource["_process_memory"].update(source.get("_process_memory") or {})
     return [resources[key] for key in sorted(resources)]
 
 

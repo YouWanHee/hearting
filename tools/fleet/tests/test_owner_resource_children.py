@@ -378,6 +378,48 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                 term_width=168, resources=[self.resource], governor=None)
             self.assertIn("7 GB", flatten(lines))
 
+    def test_owner_and_remote_resource_share_gpu_without_lost_or_double_counted_memory(self):
+        self.owner.is_child = True
+        self.owner.parent_sid = "parent-session"
+        self.owner._runtime_session_id = "owner-runtime"
+        parent = Session(harness="codex", pid=91, proc_start="91", cwd=self.owner.cwd,
+                         session_id=self.owner.parent_sid, title="parent", liveness="working")
+        job_owner = {"kind": "job", "id": self.owner.attempt_id}
+        parent_claim = {"kind": "session", "harness": parent.harness, "id": parent.session_id,
+                        "source": "persistent-claim+ancestry"}
+        gpu = {"index": 0, "name": "NVIDIA A100", "processes": [
+            {"pid": 900, "proc_start": 999, "owner": job_owner, "used_memory_mib": 6144,
+             "session_owner": {"kind": "session", "harness": self.owner.harness, "id": "owner-runtime"}},
+            {"pid": 901, "proc_start": 1000, "owner": job_owner, "used_memory_mib": 4096,
+             "session_owner": parent_claim},
+            {"pid": 902, "proc_start": 1001, "owner": parent_claim, "used_memory_mib": 1024,
+             "session_owner": parent_claim, "command": "python other.py"},
+        ]}
+        snapshot = {"configured": True, "hosts": [{"host": "xavier", "self": False,
+            "reachable": True, "gpus": [gpu]}]}
+        render.set_compute_hosts(snapshot)
+        self.addCleanup(render.set_compute_hosts, None)
+        second = replace(self.resource, run_id="second-run")
+        self.attach(resources=[self.resource, second])
+        index = render._gpu_session_resources(snapshot)
+        original_index, original_snapshot = copy.deepcopy(index), copy.deepcopy(snapshot)
+        with mock.patch.object(render, "_gpu_resource_strip", wraps=render._gpu_resource_strip) as strip:
+            render._owner_gpu_resource_rows(self.owner, {}, index, 168)
+        combined, = strip.call_args.args[0]
+        self.assertEqual((combined["process_count"], combined["used_memory_mib"]), (2, 10240))
+        self.assertEqual(index, original_index)
+        for process_view in (False, True):
+            render.set_process_view(process_view)
+            lines = render._build_lines([parent], [self.owner], "both", False, 0,
+                term_width=168, resources=[self.resource, second], governor=None)
+            rows = [line for line in lines if line and "● GPU" in flatten([line])]
+            self.assertEqual(len(rows), 2)
+            owner_rows = [line for line in rows if "eval-run" in flatten([line])]
+            parent_rows = [line for line in rows if "eval-run" not in flatten([line])]
+            self.assertIn("10 GB", flatten(owner_rows))
+            self.assertIn("1 GB", flatten(parent_rows))
+        self.assertEqual(snapshot, original_snapshot)
+
 
     def test_declared_progress_stays_on_the_resource_row_in_every_view(self):
         self.attach()
