@@ -16,6 +16,8 @@ import distribution  # noqa: E402
 import installer  # noqa: E402
 import fixture_env  # noqa: E402
 
+PYYAML_OK = {"id": "host.pyyaml", "status": "ok", "detail": "importable"}
+
 
 class ComputeHostsLauncherTest(unittest.TestCase):
     def setUp(self):
@@ -170,7 +172,8 @@ class ComputeHostsLauncherTest(unittest.TestCase):
             "runtimes": ["claude"], "target": None, "scope": "global",
             "plugin": False,
         })()
-        with mock.patch.object(installer.paths, "harness_state_dir", return_value=self.root / "missing"), \
+        with mock.patch.object(installer.host_probes, "probe_pyyaml", return_value=PYYAML_OK), \
+             mock.patch.object(installer.paths, "harness_state_dir", return_value=self.root / "missing"), \
              mock.patch.object(installer.verifier, "run", return_value=[]), \
              mock.patch.object(installer.routing_config, "validate", return_value={"ok": True, "status": "ok", "path": "x"}), \
              mock.patch.object(installer.report_bundle_config, "validate", return_value={"ok": True, "status": "ok", "path": "x"}), \
@@ -195,7 +198,8 @@ class ComputeHostsLauncherTest(unittest.TestCase):
             "runtimes": ["claude"], "target": None, "scope": "global",
             "plugin": False,
         })()
-        with mock.patch.object(installer.paths, "harness_state_dir", return_value=self.root / "missing"), \
+        with mock.patch.object(installer.host_probes, "probe_pyyaml", return_value=PYYAML_OK), \
+             mock.patch.object(installer.paths, "harness_state_dir", return_value=self.root / "missing"), \
              mock.patch.object(installer.verifier, "run", return_value=[]), \
              mock.patch.object(installer.routing_config, "validate", return_value={"ok": True, "status": "ok", "path": "x"}), \
              mock.patch.object(installer.report_bundle_config, "validate", return_value={"ok": True, "status": "ok", "path": "x"}), \

@@ -918,6 +918,11 @@ class FramedStartTest(FramedBase):
         patch = mock.patch.object(W, "_route_cli", side_effect=self.in_process_cli)
         patch.start()
         self.addCleanup(patch.stop)
+        # These briefs carry no proposal block, so whether this host has PyYAML is controlled too;
+        # the PyYAML test below stops this patch and runs against the real probe.
+        self.pyyaml = mock.patch.object(RP, "yaml_available", return_value=True)
+        self.pyyaml.start()
+        self.addCleanup(self.pyyaml.stop)
 
     def owner_gate(self, *args, **kw):
         if not self.released:
@@ -975,6 +980,20 @@ class FramedStartTest(FramedBase):
         self.assertEqual(len({c[c.index("--attempt-id") + 1] for c in self.calls}), 2)
         self.start()
         self.assertEqual(len(self.calls), 2)  # both rows exist: a repeat launches nothing
+
+    def test_without_pyyaml_the_start_launches_no_frame_leg_and_names_the_fix(self):
+        self.pyyaml.stop()
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            result = self.start()
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "yaml-unavailable", "install-pyyaml"), result)
+        self.assertEqual((self.calls, result["launches"]), ([], []))   # no frame leg, so nothing spent
+        self.assertIn("-m pip install --user pyyaml", result["next_step"])
+        self.assertIn("non-framed shape", result["next_step"])
+        self.assertFalse(R.outcome_path(self.path).exists())           # open: resume_command continues it
+        with mock.patch.object(RP, "yaml_available", return_value=True):
+            self.assertEqual(self.start()["state"], "preparing")
+        self.assertEqual(len(self.calls), 2)
 
     def test_the_joined_frames_reach_the_interview_and_the_proceed_answer_ends_the_route(self):
         self.start()

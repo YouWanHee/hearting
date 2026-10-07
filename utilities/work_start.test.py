@@ -489,6 +489,13 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["frame_attempts"], [])
         self.assertEqual(len(result["launches"]), 1)  # the anchor leg stopped the start; nothing else launched
 
+    def test_a_route_that_is_not_framed_starts_its_frame_pair_without_pyyaml(self):
+        # Only a framed route reads frame proposals; a recipe's own frame pair needs no PyYAML.
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            result = self.start()
+        self.assertEqual(result["state"], "preparing", result)
+        self.assertEqual(len(self.calls), 2)
+
     def test_automatic_frames_use_real_selector_usage_gate_before_wrapper_launch(self):
         owner = load("work_start_capacity_owner", W.ROOT / "utilities/dispatch-owner.py")
         self.route.update(cwd=self.tmp.name, capability="autopilot-code", capability_mode="debug",

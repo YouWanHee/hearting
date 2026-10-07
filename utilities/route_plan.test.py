@@ -212,6 +212,8 @@ class ExtractionTest(unittest.TestCase):
         text = brief([DIRECT])
         with mock.patch.dict(sys.modules, {"yaml": None}):
             self.assertEqual(self.reason(text), "yaml-unavailable")
+            self.assertFalse(RP.yaml_available())        # what the framed start asks before any frame leg
+        self.assertTrue(RP.yaml_available())
 
     def test_none_text(self):
         self.assertEqual(RP.none_text("block-missing"), "proposal:none(block-missing)")
